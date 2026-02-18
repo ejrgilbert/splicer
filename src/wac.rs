@@ -1,6 +1,6 @@
 use std::cmp::Reverse;
-use crate::model::{ComponentNode, CompositionGraph, InterfaceConnection};
 use std::collections::{HashMap, HashSet};
+use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
 use wirm::wasmparser::collections::IndexSet;
 
 const INST_PREFIX: &str = "my";

@@ -1,0 +1,17 @@
+# Wasm things
+*.wat
+*.bk
+*.pyc
+*.swo
+*.swp
+*.swx
+
+# Rust
+.*.rustfmt
+target
+.cargo
+Cargo.lock
+
+# IntelliJ
+.idea/
+

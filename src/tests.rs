@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use cviz::parse::json;
 use crate::{parse, wac};
 
 #[test]
@@ -72,7 +73,7 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     for (name, json) in all_json {
         graphs.insert(
             name.clone(),
-            parse::json::parse_json_str(&json)?
+            json::parse_json_str(&json)?
         );
     }
 

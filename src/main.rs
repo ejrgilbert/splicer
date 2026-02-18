@@ -1,4 +1,3 @@
-mod model;
 mod parse;
 mod wac;
 #[cfg(test)]
@@ -8,7 +7,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crate::model::CompositionGraph;
+use cviz::model::CompositionGraph;
+use cviz::parse::json;
 use crate::parse::config::SpliceRule;
 
 #[derive(Parser, Debug)]
@@ -62,7 +62,7 @@ fn get_graph(args: &Args) -> Result<CompositionGraph> {
         .with_context(|| format!("Failed to read file: {}", args.json_graph_file.display()))?;
 
     // Parse the graph
-    parse::json::parse_json(&file)
+    json::parse_json(&file)
         .with_context(|| format!("Failed to parse composition graph: {}", args.json_graph_file.display()))
 }
 
