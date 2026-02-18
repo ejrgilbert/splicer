@@ -1,15 +1,15 @@
 mod parse;
-mod wac;
 #[cfg(test)]
 mod tests;
+mod wac;
 
 use std::path::PathBuf;
 
+use crate::parse::config::SpliceRule;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cviz::model::CompositionGraph;
 use cviz::parse::json;
-use crate::parse::config::SpliceRule;
 
 #[derive(Parser, Debug)]
 #[command(name = "splicer")]
@@ -62,8 +62,12 @@ fn get_graph(args: &Args) -> Result<CompositionGraph> {
         .with_context(|| format!("Failed to read file: {}", args.json_graph_file.display()))?;
 
     // Parse the graph
-    json::parse_json(&file)
-        .with_context(|| format!("Failed to parse composition graph: {}", args.json_graph_file.display()))
+    json::parse_json(&file).with_context(|| {
+        format!(
+            "Failed to parse composition graph: {}",
+            args.json_graph_file.display()
+        )
+    })
 }
 
 fn get_cfg(args: &Args) -> Result<Vec<SpliceRule>> {
@@ -72,6 +76,10 @@ fn get_cfg(args: &Args) -> Result<Vec<SpliceRule>> {
         .with_context(|| format!("Failed to read file: {}", args.splice_cfg_file.display()))?;
 
     // Parse the config
-    parse::config::parse_yaml(&yaml_str)
-        .with_context(|| format!("Failed to parse splice configuration: {}", args.splice_cfg_file.display()))
+    parse::config::parse_yaml(&yaml_str).with_context(|| {
+        format!(
+            "Failed to parse splice configuration: {}",
+            args.splice_cfg_file.display()
+        )
+    })
 }

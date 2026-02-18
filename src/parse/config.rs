@@ -6,7 +6,6 @@ pub fn parse_yaml(yaml_str: &str) -> anyhow::Result<Vec<SpliceRule>> {
     // i'm only able to parse this config version!
     assert_eq!(config.version, 1);
     Ok(config.to_splice_rules())
-
 }
 
 /// --- YAML config structures ---
@@ -55,27 +54,45 @@ pub enum SpliceRule {
 impl ConfigFile {
     /// Convert YAML parsed rules into normalized [SpliceRule]
     pub fn to_splice_rules(&self) -> Vec<SpliceRule> {
-        self.rules.iter().map(| YamlRule { before, between, inject } | {
-            if before.is_some() && between.is_some() {
-                panic!("insert error here (should have one or the other, not BOTH!)");
-            }
+        self.rules
+            .iter()
+            .map(
+                |YamlRule {
+                     before,
+                     between,
+                     inject,
+                 }| {
+                    if before.is_some() && between.is_some() {
+                        panic!("insert error here (should have one or the other, not BOTH!)");
+                    }
 
-            if let Some(YamlStrategyBefore {interface, provider_name}) = before {
-                SpliceRule::Before {
-                    interface: interface.clone(),
-                    provider_name: provider_name.clone(),
-                    inject: inject.clone(),
-                }
-            } else if let Some(YamlStrategyBetween {interface, inner, outer }) = between {
-                SpliceRule::Between {
-                    interface: interface.clone(),
-                    inner: inner.clone(),
-                    outer: outer.clone(),
-                    inject: inject.clone(),
-                }
-            } else {
-                panic!("insert error here (should have one or the other, not neither!)");
-            }
-        }).collect()
+                    if let Some(YamlStrategyBefore {
+                        interface,
+                        provider_name,
+                    }) = before
+                    {
+                        SpliceRule::Before {
+                            interface: interface.clone(),
+                            provider_name: provider_name.clone(),
+                            inject: inject.clone(),
+                        }
+                    } else if let Some(YamlStrategyBetween {
+                        interface,
+                        inner,
+                        outer,
+                    }) = between
+                    {
+                        SpliceRule::Between {
+                            interface: interface.clone(),
+                            inner: inner.clone(),
+                            outer: outer.clone(),
+                            inject: inject.clone(),
+                        }
+                    } else {
+                        panic!("insert error here (should have one or the other, not neither!)");
+                    }
+                },
+            )
+            .collect()
     }
 }
