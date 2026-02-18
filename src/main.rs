@@ -13,7 +13,7 @@ use cviz::parse::json;
 
 #[derive(Parser, Debug)]
 #[command(name = "splicer")]
-#[command(about = "Plan how to splice middleware into a WebAssembly component")]
+#[command(version, about = "Plan how to splice middleware into a WebAssembly component.")]
 #[command(after_long_help = r#"
 SPLICE CONFIG FORMAT (YAML)
 
