@@ -15,7 +15,10 @@ use cviz::parse::json;
 
 #[derive(Parser, Debug)]
 #[command(name = "splicer")]
-#[command(version, about = "Plan how to splice middleware into a WebAssembly component.")]
+#[command(
+    version,
+    about = "Plan how to splice middleware into a WebAssembly component."
+)]
 #[command(after_long_help = r#"
 SPLICE CONFIG FORMAT (YAML)
 
@@ -50,7 +53,7 @@ fn main() -> Result<()> {
     if let Some(output_path) = args.output {
         fs::write(&output_path, wac)
             .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
-        eprintln!("Diagram written to: {}", output_path.display());
+        eprintln!("Generated `wac` written to: {}", output_path.display());
     } else {
         println!("\n{wac}");
     }
@@ -79,7 +82,10 @@ fn get_graph(args: &Args) -> Result<CompositionGraph> {
             )
         })
     } else {
-        panic!("Input file must either be a JSON or a WASM file, provided: {}", args.composition.display());
+        panic!(
+            "Input file must either be a JSON or a WASM file, provided: {}",
+            args.composition.display()
+        );
     }
 }
 

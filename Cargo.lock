@@ -112,9 +112,9 @@ checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
 name = "cviz"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63a8eb55e562dc1d73c39e670df8019e52169d643fa12f677b09c072c3b9e058"
+checksum = "22eff3fed9b84d35a1a667c65846aec5f8d85c4a54e66f1cc394c8529810605d"
 dependencies = [
  "anyhow",
  "clap",

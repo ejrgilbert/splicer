@@ -6,11 +6,18 @@ use wasmparser::collections::IndexSet;
 const INST_PREFIX: &str = "my";
 use crate::parse::config::SpliceRule;
 
+// chain_idx -> (optional alias, set of middlewares to inject AFTER)
+type InjectPlan = HashMap<usize, Injection>;
+struct Injection {
+    alias: Option<String>,
+    middlewares: IndexSet<String>,
+}
+
 struct Chain {
     interface: String,
     chain: Vec<u32>,
     // middlewares to inject after the specified index in the chain
-    inject_plan: HashMap<usize, IndexSet<String>>, // chain_idx -> set of middlewares to inject AFTER
+    inject_plan: InjectPlan,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
@@ -86,7 +93,7 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
     for rule in rules.iter() {
         for chain in chains.iter_mut() {
             apply_rule_between(rule, chain, composition);
-            apply_rule_inject(rule, chain, composition);
+            apply_rule_before(rule, chain, composition);
         }
     }
 
@@ -103,15 +110,21 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
     {
         for (i, id) in chain.iter().enumerate() {
             let node = &composition.nodes[id];
-            let node_var =
-                get_or_create_inst(*id, node, &mut instance_vars, &mdl_override, &mut wac_lines);
+            let node_var = get_or_create_inst(
+                *id,
+                inject_plan.get(&(i + 1)),
+                node,
+                &mut instance_vars,
+                &mdl_override,
+                &mut wac_lines,
+            );
 
             // set up what to wire in next
             last = node_var;
             mdl_override = Some((chain_interface.clone(), last.clone()));
 
-            // if the NEXT node has a middleware BEFORE it, inject here!
-            if let Some(middlewares) = inject_plan.get(&(i + 1)) {
+            if let Some(Injection { alias, middlewares }) = inject_plan.get(&(i + 1)) {
+                // if the NEXT node has a middleware BEFORE it, inject here!
                 // Reverse the list of items to inject (this keeps me from having to deal with this in the `wac` generation logic).
                 // Through doing this, the order of middlewares invoked will follow the order of declaration in the configuration.
                 let reversed_list = reverse_set(middlewares);
@@ -137,6 +150,7 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
             let outer_node = &composition.nodes[outer_inst_id];
             get_or_create_inst(
                 *outer_inst_id,
+                None,
                 outer_node,
                 &mut instance_vars,
                 &None,
@@ -159,8 +173,10 @@ fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &Compos
     } = chain;
     if let SpliceRule::Between {
         interface,
-        inner,
-        outer,
+        inner_name,
+        inner_alias,
+        outer_name,
+        outer_alias,
         inject,
     } = rule
     {
@@ -175,18 +191,17 @@ fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &Compos
             if interface != chain_interface {
                 continue;
             }
-            if *inner == inner_var && *outer == outer_var {
+            if *inner_name == inner_var && *outer_name == outer_var {
+                // mark the inner's index aliasing rule (if it does anything)
+                add_to_inject_plan(inner_alias, &vec![], i, inject_plan);
                 // matches! We want to inject BEFORE the outer's index
-                inject_plan
-                    .entry(i + 1)
-                    .or_insert(IndexSet::from_iter(inject.iter().cloned()))
-                    .extend(inject.iter().cloned());
+                add_to_inject_plan(outer_alias, inject, i + 1, inject_plan);
             }
         }
     }
 }
 
-fn apply_rule_inject(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
+fn apply_rule_before(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
     let Chain {
         interface: chain_interface,
         chain,
@@ -195,6 +210,7 @@ fn apply_rule_inject(rule: &SpliceRule, chain: &mut Chain, composition: &Composi
     if let SpliceRule::Before {
         interface,
         provider_name,
+        provider_alias,
         inject,
     } = rule
     {
@@ -209,16 +225,37 @@ fn apply_rule_inject(rule: &SpliceRule, chain: &mut Chain, composition: &Composi
                 }
             }
             // matches! We want to inject BEFORE the instance this guy's plugged into
-            inject_plan
-                .entry(i + 1)
-                .or_insert(IndexSet::from_iter(inject.iter().cloned()))
-                .extend(inject.iter().cloned());
+            add_to_inject_plan(provider_alias, inject, i + 1, inject_plan);
         }
     }
 }
 
+fn add_to_inject_plan(
+    my_alias: &Option<String>,
+    to_inject: &[String],
+    chain_idx: usize,
+    inject_plan: &mut InjectPlan,
+) {
+    let Injection {
+        alias: configured_alias,
+        middlewares,
+    } = inject_plan.entry(chain_idx).or_insert(Injection {
+        alias: my_alias.clone(),
+        middlewares: IndexSet::from_iter(to_inject.iter().cloned()),
+    });
+
+    if let (Some(my_alias), Some(configured_alias)) = (my_alias, configured_alias) {
+        if my_alias != configured_alias {
+            // panic! conflicting aliases!
+            todo!()
+        }
+    }
+    middlewares.extend(to_inject.iter().cloned());
+}
+
 fn get_or_create_inst(
     inst_id: u32,
+    injection: Option<&Injection>,
     node: &ComponentNode,
     instance_vars: &mut HashMap<u32, String>,
     with_override: &Option<(String, String)>,
@@ -227,11 +264,24 @@ fn get_or_create_inst(
     if let Some(var) = instance_vars.get(&inst_id) {
         return var.clone();
     }
+    let alias = if let Some(Injection {
+        alias: Some(alias), ..
+    }) = injection
+    {
+        Some(alias.clone())
+    } else {
+        None
+    };
+
     // it hasn't been instantiated yet! do so here
-    let pkg = get_name(node);
+    let pkg = if let Some(alias) = alias {
+        alias.clone()
+    } else {
+        get_name(node).to_string()
+    };
     let node_var = instance_vars
         .entry(inst_id)
-        .or_insert_with(|| to_var_name(pkg))
+        .or_insert_with(|| pkg.clone())
         .clone();
 
     let mut line = format!("let {node_var} = new {INST_PREFIX}:{pkg} {{");
@@ -268,21 +318,17 @@ fn create_mdl(
     interface: &String,
     wac_lines: &mut Vec<String>,
 ) -> String {
-    let mw_var = to_var_name(mw);
     let mw_line = format!(
-        "let {mw_var} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};"
+        "let {mw} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};"
     );
     wac_lines.push(mw_line);
 
-    mw_var
+    mw.clone()
 }
 
 /// Helper to get the instance name from a node
 fn get_name(node: &ComponentNode) -> &str {
     node.display_label()
-}
-fn to_var_name(name: &str) -> String {
-    name.replace("-", "_").to_string()
 }
 
 fn reverse_set(set: &IndexSet<String>) -> Vec<String> {

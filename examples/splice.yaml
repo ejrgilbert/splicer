@@ -3,8 +3,10 @@ version: 1
 rules:
   - between:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
-      inner: srv-b
-      outer: srv
+      inner:
+        name: srv-b
+      outer:
+        name: srv
     inject:
       - middleware-a
       - middleware-b
