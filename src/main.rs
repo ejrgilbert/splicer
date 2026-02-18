@@ -3,12 +3,14 @@ mod parse;
 mod tests;
 mod wac;
 
+use std::fs;
 use std::path::PathBuf;
 
 use crate::parse::config::SpliceRule;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cviz::model::CompositionGraph;
+use cviz::parse::component::parse_component;
 use cviz::parse::json;
 
 #[derive(Parser, Debug)]
@@ -26,9 +28,9 @@ Full format documentation:
 https://github.com/ejrgilbert/component-interposition/blob/main/splice-config.md
 "#)]
 struct Args {
-    /// Path to the composition graph in JSON format.
-    #[arg(value_name = "JSON_GRAPH")]
-    json_graph_file: PathBuf,
+    /// Path to the composition graph, either provided as JSON or the Wasm component binary.
+    #[arg(value_name = "COMP")]
+    composition: PathBuf,
 
     /// Path to the splice configuration in YAML format.
     #[arg(value_name = "SPLICE_CFG")]
@@ -46,7 +48,7 @@ fn main() -> Result<()> {
 
     let wac = wac::generate_wac(&graph, &cfg);
     if let Some(output_path) = args.output {
-        std::fs::write(&output_path, wac)
+        fs::write(&output_path, wac)
             .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
         eprintln!("Diagram written to: {}", output_path.display());
     } else {
@@ -57,22 +59,33 @@ fn main() -> Result<()> {
 }
 
 fn get_graph(args: &Args) -> Result<CompositionGraph> {
-    // Read the graph file
-    let file = std::fs::File::open(&args.json_graph_file)
-        .with_context(|| format!("Failed to read file: {}", args.json_graph_file.display()))?;
-
     // Parse the graph
-    json::parse_json(&file).with_context(|| {
-        format!(
-            "Failed to parse composition graph: {}",
-            args.json_graph_file.display()
-        )
-    })
+    let extension = args.composition.extension().unwrap().to_str();
+    if extension == Some("wasm") {
+        let bytes = fs::read(&args.composition)?;
+        parse_component(&bytes).with_context(|| {
+            format!(
+                "Failed to parse composition graph: {}",
+                args.composition.display()
+            )
+        })
+    } else if extension == Some("json") {
+        let file = fs::File::open(&args.composition)
+            .with_context(|| format!("Failed to read file: {}", args.composition.display()))?;
+        json::parse_json(&file).with_context(|| {
+            format!(
+                "Failed to parse composition graph: {}",
+                args.composition.display()
+            )
+        })
+    } else {
+        panic!("Input file must either be a JSON or a WASM file, provided: {}", args.composition.display());
+    }
 }
 
 fn get_cfg(args: &Args) -> Result<Vec<SpliceRule>> {
     // Read the splice config file
-    let yaml_str = std::fs::read_to_string(&args.splice_cfg_file)
+    let yaml_str = fs::read_to_string(&args.splice_cfg_file)
         .with_context(|| format!("Failed to read file: {}", args.splice_cfg_file.display()))?;
 
     // Parse the config
