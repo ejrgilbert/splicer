@@ -4,6 +4,8 @@ version = "1.0.0"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
 description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
+license = "Apache-2.0"
+
 readme = "README.md"
 repository = "https://github.com/ejrgilbert/splicer"
 categories = ["wasm"]
