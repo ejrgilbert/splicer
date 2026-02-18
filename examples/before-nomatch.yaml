@@ -1,0 +1,9 @@
+version: 1
+
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0-rc-2026-01-06
+      provider_name: srv-NA
+    inject:
+      - middleware-a
+      - middleware-b
