@@ -1,7 +1,7 @@
 use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use wirm::wasmparser::collections::IndexSet;
+use wasmparser::collections::IndexSet;
 
 const INST_PREFIX: &str = "my";
 use crate::parse::config::SpliceRule;
