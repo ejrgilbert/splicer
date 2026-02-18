@@ -2,6 +2,12 @@
 name = "splicer"
 version = "0.1.0"
 edition = "2021"
+authors = ["Elizabeth Gilbert"]
+description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
+readme = "README.md"
+repository = "https://github.com/ejrgilbert/splicer"
+categories = ["wasm"]
+keywords = ["wasm", "WebAssembly", "components", "composition"]
 
 [[bin]]
 doc = false
