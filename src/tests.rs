@@ -1,19 +1,16 @@
-use std::collections::HashMap;
-use cviz::parse::json;
 use crate::{parse, wac};
+use cviz::parse::json;
+use std::collections::HashMap;
 
 #[test]
 fn before_on_all() -> anyhow::Result<()> {
-    run_all(
-        testcases::yaml_before(),
-        testcases::yaml_before_all_exp()
-    )
+    run_all(testcases::yaml_before(), testcases::yaml_before_all_exp())
 }
 #[test]
 fn before_noprov_on_all() -> anyhow::Result<()> {
     run_all(
         testcases::yaml_before_noprov(),
-        testcases::yaml_before_noprov_all_exp()
+        testcases::yaml_before_noprov_all_exp(),
     )
 }
 
@@ -21,7 +18,7 @@ fn before_noprov_on_all() -> anyhow::Result<()> {
 fn before_long_on_all() -> anyhow::Result<()> {
     run_all(
         testcases::yaml_before_long(),
-        testcases::yaml_before_long_all_exp()
+        testcases::yaml_before_long_all_exp(),
     )
 }
 
@@ -29,23 +26,20 @@ fn before_long_on_all() -> anyhow::Result<()> {
 fn before_nomatch_on_all() -> anyhow::Result<()> {
     run_all(
         testcases::yaml_before_nomatch(),
-        testcases::yaml_before_nomatch_all_exp()
+        testcases::yaml_before_nomatch_all_exp(),
     )
 }
 
 #[test]
 fn splice_on_all() -> anyhow::Result<()> {
-    run_all(
-        testcases::yaml_splice(),
-        testcases::yaml_splice_all_exp()
-    )
+    run_all(testcases::yaml_splice(), testcases::yaml_splice_all_exp())
 }
 
 #[test]
 fn splice_long_on_all() -> anyhow::Result<()> {
     run_all(
         testcases::yaml_splice_long(),
-        testcases::yaml_splice_long_all_exp()
+        testcases::yaml_splice_long_all_exp(),
     )
 }
 
@@ -53,7 +47,7 @@ fn splice_long_on_all() -> anyhow::Result<()> {
 fn splice_nomatch_on_all() -> anyhow::Result<()> {
     run_all(
         testcases::yaml_splice_nomatch(),
-        testcases::yaml_splice_nomatch_all_exp()
+        testcases::yaml_splice_nomatch_all_exp(),
     )
 }
 
@@ -61,7 +55,7 @@ fn splice_nomatch_on_all() -> anyhow::Result<()> {
 fn multi_rule_on_all() -> anyhow::Result<()> {
     run_all(
         testcases::yaml_multi_rule(),
-        testcases::yaml_multi_rule_all_exp()
+        testcases::yaml_multi_rule_all_exp(),
     )
 }
 
@@ -71,17 +65,14 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     let mut graphs = HashMap::new();
     let all_json = testcases::get_all_json();
     for (name, json) in all_json {
-        graphs.insert(
-            name.clone(),
-            json::parse_json_str(&json)?
-        );
+        graphs.insert(name.clone(), json::parse_json_str(&json)?);
     }
 
     for (name, graph) in graphs.iter() {
         let wac = wac::generate_wac(graph, &cfg);
-        let exp_wac = exp.get(name).unwrap_or_else(||
+        let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
-        );
+        });
 
         assert_eq!(wac.trim(), exp_wac.trim(),
             "Failed on test '{name}', for the following config:{yaml}\nGot the following result:{wac}"
@@ -862,8 +853,14 @@ export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
     pub fn yaml_before_noprov_all_exp() -> HashMap<String, String> {
         HashMap::from_iter(vec![
             (ONE.to_string(), yaml_before_noprov_on_one_exp().to_string()),
-            (SHORT.to_string(), yaml_before_noprov_on_short_exp().to_string()),
-            (LONG.to_string(), yaml_before_noprov_on_long_exp().to_string()),
+            (
+                SHORT.to_string(),
+                yaml_before_noprov_on_short_exp().to_string(),
+            ),
+            (
+                LONG.to_string(),
+                yaml_before_noprov_on_long_exp().to_string(),
+            ),
         ])
     }
     pub fn yaml_before_long() -> &'static str {
@@ -918,7 +915,10 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
     pub fn yaml_before_long_all_exp() -> HashMap<String, String> {
         HashMap::from_iter(vec![
             (ONE.to_string(), yaml_before_long_on_one_exp().to_string()),
-            (SHORT.to_string(), yaml_before_long_on_short_exp().to_string()),
+            (
+                SHORT.to_string(),
+                yaml_before_long_on_short_exp().to_string(),
+            ),
             (LONG.to_string(), yaml_before_long_on_long_exp().to_string()),
         ])
     }
@@ -1071,7 +1071,10 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
     pub fn yaml_splice_long_all_exp() -> HashMap<String, String> {
         HashMap::from_iter(vec![
             (ONE.to_string(), yaml_splice_long_on_one_exp().to_string()),
-            (SHORT.to_string(), yaml_splice_long_on_short_exp().to_string()),
+            (
+                SHORT.to_string(),
+                yaml_splice_long_on_short_exp().to_string(),
+            ),
             (LONG.to_string(), yaml_splice_long_on_long_exp().to_string()),
         ])
     }
@@ -1224,7 +1227,10 @@ export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
     pub fn yaml_multi_rule_all_exp() -> HashMap<String, String> {
         HashMap::from_iter(vec![
             (ONE.to_string(), yaml_multi_rule_on_one_exp().to_string()),
-            (SHORT.to_string(), yaml_multi_rule_on_short_exp().to_string()),
+            (
+                SHORT.to_string(),
+                yaml_multi_rule_on_short_exp().to_string(),
+            ),
             (LONG.to_string(), yaml_multi_rule_on_long_exp().to_string()),
         ])
     }
