@@ -9,9 +9,9 @@ name = "splicer"
 path = "src/main.rs"
 
 [dependencies]
+cviz = { version = "1" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"  # or serde_toml if you prefer TOML
 anyhow = "1.0.86"
 clap = { version = "4.5.58", features = ["derive"] }
 wirm = { path = "../../research/compilers/wirm-COMP/wirm" }
-cviz = { path = "../cviz" }
