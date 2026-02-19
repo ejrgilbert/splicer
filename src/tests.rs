@@ -130,6 +130,7 @@ mod testcases {
               "id": 12,
               "name": "srv-b",
               "component_index": 0,
+              "component_num": 0,
               "imports": [
                 {
                   "interface": "import-func-handle",
@@ -213,6 +214,7 @@ mod testcases {
               "id": 11,
               "name": "srv-b",
               "component_index": 0,
+              "component_num": 0,
               "imports": [
                 {
                   "interface": "wasi:http/types@0.3.0-rc-2026-01-06",
@@ -286,6 +288,7 @@ mod testcases {
               "id": 13,
               "name": "srv",
               "component_index": 1,
+              "component_num": 1,
               "imports": [
                 {
                   "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",
@@ -381,6 +384,7 @@ mod testcases {
               "id": 11,
               "name": "srv-c",
               "component_index": 0,
+              "component_num": 0,
               "imports": [
                 {
                   "interface": "wasi:http/types@0.3.0-rc-2026-01-06",
@@ -454,6 +458,7 @@ mod testcases {
               "id": 12,
               "name": "srv-b",
               "component_index": 1,
+              "component_num": 1,
               "imports": [
                 {
                   "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",
@@ -533,6 +538,7 @@ mod testcases {
               "id": 13,
               "name": "srv",
               "component_index": 2,
+              "component_num": 2,
               "imports": [
                 {
                   "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",

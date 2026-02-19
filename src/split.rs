@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::PathBuf;
-use colored::Colorize;
 use wirm::Component;
 use wirm::ir::component::visitor::{traverse_component, ComponentVisitor, VisitCtx};
 
@@ -34,9 +33,9 @@ struct EmitVisitor {
     err: Option<std::io::Error>,
 }
 impl EmitVisitor {
-    fn new(output_path: &String) -> Self {
+    fn new(output_path: &str) -> Self {
         Self {
-            output_path: output_path.clone(),
+            output_path: output_path.to_string(),
             curr_comp_num: 0,
             nested_comps: vec![],
             shim_comps: vec![],

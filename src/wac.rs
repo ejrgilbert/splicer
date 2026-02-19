@@ -198,7 +198,7 @@ fn gen_wac_args(shim_comps: Vec<usize>, splits_path: &str, graph: &CompositionGr
     }
 
     // handle the used middlewares
-    args.extend(used_mdls.clone());
+    args.extend(used_mdls.to_owned());
 
     args
 }
@@ -286,7 +286,7 @@ fn add_to_inject_plan(
     let middlewares = inject_plan.entry(chain_idx).or_insert(IndexSet::from_iter(to_inject.iter().cloned()));
 
     for (inst_id, new_alias) in new_aliases {
-        if let (Some(new_alias), Some(Some(configured_alias))) = (new_alias, aliases.get(&inst_id)) {
+        if let (Some(new_alias), Some(Some(configured_alias))) = (new_alias, aliases.get(inst_id)) {
             if new_alias != configured_alias {
                 // panic! conflicting aliases!
                 todo!()
@@ -310,12 +310,7 @@ fn get_or_create_inst(
     if let Some(var) = instance_vars.get(&inst_id) {
         return var.clone();
     }
-    let alias = if let Some(alias) = aliases.get(&inst_id)
-    {
-        Some(alias.clone())
-    } else {
-        None
-    };
+    let alias = aliases.get(&inst_id).cloned();
 
     // it hasn't been instantiated yet! do so here
     let pkg = if let Some(Some(alias)) = alias {
