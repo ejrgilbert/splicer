@@ -19,7 +19,7 @@ pub struct ConfigFile {
 pub struct YamlRule {
     before: Option<YamlStrategyBefore>,
     between: Option<YamlStrategyBetween>,
-    inject: Vec<String>,
+    inject: Vec<Injection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +53,12 @@ pub struct YamlProviderOpt {
     alias: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Injection {
+    pub name: String,
+    pub path: Option<String>,
+}
+
 /// --- Normalized rule type for Rust usage ---
 #[derive(Debug)]
 pub enum SpliceRule {
@@ -60,7 +66,7 @@ pub enum SpliceRule {
         interface: String,
         provider_name: Option<String>,
         provider_alias: Option<String>,
-        inject: Vec<String>,
+        inject: Vec<Injection>,
     },
     Between {
         interface: String,
@@ -68,7 +74,7 @@ pub enum SpliceRule {
         inner_alias: Option<String>,
         outer_name: String,
         outer_alias: Option<String>,
-        inject: Vec<String>,
+        inject: Vec<Injection>,
     },
 }
 
@@ -104,7 +110,7 @@ impl ConfigFile {
                             } else {
                                 None
                             },
-                            inject: inject.clone(),
+                            inject: (*inject).clone(),
                         }
                     } else if let Some(YamlStrategyBetween {
                         interface,
@@ -118,7 +124,7 @@ impl ConfigFile {
                             inner_alias: inner.alias.clone(),
                             outer_name: outer.name.clone(),
                             outer_alias: outer.alias.clone(),
-                            inject: inject.clone(),
+                            inject: (*inject).clone(),
                         }
                     } else {
                         panic!("insert error here (should have one or the other, not neither!)");

@@ -101,7 +101,7 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     }
 
     for (name, graph) in graphs.iter() {
-        let wac = wac::generate_wac(graph, &cfg);
+        let (wac, _) = wac::generate_wac(vec![], "placeholder", graph, &cfg);
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
@@ -691,8 +691,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               provider:
                 name: srv-b
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn yaml_before_on_one_exp() -> &'static str {
@@ -783,8 +783,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
       - before:
           interface: wasi:http/handler@0.3.0-rc-2026-01-06
         inject:
-        - middleware-a
-        - middleware-b
+        - name: middleware-a
+        - name: middleware-b
     "#
     }
     fn yaml_before_noprov_on_one_exp() -> &'static str {
@@ -907,8 +907,8 @@ export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
               provider:
                 name: srv-c
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn yaml_before_long_on_one_exp() -> &'static str {
@@ -967,8 +967,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               provider:
                 name: srv-NA
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     pub fn yaml_before_nomatch_all_exp() -> HashMap<String, String> {
@@ -987,8 +987,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               outer:
                 name: srv
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn yaml_splice_on_one_exp() -> &'static str {
@@ -1067,8 +1067,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               outer:
                 name: srv-b
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
 
         "#
     }
@@ -1130,8 +1130,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               outer:
                 name: srv
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     pub fn yaml_splice_nomatch_all_exp() -> HashMap<String, String> {
@@ -1145,14 +1145,14 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
             inject:
-            - middleware-a
+            - name: middleware-a
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
               provider:
                 name: srv-b
             inject:
-            - middleware-b
-            - middleware-c
+            - name: middleware-b
+            - name: middleware-c
           - between:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
               inner:
@@ -1160,8 +1160,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               outer:
                 name: srv-b
             inject:
-            - middleware-d
-            - middleware-e
+            - name: middleware-d
+            - name: middleware-e
         "#
     }
     fn yaml_multi_rule_on_one_exp() -> &'static str {
@@ -1290,8 +1290,8 @@ export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv-b
                 alias: other-name
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn yaml_alias_in_before_on_one_exp() -> &'static str {
@@ -1395,8 +1395,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               outer:
                 name: srv
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn alias_in_between_inner_on_one_exp() -> &'static str {
@@ -1484,8 +1484,8 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv
                 alias: other
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn alias_in_between_outer_on_one_exp() -> &'static str {
@@ -1574,8 +1574,8 @@ export other["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv
                 alias: other
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn alias_in_between_inner_and_outer_on_one_exp() -> &'static str {

@@ -1,13 +1,16 @@
 use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use colored::Colorize;
 use wasmparser::collections::IndexSet;
 
-const INST_PREFIX: &str = "my";
-use crate::parse::config::SpliceRule;
+pub const INST_PREFIX: &str = "my";
+const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
+use crate::parse::config::{Injection, SpliceRule};
+use crate::split::gen_split_path;
 
 // chain_idx -> set of middlewares to inject AFTER
-type InjectPlan = HashMap<usize, IndexSet<String>>;
+type InjectPlan = HashMap<usize, IndexSet<Injection>>;
 
 struct Chain {
     interface: String,
@@ -18,7 +21,10 @@ struct Chain {
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
-pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> String {
+/// Returns:
+/// - The generated Wac
+/// - A list of the `wac compose` args: (service-name, service-path)
+pub fn generate_wac(shim_comps: Vec<usize>, splits_path: &str, composition: &CompositionGraph, rules: &[SpliceRule]) -> (String, Vec<(String, String)>) {
     let mut wac_lines = vec!["package example:composition;".to_string()];
 
     let mut handled_interfaces = HashSet::new();
@@ -101,6 +107,8 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
     let mut last;
     let mut instance_vars: HashMap<u32, String> = HashMap::new();
     let mut outer_instances: HashMap<u32, String> = HashMap::new(); // orig_inst_id -> generated_outer_var
+    let mut used_comp_nodes: HashMap<u32, String> = HashMap::new(); // inst_id -> used_name
+    let mut used_middlewares: Vec<(String, String)> = Vec::new(); // (used_name, path)
     for Chain {
         interface: chain_interface,
         chain,
@@ -113,7 +121,7 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
             let node_var = get_or_create_inst(
                 *id,
                 aliases,
-                inject_plan.get(&(i + 1)),
+                &mut used_comp_nodes,
                 node,
                 &mut instance_vars,
                 &mdl_override,
@@ -131,7 +139,8 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
                 let reversed_list = reverse_set(middlewares);
                 for mdl in reversed_list.iter() {
                     // instantiate
-                    last = create_mdl(&last, mdl, chain_interface, &mut wac_lines);
+                    last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
+                    used_middlewares.push((last.clone(), mdl.path.as_ref().cloned().unwrap_or(PATH_PLACEHOLDER.to_string())));
                     mdl_override = Some((chain_interface.clone(), last.clone()));
                 }
             }
@@ -152,7 +161,7 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
             get_or_create_inst(
                 *outer_inst_id,
                 &HashMap::new(),
-                None,
+                &mut used_comp_nodes,
                 outer_node,
                 &mut instance_vars,
                 &None,
@@ -164,7 +173,34 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
         wac_lines.push(export_line);
     }
 
-    wac_lines.join("\n\n")
+    // Create the wac command arguments!
+    let args = gen_wac_args(shim_comps, splits_path, composition, &used_comp_nodes, &used_middlewares);
+
+    (wac_lines.join("\n\n"), args)
+}
+
+fn gen_wac_args(shim_comps: Vec<usize>, splits_path: &str, graph: &CompositionGraph, used_comps: &HashMap<u32, String>, used_mdls: &Vec<(String, String)>) -> Vec<(String, String)> {
+    // List of (used_name, path)
+    let mut args = vec![];
+
+    // handle the used component parts
+    for (inst_id, name) in used_comps.iter() {
+        // we reserve component 0 for the root component, so add one here!
+        let component_num = graph.nodes[inst_id].component_num + 1;
+        let comp_offset = if shim_comps.contains(&(component_num as usize)) {
+            // this is likely a shim component
+            eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{} is a shim component, defaulting to split{} instead in the generated wac command!\n\
+                                                     \tIf this assumption is incorrect, modify the generated wac command.", component_num, component_num - 1).yellow());
+            1
+        } else { 0 };
+        let comp_path = gen_split_path(splits_path, (component_num - comp_offset) as usize);
+        args.push((name.clone(), comp_path));
+    }
+
+    // handle the used middlewares
+    args.extend(used_mdls.clone());
+
+    args
 }
 
 fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
@@ -241,7 +277,7 @@ fn apply_rule_before(rule: &SpliceRule, chain: &mut Chain, composition: &Composi
 }
 
 fn add_to_inject_plan(
-    to_inject: &[String],
+    to_inject: &[Injection],
     chain_idx: usize,
     new_aliases: &[(u32, Option<String>)],
     aliases: &mut HashMap<u32, Option<String>>,
@@ -265,7 +301,7 @@ fn add_to_inject_plan(
 fn get_or_create_inst(
     inst_id: u32,
     aliases: &HashMap<u32, Option<String>>,
-    injection: Option<&IndexSet<String>>,
+    used_comp_nodes: &mut HashMap<u32, String>,
     node: &ComponentNode,
     instance_vars: &mut HashMap<u32, String>,
     with_override: &Option<(String, String)>,
@@ -287,6 +323,7 @@ fn get_or_create_inst(
     } else {
         get_name(node).to_string()
     };
+    used_comp_nodes.insert(inst_id, pkg.clone());
     let node_var = instance_vars
         .entry(inst_id)
         .or_insert_with(|| pkg.clone())
@@ -339,7 +376,7 @@ fn get_name(node: &ComponentNode) -> &str {
     node.display_label()
 }
 
-fn reverse_set(set: &IndexSet<String>) -> Vec<String> {
+fn reverse_set(set: &IndexSet<Injection>) -> Vec<Injection> {
     let mut res = vec![];
     for item in set.iter() {
         res.insert(0, item.clone());

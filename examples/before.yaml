@@ -6,5 +6,5 @@ rules:
       provider:
         name: srv-b
     inject:
-      - middleware-a
-      - middleware-b
+      - name: middleware-a
+      - name: middleware-b

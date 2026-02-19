@@ -2,7 +2,9 @@ mod parse;
 #[cfg(test)]
 mod tests;
 mod wac;
+mod split;
 
+use crate::wac::INST_PREFIX;
 use std::fs;
 use std::path::PathBuf;
 
@@ -11,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cviz::model::CompositionGraph;
 use cviz::parse::component::parse_component;
-use cviz::parse::json;
+use crate::split::split_out_composition;
 
 #[derive(Parser, Debug)]
 #[command(name = "splicer")]
@@ -31,17 +33,21 @@ Full format documentation:
 https://github.com/ejrgilbert/component-interposition/blob/main/splice-config.md
 "#)]
 struct Args {
-    /// Path to the composition graph, either provided as JSON or the Wasm component binary.
-    #[arg(value_name = "COMP")]
-    composition: PathBuf,
+    /// Path to the Wasm component binary.
+    #[arg(value_name = "COMP_WASM")]
+    wasm: PathBuf,
 
     /// Path to the splice configuration in YAML format.
     #[arg(value_name = "SPLICE_CFG")]
     splice_cfg_file: PathBuf,
 
-    /// Output file (stdout if not specified)
+    /// Output destination for the generated wac (flushed to output.wac if not specified)
     #[arg(short, long)]
-    output: Option<PathBuf>,
+    output_wac: Option<PathBuf>,
+
+    /// Output destination for the split out subcomponents of the Wasm component binary.
+    #[arg(short, long)]
+    dir_splits: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -49,44 +55,49 @@ fn main() -> Result<()> {
     let graph = get_graph(&args)?;
     let cfg = get_cfg(&args)?;
 
-    let wac = wac::generate_wac(&graph, &cfg);
-    if let Some(output_path) = args.output {
-        fs::write(&output_path, wac)
-            .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
-        eprintln!("Generated `wac` written to: {}", output_path.display());
+    let (splits_path, shim_comps) = gen_splits(&args)?;
+    let (wac, cmd_args) = wac::generate_wac(shim_comps, &splits_path, &graph, &cfg);
+
+    let output_path = if let Some(output_path) = args.output_wac {
+        output_path
     } else {
-        println!("\n{wac}");
-    }
+        PathBuf::from("output.wac")
+    };
+
+    fs::write(&output_path, wac)
+        .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
+    eprintln!("Generated `wac` written to: {}\n", output_path.display());
+
+
+    let wac_cmd = gen_wac_cmd(output_path.into_os_string().to_str().unwrap(), cmd_args)?;
+    println!("{wac_cmd}");
 
     Ok(())
 }
 
+fn gen_splits(args: &Args) -> Result<(String, Vec<usize>)> {
+    split_out_composition(&args.wasm, &args.dir_splits)
+}
+
+fn gen_wac_cmd(wac_path: &str, cmd_args: Vec<(String, String)>) -> Result<String> {
+    let mut cmd = format!("wac compose {wac_path} ");
+
+    for (srv_name, srv_path) in cmd_args {
+        cmd.push_str(&format!("\\\n    --dep {INST_PREFIX}:{srv_name}=\"{srv_path}\" "));
+    }
+
+    Ok(cmd)
+}
+
 fn get_graph(args: &Args) -> Result<CompositionGraph> {
     // Parse the graph
-    let extension = args.composition.extension().unwrap().to_str();
-    if extension == Some("wasm") {
-        let bytes = fs::read(&args.composition)?;
-        parse_component(&bytes).with_context(|| {
-            format!(
-                "Failed to parse composition graph: {}",
-                args.composition.display()
-            )
-        })
-    } else if extension == Some("json") {
-        let file = fs::File::open(&args.composition)
-            .with_context(|| format!("Failed to read file: {}", args.composition.display()))?;
-        json::parse_json(&file).with_context(|| {
-            format!(
-                "Failed to parse composition graph: {}",
-                args.composition.display()
-            )
-        })
-    } else {
-        panic!(
-            "Input file must either be a JSON or a WASM file, provided: {}",
-            args.composition.display()
-        );
-    }
+    let bytes = fs::read(&args.wasm)?;
+    parse_component(&bytes).with_context(|| {
+        format!(
+            "Failed to parse composition graph from Wasm component: {}",
+            args.wasm.display()
+        )
+    })
 }
 
 fn get_cfg(args: &Args) -> Result<Vec<SpliceRule>> {

@@ -4,14 +4,14 @@ rules:
   - before:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
     inject:
-      - middleware-a
+      - name: middleware-a
   - before:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
       provider:
         name: srv-b
     inject:
-      - middleware-b
-      - middleware-c
+      - name: middleware-b
+      - name: middleware-c
   - between:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
       inner:
@@ -19,5 +19,5 @@ rules:
       outer:
         name: srv-b
     inject:
-      - middleware-d
-      - middleware-e
+      - name: middleware-d
+      - name: middleware-e

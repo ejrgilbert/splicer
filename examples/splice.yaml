@@ -8,5 +8,5 @@ rules:
       outer:
         name: srv
     inject:
-      - middleware-a
-      - middleware-b
+      - name: middleware-a
+      - name: middleware-b

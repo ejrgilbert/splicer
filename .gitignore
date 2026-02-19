@@ -1,3 +1,7 @@
+# Generated
+splits/
+output.wac
+
 # Wasm things
 *.wat
 *.bk
