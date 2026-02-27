@@ -1,6 +1,6 @@
 [package]
 name = "splicer"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
 description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
