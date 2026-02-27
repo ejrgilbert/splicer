@@ -1,20 +1,35 @@
+use colored::Colorize;
 use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use wasmparser::collections::IndexSet;
 
-const INST_PREFIX: &str = "my";
-use crate::parse::config::SpliceRule;
+pub const INST_PREFIX: &str = "my";
+const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
+use crate::parse::config::{Injection, SpliceRule};
+use crate::split::gen_split_path;
+
+// chain_idx -> set of middlewares to inject AFTER
+type InjectPlan = HashMap<usize, IndexSet<Injection>>;
 
 struct Chain {
     interface: String,
     chain: Vec<u32>,
+    aliases: HashMap<u32, Option<String>>,
     // middlewares to inject after the specified index in the chain
-    inject_plan: HashMap<usize, IndexSet<String>>, // chain_idx -> set of middlewares to inject AFTER
+    inject_plan: InjectPlan,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
-pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> String {
+/// Returns:
+/// - The generated Wac
+/// - A list of the `wac compose` args: (service-name, service-path)
+pub fn generate_wac(
+    shim_comps: HashMap<usize, usize>,
+    splits_path: &str,
+    composition: &CompositionGraph,
+    rules: &[SpliceRule],
+) -> (String, Vec<(String, String)>) {
     let mut wac_lines = vec!["package example:composition;".to_string()];
 
     let mut handled_interfaces = HashSet::new();
@@ -59,6 +74,7 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
                 chains.push(Chain {
                     interface: interface_name.to_string(),
                     chain,
+                    aliases: HashMap::new(),
                     inject_plan: HashMap::new(),
                 });
             }
@@ -77,6 +93,7 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
         chains.push(Chain {
             interface: interface.clone(),
             chain: vec![*source_inst],
+            aliases: HashMap::new(),
             inject_plan: HashMap::new(),
         });
     }
@@ -86,7 +103,7 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
     for rule in rules.iter() {
         for chain in chains.iter_mut() {
             apply_rule_between(rule, chain, composition);
-            apply_rule_inject(rule, chain, composition);
+            apply_rule_before(rule, chain, composition);
         }
     }
 
@@ -95,29 +112,46 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
     let mut last;
     let mut instance_vars: HashMap<u32, String> = HashMap::new();
     let mut outer_instances: HashMap<u32, String> = HashMap::new(); // orig_inst_id -> generated_outer_var
+    let mut used_comp_nodes: HashMap<u32, String> = HashMap::new(); // inst_id -> used_name
+    let mut used_middlewares: Vec<(String, String)> = Vec::new(); // (used_name, path)
     for Chain {
         interface: chain_interface,
         chain,
+        aliases,
         inject_plan,
     } in chains.iter()
     {
         for (i, id) in chain.iter().enumerate() {
             let node = &composition.nodes[id];
-            let node_var =
-                get_or_create_inst(*id, node, &mut instance_vars, &mdl_override, &mut wac_lines);
+            let node_var = get_or_create_inst(
+                *id,
+                aliases,
+                &mut used_comp_nodes,
+                node,
+                &mut instance_vars,
+                &mdl_override,
+                &mut wac_lines,
+            );
 
             // set up what to wire in next
             last = node_var;
             mdl_override = Some((chain_interface.clone(), last.clone()));
 
-            // if the NEXT node has a middleware BEFORE it, inject here!
             if let Some(middlewares) = inject_plan.get(&(i + 1)) {
+                // if the NEXT node has a middleware BEFORE it, inject here!
                 // Reverse the list of items to inject (this keeps me from having to deal with this in the `wac` generation logic).
                 // Through doing this, the order of middlewares invoked will follow the order of declaration in the configuration.
                 let reversed_list = reverse_set(middlewares);
                 for mdl in reversed_list.iter() {
                     // instantiate
-                    last = create_mdl(&last, mdl, chain_interface, &mut wac_lines);
+                    last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
+                    used_middlewares.push((
+                        last.clone(),
+                        mdl.path
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or(PATH_PLACEHOLDER.to_string()),
+                    ));
                     mdl_override = Some((chain_interface.clone(), last.clone()));
                 }
             }
@@ -137,6 +171,8 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
             let outer_node = &composition.nodes[outer_inst_id];
             get_or_create_inst(
                 *outer_inst_id,
+                &HashMap::new(),
+                &mut used_comp_nodes,
                 outer_node,
                 &mut instance_vars,
                 &None,
@@ -148,7 +184,53 @@ pub fn generate_wac(composition: &CompositionGraph, rules: &[SpliceRule]) -> Str
         wac_lines.push(export_line);
     }
 
-    wac_lines.join("\n\n")
+    // Create the wac command arguments!
+    let args = gen_wac_args(
+        shim_comps,
+        splits_path,
+        composition,
+        &used_comp_nodes,
+        &used_middlewares,
+    );
+
+    (wac_lines.join("\n\n"), args)
+}
+
+fn gen_wac_args(
+    shim_comps: HashMap<usize, usize>,
+    splits_path: &str,
+    graph: &CompositionGraph,
+    used_comps: &HashMap<u32, String>,
+    used_mdls: &Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    // List of (used_name, path)
+    let mut args = vec![];
+
+    // handle the used component parts
+    for (inst_id, name) in used_comps.iter() {
+        // we reserve component 0 for the root component, so add one here!
+        let component_num = graph.nodes[inst_id].component_num + 1;
+
+        let split_to_use = resolve_shim(component_num as usize, &shim_comps);
+        let comp_path = gen_split_path(splits_path, split_to_use);
+        args.push((name.clone(), comp_path));
+    }
+
+    // handle the used middlewares
+    args.extend(used_mdls.to_owned());
+
+    args
+}
+fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) -> usize {
+    let original_num = component_num;
+    while let Some(&next) = shim_comps.get(&component_num) {
+        component_num = next;
+    }
+    if component_num != original_num {
+        eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{} is a shim component, defaulting to split{} instead in the generated wac command!\n\
+                                                     \tIf this assumption is incorrect, modify the generated wac command.", original_num, component_num).yellow());
+    }
+    component_num
 }
 
 fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
@@ -156,11 +238,14 @@ fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &Compos
         interface: chain_interface,
         chain,
         inject_plan,
+        aliases,
     } = chain;
     if let SpliceRule::Between {
         interface,
-        inner,
-        outer,
+        inner_name,
+        inner_alias,
+        outer_name,
+        outer_alias,
         inject,
     } = rule
     {
@@ -175,26 +260,30 @@ fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &Compos
             if interface != chain_interface {
                 continue;
             }
-            if *inner == inner_var && *outer == outer_var {
+            if *inner_name == inner_var && *outer_name == outer_var {
+                let new_aliases = vec![
+                    (inner_id, inner_alias.clone()),
+                    (outer_id, outer_alias.clone()),
+                ];
+
                 // matches! We want to inject BEFORE the outer's index
-                inject_plan
-                    .entry(i + 1)
-                    .or_insert(IndexSet::from_iter(inject.iter().cloned()))
-                    .extend(inject.iter().cloned());
+                add_to_inject_plan(inject, i + 1, &new_aliases, aliases, inject_plan);
             }
         }
     }
 }
 
-fn apply_rule_inject(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
+fn apply_rule_before(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
     let Chain {
         interface: chain_interface,
         chain,
         inject_plan,
+        aliases,
     } = chain;
     if let SpliceRule::Before {
         interface,
         provider_name,
+        provider_alias,
         inject,
     } = rule
     {
@@ -208,17 +297,41 @@ fn apply_rule_inject(rule: &SpliceRule, chain: &mut Chain, composition: &Composi
                     continue;
                 }
             }
+            let new_aliases = vec![(*id, provider_alias.clone())];
             // matches! We want to inject BEFORE the instance this guy's plugged into
-            inject_plan
-                .entry(i + 1)
-                .or_insert(IndexSet::from_iter(inject.iter().cloned()))
-                .extend(inject.iter().cloned());
+            add_to_inject_plan(inject, i + 1, &new_aliases, aliases, inject_plan);
         }
     }
 }
 
+fn add_to_inject_plan(
+    to_inject: &[Injection],
+    chain_idx: usize,
+    new_aliases: &[(u32, Option<String>)],
+    aliases: &mut HashMap<u32, Option<String>>,
+    inject_plan: &mut InjectPlan,
+) {
+    let middlewares = inject_plan
+        .entry(chain_idx)
+        .or_insert(IndexSet::from_iter(to_inject.iter().cloned()));
+
+    for (inst_id, new_alias) in new_aliases {
+        if let (Some(new_alias), Some(Some(configured_alias))) = (new_alias, aliases.get(inst_id)) {
+            if new_alias != configured_alias {
+                // panic! conflicting aliases!
+                todo!()
+            }
+        }
+        aliases.insert(*inst_id, new_alias.clone());
+    }
+
+    middlewares.extend(to_inject.iter().cloned());
+}
+
 fn get_or_create_inst(
     inst_id: u32,
+    aliases: &HashMap<u32, Option<String>>,
+    used_comp_nodes: &mut HashMap<u32, String>,
     node: &ComponentNode,
     instance_vars: &mut HashMap<u32, String>,
     with_override: &Option<(String, String)>,
@@ -227,11 +340,18 @@ fn get_or_create_inst(
     if let Some(var) = instance_vars.get(&inst_id) {
         return var.clone();
     }
+    let alias = aliases.get(&inst_id).cloned();
+
     // it hasn't been instantiated yet! do so here
-    let pkg = get_name(node);
+    let pkg = if let Some(Some(alias)) = alias {
+        alias.clone()
+    } else {
+        get_name(node).to_string()
+    };
+    used_comp_nodes.insert(inst_id, pkg.clone());
     let node_var = instance_vars
         .entry(inst_id)
-        .or_insert_with(|| to_var_name(pkg))
+        .or_insert_with(|| pkg.clone())
         .clone();
 
     let mut line = format!("let {node_var} = new {INST_PREFIX}:{pkg} {{");
@@ -268,24 +388,20 @@ fn create_mdl(
     interface: &String,
     wac_lines: &mut Vec<String>,
 ) -> String {
-    let mw_var = to_var_name(mw);
     let mw_line = format!(
-        "let {mw_var} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};"
+        "let {mw} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};"
     );
     wac_lines.push(mw_line);
 
-    mw_var
+    mw.clone()
 }
 
 /// Helper to get the instance name from a node
 fn get_name(node: &ComponentNode) -> &str {
     node.display_label()
 }
-fn to_var_name(name: &str) -> String {
-    name.replace("-", "_").to_string()
-}
 
-fn reverse_set(set: &IndexSet<String>) -> Vec<String> {
+fn reverse_set(set: &IndexSet<Injection>) -> Vec<Injection> {
     let mut res = vec![];
     for item in set.iter() {
         res.insert(0, item.clone());

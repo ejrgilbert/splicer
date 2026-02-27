@@ -59,6 +59,38 @@ fn multi_rule_on_all() -> anyhow::Result<()> {
     )
 }
 
+#[test]
+fn alias_in_before() -> anyhow::Result<()> {
+    run_all(
+        testcases::yaml_alias_in_before(),
+        testcases::yaml_alias_in_before_all_exp(),
+    )
+}
+
+#[test]
+fn alias_in_between_inner() -> anyhow::Result<()> {
+    run_all(
+        testcases::alias_in_between_inner(),
+        testcases::alias_in_between_inner_all_exp(),
+    )
+}
+
+#[test]
+fn alias_in_between_outer() -> anyhow::Result<()> {
+    run_all(
+        testcases::alias_in_between_outer(),
+        testcases::alias_in_between_outer_all_exp(),
+    )
+}
+
+#[test]
+fn alias_in_between_inner_and_outer() -> anyhow::Result<()> {
+    run_all(
+        testcases::alias_in_between_inner_and_outer(),
+        testcases::alias_in_between_inner_and_outer_all_exp(),
+    )
+}
+
 fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     let cfg = parse::config::parse_yaml(yaml)?;
 
@@ -69,7 +101,7 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     }
 
     for (name, graph) in graphs.iter() {
-        let wac = wac::generate_wac(graph, &cfg);
+        let (wac, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
@@ -98,6 +130,7 @@ mod testcases {
               "id": 12,
               "name": "srv-b",
               "component_index": 0,
+              "component_num": 0,
               "imports": [
                 {
                   "interface": "import-func-handle",
@@ -181,6 +214,7 @@ mod testcases {
               "id": 11,
               "name": "srv-b",
               "component_index": 0,
+              "component_num": 0,
               "imports": [
                 {
                   "interface": "wasi:http/types@0.3.0-rc-2026-01-06",
@@ -254,6 +288,7 @@ mod testcases {
               "id": 13,
               "name": "srv",
               "component_index": 1,
+              "component_num": 1,
               "imports": [
                 {
                   "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",
@@ -349,6 +384,7 @@ mod testcases {
               "id": 11,
               "name": "srv-c",
               "component_index": 0,
+              "component_num": 0,
               "imports": [
                 {
                   "interface": "wasi:http/types@0.3.0-rc-2026-01-06",
@@ -422,6 +458,7 @@ mod testcases {
               "id": 12,
               "name": "srv-b",
               "component_index": 1,
+              "component_num": 1,
               "imports": [
                 {
                   "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",
@@ -501,6 +538,7 @@ mod testcases {
               "id": 13,
               "name": "srv",
               "component_index": 2,
+              "component_num": 2,
               "imports": [
                 {
                   "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",
@@ -597,23 +635,23 @@ mod testcases {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-export srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     fn wac_short_identity() -> &'static str {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -624,17 +662,17 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         r#"
 package example:composition;
 
-let srv_c = new my:srv-c {
+let srv-c = new my:srv-c {
     ...
 };
 
-let srv_b = new my:srv-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_c["wasi:http/handler@0.3.0-rc-2026-01-06"],
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -656,49 +694,50 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         rules:
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              provider_name: srv-b
+              provider:
+                name: srv-b
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn yaml_before_on_one_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     fn yaml_before_on_short_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -709,25 +748,25 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         r#"
 package example:composition;
 
-let srv_c = new my:srv-c {
+let srv-c = new my:srv-c {
     ...
 };
 
-let srv_b = new my:srv-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_c["wasi:http/handler@0.3.0-rc-2026-01-06"],
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -750,104 +789,104 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
       - before:
           interface: wasi:http/handler@0.3.0-rc-2026-01-06
         inject:
-        - middleware-a
-        - middleware-b
+        - name: middleware-a
+        - name: middleware-b
     "#
     }
     fn yaml_before_noprov_on_one_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     fn yaml_before_noprov_on_short_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_b = new my:middleware-b {
+let middleware-b = new my:middleware-b {
     "wasi:http/handler@0.3.0-rc-2026-01-06": srv["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     fn yaml_before_noprov_on_long_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_c = new my:srv-c {
+let srv-c = new my:srv-c {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let srv_b = new my:srv-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_b = new my:middleware-b {
+let middleware-b = new my:middleware-b {
     "wasi:http/handler@0.3.0-rc-2026-01-06": srv["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     pub fn yaml_before_noprov_all_exp() -> HashMap<String, String> {
@@ -871,10 +910,11 @@ export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         rules:
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              provider_name: srv-c
+              provider:
+                name: srv-c
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn yaml_before_long_on_one_exp() -> &'static str {
@@ -887,25 +927,25 @@ export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         r#"
 package example:composition;
 
-let srv_c = new my:srv-c {
+let srv-c = new my:srv-c {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let srv_b = new my:srv-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -930,10 +970,11 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         rules:
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              provider_name: srv-NA
+              provider:
+                name: srv-NA
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     pub fn yaml_before_nomatch_all_exp() -> HashMap<String, String> {
@@ -947,11 +988,13 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         rules:
           - between:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              inner: srv-b
-              outer: srv
+              inner:
+                name: srv-b
+              outer:
+                name: srv
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     fn yaml_splice_on_one_exp() -> &'static str {
@@ -961,20 +1004,20 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -985,25 +1028,25 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         r#"
 package example:composition;
 
-let srv_c = new my:srv-c {
+let srv-c = new my:srv-c {
     ...
 };
 
-let srv_b = new my:srv-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_c["wasi:http/handler@0.3.0-rc-2026-01-06"],
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -1025,11 +1068,13 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         rules:
           - between:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              inner: srv-c
-              outer: srv-b
+              inner:
+                name: srv-c
+              outer:
+                name: srv-b
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
 
         "#
     }
@@ -1043,25 +1088,25 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         r#"
 package example:composition;
 
-let srv_c = new my:srv-c {
+let srv-c = new my:srv-c {
     ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let srv_b = new my:srv-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
@@ -1086,11 +1131,13 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
         rules:
           - between:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              inner: srv-NA
-              outer: srv
+              inner:
+                name: srv-NA
+              outer:
+                name: srv
             inject:
-            - middleware-a
-            - middleware-b
+            - name: middleware-a
+            - name: middleware-b
         "#
     }
     pub fn yaml_splice_nomatch_all_exp() -> HashMap<String, String> {
@@ -1104,124 +1151,127 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
             inject:
-            - middleware-a
+            - name: middleware-a
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              provider_name: srv-b
+              provider:
+                name: srv-b
             inject:
-            - middleware-b
-            - middleware-c
+            - name: middleware-b
+            - name: middleware-c
           - between:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
-              inner: srv-c
-              outer: srv-b
+              inner:
+                name: srv-c
+              outer:
+                name: srv-b
             inject:
-            - middleware-d
-            - middleware-e
+            - name: middleware-d
+            - name: middleware-e
         "#
     }
     fn yaml_multi_rule_on_one_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-let middleware_c = new my:middleware-c {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-c = new my:middleware-c {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     fn yaml_multi_rule_on_short_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_b = new my:srv-b {
+let srv-b = new my:srv-b {
     ...
 };
 
-let middleware_c = new my:middleware-c {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-c = new my:middleware-c {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_a = new my:middleware-a {
+let middleware-a = new my:middleware-a {
     "wasi:http/handler@0.3.0-rc-2026-01-06": srv["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     fn yaml_multi_rule_on_long_exp() -> &'static str {
         r#"
 package example:composition;
 
-let srv_c = new my:srv-c {
+let srv-c = new my:srv-c {
     ...
 };
 
-let middleware_e = new my:middleware-e {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-e = new my:middleware-e {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_d = new my:middleware-d {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_e["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-d = new my:middleware-d {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-e["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_d["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-d["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let srv_b = new my:srv-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_c = new my:middleware-c {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": srv_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-c = new my:middleware-c {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_b = new my:middleware-b {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-c["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-let middleware_a = new my:middleware-a {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
 let srv = new my:srv {
-    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
     ...
 };
 
-let middleware_a = new my:middleware-a {
+let middleware-a = new my:middleware-a {
     "wasi:http/handler@0.3.0-rc-2026-01-06": srv["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
 };
 
-export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
         "#
     }
     pub fn yaml_multi_rule_all_exp() -> HashMap<String, String> {
@@ -1232,6 +1282,378 @@ export middleware_a["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 yaml_multi_rule_on_short_exp().to_string(),
             ),
             (LONG.to_string(), yaml_multi_rule_on_long_exp().to_string()),
+        ])
+    }
+    pub fn yaml_alias_in_before() -> &'static str {
+        // before.yaml
+        r#"
+        version: 1
+
+        rules:
+          - before:
+              interface: wasi:http/handler@0.3.0-rc-2026-01-06
+              provider:
+                name: srv-b
+                alias: other-name
+            inject:
+            - name: middleware-a
+            - name: middleware-b
+        "#
+    }
+    fn yaml_alias_in_before_on_one_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let other-name = new my:other-name {
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": other-name["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+export middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    fn yaml_alias_in_before_on_short_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let other-name = new my:other-name {
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": other-name["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let srv = new my:srv {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    fn yaml_alias_in_before_on_long_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let srv-c = new my:srv-c {
+    ...
+};
+
+let other-name = new my:other-name {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": other-name["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let srv = new my:srv {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    pub fn yaml_alias_in_before_all_exp() -> HashMap<String, String> {
+        HashMap::from_iter(vec![
+            (
+                ONE.to_string(),
+                yaml_alias_in_before_on_one_exp().to_string(),
+            ),
+            (
+                SHORT.to_string(),
+                yaml_alias_in_before_on_short_exp().to_string(),
+            ),
+            (
+                LONG.to_string(),
+                yaml_alias_in_before_on_long_exp().to_string(),
+            ),
+        ])
+    }
+    pub fn alias_in_between_inner() -> &'static str {
+        r#"
+        version: 1
+
+        rules:
+          - between:
+              interface: wasi:http/handler@0.3.0-rc-2026-01-06
+              inner:
+                name: srv-b
+                alias: other-b
+              outer:
+                name: srv
+            inject:
+            - name: middleware-a
+            - name: middleware-b
+        "#
+    }
+    fn alias_in_between_inner_on_one_exp() -> &'static str {
+        wac_one_identity()
+    }
+    fn alias_in_between_inner_on_short_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let other-b = new my:other-b {
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": other-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let srv = new my:srv {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    fn alias_in_between_inner_on_long_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let srv-c = new my:srv-c {
+    ...
+};
+
+let other-b = new my:other-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": other-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let srv = new my:srv {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    pub fn alias_in_between_inner_all_exp() -> HashMap<String, String> {
+        HashMap::from_iter(vec![
+            (
+                ONE.to_string(),
+                alias_in_between_inner_on_one_exp().to_string(),
+            ),
+            (
+                SHORT.to_string(),
+                alias_in_between_inner_on_short_exp().to_string(),
+            ),
+            (
+                LONG.to_string(),
+                alias_in_between_inner_on_long_exp().to_string(),
+            ),
+        ])
+    }
+    pub fn alias_in_between_outer() -> &'static str {
+        r#"
+        version: 1
+
+        rules:
+          - between:
+              interface: wasi:http/handler@0.3.0-rc-2026-01-06
+              inner:
+                name: srv-b
+              outer:
+                name: srv
+                alias: other
+            inject:
+            - name: middleware-a
+            - name: middleware-b
+        "#
+    }
+    fn alias_in_between_outer_on_one_exp() -> &'static str {
+        wac_one_identity()
+    }
+    fn alias_in_between_outer_on_short_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let srv-b = new my:srv-b {
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let other = new my:other {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export other["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    fn alias_in_between_outer_on_long_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let srv-c = new my:srv-c {
+    ...
+};
+
+let srv-b = new my:srv-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let other = new my:other {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export other["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    pub fn alias_in_between_outer_all_exp() -> HashMap<String, String> {
+        HashMap::from_iter(vec![
+            (
+                ONE.to_string(),
+                alias_in_between_outer_on_one_exp().to_string(),
+            ),
+            (
+                SHORT.to_string(),
+                alias_in_between_outer_on_short_exp().to_string(),
+            ),
+            (
+                LONG.to_string(),
+                alias_in_between_outer_on_long_exp().to_string(),
+            ),
+        ])
+    }
+    pub fn alias_in_between_inner_and_outer() -> &'static str {
+        r#"
+        version: 1
+
+        rules:
+          - between:
+              interface: wasi:http/handler@0.3.0-rc-2026-01-06
+              inner:
+                name: srv-b
+                alias: other-b
+              outer:
+                name: srv
+                alias: other
+            inject:
+            - name: middleware-a
+            - name: middleware-b
+        "#
+    }
+    fn alias_in_between_inner_and_outer_on_one_exp() -> &'static str {
+        wac_one_identity()
+    }
+    fn alias_in_between_inner_and_outer_on_short_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let other-b = new my:other-b {
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": other-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let other = new my:other {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export other["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    fn alias_in_between_inner_and_outer_on_long_exp() -> &'static str {
+        r#"
+package example:composition;
+
+let srv-c = new my:srv-c {
+    ...
+};
+
+let other-b = new my:other-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": srv-c["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+let middleware-b = new my:middleware-b {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": other-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let middleware-a = new my:middleware-a {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-b["wasi:http/handler@0.3.0-rc-2026-01-06"], ...
+};
+
+let other = new my:other {
+    "wasi:http/handler@0.3.0-rc-2026-01-06": middleware-a["wasi:http/handler@0.3.0-rc-2026-01-06"],
+    ...
+};
+
+export other["wasi:http/handler@0.3.0-rc-2026-01-06"];
+        "#
+    }
+    pub fn alias_in_between_inner_and_outer_all_exp() -> HashMap<String, String> {
+        HashMap::from_iter(vec![
+            (
+                ONE.to_string(),
+                alias_in_between_inner_and_outer_on_one_exp().to_string(),
+            ),
+            (
+                SHORT.to_string(),
+                alias_in_between_inner_and_outer_on_short_exp().to_string(),
+            ),
+            (
+                LONG.to_string(),
+                alias_in_between_inner_and_outer_on_long_exp().to_string(),
+            ),
         ])
     }
 }

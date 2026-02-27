@@ -19,20 +19,44 @@ pub struct ConfigFile {
 pub struct YamlRule {
     before: Option<YamlStrategyBefore>,
     between: Option<YamlStrategyBetween>,
-    inject: Vec<String>,
+    inject: Vec<Injection>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct YamlStrategyBefore {
     interface: String,
-    provider_name: Option<String>,
+    provider: Option<YamlProviderOpt>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct YamlStrategyBetween {
-    inner: String,
-    outer: String,
+    inner: YamlProviderReq,
+    outer: YamlProviderReq,
     interface: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct YamlProviderReq {
+    // The name of the instance to match on in the component
+    // e.g.: `(instance $srv-b ...` --> "srv-b"
+    // OR  : `(instance $wasi:http/handler@0.3.0-rc-2026-01-06-shim-instance ...` --> "wasi:http/handler@0.3.0-rc-2026-01-06-shim-instance"
+    name: String,
+    // Alias the matched provider to this name in the generated wac
+    alias: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct YamlProviderOpt {
+    // The name of the instance to match on in the component
+    name: Option<String>,
+    // Alias the matched provider to this name in the generated wac
+    alias: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Injection {
+    pub name: String,
+    pub path: Option<String>,
 }
 
 /// --- Normalized rule type for Rust usage ---
@@ -41,13 +65,16 @@ pub enum SpliceRule {
     Before {
         interface: String,
         provider_name: Option<String>,
-        inject: Vec<String>,
+        provider_alias: Option<String>,
+        inject: Vec<Injection>,
     },
     Between {
         interface: String,
-        inner: String,
-        outer: String,
-        inject: Vec<String>,
+        inner_name: String,
+        inner_alias: Option<String>,
+        outer_name: String,
+        outer_alias: Option<String>,
+        inject: Vec<Injection>,
     },
 }
 
@@ -68,13 +95,22 @@ impl ConfigFile {
 
                     if let Some(YamlStrategyBefore {
                         interface,
-                        provider_name,
+                        provider,
                     }) = before
                     {
                         SpliceRule::Before {
                             interface: interface.clone(),
-                            provider_name: provider_name.clone(),
-                            inject: inject.clone(),
+                            provider_name: if let Some(prov) = provider {
+                                prov.name.clone()
+                            } else {
+                                None
+                            },
+                            provider_alias: if let Some(prov) = provider {
+                                prov.alias.clone()
+                            } else {
+                                None
+                            },
+                            inject: (*inject).clone(),
                         }
                     } else if let Some(YamlStrategyBetween {
                         interface,
@@ -84,9 +120,11 @@ impl ConfigFile {
                     {
                         SpliceRule::Between {
                             interface: interface.clone(),
-                            inner: inner.clone(),
-                            outer: outer.clone(),
-                            inject: inject.clone(),
+                            inner_name: inner.name.clone(),
+                            inner_alias: inner.alias.clone(),
+                            outer_name: outer.name.clone(),
+                            outer_alias: outer.alias.clone(),
+                            inject: (*inject).clone(),
                         }
                     } else {
                         panic!("insert error here (should have one or the other, not neither!)");

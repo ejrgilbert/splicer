@@ -4,5 +4,5 @@ rules:
   - before:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
     inject:
-      - middleware-a
-      - middleware-b
+      - name: middleware-a
+      - name: middleware-b

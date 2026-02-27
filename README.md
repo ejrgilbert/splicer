@@ -86,15 +86,18 @@ version: 1
 rules:
   - before:
       interface: wasi:http/handler
-      provider_name: auth
+      provider:
+        name: auth
     inject:
         - middleware-a
         - middleware-b
 
   - between:
       interface: wasi:http/handler
-      inner: auth
-      outer: handler
+      inner:
+        name: auth
+      outer:
+        name: handler
     inject:
         - tracing
 ```
@@ -116,10 +119,11 @@ Inject middleware for a given interface, optionally scoped to a specific provide
 ```yaml
 before:
   interface: wasi:http/handler
-  provider_name: auth
+  provider:
+    name: auth
 ```
 
-If `provider_name` is omitted, all providers of that interface are matched.
+If `provider.name` is omitted, all providers of that interface are matched.
 
 ---
 
@@ -130,8 +134,10 @@ Inject middleware between two specific components connected via an interface edg
 ```yaml
 between:
    interface: wasi:http/handler
-   inner: auth
-   outer: handler
+   inner:
+     name: auth
+   outer:
+     name: handler
 ```
 
 This replaces:
