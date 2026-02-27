@@ -1,19 +1,20 @@
 mod parse;
+mod split;
 #[cfg(test)]
 mod tests;
 mod wac;
-mod split;
 
 use crate::wac::INST_PREFIX;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
 use crate::parse::config::SpliceRule;
+use crate::split::split_out_composition;
 use anyhow::{Context, Result};
 use clap::Parser;
 use cviz::model::CompositionGraph;
 use cviz::parse::component::parse_component;
-use crate::split::split_out_composition;
 
 #[derive(Parser, Debug)]
 #[command(name = "splicer")]
@@ -68,14 +69,13 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
     eprintln!("Generated `wac` written to: {}\n", output_path.display());
 
-
     let wac_cmd = gen_wac_cmd(output_path.into_os_string().to_str().unwrap(), cmd_args)?;
     println!("{wac_cmd}");
 
     Ok(())
 }
 
-fn gen_splits(args: &Args) -> Result<(String, Vec<usize>)> {
+fn gen_splits(args: &Args) -> Result<(String, HashMap<usize, usize>)> {
     split_out_composition(&args.wasm, &args.dir_splits)
 }
 
@@ -83,7 +83,9 @@ fn gen_wac_cmd(wac_path: &str, cmd_args: Vec<(String, String)>) -> Result<String
     let mut cmd = format!("wac compose {wac_path} ");
 
     for (srv_name, srv_path) in cmd_args {
-        cmd.push_str(&format!("\\\n    --dep {INST_PREFIX}:{srv_name}=\"{srv_path}\" "));
+        cmd.push_str(&format!(
+            "\\\n    --dep {INST_PREFIX}:{srv_name}=\"{srv_path}\" "
+        ));
     }
 
     Ok(cmd)

@@ -127,7 +127,9 @@ dependencies = [
 
 [[package]]
 name = "cviz"
-version = "1.0.1"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8c65e06772a960d5fd04a9376413a68df3e88bca5f96b5efd55c04f69087541"
 dependencies = [
  "anyhow",
  "clap",
@@ -405,7 +407,6 @@ dependencies = [
  "clap",
  "colored",
  "cviz",
- "log",
  "serde",
  "serde_yaml",
  "wasmparser 0.245.1",
@@ -549,7 +550,9 @@ dependencies = [
 
 [[package]]
 name = "wirm"
-version = "2.2.0"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea681019c5271edafe465f08b5cce85246973369549c6a8402fd51a6343c301"
 dependencies = [
  "log",
  "serde_json",

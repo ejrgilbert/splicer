@@ -1,7 +1,7 @@
+use colored::Colorize;
 use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use colored::Colorize;
 use wasmparser::collections::IndexSet;
 
 pub const INST_PREFIX: &str = "my";
@@ -17,14 +17,19 @@ struct Chain {
     chain: Vec<u32>,
     aliases: HashMap<u32, Option<String>>,
     // middlewares to inject after the specified index in the chain
-    inject_plan: InjectPlan
+    inject_plan: InjectPlan,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
 /// Returns:
 /// - The generated Wac
 /// - A list of the `wac compose` args: (service-name, service-path)
-pub fn generate_wac(shim_comps: Vec<usize>, splits_path: &str, composition: &CompositionGraph, rules: &[SpliceRule]) -> (String, Vec<(String, String)>) {
+pub fn generate_wac(
+    shim_comps: HashMap<usize, usize>,
+    splits_path: &str,
+    composition: &CompositionGraph,
+    rules: &[SpliceRule],
+) -> (String, Vec<(String, String)>) {
     let mut wac_lines = vec!["package example:composition;".to_string()];
 
     let mut handled_interfaces = HashSet::new();
@@ -140,7 +145,13 @@ pub fn generate_wac(shim_comps: Vec<usize>, splits_path: &str, composition: &Com
                 for mdl in reversed_list.iter() {
                     // instantiate
                     last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
-                    used_middlewares.push((last.clone(), mdl.path.as_ref().cloned().unwrap_or(PATH_PLACEHOLDER.to_string())));
+                    used_middlewares.push((
+                        last.clone(),
+                        mdl.path
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or(PATH_PLACEHOLDER.to_string()),
+                    ));
                     mdl_override = Some((chain_interface.clone(), last.clone()));
                 }
             }
@@ -174,12 +185,24 @@ pub fn generate_wac(shim_comps: Vec<usize>, splits_path: &str, composition: &Com
     }
 
     // Create the wac command arguments!
-    let args = gen_wac_args(shim_comps, splits_path, composition, &used_comp_nodes, &used_middlewares);
+    let args = gen_wac_args(
+        shim_comps,
+        splits_path,
+        composition,
+        &used_comp_nodes,
+        &used_middlewares,
+    );
 
     (wac_lines.join("\n\n"), args)
 }
 
-fn gen_wac_args(shim_comps: Vec<usize>, splits_path: &str, graph: &CompositionGraph, used_comps: &HashMap<u32, String>, used_mdls: &Vec<(String, String)>) -> Vec<(String, String)> {
+fn gen_wac_args(
+    shim_comps: HashMap<usize, usize>,
+    splits_path: &str,
+    graph: &CompositionGraph,
+    used_comps: &HashMap<u32, String>,
+    used_mdls: &Vec<(String, String)>,
+) -> Vec<(String, String)> {
     // List of (used_name, path)
     let mut args = vec![];
 
@@ -187,13 +210,9 @@ fn gen_wac_args(shim_comps: Vec<usize>, splits_path: &str, graph: &CompositionGr
     for (inst_id, name) in used_comps.iter() {
         // we reserve component 0 for the root component, so add one here!
         let component_num = graph.nodes[inst_id].component_num + 1;
-        let comp_offset = if shim_comps.contains(&(component_num as usize)) {
-            // this is likely a shim component
-            eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{} is a shim component, defaulting to split{} instead in the generated wac command!\n\
-                                                     \tIf this assumption is incorrect, modify the generated wac command.", component_num, component_num - 1).yellow());
-            1
-        } else { 0 };
-        let comp_path = gen_split_path(splits_path, (component_num - comp_offset) as usize);
+
+        let split_to_use = resolve_shim(component_num as usize, &shim_comps);
+        let comp_path = gen_split_path(splits_path, split_to_use);
         args.push((name.clone(), comp_path));
     }
 
@@ -201,6 +220,17 @@ fn gen_wac_args(shim_comps: Vec<usize>, splits_path: &str, graph: &CompositionGr
     args.extend(used_mdls.to_owned());
 
     args
+}
+fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) -> usize {
+    let original_num = component_num;
+    while let Some(&next) = shim_comps.get(&component_num) {
+        component_num = next;
+    }
+    if component_num != original_num {
+        eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{} is a shim component, defaulting to split{} instead in the generated wac command!\n\
+                                                     \tIf this assumption is incorrect, modify the generated wac command.", original_num, component_num).yellow());
+    }
+    component_num
 }
 
 fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
@@ -233,7 +263,7 @@ fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &Compos
             if *inner_name == inner_var && *outer_name == outer_var {
                 let new_aliases = vec![
                     (inner_id, inner_alias.clone()),
-                    (outer_id, outer_alias.clone())
+                    (outer_id, outer_alias.clone()),
                 ];
 
                 // matches! We want to inject BEFORE the outer's index
@@ -267,9 +297,7 @@ fn apply_rule_before(rule: &SpliceRule, chain: &mut Chain, composition: &Composi
                     continue;
                 }
             }
-            let new_aliases = vec![
-                (*id, provider_alias.clone()),
-            ];
+            let new_aliases = vec![(*id, provider_alias.clone())];
             // matches! We want to inject BEFORE the instance this guy's plugged into
             add_to_inject_plan(inject, i + 1, &new_aliases, aliases, inject_plan);
         }
@@ -283,7 +311,9 @@ fn add_to_inject_plan(
     aliases: &mut HashMap<u32, Option<String>>,
     inject_plan: &mut InjectPlan,
 ) {
-    let middlewares = inject_plan.entry(chain_idx).or_insert(IndexSet::from_iter(to_inject.iter().cloned()));
+    let middlewares = inject_plan
+        .entry(chain_idx)
+        .or_insert(IndexSet::from_iter(to_inject.iter().cloned()));
 
     for (inst_id, new_alias) in new_aliases {
         if let (Some(new_alias), Some(Some(configured_alias))) = (new_alias, aliases.get(inst_id)) {

@@ -101,7 +101,7 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _) = wac::generate_wac(vec![], "placeholder", graph, &cfg);
+        let (wac, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
