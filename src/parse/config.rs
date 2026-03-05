@@ -132,5 +132,7 @@ impl ConfigFile {
                 },
             )
             .collect()
+        
+        // TODO: Ensure this is valid -- all `Injection` must have a unique name
     }
 }

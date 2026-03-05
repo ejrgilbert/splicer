@@ -3,6 +3,7 @@ mod split;
 #[cfg(test)]
 mod tests;
 mod wac;
+mod contract;
 
 use crate::wac::INST_PREFIX;
 use std::collections::HashMap;

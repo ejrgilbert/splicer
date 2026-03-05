@@ -1,8 +1,9 @@
 use colored::Colorize;
-use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
+use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use wasmparser::collections::IndexSet;
+use crate::contract::{validate_contract, ExportContract};
 
 pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
@@ -13,11 +14,17 @@ use crate::split::gen_split_path;
 type InjectPlan = HashMap<usize, IndexSet<Injection>>;
 
 struct Chain {
-    interface: String,
+    interface: Contract,
     chain: Vec<u32>,
     aliases: HashMap<u32, Option<String>>,
     // middlewares to inject after the specified index in the chain
     inject_plan: InjectPlan,
+}
+
+#[derive(Clone, Debug)]
+struct Contract {
+    name: String,
+    ty_fingerprint: Option<String>
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
@@ -46,6 +53,8 @@ pub fn generate_wac(
             interface_name,
             source_instance,
             is_host_import,
+            fingerprint,
+            ..
         } in node.imports.iter()
         {
             let mut chain = vec![*outer_node_id];
@@ -72,7 +81,10 @@ pub fn generate_wac(
             if !handled_interfaces.contains(interface_name) && chain.len() > 1 {
                 chain.reverse();
                 chains.push(Chain {
-                    interface: interface_name.to_string(),
+                    interface: Contract {
+                        name: interface_name.to_string(),
+                        ty_fingerprint: fingerprint.clone()
+                    },
                     chain,
                     aliases: HashMap::new(),
                     inject_plan: HashMap::new(),
@@ -83,7 +95,9 @@ pub fn generate_wac(
     }
 
     // handle standalone exported interfaces!
-    for (interface, source_inst) in composition.component_exports.iter() {
+    for (interface, ExportInfo {
+        source_instance: source_inst, fingerprint, ..
+    }) in composition.component_exports.iter() {
         if handled_interfaces.contains(interface) {
             continue;
         }
@@ -91,19 +105,25 @@ pub fn generate_wac(
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
         chains.push(Chain {
-            interface: interface.clone(),
+            interface: Contract {
+                name: interface.to_string(),
+                ty_fingerprint: Some(fingerprint.clone())
+            },
             chain: vec![*source_inst],
             aliases: HashMap::new(),
             inject_plan: HashMap::new(),
         });
     }
 
+    // This is to allow for caching the export contract discover of middleware components.
+    let mut checked_middlewares = HashMap::new();
+
     // Apply the rules in order of their declaration in the configuration.
     // This enforces an ordering semantic for the rule application.
     for rule in rules.iter() {
         for chain in chains.iter_mut() {
-            apply_rule_between(rule, chain, composition);
-            apply_rule_before(rule, chain, composition);
+            apply_rule_between(rule, chain, composition, &mut checked_middlewares);
+            apply_rule_before(rule, chain, composition, &mut checked_middlewares);
         }
     }
 
@@ -164,7 +184,9 @@ pub fn generate_wac(
     }
 
     // Generate WAC to export the appropriate functions
-    for (export_name, outer_inst_id) in composition.component_exports.iter() {
+    for (export_name, ExportInfo {
+        source_instance: outer_inst_id, ..
+    }) in composition.component_exports.iter() {
         let node_var = if let Some(generated_outer) = outer_instances.get(outer_inst_id) {
             generated_outer.clone()
         } else {
@@ -233,9 +255,12 @@ fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) ->
     component_num
 }
 
-fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
+fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph, checked_middlewares: &mut HashMap<String, Vec<ExportContract>>) {
     let Chain {
-        interface: chain_interface,
+        interface: Contract {
+            name: chain_interface,
+            ty_fingerprint
+        },
         chain,
         inject_plan,
         aliases,
@@ -267,15 +292,18 @@ fn apply_rule_between(rule: &SpliceRule, chain: &mut Chain, composition: &Compos
                 ];
 
                 // matches! We want to inject BEFORE the outer's index
-                add_to_inject_plan(inject, i + 1, &new_aliases, aliases, inject_plan);
+                add_to_inject_plan(interface, inject, i + 1, &new_aliases, aliases, inject_plan, ty_fingerprint, checked_middlewares);
             }
         }
     }
 }
 
-fn apply_rule_before(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph) {
+fn apply_rule_before(rule: &SpliceRule, chain: &mut Chain, composition: &CompositionGraph, checked_middlewares: &mut HashMap<String, Vec<ExportContract>>) {
     let Chain {
-        interface: chain_interface,
+        interface: Contract {
+            name: chain_interface,
+            ty_fingerprint
+        },
         chain,
         inject_plan,
         aliases,
@@ -299,18 +327,24 @@ fn apply_rule_before(rule: &SpliceRule, chain: &mut Chain, composition: &Composi
             }
             let new_aliases = vec![(*id, provider_alias.clone())];
             // matches! We want to inject BEFORE the instance this guy's plugged into
-            add_to_inject_plan(inject, i + 1, &new_aliases, aliases, inject_plan);
+            add_to_inject_plan(&interface, inject, i + 1, &new_aliases, aliases, inject_plan, ty_fingerprint, checked_middlewares);
         }
     }
 }
 
 fn add_to_inject_plan(
+    interface_name: &str,
     to_inject: &[Injection],
     chain_idx: usize,
     new_aliases: &[(u32, Option<String>)],
     aliases: &mut HashMap<u32, Option<String>>,
     inject_plan: &mut InjectPlan,
+    contract_fingerprint: &Option<String>,
+    checked_middlewares: &mut HashMap<String, Vec<ExportContract>>
 ) {
+    // check to make sure that the import/export contract is upheld by this plan
+    validate_contract(to_inject, interface_name, contract_fingerprint, checked_middlewares);
+
     let middlewares = inject_plan
         .entry(chain_idx)
         .or_insert(IndexSet::from_iter(to_inject.iter().cloned()));
@@ -334,7 +368,7 @@ fn get_or_create_inst(
     used_comp_nodes: &mut HashMap<u32, String>,
     node: &ComponentNode,
     instance_vars: &mut HashMap<u32, String>,
-    with_override: &Option<(String, String)>,
+    with_override: &Option<(Contract, String)>,
     wac_lines: &mut Vec<String>,
 ) -> String {
     if let Some(var) = instance_vars.get(&inst_id) {
@@ -358,7 +392,10 @@ fn get_or_create_inst(
     for conn in &node.imports {
         if !conn.is_host_import {
             let src_id = conn.source_instance;
-            if let Some((override_interface, override_var)) = &with_override {
+            if let Some((Contract {
+                name: override_interface,
+                ..
+            }, override_var)) = &with_override {
                 let src_var = if conn.interface_name == *override_interface {
                     override_var.clone()
                 } else if let Some(src_var) = instance_vars.get(&src_id) {
@@ -385,11 +422,12 @@ fn get_or_create_inst(
 fn create_mdl(
     input_inst: &String,
     mw: &String,
-    interface: &String,
+    interface: &Contract,
     wac_lines: &mut Vec<String>,
 ) -> String {
     let mw_line = format!(
-        "let {mw} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};"
+        "let {mw} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};",
+        interface = interface.name,
     );
     wac_lines.push(mw_line);
 
