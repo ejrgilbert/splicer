@@ -163,7 +163,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "wirm",
+ "wirm 4.0.0-rc2",
 ]
 
 [[package]]
@@ -475,7 +475,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "wasmparser 0.245.1",
- "wirm",
+ "wirm 3.0.0",
 ]
 
 [[package]]
@@ -630,6 +630,17 @@ name = "wirm"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea681019c5271edafe465f08b5cce85246973369549c6a8402fd51a6343c301"
+dependencies = [
+ "log",
+ "serde_json",
+ "tempfile",
+ "wasm-encoder",
+ "wasmparser 0.244.0",
+]
+
+[[package]]
+name = "wirm"
+version = "4.0.0-rc2"
 dependencies = [
  "log",
  "serde_json",

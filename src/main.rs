@@ -1,11 +1,13 @@
+mod contract;
 mod parse;
 mod split;
 #[cfg(test)]
 mod tests;
 mod wac;
-mod contract;
 
+use crate::contract::ContractResult;
 use crate::wac::INST_PREFIX;
+use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -58,7 +60,14 @@ fn main() -> Result<()> {
     let cfg = get_cfg(&args)?;
 
     let (splits_path, shim_comps) = gen_splits(&args)?;
-    let (wac, cmd_args) = wac::generate_wac(shim_comps, &splits_path, &graph, &cfg);
+    let (wac, cmd_args, diagnostics) = wac::generate_wac(shim_comps, &splits_path, &graph, &cfg);
+    for diag in diagnostics {
+        match diag {
+            ContractResult::Ok => {}
+            ContractResult::Warn(msg) => eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow()),
+            ContractResult::Error(msg) => panic!("ERROR: {msg}"),
+        }
+    }
 
     let output_path = if let Some(output_path) = args.output_wac {
         output_path

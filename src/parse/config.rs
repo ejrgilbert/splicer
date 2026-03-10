@@ -132,7 +132,170 @@ impl ConfigFile {
                 },
             )
             .collect()
-        
+
         // TODO: Ensure this is valid -- all `Injection` must have a unique name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_before_rule() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+      provider:
+        name: srv-b
+    inject:
+      - name: middleware-a
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        assert_eq!(rules.len(), 1);
+        let SpliceRule::Before {
+            interface,
+            provider_name,
+            provider_alias,
+            inject,
+        } = &rules[0]
+        else {
+            panic!("expected Before rule");
+        };
+        assert_eq!(interface, "wasi:http/handler@0.3.0");
+        assert_eq!(provider_name.as_deref(), Some("srv-b"));
+        assert!(provider_alias.is_none());
+        assert_eq!(inject.len(), 1);
+        assert_eq!(inject[0].name, "middleware-a");
+        assert!(inject[0].path.is_none());
+    }
+
+    #[test]
+    fn parse_before_rule_no_provider() {
+        // `provider` is optional — omitting it means inject before every instance.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - name: mw
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        assert_eq!(rules.len(), 1);
+        let SpliceRule::Before {
+            provider_name,
+            provider_alias,
+            ..
+        } = &rules[0]
+        else {
+            panic!("expected Before rule");
+        };
+        assert!(provider_name.is_none());
+        assert!(provider_alias.is_none());
+    }
+
+    #[test]
+    fn parse_between_rule() {
+        let yaml = r#"
+version: 1
+rules:
+  - between:
+      interface: wasi:http/handler@0.3.0
+      inner:
+        name: srv-b
+        alias: renamed-b
+      outer:
+        name: srv
+    inject:
+      - name: mw-a
+      - name: mw-b
+        path: /tmp/mw-b.wasm
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        assert_eq!(rules.len(), 1);
+        let SpliceRule::Between {
+            interface,
+            inner_name,
+            inner_alias,
+            outer_name,
+            outer_alias,
+            inject,
+        } = &rules[0]
+        else {
+            panic!("expected Between rule");
+        };
+        assert_eq!(interface, "wasi:http/handler@0.3.0");
+        assert_eq!(inner_name, "srv-b");
+        assert_eq!(inner_alias.as_deref(), Some("renamed-b"));
+        assert_eq!(outer_name, "srv");
+        assert!(outer_alias.is_none());
+        assert_eq!(inject.len(), 2);
+        assert_eq!(inject[1].path.as_deref(), Some("/tmp/mw-b.wasm"));
+    }
+
+    #[test]
+    fn parse_multi_rule() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - name: first
+  - between:
+      interface: wasi:http/handler@0.3.0
+      inner:
+        name: srv-b
+      outer:
+        name: srv
+    inject:
+      - name: second
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert!(matches!(rules[0], SpliceRule::Before { .. }));
+        assert!(matches!(rules[1], SpliceRule::Between { .. }));
+        // Order is preserved
+        let SpliceRule::Before { inject: inj0, .. } = &rules[0] else {
+            unreachable!()
+        };
+        let SpliceRule::Between { inject: inj1, .. } = &rules[1] else {
+            unreachable!()
+        };
+        assert_eq!(inj0[0].name, "first");
+        assert_eq!(inj1[0].name, "second");
+    }
+
+    #[test]
+    fn parse_missing_interface() {
+        // `interface` is required inside `before`; omitting it is a parse error.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      provider:
+        name: srv-b
+    inject:
+      - name: mw
+"#;
+        let result = parse_yaml(yaml);
+        assert!(
+            result.is_err(),
+            "expected parse error for missing interface field"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn parse_unknown_version() {
+        let yaml = r#"
+version: 99
+rules: []
+"#;
+        // version check is an assert_eq! inside parse_yaml — panics on mismatch
+        let _ = parse_yaml(yaml);
     }
 }
