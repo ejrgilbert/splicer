@@ -32,6 +32,8 @@ Instead of manually restructuring component wiring, you define:
 
 And `splicer` generates the modified composition plan.
 
+A demo of `splicer` can be run using: `cargo run --example demo`
+
 ---
 
 # Installation
