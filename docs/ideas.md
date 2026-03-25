@@ -1,13 +1,3 @@
-# Perform Type Checking #
-
-Make sure middleware is compatible with the types of the target interface. Output an error if it's not.
-
-This can be started once I have type information in the composition graph (waiting on the
-following PRs):
-- [ ] https://github.com/composablesys/wirm/pull/307
-- [ ] https://github.com/composablesys/wirm/pull/309
-- [ ] https://github.com/cosmonic-labs/cviz/pull/9
-
 # Generate Proxy Component #
 
 Proxy component adapters for ease of middleware injection.

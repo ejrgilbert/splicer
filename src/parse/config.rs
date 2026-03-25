@@ -1,11 +1,11 @@
+use anyhow::bail;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 pub fn parse_yaml(yaml_str: &str) -> anyhow::Result<Vec<SpliceRule>> {
     let config: ConfigFile = serde_yaml::from_str(yaml_str)?;
-
-    // i'm only able to parse this config version!
-    assert_eq!(config.version, 1);
-    Ok(config.to_splice_rules())
+    config.validate()?;
+    Ok(config.into_splice_rules())
 }
 
 /// --- YAML config structures ---
@@ -79,38 +79,136 @@ pub enum SpliceRule {
 }
 
 impl ConfigFile {
-    /// Convert YAML parsed rules into normalized [SpliceRule]
-    pub fn to_splice_rules(&self) -> Vec<SpliceRule> {
+    /// Validate the parsed configuration, returning a descriptive error for any problem.
+    ///
+    /// Checks (in order):
+    /// 1. Supported version number.
+    /// 2. Each rule specifies exactly one strategy (`before` XOR `between`).
+    /// 3. Each rule's `inject` list is non-empty.
+    /// 4. Each injection name is non-empty.
+    /// 5. Each injection `path`, when present, is non-empty.
+    /// 6. Interface names are non-empty.
+    /// 7. `before` provider `name`, when present, is non-empty.
+    /// 8. `between` `inner` and `outer` must name different instances.
+    /// 9. Injection names are globally unique across all rules (required because
+    ///    each name becomes a WAC instance identifier and `--dep` argument key).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.version != 1 {
+            bail!(
+                "unsupported config version {}: only version 1 is supported",
+                self.version
+            );
+        }
+
+        // name → first rule index (1-based) for duplicate detection
+        let mut seen_names: HashMap<&str, usize> = HashMap::new();
+
+        for (i, rule) in self.rules.iter().enumerate() {
+            let rule_num = i + 1;
+
+            // Strategy must be exactly one of before/between.
+            match (&rule.before, &rule.between) {
+                (Some(_), Some(_)) => {
+                    bail!("rule {rule_num}: a rule may specify 'before' or 'between', not both")
+                }
+                (None, None) => {
+                    bail!("rule {rule_num}: a rule must specify either 'before' or 'between'")
+                }
+                _ => {}
+            }
+
+            // Interface name must be non-empty.
+            let interface = if let Some(b) = &rule.before {
+                &b.interface
+            } else if let Some(bw) = &rule.between {
+                &bw.interface
+            } else {
+                unreachable!()
+            };
+            if interface.is_empty() {
+                bail!("rule {rule_num}: 'interface' must not be empty");
+            }
+
+            // before-specific checks.
+            if let Some(before) = &rule.before {
+                if let Some(prov) = &before.provider {
+                    if prov.name.as_deref() == Some("") {
+                        bail!(
+                            "rule {rule_num}: provider 'name' must not be empty if specified \
+                             (omit the key to leave it unset)"
+                        );
+                    }
+                }
+            }
+
+            // between-specific checks.
+            if let Some(between) = &rule.between {
+                if between.inner.name == between.outer.name {
+                    bail!(
+                        "rule {rule_num} (between): 'inner' and 'outer' must name different \
+                         instances, but both are '{}'",
+                        between.inner.name
+                    );
+                }
+            }
+
+            // inject list must be non-empty.
+            if rule.inject.is_empty() {
+                bail!("rule {rule_num}: 'inject' list must contain at least one entry");
+            }
+
+            for (j, inj) in rule.inject.iter().enumerate() {
+                let inj_num = j + 1;
+
+                if inj.name.is_empty() {
+                    bail!("rule {rule_num}, injection {inj_num}: injection name must not be empty");
+                }
+
+                if inj.path.as_deref() == Some("") {
+                    bail!(
+                        "rule {rule_num}, injection '{}': 'path' must not be empty if specified \
+                         (omit the key to leave it unset)",
+                        inj.name
+                    );
+                }
+
+                // Global uniqueness: injection names are used as WAC identifiers.
+                if let Some(first_rule) = seen_names.get(inj.name.as_str()) {
+                    bail!(
+                        "injection name '{}' is used in rule {rule_num} but was already declared \
+                         in rule {first_rule}; each injection must have a globally unique name",
+                        inj.name
+                    );
+                }
+                seen_names.insert(&inj.name, rule_num);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Convert validated YAML rules into normalized [`SpliceRule`]s.
+    ///
+    /// Assumes [`ConfigFile::validate`] has already been called.
+    pub fn into_splice_rules(self) -> Vec<SpliceRule> {
         self.rules
-            .iter()
+            .into_iter()
             .map(
                 |YamlRule {
                      before,
                      between,
                      inject,
                  }| {
-                    if before.is_some() && between.is_some() {
-                        panic!("insert error here (should have one or the other, not BOTH!)");
-                    }
-
                     if let Some(YamlStrategyBefore {
                         interface,
                         provider,
                     }) = before
                     {
                         SpliceRule::Before {
-                            interface: interface.clone(),
-                            provider_name: if let Some(prov) = provider {
-                                prov.name.clone()
-                            } else {
-                                None
-                            },
-                            provider_alias: if let Some(prov) = provider {
-                                prov.alias.clone()
-                            } else {
-                                None
-                            },
-                            inject: (*inject).clone(),
+                            interface,
+                            provider_name: provider.as_ref().and_then(|p| p.name.clone()),
+                            provider_alias: provider.and_then(|p| p.alias),
+                            inject,
                         }
                     } else if let Some(YamlStrategyBetween {
                         interface,
@@ -119,21 +217,19 @@ impl ConfigFile {
                     }) = between
                     {
                         SpliceRule::Between {
-                            interface: interface.clone(),
-                            inner_name: inner.name.clone(),
-                            inner_alias: inner.alias.clone(),
-                            outer_name: outer.name.clone(),
-                            outer_alias: outer.alias.clone(),
-                            inject: (*inject).clone(),
+                            interface,
+                            inner_name: inner.name,
+                            inner_alias: inner.alias,
+                            outer_name: outer.name,
+                            outer_alias: outer.alias,
+                            inject,
                         }
                     } else {
-                        panic!("insert error here (should have one or the other, not neither!)");
+                        unreachable!("validate() guarantees exactly one strategy per rule")
                     }
                 },
             )
             .collect()
-
-        // TODO: Ensure this is valid -- all `Injection` must have a unique name
     }
 }
 
@@ -289,13 +385,192 @@ rules:
     }
 
     #[test]
-    #[should_panic]
     fn parse_unknown_version() {
         let yaml = r#"
 version: 99
 rules: []
 "#;
-        // version check is an assert_eq! inside parse_yaml — panics on mismatch
-        let _ = parse_yaml(yaml);
+        let err = parse_yaml(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported config version"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Validation error cases
+    // -----------------------------------------------------------------------
+
+    fn assert_err(yaml: &str, expected_fragment: &str) {
+        let err = parse_yaml(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains(expected_fragment),
+            "expected error containing {expected_fragment:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_both_before_and_between() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    between:
+      interface: wasi:http/handler
+      inner:
+        name: a
+      outer:
+        name: b
+    inject:
+      - name: mw
+"#,
+            "'before' or 'between', not both",
+        );
+    }
+
+    #[test]
+    fn validate_neither_before_nor_between() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - inject:
+      - name: mw
+"#,
+            "either 'before' or 'between'",
+        );
+    }
+
+    #[test]
+    fn validate_empty_inject_list() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject: []
+"#,
+            "'inject' list must contain at least one entry",
+        );
+    }
+
+    #[test]
+    fn validate_empty_injection_name() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - name: ""
+"#,
+            "injection name must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_empty_injection_path() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - name: mw
+        path: ""
+"#,
+            "'path' must not be empty if specified",
+        );
+    }
+
+    #[test]
+    fn validate_empty_interface_name() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: ""
+    inject:
+      - name: mw
+"#,
+            "'interface' must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_empty_before_provider_name() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+      provider:
+        name: ""
+    inject:
+      - name: mw
+"#,
+            "provider 'name' must not be empty if specified",
+        );
+    }
+
+    #[test]
+    fn validate_between_same_inner_outer() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - between:
+      interface: wasi:http/handler
+      inner:
+        name: srv
+      outer:
+        name: srv
+    inject:
+      - name: mw
+"#,
+            "'inner' and 'outer' must name different instances",
+        );
+    }
+
+    #[test]
+    fn validate_duplicate_injection_name_across_rules() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - name: mw-a
+  - before:
+      interface: wasi:logging/log
+    inject:
+      - name: mw-a
+"#,
+            "injection name 'mw-a' is used in rule 2 but was already declared in rule 1",
+        );
+    }
+
+    #[test]
+    fn validate_duplicate_injection_name_within_rule() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - name: mw-a
+      - name: mw-a
+"#,
+            "injection name 'mw-a' is used in rule 1 but was already declared in rule 1",
+        );
     }
 }

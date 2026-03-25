@@ -1,4 +1,5 @@
 use crate::parse::config::Injection;
+use anyhow::Context;
 use cviz::model::{compatible_fingerprints, ExportInfo};
 use cviz::parse::component::parse_component;
 use std::collections::{BTreeMap, HashMap};
@@ -31,9 +32,20 @@ pub fn validate_contract(
 ) -> Vec<ContractResult> {
     let mut results = vec![];
     for Injection { name, path } in to_inject.iter() {
-        let exports = checked_middlewares
-            .entry(name.to_string())
-            .or_insert_with(|| discover_middleware_exports(path));
+        if !checked_middlewares.contains_key(name.as_str()) {
+            match discover_middleware_exports(path) {
+                Ok(exports) => {
+                    checked_middlewares.insert(name.clone(), exports);
+                }
+                Err(err) => {
+                    results.push(ContractResult::Warn(format!(
+                        "Unable to load middleware '{name}': {err:#}"
+                    )));
+                    continue;
+                }
+            }
+        }
+        let exports = checked_middlewares.get(name.as_str()).unwrap();
 
         if let Some(ExportInfo { fingerprint, .. }) = exports.get(interface_name) {
             if !compatible_fingerprints(contract_fingerprint, fingerprint) {
@@ -54,15 +66,16 @@ pub fn validate_contract(
     results
 }
 
-fn discover_middleware_exports(wasm_path: &Option<String>) -> BTreeMap<String, ExportInfo> {
-    if let Some(path) = wasm_path {
-        let buff = fs::read(path).unwrap(); // todo: make this more elegant (handle the error)!
-        let graph = parse_component(&buff).expect("Unable to discover composition"); // todo: make this more elegant (handle the error!)
-
-        graph.component_exports
-    } else {
-        BTreeMap::default()
-    }
+fn discover_middleware_exports(
+    wasm_path: &Option<String>,
+) -> anyhow::Result<BTreeMap<String, ExportInfo>> {
+    let Some(path) = wasm_path else {
+        return Ok(BTreeMap::default());
+    };
+    let buff = fs::read(path).with_context(|| format!("failed to read '{path}'"))?;
+    let graph = parse_component(&buff)
+        .with_context(|| format!("failed to parse Wasm component '{path}'"))?;
+    Ok(graph.component_exports)
 }
 
 #[cfg(test)]
