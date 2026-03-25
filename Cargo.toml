@@ -16,6 +16,14 @@ doc = false
 name = "splicer"
 path = "src/main.rs"
 
+[lib]
+name = "splicer"
+path = "src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
 [dependencies]
 colored = "3.1.1"
 cviz = "2.0.0-rc1"
