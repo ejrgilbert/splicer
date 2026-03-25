@@ -1,4 +1,5 @@
 use crate::{parse, wac};
+use cviz::model::CompositionGraph;
 use cviz::parse::json;
 use std::collections::HashMap;
 
@@ -91,6 +92,287 @@ fn alias_in_between_inner_and_outer() -> anyhow::Result<()> {
     )
 }
 
+// --- Graph edge-case tests (priority 7 from test-plan.md) ---
+
+#[test]
+fn between_rule_on_http_does_not_affect_log_chain() -> anyhow::Result<()> {
+    // A `between` rule scoped to wasi:http/handler injects between http-provider and app.
+    // The wasi:logging/log chain (log-provider → app) must be untouched.
+    let yaml = r#"
+version: 1
+rules:
+  - between:
+      interface: wasi:http/handler@0.3.0-rc-2026-01-06
+      inner:
+        name: http-provider
+      outer:
+        name: app
+    inject:
+      - name: http-middleware
+"#;
+    let cfg = parse::config::parse_yaml(yaml)?;
+    let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
+    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+
+    // http-middleware is injected for the http chain
+    assert!(
+        wac.contains("let http-middleware = new my:http-middleware {"),
+        "expected http-middleware instantiation"
+    );
+    assert!(wac.contains(r#""wasi:http/handler@0.3.0-rc-2026-01-06": http-provider["wasi:http/handler@0.3.0-rc-2026-01-06"]"#),
+        "http-middleware should be wired from http-provider");
+    // log-provider is instantiated independently (not wrapped by any middleware)
+    assert!(
+        wac.contains("let log-provider = new my:log-provider {"),
+        "log-provider should be instantiated directly"
+    );
+    // no log-middleware or any wrapping of the log interface
+    assert!(
+        !wac.contains("log-middleware"),
+        "log chain must not have middleware injected"
+    );
+    Ok(())
+}
+
+#[test]
+fn before_on_http_does_not_affect_log_interface() -> anyhow::Result<()> {
+    // A `before` rule on wasi:http/handler injects http-middleware before http-provider.
+    // The wasi:logging/log chain must be untouched — log-provider is instantiated
+    // directly and the log interface is satisfied via WAC's `...` spread in app.
+    let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0-rc-2026-01-06
+      provider:
+        name: http-provider
+    inject:
+      - name: http-middleware
+"#;
+    let cfg = parse::config::parse_yaml(yaml)?;
+    let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
+    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+
+    // http-middleware inserted before http-provider
+    assert!(
+        wac.contains("let http-middleware = new my:http-middleware {"),
+        "expected http-middleware instantiation"
+    );
+    // app's explicit http wiring goes through http-middleware
+    assert!(wac.contains(r#""wasi:http/handler@0.3.0-rc-2026-01-06": http-middleware["wasi:http/handler@0.3.0-rc-2026-01-06"]"#),
+        "app should receive http through http-middleware");
+    // log-provider is instantiated independently — the log interface is satisfied
+    // via WAC's `...` spread (no explicit binding needed in the app block)
+    assert!(
+        wac.contains("let log-provider = new my:log-provider {"),
+        "log-provider should be instantiated directly"
+    );
+    // http-middleware must not appear in any log-related wiring
+    assert!(
+        !wac.contains(r#"wasi:logging/log@0.1.0": http-middleware"#),
+        "http-middleware must not be wired into the log interface"
+    );
+    Ok(())
+}
+
+// --- Non-http interface chain tests ---
+// All existing tests use wasi:http/handler.  These verify that rules dispatch
+// correctly on a completely different interface (wasi:logging/log).
+
+#[test]
+fn before_on_log_chain() -> anyhow::Result<()> {
+    let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:logging/log@0.1.0
+      provider:
+        name: log-provider
+    inject:
+      - name: log-middleware
+"#;
+    let cfg = parse::config::parse_yaml(yaml)?;
+    let graph = json::parse_json_str(testcases::json_log_short_chain())?;
+    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+
+    let expected = r#"
+package example:composition;
+
+let log-provider = new my:log-provider {
+    ...
+};
+
+let log-middleware = new my:log-middleware {
+    "wasi:logging/log@0.1.0": log-provider["wasi:logging/log@0.1.0"], ...
+};
+
+let app = new my:app {
+    "wasi:logging/log@0.1.0": log-middleware["wasi:logging/log@0.1.0"],
+    ...
+};
+
+export app["wasi:logging/log@0.1.0"];
+"#;
+    assert_eq!(wac.trim(), expected.trim(), "unexpected WAC output:\n{wac}");
+    Ok(())
+}
+
+#[test]
+fn between_on_log_chain() -> anyhow::Result<()> {
+    let yaml = r#"
+version: 1
+rules:
+  - between:
+      interface: wasi:logging/log@0.1.0
+      inner:
+        name: log-provider-inner
+      outer:
+        name: log-provider
+    inject:
+      - name: log-middleware
+"#;
+    let cfg = parse::config::parse_yaml(yaml)?;
+    let graph = json::parse_json_str(testcases::json_log_long_chain())?;
+    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+
+    let expected = r#"
+package example:composition;
+
+let log-provider-inner = new my:log-provider-inner {
+    ...
+};
+
+let log-middleware = new my:log-middleware {
+    "wasi:logging/log@0.1.0": log-provider-inner["wasi:logging/log@0.1.0"], ...
+};
+
+let log-provider = new my:log-provider {
+    "wasi:logging/log@0.1.0": log-middleware["wasi:logging/log@0.1.0"],
+    ...
+};
+
+let app = new my:app {
+    "wasi:logging/log@0.1.0": log-provider["wasi:logging/log@0.1.0"],
+    ...
+};
+
+export app["wasi:logging/log@0.1.0"];
+"#;
+    assert_eq!(wac.trim(), expected.trim(), "unexpected WAC output:\n{wac}");
+    Ok(())
+}
+
+#[test]
+fn http_rule_does_not_inject_into_log_chain() -> anyhow::Result<()> {
+    // A rule targeting wasi:http/handler must produce no effect on a pure log graph.
+    let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0-rc-2026-01-06
+    inject:
+      - name: http-middleware
+"#;
+    let cfg = parse::config::parse_yaml(yaml)?;
+    let graph = json::parse_json_str(testcases::json_log_short_chain())?;
+    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+
+    assert!(
+        !wac.contains("http-middleware"),
+        "http rule must not affect a log-only graph"
+    );
+    assert!(
+        wac.contains("let log-provider = new my:log-provider {"),
+        "log-provider should still be instantiated"
+    );
+    assert!(
+        wac.contains(r#"export app["wasi:logging/log@0.1.0"];"#),
+        "log export must still be present"
+    );
+    Ok(())
+}
+
+// --- Typed-graph tests (priority 4 from test-plan.md) ---
+// These use the same YAML configs and expected WAC outputs as the untyped
+// variants, but the parsed graphs are post-processed to carry a fake
+// fingerprint on the `wasi:http/handler` chain.  The middleware has no
+// path (path: None), so `validate_contract` emits a Warn and proceeds;
+// the generated WAC must be identical to the untyped result.
+
+#[test]
+fn before_on_all_typed() -> anyhow::Result<()> {
+    run_all_typed(testcases::yaml_before(), testcases::yaml_before_all_exp())
+}
+
+#[test]
+fn before_noprov_on_all_typed() -> anyhow::Result<()> {
+    run_all_typed(
+        testcases::yaml_before_noprov(),
+        testcases::yaml_before_noprov_all_exp(),
+    )
+}
+
+#[test]
+fn splice_on_all_typed() -> anyhow::Result<()> {
+    run_all_typed(testcases::yaml_splice(), testcases::yaml_splice_all_exp())
+}
+
+// --- P8: validate → generate integration test ---
+
+#[test]
+fn warn_is_non_blocking_and_wac_still_generated() -> anyhow::Result<()> {
+    // Typed graph + middleware with path: None.
+    // validate_contract produces one Warn per middleware (can't verify without a path),
+    // but the plan still proceeds and the WAC is emitted.
+    let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:logging/log@0.1.0
+      provider:
+        name: log-provider
+    inject:
+      - name: log-middleware
+      - name: log-middleware-2
+"#;
+    let cfg = parse::config::parse_yaml(yaml)?;
+    let mut graph = json::parse_json_str(testcases::json_log_short_chain())?;
+    add_chain_fingerprint(&mut graph, "wasi:logging/log@0.1.0", "fake-fp-xyz");
+
+    let (wac, _, diagnostics) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+
+    // WAC is still generated — the Warn is advisory only
+    assert!(
+        wac.contains("let log-middleware = new my:log-middleware {"),
+        "WAC must be generated even when contract validation warns"
+    );
+    assert!(
+        wac.contains("let log-middleware-2 = new my:log-middleware-2 {"),
+        "second middleware must also be injected"
+    );
+
+    // One Warn per middleware injection (2 middlewares, no paths → 2 Warns)
+    let warns: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| matches!(d, crate::contract::ContractResult::Warn(_)))
+        .collect();
+    assert_eq!(
+        warns.len(),
+        2,
+        "expected one Warn per middleware without a path, got: {diagnostics:?}"
+    );
+
+    // No errors or unexpected Ok results
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| matches!(d, crate::contract::ContractResult::Warn(_))),
+        "all diagnostics should be Warn, got: {diagnostics:?}"
+    );
+
+    Ok(())
+}
+
 fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     let cfg = parse::config::parse_yaml(yaml)?;
 
@@ -101,12 +383,56 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
+        let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
 
         assert_eq!(wac.trim(), exp_wac.trim(),
+            "Failed on test '{name}', for the following config:{yaml}\nGot the following result:{wac}"
+        );
+    }
+    Ok(())
+}
+
+/// Set a stable fake fingerprint on all non-host imports and exports whose
+/// interface name matches `interface_name`.  This simulates type-annotated
+/// graphs without needing real WASM parsing.
+fn add_chain_fingerprint(graph: &mut CompositionGraph, interface_name: &str, fingerprint: &str) {
+    for node in graph.nodes.values_mut() {
+        for conn in node.imports.iter_mut() {
+            if !conn.is_host_import && conn.interface_name == interface_name {
+                conn.fingerprint = Some(fingerprint.to_string());
+            }
+        }
+    }
+    if let Some(export) = graph.component_exports.get_mut(interface_name) {
+        export.fingerprint = Some(fingerprint.to_string());
+    }
+}
+
+fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
+    let cfg = parse::config::parse_yaml(yaml)?;
+    const IFACE: &str = "wasi:http/handler@0.3.0-rc-2026-01-06";
+    const FP: &str = "fake-fingerprint-abc123";
+
+    let mut graphs = HashMap::new();
+    let all_json = testcases::get_all_json();
+    for (name, json_str) in all_json {
+        let mut graph = json::parse_json_str(&json_str)?;
+        add_chain_fingerprint(&mut graph, IFACE, FP);
+        graphs.insert(name.clone(), graph);
+    }
+
+    for (name, graph) in graphs.iter() {
+        let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
+        let exp_wac = exp.get(name).unwrap_or_else(|| {
+            panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
+        });
+
+        assert_eq!(
+            wac.trim(),
+            exp_wac.trim(),
             "Failed on test '{name}', for the following config:{yaml}\nGot the following result:{wac}"
         );
     }
@@ -1655,5 +1981,155 @@ export other["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 alias_in_between_inner_and_outer_on_long_exp().to_string(),
             ),
         ])
+    }
+
+    // --- Edge-case fixtures (P7) ---
+
+    /// A two-node chain using `wasi:logging/log@0.1.0` instead of `wasi:http/handler`.
+    /// log-provider exports the log interface; app consumes it.
+    pub fn json_log_short_chain() -> &'static str {
+        r#"
+        {
+          "version": 1,
+          "nodes": [
+            {
+              "id": 11,
+              "name": "log-provider",
+              "component_index": 0,
+              "component_num": 0,
+              "imports": []
+            },
+            {
+              "id": 13,
+              "name": "app",
+              "component_index": 1,
+              "component_num": 1,
+              "imports": [
+                {
+                  "interface": "wasi:logging/log@0.1.0",
+                  "short": "log",
+                  "source_instance": 11,
+                  "is_host_import": false
+                }
+              ]
+            }
+          ],
+          "exports": [
+            {
+              "interface": "wasi:logging/log@0.1.0",
+              "source_instance": 13
+            }
+          ]
+        }
+        "#
+    }
+
+    /// A three-node chain using `wasi:logging/log@0.1.0`:
+    /// log-provider-inner → log-provider → app
+    pub fn json_log_long_chain() -> &'static str {
+        r#"
+        {
+          "version": 1,
+          "nodes": [
+            {
+              "id": 11,
+              "name": "log-provider-inner",
+              "component_index": 0,
+              "component_num": 0,
+              "imports": []
+            },
+            {
+              "id": 12,
+              "name": "log-provider",
+              "component_index": 1,
+              "component_num": 1,
+              "imports": [
+                {
+                  "interface": "wasi:logging/log@0.1.0",
+                  "short": "log",
+                  "source_instance": 11,
+                  "is_host_import": false
+                }
+              ]
+            },
+            {
+              "id": 13,
+              "name": "app",
+              "component_index": 2,
+              "component_num": 2,
+              "imports": [
+                {
+                  "interface": "wasi:logging/log@0.1.0",
+                  "short": "log",
+                  "source_instance": 12,
+                  "is_host_import": false
+                }
+              ]
+            }
+          ],
+          "exports": [
+            {
+              "interface": "wasi:logging/log@0.1.0",
+              "source_instance": 13
+            }
+          ]
+        }
+        "#
+    }
+
+    /// A single consumer (app) that imports two different interfaces from two
+    /// different providers.  Both exports are surfaced.
+    pub fn json_multi_interface_node() -> &'static str {
+        r#"
+        {
+          "version": 1,
+          "nodes": [
+            {
+              "id": 201,
+              "name": "http-provider",
+              "component_index": 0,
+              "component_num": 0,
+              "imports": []
+            },
+            {
+              "id": 202,
+              "name": "log-provider",
+              "component_index": 1,
+              "component_num": 1,
+              "imports": []
+            },
+            {
+              "id": 203,
+              "name": "app",
+              "component_index": 2,
+              "component_num": 2,
+              "imports": [
+                {
+                  "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",
+                  "short": "handler",
+                  "source_instance": 201,
+                  "is_host_import": false
+                },
+                {
+                  "interface": "wasi:logging/log@0.1.0",
+                  "short": "log",
+                  "source_instance": 202,
+                  "is_host_import": false
+                }
+              ]
+            }
+          ],
+          "exports": [
+            {
+              "interface": "wasi:http/handler@0.3.0-rc-2026-01-06",
+              "source_instance": 203
+            },
+            {
+              "interface": "wasi:logging/log@0.1.0",
+              "source_instance": 203
+            }
+          ]
+        }
+        "#
     }
 }

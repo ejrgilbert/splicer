@@ -1,10 +1,13 @@
+mod contract;
 mod parse;
 mod split;
 #[cfg(test)]
 mod tests;
 mod wac;
 
+use crate::contract::ContractResult;
 use crate::wac::INST_PREFIX;
+use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -49,6 +52,11 @@ struct Args {
     /// Output destination for the split out subcomponents of the Wasm component binary.
     #[arg(short, long)]
     dir_splits: Option<String>,
+
+    /// Demote type-incompatibility errors to warnings so injection proceeds even
+    /// when middleware type signatures cannot be verified.
+    #[arg(long, default_value_t = false)]
+    skip_type_check: bool,
 }
 
 fn main() -> Result<()> {
@@ -57,7 +65,24 @@ fn main() -> Result<()> {
     let cfg = get_cfg(&args)?;
 
     let (splits_path, shim_comps) = gen_splits(&args)?;
-    let (wac, cmd_args) = wac::generate_wac(shim_comps, &splits_path, &graph, &cfg);
+    let (wac, cmd_args, diagnostics) = wac::generate_wac(shim_comps, &splits_path, &graph, &cfg);
+    for diag in diagnostics {
+        match diag {
+            ContractResult::Ok => {}
+            ContractResult::Warn(msg) => eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow()),
+            ContractResult::Error(msg) => {
+                if args.skip_type_check {
+                    eprintln!(
+                        "{}: type check skipped — {}",
+                        "WARN".yellow().bold(),
+                        msg.yellow()
+                    );
+                } else {
+                    panic!("ERROR: {msg}");
+                }
+            }
+        }
+    }
 
     let output_path = if let Some(output_path) = args.output_wac {
         output_path
