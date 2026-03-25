@@ -15,8 +15,15 @@
 //!   Warn  — middleware has no path; type safety unconfirmed but injection proceeds
 //!   Ok    — fingerprints match; injection confirmed safe
 //!   Error — fingerprints differ; types are structurally incompatible
+//!
+//! ## Phase 3 — Full pipeline with real WAT
+//! Compiles WAT middleware sources from `demo/wat/`, writes them to temp files,
+//! and calls `validate_contract` via the real `discover_middleware_exports` path:
+//!   Ok    — compatible WAT middleware (same `log` signature as chain)
+//!   Error — incompatible WAT middleware (different `log` signature)
 
 use cviz::model::ExportInfo;
+use cviz::parse::component::parse_component;
 use cviz::parse::json::parse_json_str;
 use splicer::contract::{validate_contract, ContractResult};
 use splicer::parse::config::{parse_yaml, Injection};
@@ -189,6 +196,61 @@ pub fn scenario_2c_error_incompatible() -> Vec<ContractResult> {
     )
 }
 
+// ─── Phase 3 helpers ─────────────────────────────────────────────────────
+
+// Chain WAT used solely to derive the fingerprint for wasi:logging/log@0.1.0.
+// The interface exports a single `log(level: u32, message: string)` function.
+const CHAIN_WAT: &str = r#"(component
+    (import "wasi:logging/log@0.1.0" (instance $host
+        (export "log" (func (param "level" u32) (param "message" string)))
+    ))
+    (alias export $host "log" (func $f))
+    (instance $out (export "log" (func $f)))
+    (export "wasi:logging/log@0.1.0" (instance $out))
+)"#;
+
+/// Derive the fingerprint for `wasi:logging/log@0.1.0` from the chain WAT.
+fn chain_log_fingerprint() -> Option<String> {
+    let bytes = wat::parse_str(CHAIN_WAT).expect("compile chain WAT");
+    let graph = parse_component(&bytes).expect("parse chain component");
+    graph
+        .component_exports
+        .get(LOG_IFACE)
+        .and_then(|e| e.fingerprint.clone())
+}
+
+/// Compile `mw_wat`, write the WASM bytes to a temp file, then run
+/// `validate_contract` — exercising the real `discover_middleware_exports` path.
+fn run_type_check_full(mw_wat: &str, temp_name: &str) -> Vec<ContractResult> {
+    let chain_fp = chain_log_fingerprint();
+
+    let mw_bytes = wat::parse_str(mw_wat).expect("compile middleware WAT");
+    let tmp_path = std::env::temp_dir().join(temp_name);
+    std::fs::write(&tmp_path, &mw_bytes).expect("write temp wasm");
+
+    let inj = Injection {
+        name: "mw".to_string(),
+        path: Some(tmp_path.to_str().unwrap().to_string()),
+    };
+
+    let mut cache = HashMap::new();
+    validate_contract(&[inj], LOG_IFACE, &chain_fp, &mut cache)
+}
+
+// ─── Phase 3 scenario functions ───────────────────────────────────────────
+
+/// 3a: compatible WAT middleware (same signature as chain) → Ok.
+pub fn scenario_3a_ok_compatible_wat() -> Vec<ContractResult> {
+    let mw_wat = include_str!("../demo/wat/log-middleware-compatible.wat");
+    run_type_check_full(mw_wat, "splicer-demo-mw-compatible.wasm")
+}
+
+/// 3b: incompatible WAT middleware (different `log` signature) → Error.
+pub fn scenario_3b_error_incompatible_wat() -> Vec<ContractResult> {
+    let mw_wat = include_str!("../demo/wat/log-middleware-incompatible.wat");
+    run_type_check_full(mw_wat, "splicer-demo-mw-incompatible.wasm")
+}
+
 // ─── Printing helpers ─────────────────────────────────────────────────────
 
 fn header(title: &str) {
@@ -242,6 +304,22 @@ fn main() {
 
     subheader("2c · Error — middleware exports the interface with a DIFFERENT fingerprint");
     for r in scenario_2c_error_incompatible() {
+        show_contract_result(&r);
+    }
+
+    // ── Phase 3 ──────────────────────────────────────────────────────────
+    header("Phase 3 — Full Pipeline with Real WAT");
+    println!();
+    println!("  Interface : {LOG_IFACE}");
+    println!("  Chain WAT : log(level: u32, message: string)");
+
+    subheader("3a · Ok — compatible WAT middleware  (same log signature)");
+    for r in scenario_3a_ok_compatible_wat() {
+        show_contract_result(&r);
+    }
+
+    subheader("3b · Error — incompatible WAT middleware  (level: string vs u32)");
+    for r in scenario_3b_error_incompatible_wat() {
         show_contract_result(&r);
     }
 
@@ -334,6 +412,28 @@ fn test_2c_produces_error() {
     assert!(
         matches!(results[0], ContractResult::Error(_)),
         "expected Error, got {:?}",
+        results[0]
+    );
+}
+
+#[test]
+fn test_3a_compatible_wat_produces_ok() {
+    let results = scenario_3a_ok_compatible_wat();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0],
+        ContractResult::Ok,
+        "compatible WAT middleware should produce Ok"
+    );
+}
+
+#[test]
+fn test_3b_incompatible_wat_produces_error() {
+    let results = scenario_3b_error_incompatible_wat();
+    assert_eq!(results.len(), 1);
+    assert!(
+        matches!(results[0], ContractResult::Error(_)),
+        "incompatible WAT middleware should produce Error, got {:?}",
         results[0]
     );
 }
