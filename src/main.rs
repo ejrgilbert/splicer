@@ -52,6 +52,11 @@ struct Args {
     /// Output destination for the split out subcomponents of the Wasm component binary.
     #[arg(short, long)]
     dir_splits: Option<String>,
+
+    /// Demote type-incompatibility errors to warnings so injection proceeds even
+    /// when middleware type signatures cannot be verified.
+    #[arg(long, default_value_t = false)]
+    skip_type_check: bool,
 }
 
 fn main() -> Result<()> {
@@ -65,7 +70,17 @@ fn main() -> Result<()> {
         match diag {
             ContractResult::Ok => {}
             ContractResult::Warn(msg) => eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow()),
-            ContractResult::Error(msg) => panic!("ERROR: {msg}"),
+            ContractResult::Error(msg) => {
+                if args.skip_type_check {
+                    eprintln!(
+                        "{}: type check skipped — {}",
+                        "WARN".yellow().bold(),
+                        msg.yellow()
+                    );
+                } else {
+                    panic!("ERROR: {msg}");
+                }
+            }
         }
     }
 

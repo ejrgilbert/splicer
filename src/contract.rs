@@ -38,7 +38,7 @@ pub fn validate_contract(
         if let Some(ExportInfo { fingerprint, .. }) = exports.get(interface_name) {
             if !compatible_fingerprints(contract_fingerprint, fingerprint) {
                 results.push(ContractResult::Error(format!(
-                    "incompatible type signatures for middleware '{}' on interface '{}'",
+                    "incompatible type signatures for middleware '{}' on interface '{}'\n\t{name}:\t{fingerprint:?}\n\ttarget: {contract_fingerprint:?}",
                     name, interface_name
                 )));
             } else {
@@ -69,6 +69,11 @@ fn discover_middleware_exports(wasm_path: &Option<String>) -> BTreeMap<String, E
 mod tests {
     use super::*;
     use cviz::model::ExportInfo;
+
+    fn discover_exports_from_bytes(bytes: &[u8]) -> BTreeMap<String, ExportInfo> {
+        let graph = parse_component(bytes).expect("Unable to parse component");
+        graph.component_exports
+    }
 
     fn injection(name: &str) -> Injection {
         Injection {
@@ -207,6 +212,141 @@ mod tests {
         let results = validate_contract(&[injection("mw")], "wasi:http/handler", &None, &mut cache);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], ContractResult::Ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // WAT-based integration: discover_exports_from_bytes
+    // -----------------------------------------------------------------------
+
+    /// Middleware using the FromExports pattern produces a non-None fingerprint.
+    #[test]
+    fn discover_exports_from_from_exports_mw() {
+        let wat = r#"(component
+            (import "wasi:http/handler@0.3.0" (instance $host
+                (export "handle" (func (param "req" u32) (result u32)))
+            ))
+            (alias export $host "handle" (func $f))
+            (instance $out (export "handle" (func $f)))
+            (export "wasi:http/handler@0.3.0" (instance $out))
+        )"#;
+        let bytes = wat::parse_str(wat).expect("failed to parse WAT");
+        let exports = discover_exports_from_bytes(&bytes);
+
+        let export = exports
+            .get("wasi:http/handler@0.3.0")
+            .expect("expected export for wasi:http/handler@0.3.0");
+        assert!(
+            export.fingerprint.is_some(),
+            "expected fingerprint for FromExports middleware"
+        );
+    }
+
+    /// Middleware that directly re-exports an imported instance produces a
+    /// non-None fingerprint (RC-3 coverage).
+    #[test]
+    fn discover_exports_from_passthrough_mw() {
+        let wat = r#"(component
+            (import "wasi:http/handler@0.3.0" (instance $handler
+                (export "handle" (func (param "req" u32) (result u32)))
+            ))
+            (export "wasi:http/handler@0.3.0" (instance $handler))
+        )"#;
+        let bytes = wat::parse_str(wat).expect("failed to parse WAT");
+        let exports = discover_exports_from_bytes(&bytes);
+
+        let export = exports
+            .get("wasi:http/handler@0.3.0")
+            .expect("expected export for wasi:http/handler@0.3.0");
+        assert!(
+            export.fingerprint.is_some(),
+            "expected fingerprint for import-reexport middleware"
+        );
+    }
+
+    /// A compatible WAT middleware (same signature as chain) validates as Ok.
+    #[test]
+    fn ok_result_for_compatible_wat_middleware() {
+        // Chain component exports "handle" (param u32) -> u32
+        let chain_wat = r#"(component
+            (import "wasi:http/handler@0.3.0" (instance $host
+                (export "handle" (func (param "req" u32) (result u32)))
+            ))
+            (alias export $host "handle" (func $f))
+            (instance $out (export "handle" (func $f)))
+            (export "wasi:http/handler@0.3.0" (instance $out))
+        )"#;
+        // Middleware with the same signature
+        let mw_wat = r#"(component
+            (import "wasi:http/handler@0.3.0" (instance $handler
+                (export "handle" (func (param "req" u32) (result u32)))
+            ))
+            (export "wasi:http/handler@0.3.0" (instance $handler))
+        )"#;
+
+        let chain_bytes = wat::parse_str(chain_wat).expect("failed to parse chain WAT");
+        let mw_bytes = wat::parse_str(mw_wat).expect("failed to parse middleware WAT");
+
+        let chain_exports = discover_exports_from_bytes(&chain_bytes);
+        let chain_fp = chain_exports
+            .get("wasi:http/handler@0.3.0")
+            .and_then(|e| e.fingerprint.clone());
+
+        // Pre-populate cache with the middleware's discovered exports
+        let mw_exports = discover_exports_from_bytes(&mw_bytes);
+        let mut cache = HashMap::new();
+        cache.insert("mw".to_string(), mw_exports);
+
+        let inj = Injection {
+            name: "mw".to_string(),
+            path: None,
+        };
+        let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], ContractResult::Ok);
+    }
+
+    /// An incompatible WAT middleware (different signature) validates as Error.
+    #[test]
+    fn error_result_for_incompatible_wat_middleware() {
+        // Chain: (param u32) -> u32
+        let chain_wat = r#"(component
+            (import "wasi:http/handler@0.3.0" (instance $host
+                (export "handle" (func (param "req" u32) (result u32)))
+            ))
+            (alias export $host "handle" (func $f))
+            (instance $out (export "handle" (func $f)))
+            (export "wasi:http/handler@0.3.0" (instance $out))
+        )"#;
+        // Incompatible middleware: different param type
+        let mw_wat = r#"(component
+            (import "wasi:http/handler@0.3.0" (instance $handler
+                (export "handle" (func (param "req" string) (result u32)))
+            ))
+            (export "wasi:http/handler@0.3.0" (instance $handler))
+        )"#;
+
+        let chain_bytes = wat::parse_str(chain_wat).expect("failed to parse chain WAT");
+        let mw_bytes = wat::parse_str(mw_wat).expect("failed to parse middleware WAT");
+
+        let chain_exports = discover_exports_from_bytes(&chain_bytes);
+        let chain_fp = chain_exports
+            .get("wasi:http/handler@0.3.0")
+            .and_then(|e| e.fingerprint.clone());
+
+        let mw_exports = discover_exports_from_bytes(&mw_bytes);
+        let mut cache = HashMap::new();
+        cache.insert("mw".to_string(), mw_exports);
+
+        let inj = Injection {
+            name: "mw".to_string(),
+            path: None,
+        };
+        let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0], ContractResult::Error(_)),
+            "expected Error for incompatible middleware"
+        );
     }
 
     #[test]
