@@ -2,7 +2,8 @@ use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
 use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use wasmparser::collections::IndexSet;
 
 pub const INST_PREFIX: &str = "my";
@@ -32,13 +33,18 @@ struct Contract {
 /// - The generated Wac
 /// - A list of the `wac compose` args: (service-name, service-path)
 /// - Diagnostics from contract validation (one per middleware injection attempted)
+///
+/// `node_paths` is `Some` for the multi-component path; when present each node's
+/// original `.wasm` path is used directly instead of deriving a split path.
 pub fn generate_wac(
     shim_comps: HashMap<usize, usize>,
     splits_path: &str,
     composition: &CompositionGraph,
     rules: &[SpliceRule],
+    node_paths: Option<&HashMap<u32, PathBuf>>,
+    pkg_name: &str,
 ) -> (String, Vec<(String, String)>, Vec<ContractResult>) {
-    let mut wac_lines = vec!["package example:composition;".to_string()];
+    let mut wac_lines = vec![format!("package {pkg_name};")];
 
     let mut handled_interfaces = HashSet::new();
 
@@ -152,6 +158,57 @@ pub fn generate_wac(
     let mut outer_instances: HashMap<u32, String> = HashMap::new(); // orig_inst_id -> generated_outer_var
     let mut used_comp_nodes: HashMap<u32, String> = HashMap::new(); // inst_id -> used_name
     let mut used_middlewares: Vec<(String, String)> = Vec::new(); // (used_name, path)
+
+    // Pre-instantiation pass for fan-in topologies.
+    //
+    // A node that only ever appears at position 0 (innermost) across all chains is a
+    // pure provider — it doesn't consume any chained interface itself and is never the
+    // target of middleware injection.  We instantiate these eagerly in ascending node-ID
+    // order (which is topological order for synthetically-built graphs) so that when a
+    // fan-in consumer node is first encountered, ALL of its provider deps are already in
+    // `instance_vars` and can be wired up correctly in a single `let` statement.
+    //
+    // Nodes that appear at any position > 0 are skipped here; they will be instantiated
+    // during the normal per-chain pass below, where `with_override` / inject plans ensure
+    // correct wiring.
+    {
+        let mut node_positions: HashMap<u32, BTreeSet<usize>> = HashMap::new();
+        for chain in &chains {
+            for (pos, &id) in chain.chain.iter().enumerate() {
+                node_positions.entry(id).or_default().insert(pos);
+            }
+        }
+
+        let mut pure_providers: Vec<u32> = node_positions
+            .iter()
+            .filter(|(_, positions)| positions.iter().all(|&p| p == 0))
+            .map(|(&id, _)| id)
+            .collect();
+        pure_providers.sort(); // ascending = topological order for synthetic graphs
+
+        // Collect aliases assigned to pure-provider nodes by any rule so that nodes
+        // pre-instantiated here use the same name that the chain pass would assign.
+        let mut pre_pass_aliases: HashMap<u32, Option<String>> = HashMap::new();
+        for chain in &chains {
+            for (&id, alias) in &chain.aliases {
+                pre_pass_aliases.insert(id, alias.clone());
+            }
+        }
+
+        for node_id in pure_providers {
+            let node = &composition.nodes[&node_id];
+            get_or_create_inst(
+                node_id,
+                &pre_pass_aliases,
+                &mut used_comp_nodes,
+                node,
+                &mut instance_vars,
+                &None,
+                &mut wac_lines,
+            );
+        }
+    }
+
     for Chain {
         interface: chain_interface,
         chain,
@@ -236,6 +293,7 @@ pub fn generate_wac(
         composition,
         &used_comp_nodes,
         &used_middlewares,
+        node_paths,
     );
 
     (wac_lines.join("\n\n"), args, diagnostics)
@@ -247,17 +305,25 @@ fn gen_wac_args(
     graph: &CompositionGraph,
     used_comps: &HashMap<u32, String>,
     used_mdls: &Vec<(String, String)>,
+    node_paths: Option<&HashMap<u32, PathBuf>>,
 ) -> Vec<(String, String)> {
     // List of (used_name, path)
     let mut args = vec![];
 
-    // handle the used component parts
     for (inst_id, name) in used_comps.iter() {
-        // we reserve component 0 for the root component, so add one here!
-        let component_num = graph.nodes[inst_id].component_num + 1;
-
-        let split_to_use = resolve_shim(component_num as usize, &shim_comps);
-        let comp_path = gen_split_path(splits_path, split_to_use);
+        let comp_path = if let Some(paths) = node_paths {
+            // Multi-component mode: use the original wasm path directly.
+            paths
+                .get(inst_id)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| PATH_PLACEHOLDER.to_string())
+        } else {
+            // Single-component mode: derive path from the split directory.
+            // We reserve component 0 for the root component, so add one here.
+            let component_num = graph.nodes[inst_id].component_num + 1;
+            let split_to_use = resolve_shim(component_num as usize, &shim_comps);
+            gen_split_path(splits_path, split_to_use)
+        };
         args.push((name.clone(), comp_path));
     }
 

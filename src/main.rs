@@ -1,3 +1,4 @@
+mod compose;
 mod contract;
 mod parse;
 mod split;
@@ -15,63 +16,171 @@ use std::path::PathBuf;
 use crate::parse::config::SpliceRule;
 use crate::split::split_out_composition;
 use anyhow::{Context, Result};
-use clap::Parser;
-use cviz::model::CompositionGraph;
+use clap::{Parser, Subcommand};
 use cviz::parse::component::parse_component;
+
+const DEFAULT_PKG: &str = "example:composition";
 
 #[derive(Parser, Debug)]
 #[command(name = "splicer")]
 #[command(
     version,
-    about = "Plan how to splice middleware into a WebAssembly component."
+    about = "Plan and generate WebAssembly component compositions."
 )]
-#[command(after_long_help = r#"
-SPLICE CONFIG FORMAT (YAML)
-
-This splice configuration describes how middleware components
-should be inserted into a composition graph.
-
-Minimal example:
-
-Full format documentation:
-https://github.com/ejrgilbert/component-interposition/blob/main/splice-config.md
-"#)]
 struct Args {
-    /// Path to the Wasm component binary.
-    #[arg(value_name = "COMP_WASM")]
-    wasm: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Path to the splice configuration in YAML format.
-    #[arg(value_name = "SPLICE_CFG")]
-    splice_cfg_file: PathBuf,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Inject middleware into an existing composed Wasm component.
+    ///
+    /// Reads the splice configuration, splits the composed binary, and emits
+    /// a WAC file + the `wac compose` command needed to reassemble it with the
+    /// injected middleware.
+    Splice {
+        /// Path to the splice configuration in YAML format.
+        #[arg(value_name = "SPLICE_CFG")]
+        splice_cfg_file: PathBuf,
 
-    /// Output destination for the generated wac (flushed to output.wac if not specified)
-    #[arg(short, long)]
-    output_wac: Option<PathBuf>,
+        /// Pre-composed Wasm component binary to splice into.
+        #[arg(value_name = "COMP_WASM")]
+        comp_wasm: PathBuf,
 
-    /// Output destination for the split out subcomponents of the Wasm component binary.
-    #[arg(short, long)]
-    dir_splits: Option<String>,
+        /// Output destination for the generated WAC (defaults to output.wac).
+        #[arg(short, long)]
+        output_wac: Option<PathBuf>,
 
-    /// Demote type-incompatibility errors to warnings so injection proceeds even
-    /// when middleware type signatures cannot be verified.
-    #[arg(long, default_value_t = false)]
-    skip_type_check: bool,
+        /// Directory where split sub-components are written.
+        #[arg(short, long)]
+        dir_splits: Option<String>,
+
+        /// Package name written at the top of the generated WAC.
+        #[arg(long, default_value = DEFAULT_PKG)]
+        package: String,
+
+        /// Demote type-incompatibility errors to warnings so injection proceeds
+        /// even when middleware type signatures cannot be verified.
+        #[arg(long, default_value_t = false)]
+        skip_type_check: bool,
+    },
+
+    /// Synthesise a composition from N individual Wasm components.
+    ///
+    /// Matches each component's exports to the imports of the others,
+    /// topologically sorts them, and emits a WAC file + the `wac compose`
+    /// command needed to build the final composed binary.
+    ///
+    /// No splice configuration is required — the composition graph is
+    /// discovered automatically from the components' import/export surfaces.
+    Compose {
+        /// Two or more individual (non-composed) Wasm component binaries.
+        #[arg(value_name = "COMP_WASM", num_args = 2..)]
+        wasms: Vec<PathBuf>,
+
+        /// Output destination for the generated WAC (defaults to output.wac).
+        #[arg(short, long)]
+        output_wac: Option<PathBuf>,
+
+        /// Package name written at the top of the generated WAC.
+        #[arg(long, default_value = DEFAULT_PKG)]
+        package: String,
+    },
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    let graph = get_graph(&args)?;
-    let cfg = get_cfg(&args)?;
+    match Args::parse().command {
+        Command::Splice {
+            splice_cfg_file,
+            comp_wasm,
+            output_wac,
+            dir_splits,
+            package,
+            skip_type_check,
+        } => {
+            let yaml_str = fs::read_to_string(&splice_cfg_file)
+                .with_context(|| format!("Failed to read: {}", splice_cfg_file.display()))?;
+            let cfg = parse::config::parse_yaml(&yaml_str).with_context(|| {
+                format!(
+                    "Failed to parse splice configuration: {}",
+                    splice_cfg_file.display()
+                )
+            })?;
 
-    let (splits_path, shim_comps) = gen_splits(&args)?;
-    let (wac, cmd_args, diagnostics) = wac::generate_wac(shim_comps, &splits_path, &graph, &cfg);
+            let bytes = fs::read(&comp_wasm)?;
+            let graph = parse_component(&bytes).with_context(|| {
+                format!(
+                    "Failed to parse composition graph from: {}",
+                    comp_wasm.display()
+                )
+            })?;
+
+            let (splits_path, shim_comps) = split_out_composition(&comp_wasm, &dir_splits)?;
+
+            run_wac(
+                shim_comps,
+                &splits_path,
+                &graph,
+                &cfg,
+                None,
+                &package,
+                output_wac,
+                skip_type_check,
+            )
+        }
+
+        Command::Compose {
+            wasms,
+            output_wac,
+            package,
+        } => {
+            let components: Vec<(PathBuf, Vec<u8>)> = wasms
+                .iter()
+                .map(|p| {
+                    let bytes = fs::read(p).with_context(|| {
+                        format!("Failed to read Wasm component: {}", p.display())
+                    })?;
+                    Ok((p.clone(), bytes))
+                })
+                .collect::<Result<_>>()?;
+
+            let (graph, node_paths) = compose::build_graph_from_components(&components)?;
+
+            run_wac(
+                HashMap::new(),
+                "",
+                &graph,
+                &[],
+                Some(&node_paths),
+                &package,
+                output_wac,
+                false,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_wac(
+    shim_comps: HashMap<usize, usize>,
+    splits_path: &str,
+    graph: &cviz::model::CompositionGraph,
+    rules: &[SpliceRule],
+    node_paths: Option<&HashMap<u32, PathBuf>>,
+    pkg_name: &str,
+    output_wac: Option<PathBuf>,
+    skip_type_check: bool,
+) -> Result<()> {
+    let (wac, cmd_args, diagnostics) =
+        wac::generate_wac(shim_comps, splits_path, graph, rules, node_paths, pkg_name);
+
     for diag in diagnostics {
         match diag {
             ContractResult::Ok => {}
             ContractResult::Warn(msg) => eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow()),
             ContractResult::Error(msg) => {
-                if args.skip_type_check {
+                if skip_type_check {
                     eprintln!(
                         "{}: type check skipped — {}",
                         "WARN".yellow().bold(),
@@ -84,13 +193,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let output_path = if let Some(output_path) = args.output_wac {
-        output_path
-    } else {
-        PathBuf::from("output.wac")
-    };
-
-    fs::write(&output_path, wac)
+    let output_path = output_wac.unwrap_or_else(|| PathBuf::from("output.wac"));
+    fs::write(&output_path, &wac)
         .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
     eprintln!("Generated `wac` written to: {}\n", output_path.display());
 
@@ -100,43 +204,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn gen_splits(args: &Args) -> Result<(String, HashMap<usize, usize>)> {
-    split_out_composition(&args.wasm, &args.dir_splits)
-}
-
 fn gen_wac_cmd(wac_path: &str, cmd_args: Vec<(String, String)>) -> Result<String> {
     let mut cmd = format!("wac compose {wac_path} ");
-
     for (srv_name, srv_path) in cmd_args {
         cmd.push_str(&format!(
             "\\\n    --dep {INST_PREFIX}:{srv_name}=\"{srv_path}\" "
         ));
     }
-
     Ok(cmd)
-}
-
-fn get_graph(args: &Args) -> Result<CompositionGraph> {
-    // Parse the graph
-    let bytes = fs::read(&args.wasm)?;
-    parse_component(&bytes).with_context(|| {
-        format!(
-            "Failed to parse composition graph from Wasm component: {}",
-            args.wasm.display()
-        )
-    })
-}
-
-fn get_cfg(args: &Args) -> Result<Vec<SpliceRule>> {
-    // Read the splice config file
-    let yaml_str = fs::read_to_string(&args.splice_cfg_file)
-        .with_context(|| format!("Failed to read file: {}", args.splice_cfg_file.display()))?;
-
-    // Parse the config
-    parse::config::parse_yaml(&yaml_str).with_context(|| {
-        format!(
-            "Failed to parse splice configuration: {}",
-            args.splice_cfg_file.display()
-        )
-    })
 }

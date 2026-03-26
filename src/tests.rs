@@ -112,7 +112,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     // http-middleware is injected for the http chain
     assert!(
@@ -151,7 +158,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     // http-middleware inserted before http-provider
     assert!(
@@ -193,7 +207,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     let expected = r#"
 package example:composition;
@@ -233,7 +254,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_long_chain())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     let expected = r#"
 package example:composition;
@@ -275,7 +303,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     assert!(
         !wac.contains("http-middleware"),
@@ -339,7 +374,14 @@ rules:
     let mut graph = json::parse_json_str(testcases::json_log_short_chain())?;
     add_chain_fingerprint(&mut graph, "wasi:logging/log@0.1.0", "fake-fp-xyz");
 
-    let (wac, _, diagnostics) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, diagnostics) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     // WAC is still generated — the Warn is advisory only
     assert!(
@@ -383,7 +425,14 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
+        let (wac, _, _) = wac::generate_wac(
+            HashMap::new(),
+            "placeholder",
+            graph,
+            &cfg,
+            None,
+            "example:composition",
+        );
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
@@ -425,7 +474,14 @@ fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()>
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
+        let (wac, _, _) = wac::generate_wac(
+            HashMap::new(),
+            "placeholder",
+            graph,
+            &cfg,
+            None,
+            "example:composition",
+        );
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
