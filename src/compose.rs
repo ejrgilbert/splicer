@@ -558,6 +558,156 @@ mod tests {
         Ok(())
     }
 
+    // ── Roundtrip tests ───────────────────────────────────────────────────────
+    // Feed build_graph_from_components output into generate_wac, verifying the
+    // full compose → WAC pipeline end-to-end.
+
+    #[test]
+    fn roundtrip_simple_chain_wac() -> anyhow::Result<()> {
+        let comps = vec![
+            mk("provider-a.wasm", WAT_PROVIDER_A),
+            mk("consumer.wasm", WAT_SIMPLE_CONSUMER),
+        ];
+        let (graph, node_paths) = build_graph_from_components(&comps)?;
+        let (wac, cmd_args, diagnostics) = crate::wac::generate_wac(
+            HashMap::new(),
+            "",
+            &graph,
+            &[],
+            Some(&node_paths),
+            "test:pkg",
+        );
+
+        assert!(diagnostics.is_empty());
+        assert!(wac.contains("package test:pkg;"), "missing package line:\n{wac}");
+        assert!(
+            wac.contains("let provider-a = new my:provider-a {"),
+            "missing provider-a instantiation:\n{wac}"
+        );
+        assert!(
+            wac.contains("let consumer = new my:consumer {"),
+            "missing consumer instantiation:\n{wac}"
+        );
+        assert!(
+            wac.contains(r#""my:providers/a@0.1.0": provider-a["my:providers/a@0.1.0"]"#),
+            "consumer should wire provider-a for my:providers/a@0.1.0:\n{wac}"
+        );
+        assert!(
+            wac.contains(r#"export consumer["my:consumer/app@0.1.0"];"#),
+            "missing export line:\n{wac}"
+        );
+
+        assert_eq!(cmd_args.len(), 2, "expected 2 cmd_args entries");
+        let paths: Vec<&str> = cmd_args.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(paths.contains(&"provider-a.wasm"), "provider-a.wasm missing from cmd_args");
+        assert!(paths.contains(&"consumer.wasm"), "consumer.wasm missing from cmd_args");
+
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_fan_in_wac() -> anyhow::Result<()> {
+        let comps = vec![
+            mk("provider-a.wasm", WAT_PROVIDER_A),
+            mk("provider-b.wasm", WAT_PROVIDER_B),
+            mk("provider-c.wasm", WAT_PROVIDER_C),
+            mk("consumer.wasm", WAT_CONSUMER_FAN_IN),
+        ];
+        let (graph, node_paths) = build_graph_from_components(&comps)?;
+        let (wac, cmd_args, diagnostics) = crate::wac::generate_wac(
+            HashMap::new(),
+            "",
+            &graph,
+            &[],
+            Some(&node_paths),
+            "test:pkg",
+        );
+
+        assert!(diagnostics.is_empty());
+        for name in &["provider-a", "provider-b", "provider-c", "consumer"] {
+            assert!(
+                wac.contains(&format!("let {name} = new my:{name} {{")),
+                "missing {name} instantiation:\n{wac}"
+            );
+        }
+        for (iface, var) in &[
+            ("my:providers/a@0.1.0", "provider-a"),
+            ("my:providers/b@0.1.0", "provider-b"),
+            ("my:providers/c@0.1.0", "provider-c"),
+        ] {
+            assert!(
+                wac.contains(&format!(r#""{iface}": {var}["{iface}"]"#)),
+                "consumer should wire {iface} from {var}:\n{wac}"
+            );
+        }
+        assert!(
+            wac.contains(r#"export consumer["my:consumer/app@0.1.0"];"#),
+            "missing export line:\n{wac}"
+        );
+        assert_eq!(cmd_args.len(), 4, "expected 4 cmd_args entries");
+
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_internally_consumed_iface_not_exported() -> anyhow::Result<()> {
+        // my:providers/a@0.1.0 is consumed by consumer — must NOT appear as a
+        // WAC-level export statement.
+        let comps = vec![
+            mk("provider-a.wasm", WAT_PROVIDER_A),
+            mk("consumer.wasm", WAT_SIMPLE_CONSUMER),
+        ];
+        let (graph, node_paths) = build_graph_from_components(&comps)?;
+        let (wac, _, _) = crate::wac::generate_wac(
+            HashMap::new(),
+            "",
+            &graph,
+            &[],
+            Some(&node_paths),
+            "test:pkg",
+        );
+
+        assert!(
+            !wac.contains(r#"export provider-a["my:providers/a@0.1.0"];"#),
+            "internally-consumed interface must not be exported:\n{wac}"
+        );
+        assert!(
+            wac.contains(r#"export consumer["my:consumer/app@0.1.0"];"#),
+            "graph-level export must be present:\n{wac}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_cmd_args_contain_correct_paths() -> anyhow::Result<()> {
+        let comps = vec![
+            mk("path/to/provider-a.wasm", WAT_PROVIDER_A),
+            mk("path/to/consumer.wasm", WAT_SIMPLE_CONSUMER),
+        ];
+        let (graph, node_paths) = build_graph_from_components(&comps)?;
+        let (_, cmd_args, _) = crate::wac::generate_wac(
+            HashMap::new(),
+            "",
+            &graph,
+            &[],
+            Some(&node_paths),
+            "test:pkg",
+        );
+
+        let paths: HashSet<&str> = cmd_args.iter().map(|(_, p)| p.as_str()).collect();
+        assert!(
+            paths.contains("path/to/provider-a.wasm"),
+            "expected path/to/provider-a.wasm in cmd_args, got: {paths:?}"
+        );
+        assert!(
+            paths.contains("path/to/consumer.wasm"),
+            "expected path/to/consumer.wasm in cmd_args, got: {paths:?}"
+        );
+
+        Ok(())
+    }
+
     // ── Error-case tests ──────────────────────────────────────────────────────
 
     #[test]

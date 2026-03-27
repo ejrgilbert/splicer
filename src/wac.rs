@@ -114,6 +114,14 @@ pub fn generate_wac(
         if handled_interfaces.contains(interface) {
             continue;
         }
+        // Skip exports whose source is a shim node — shims are internal
+        // implementation details of the composed binary and must not appear
+        // as graph-level exports in a roundtrip splice.
+        // TODO: Keeping the below condition for non `splicer compose` round trips
+        //       breaks since i need shim node imp/exp in those cases!
+        // if is_shim_node(&composition.nodes[source_inst], &shim_comps) {
+        //     continue;
+        // }
 
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
@@ -134,20 +142,72 @@ pub fn generate_wac(
     // Apply the rules in order of their declaration in the configuration.
     // This enforces an ordering semantic for the rule application.
     let mut diagnostics: Vec<ContractResult> = vec![];
-    for rule in rules.iter() {
+    for (rule_idx, rule) in rules.iter().enumerate() {
+        let mut any_interface_matched = false;
+        let mut any_full_match = false;
         for chain in chains.iter_mut() {
-            diagnostics.extend(apply_rule_between(
-                rule,
-                chain,
-                composition,
-                &mut checked_middlewares,
-            ));
-            diagnostics.extend(apply_rule_before(
-                rule,
-                chain,
-                composition,
-                &mut checked_middlewares,
-            ));
+            let between = apply_rule_between(rule, chain, composition, &mut checked_middlewares);
+            let before = apply_rule_before(rule, chain, composition, &mut checked_middlewares);
+            any_interface_matched |= between.interface_matched | before.interface_matched;
+            any_full_match |= between.full_match | before.full_match;
+            diagnostics.extend(between.contract_results);
+            diagnostics.extend(before.contract_results);
+        }
+        if !any_full_match {
+            let iface = rule_interface(rule);
+            if !any_interface_matched {
+                // Interface name itself wasn't found — suggest close matches.
+                let available: Vec<&str> =
+                    chains.iter().map(|c| c.interface.name.as_str()).collect();
+                let iface_base = iface.split('@').next().unwrap_or(iface);
+                let possibly_intended: Vec<&str> = available
+                    .iter()
+                    .copied()
+                    .filter(|&avail| {
+                        let avail_base = avail.split('@').next().unwrap_or(avail);
+                        avail_base == iface_base
+                            || avail.starts_with(iface)
+                            || iface.starts_with(avail)
+                    })
+                    .collect();
+                let intended_msg = if possibly_intended.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\t  Possibly intended:    [{}]", possibly_intended.join(", "))
+                };
+                eprintln!(
+                    "{}: rule {} — interface '{}' was not found in the composition.\n\
+                     \t  Available interfaces: [{}]{}",
+                    "WARN".yellow().bold(),
+                    rule_idx + 1,
+                    iface,
+                    available.join(", "),
+                    intended_msg
+                );
+            } else {
+                // Interface matched but node names didn't — show available node names
+                // for chains on that interface so the user can fix their config.
+                let node_names: Vec<String> = chains
+                    .iter()
+                    .filter(|c| c.interface.name == iface)
+                    .flat_map(|c| {
+                        c.chain
+                            .iter()
+                            .map(|id| get_name(&composition.nodes[id]).to_string())
+                    })
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                eprintln!(
+                    "{}: rule {} — interface '{}' matched but no node names matched.\n\
+                     \t  Nodes on that interface: [{}]\n\
+                     \t  Check the 'name' fields in your config against these exactly.",
+                    "WARN".yellow().bold(),
+                    rule_idx + 1,
+                    iface,
+                    node_names.join(", ")
+                );
+            }
         }
     }
 
@@ -267,6 +327,14 @@ pub fn generate_wac(
         },
     ) in composition.component_exports.iter()
     {
+        // Skip exports sourced from shim nodes — same reason as the chain-building
+        // filter above: shims are internal and must not become graph-level exports.
+        // TODO: Keeping the below condition for non `splicer compose` round trips
+        //       breaks since i need shim node imp/exp in those cases!
+        // if is_shim_node(&composition.nodes[outer_inst_id], &shim_comps) {
+        //     continue;
+        // }
+
         let node_var = if let Some(generated_outer) = outer_instances.get(outer_inst_id) {
             generated_outer.clone()
         } else {
@@ -334,14 +402,27 @@ fn gen_wac_args(
 }
 fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) -> usize {
     let original_num = component_num;
-    while let Some(&next) = shim_comps.get(&component_num) {
-        component_num = next;
+    while is_shim_split_num(component_num, shim_comps) {
+        component_num = shim_comps[&component_num];
     }
     if component_num != original_num {
-        eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{} is a shim component, defaulting to split{} instead in the generated wac command!\n\
-                                                     \tIf this assumption is incorrect, modify the generated wac command.", original_num, component_num).yellow());
+        eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{original_num} is a shim component,\n\
+                                                     \tdefaulting to split{component_num} instead in the generated wac command!\n\
+                                                     \tIf this assumption is incorrect, modify the generated wac command.").yellow());
     }
     component_num
+}
+
+/// Return value from rule application functions.
+/// Separates "interface matched" from "full rule matched (interface + node names)",
+/// so callers can emit precise diagnostics.
+struct RuleApplyResult {
+    contract_results: Vec<ContractResult>,
+    /// True if the chain's interface matched the rule's interface field (regardless
+    /// of whether the node-name conditions were also satisfied).
+    interface_matched: bool,
+    /// True if the full rule matched (interface + all node-name conditions).
+    full_match: bool,
 }
 
 fn apply_rule_between(
@@ -349,8 +430,10 @@ fn apply_rule_between(
     chain: &mut Chain,
     composition: &CompositionGraph,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> Vec<ContractResult> {
-    let mut results = vec![];
+) -> RuleApplyResult {
+    let mut contract_results = vec![];
+    let mut interface_matched = false;
+    let mut full_match = false;
     let Chain {
         interface:
             Contract {
@@ -381,14 +464,14 @@ fn apply_rule_between(
             if interface != chain_interface {
                 continue;
             }
+            interface_matched = true;
             if *inner_name == inner_var && *outer_name == outer_var {
+                full_match = true;
                 let new_aliases = vec![
                     (inner_id, inner_alias.clone()),
                     (outer_id, outer_alias.clone()),
                 ];
-
-                // matches! We want to inject BEFORE the outer's index
-                results.extend(add_to_inject_plan(
+                contract_results.extend(add_to_inject_plan(
                     interface,
                     inject,
                     i + 1,
@@ -401,7 +484,7 @@ fn apply_rule_between(
             }
         }
     }
-    results
+    RuleApplyResult { contract_results, interface_matched, full_match }
 }
 
 fn apply_rule_before(
@@ -409,8 +492,10 @@ fn apply_rule_before(
     chain: &mut Chain,
     composition: &CompositionGraph,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> Vec<ContractResult> {
-    let mut results = vec![];
+) -> RuleApplyResult {
+    let mut contract_results = vec![];
+    let mut interface_matched = false;
+    let mut full_match = false;
     let Chain {
         interface:
             Contract {
@@ -432,15 +517,16 @@ fn apply_rule_before(
             if interface != chain_interface {
                 continue;
             }
+            interface_matched = true;
             let outer_node = &composition.nodes[id];
             if let Some(provider) = provider_name {
                 if get_name(outer_node) != *provider {
                     continue;
                 }
             }
+            full_match = true;
             let new_aliases = vec![(*id, provider_alias.clone())];
-            // matches! We want to inject BEFORE the instance this guy's plugged into
-            results.extend(add_to_inject_plan(
+            contract_results.extend(add_to_inject_plan(
                 interface,
                 inject,
                 i + 1,
@@ -452,7 +538,7 @@ fn apply_rule_before(
             ));
         }
     }
-    results
+    RuleApplyResult { contract_results, interface_matched, full_match }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -510,7 +596,7 @@ fn get_or_create_inst(
     let pkg = if let Some(Some(alias)) = alias {
         alias.clone()
     } else {
-        get_name(node).to_string()
+        sanitize_wac_id(get_name(node))
     };
     used_comp_nodes.insert(inst_id, pkg.clone());
     let node_var = instance_vars
@@ -568,9 +654,52 @@ fn create_mdl(
     mw.clone()
 }
 
+fn rule_interface(rule: &SpliceRule) -> &str {
+    match rule {
+        SpliceRule::Before { interface, .. } => interface,
+        SpliceRule::Between { interface, .. } => interface,
+    }
+}
+
 /// Helper to get the instance name from a node
 fn get_name(node: &ComponentNode) -> &str {
     node.display_label()
+}
+
+/// Returns true if the split-file number `split_num` corresponds to a shim.
+///
+/// `split_num` is `node.component_num + 1` — the key space used by the
+/// `shim_comps` map produced by `split_out_composition`.
+fn is_shim_split_num(split_num: usize, shim_comps: &HashMap<usize, usize>) -> bool {
+    shim_comps.contains_key(&split_num)
+}
+
+/// Returns true if `node` is a shim sub-component.
+///
+/// Shims are internal implementation details of a composed binary (e.g. adapter
+/// instances that provide WASI interfaces).  They are identified by the
+/// `shim_comps` map produced by `split_out_composition`: the map key is
+/// `component_num + 1` (the split-file number), so a node is a shim if that
+/// derived key is present in the map.
+fn is_shim_node(node: &ComponentNode, shim_comps: &HashMap<usize, usize>) -> bool {
+    is_shim_split_num((node.component_num + 1) as usize, shim_comps)
+}
+
+/// Convert an arbitrary node label into a valid WAC kebab-case identifier.
+///
+/// Node names in pre-composed binaries often look like `my:service/foo-shim`
+/// (a WIT package path).  WAC identifiers may only contain `[a-z0-9-]`, so we
+/// replace every invalid character with `-`.
+///
+/// Because the caller wraps the result in `new {INST_PREFIX}:{name}`, we also
+/// strip a leading `my-` that would otherwise double the namespace prefix into
+/// `my:my-…` when the raw name already started with `my:`.
+fn sanitize_wac_id(raw: &str) -> String {
+    let sanitized = raw.replace([':', '/', '.', '_'], "-");
+    sanitized
+        .strip_prefix(&format!("{INST_PREFIX}-"))
+        .map(str::to_string)
+        .unwrap_or(sanitized)
 }
 
 fn reverse_set(set: &IndexSet<Injection>) -> Vec<Injection> {
