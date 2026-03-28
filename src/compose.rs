@@ -4,7 +4,7 @@ use cviz::parse::component::{parse_component, parse_component_imports};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
-/// Parse N individual Wasm components and synthesise a [`CompositionGraph`] by
+/// Parse N individual Wasm components and synthesize a [`CompositionGraph`] by
 /// matching their exports to each other's imports.
 ///
 /// Returns:
@@ -179,6 +179,8 @@ pub fn build_graph_from_components(
         let info = &comp_infos[comp_idx];
         let node_id = topo_pos as u32;
 
+        // TODO: If `node_id` is from a shim component -- skip!
+
         let mut node =
             ComponentNode::new(format!("${}", info.name), comp_idx as u32, comp_idx as u32);
 
@@ -195,7 +197,7 @@ pub fn build_graph_from_components(
 
             node.add_import(InterfaceConnection {
                 interface_name: res_import.interface_name.clone(),
-                source_instance: provider_node_id,
+                source_instance: Some(provider_node_id),
                 is_host_import: false,
                 interface_type: None,
                 fingerprint,
@@ -205,7 +207,7 @@ pub fn build_graph_from_components(
         for host_iface in &unresolved[comp_idx] {
             node.add_import(InterfaceConnection {
                 interface_name: host_iface.clone(),
-                source_instance: u32::MAX,
+                source_instance: Some(u32::MAX),
                 is_host_import: true,
                 interface_type: None,
                 fingerprint: None,
@@ -413,7 +415,7 @@ mod tests {
             .find(|n| n.name.contains("provider-a"))
             .expect("provider-a node not found");
         assert_eq!(
-            resolved_import.source_instance,
+            resolved_import.source_instance.unwrap(),
             *graph
                 .nodes
                 .iter()
@@ -579,7 +581,10 @@ mod tests {
         );
 
         assert!(diagnostics.is_empty());
-        assert!(wac.contains("package test:pkg;"), "missing package line:\n{wac}");
+        assert!(
+            wac.contains("package test:pkg;"),
+            "missing package line:\n{wac}"
+        );
         assert!(
             wac.contains("let provider-a = new my:provider-a {"),
             "missing provider-a instantiation:\n{wac}"
@@ -599,8 +604,14 @@ mod tests {
 
         assert_eq!(cmd_args.len(), 2, "expected 2 cmd_args entries");
         let paths: Vec<&str> = cmd_args.iter().map(|(_, p)| p.as_str()).collect();
-        assert!(paths.contains(&"provider-a.wasm"), "provider-a.wasm missing from cmd_args");
-        assert!(paths.contains(&"consumer.wasm"), "consumer.wasm missing from cmd_args");
+        assert!(
+            paths.contains(&"provider-a.wasm"),
+            "provider-a.wasm missing from cmd_args"
+        );
+        assert!(
+            paths.contains(&"consumer.wasm"),
+            "consumer.wasm missing from cmd_args"
+        );
 
         Ok(())
     }
@@ -703,6 +714,75 @@ mod tests {
         assert!(
             paths.contains("path/to/consumer.wasm"),
             "expected path/to/consumer.wasm in cmd_args, got: {paths:?}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn roundtrip_fan_in_middleware_wired_correctly() -> anyhow::Result<()> {
+        // Regression test for the fan-in middleware bug:
+        // when service-comp is a fan-in consumer (imports from A, B, C), injecting
+        // middleware on ONE of those interfaces (e.g. my:providers/a) must result in
+        // service-comp wiring through the middleware, NOT the raw provider.
+        //
+        // Before the fix, service-comp was instantiated in the first chain it appeared in
+        // (using the raw provider-a), and by the time the middleware chain was processed
+        // the consumer was already in instance_vars so it was skipped.
+        use crate::parse::config::{Injection, SpliceRule};
+
+        let comps = vec![
+            mk("provider-a.wasm", WAT_PROVIDER_A),
+            mk("provider-b.wasm", WAT_PROVIDER_B),
+            mk("provider-c.wasm", WAT_PROVIDER_C),
+            mk("consumer.wasm", WAT_CONSUMER_FAN_IN),
+        ];
+        let (graph, node_paths) = build_graph_from_components(&comps)?;
+
+        // Inject middleware only on the `my:providers/a@0.1.0` interface.
+        let rules = vec![SpliceRule::Before {
+            interface: "my:providers/a@0.1.0".to_string(),
+            provider_name: Some("provider-a".to_string()),
+            provider_alias: None,
+            inject: vec![Injection {
+                name: "a-middleware".to_string(),
+                path: None,
+            }],
+        }];
+
+        let (wac, _, _) = crate::wac::generate_wac(
+            HashMap::new(),
+            "",
+            &graph,
+            &rules,
+            Some(&node_paths),
+            "test:pkg",
+        );
+
+        // Middleware must be instantiated and wired from provider-a.
+        assert!(
+            wac.contains(r#""my:providers/a@0.1.0": provider-a["my:providers/a@0.1.0"]"#),
+            "a-middleware should be wired from provider-a:\n{wac}"
+        );
+        assert!(
+            wac.contains("let a-middleware = new my:a-middleware {"),
+            "a-middleware must be instantiated:\n{wac}"
+        );
+
+        // consumer must wire through the middleware for the injected interface.
+        assert!(
+            wac.contains(r#""my:providers/a@0.1.0": a-middleware["my:providers/a@0.1.0"]"#),
+            "consumer should receive my:providers/a@0.1.0 through a-middleware, not raw provider-a:\n{wac}"
+        );
+
+        // The non-injected interfaces must still wire directly from their providers.
+        assert!(
+            wac.contains(r#""my:providers/b@0.1.0": provider-b["my:providers/b@0.1.0"]"#),
+            "consumer should still wire provider-b directly:\n{wac}"
+        );
+        assert!(
+            wac.contains(r#""my:providers/c@0.1.0": provider-c["my:providers/c@0.1.0"]"#),
+            "consumer should still wire provider-c directly:\n{wac}"
         );
 
         Ok(())

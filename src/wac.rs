@@ -65,10 +65,12 @@ pub fn generate_wac(
         } in node.imports.iter()
         {
             let mut chain = vec![*outer_node_id];
-            if !is_host_import {
-                chain.push(*source_instance);
+            if *is_host_import {
+                continue;
             }
-            let mut current_id = *source_instance;
+            let mut current_id = source_instance.unwrap();
+
+            chain.push(source_instance.unwrap());
             while let Some(node) = composition.nodes.get(&current_id) {
                 if let Some(conn) = node
                     .imports
@@ -76,7 +78,7 @@ pub fn generate_wac(
                     .find(|c| c.interface_name == *interface_name)
                 {
                     if !conn.is_host_import {
-                        let src_id = conn.source_instance;
+                        let src_id = conn.source_instance.unwrap();
                         chain.push(src_id);
                         current_id = src_id;
                         continue;
@@ -114,15 +116,6 @@ pub fn generate_wac(
         if handled_interfaces.contains(interface) {
             continue;
         }
-        // Skip exports whose source is a shim node — shims are internal
-        // implementation details of the composed binary and must not appear
-        // as graph-level exports in a roundtrip splice.
-        // TODO: Keeping the below condition for non `splicer compose` round trips
-        //       breaks since i need shim node imp/exp in those cases!
-        // if is_shim_node(&composition.nodes[source_inst], &shim_comps) {
-        //     continue;
-        // }
-
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
         chains.push(Chain {
@@ -173,7 +166,10 @@ pub fn generate_wac(
                 let intended_msg = if possibly_intended.is_empty() {
                     String::new()
                 } else {
-                    format!("\n\t  Possibly intended:    [{}]", possibly_intended.join(", "))
+                    format!(
+                        "\n\t  Possibly intended:    [{}]",
+                        possibly_intended.join(", ")
+                    )
                 };
                 eprintln!(
                     "{}: rule {} — interface '{}' was not found in the composition.\n\
@@ -213,7 +209,7 @@ pub fn generate_wac(
 
     // Let's now generate WAC to handle the chains we've planned to emit
     let mut mdl_override = None;
-    let mut last;
+    let mut last = String::new();
     let mut instance_vars: HashMap<u32, String> = HashMap::new();
     let mut outer_instances: HashMap<u32, String> = HashMap::new(); // orig_inst_id -> generated_outer_var
     let mut used_comp_nodes: HashMap<u32, String> = HashMap::new(); // inst_id -> used_name
@@ -228,9 +224,12 @@ pub fn generate_wac(
     // fan-in consumer node is first encountered, ALL of its provider deps are already in
     // `instance_vars` and can be wired up correctly in a single `let` statement.
     //
-    // Nodes that appear at any position > 0 are skipped here; they will be instantiated
-    // during the normal per-chain pass below, where `with_override` / inject plans ensure
-    // correct wiring.
+    // Nodes that appear at any position > 0 in MORE THAN ONE chain are "fan-in
+    // consumers".  Their instantiation is deferred until after the chain pass so that
+    // every per-interface middleware is created first.  Without deferral the consumer
+    // would be instantiated in the first chain it appears in, hardwiring the raw
+    // provider before later chains have a chance to inject middleware.
+    let fan_in_consumers: HashSet<u32>;
     {
         let mut node_positions: HashMap<u32, BTreeSet<usize>> = HashMap::new();
         for chain in &chains {
@@ -238,6 +237,21 @@ pub fn generate_wac(
                 node_positions.entry(id).or_default().insert(pos);
             }
         }
+
+        // Count how many chains each node appears in at a non-zero position.
+        let mut non_zero_chain_count: HashMap<u32, usize> = HashMap::new();
+        for chain in &chains {
+            for (pos, &id) in chain.chain.iter().enumerate() {
+                if pos > 0 {
+                    *non_zero_chain_count.entry(id).or_default() += 1;
+                }
+            }
+        }
+        fan_in_consumers = non_zero_chain_count
+            .into_iter()
+            .filter(|(_, n)| *n > 1)
+            .map(|(id, _)| id)
+            .collect();
 
         let mut pure_providers: Vec<u32> = node_positions
             .iter()
@@ -269,6 +283,12 @@ pub fn generate_wac(
         }
     }
 
+    // Per fan-in consumer: the final provider var for each of its imported interfaces
+    // after middleware has been applied.  Populated during the chain pass below.
+    let mut fan_in_iface_vars: HashMap<u32, HashMap<String, String>> = HashMap::new();
+    // Aliases for fan-in consumers (first chain that sets them wins).
+    let mut fan_in_aliases: HashMap<u32, HashMap<u32, Option<String>>> = HashMap::new();
+
     for Chain {
         interface: chain_interface,
         chain,
@@ -277,20 +297,23 @@ pub fn generate_wac(
     } in chains.iter()
     {
         for (i, id) in chain.iter().enumerate() {
-            let node = &composition.nodes[id];
-            let node_var = get_or_create_inst(
-                *id,
-                aliases,
-                &mut used_comp_nodes,
-                node,
-                &mut instance_vars,
-                &mdl_override,
-                &mut wac_lines,
-            );
+            let is_fan_in_last = fan_in_consumers.contains(id) && i == chain.len() - 1;
 
-            // set up what to wire in next
-            last = node_var;
-            mdl_override = Some((chain_interface.clone(), last.clone()));
+            if !is_fan_in_last {
+                let node = &composition.nodes[id];
+                let node_var = get_or_create_inst(
+                    *id,
+                    aliases,
+                    &mut used_comp_nodes,
+                    node,
+                    &mut instance_vars,
+                    &mdl_override,
+                    &mut wac_lines,
+                );
+                // set up what to wire in next
+                last = node_var;
+                mdl_override = Some((chain_interface.clone(), last.clone()));
+            }
 
             if let Some(middlewares) = inject_plan.get(&(i + 1)) {
                 // if the NEXT node has a middleware BEFORE it, inject here!
@@ -310,12 +333,61 @@ pub fn generate_wac(
                     mdl_override = Some((chain_interface.clone(), last.clone()));
                 }
             }
-            if i == chain.len() - 1 {
+
+            if is_fan_in_last {
+                // Record the final provider var for this interface so we can wire it
+                // when the consumer is instantiated after all chains are processed.
+                fan_in_iface_vars
+                    .entry(*id)
+                    .or_default()
+                    .insert(chain_interface.name.clone(), last.clone());
+                fan_in_aliases.entry(*id).or_insert_with(|| aliases.clone());
+            } else if i == chain.len() - 1 {
                 // If we're at the end of the chain, remember what our outermost layer is now.
                 // This makes sure we actually export middleware if it overrode the outermost service.
                 outer_instances.insert(*id, last.clone());
             }
         }
+    }
+
+    // Deferred instantiation of fan-in consumers.
+    //
+    // Now that every per-interface middleware has been created, we can instantiate
+    // each fan-in consumer once with all of its imports wired correctly.
+    for (consumer_id, iface_vars) in fan_in_iface_vars.iter() {
+        let consumer_node = &composition.nodes[consumer_id];
+        let aliases = fan_in_aliases.get(consumer_id).unwrap();
+
+        let alias = aliases.get(consumer_id).cloned();
+        let pkg = if let Some(Some(a)) = alias {
+            a
+        } else {
+            sanitize_wac_id(get_name(consumer_node))
+        };
+        used_comp_nodes.insert(*consumer_id, pkg.clone());
+        let node_var = instance_vars
+            .entry(*consumer_id)
+            .or_insert_with(|| pkg.clone())
+            .clone();
+
+        let mut line = format!("let {node_var} = new {INST_PREFIX}:{pkg} {{");
+        for conn in &consumer_node.imports {
+            if !conn.is_host_import {
+                let iface = &conn.interface_name;
+                let src_var = if let Some(v) = iface_vars.get(iface) {
+                    v.clone()
+                } else if let Some(v) = conn.source_instance.and_then(|id| instance_vars.get(&id)) {
+                    v.clone()
+                } else {
+                    continue;
+                };
+                line.push_str(&format!("\n    \"{iface}\": {src_var}[\"{iface}\"],"));
+            }
+        }
+        line.push_str("\n    ...\n};");
+        wac_lines.push(line);
+
+        outer_instances.insert(*consumer_id, node_var.clone());
     }
 
     // Generate WAC to export the appropriate functions
@@ -327,13 +399,21 @@ pub fn generate_wac(
         },
     ) in composition.component_exports.iter()
     {
-        // Skip exports sourced from shim nodes — same reason as the chain-building
-        // filter above: shims are internal and must not become graph-level exports.
-        // TODO: Keeping the below condition for non `splicer compose` round trips
-        //       breaks since i need shim node imp/exp in those cases!
-        // if is_shim_node(&composition.nodes[outer_inst_id], &shim_comps) {
-        //     continue;
-        // }
+        // A shim sub-component that provides an interface to another node in the
+        // graph will appear in `handled_interfaces` (the interface is internal
+        // wiring) but NOT in `outer_instances` (it is not the outermost node of
+        // its chain).  If such a node is also present in `component_exports` it
+        // is a spurious root-level export produced when wac compose flattens
+        // shim sub-components to the peer level.  Exporting it would reference
+        // the wrong (intermediate) instance, so we skip it here.
+        //
+        // Legitimate final exports (e.g. srv re-exporting an interface it
+        // consumes from a provider) ARE in `outer_instances` (srv is the last
+        // node of its chain), so they pass this check.
+        if handled_interfaces.contains(export_name) && !outer_instances.contains_key(outer_inst_id)
+        {
+            continue;
+        }
 
         let node_var = if let Some(generated_outer) = outer_instances.get(outer_inst_id) {
             generated_outer.clone()
@@ -484,7 +564,11 @@ fn apply_rule_between(
             }
         }
     }
-    RuleApplyResult { contract_results, interface_matched, full_match }
+    RuleApplyResult {
+        contract_results,
+        interface_matched,
+        full_match,
+    }
 }
 
 fn apply_rule_before(
@@ -538,7 +622,11 @@ fn apply_rule_before(
             ));
         }
     }
-    RuleApplyResult { contract_results, interface_matched, full_match }
+    RuleApplyResult {
+        contract_results,
+        interface_matched,
+        full_match,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -618,7 +706,7 @@ fn get_or_create_inst(
             {
                 let src_var = if conn.interface_name == *override_interface {
                     override_var.clone()
-                } else if let Some(src_var) = instance_vars.get(&src_id) {
+                } else if let Some(src_var) = instance_vars.get(&src_id.unwrap()) {
                     // could be an import from the host!
                     // only do this if it's not
                     src_var.clone()
@@ -672,17 +760,6 @@ fn get_name(node: &ComponentNode) -> &str {
 /// `shim_comps` map produced by `split_out_composition`.
 fn is_shim_split_num(split_num: usize, shim_comps: &HashMap<usize, usize>) -> bool {
     shim_comps.contains_key(&split_num)
-}
-
-/// Returns true if `node` is a shim sub-component.
-///
-/// Shims are internal implementation details of a composed binary (e.g. adapter
-/// instances that provide WASI interfaces).  They are identified by the
-/// `shim_comps` map produced by `split_out_composition`: the map key is
-/// `component_num + 1` (the split-file number), so a node is a shim if that
-/// derived key is present in the map.
-fn is_shim_node(node: &ComponentNode, shim_comps: &HashMap<usize, usize>) -> bool {
-    is_shim_split_num((node.component_num + 1) as usize, shim_comps)
 }
 
 /// Convert an arbitrary node label into a valid WAC kebab-case identifier.
