@@ -1,6 +1,6 @@
 [package]
 name = "splicer"
-version = "2.0.0-rc1"
+version = "2.0.0-rc2"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
 description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
@@ -26,8 +26,8 @@ path = "examples/demo.rs"
 
 [dependencies]
 colored = "3.1.1"
-#cviz = "2.0.0-rc1"
-cviz = { path = "../cviz" }
+cviz = "2.0.0-rc2"
+#cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"  # or serde_toml if you prefer TOML
 anyhow = "1.0.86"
