@@ -58,8 +58,12 @@ pub fn validate_contract(
             }
         } else {
             results.push(ContractResult::Warn(format!(
-                "Unable to validate contract for injection '{}' on interface '{}'",
-                name, interface_name
+                "Middleware '{}' does not export interface '{}'.\n\
+                 \tIt cannot be spliced on this interface.\n\
+                 \tCheck that the middleware both imports and re-exports '{}',\n\
+                 \tor that the interface name in your config exactly matches\n\
+                 \twhat the middleware binary exports.",
+                name, interface_name, interface_name
             )));
         }
     }

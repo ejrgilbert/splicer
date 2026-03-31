@@ -112,7 +112,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     // http-middleware is injected for the http chain
     assert!(
@@ -151,7 +158,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     // http-middleware inserted before http-provider
     assert!(
@@ -193,7 +207,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     let expected = r#"
 package example:composition;
@@ -233,7 +254,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_long_chain())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     let expected = r#"
 package example:composition;
@@ -275,7 +303,14 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     assert!(
         !wac.contains("http-middleware"),
@@ -339,7 +374,14 @@ rules:
     let mut graph = json::parse_json_str(testcases::json_log_short_chain())?;
     add_chain_fingerprint(&mut graph, "wasi:logging/log@0.1.0", "fake-fp-xyz");
 
-    let (wac, _, diagnostics) = wac::generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, diagnostics) = wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
 
     // WAC is still generated — the Warn is advisory only
     assert!(
@@ -383,7 +425,14 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
+        let (wac, _, _) = wac::generate_wac(
+            HashMap::new(),
+            "placeholder",
+            graph,
+            &cfg,
+            None,
+            "example:composition",
+        );
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
@@ -425,7 +474,14 @@ fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()>
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _, _) = wac::generate_wac(HashMap::new(), "placeholder", graph, &cfg);
+        let (wac, _, _) = wac::generate_wac(
+            HashMap::new(),
+            "placeholder",
+            graph,
+            &cfg,
+            None,
+            "example:composition",
+        );
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
@@ -436,6 +492,105 @@ fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()>
             "Failed on test '{name}', for the following config:{yaml}\nGot the following result:{wac}"
         );
     }
+    Ok(())
+}
+
+// ── Shim roundtrip test ───────────────────────────────────────────────────────
+// Exercises the full splice pipeline on a real composed Wasm binary that
+// contains an internal shim sub-component.  Unlike the JSON-fixture tests
+// above, this one writes actual bytes to disk so split_out_composition can
+// identify shim nodes via its heuristic, then verifies that generate_wac
+// omits those spurious shim-sourced graph-level exports.
+
+#[test]
+fn shim_exports_not_in_splice_roundtrip_wac() -> anyhow::Result<()> {
+    use crate::split::split_out_composition;
+    use cviz::parse::component::parse_component;
+
+    // A composed binary whose root component exports two things:
+    //   - "my:service/handler@0.1.0" from $svc-inst  ← legitimate
+    //   - "my:shim/iface@0.1.0"     from $shim-inst  ← spurious (simulates
+    //     what wac compose produces when an inner component's shim becomes
+    //     visible as a peer-level node after flattening)
+    //
+    // $shim has no core module → split.rs marks it as a shim.
+    // $service has a core module → split.rs treats it as a real component.
+    let wat = r#"(component
+        (component $shim
+            (import "host:env/dep@0.1.0" (instance $dep
+                (export "get" (func (result u32)))
+            ))
+            (export "my:shim/iface@0.1.0" (instance $dep))
+        )
+        (component $service
+            (import "my:shim/iface@0.1.0" (instance $iface
+                (export "get" (func (result u32)))
+            ))
+            (core module $m
+                (func (export "run") (result i32) i32.const 42)
+            )
+            (core instance $mi (instantiate $m))
+            (alias export $iface "get" (func $get))
+            (instance $h-out (export "run" (func $get)))
+            (export "my:service/handler@0.1.0" (instance $h-out))
+        )
+        (import "host:env/dep@0.1.0" (instance $host-dep
+            (export "get" (func (result u32)))
+        ))
+        (instance $shim-inst (instantiate $shim
+            (with "host:env/dep@0.1.0" (instance $host-dep))
+        ))
+        (instance $svc-inst (instantiate $service
+            (with "my:shim/iface@0.1.0" (instance $shim-inst "my:shim/iface@0.1.0"))
+        ))
+        (export "my:service/handler@0.1.0" (instance $svc-inst "my:service/handler@0.1.0"))
+        (export "my:shim/iface@0.1.0" (instance $shim-inst "my:shim/iface@0.1.0"))
+    )"#;
+
+    let bytes = wat::parse_str(wat).expect("failed to parse WAT");
+
+    // Write the composed binary and a splits dir to a deterministic temp location.
+    let tmp = std::env::temp_dir().join("splicer_shim_roundtrip");
+    std::fs::create_dir_all(&tmp)?;
+    let wasm_path = tmp.join("composed.wasm");
+    let splits_dir = tmp.join("splits");
+    std::fs::write(&wasm_path, &bytes)?;
+
+    let (splits_path, shim_comps) =
+        split_out_composition(&wasm_path, &Some(splits_dir.to_string_lossy().into_owned()))?;
+
+    // shim_comps must be non-empty — if it's empty the filter is a no-op and
+    // the test would pass vacuously.
+    assert!(
+        !shim_comps.is_empty(),
+        "expected split.rs to detect at least one shim component; \
+         check the WAT — the shim sub-component must have no core module"
+    );
+
+    let graph = parse_component(&bytes).expect("failed to parse composed binary");
+
+    let (wac, _, _) = wac::generate_wac(shim_comps, &splits_path, &graph, &[], None, "test:pkg");
+
+    // The service's interface MUST appear as a graph-level export statement.
+    let has_service_export = wac
+        .lines()
+        .any(|l| l.trim().starts_with("export") && l.contains("my:service/handler@0.1.0"));
+    assert!(
+        has_service_export,
+        "expected 'export …[\"my:service/handler@0.1.0\"];' in WAC:\n{wac}"
+    );
+
+    // The shim's interface MUST NOT appear as a graph-level export statement.
+    // Before the fix this produced: export shim-iface["my:shim/iface@0.1.0"];
+    let has_shim_export = wac
+        .lines()
+        .any(|l| l.trim().starts_with("export") && l.contains("my:shim/iface@0.1.0"));
+    assert!(
+        !has_shim_export,
+        "shim interface must not appear as a WAC-level export:\n{wac}"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
     Ok(())
 }
 

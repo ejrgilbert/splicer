@@ -92,7 +92,14 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_SHORT).unwrap();
-    let (wac, _, _) = generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
     wac
 }
 
@@ -110,7 +117,14 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
-    let (wac, _, _) = generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
     wac
 }
 
@@ -131,7 +145,14 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
-    let (wac, _, _) = generate_wac(HashMap::new(), "placeholder", &graph, &cfg);
+    let (wac, _, _) = generate_wac(
+        HashMap::new(),
+        "placeholder",
+        &graph,
+        &cfg,
+        None,
+        "example:composition",
+    );
     wac
 }
 
