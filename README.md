@@ -1,4 +1,4 @@
-# `splicer` 🔍✂️
+# `splicer` 🔍✂️🪡
 
 **Plan and generate middleware splice operations for WebAssembly component composition graphs.**
 
