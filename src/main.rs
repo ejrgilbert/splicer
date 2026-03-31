@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::compose::filename_from_path;
 use crate::parse::config::SpliceRule;
 use crate::split::split_out_composition;
 use anyhow::{Context, Result};
@@ -74,10 +75,16 @@ enum Command {
     ///
     /// No splice configuration is required — the composition graph is
     /// discovered automatically from the components' import/export surfaces.
+    ///
+    /// Each argument is either a plain path (`path/to/comp.wasm`) or an
+    /// aliased path (`alias=path/to/comp.wasm`).  Aliases are required when
+    /// two components share the same filename stem, e.g.:
+    ///
+    ///   splicer compose svc0=~/dir0/service.wasm svc1=~/dir1/service.wasm
     Compose {
-        /// Two or more individual (non-composed) Wasm component binaries.
+        /// Two or more Wasm components, each as `path` or `alias=path`.
         #[arg(value_name = "COMP_WASM", num_args = 2..)]
-        wasms: Vec<PathBuf>,
+        wasms: Vec<String>,
 
         /// Output destination for the generated WAC (defaults to output.wac).
         #[arg(short, long)]
@@ -135,15 +142,45 @@ fn main() -> Result<()> {
             output_wac,
             package,
         } => {
-            let components: Vec<(PathBuf, Vec<u8>)> = wasms
-                .iter()
-                .map(|p| {
-                    let bytes = fs::read(p).with_context(|| {
-                        format!("Failed to read Wasm component: {}", p.display())
-                    })?;
-                    Ok((p.clone(), bytes))
-                })
-                .collect::<Result<_>>()?;
+            // Parse each entry as `alias=path` or bare `path`, then validate
+            // that all resolved names are unique before any composition work.
+            let mut components: Vec<(String, PathBuf, Vec<u8>)> = Vec::with_capacity(wasms.len());
+
+            for entry in &wasms {
+                let (name, path) = if let Some((alias, rest)) = entry.split_once('=') {
+                    (alias.to_string(), PathBuf::from(rest))
+                } else {
+                    let path = PathBuf::from(entry);
+                    (filename_from_path(&path), path)
+                };
+
+                let bytes = fs::read(&path).with_context(|| {
+                    format!("Failed to read Wasm component: {}", path.display())
+                })?;
+                components.push((name, path, bytes));
+            }
+
+            // Duplicate-name check: surface a clear error before attempting
+            // composition so the user knows exactly what went wrong.
+            {
+                let mut seen: HashMap<&str, &PathBuf> = HashMap::new();
+                for (name, path, _) in &components {
+                    if let Some(prev) = seen.insert(name.as_str(), path) {
+                        anyhow::bail!(
+                            "Name conflict: '{}' and '{}' both resolve to the name '{}'.\n\
+                             Use aliases to disambiguate, e.g.:\n\
+                             \t{}0={} {}1={}",
+                            prev.display(),
+                            path.display(),
+                            name,
+                            name,
+                            prev.display(),
+                            name,
+                            path.display(),
+                        );
+                    }
+                }
+            }
 
             let (graph, node_paths) = compose::build_graph_from_components(&components)?;
 

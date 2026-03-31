@@ -2,10 +2,15 @@ use anyhow::{bail, Result};
 use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
 use cviz::parse::component::{parse_component, parse_component_imports};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Parse N individual Wasm components and synthesize a [`CompositionGraph`] by
 /// matching their exports to each other's imports.
+///
+/// Each entry is `(name, path, bytes)` where `name` is the variable-friendly
+/// identifier used in the generated WAC (either an explicit alias supplied by
+/// the caller, or a stem derived from the filename).  All names must be unique;
+/// duplicate names cause an error before any composition work begins.
 ///
 /// Returns:
 /// - The synthetic [`CompositionGraph`] with topologically-ordered node IDs
@@ -13,14 +18,35 @@ use std::path::PathBuf;
 /// - A map from node ID → original `.wasm` path, used later to generate the
 ///   `wac compose --dep` arguments without needing a split pass.
 pub fn build_graph_from_components(
-    components: &[(PathBuf, Vec<u8>)],
+    components: &[(String, PathBuf, Vec<u8>)],
 ) -> Result<(CompositionGraph, HashMap<u32, PathBuf>)> {
     let n = components.len();
+
+    // ── 0. Validate: no two components may share the same name ───────────────
+    {
+        let mut seen: HashMap<&str, &PathBuf> = HashMap::with_capacity(n);
+        for (name, path, _) in components {
+            if let Some(prev_path) = seen.insert(name.as_str(), path) {
+                bail!(
+                    "Name conflict: components at '{}' and '{}' both resolve to the name '{}'.\n\
+                     Use the alias syntax (alias=path) to give them distinct names, e.g.:\n\
+                     \t{}0={} {}1={}",
+                    prev_path.display(),
+                    path.display(),
+                    name,
+                    name,
+                    prev_path.display(),
+                    name,
+                    path.display(),
+                );
+            }
+        }
+    }
 
     // ── 1. Parse each component: collect exports and imports ─────────────────
     struct CompInfo {
         path: PathBuf,
-        /// Variable-friendly name derived from the filename stem.
+        /// Variable-friendly name (alias or stem).
         name: String,
         /// Interface names this component exports.
         exports: Vec<String>,
@@ -30,21 +56,15 @@ pub fn build_graph_from_components(
 
     let mut comp_infos: Vec<CompInfo> = Vec::with_capacity(n);
 
-    for (path, bytes) in components {
+    for (name, path, bytes) in components {
         let graph = parse_component(bytes)?;
         let imports = parse_component_imports(bytes)?;
-
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .replace(['.', '_'], "-");
 
         let exports: Vec<String> = graph.component_exports.keys().cloned().collect();
 
         comp_infos.push(CompInfo {
             path: path.clone(),
-            name,
+            name: name.clone(),
             exports,
             imports,
         });
@@ -79,7 +99,7 @@ pub fn build_graph_from_components(
     // Parse once up-front so we can look up fingerprints without re-parsing later.
     let parsed_graphs: Vec<CompositionGraph> = components
         .iter()
-        .map(|(_, bytes)| parse_component(bytes))
+        .map(|(_, _, bytes)| parse_component(bytes))
         .collect::<Result<_>>()?;
 
     for (comp_idx, info) in comp_infos.iter().enumerate() {
@@ -179,8 +199,6 @@ pub fn build_graph_from_components(
         let info = &comp_infos[comp_idx];
         let node_id = topo_pos as u32;
 
-        // TODO: If `node_id` is from a shim component -- skip!
-
         let mut node =
             ComponentNode::new(format!("${}", info.name), comp_idx as u32, comp_idx as u32);
 
@@ -250,13 +268,29 @@ pub fn build_graph_from_components(
     Ok((graph, node_paths))
 }
 
+pub fn filename_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .replace(['.', '_'], "-")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn mk(path: &str, wat: &str) -> (PathBuf, Vec<u8>) {
+    /// Build a test component tuple `(name, path, bytes)`.
+    /// The name is derived from the path stem the same way the CLI does it.
+    fn mk(path: &str, wat: &str) -> (String, PathBuf, Vec<u8>) {
         let bytes = wat::parse_str(wat).expect("invalid WAT");
-        (PathBuf::from(path), bytes)
+        let pb = PathBuf::from(path);
+        (filename_from_path(&pb), pb, bytes)
+    }
+
+    /// Build a test component tuple with an explicit alias name.
+    fn mk_alias(alias: &str, path: &str, wat: &str) -> (String, PathBuf, Vec<u8>) {
+        let bytes = wat::parse_str(wat).expect("invalid WAT");
+        (alias.to_string(), PathBuf::from(path), bytes)
     }
 
     // ── WAT fixtures ──────────────────────────────────────────────────────────
@@ -831,6 +865,77 @@ mod tests {
         assert!(
             err.to_string().contains("both imports and exports"),
             "expected 'both imports and exports' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn error_duplicate_stem_names() {
+        // Two paths with the same filename stem produce the same derived name.
+        let comps = vec![
+            mk("dir0/file.wasm", WAT_PROVIDER_A),
+            mk("dir1/file.wasm", WAT_PROVIDER_B),
+        ];
+        let result = build_graph_from_components(&comps);
+        assert!(result.is_err(), "expected name-conflict error");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("Name conflict") && err.contains("file"),
+            "expected 'Name conflict' mentioning the stem, got: {err}"
+        );
+        assert!(
+            err.contains("alias"),
+            "error should mention alias syntax, got: {err}"
+        );
+    }
+
+    #[test]
+    fn error_duplicate_explicit_aliases() {
+        // Caller supplies the same alias string for two different paths.
+        let comps = vec![
+            mk_alias("mycomp", "dir0/a.wasm", WAT_PROVIDER_A),
+            mk_alias("mycomp", "dir1/b.wasm", WAT_PROVIDER_B),
+        ];
+        let result = build_graph_from_components(&comps);
+        assert!(
+            result.is_err(),
+            "expected name-conflict error for duplicate aliases"
+        );
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("Name conflict") && err.contains("mycomp"),
+            "expected 'Name conflict' mentioning 'mycomp', got: {err}"
+        );
+    }
+
+    #[test]
+    fn alias_disambiguates_same_stem() {
+        // With distinct aliases the two same-stem components can coexist,
+        // and composition still resolves correctly.
+        let comps = vec![
+            mk_alias("provider-first", "dir0/file.wasm", WAT_PROVIDER_A),
+            mk_alias("consumer-app", "dir1/file.wasm", WAT_SIMPLE_CONSUMER),
+        ];
+        let result = build_graph_from_components(&comps);
+        assert!(
+            result.is_ok(),
+            "aliases should resolve the name conflict: {:?}",
+            result.err()
+        );
+        let (graph, _) = result.unwrap();
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|n| n.name.contains("provider-first")),
+            "expected node named provider-first"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|n| n.name.contains("consumer-app")),
+            "expected node named consumer-app"
         );
     }
 
