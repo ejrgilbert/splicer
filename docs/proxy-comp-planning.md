@@ -80,7 +80,7 @@ export handle(req: request) -> response:
         // block case constraints apply (see above)
 ```
 
-The block case has one wrinkle: if before-call returns false, you need to return something from the exported function
+The block case has one wrinkle: if `should-block-call` returns `false`, you need to return something from the exported function
 without calling downstream. This is fine for:
 - `void functions`: just return
 - `result<T, E>` return types: return an Err (very common in WASI, e.g. wasi:http/handler)

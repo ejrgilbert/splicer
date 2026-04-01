@@ -1,9 +1,35 @@
 use crate::parse::config::Injection;
 use anyhow::Context;
 use cviz::model::{compatible_fingerprints, ExportInfo};
-use cviz::parse::component::parse_component;
+use cviz::parse::component::{parse_component, parse_component_imports};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+
+/// The set of interface names that collectively define the tier-1 (type-erased)
+/// middleware contract, drawn from the WIT package:
+///
+/// ```wit
+/// package splicer:proxy;
+///
+/// interface before   { before-call:       func(name: string);         }
+/// interface after    { after-call:         func(name: string);         }
+/// interface blocking { should-block-call:  func(name: string) -> bool; }
+///
+/// world type-erased-middleware {
+///     export before;
+///     export blocking;
+///     export after;
+/// }
+/// ```
+///
+/// A middleware is tier-1 compatible when it exports **at least one** of these
+/// interfaces. The generated proxy will only wire up the hooks that are actually
+/// present, so any non-empty subset is valid.
+pub const TIER1_INTERFACES: &[&str] = &[
+    "splicer:proxy/before",
+    "splicer:proxy/after",
+    "splicer:proxy/blocking",
+];
 
 /// The outcome of a single middleware contract check.
 #[derive(Debug, PartialEq)]
@@ -17,6 +43,11 @@ pub enum ContractResult {
     /// The middleware exports the interface but with an incompatible type
     /// fingerprint.  Injection should be blocked.
     Error(String),
+    /// The middleware does not export the target interface but does export at
+    /// least one tier-1 type-erased interface (`splicer:proxy/{before,after,blocking}`).
+    /// The inner list names the matched interfaces so the proxy generator knows
+    /// exactly which hooks to wire up.
+    Tier1Compatible(Vec<String>),
 }
 
 /// Check that every middleware in `to_inject` is type-compatible with the
@@ -56,6 +87,8 @@ pub fn validate_contract(
             } else {
                 results.push(ContractResult::Ok);
             }
+        } else if let Some(matched) = is_tier1_compatible(exports, path, interface_name) {
+            results.push(ContractResult::Tier1Compatible(matched));
         } else {
             results.push(ContractResult::Warn(format!(
                 "Middleware '{}' does not export interface '{}'.\n\
@@ -68,6 +101,55 @@ pub fn validate_contract(
         }
     }
     results
+}
+
+/// Returns `true` when a middleware is a candidate for tier-1 proxy generation.
+///
+/// A middleware is tier-1 compatible when:
+/// 1. It exports one of the [`TIER1_INTERFACES`] — the positive signal that it was written
+///    as a type-erased middleware.  cviz has already validated that the exported
+///    interface is structurally sound when it produced the fingerprint.
+/// 2. A path to the binary is provided — the proxy cannot be generated without it.
+/// 3. It does **not** import `target_interface` — confirming it is not a regular
+///    pass-through middleware that simply failed the fingerprint check.
+///
+/// Subset support (middleware implementing only some of the tier-1 functions) and
+/// detailed function-signature validation are left to the proxy generation step.
+/// Returns the subset of [`TIER1_INTERFACES`] that the middleware exports, or
+/// `None` if the middleware is not tier-1 compatible.
+///
+/// A middleware is tier-1 compatible when:
+/// 1. It exports **at least one** of the tier-1 interfaces — the positive signal
+///    that it was written as a type-erased middleware.
+/// 2. A path to the binary is provided — the proxy cannot be generated without it.
+/// 3. It does **not** import `target_interface` — confirming it is not a regular
+///    pass-through middleware that simply failed the fingerprint check.
+fn is_tier1_compatible(
+    exports: &BTreeMap<String, ExportInfo>,
+    middleware_path: &Option<String>,
+    target_interface: &str,
+) -> Option<Vec<String>> {
+    let matched: Vec<String> = TIER1_INTERFACES
+        .iter()
+        .filter(|iface| exports.contains_key(**iface))
+        .map(|iface| iface.to_string())
+        .collect();
+    if matched.is_empty() {
+        return None;
+    }
+    let Some(path) = middleware_path else {
+        return None;
+    };
+    let Ok(buff) = fs::read(path) else {
+        return None;
+    };
+    let Ok(imports) = parse_component_imports(&buff) else {
+        return None;
+    };
+    if imports.iter().any(|(name, _)| name == target_interface) {
+        return None;
+    }
+    Some(matched)
 }
 
 fn discover_middleware_exports(

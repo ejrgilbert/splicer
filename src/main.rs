@@ -1,6 +1,7 @@
 mod compose;
 mod contract;
 mod parse;
+mod proxy;
 mod split;
 #[cfg(test)]
 mod tests;
@@ -209,12 +210,16 @@ fn run_wac(
     output_wac: Option<PathBuf>,
     skip_type_check: bool,
 ) -> Result<()> {
-    let (wac, cmd_args, diagnostics) =
-        wac::generate_wac(shim_comps, splits_path, graph, rules, node_paths, pkg_name);
+    let out = wac::generate_wac(shim_comps, splits_path, graph, rules, node_paths, pkg_name)?;
 
-    for diag in diagnostics {
+    for diag in out.diagnostics {
         match diag {
             ContractResult::Ok => {}
+            // Tier1Compatible is fully consumed inside generate_wac (proxy is generated
+            // and the injection path is substituted).  It should never surface here.
+            ContractResult::Tier1Compatible(_) => unreachable!(
+                "Tier1Compatible must be consumed by add_to_inject_plan before reaching diagnostics"
+            ),
             ContractResult::Warn(msg) => eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow()),
             ContractResult::Error(msg) => {
                 if skip_type_check {
@@ -231,11 +236,11 @@ fn run_wac(
     }
 
     let output_path = output_wac.unwrap_or_else(|| PathBuf::from("output.wac"));
-    fs::write(&output_path, &wac)
+    fs::write(&output_path, &out.wac)
         .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
     eprintln!("Generated `wac` written to: {}\n", output_path.display());
 
-    let wac_cmd = gen_wac_cmd(output_path.into_os_string().to_str().unwrap(), cmd_args)?;
+    let wac_cmd = gen_wac_cmd(output_path.into_os_string().to_str().unwrap(), out.cmd_args)?;
     println!("{wac_cmd}");
 
     Ok(())

@@ -605,16 +605,17 @@ mod tests {
             mk("consumer.wasm", WAT_SIMPLE_CONSUMER),
         ];
         let (graph, node_paths) = build_graph_from_components(&comps)?;
-        let (wac, cmd_args, diagnostics) = crate::wac::generate_wac(
+        let out = crate::wac::generate_wac(
             HashMap::new(),
             "",
             &graph,
             &[],
             Some(&node_paths),
             "test:pkg",
-        );
+        )?;
+        let wac = out.wac;
 
-        assert!(diagnostics.is_empty());
+        assert!(out.diagnostics.is_empty());
         assert!(
             wac.contains("package test:pkg;"),
             "missing package line:\n{wac}"
@@ -636,8 +637,8 @@ mod tests {
             "missing export line:\n{wac}"
         );
 
-        assert_eq!(cmd_args.len(), 2, "expected 2 cmd_args entries");
-        let paths: Vec<&str> = cmd_args.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(out.cmd_args.len(), 2, "expected 2 cmd_args entries");
+        let paths: Vec<&str> = out.cmd_args.iter().map(|(_, p)| p.as_str()).collect();
         assert!(
             paths.contains(&"provider-a.wasm"),
             "provider-a.wasm missing from cmd_args"
@@ -659,16 +660,17 @@ mod tests {
             mk("consumer.wasm", WAT_CONSUMER_FAN_IN),
         ];
         let (graph, node_paths) = build_graph_from_components(&comps)?;
-        let (wac, cmd_args, diagnostics) = crate::wac::generate_wac(
+        let out = crate::wac::generate_wac(
             HashMap::new(),
             "",
             &graph,
             &[],
             Some(&node_paths),
             "test:pkg",
-        );
+        )?;
+        let wac = out.wac;
 
-        assert!(diagnostics.is_empty());
+        assert!(out.diagnostics.is_empty());
         for name in &["provider-a", "provider-b", "provider-c", "consumer"] {
             assert!(
                 wac.contains(&format!("let {name} = new my:{name} {{")),
@@ -689,7 +691,7 @@ mod tests {
             wac.contains(r#"export consumer["my:consumer/app@0.1.0"];"#),
             "missing export line:\n{wac}"
         );
-        assert_eq!(cmd_args.len(), 4, "expected 4 cmd_args entries");
+        assert_eq!(out.cmd_args.len(), 4, "expected 4 cmd_args entries");
 
         Ok(())
     }
@@ -703,14 +705,15 @@ mod tests {
             mk("consumer.wasm", WAT_SIMPLE_CONSUMER),
         ];
         let (graph, node_paths) = build_graph_from_components(&comps)?;
-        let (wac, _, _) = crate::wac::generate_wac(
+        let out = crate::wac::generate_wac(
             HashMap::new(),
             "",
             &graph,
             &[],
             Some(&node_paths),
             "test:pkg",
-        );
+        )?;
+        let wac = out.wac;
 
         assert!(
             !wac.contains(r#"export provider-a["my:providers/a@0.1.0"];"#),
@@ -731,16 +734,16 @@ mod tests {
             mk("path/to/consumer.wasm", WAT_SIMPLE_CONSUMER),
         ];
         let (graph, node_paths) = build_graph_from_components(&comps)?;
-        let (_, cmd_args, _) = crate::wac::generate_wac(
+        let out = crate::wac::generate_wac(
             HashMap::new(),
             "",
             &graph,
             &[],
             Some(&node_paths),
             "test:pkg",
-        );
+        )?;
 
-        let paths: HashSet<&str> = cmd_args.iter().map(|(_, p)| p.as_str()).collect();
+        let paths: HashSet<&str> = out.cmd_args.iter().map(|(_, p)| p.as_str()).collect();
         assert!(
             paths.contains("path/to/provider-a.wasm"),
             "expected path/to/provider-a.wasm in cmd_args, got: {paths:?}"
@@ -784,14 +787,15 @@ mod tests {
             }],
         }];
 
-        let (wac, _, _) = crate::wac::generate_wac(
+        let out = crate::wac::generate_wac(
             HashMap::new(),
             "",
             &graph,
             &rules,
             Some(&node_paths),
             "test:pkg",
-        );
+        )?;
+        let wac = out.wac;
 
         // Middleware must be instantiated and wired from provider-a.
         assert!(

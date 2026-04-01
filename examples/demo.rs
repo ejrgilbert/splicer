@@ -92,15 +92,16 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_SHORT).unwrap();
-    let (wac, _, _) = generate_wac(
+    generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
-    wac
+    )
+    .unwrap()
+    .wac
 }
 
 /// 1b: inject `mw-a` before `log-provider-inner` (the deepest node) in a three-node chain.
@@ -117,15 +118,16 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
-    let (wac, _, _) = generate_wac(
+    generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
-    wac
+    )
+    .unwrap()
+    .wac
 }
 
 /// 1c: inject `mw-a` and `mw-b` between `log-provider-inner` and `log-provider`.
@@ -145,15 +147,16 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
-    let (wac, _, _) = generate_wac(
+    generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
-    wac
+    )
+    .unwrap()
+    .wac
 }
 
 // ─── Phase 2 helpers ─────────────────────────────────────────────────────
@@ -290,6 +293,9 @@ fn show_contract_result(result: &ContractResult) {
         ContractResult::Ok => println!("  ✔  Ok — types are compatible, injection confirmed safe"),
         ContractResult::Warn(msg) => println!("  ⚠  Warn — {msg}"),
         ContractResult::Error(msg) => println!("  ✘  Error — {msg}"),
+        ContractResult::Tier1Compatible(ifaces) => {
+            println!("  ↪  Tier1Compatible — middleware is type-erased; proxy component will be generated (hooks: {ifaces:?})")
+        }
     }
 }
 

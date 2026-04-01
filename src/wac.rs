@@ -1,4 +1,5 @@
 use crate::contract::{validate_contract, ContractResult};
+use crate::proxy::generate_tier1_proxy;
 use colored::Colorize;
 use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
 use std::cmp::Reverse;
@@ -28,11 +29,17 @@ struct Contract {
     ty_fingerprint: Option<String>,
 }
 
+/// Output of [`generate_wac`].
+pub struct WacOutput {
+    /// The generated WAC source text.
+    pub wac: String,
+    /// Arguments for the `wac compose` command: `(service-name, service-path)` pairs.
+    pub cmd_args: Vec<(String, String)>,
+    /// Diagnostics from contract validation, one per middleware injection attempted.
+    pub diagnostics: Vec<ContractResult>,
+}
+
 /// Generate WAC from a composition graph and a set of splicing rules.
-/// Returns:
-/// - The generated Wac
-/// - A list of the `wac compose` args: (service-name, service-path)
-/// - Diagnostics from contract validation (one per middleware injection attempted)
 ///
 /// `node_paths` is `Some` for the multi-component path; when present each node's
 /// original `.wasm` path is used directly instead of deriving a split path.
@@ -43,7 +50,7 @@ pub fn generate_wac(
     rules: &[SpliceRule],
     node_paths: Option<&HashMap<u32, PathBuf>>,
     pkg_name: &str,
-) -> (String, Vec<(String, String)>, Vec<ContractResult>) {
+) -> anyhow::Result<WacOutput> {
     let mut wac_lines = vec![format!("package {pkg_name};")];
 
     let mut handled_interfaces = HashSet::new();
@@ -139,8 +146,8 @@ pub fn generate_wac(
         let mut any_interface_matched = false;
         let mut any_full_match = false;
         for chain in chains.iter_mut() {
-            let between = apply_rule_between(rule, chain, composition, &mut checked_middlewares);
-            let before = apply_rule_before(rule, chain, composition, &mut checked_middlewares);
+            let between = apply_rule_between(rule, chain, composition, &mut checked_middlewares)?;
+            let before = apply_rule_before(rule, chain, composition, &mut checked_middlewares)?;
             any_interface_matched |= between.interface_matched | before.interface_matched;
             any_full_match |= between.full_match | before.full_match;
             diagnostics.extend(between.contract_results);
@@ -444,7 +451,11 @@ pub fn generate_wac(
         node_paths,
     );
 
-    (wac_lines.join("\n\n"), args, diagnostics)
+    Ok(WacOutput {
+        wac: wac_lines.join("\n\n"),
+        cmd_args: args,
+        diagnostics,
+    })
 }
 
 fn gen_wac_args(
@@ -510,7 +521,7 @@ fn apply_rule_between(
     chain: &mut Chain,
     composition: &CompositionGraph,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> RuleApplyResult {
+) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
     let mut interface_matched = false;
     let mut full_match = false;
@@ -560,15 +571,15 @@ fn apply_rule_between(
                     inject_plan,
                     ty_fingerprint,
                     checked_middlewares,
-                ));
+                )?);
             }
         }
     }
-    RuleApplyResult {
+    Ok(RuleApplyResult {
         contract_results,
         interface_matched,
         full_match,
-    }
+    })
 }
 
 fn apply_rule_before(
@@ -576,7 +587,7 @@ fn apply_rule_before(
     chain: &mut Chain,
     composition: &CompositionGraph,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> RuleApplyResult {
+) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
     let mut interface_matched = false;
     let mut full_match = false;
@@ -619,14 +630,14 @@ fn apply_rule_before(
                 inject_plan,
                 ty_fingerprint,
                 checked_middlewares,
-            ));
+            )?);
         }
     }
-    RuleApplyResult {
+    Ok(RuleApplyResult {
         contract_results,
         interface_matched,
         full_match,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -639,7 +650,7 @@ fn add_to_inject_plan(
     inject_plan: &mut InjectPlan,
     contract_fingerprint: &Option<String>,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> Vec<ContractResult> {
+) -> anyhow::Result<Vec<ContractResult>> {
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
     let contract_results = validate_contract(
@@ -649,9 +660,35 @@ fn add_to_inject_plan(
         checked_middlewares,
     );
 
+    // For tier-1 compatible middleware, generate a proxy component and substitute
+    // the injection path so the rest of the WAC generation uses the proxy.
+    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
+    let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
+    for (injection, result) in to_inject.iter().zip(contract_results.into_iter()) {
+        match result {
+            ContractResult::Tier1Compatible(matched_interfaces) => {
+                let proxy_path = generate_tier1_proxy(
+                    &injection.name,
+                    injection.path.as_deref(),
+                    interface_name,
+                    &matched_interfaces,
+                )?;
+                resolved.push(Injection {
+                    name: injection.name.clone(),
+                    path: Some(proxy_path.to_string_lossy().into_owned()),
+                });
+                // Tier1Compatible is fully handled here; no diagnostic needed upstream.
+            }
+            other => {
+                resolved.push(injection.clone());
+                final_results.push(other);
+            }
+        }
+    }
+
     let middlewares = inject_plan
         .entry(chain_idx)
-        .or_insert(IndexSet::from_iter(to_inject.iter().cloned()));
+        .or_insert(IndexSet::from_iter(resolved.iter().cloned()));
 
     for (inst_id, new_alias) in new_aliases {
         if let (Some(new_alias), Some(Some(configured_alias))) = (new_alias, aliases.get(inst_id)) {
@@ -662,8 +699,8 @@ fn add_to_inject_plan(
         aliases.insert(*inst_id, new_alias.clone());
     }
 
-    middlewares.extend(to_inject.iter().cloned());
-    contract_results
+    middlewares.extend(resolved);
+    Ok(final_results)
 }
 
 fn get_or_create_inst(
