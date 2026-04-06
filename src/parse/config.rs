@@ -53,10 +53,23 @@ pub struct YamlProviderOpt {
     alias: Option<String>,
 }
 
+/// Extra information stored on an [`Injection`] when it has been resolved as a
+/// tier-1 proxy by `add_to_inject_plan`.  Not present in the YAML config.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProxyInjectionInfo {
+    /// Path to the generated proxy `.wasm` file.
+    pub proxy_path: String,
+    /// Tier-1 interfaces the middleware exports (e.g. `"splicer:proxy/before"`).
+    pub tier1_interfaces: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Injection {
     pub name: String,
     pub path: Option<String>,
+    /// Populated at runtime (not from config) when this injection is a tier-1 proxy.
+    #[serde(skip)]
+    pub proxy_info: Option<ProxyInjectionInfo>,
 }
 
 /// --- Normalized rule type for Rust usage ---

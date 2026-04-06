@@ -1,7 +1,10 @@
 use crate::contract::{validate_contract, ContractResult};
 use crate::proxy::generate_tier1_proxy;
 use colored::Colorize;
-use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
+use cviz::model::{
+    ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection, InterfaceType, InternedId,
+    TypeArena,
+};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -9,7 +12,7 @@ use wasmparser::collections::IndexSet;
 
 pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
-use crate::parse::config::{Injection, SpliceRule};
+use crate::parse::config::{Injection, ProxyInjectionInfo, SpliceRule};
 use crate::split::gen_split_path;
 
 // chain_idx -> set of middlewares to inject AFTER
@@ -27,6 +30,7 @@ struct Chain {
 struct Contract {
     name: String,
     ty_fingerprint: Option<String>,
+    interface_type: Option<InterfaceType>,
 }
 
 /// Output of [`generate_wac`].
@@ -68,7 +72,7 @@ pub fn generate_wac(
             source_instance,
             is_host_import,
             fingerprint,
-            ..
+            interface_type: iface_ty,
         } in node.imports.iter()
         {
             let mut chain = vec![*outer_node_id];
@@ -100,6 +104,7 @@ pub fn generate_wac(
                     interface: Contract {
                         name: interface_name.to_string(),
                         ty_fingerprint: fingerprint.clone(),
+                        interface_type: iface_ty.clone(),
                     },
                     chain,
                     aliases: HashMap::new(),
@@ -116,19 +121,27 @@ pub fn generate_wac(
         ExportInfo {
             source_instance: source_inst,
             fingerprint,
-            ..
+            ty: export_ty,
         },
     ) in composition.component_exports.iter()
     {
         if handled_interfaces.contains(interface) {
             continue;
         }
+        // Resolve the interface type from the export info if available.
+        let interface_type = export_ty.and_then(|id| match id {
+            InternedId::Interface(iface_id) => {
+                Some(composition.arena.lookup_interface(iface_id).clone())
+            }
+            _ => None,
+        });
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
         chains.push(Chain {
             interface: Contract {
                 name: interface.to_string(),
                 ty_fingerprint: fingerprint.clone(),
+                interface_type,
             },
             chain: vec![*source_inst],
             aliases: HashMap::new(),
@@ -146,8 +159,20 @@ pub fn generate_wac(
         let mut any_interface_matched = false;
         let mut any_full_match = false;
         for chain in chains.iter_mut() {
-            let between = apply_rule_between(rule, chain, composition, &mut checked_middlewares)?;
-            let before = apply_rule_before(rule, chain, composition, &mut checked_middlewares)?;
+            let between = apply_rule_between(
+                rule,
+                chain,
+                composition,
+                splits_path,
+                &mut checked_middlewares,
+            )?;
+            let before = apply_rule_before(
+                rule,
+                chain,
+                composition,
+                splits_path,
+                &mut checked_middlewares,
+            )?;
             any_interface_matched |= between.interface_matched | before.interface_matched;
             any_full_match |= between.full_match | before.full_match;
             diagnostics.extend(between.contract_results);
@@ -329,14 +354,26 @@ pub fn generate_wac(
                 let reversed_list = reverse_set(middlewares);
                 for mdl in reversed_list.iter() {
                     // instantiate
-                    last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
-                    used_middlewares.push((
-                        last.clone(),
-                        mdl.path
-                            .as_ref()
-                            .cloned()
-                            .unwrap_or(PATH_PLACEHOLDER.to_string()),
-                    ));
+                    if let Some(proxy_info) = &mdl.proxy_info {
+                        let (proxy_var, extra_args) = create_tier1_mdl(
+                            &last,
+                            mdl,
+                            chain_interface,
+                            proxy_info,
+                            &mut wac_lines,
+                        );
+                        last = proxy_var;
+                        used_middlewares.extend(extra_args);
+                    } else {
+                        last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
+                        used_middlewares.push((
+                            last.clone(),
+                            mdl.path
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or(PATH_PLACEHOLDER.to_string()),
+                        ));
+                    }
                     mdl_override = Some((chain_interface.clone(), last.clone()));
                 }
             }
@@ -520,6 +557,7 @@ fn apply_rule_between(
     rule: &SpliceRule,
     chain: &mut Chain,
     composition: &CompositionGraph,
+    splits_path: &str,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
 ) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
@@ -530,6 +568,7 @@ fn apply_rule_between(
             Contract {
                 name: chain_interface,
                 ty_fingerprint,
+                interface_type: chain_iface_ty,
             },
         chain,
         inject_plan,
@@ -570,6 +609,9 @@ fn apply_rule_between(
                     aliases,
                     inject_plan,
                     ty_fingerprint,
+                    chain_iface_ty.as_ref(),
+                    splits_path,
+                    &composition.arena,
                     checked_middlewares,
                 )?);
             }
@@ -586,6 +628,7 @@ fn apply_rule_before(
     rule: &SpliceRule,
     chain: &mut Chain,
     composition: &CompositionGraph,
+    splits_path: &str,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
 ) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
@@ -596,6 +639,7 @@ fn apply_rule_before(
             Contract {
                 name: chain_interface,
                 ty_fingerprint,
+                interface_type: chain_iface_ty,
             },
         chain,
         inject_plan,
@@ -629,6 +673,9 @@ fn apply_rule_before(
                 aliases,
                 inject_plan,
                 ty_fingerprint,
+                chain_iface_ty.as_ref(),
+                splits_path,
+                &composition.arena,
                 checked_middlewares,
             )?);
         }
@@ -649,6 +696,9 @@ fn add_to_inject_plan(
     aliases: &mut HashMap<u32, Option<String>>,
     inject_plan: &mut InjectPlan,
     contract_fingerprint: &Option<String>,
+    interface_type: Option<&InterfaceType>,
+    splits_path: &str,
+    arena: &TypeArena,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
 ) -> anyhow::Result<Vec<ContractResult>> {
     // Check that the import/export contract is upheld by this plan and return results
@@ -672,10 +722,18 @@ fn add_to_inject_plan(
                     injection.path.as_deref(),
                     interface_name,
                     &matched_interfaces,
+                    interface_type,
+                    splits_path,
+                    arena,
                 )?;
                 resolved.push(Injection {
                     name: injection.name.clone(),
-                    path: Some(proxy_path.to_string_lossy().into_owned()),
+                    // Keep the original middleware path; proxy_path goes in proxy_info.
+                    path: injection.path.clone(),
+                    proxy_info: Some(ProxyInjectionInfo {
+                        proxy_path,
+                        tier1_interfaces: matched_interfaces,
+                    }),
                 });
                 // Tier1Compatible is fully handled here; no diagnostic needed upstream.
             }
@@ -777,6 +835,53 @@ fn create_mdl(
     wac_lines.push(mw_line);
 
     mw.clone()
+}
+
+/// Emit WAC for a tier-1 proxy injection: two instances — the real middleware
+/// (host-imports only) and the generated proxy wrapper that wires both.
+///
+/// Returns `(proxy_var_name, [(pkg_name, path), ...])` where the vec has two
+/// entries: one for the real middleware and one for the proxy component.
+fn create_tier1_mdl(
+    downstream_inst: &str,
+    mdl: &Injection,
+    interface: &Contract,
+    proxy_info: &ProxyInjectionInfo,
+    wac_lines: &mut Vec<String>,
+) -> (String, Vec<(String, String)>) {
+    let real_var = mdl.name.clone();
+    let proxy_var = format!("{}-proxy", mdl.name);
+
+    // Real middleware — only has host imports, so no explicit wiring needed.
+    wac_lines.push(format!(
+        "let {real_var} = new {INST_PREFIX}:{real_var} {{ ... }};"
+    ));
+
+    // Proxy — wires the downstream target interface and the tier-1 hook interfaces
+    // from the real middleware instance.
+    let mut proxy_line = format!(
+        "let {proxy_var} = new {INST_PREFIX}:{proxy_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
+        iface = interface.name,
+    );
+    for tier1_iface in &proxy_info.tier1_interfaces {
+        proxy_line.push_str(&format!(
+            "\n    \"{tier1_iface}\": {real_var}[\"{tier1_iface}\"],"
+        ));
+    }
+    proxy_line.push_str("\n    ...\n};");
+    wac_lines.push(proxy_line);
+
+    let used = vec![
+        (
+            real_var,
+            mdl.path
+                .as_ref()
+                .cloned()
+                .unwrap_or(PATH_PLACEHOLDER.to_string()),
+        ),
+        (proxy_var.clone(), proxy_info.proxy_path.clone()),
+    ];
+    (proxy_var, used)
 }
 
 fn rule_interface(rule: &SpliceRule) -> &str {

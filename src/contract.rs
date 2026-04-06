@@ -62,7 +62,7 @@ pub fn validate_contract(
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
 ) -> Vec<ContractResult> {
     let mut results = vec![];
-    for Injection { name, path } in to_inject.iter() {
+    for Injection { name, path, .. } in to_inject.iter() {
         if !checked_middlewares.contains_key(name.as_str()) {
             match discover_middleware_exports(path) {
                 Ok(exports) => {
@@ -177,6 +177,7 @@ mod tests {
     fn injection(name: &str) -> Injection {
         Injection {
             name: name.to_string(),
+            proxy_info: None,
             path: None,
         }
     }
@@ -397,6 +398,7 @@ mod tests {
 
         let inj = Injection {
             name: "mw".to_string(),
+            proxy_info: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);
@@ -438,6 +440,7 @@ mod tests {
 
         let inj = Injection {
             name: "mw".to_string(),
+            proxy_info: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);

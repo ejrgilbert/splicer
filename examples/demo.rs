@@ -166,6 +166,7 @@ const CHAIN_FP: &str = "sha256-abc123-fake-fingerprint";
 fn injection(name: &str) -> Injection {
     Injection {
         name: name.to_string(),
+        proxy_info: None,
         path: None,
     }
 }
@@ -254,6 +255,7 @@ fn run_type_check_full(mw_wat: &str, temp_name: &str) -> Vec<ContractResult> {
 
     let inj = Injection {
         name: "mw".to_string(),
+        proxy_info: None,
         path: Some(tmp_path.to_str().unwrap().to_string()),
     };
 
