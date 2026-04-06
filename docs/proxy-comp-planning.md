@@ -100,9 +100,9 @@ WIT interface:
 ```wit
 interface value-aware-middleware {
     // return some(wave-encoded-result) to short-circuit and skip downstream entirely
-    before-call: func(name: string, args: string) -> option<string>
+    before-call: async func(name: string, args: string) -> option<string>
     // return some(wave-encoded-result) to replace the downstream result
-    after-call: func(name: string, result: string) -> option<string>
+    after-call: async func(name: string, result: string) -> option<string>
 }
 ```
 
