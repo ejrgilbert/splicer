@@ -654,19 +654,16 @@ fn build_proxy_bytes(
             core_subtask_drop = None;
         }
 
-        // task.return canonicals — one per async func with a result.
+        // task.return canonicals — one per async func (void or not).
+        // Void async functions need task.return() with no args before any early Return.
         core_task_return_funcs = funcs
             .iter()
             .map(|func| {
                 if func.is_async {
-                    if let Some(cv) = func.comp_result {
-                        let idx = core_func_count;
-                        core_func_count += 1;
-                        canons.task_return(Some(cv), []);
-                        Some(idx)
-                    } else {
-                        None // void async: no task.return needed
-                    }
+                    let idx = core_func_count;
+                    core_func_count += 1;
+                    canons.task_return(func.comp_result, []);
+                    Some(idx)
                 } else {
                     None // sync: no task.return
                 }
@@ -915,6 +912,7 @@ fn build_dispatch_module(
     let waitable_join_ty: u32;
     let waitable_wait_ty: u32;
     let void_i32_ty: u32; // (i32)->()  shared for drop+task_return_i32
+    let void_void_ty: u32; // ()->()  for void async task.return
     let void_i64_ty: u32;
     let void_f32_ty: u32;
     let void_f64_ty: u32;
@@ -992,8 +990,12 @@ fn build_dispatch_module(
             types.ty().function([ValType::F32], []);
 
             void_f64_ty = ty_idx;
-            // ty_idx += 1;
+            ty_idx += 1;
             types.ty().function([ValType::F64], []);
+
+            void_void_ty = ty_idx;
+            // ty_idx += 1;
+            types.ty().function([], []);
         } else {
             // Placeholders — never used when has_async is false.
             waitable_new_ty = 0;
@@ -1003,6 +1005,7 @@ fn build_dispatch_module(
             void_i64_ty = 0;
             void_f32_ty = 0;
             void_f64_ty = 0;
+            void_void_ty = 0;
         }
 
         module.section(&types);
@@ -1107,16 +1110,20 @@ fn build_dispatch_module(
             fn_idx += 1;
             imports.import("env", "subtask_drop", EntityType::Function(void_i32_ty));
 
-            // task.return per async func with result.
+            // task.return per async func (void or non-void).
             let mut trf: Vec<Option<u32>> = vec![None; funcs.len()];
             for (i, func) in funcs.iter().enumerate() {
-                if func.is_async && func.comp_result.is_some() {
-                    let tr_ty = match func.core_results.first() {
-                        Some(ValType::I32) => void_i32_ty,
-                        Some(ValType::I64) => void_i64_ty,
-                        Some(ValType::F32) => void_f32_ty,
-                        Some(ValType::F64) => void_f64_ty,
-                        _ => void_i32_ty, // fallback
+                if func.is_async {
+                    let tr_ty = if func.comp_result.is_none() {
+                        void_void_ty // void async: task.return takes no args
+                    } else {
+                        match func.core_results.first() {
+                            Some(ValType::I32) => void_i32_ty,
+                            Some(ValType::I64) => void_i64_ty,
+                            Some(ValType::F32) => void_f32_ty,
+                            Some(ValType::F64) => void_f64_ty,
+                            _ => void_i32_ty,
+                        }
                     };
                     trf[i] = Some(fn_idx);
                     fn_idx += 1;
@@ -1148,10 +1155,10 @@ fn build_dispatch_module(
         wrapper_fn_base = downstream_import_fn_base
             + funcs.len() as u32
             + if has_async_machinery {
-                // waitable_new, join, wait, drop, subtask_drop + task_return funcs
+                // waitable_new, join, wait, drop, subtask_drop + one task.return per async func
                 5 + funcs
                     .iter()
-                    .filter(|f| f.is_async && f.comp_result.is_some())
+                    .filter(|f| f.is_async)
                     .count() as u32
             } else {
                 0
@@ -1271,6 +1278,12 @@ fn build_dispatch_module(
                     memory_index: 0,
                 }));
                 f.instruction(&Instruction::If(BlockType::Empty));
+                // Async-lifted functions MUST call task.return before returning.
+                // For void async: task.return with no args.
+                // (Blocking with a result-returning async function is rejected earlier.)
+                if let Some(tr_fn) = task_return_fns[fi] {
+                    f.instruction(&Instruction::Call(tr_fn));
+                }
                 f.instruction(&Instruction::Return);
                 f.instruction(&Instruction::End);
             }
@@ -1321,8 +1334,9 @@ fn build_dispatch_module(
             }
 
             if func.is_async {
-                // 5. task.return with result (if any)
+                // 5. task.return — required for ALL async-lifted wrappers before End.
                 if let Some(result_ptr) = func.async_result_mem_offset {
+                    // Non-void: load result from memory and return it.
                     if let Some(tr_fn) = task_return_fns[fi] {
                         let load_instr = match func.core_results.first() {
                             Some(ValType::I64) => Instruction::I64Load(wasm_encoder::MemArg {
@@ -1350,6 +1364,9 @@ fn build_dispatch_module(
                         f.instruction(&load_instr);
                         f.instruction(&Instruction::Call(tr_fn));
                     }
+                } else if let Some(tr_fn) = task_return_fns[fi] {
+                    // Void async: task.return with no args (still required before End).
+                    f.instruction(&Instruction::Call(tr_fn));
                 }
             } else {
                 // 5. return with result (if any)
