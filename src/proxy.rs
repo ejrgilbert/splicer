@@ -38,6 +38,17 @@ struct ProxyFunc {
     async_result_mem_offset: Option<u32>,
 }
 
+impl ProxyFunc {
+    /// Returns true if any parameter or the result is a string type.
+    /// Functions with strings need `Memory` + `UTF8` canonical options.
+    fn has_strings(&self) -> bool {
+        let is_string = |cv: &ComponentValType| {
+            matches!(cv, ComponentValType::Primitive(PrimitiveValType::String))
+        };
+        self.comp_params.iter().any(is_string) || self.comp_result.as_ref().is_some_and(is_string)
+    }
+}
+
 /// Generate a tier-1 proxy component that wraps `middleware_name` and adapts it to
 /// export `target_interface`.
 ///
@@ -153,6 +164,15 @@ fn extract_proxy_funcs(
             (None, vec![])
         } else {
             let (cv, ct) = primitive_cvt(arena.lookup_val(sig.results[0]), name)?;
+            // TODO: string results require a two-i32 task.return (ptr+len) and
+            // Realloc canon option for canon lift — not yet implemented.
+            if matches!(cv, ComponentValType::Primitive(PrimitiveValType::String)) {
+                anyhow::bail!(
+                    "Function '{}' has a string result which is not yet supported for \
+                     tier-1 proxy generation (requires multi-value task.return).",
+                    name
+                );
+            }
             (Some(cv), ct)
         };
 
@@ -185,13 +205,19 @@ fn extract_proxy_funcs(
 
 /// Map a cviz `ValueType` to `(ComponentValType, core_flat_types)`.
 ///
-/// Only primitive types are supported in this version. Complex types (strings in the
-/// target interface, records, variants, etc.) produce an error — use `unimplemented!`-style
-/// messages so callers can see what needs to be added.
+/// Primitive types map 1:1. Strings map to `(String, [I32, I32])` (ptr + len in canonical ABI).
+/// Other complex types (records, variants, lists, etc.) produce an error.
 fn primitive_cvt(
     vt: &ValueType,
     fn_name: &str,
 ) -> anyhow::Result<(ComponentValType, Vec<ValType>)> {
+    // String is a primitive component val type but flattens to two core values (ptr, len).
+    if matches!(vt, ValueType::String) {
+        return Ok((
+            ComponentValType::Primitive(PrimitiveValType::String),
+            vec![ValType::I32, ValType::I32],
+        ));
+    }
     let (pv, cv) = match vt {
         ValueType::Bool => (PrimitiveValType::Bool, ValType::I32),
         ValueType::S8 => (PrimitiveValType::S8, ValType::I32),
@@ -205,10 +231,13 @@ fn primitive_cvt(
         ValueType::F32 => (PrimitiveValType::F32, ValType::F32),
         ValueType::F64 => (PrimitiveValType::F64, ValType::F64),
         ValueType::Char => (PrimitiveValType::Char, ValType::I32),
+        ValueType::String => unreachable!("handled above"),
+        // TODO: add support for list, record, tuple, variant, option, result, flags, enum.
+        // Each will require updating: primitive_cvt, canon lower/lift options, and
+        // potentially the async result memory layout and task.return type.
         other => anyhow::bail!(
             "Function '{}' uses type {:?} which is not yet supported for tier-1 proxy \
-             generation. Only primitive types (bool, u8..u64, s8..s64, f32, f64, char) \
-             are supported in this version.",
+             generation. Supported types: bool, u8..u64, s8..s64, f32, f64, char, string.",
             fn_name,
             other
         ),
@@ -605,20 +634,29 @@ fn build_proxy_bytes(
         });
 
         // Lower each downstream function.
-        // Sync: no options.  Async: Async option + Memory if the func has a result.
+        // Sync: no options unless strings present (need Memory + UTF8).
+        // Async: Async + Memory if result or strings present; UTF8 if strings present.
         core_downstream_func_base = core_func_count;
         for (i, func) in funcs.iter().enumerate() {
             core_func_count += 1;
             if func.is_async {
-                let opts: Vec<CanonicalOption> = if func.comp_result.is_some() {
-                    vec![
-                        CanonicalOption::Async,
-                        CanonicalOption::Memory(mem_core_mem),
-                    ]
-                } else {
-                    vec![CanonicalOption::Async]
-                };
+                let needs_mem = func.comp_result.is_some() || func.has_strings();
+                let mut opts = vec![CanonicalOption::Async];
+                if needs_mem {
+                    opts.push(CanonicalOption::Memory(mem_core_mem));
+                }
+                if func.has_strings() {
+                    opts.push(CanonicalOption::UTF8);
+                }
                 canons.lower(downstream_func_base + i as u32, opts);
+            } else if func.has_strings() {
+                canons.lower(
+                    downstream_func_base + i as u32,
+                    [
+                        CanonicalOption::Memory(mem_core_mem),
+                        CanonicalOption::UTF8,
+                    ],
+                );
             } else {
                 canons.lower(downstream_func_base + i as u32, []);
             }
@@ -675,6 +713,16 @@ fn build_proxy_bytes(
 
     // ── 8. Core module 1: dispatch ────────────────────────────────────────
 
+    // canon lift (both sync and async) with string params requires a Realloc option so the
+    // framework can copy/allocate string data. We provide a bump allocator in the dispatch module.
+    let needs_realloc = funcs.iter().any(|f| f.has_strings());
+    // bump_start: first free byte in linear memory after all static data.
+    // Static layout: names | async results (8 bytes each) | event output (8 bytes) | block result (4 bytes)
+    let bump_start: u32 = {
+        let after_block = event_ptr + 8 + if has_blocking { 4 } else { 0 };
+        (after_block + 7) & !7 // round up to 8-byte alignment
+    };
+
     {
         let dispatch_bytes = build_dispatch_module(
             funcs,
@@ -683,6 +731,8 @@ fn build_proxy_bytes(
             has_blocking,
             event_ptr,
             block_result_ptr,
+            needs_realloc,
+            bump_start,
         )?;
         // Use RawSection to embed the pre-built module bytes directly.
         component.section(&RawSection {
@@ -755,9 +805,10 @@ fn build_proxy_bytes(
         component.section(&instances);
     }
 
-    // ── 10. Alias core wrapper functions from dispatch instance ────────────
+    // ── 10. Alias core wrapper functions (and realloc) from dispatch instance ─
 
     let core_wrapper_func_base: u32;
+    let core_realloc_fn: Option<u32>;
     {
         let mut aliases = ComponentAliasSection::new();
         core_wrapper_func_base = core_func_count;
@@ -768,6 +819,17 @@ fn build_proxy_bytes(
                 name: &func.name,
             });
         }
+        core_realloc_fn = if needs_realloc {
+            let idx = core_wrapper_func_base + funcs.len() as u32;
+            aliases.alias(Alias::CoreInstanceExport {
+                instance: dispatch_core_inst,
+                kind: ExportKind::Func,
+                name: "realloc",
+            });
+            Some(idx)
+        } else {
+            None
+        };
         component.section(&aliases);
     }
 
@@ -778,11 +840,20 @@ fn build_proxy_bytes(
         let mut canons = CanonicalFunctionSection::new();
         wrapped_func_base = func_count;
         for (i, func) in funcs.iter().enumerate() {
-            let opts: Vec<CanonicalOption> = if func.is_async {
+            let mut opts: Vec<CanonicalOption> = if func.is_async {
                 vec![CanonicalOption::Async]
             } else {
                 vec![]
             };
+            if func.has_strings() {
+                opts.push(CanonicalOption::Memory(mem_core_mem));
+                opts.push(CanonicalOption::UTF8);
+                // canon lift (sync and async) with string params requires Realloc so the
+                // framework can copy/allocate string data.
+                if let Some(rf) = core_realloc_fn {
+                    opts.push(CanonicalOption::Realloc(rf));
+                }
+            }
             canons.lift(
                 core_wrapper_func_base + i as u32,
                 target_func_ty_base + i as u32,
@@ -874,6 +945,8 @@ fn build_mem_module() -> Module {
 ///   - async builtins from `env`     (if any async funcs present)
 ///
 /// `event_ptr` is the memory offset reserved for `waitable-set.wait` event output.
+/// `needs_realloc` is true when any async function has string params (canon lift async requires Realloc).
+/// `bump_start` is the first free byte in linear memory for the bump allocator (after static data).
 fn build_dispatch_module(
     funcs: &[ProxyFunc],
     has_before: bool,
@@ -881,6 +954,8 @@ fn build_dispatch_module(
     has_blocking: bool,
     event_ptr: u32,
     block_result_ptr: Option<u32>,
+    needs_realloc: bool,
+    bump_start: u32,
 ) -> anyhow::Result<Vec<u8>> {
     let has_async = funcs.iter().any(|f| f.is_async);
     let has_async_machinery = has_async || has_before || has_after || has_blocking;
@@ -916,6 +991,7 @@ fn build_dispatch_module(
     let void_i64_ty: u32;
     let void_f32_ty: u32;
     let void_f64_ty: u32;
+    let realloc_ty: u32; // (i32,i32,i32,i32)->i32  for bump-allocator realloc
 
     {
         let mut types = TypeSection::new();
@@ -994,7 +1070,7 @@ fn build_dispatch_module(
             types.ty().function([ValType::F64], []);
 
             void_void_ty = ty_idx;
-            // ty_idx += 1;
+            ty_idx += 1;
             types.ty().function([], []);
         } else {
             // Placeholders — never used when has_async is false.
@@ -1006,6 +1082,17 @@ fn build_dispatch_module(
             void_f32_ty = 0;
             void_f64_ty = 0;
             void_void_ty = 0;
+        }
+
+        // Realloc type is needed whenever any function has strings (sync or async).
+        if needs_realloc {
+            realloc_ty = ty_idx;
+            // ty_idx += 1;
+            types
+                .ty()
+                .function([ValType::I32, ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+        } else {
+            realloc_ty = 0; // placeholder, unused
         }
 
         module.section(&types);
@@ -1167,7 +1254,24 @@ fn build_dispatch_module(
         for (i, _) in funcs.iter().enumerate() {
             fn_section.function(wrapper_ty_base + i as u32);
         }
+        if needs_realloc {
+            fn_section.function(realloc_ty);
+        }
         module.section(&fn_section);
+    }
+
+    // ── Global section (bump allocator pointer, only when realloc is needed) ──
+    if needs_realloc {
+        let mut globals = wasm_encoder::GlobalSection::new();
+        globals.global(
+            wasm_encoder::GlobalType {
+                val_type: ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &wasm_encoder::ConstExpr::i32_const(bump_start as i32),
+        );
+        module.section(&globals);
     }
 
     // ── Export section ────────────────────────────────────────────────────
@@ -1176,6 +1280,9 @@ fn build_dispatch_module(
         let mut exports = ExportSection::new();
         for (i, func) in funcs.iter().enumerate() {
             exports.export(&func.name, ExportKind::Func, wrapper_fn_base + i as u32);
+        }
+        if needs_realloc {
+            exports.export("realloc", ExportKind::Func, wrapper_fn_base + funcs.len() as u32);
         }
         module.section(&exports);
     }
@@ -1304,6 +1411,8 @@ fn build_dispatch_module(
             } else {
                 // ── Sync wrapper ───────────────────────────────────────────────
                 let mut locals: Vec<(u32, ValType)> = Vec::new();
+                // TODO: multi-value results (e.g. string → ptr+len) with has_after need
+                // multiple locals saved, one per core_results entry, not just the first.
                 if has_after && has_result {
                     let result_val_type = func.core_results[0];
                     result_local_idx = Some(func.core_params.len() as u32);
@@ -1377,6 +1486,40 @@ fn build_dispatch_module(
 
             f.instruction(&Instruction::End);
             code_section.function(&f);
+        }
+
+        // Bump-allocator realloc: (src: i32, old_size: i32, align: i32, new_size: i32) -> i32
+        // Used by canon lift async when string params are present so the framework can
+        // copy string data from the caller's stack into the proxy's linear memory.
+        // Global 0 holds the bump pointer (initialized to bump_start).
+        // aligned = (bump_ptr + align - 1) & ~(align - 1)
+        // bump_ptr = aligned + new_size
+        // return aligned
+        if needs_realloc {
+            let mut rf = Function::new(vec![(1u32, ValType::I32)]); // local 4: aligned result
+            // mask = ~(align - 1) = (align - 1) ^ -1
+            rf.instruction(&Instruction::LocalGet(2)); // align
+            rf.instruction(&Instruction::I32Const(1));
+            rf.instruction(&Instruction::I32Sub); // align - 1
+            rf.instruction(&Instruction::I32Const(-1));
+            rf.instruction(&Instruction::I32Xor); // ~(align - 1)
+            // bump_ptr + align - 1
+            rf.instruction(&Instruction::GlobalGet(0)); // bump_ptr
+            rf.instruction(&Instruction::LocalGet(2)); // align
+            rf.instruction(&Instruction::I32Const(1));
+            rf.instruction(&Instruction::I32Sub); // align - 1
+            rf.instruction(&Instruction::I32Add); // bump_ptr + align - 1
+            // aligned = and
+            rf.instruction(&Instruction::I32And);
+            rf.instruction(&Instruction::LocalTee(4)); // save aligned to local 4
+            // bump_ptr = aligned + new_size
+            rf.instruction(&Instruction::LocalGet(3)); // new_size
+            rf.instruction(&Instruction::I32Add);
+            rf.instruction(&Instruction::GlobalSet(0)); // update bump_ptr
+            // return aligned
+            rf.instruction(&Instruction::LocalGet(4));
+            rf.instruction(&Instruction::End);
+            code_section.function(&rf);
         }
 
         module.section(&code_section);
