@@ -12,8 +12,8 @@ use wasm_encoder::{
 };
 
 /// A function in the target interface, fully resolved to both component-level and
-/// core-Wasm types for proxy generation.
-struct ProxyFunc {
+/// core-Wasm types for adapter generation.
+struct AdapterFunc {
     /// The function's name in the interface.
     name: String,
     /// Whether this function is `async` in the component model.
@@ -46,7 +46,7 @@ struct ProxyFunc {
     async_result_mem_size: u32,
 }
 
-impl ProxyFunc {
+impl AdapterFunc {
     /// Returns true if any parameter or the result contains a string type (deep check).
     fn has_strings(&self, arena: &TypeArena) -> bool {
         self.param_type_ids.iter().any(|&id| type_has_strings(id, arena))
@@ -56,10 +56,10 @@ impl ProxyFunc {
     }
 }
 
-/// Generate a tier-1 proxy component that wraps `middleware_name` and adapts it to
+/// Generate a tier-1 adapter component that wraps `middleware_name` and adapts it to
 /// export `target_interface`.
 ///
-/// The generated proxy component:
+/// The generated adapter component:
 /// - Exports `target_interface` (making it a drop-in replacement for the upstream caller)
 /// - Imports the downstream component providing `target_interface`
 /// - Imports the middleware via the tier-1 type-erased interface(s)
@@ -70,8 +70,8 @@ impl ProxyFunc {
 ///   3. Forwards the call to the downstream (unless blocked)
 ///   4. Calls `after-call(fn_name)` if the middleware exports it
 ///
-/// Returns the path to the generated proxy `.wasm` file.
-pub fn generate_tier1_proxy(
+/// Returns the path to the generated adapter `.wasm` file.
+pub fn generate_tier1_adapter(
     middleware_name: &str,
     _middleware_path: Option<&str>,
     target_interface: &str,
@@ -82,13 +82,13 @@ pub fn generate_tier1_proxy(
 ) -> anyhow::Result<String> {
     let iface_ty = interface_type.ok_or_else(|| {
         anyhow::anyhow!(
-            "Type information for interface '{}' is required to generate a tier-1 proxy \
+            "Type information for interface '{}' is required to generate a tier-1 adapter \
              but was not available in the composition graph.",
             target_interface
         )
     })?;
 
-    let funcs = extract_proxy_funcs(iface_ty, arena)?;
+    let funcs = extract_adapter_funcs(iface_ty, arena)?;
 
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
@@ -96,7 +96,7 @@ pub fn generate_tier1_proxy(
         .iter()
         .any(|i| i.contains("/blocking"));
 
-    let bytes = build_proxy_bytes(
+    let bytes = build_adapter_bytes(
         target_interface,
         &funcs,
         has_before,
@@ -107,12 +107,12 @@ pub fn generate_tier1_proxy(
     )?;
 
     let out_path = format!(
-        "{splits_path}/splicer_proxy_{}_{}.wasm",
+        "{splits_path}/splicer_adapter_{}_{}.wasm",
         sanitize_name(middleware_name),
         sanitize_name(target_interface)
     );
     std::fs::write(&out_path, &bytes)
-        .with_context(|| format!("Failed to write proxy component to '{}'", out_path))?;
+        .with_context(|| format!("Failed to write adapter component to '{}'", out_path))?;
 
     Ok(out_path)
 }
@@ -339,7 +339,7 @@ fn derive_types_interface(target: &str) -> Option<String> {
 }
 
 /// Collect all unique resource ValueTypeIds used (transitively) in function signatures.
-fn collect_resource_ids(funcs: &[ProxyFunc], arena: &TypeArena) -> Vec<(ValueTypeId, String)> {
+fn collect_resource_ids(funcs: &[AdapterFunc], arena: &TypeArena) -> Vec<(ValueTypeId, String)> {
     let mut seen = HashMap::new();
     for func in funcs {
         for &id in &func.param_type_ids {
@@ -673,7 +673,7 @@ fn encode_types_inst_cv(
             .get(&id)
             .copied()
             .unwrap_or_else(|| {
-                // Leak a synthetic name — this is fine since proxy generation is short-lived.
+                // Leak a synthetic name — this is fine since adapter generation is short-lived.
                 Box::leak(format!("type-{}", raw_idx).into_boxed_str())
             });
         let export_idx = inst.type_count();
@@ -711,14 +711,14 @@ fn prim_cv(vt: &ValueType) -> Option<ComponentValType> {
 
 // ─── Type extraction ────────────────────────────────────────────────────────
 
-fn extract_proxy_funcs(
+fn extract_adapter_funcs(
     iface_ty: &InterfaceType,
     arena: &TypeArena,
-) -> anyhow::Result<Vec<ProxyFunc>> {
+) -> anyhow::Result<Vec<AdapterFunc>> {
     let inst = match iface_ty {
         InterfaceType::Instance(i) => i,
         InterfaceType::Func(_) => anyhow::bail!(
-            "Expected an instance-type interface for tier-1 proxy generation; \
+            "Expected an instance-type interface for tier-1 adapter generation; \
              bare function-type interfaces are not supported."
         ),
     };
@@ -749,7 +749,7 @@ fn extract_proxy_funcs(
         if sig.results.len() > 1 {
             anyhow::bail!(
                 "Function '{}' has {} results; only 0 or 1 results are supported \
-                 for tier-1 proxy generation in this version.",
+                 for tier-1 adapter generation in this version.",
                 name,
                 sig.results.len()
             );
@@ -765,7 +765,7 @@ fn extract_proxy_funcs(
             if !sig.is_async && is_complex {
                 anyhow::bail!(
                     "Function '{}' has a multi-value result ({} flat values) which is not \
-                     yet supported for sync tier-1 proxy generation.",
+                     yet supported for sync tier-1 adapter generation.",
                     name,
                     flat.len()
                 );
@@ -786,7 +786,7 @@ fn extract_proxy_funcs(
             };
 
         let name_len = name.len() as u32;
-        funcs.push(ProxyFunc {
+        funcs.push(AdapterFunc {
             name: name.clone(),
             is_async: sig.is_async,
             param_names,
@@ -1167,14 +1167,14 @@ fn encode_comp_cv(
 
 // ─── Component binary generation ────────────────────────────────────────────
 
-/// Build the full Wasm component binary for the tier-1 proxy.
+/// Build the full Wasm component binary for the tier-1 adapter.
 ///
 /// Uses `wasm_encoder::Component` with explicit section management so that
 /// we can create a component instance from exported items (a capability not
 /// exposed as a public method by `ComponentBuilder`).
-fn build_proxy_bytes(
+fn build_adapter_bytes(
     target_interface: &str,
-    funcs: &[ProxyFunc],
+    funcs: &[AdapterFunc],
     has_before: bool,
     has_after: bool,
     has_blocking: bool,
@@ -1271,7 +1271,7 @@ fn build_proxy_bytes(
     fn build_downstream_inst_type(
         ctx: &mut InstTypeCtx,
         inst: &mut InstanceType,
-        funcs: &[ProxyFunc],
+        funcs: &[AdapterFunc],
         arena: &TypeArena,
     ) {
         let mut pp_cvs: Vec<Vec<ComponentValType>> = Vec::new();
@@ -1381,19 +1381,19 @@ fn build_proxy_bytes(
         let before_inst = before_ty.map(|ty_idx| {
             let idx = *instance_count;
             *instance_count += 1;
-            imports.import("splicer:proxy/before", ComponentTypeRef::Instance(ty_idx));
+            imports.import("splicer:adapter/before", ComponentTypeRef::Instance(ty_idx));
             idx
         });
         let after_inst = after_ty.map(|ty_idx| {
             let idx = *instance_count;
             *instance_count += 1;
-            imports.import("splicer:proxy/after", ComponentTypeRef::Instance(ty_idx));
+            imports.import("splicer:adapter/after", ComponentTypeRef::Instance(ty_idx));
             idx
         });
         let blocking_inst = blocking_ty.map(|ty_idx| {
             let idx = *instance_count;
             *instance_count += 1;
-            imports.import("splicer:proxy/blocking", ComponentTypeRef::Instance(ty_idx));
+            imports.import("splicer:adapter/blocking", ComponentTypeRef::Instance(ty_idx));
             idx
         });
         (before_inst, after_inst, blocking_inst)
@@ -1403,7 +1403,7 @@ fn build_proxy_bytes(
     fn emit_func_aliases(
         aliases: &mut ComponentAliasSection,
         func_count: &mut u32,
-        funcs: &[ProxyFunc],
+        funcs: &[AdapterFunc],
         downstream_inst: u32,
         before_inst: Option<u32>,
         after_inst: Option<u32>,
@@ -2351,7 +2351,7 @@ fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
 /// `needs_realloc` is true when any async function has string params (canon lift async requires Realloc).
 /// `bump_start` is the first free byte in linear memory for the bump allocator (after static data).
 fn build_dispatch_module(
-    funcs: &[ProxyFunc],
+    funcs: &[AdapterFunc],
     has_before: bool,
     has_after: bool,
     has_blocking: bool,
@@ -2917,4 +2917,224 @@ fn build_dispatch_module(
     }
 
     Ok(module.finish().to_vec())
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cviz::model::{FuncSignature, InstanceInterface};
+
+    /// Helper: validate that bytes form a valid component-model binary.
+    fn validate_component(bytes: &[u8]) {
+        let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+        validator.validate_all(bytes).expect("generated adapter should be a valid component");
+    }
+
+    /// Helper: generate an adapter and return the raw bytes.
+    fn gen_adapter(
+        target: &str,
+        hooks: &[&str],
+        iface: &InterfaceType,
+        arena: &TypeArena,
+    ) -> Vec<u8> {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_strings: Vec<String> = hooks.iter().map(|s| s.to_string()).collect();
+        let path = generate_tier1_adapter(
+            "test-mdl",
+            None,
+            target,
+            &hook_strings,
+            Some(iface),
+            tmp.path().to_str().unwrap(),
+            arena,
+        )
+        .expect("adapter generation should succeed");
+        std::fs::read(&path).expect("should read generated adapter file")
+    }
+
+    fn make_iface(funcs: Vec<(&str, FuncSignature)>) -> InterfaceType {
+        InterfaceType::Instance(InstanceInterface {
+            functions: funcs
+                .into_iter()
+                .map(|(n, s)| (n.to_string(), s))
+                .collect(),
+            type_exports: BTreeMap::new(),
+        })
+    }
+
+    fn sig(is_async: bool, names: &[&str], params: Vec<ValueTypeId>, results: Vec<ValueTypeId>) -> FuncSignature {
+        FuncSignature {
+            is_async,
+            param_names: names.iter().map(|s| s.to_string()).collect(),
+            params,
+            results,
+        }
+    }
+
+    // ── Tier 1: sync primitives ──────────────────────────────────────────
+
+    #[test]
+    fn test_adapter_sync_primitives() {
+        let mut arena = TypeArena::default();
+        let s32 = arena.intern_val(ValueType::S32);
+        let iface = make_iface(vec![("add", sig(false, &["a", "b"], vec![s32, s32], vec![s32]))]);
+        let bytes = gen_adapter(
+            "test:pkg/adder@1.0.0",
+            &["splicer:adapter/before", "splicer:adapter/after"],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
+
+    // ── Tier 1: async void with string param ─────────────────────────────
+
+    #[test]
+    fn test_adapter_async_void_string() {
+        let mut arena = TypeArena::default();
+        let string = arena.intern_val(ValueType::String);
+        let iface = make_iface(vec![("print", sig(true, &["msg"], vec![string], vec![]))]);
+        let bytes = gen_adapter(
+            "test:pkg/printer@1.0.0",
+            &["splicer:adapter/before", "splicer:adapter/after"],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
+
+    // ── Tier 1: async with resource types (HTTP handler pattern) ─────────
+
+    #[test]
+    fn test_adapter_resource_handler() {
+        let mut arena = TypeArena::default();
+
+        // Build the error-code variant (simplified)
+        let string_id = arena.intern_val(ValueType::String);
+        let opt_string = arena.intern_val(ValueType::Option(string_id));
+        let u16_id = arena.intern_val(ValueType::U16);
+        let opt_u16 = arena.intern_val(ValueType::Option(u16_id));
+        let dns_error_payload = arena.intern_val(ValueType::Record(vec![
+            ("rcode".into(), opt_string),
+            ("info-code".into(), opt_u16),
+        ]));
+        let error_code = arena.intern_val(ValueType::Variant(vec![
+            ("DNS-timeout".into(), None),
+            ("DNS-error".into(), Some(dns_error_payload)),
+            ("connection-refused".into(), None),
+            ("internal-error".into(), Some(opt_string)),
+        ]));
+
+        let request = arena.intern_val(ValueType::Resource("request".into()));
+        let response = arena.intern_val(ValueType::Resource("response".into()));
+        let result_ty = arena.intern_val(ValueType::Result {
+            ok: Some(response),
+            err: Some(error_code),
+        });
+
+        let func = sig(true, &["request"], vec![request], vec![result_ty]);
+        let iface = InterfaceType::Instance(InstanceInterface {
+            functions: BTreeMap::from([("handle".to_string(), func)]),
+            type_exports: BTreeMap::from([
+                ("request".to_string(), request),
+                ("response".to_string(), response),
+                ("error-code".to_string(), error_code),
+            ]),
+        });
+
+        let bytes = gen_adapter(
+            "wasi:http/handler@0.3.0-rc-2026-01-06",
+            &["splicer:adapter/before", "splicer:adapter/after"],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
+
+    // ── Tier 1: multiple functions ───────────────────────────────────────
+
+    #[test]
+    fn test_adapter_multi_func() {
+        let mut arena = TypeArena::default();
+        let s32 = arena.intern_val(ValueType::S32);
+        let string = arena.intern_val(ValueType::String);
+        let iface = make_iface(vec![
+            ("add", sig(false, &["a", "b"], vec![s32, s32], vec![s32])),
+            ("print", sig(true, &["msg"], vec![string], vec![])),
+            ("get-value", sig(false, &[], vec![], vec![s32])),
+        ]);
+        let bytes = gen_adapter(
+            "test:pkg/mixed@1.0.0",
+            &["splicer:adapter/before", "splicer:adapter/after"],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
+
+    // ── Tier 1: before hook only ─────────────────────────────────────────
+
+    #[test]
+    fn test_adapter_before_only() {
+        let mut arena = TypeArena::default();
+        let s32 = arena.intern_val(ValueType::S32);
+        let iface = make_iface(vec![("get", sig(false, &[], vec![], vec![s32]))]);
+        let bytes = gen_adapter(
+            "test:pkg/getter@1.0.0",
+            &["splicer:adapter/before"],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
+
+    // ── Tier 1: after hook only ──────────────────────────────────────────
+
+    #[test]
+    fn test_adapter_after_only() {
+        let mut arena = TypeArena::default();
+        let s32 = arena.intern_val(ValueType::S32);
+        let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![s32]))]);
+        let bytes = gen_adapter(
+            "test:pkg/getter@1.0.0",
+            &["splicer:adapter/after"],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
+
+    // ── Tier 1: blocking hook (void async only) ──────────────────────────
+
+    #[test]
+    fn test_adapter_blocking() {
+        let mut arena = TypeArena::default();
+        let string = arena.intern_val(ValueType::String);
+        let iface = make_iface(vec![("fire", sig(true, &["msg"], vec![string], vec![]))]);
+        let bytes = gen_adapter(
+            "test:pkg/fire@1.0.0",
+            &["splicer:adapter/before", "splicer:adapter/blocking", "splicer:adapter/after"],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
+
+    // ── Tier 1: no hooks at all ──────────────────────────────────────────
+
+    #[test]
+    fn test_adapter_no_hooks() {
+        let mut arena = TypeArena::default();
+        let s32 = arena.intern_val(ValueType::S32);
+        let iface = make_iface(vec![("add", sig(false, &["a", "b"], vec![s32, s32], vec![s32]))]);
+        let bytes = gen_adapter(
+            "test:pkg/adder@1.0.0",
+            &[],
+            &iface,
+            &arena,
+        );
+        validate_component(&bytes);
+    }
 }

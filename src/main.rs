@@ -1,7 +1,7 @@
 mod compose;
 mod contract;
 mod parse;
-mod proxy;
+mod adapter;
 mod split;
 #[cfg(test)]
 mod tests;
@@ -215,7 +215,7 @@ fn run_wac(
     for diag in out.diagnostics {
         match diag {
             ContractResult::Ok => {}
-            // Tier1Compatible is fully consumed inside generate_wac (proxy is generated
+            // Tier1Compatible is fully consumed inside generate_wac (adapter is generated
             // and the injection path is substituted).  It should never surface here.
             ContractResult::Tier1Compatible(_) => unreachable!(
                 "Tier1Compatible must be consumed by add_to_inject_plan before reaching diagnostics"

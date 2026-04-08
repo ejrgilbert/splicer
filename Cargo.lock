@@ -480,6 +480,7 @@ dependencies = [
  "cviz",
  "serde",
  "serde_yaml",
+ "tempfile",
  "wasm-encoder 0.245.1",
  "wasmparser 0.245.1",
  "wat",

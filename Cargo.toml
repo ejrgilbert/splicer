@@ -39,3 +39,4 @@ wirm = { path = "../../research/compilers/wirm" }
 
 [dev-dependencies]
 wat = "1"
+tempfile = "3"

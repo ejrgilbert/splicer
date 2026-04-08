@@ -1,0 +1,3 @@
+[submodule "tests/component-interposition"]
+	path = tests/component-interposition
+	url = git@github.com:ejrgilbert/component-interposition.git

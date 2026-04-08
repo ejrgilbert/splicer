@@ -1,5 +1,5 @@
 use crate::contract::{validate_contract, ContractResult};
-use crate::proxy::generate_tier1_proxy;
+use crate::adapter::generate_tier1_adapter;
 use colored::Colorize;
 use cviz::model::{
     ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection, InterfaceType, InternedId,
@@ -12,7 +12,7 @@ use wasmparser::collections::IndexSet;
 
 pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
-use crate::parse::config::{Injection, ProxyInjectionInfo, SpliceRule};
+use crate::parse::config::{Injection, AdapterInjectionInfo, SpliceRule};
 use crate::split::gen_split_path;
 
 // chain_idx -> set of middlewares to inject AFTER
@@ -354,15 +354,15 @@ pub fn generate_wac(
                 let reversed_list = reverse_set(middlewares);
                 for mdl in reversed_list.iter() {
                     // instantiate
-                    if let Some(proxy_info) = &mdl.proxy_info {
-                        let (proxy_var, extra_args) = create_tier1_mdl(
+                    if let Some(adapter_info) = &mdl.adapter_info {
+                        let (adapter_var, extra_args) = create_tier1_mdl(
                             &last,
                             mdl,
                             chain_interface,
-                            proxy_info,
+                            adapter_info,
                             &mut wac_lines,
                         );
-                        last = proxy_var;
+                        last = adapter_var;
                         used_middlewares.extend(extra_args);
                     } else {
                         last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
@@ -710,14 +710,14 @@ fn add_to_inject_plan(
         checked_middlewares,
     );
 
-    // For tier-1 compatible middleware, generate a proxy component and substitute
-    // the injection path so the rest of the WAC generation uses the proxy.
+    // For tier-1 compatible middleware, generate a adapter component and substitute
+    // the injection path so the rest of the WAC generation uses the adapter.
     let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
     let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
     for (injection, result) in to_inject.iter().zip(contract_results.into_iter()) {
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
-                let proxy_path = generate_tier1_proxy(
+                let adapter_path = generate_tier1_adapter(
                     &injection.name,
                     injection.path.as_deref(),
                     interface_name,
@@ -728,10 +728,10 @@ fn add_to_inject_plan(
                 )?;
                 resolved.push(Injection {
                     name: injection.name.clone(),
-                    // Keep the original middleware path; proxy_path goes in proxy_info.
+                    // Keep the original middleware path; adapter_path goes in adapter_info.
                     path: injection.path.clone(),
-                    proxy_info: Some(ProxyInjectionInfo {
-                        proxy_path,
+                    adapter_info: Some(AdapterInjectionInfo {
+                        adapter_path,
                         tier1_interfaces: matched_interfaces,
                     }),
                 });
@@ -837,20 +837,20 @@ fn create_mdl(
     mw.clone()
 }
 
-/// Emit WAC for a tier-1 proxy injection: two instances — the real middleware
-/// (host-imports only) and the generated proxy wrapper that wires both.
+/// Emit WAC for a tier-1 adapter injection: two instances — the real middleware
+/// (host-imports only) and the generated adapter wrapper that wires both.
 ///
-/// Returns `(proxy_var_name, [(pkg_name, path), ...])` where the vec has two
-/// entries: one for the real middleware and one for the proxy component.
+/// Returns `(adapter_var_name, [(pkg_name, path), ...])` where the vec has two
+/// entries: one for the real middleware and one for the adapter component.
 fn create_tier1_mdl(
     downstream_inst: &str,
     mdl: &Injection,
     interface: &Contract,
-    proxy_info: &ProxyInjectionInfo,
+    adapter_info: &AdapterInjectionInfo,
     wac_lines: &mut Vec<String>,
 ) -> (String, Vec<(String, String)>) {
     let real_var = mdl.name.clone();
-    let proxy_var = format!("{}-proxy", mdl.name);
+    let adapter_var = format!("{}-adapter", mdl.name);
 
     // Real middleware — only has host imports, so no explicit wiring needed.
     wac_lines.push(format!(
@@ -859,17 +859,17 @@ fn create_tier1_mdl(
 
     // Proxy — wires the downstream target interface and the tier-1 hook interfaces
     // from the real middleware instance.
-    let mut proxy_line = format!(
-        "let {proxy_var} = new {INST_PREFIX}:{proxy_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
+    let mut adapter_line = format!(
+        "let {adapter_var} = new {INST_PREFIX}:{adapter_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
         iface = interface.name,
     );
-    for tier1_iface in &proxy_info.tier1_interfaces {
-        proxy_line.push_str(&format!(
+    for tier1_iface in &adapter_info.tier1_interfaces {
+        adapter_line.push_str(&format!(
             "\n    \"{tier1_iface}\": {real_var}[\"{tier1_iface}\"],"
         ));
     }
-    proxy_line.push_str("\n    ...\n};");
-    wac_lines.push(proxy_line);
+    adapter_line.push_str("\n    ...\n};");
+    wac_lines.push(adapter_line);
 
     let used = vec![
         (
@@ -879,9 +879,9 @@ fn create_tier1_mdl(
                 .cloned()
                 .unwrap_or(PATH_PLACEHOLDER.to_string()),
         ),
-        (proxy_var.clone(), proxy_info.proxy_path.clone()),
+        (adapter_var.clone(), adapter_info.adapter_path.clone()),
     ];
-    (proxy_var, used)
+    (adapter_var, used)
 }
 
 fn rule_interface(rule: &SpliceRule) -> &str {

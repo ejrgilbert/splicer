@@ -9,7 +9,7 @@ use std::fs;
 /// middleware contract, drawn from the WIT package:
 ///
 /// ```wit
-/// package splicer:proxy;
+/// package splicer:adapter;
 ///
 /// interface before   { before-call:       func(name: string);         }
 /// interface after    { after-call:         func(name: string);         }
@@ -23,12 +23,12 @@ use std::fs;
 /// ```
 ///
 /// A middleware is tier-1 compatible when it exports **at least one** of these
-/// interfaces. The generated proxy will only wire up the hooks that are actually
+/// interfaces. The generated adapter will only wire up the hooks that are actually
 /// present, so any non-empty subset is valid.
 pub const TIER1_INTERFACES: &[&str] = &[
-    "splicer:proxy/before",
-    "splicer:proxy/after",
-    "splicer:proxy/blocking",
+    "splicer:adapter/before",
+    "splicer:adapter/after",
+    "splicer:adapter/blocking",
 ];
 
 /// The outcome of a single middleware contract check.
@@ -44,8 +44,8 @@ pub enum ContractResult {
     /// fingerprint.  Injection should be blocked.
     Error(String),
     /// The middleware does not export the target interface but does export at
-    /// least one tier-1 type-erased interface (`splicer:proxy/{before,after,blocking}`).
-    /// The inner list names the matched interfaces so the proxy generator knows
+    /// least one tier-1 type-erased interface (`splicer:adapter/{before,after,blocking}`).
+    /// The inner list names the matched interfaces so the adapter generator knows
     /// exactly which hooks to wire up.
     Tier1Compatible(Vec<String>),
 }
@@ -103,25 +103,25 @@ pub fn validate_contract(
     results
 }
 
-/// Returns `true` when a middleware is a candidate for tier-1 proxy generation.
+/// Returns `true` when a middleware is a candidate for tier-1 adapter generation.
 ///
 /// A middleware is tier-1 compatible when:
 /// 1. It exports one of the [`TIER1_INTERFACES`] — the positive signal that it was written
 ///    as a type-erased middleware.  cviz has already validated that the exported
 ///    interface is structurally sound when it produced the fingerprint.
-/// 2. A path to the binary is provided — the proxy cannot be generated without it.
+/// 2. A path to the binary is provided — the adapter cannot be generated without it.
 /// 3. It does **not** import `target_interface` — confirming it is not a regular
 ///    pass-through middleware that simply failed the fingerprint check.
 ///
 /// Subset support (middleware implementing only some of the tier-1 functions) and
-/// detailed function-signature validation are left to the proxy generation step.
+/// detailed function-signature validation are left to the adapter generation step.
 /// Returns the subset of [`TIER1_INTERFACES`] that the middleware exports, or
 /// `None` if the middleware is not tier-1 compatible.
 ///
 /// A middleware is tier-1 compatible when:
 /// 1. It exports **at least one** of the tier-1 interfaces — the positive signal
 ///    that it was written as a type-erased middleware.
-/// 2. A path to the binary is provided — the proxy cannot be generated without it.
+/// 2. A path to the binary is provided — the adapter cannot be generated without it.
 /// 3. It does **not** import `target_interface` — confirming it is not a regular
 ///    pass-through middleware that simply failed the fingerprint check.
 fn is_tier1_compatible(
@@ -177,7 +177,7 @@ mod tests {
     fn injection(name: &str) -> Injection {
         Injection {
             name: name.to_string(),
-            proxy_info: None,
+            adapter_info: None,
             path: None,
         }
     }
@@ -398,7 +398,7 @@ mod tests {
 
         let inj = Injection {
             name: "mw".to_string(),
-            proxy_info: None,
+            adapter_info: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);
@@ -440,7 +440,7 @@ mod tests {
 
         let inj = Injection {
             name: "mw".to_string(),
-            proxy_info: None,
+            adapter_info: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);

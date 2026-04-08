@@ -783,7 +783,7 @@ mod tests {
             provider_alias: None,
             inject: vec![Injection {
                 name: "a-middleware".to_string(),
-                proxy_info: None,
+                adapter_info: None,
                 path: None,
             }],
         }];
