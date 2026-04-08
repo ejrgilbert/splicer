@@ -1209,6 +1209,22 @@ fn build_adapter_bytes(
         .collect();
     let any_has_resources = func_has_resources.iter().any(|&b| b);
 
+    // DEBUG: trace path selection
+    if let InterfaceType::Instance(inst) = iface_ty {
+        eprintln!("[adapter] any_has_resources={} has_type_exports={} type_exports={:?}",
+            any_has_resources, !inst.type_exports.is_empty(),
+            inst.type_exports.keys().collect::<Vec<_>>());
+        for func in funcs.iter() {
+            eprintln!("[adapter]   func '{}': params={:?} result={:?}",
+                func.name,
+                func.param_type_ids.iter().map(|&id| format!("{:?}", arena.lookup_val(id))).collect::<Vec<_>>(),
+                func.result_type_id.map(|id| format!("{:?}", arena.lookup_val(id))));
+        }
+    }
+    eprintln!("[adapter] resource_ids will be: {:?}", if any_has_resources {
+        collect_resource_ids(funcs, arena).iter().map(|(_, n)| n.clone()).collect::<Vec<_>>()
+    } else { vec![] });
+
     // Collect distinct resource ValueTypeIds and their names.
     let resource_ids: Vec<(ValueTypeId, String)> = if any_has_resources {
         collect_resource_ids(funcs, arena)
@@ -1456,7 +1472,16 @@ fn build_adapter_bytes(
         )
     }
 
-    if any_has_resources {
+    // Path A requires named type exports (from wirm) so we can build the types
+    // instance with proper export names.  When type_exports is empty (e.g. the
+    // composed component's handler interface didn't resolve resource names),
+    // fall back to path B which uses SubResource exports from the downstream.
+    let has_type_exports = match iface_ty {
+        InterfaceType::Instance(inst) => !inst.type_exports.is_empty(),
+        _ => false,
+    };
+
+    if any_has_resources && has_type_exports {
         // ── Path (A): types-instance import pattern ──────────────────────────
         //
         // 1a. ComponentTypeSection: hook func types + types instance type
@@ -1767,7 +1792,7 @@ fn build_adapter_bytes(
         // instance.  This ensures encode_comp_cv uses the aliased indices (e.g. the
         // aliased error-code type) instead of building fresh type definitions.
         let mut comp_cv_cache: HashMap<ValueTypeId, u32> = HashMap::new();
-        if any_has_resources {
+        if any_has_resources && has_type_exports {
             if let InterfaceType::Instance(inst) = iface_ty {
                 for (_name, &vid) in &inst.type_exports {
                     if !matches!(arena.lookup_val(vid), ValueType::Resource(_) | ValueType::AsyncHandle) {
