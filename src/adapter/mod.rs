@@ -11,6 +11,9 @@ use wasm_encoder::{
     PrimitiveValType, RawSection, TypeBounds, TypeSection, ValType,
 };
 
+mod split_imports;
+use split_imports::{extract_split_imports, SplitImports};
+
 /// A function in the target interface, fully resolved to both component-level and
 /// core-Wasm types for adapter generation.
 struct AdapterFunc {
@@ -78,6 +81,7 @@ pub fn generate_tier1_adapter(
     middleware_interfaces: &[String],
     interface_type: Option<&InterfaceType>,
     splits_path: &str,
+    downstream_split_path: Option<&str>,
     arena: &TypeArena,
 ) -> anyhow::Result<String> {
     let iface_ty = interface_type.ok_or_else(|| {
@@ -96,6 +100,12 @@ pub fn generate_tier1_adapter(
         .iter()
         .any(|i| i.contains("/blocking"));
 
+    // Extract the downstream split's import structure if available.
+    eprintln!("[adapter] downstream_split_path={:?}", downstream_split_path);
+    let split_imports = downstream_split_path
+        .map(extract_split_imports)
+        .transpose()?;
+
     let bytes = build_adapter_bytes(
         target_interface,
         &funcs,
@@ -104,6 +114,7 @@ pub fn generate_tier1_adapter(
         has_blocking,
         arena,
         iface_ty,
+        split_imports.as_ref(),
     )?;
 
     let out_path = format!(
@@ -1180,6 +1191,7 @@ fn build_adapter_bytes(
     has_blocking: bool,
     arena: &TypeArena,
     iface_ty: &InterfaceType,
+    split_imports: Option<&SplitImports>,
 ) -> anyhow::Result<Vec<u8>> {
     // ── Index counters ─────────────────────────────────────────────────────
     let mut type_count: u32 = 0;
@@ -1481,7 +1493,188 @@ fn build_adapter_bytes(
         _ => false,
     };
 
-    if any_has_resources && has_type_exports {
+    if let Some(split) = split_imports {
+        // ── Path (S): pass-through split imports ─────────────────────────────
+        //
+        // Copy the downstream split's type/import/alias sections verbatim.
+        // This gives the adapter the same type definitions and pass-through
+        // imports (types instance, WASI interfaces) as the downstream.
+        //
+        // If the split imports the handler, we use that import directly.
+        // If the split exports the handler (it IS the downstream service),
+        // we build the handler import type from the interface type info.
+
+        // Copy raw type/import/alias sections from the split
+        for (section_id, data) in &split.raw_sections {
+            component.section(&RawSection {
+                id: *section_id,
+                data,
+            });
+        }
+        type_count = split.type_count;
+        instance_count = split.instance_count;
+
+        // Check if the handler is already imported by the split
+        let handler_in_split = split.import_names.iter().any(|n| n == target_interface);
+
+        if handler_in_split {
+            // Handler import came from the raw sections — find its instance index
+            let handler_idx = split
+                .import_names
+                .iter()
+                .position(|n| n == target_interface)
+                .unwrap() as u32;
+            downstream_inst = handler_idx;
+
+            // Hook types + imports
+            {
+                let mut types = ComponentTypeSection::new();
+                let (bt, at, blt) = emit_hook_inst_types(
+                    &mut types, &mut type_count, has_before, has_after, has_blocking,
+                );
+                before_inst_ty = bt;
+                after_inst_ty = at;
+                blocking_inst_ty = blt;
+                component.section(&types);
+            }
+            {
+                let mut imports = ComponentImportSection::new();
+                let (bi, ai, bli) = emit_hook_imports(
+                    &mut imports, &mut instance_count, before_inst_ty, after_inst_ty, blocking_inst_ty,
+                );
+                before_inst = bi;
+                after_inst = ai;
+                blocking_inst = bli;
+                component.section(&imports);
+            }
+
+            // Alias funcs
+            {
+                let mut aliases = ComponentAliasSection::new();
+                let (dfb, bcf, acf, blcf) = emit_func_aliases(
+                    &mut aliases, &mut func_count, funcs, downstream_inst,
+                    before_inst, after_inst, blocking_inst,
+                );
+                downstream_func_base = dfb;
+                before_comp_func = bcf;
+                after_comp_func = acf;
+                blocking_comp_func = blcf;
+                component.section(&aliases);
+            }
+
+            // Build inst_ctx to discover resource exports (needed for
+            // sections 3b/3c), but don't emit the instance type — it came
+            // from the raw sections.
+            {
+                let mut ctx = InstTypeCtx::new();
+                let mut dummy_inst = InstanceType::new();
+                build_downstream_inst_type(&mut ctx, &mut dummy_inst, funcs, arena);
+                inst_ctx = ctx;
+            }
+
+            // Alias resource types from the handler instance
+            {
+                let mut aliases = ComponentAliasSection::new();
+                let mut res_vec: Vec<u32> = Vec::new();
+                for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
+                    let comp_res_idx = type_count;
+                    type_count += 1;
+                    aliases.alias(Alias::InstanceExport {
+                        instance: downstream_inst,
+                        kind: ComponentExportKind::Type,
+                        name: export_name,
+                    });
+                    res_vec.push(comp_res_idx);
+                }
+                comp_resource_indices = res_vec;
+                if !inst_ctx.resource_exports.is_empty() {
+                    component.section(&aliases);
+                }
+            }
+            downstream_inst_ty = 0; // handler type came from raw sections
+        } else {
+            // The split exports the handler rather than importing it (this is the
+            // downstream service itself). Build the handler import type from the
+            // interface type information. The raw sections already provide shared
+            // type definitions (e.g. wasi:http/types) that the handler references.
+
+            // Build handler instance type using the existing InstTypeCtx logic.
+            // The type_count starts from where the raw sections left off.
+            let mut types = ComponentTypeSection::new();
+
+            if any_has_resources {
+                // Build handler instance type with alias outer for resources
+                let mut ctx = InstTypeCtx::with_outer_resources(HashMap::new());
+                let mut inst = InstanceType::new();
+                // Resources are defined in the raw sections but we don't have
+                // their type indices. Use the simple SubResource path instead —
+                // the types instance from the raw sections provides the context.
+                build_downstream_inst_type(&mut ctx, &mut inst, funcs, arena);
+                downstream_inst_ty = type_count;
+                type_count += 1;
+                inst_ctx = ctx;
+                types.instance(&inst);
+            } else {
+                let mut ctx = InstTypeCtx::new();
+                let mut inst = InstanceType::new();
+                build_downstream_inst_type(&mut ctx, &mut inst, funcs, arena);
+                downstream_inst_ty = type_count;
+                type_count += 1;
+                inst_ctx = ctx;
+                types.instance(&inst);
+            }
+
+            let (bt, at, blt) = emit_hook_inst_types(
+                &mut types, &mut type_count, has_before, has_after, has_blocking,
+            );
+            before_inst_ty = bt;
+            after_inst_ty = at;
+            blocking_inst_ty = blt;
+            component.section(&types);
+
+            // Import handler + hooks
+            {
+                let mut imports = ComponentImportSection::new();
+                downstream_inst = instance_count;
+                instance_count += 1;
+                imports.import(target_interface, ComponentTypeRef::Instance(downstream_inst_ty));
+                let (bi, ai, bli) = emit_hook_imports(
+                    &mut imports, &mut instance_count, before_inst_ty, after_inst_ty, blocking_inst_ty,
+                );
+                before_inst = bi;
+                after_inst = ai;
+                blocking_inst = bli;
+                component.section(&imports);
+            }
+
+            // Alias funcs + resource types
+            {
+                let mut aliases = ComponentAliasSection::new();
+                let (dfb, bcf, acf, blcf) = emit_func_aliases(
+                    &mut aliases, &mut func_count, funcs, downstream_inst,
+                    before_inst, after_inst, blocking_inst,
+                );
+                downstream_func_base = dfb;
+                before_comp_func = bcf;
+                after_comp_func = acf;
+                blocking_comp_func = blcf;
+
+                let mut res_vec: Vec<u32> = Vec::new();
+                for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
+                    let comp_res_idx = type_count;
+                    type_count += 1;
+                    aliases.alias(Alias::InstanceExport {
+                        instance: downstream_inst,
+                        kind: ComponentExportKind::Type,
+                        name: export_name,
+                    });
+                    res_vec.push(comp_res_idx);
+                }
+                comp_resource_indices = res_vec;
+                component.section(&aliases);
+            }
+        }
+    } else if any_has_resources && has_type_exports {
         // ── Path (A): types-instance import pattern ──────────────────────────
         //
         // 1a. ComponentTypeSection: hook func types + types instance type
@@ -2973,6 +3166,7 @@ mod tests {
             &hook_strings,
             Some(iface),
             tmp.path().to_str().unwrap(),
+            None, // no downstream split in unit tests
             arena,
         )
         .expect("adapter generation should succeed");
