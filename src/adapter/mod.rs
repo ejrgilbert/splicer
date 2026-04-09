@@ -1572,22 +1572,44 @@ fn build_adapter_bytes(
                 inst_ctx = ctx;
             }
 
-            // Alias resource types from the handler instance
+            // Alias ALL type exports from the handler instance — both
+            // resources (request, response) and compound types (error-code).
+            // This ensures the adapter's exported function type references
+            // the same types as the handler import.
             {
                 let mut aliases = ComponentAliasSection::new();
                 let mut res_vec: Vec<u32> = Vec::new();
+
+                // Alias resources
                 for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
-                    let comp_res_idx = type_count;
+                    let comp_idx = type_count;
                     type_count += 1;
                     aliases.alias(Alias::InstanceExport {
                         instance: downstream_inst,
                         kind: ComponentExportKind::Type,
                         name: export_name,
                     });
-                    res_vec.push(comp_res_idx);
+                    res_vec.push(comp_idx);
                 }
                 comp_resource_indices = res_vec;
-                if !inst_ctx.resource_exports.is_empty() {
+
+                // Alias compound type exports (e.g. error-code)
+                if let InterfaceType::Instance(inst) = iface_ty {
+                    for (export_name, &vid) in &inst.type_exports {
+                        if !matches!(arena.lookup_val(vid), ValueType::Resource(_) | ValueType::AsyncHandle) {
+                            let comp_idx = type_count;
+                            type_count += 1;
+                            aliases.alias(Alias::InstanceExport {
+                                instance: downstream_inst,
+                                kind: ComponentExportKind::Type,
+                                name: export_name,
+                            });
+                            comp_aliased_types.insert(vid, comp_idx);
+                        }
+                    }
+                }
+
+                if type_count > split.type_count {
                     component.section(&aliases);
                 }
             }
@@ -1984,16 +2006,12 @@ fn build_adapter_bytes(
         // Pre-populate the cache with aliased compound type indices from the types
         // instance.  This ensures encode_comp_cv uses the aliased indices (e.g. the
         // aliased error-code type) instead of building fresh type definitions.
+        // Pre-populate the cache with any aliased compound types so that
+        // encode_comp_cv reuses them instead of building fresh definitions.
         let mut comp_cv_cache: HashMap<ValueTypeId, u32> = HashMap::new();
-        if any_has_resources && has_type_exports {
-            if let InterfaceType::Instance(inst) = iface_ty {
-                for (_name, &vid) in &inst.type_exports {
-                    if !matches!(arena.lookup_val(vid), ValueType::Resource(_) | ValueType::AsyncHandle) {
-                        if let Some(&comp_idx) = comp_aliased_types.get(&vid) {
-                            comp_cv_cache.insert(vid, comp_idx);
-                        }
-                    }
-                }
+        for (&vid, &comp_idx) in &comp_aliased_types {
+            if !matches!(arena.lookup_val(vid), ValueType::Resource(_) | ValueType::AsyncHandle) {
+                comp_cv_cache.insert(vid, comp_idx);
             }
         }
 
@@ -2427,17 +2445,46 @@ fn build_adapter_bytes(
         export_inst = instance_count;
         // instance_count += 1; // not tracking further
 
-        let export_items: Vec<(&str, ComponentExportKind, u32)> = funcs
-            .iter()
-            .enumerate()
-            .map(|(i, func)| {
-                (
-                    func.name.as_str(),
-                    ComponentExportKind::Func,
-                    wrapped_func_base + i as u32,
-                )
-            })
-            .collect();
+        let mut export_items: Vec<(&str, ComponentExportKind, u32)> = Vec::new();
+
+        // When the handler import came from raw split sections, re-export
+        // its type exports so the adapter's handler export matches what
+        // consumers expect.
+        let handler_from_split = split_imports
+            .map(|s| s.import_names.iter().any(|n| n == target_interface))
+            .unwrap_or(false);
+        if handler_from_split {
+            for (i, (_vid, export_name, _res_local, _own_local)) in
+                inst_ctx.resource_exports.iter().enumerate()
+            {
+                export_items.push((
+                    export_name,
+                    ComponentExportKind::Type,
+                    comp_resource_indices[i],
+                ));
+            }
+            if let InterfaceType::Instance(inst) = iface_ty {
+                for (export_name, &vid) in &inst.type_exports {
+                    if let Some(&comp_idx) = comp_aliased_types.get(&vid) {
+                        export_items.push((
+                            export_name,
+                            ComponentExportKind::Type,
+                            comp_idx,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Export adapter-wrapped functions
+        for (i, func) in funcs.iter().enumerate() {
+            export_items.push((
+                func.name.as_str(),
+                ComponentExportKind::Func,
+                wrapped_func_base + i as u32,
+            ));
+        }
+
         comp_instances.export_items(export_items);
         component.section(&comp_instances);
     }
