@@ -3,7 +3,7 @@ use wasm_encoder::ComponentSectionId;
 
 use super::filter::FilteredSections;
 
-/// Extracted import structure from a downstream split component.
+/// Extracted import structure from a consumer split component.
 /// Raw section bytes are copied verbatim into the adapter.
 pub(crate) struct SplitImports {
     /// Raw section bytes (section_id, data) for all type + import + alias sections,
@@ -32,7 +32,7 @@ impl From<FilteredSections> for SplitImports {
 /// as raw bytes, along with import names and index counts.
 pub(crate) fn extract_split_imports(split_path: &str) -> anyhow::Result<SplitImports> {
     let bytes = std::fs::read(split_path)
-        .with_context(|| format!("Failed to read downstream split at '{}'", split_path))?;
+        .with_context(|| format!("Failed to read consumer split at '{}'", split_path))?;
 
     let mut raw_sections = Vec::new();
     let mut import_names = Vec::new();

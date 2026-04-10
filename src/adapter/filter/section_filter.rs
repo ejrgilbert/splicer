@@ -3,17 +3,17 @@
 //! ## Why this module exists
 //!
 //! When `generate_tier1_adapter` builds an adapter for a middleware that fronts a
-//! downstream component, the adapter has to inherit the same import structure that
-//! the downstream split exposes — same type instance, same alias chain, same
-//! resource handles — so the wac composition step accepts it as a drop-in
-//! replacement.
+//! handler-providing component, the adapter has to inherit the same import structure
+//! that the *consumer* of that handler exposes — same type instance, same alias
+//! chain, same resource handles — so the wac composition step accepts it as a
+//! drop-in replacement in front of that consumer.
 //!
 //! ## Chain vs fan-in (the shape that matters)
 //!
-//! splicer wraps middleware on top of one or more downstream services. A
+//! splicer wraps middleware on top of one or more handler-providing services. A
 //! **chain** config has each service consuming exactly one upstream interface,
-//! so the split that the middleware fronts only imports the interfaces needed
-//! by that single handler:
+//! so the consumer split only imports the interfaces needed by that single
+//! handler:
 //!
 //! ```text
 //!     caller ──▶ middleware-a ──▶ service-b
@@ -129,7 +129,7 @@ impl HandlerDeps {
     }
 }
 
-/// Walk a downstream split with wirm and compute the set of section items
+/// Walk a consumer split with wirm and compute the set of section items
 /// that the target import (transitively) depends on.
 ///
 /// `target_interface` is the **import name** to look for, e.g.
@@ -140,7 +140,7 @@ pub(crate) fn find_handler_deps(
     target_interface: &str,
 ) -> anyhow::Result<HandlerDeps> {
     let bytes = std::fs::read(split_path)
-        .with_context(|| format!("Failed to read downstream split at '{split_path}'"))?;
+        .with_context(|| format!("Failed to read consumer split at '{split_path}'"))?;
     find_handler_deps_in_bytes(&bytes, target_interface)
 }
 
@@ -151,7 +151,7 @@ pub(crate) fn find_handler_deps_in_bytes(
     target_interface: &str,
 ) -> anyhow::Result<HandlerDeps> {
     let component = wirm::Component::parse(bytes, false, false)
-        .context("Failed to parse downstream split bytes")?;
+        .context("Failed to parse consumer split bytes")?;
     let mut collector = DepCollector::new(target_interface);
     walk_structural(&component, &mut collector);
     Ok(collector.into_handler_deps())

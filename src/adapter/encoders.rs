@@ -4,11 +4,10 @@
 //! Three encoders live here:
 //!
 //! - [`InstTypeCtx`] — recursively encodes component value types into
-//!   an [`InstanceType`] for use as the *downstream-import* instance
+//!   an [`InstanceType`] for use as the *handler-import* instance
 //!   type. Tracks resource exports and supports two resource modes:
 //!   in-instance `SubResource` exports (the default) or `alias outer`
-//!   to a parent-scope resource (the resource-handler / types-instance
-//!   path).
+//!   to a parent-scope resource (the via-types-instance strategy).
 //! - [`build_types_instance_type`] / [`encode_types_inst_cv`] —
 //!   build the *types-instance* import type. In an import instance
 //!   type, compound types referenced by other types must be exported

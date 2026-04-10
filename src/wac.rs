@@ -33,15 +33,15 @@ impl Chain {
     /// The consumer is the component that IMPORTS the handler interface —
     /// the adapter copies its import structure to get the right types.
     /// At `chain_idx`, the consumer is `chain[chain_idx]`.
-    fn downstream_split_path(
+    fn consumer_split_path(
         &self,
         chain_idx: usize,
         composition: &CompositionGraph,
         splits_path: &str,
         shim_comps: &HashMap<usize, usize>,
     ) -> Option<String> {
-        let downstream_id = *self.chain.get(chain_idx)?;
-        let component_num = composition.nodes.get(&downstream_id)?.component_num + 1;
+        let consumer_id = *self.chain.get(chain_idx)?;
+        let component_num = composition.nodes.get(&consumer_id)?.component_num + 1;
         let split_to_use = resolve_shim(component_num as usize, shim_comps);
         Some(gen_split_path(splits_path, split_to_use))
     }
@@ -614,7 +614,7 @@ fn apply_rule_between(
                     (inner_id, inner_alias.clone()),
                     (outer_id, outer_alias.clone()),
                 ];
-                let ds_path = chain.downstream_split_path(
+                let consumer_path = chain.consumer_split_path(
                     i + 1, composition, splits_path, shim_comps,
                 );
                 contract_results.extend(add_to_inject_plan(
@@ -627,7 +627,7 @@ fn apply_rule_between(
                     &chain.interface.ty_fingerprint,
                     chain.interface.interface_type.as_ref(),
                     splits_path,
-                    ds_path,
+                    consumer_path,
                     &composition.arena,
                     checked_middlewares,
                 )?);
@@ -672,7 +672,7 @@ fn apply_rule_before(
             }
             full_match = true;
             let new_aliases = vec![(*id, provider_alias.clone())];
-            let ds_path = chain.downstream_split_path(
+            let consumer_path = chain.consumer_split_path(
                 i + 1, composition, splits_path, shim_comps,
             );
             contract_results.extend(add_to_inject_plan(
@@ -685,7 +685,7 @@ fn apply_rule_before(
                 &chain.interface.ty_fingerprint,
                 chain.interface.interface_type.as_ref(),
                 splits_path,
-                ds_path,
+                consumer_path,
                 &composition.arena,
                 checked_middlewares,
             )?);
@@ -709,7 +709,7 @@ fn add_to_inject_plan(
     contract_fingerprint: &Option<String>,
     interface_type: Option<&InterfaceType>,
     splits_path: &str,
-    downstream_split: Option<String>,
+    consumer_split: Option<String>,
     arena: &TypeArena,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
 ) -> anyhow::Result<Vec<ContractResult>> {
@@ -736,7 +736,7 @@ fn add_to_inject_plan(
                     &matched_interfaces,
                     interface_type,
                     splits_path,
-                    downstream_split.as_deref(),
+                    consumer_split.as_deref(),
                     arena,
                 )?;
                 resolved.push(Injection {

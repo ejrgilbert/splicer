@@ -1,6 +1,6 @@
 //! Tier-1 adapter generator: wraps a middleware component with
-//! before/after/blocking hooks and re-exports the downstream
-//! component's target interface.
+//! before/after/blocking hooks and re-exports the wrapped handler's
+//! target interface.
 //!
 //! Submodules:
 //! - [`component`] — orchestrates the full Component binary build
@@ -10,11 +10,11 @@
 //! - [`encoders`] — recursive value-type encoders for component-level
 //!   and instance-level type sections.
 //! - [`filter`] — closure-based dependency walker + raw-sections
-//!   re-encoder used to filter a downstream split's import preamble.
+//!   re-encoder used to filter a consumer split's import preamble.
 //! - [`func`] — the [`AdapterFunc`] value object and the cviz →
 //!   `Vec<AdapterFunc>` extraction.
 //! - [`split_imports`] — the legacy verbatim-copy path that ships the
-//!   downstream split's whole import preamble (used as a fallback
+//!   consumer split's whole import preamble (used as a fallback
 //!   when the closure walker decides the target isn't in the split).
 //! - [`ty`] — canonical-ABI type analysis helpers (flattening,
 //!   alignment, resource collection).
@@ -44,13 +44,13 @@ use split_imports::{extract_split_imports, SplitImports};
 ///
 /// The generated adapter component:
 /// - Exports `target_interface` (making it a drop-in replacement for the upstream caller)
-/// - Imports the downstream component providing `target_interface`
+/// - Imports `target_interface` from the handler-providing component
 /// - Imports the middleware via the tier-1 type-erased interface(s)
 /// - For each function in `target_interface`:
 ///   1. Calls `before-call(fn_name)` if the middleware exports it
 ///   2. Calls `should-block-call(fn_name)` if the middleware exports it; skips
-///      the downstream invocation when it returns `true` (void functions only)
-///   3. Forwards the call to the downstream (unless blocked)
+///      the handler invocation when it returns `true` (void functions only)
+///   3. Forwards the call to the handler (unless blocked)
 ///   4. Calls `after-call(fn_name)` if the middleware exports it
 ///
 /// Returns the path to the generated adapter `.wasm` file.
@@ -61,7 +61,7 @@ pub fn generate_tier1_adapter(
     middleware_interfaces: &[String],
     interface_type: Option<&InterfaceType>,
     splits_path: &str,
-    downstream_split_path: Option<&str>,
+    consumer_split_path: Option<&str>,
     arena: &TypeArena,
 ) -> anyhow::Result<String> {
     let iface_ty = interface_type.ok_or_else(|| {
@@ -80,7 +80,7 @@ pub fn generate_tier1_adapter(
         .iter()
         .any(|i| i.contains("/blocking"));
 
-    // Extract the downstream split's import structure if available.
+    // Extract the consumer split's import structure if available.
     //
     // We run the closure-based filter (find_handler_deps + the
     // raw-section reencoder) so that fan-in splits — where the target
@@ -90,8 +90,8 @@ pub fn generate_tier1_adapter(
     // is a (mostly) no-op pass-through that re-encodes the same items
     // it walked. The reencoded bytes may differ at the LEB128 level
     // from the original verbatim bytes but are semantically identical.
-    eprintln!("[adapter] downstream_split_path={:?}", downstream_split_path);
-    let split_imports = if let Some(path) = downstream_split_path {
+    eprintln!("[adapter] consumer_split_path={:?}", consumer_split_path);
+    let split_imports = if let Some(path) = consumer_split_path {
         let deps = find_handler_deps(path, target_interface)?;
         eprintln!(
             "[adapter] find_handler_deps target={:?} -> needed={:?}",
@@ -106,7 +106,7 @@ pub fn generate_tier1_adapter(
             Some(extract_split_imports(path)?)
         } else {
             let bytes = std::fs::read(path)
-                .with_context(|| format!("Failed to read downstream split at '{}'", path))?;
+                .with_context(|| format!("Failed to read consumer split at '{}'", path))?;
             Some(SplitImports::from(extract_filtered_sections(&bytes, &deps)?))
         }
     } else {

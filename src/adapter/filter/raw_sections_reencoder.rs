@@ -109,7 +109,7 @@ pub(crate) struct FilteredSections {
     pub instance_count: u32,
 }
 
-/// Drive the closure re-encoder over a downstream split.
+/// Drive the closure re-encoder over a consumer split.
 ///
 /// Walks the binary once with wasmparser, dispatches each
 /// type/import/alias section to a [`ClosureReencoder`] that filters items

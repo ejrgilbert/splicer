@@ -1,9 +1,9 @@
-//! # Closure-based filtering of a downstream split's import preamble
+//! # Closure-based filtering of a consumer split's import preamble
 //!
 //! Two phases live in this submodule:
 //!
 //! 1. [`section_filter`] computes the **dependency closure** of a target
-//!    import in a downstream split. Output is a [`HandlerDeps`] map of
+//!    import in a consumer split. Output is a [`HandlerDeps`] map of
 //!    `section_ordinal → set of in-section item indices` describing
 //!    exactly which top-level type/import/alias items the target
 //!    transitively depends on.

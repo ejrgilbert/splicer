@@ -39,7 +39,7 @@ fn gen_adapter(
         &hook_strings,
         Some(iface),
         tmp.path().to_str().unwrap(),
-        None, // no downstream split in unit tests
+        None, // no consumer split in unit tests
         arena,
     )
     .expect("adapter generation should succeed");

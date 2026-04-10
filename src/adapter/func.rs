@@ -49,7 +49,7 @@ pub(super) struct AdapterFunc {
     pub name_len: u32,
     /// For async functions that have a result: the byte offset
     /// within the dispatch module's memory where the result will
-    /// be written by the async-lowered downstream call. `None` for
+    /// be written by the async-lowered handler call. `None` for
     /// sync functions or async void functions.
     pub async_result_mem_offset: Option<u32>,
     /// Number of bytes reserved for the async result in linear

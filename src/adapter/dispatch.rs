@@ -13,8 +13,8 @@
 //!        the returned subtask handle if the hook is async-lowered;
 //!     2. (optional) calls `should_block_call(name, result_ptr)` and,
 //!        if the hook signals true, calls `task.return` and returns
-//!        without invoking the downstream;
-//!     3. calls `downstream_f{i}` — for sync funcs this is a regular
+//!        without invoking the handler;
+//!     3. calls `handler_f{i}` — for sync funcs this is a regular
 //!        call, for async funcs it's the `canon lower async` shape
 //!        `(flat_params..., result_ptr?) -> packed_handle`;
 //!     4. (optional) calls `after_call(name)` and waits;
@@ -249,7 +249,7 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
 ///   - `env/before_call`             (func, if `has_before`)
 ///   - `env/after_call`              (func, if `has_after`)
 ///   - `env/should_block_call`       (func, if `has_blocking`)
-///   - `env/downstream_f{i}`         (func, for each target function)
+///   - `env/handler_f{i}`            (func, for each target function)
 ///   - async builtins from `env`     (if any async funcs present)
 ///
 /// `event_ptr` is the memory offset reserved for `waitable-set.wait` event output.
@@ -276,7 +276,7 @@ pub(super) fn build_dispatch_module(
     // slot 1: block   (i32, i32) -> i32
     // slot 2..2+N-1:  wrapper types (sync: params→results, async: params→void)
     // if has_async:
-    //   slot 2+N..2+N+A-1: downstream async call types (flat_params[,result_ptr]→i32)
+    //   slot 2+N..2+N+A-1: handler async call types (flat_params[,result_ptr]→i32)
     //   slot 2+N+A:   () -> i32          (waitable_set_new)
     //   slot 2+N+A+1: (i32,i32) -> ()   (waitable_join)
     //   slot 2+N+A+2: (i32,i32) -> i32  (waitable_set_wait)
@@ -289,7 +289,7 @@ pub(super) fn build_dispatch_module(
     let block_ty: u32 = 1;
     let wrapper_ty_base: u32 = 2;
 
-    // Async downstream call type indices, parallel to funcs (None for sync funcs).
+    // Async handler call type indices, parallel to funcs (None for sync funcs).
     let mut async_ds_tys: Vec<Option<u32>> = vec![None; funcs.len()];
     // Async builtin type indices.
     let waitable_new_ty: u32;
@@ -332,7 +332,7 @@ pub(super) fn build_dispatch_module(
         }
 
         if has_async_machinery {
-            // Async downstream call types: (flat_params..., result_ptr?) -> i32
+            // Async handler call types: (flat_params..., result_ptr?) -> i32
             let mut async_count: u32 = 0;
             for (i, func) in funcs.iter().enumerate() {
                 if func.is_async {
@@ -414,7 +414,7 @@ pub(super) fn build_dispatch_module(
     let before_import_fn: Option<u32>;
     let after_import_fn: Option<u32>;
     let blocking_import_fn: Option<u32>;
-    let downstream_import_fn_base: u32;
+    let handler_import_fn_base: u32;
     let waitable_new_fn: u32;
     let waitable_join_fn: u32;
     let waitable_wait_fn: u32;
@@ -467,14 +467,14 @@ pub(super) fn build_dispatch_module(
         };
 
         // Downstream funcs — type is wrapper_ty for sync, async_ds_ty for async.
-        downstream_import_fn_base = fn_idx;
+        handler_import_fn_base = fn_idx;
         for (i, func) in funcs.iter().enumerate() {
             let ty = if func.is_async {
                 async_ds_tys[i].expect("async_ds_ty must be set for async func")
             } else {
                 wrapper_ty_base + i as u32
             };
-            imports.import("env", &format!("downstream_f{i}"), EntityType::Function(ty));
+            imports.import("env", &format!("handler_f{i}"), EntityType::Function(ty));
         }
         fn_idx += funcs.len() as u32;
 
@@ -559,7 +559,7 @@ pub(super) fn build_dispatch_module(
     let wrapper_fn_base: u32;
     {
         let mut fn_section = FunctionSection::new();
-        wrapper_fn_base = downstream_import_fn_base
+        wrapper_fn_base = handler_import_fn_base
             + funcs.len() as u32
             + if has_async_machinery {
                 // waitable_new, join, wait, drop, subtask_drop + one task.return per async func
@@ -643,7 +643,7 @@ pub(super) fn build_dispatch_module(
             // ── Async wrapper ──────────────────────────────────────────────
             // Core sig: (flat_params...) -> ()
             // Locals beyond params: [subtask: i32, ws: i32]
-            // subtask/ws are reused sequentially for hook and downstream waits.
+            // subtask/ws are reused sequentially for hook and handler waits.
             let first_local = func.core_params.len() as u32;
             let subtask_local = first_local;
             let ws_local = first_local + 1;
@@ -696,15 +696,15 @@ pub(super) fn build_dispatch_module(
 
             let mut result_local_idx = None;
             if func.is_async {
-                // 3. Call async-lowered downstream: (flat_params...[, result_ptr]) -> subtask
-                let ds_fn = downstream_import_fn_base + fi as u32;
+                // 3. Call async-lowered handler: (flat_params...[, result_ptr]) -> subtask
+                let handler_fn = handler_import_fn_base + fi as u32;
                 for (pi, _) in func.core_params.iter().enumerate() {
                     f.instruction(&Instruction::LocalGet(pi as u32));
                 }
                 if let Some(result_ptr) = func.async_result_mem_offset {
                     f.instruction(&Instruction::I32Const(result_ptr as i32));
                 }
-                f.instruction(&Instruction::Call(ds_fn));
+                f.instruction(&Instruction::Call(handler_fn));
                 f.instruction(&Instruction::LocalSet(subtask_local));
                 emit_wait_loop!(f, subtask_local, ws_local);
             } else {
@@ -720,12 +720,12 @@ pub(super) fn build_dispatch_module(
                     result_local_idx = None;
                 }
 
-                // 3. Call downstream
-                let ds_fn = downstream_import_fn_base + fi as u32;
+                // 3. Call handler
+                let handler_fn = handler_import_fn_base + fi as u32;
                 for (pi, _) in func.core_params.iter().enumerate() {
                     f.instruction(&Instruction::LocalGet(pi as u32));
                 }
-                f.instruction(&Instruction::Call(ds_fn));
+                f.instruction(&Instruction::Call(handler_fn));
 
                 if let Some(local_idx) = result_local_idx {
                     f.instruction(&Instruction::LocalSet(local_idx));
