@@ -11,7 +11,12 @@ use wasm_encoder::{
     PrimitiveValType, RawSection, TypeBounds, TypeSection, ValType,
 };
 
+mod filter;
 mod split_imports;
+#[allow(unused_imports)]
+use filter::{
+    extract_filtered_sections, find_handler_deps, FilteredSections, HandlerDeps,
+};
 use split_imports::{extract_split_imports, SplitImports};
 
 /// A function in the target interface, fully resolved to both component-level and
@@ -101,10 +106,37 @@ pub fn generate_tier1_adapter(
         .any(|i| i.contains("/blocking"));
 
     // Extract the downstream split's import structure if available.
+    //
+    // We run the closure-based filter (find_handler_deps + the
+    // raw-section reencoder) so that fan-in splits — where the target
+    // interface is one of several unrelated imports in the split — only
+    // contribute the items the target actually depends on. For chain
+    // splits the closure is the entire import preamble, so the filter
+    // is a (mostly) no-op pass-through that re-encodes the same items
+    // it walked. The reencoded bytes may differ at the LEB128 level
+    // from the original verbatim bytes but are semantically identical.
     eprintln!("[adapter] downstream_split_path={:?}", downstream_split_path);
-    let split_imports = downstream_split_path
-        .map(extract_split_imports)
-        .transpose()?;
+    let split_imports = if let Some(path) = downstream_split_path {
+        let deps = find_handler_deps(path, target_interface)?;
+        eprintln!(
+            "[adapter] find_handler_deps target={:?} -> needed={:?}",
+            target_interface, deps.needed
+        );
+        if deps.is_empty() {
+            // Target import not present in the split (e.g. the split
+            // exports the handler instead of importing it). Fall back
+            // to the verbatim-copy path so the existing
+            // handler-from-export codepath still has the import
+            // metadata it needs.
+            Some(extract_split_imports(path)?)
+        } else {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read downstream split at '{}'", path))?;
+            Some(SplitImports::from(extract_filtered_sections(&bytes, &deps)?))
+        }
+    } else {
+        None
+    };
 
     let bytes = build_adapter_bytes(
         target_interface,
@@ -1494,6 +1526,10 @@ fn build_adapter_bytes(
     };
 
     if let Some(split) = split_imports {
+        eprintln!(
+            "[adapter.path] target={:?} import_names={:?} type_count={} instance_count={}",
+            target_interface, split.import_names, split.type_count, split.instance_count
+        );
         // ── Path (S): pass-through split imports ─────────────────────────────
         //
         // Copy the downstream split's type/import/alias sections verbatim.

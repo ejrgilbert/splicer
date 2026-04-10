@@ -1,6 +1,8 @@
 use anyhow::Context;
 use wasm_encoder::ComponentSectionId;
 
+use super::filter::FilteredSections;
+
 /// Extracted import structure from a downstream split component.
 /// Raw section bytes are copied verbatim into the adapter.
 pub(crate) struct SplitImports {
@@ -13,6 +15,17 @@ pub(crate) struct SplitImports {
     pub type_count: u32,
     /// Total number of instances imported.
     pub instance_count: u32,
+}
+
+impl From<FilteredSections> for SplitImports {
+    fn from(f: FilteredSections) -> Self {
+        Self {
+            raw_sections: f.raw_sections,
+            import_names: f.import_names,
+            type_count: f.type_count,
+            instance_count: f.instance_count,
+        }
+    }
 }
 
 /// Read a split component binary and extract its type/import/alias sections

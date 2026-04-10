@@ -33,7 +33,7 @@ serde_yaml = "0.9"  # or serde_toml if you prefer TOML
 anyhow = "1.0.86"
 clap = { version = "4.5.58", features = ["derive"] }
 wasmparser = "0.245.1"
-wasm-encoder = "0.245.1"
+wasm-encoder = { version = "0.245.1", features = ["wasmparser"] }
 #wirm = "3.0.0"
 wirm = { path = "../../research/compilers/wirm" }
 
