@@ -90,13 +90,8 @@ pub fn generate_tier1_adapter(
     // is a (mostly) no-op pass-through that re-encodes the same items
     // it walked. The reencoded bytes may differ at the LEB128 level
     // from the original verbatim bytes but are semantically identical.
-    eprintln!("[adapter] consumer_split_path={:?}", consumer_split_path);
     let split_imports = if let Some(path) = consumer_split_path {
         let deps = find_handler_deps(path, target_interface)?;
-        eprintln!(
-            "[adapter] find_handler_deps target={:?} -> needed={:?}",
-            target_interface, deps.needed
-        );
         if deps.is_empty() {
             // Target import not present in the split (e.g. the split
             // exports the handler instead of importing it). Fall back

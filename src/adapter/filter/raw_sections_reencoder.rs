@@ -128,7 +128,6 @@ pub(crate) fn extract_filtered_sections(
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.context("parsing split for re-encode")?;
         reencoder.current_section_idx = section_idx;
-        eprintln!("[reencoder.driver] section_idx={} payload variant", section_idx);
         match payload {
             // ─── sections we filter + emit ───────────────────────────
             Payload::ComponentTypeSection(section) => {
@@ -458,11 +457,6 @@ impl<'a> ReencodeComponent for ClosureReencoder<'a> {
         dst: &mut wasm_encoder::ComponentImportSection,
         section: wasmparser::ComponentImportSectionReader<'_>,
     ) -> Result<(), wasm_encoder::reencode::Error<Self::Error>> {
-        eprintln!(
-            "[reencoder] parse_import_section current_section_idx={} needed={:?}",
-            self.current_section_idx,
-            self.deps.needed.get(&self.current_section_idx)
-        );
         for (i, import) in section.into_iter().enumerate() {
             let import = import.map_err(|e| {
                 wasm_encoder::reencode::Error::UserError(anyhow::anyhow!(

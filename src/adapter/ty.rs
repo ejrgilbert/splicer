@@ -15,19 +15,11 @@
 //!   `string-encoding` canonical options.
 //! - **Layout** ([`canonical_align`], [`disc_align`],
 //!   [`align_to_val`]) — alignment math for the canonical ABI.
-//! - **Resources** ([`collect_resource_ids`],
-//!   [`collect_resources_rec`]) — walk a function's signatures
-//!   and collect every resource type it touches, with deterministic
-//!   names.
 //! - **Conversion** ([`prim_cv`]) — turn a primitive `ValueType`
 //!   into a `wasm_encoder::ComponentValType`.
 
-use std::collections::HashMap;
-
 use cviz::model::{TypeArena, ValueType, ValueTypeId};
 use wasm_encoder::{ComponentValType, PrimitiveValType, ValType};
-
-use super::func::AdapterFunc;
 
 /// Flatten a component-level value type into the canonical ABI
 /// sequence of core-Wasm `ValType`s.
@@ -229,81 +221,6 @@ pub(super) fn disc_align(n: usize) -> u32 {
 /// Round `offset` up to the nearest multiple of `align`.
 pub(super) fn align_to_val(offset: u32, align: u32) -> u32 {
     (offset + align - 1) & !(align - 1)
-}
-
-/// Collect all unique resource `ValueTypeId`s used (transitively) in
-/// function signatures, with deterministic export names.
-pub(super) fn collect_resource_ids(
-    funcs: &[AdapterFunc],
-    arena: &TypeArena,
-) -> Vec<(ValueTypeId, String)> {
-    let mut seen = HashMap::new();
-    for func in funcs {
-        for &id in &func.param_type_ids {
-            collect_resources_rec(id, arena, &mut seen);
-        }
-        if let Some(id) = func.result_type_id {
-            collect_resources_rec(id, arena, &mut seen);
-        }
-    }
-    let mut out: Vec<(ValueTypeId, String)> = seen.into_iter().collect();
-    out.sort_by(|a, b| a.1.cmp(&b.1)); // deterministic order
-    out
-}
-
-pub(super) fn collect_resources_rec(
-    id: ValueTypeId,
-    arena: &TypeArena,
-    seen: &mut HashMap<ValueTypeId, String>,
-) {
-    match arena.lookup_val(id) {
-        ValueType::Resource(name) => {
-            if !seen.contains_key(&id) {
-                let export_name = if name.is_empty() {
-                    format!("res-{}", seen.len())
-                } else {
-                    name.clone()
-                };
-                seen.insert(id, export_name);
-            }
-        }
-        ValueType::AsyncHandle => {
-            if !seen.contains_key(&id) {
-                let export_name = format!("res-{}", seen.len());
-                seen.insert(id, export_name);
-            }
-        }
-        ValueType::Record(fields) => {
-            for (_, fid) in fields {
-                collect_resources_rec(*fid, arena, seen);
-            }
-        }
-        ValueType::Tuple(ids) => {
-            for fid in ids {
-                collect_resources_rec(*fid, arena, seen);
-            }
-        }
-        ValueType::Variant(cases) => {
-            for (_, opt_id) in cases {
-                if let Some(fid) = opt_id {
-                    collect_resources_rec(*fid, arena, seen);
-                }
-            }
-        }
-        ValueType::Option(inner) => collect_resources_rec(*inner, arena, seen),
-        ValueType::Result { ok, err } => {
-            if let Some(oid) = ok {
-                collect_resources_rec(*oid, arena, seen);
-            }
-            if let Some(eid) = err {
-                collect_resources_rec(*eid, arena, seen);
-            }
-        }
-        ValueType::List(inner) | ValueType::FixedSizeList(inner, _) => {
-            collect_resources_rec(*inner, arena, seen);
-        }
-        _ => {}
-    }
 }
 
 /// Convert a primitive `ValueType` into a wasm-encoder

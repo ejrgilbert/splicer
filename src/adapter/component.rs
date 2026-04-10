@@ -66,7 +66,7 @@ use super::dispatch::{build_dispatch_module, build_mem_module};
 use super::encoders::{build_types_instance_type, encode_comp_cv, InstTypeCtx};
 use super::func::AdapterFunc;
 use super::split_imports::SplitImports;
-use super::ty::{collect_resource_ids, type_has_resources};
+use super::ty::type_has_resources;
 
 /// Derive the "types" interface name from a target interface name.
 /// e.g. "wasi:http/handler@0.3.0-rc-2026-01-06" → "wasi:http/types@0.3.0-rc-2026-01-06"
@@ -332,11 +332,6 @@ fn emit_imports_from_consumer_split(
     split: &SplitImports,
     any_has_resources: bool,
 ) -> ImportsOutcome {
-    eprintln!(
-        "[adapter.consumer-split] target={:?} import_names={:?} type_count={} instance_count={}",
-        target_interface, split.import_names, split.type_count, split.instance_count
-    );
-
     // Strategy-internal counters: we start by claiming the index space the
     // raw sections we just copied already consumed.
     let mut type_count: u32;
@@ -1802,29 +1797,6 @@ pub(super) fn build_adapter_bytes(
         })
         .collect();
     let any_has_resources = func_has_resources.iter().any(|&b| b);
-
-    // DEBUG: trace path selection
-    if let InterfaceType::Instance(inst) = iface_ty {
-        eprintln!("[adapter] any_has_resources={} has_type_exports={} type_exports={:?}",
-            any_has_resources, !inst.type_exports.is_empty(),
-            inst.type_exports.keys().collect::<Vec<_>>());
-        for func in funcs.iter() {
-            eprintln!("[adapter]   func '{}': params={:?} result={:?}",
-                func.name,
-                func.param_type_ids.iter().map(|&id| format!("{:?}", arena.lookup_val(id))).collect::<Vec<_>>(),
-                func.result_type_id.map(|id| format!("{:?}", arena.lookup_val(id))));
-        }
-    }
-    eprintln!("[adapter] resource_ids will be: {:?}", if any_has_resources {
-        collect_resource_ids(funcs, arena).iter().map(|(_, n)| n.clone()).collect::<Vec<_>>()
-    } else { vec![] });
-
-    // Collect distinct resource ValueTypeIds and their names.
-    let resource_ids: Vec<(ValueTypeId, String)> = if any_has_resources {
-        collect_resource_ids(funcs, arena)
-    } else {
-        vec![]
-    };
 
     let mut component = Component::new();
 

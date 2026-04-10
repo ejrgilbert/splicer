@@ -379,14 +379,16 @@ pub(super) fn build_dispatch_module(
             types.ty().function([ValType::F64], []);
 
             void_void_ty = ty_idx;
-            ty_idx += 1;
+            // No further reads of ty_idx after this point — the per-function
+            // custom task.return types live at indices `void_void_ty + 1 + N`
+            // and are tracked separately in the import phase via
+            // `custom_tr_ty_idx` (see line ~515).
             types.ty().function([], []);
 
             // Per-function custom task.return types for multi-value results.
             // Only emitted for async funcs with result_is_complex (>1 flat value).
             for func in funcs.iter() {
                 if func.is_async && func.result_is_complex {
-                    ty_idx += 1;
                     types.ty().function(func.core_results.iter().copied(), []);
                 }
             }

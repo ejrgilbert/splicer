@@ -493,10 +493,6 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         let Some(loc) = self.record_top_level(cx, item_kind_to_space(kind), id) else {
             return;
         };
-        eprintln!(
-            "[depcoll] import name={:?} kind={:?} id={} loc={:?} target={:?}",
-            import.name.0, kind, id, loc, self.target
-        );
         if import.name.0 == self.target {
             self.target_loc = Some(loc);
         }
@@ -513,10 +509,6 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         let Some(loc) = self.record_top_level(cx, item_kind_to_space(kind), id) else {
             return;
         };
-        eprintln!(
-            "[depcoll] alias kind={:?} id={} loc={:?} alias={:?}",
-            kind, id, loc, alias
-        );
         self.add_refs(cx, loc, alias);
     }
 }
