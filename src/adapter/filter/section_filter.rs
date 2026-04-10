@@ -563,38 +563,56 @@ mod tests {
         "#)
     }
 
-    /// Targeting `my:service/adder` against the simple fan-in fixture should
-    /// keep exactly the adder type section and the adder import section, and
-    /// drop everything else.
+    /// Helper: closure for a single target import in `simple_fanin`.
+    /// The closure for any target in this fixture is exactly the
+    /// pair `(its type, its import)` — we ask the layout for both
+    /// rather than hardcoding section ordinals.
+    fn simple_fanin_closure_for(layout: &BinaryLayout, target: &str) -> Vec<(usize, usize)> {
+        let import_loc = layout
+            .import_loc(target)
+            .unwrap_or_else(|| panic!("import {target} in layout"));
+        // Each interface's type section sits immediately before its
+        // import section in source order. The closure includes the
+        // type at the same position-within-types as the target
+        // import is within imports.
+        let type_locs = layout.type_locs();
+        let imports_in_order: Vec<&str> = layout
+            .sections
+            .iter()
+            .filter(|s| s.kind == BinarySectionKind::Import)
+            .flat_map(|s| s.items.iter())
+            .map(|i| i.name.as_deref().unwrap_or(""))
+            .collect();
+        let target_pos = imports_in_order
+            .iter()
+            .position(|&n| n == target)
+            .expect("target import in import-order list");
+        vec![type_locs[target_pos], import_loc]
+    }
+
+    /// Targeting `my:service/adder` against the simple fan-in fixture
+    /// should keep exactly the adder type section and the adder
+    /// import section, and drop everything else.
     #[test]
     fn simple_fanin_keeps_only_target_interface() {
         let bytes = simple_fanin();
+        let layout = BinaryLayout::from_bytes(&bytes);
+        let expected = simple_fanin_closure_for(&layout, "my:service/adder");
         let deps =
             find_handler_deps_in_bytes(&bytes, "my:service/adder").expect("dep walk");
-
-        assert!(!deps.is_empty(), "should have found the adder import");
-        assert_eq!(deps.needed.get(&0), Some(&BTreeSet::from([0])));
-        assert_eq!(deps.needed.get(&1), Some(&BTreeSet::from([0])));
-        assert_eq!(
-            deps.needed.len(),
-            2,
-            "exactly 2 sections expected; got {:?}",
-            deps.needed
-        );
+        assert_deps_match(&deps, &expected);
     }
 
-    /// Targeting the middle import in the fan-in: should pick out section 2
-    /// (its type) and section 3 (its import), nothing else. Confirms we don't
+    /// Targeting the middle import in the fan-in. Confirms we don't
     /// accidentally pick up earlier or later sections via stale state.
     #[test]
     fn simple_fanin_middle_target() {
         let bytes = simple_fanin();
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "my:service/messenger").expect("dep walk");
-
-        assert_eq!(deps.needed.get(&2), Some(&BTreeSet::from([0])));
-        assert_eq!(deps.needed.get(&3), Some(&BTreeSet::from([0])));
-        assert_eq!(deps.needed.len(), 2, "got {:?}", deps.needed);
+        let layout = BinaryLayout::from_bytes(&bytes);
+        let expected = simple_fanin_closure_for(&layout, "my:service/messenger");
+        let deps = find_handler_deps_in_bytes(&bytes, "my:service/messenger")
+            .expect("dep walk");
+        assert_deps_match(&deps, &expected);
     }
 
     /// Targeting an interface that doesn't exist in the split should yield an
@@ -617,206 +635,164 @@ mod tests {
     // with `num_aliases` items — exactly the dirty/clean classification
     // surface Step 3's byte slicer needs.
 
-    /// Build a fixture where the handler imports references the resource
-    /// aliases at the given positions in `[0, num_aliases)`. Section layout
-    /// (with the wirm `add_to_sections` collapse fix in place):
-    ///
-    /// ```text
-    /// 0: ComponentType   (types instance type, num_aliases resource exports)
-    /// 1: ComponentImport (wasi:http/types)
-    /// 2: Alias           (num_aliases items)
-    /// 3: ComponentType   (handler instance type)
-    /// 4: ComponentImport (wasi:http/handler)
-    /// ```
-    fn alias_section_fixture(num_aliases: usize, handler_uses: &[usize]) -> Vec<u8> {
-        assert!(num_aliases > 0, "fixture needs at least one alias");
-        assert!(
-            !handler_uses.is_empty(),
-            "handler must reference at least one alias for the WAT to be valid"
-        );
-        for &i in handler_uses {
-            assert!(i < num_aliases, "handler_uses index {i} out of range");
-        }
+    use super::super::test_helpers::{
+        alias_section_expected_locs, alias_section_fixture, assert_deps_match,
+        assert_layout_kinds, BinaryLayout, BinarySectionKind,
+    };
 
-        let resource_exports: String = (0..num_aliases)
-            .map(|i| format!(r#"(export "r{i}" (type (sub resource)))"#))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let aliases: String = (0..num_aliases)
-            .map(|i| format!(r#"(alias export 0 "r{i}" (type))"#))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // For each alias the handler uses, emit `(alias outer 1 (1+i) (type))`
-        // — type 0 is the types instance type, so component type `1+i` is
-        // the i-th alias-produced resource. Then export the body-local
-        // copy so the import is non-empty (some toolchains reject empty
-        // instance type bodies).
-        let handler_body: String = handler_uses
-            .iter()
-            .enumerate()
-            .map(|(body_local, &outer_alias_idx)| {
-                let outer_comp_type = outer_alias_idx + 1;
-                format!(
-                    r#"(alias outer 1 {outer_comp_type} (type)) (export "e{body_local}" (type (eq {body_local})))"#
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let handler_type_idx = num_aliases + 1;
-
-        let wat = format!(
-            r#"
-            (component
-              (type (instance {resource_exports}))
-              (import "wasi:http/types" (instance (type 0)))
-              {aliases}
-              (type (instance {handler_body}))
-              (import "wasi:http/handler" (instance (type {handler_type_idx}))))
-            "#
-        );
-
-        wat::parse_str(&wat).unwrap_or_else(|e| panic!("invalid WAT:\n{wat}\nerror: {e}"))
-    }
-
-    /// Pull just the dep set for the alias section (section ordinal 2 in the
-    /// `alias_section_fixture` shape).
-    fn alias_section_needed(deps: &HandlerDeps) -> &BTreeSet<usize> {
-        deps.needed
-            .get(&2)
-            .expect("alias section ordinal 2 missing from HandlerDeps")
+    /// Run the dep walker against an [`alias_section_fixture`] and
+    /// assert the closure matches the layout-derived expected shape
+    /// for the given `handler_uses` subset.
+    fn run_alias_section_test(num_aliases: usize, handler_uses: &[usize]) {
+        let bytes = alias_section_fixture(num_aliases, handler_uses);
+        let layout = BinaryLayout::from_bytes(&bytes);
+        let expected = alias_section_expected_locs(&layout, handler_uses);
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
+            .expect("dep walk");
+        assert_deps_match(&deps, &expected);
     }
 
     #[test]
     fn alias_section_all_clean() {
-        // 4 aliases, handler uses every one — section is fully clean.
-        let bytes = alias_section_fixture(4, &[0, 1, 2, 3]);
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
-        assert_eq!(alias_section_needed(&deps), &BTreeSet::from([0, 1, 2, 3]));
+        run_alias_section_test(4, &[0, 1, 2, 3]);
     }
 
     #[test]
     fn alias_section_dirty_scrub_first() {
-        // Drop item 0, keep items 1, 2, 3.
-        let bytes = alias_section_fixture(4, &[1, 2, 3]);
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
-        assert_eq!(alias_section_needed(&deps), &BTreeSet::from([1, 2, 3]));
+        run_alias_section_test(4, &[1, 2, 3]);
     }
 
     #[test]
     fn alias_section_dirty_scrub_middle() {
-        // Keep first and last, drop the two middle items.
-        let bytes = alias_section_fixture(4, &[0, 3]);
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
-        assert_eq!(alias_section_needed(&deps), &BTreeSet::from([0, 3]));
+        run_alias_section_test(4, &[0, 3]);
     }
 
     #[test]
     fn alias_section_dirty_scrub_last() {
-        // Keep items 0, 1, 2; drop the trailing item.
-        let bytes = alias_section_fixture(4, &[0, 1, 2]);
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
-        assert_eq!(alias_section_needed(&deps), &BTreeSet::from([0, 1, 2]));
+        run_alias_section_test(4, &[0, 1, 2]);
     }
 
     #[test]
     fn alias_section_dirty_single_needed_among_many() {
-        // 5 items, only the middle one is referenced.
-        let bytes = alias_section_fixture(5, &[2]);
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
-        assert_eq!(alias_section_needed(&deps), &BTreeSet::from([2]));
+        run_alias_section_test(5, &[2]);
     }
 
     #[test]
     fn alias_section_dirty_all_but_one() {
-        // 5 items, only the last is dropped.
-        let bytes = alias_section_fixture(5, &[0, 1, 2, 3]);
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
-        assert_eq!(alias_section_needed(&deps), &BTreeSet::from([0, 1, 2, 3]));
+        run_alias_section_test(5, &[0, 1, 2, 3]);
     }
 
-    /// Two alias sections separated by a record-type section: the first
-    /// alias section is fully clean, the record section is unrelated and
-    /// gets skipped entirely, and the second alias section is dirty
-    /// (only its first item is needed). This is the multi-section
-    /// classification matrix in a single fixture.
+    /// Two alias groups separated by a record-type section: the
+    /// first alias group is fully clean (both items needed), the
+    /// record section is unrelated and gets skipped entirely, and
+    /// the second alias group is dirty (only its first item is
+    /// needed). The expected closure is derived from the binary
+    /// layout — we ask wasmparser where each alias and import
+    /// actually sits, then build the expected loc set from those
+    /// queries. Hardcoded section ordinals would mask any
+    /// future drift.
     #[test]
     fn mixed_clean_dirty_and_skip_sections() {
         let bytes = wat(r#"
             (component
-              ;; section 0: types instance with 4 resources (component type 0)
               (type (instance
                 (export "r0" (type (sub resource)))
                 (export "r1" (type (sub resource)))
                 (export "r2" (type (sub resource)))
                 (export "r3" (type (sub resource)))))
-
-              ;; section 1: types-instance import
               (import "wasi:http/types" (instance (type 0)))
 
-              ;; section 2: alias section A — both items needed (CLEAN)
-              (alias export 0 "r0" (type))    ;; component type 1
-              (alias export 0 "r1" (type))    ;; component type 2
+              ;; alias group A
+              (alias export 0 "r0" (type))
+              (alias export 0 "r1" (type))
 
-              ;; section 3: defined record type (separator, unrelated to handler)
-              (type (record (field "x" u32)))  ;; component type 3
+              ;; record type (separator — not in the closure)
+              (type (record (field "x" u32)))
 
-              ;; section 4: alias section B — only the first item needed (DIRTY)
-              (alias export 0 "r2" (type))    ;; component type 4
-              (alias export 0 "r3" (type))    ;; component type 5
+              ;; alias group B
+              (alias export 0 "r2" (type))
+              (alias export 0 "r3" (type))
 
-              ;; section 5: handler instance type — uses r0, r1, r2 (drops r3)
+              ;; handler instance type uses r0, r1, r2 — drops r3
               (type (instance
-                (alias outer 1 1 (type))      ;; r0  → body type 0
-                (alias outer 1 2 (type))      ;; r1  → body type 1
-                (alias outer 1 4 (type))      ;; r2  → body type 2 (skip record)
+                (alias outer 1 1 (type))
+                (alias outer 1 2 (type))
+                (alias outer 1 4 (type))
                 (export "e0" (type (eq 0)))
                 (export "e1" (type (eq 1)))
                 (export "e2" (type (eq 2)))))
-
-              ;; section 6: handler import (component type 6 above)
               (import "wasi:http/handler" (instance (type 6))))
         "#);
 
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
+        let layout = BinaryLayout::from_bytes(&bytes);
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
+            .expect("dep walk");
 
-        // section 2 — clean, both alias items needed
-        assert_eq!(
-            deps.needed.get(&2),
-            Some(&BTreeSet::from([0, 1])),
-            "section 2 should be clean (both alias items needed); got {:?}",
-            deps.needed
-        );
+        // Build the expected closure by name, asking the layout
+        // for each item's actual loc:
+        //   - both imports (types instance + handler)
+        //   - r0, r1, r2 aliases (r3 is dropped)
+        //   - both top-level instance types (types-instance and
+        //     handler-instance — the record-type section is the
+        //     ONLY type item NOT in the closure)
+        let r0 = layout.alias_loc("r0").expect("r0 in layout");
+        let r1 = layout.alias_loc("r1").expect("r1 in layout");
+        let r2 = layout.alias_loc("r2").expect("r2 in layout");
+        let r3 = layout.alias_loc("r3").expect("r3 in layout");
+        let types_import = layout
+            .import_loc("wasi:http/types")
+            .expect("types import in layout");
+        let handler_import = layout
+            .import_loc("wasi:http/handler")
+            .expect("handler import in layout");
 
-        // section 3 — record type, NOT referenced anywhere → skipped entirely
+        // For the types: we need every type EXCEPT the standalone
+        // record (which has no name we can query). Use type_locs()
+        // and check that the closure matches all type locs minus
+        // the unrelated record.
+        let all_type_locs = layout.type_locs();
+
+        // The unrelated record sits between the two alias groups
+        // structurally, but we don't want to hardcode its position.
+        // Instead, we EXPECT the closure to contain all type locs
+        // EXCEPT exactly one — and we verify the exact "minus one"
+        // by checking the dep walker's output directly.
+        let mut expected: Vec<(usize, usize)> = vec![
+            r0,
+            r1,
+            r2,
+            types_import,
+            handler_import,
+        ];
+        // Add the two top-level instance types from the layout.
+        // The record type is the third type by source order, so
+        // it's at index 1 in `type_locs` (between the types-inst
+        // type at 0 and the handler-inst type at 2). We assert
+        // that explicitly via the closure size check below.
+        expected.push(all_type_locs[0]); // types-instance type
+        expected.push(all_type_locs[2]); // handler-instance type
+        assert_deps_match(&deps, &expected);
+
+        // And r3 must NOT be in the closure (the dropped item).
         assert!(
-            !deps.needed.contains_key(&3),
-            "record-type section 3 should be skipped; got {:?}",
+            !deps
+                .needed
+                .get(&r3.0)
+                .is_some_and(|s| s.contains(&r3.1)),
+            "r3 should be dropped, but it's in {:?}",
             deps.needed
         );
-
-        // section 4 — dirty, only the first alias item (r2) is needed
-        assert_eq!(
-            deps.needed.get(&4),
-            Some(&BTreeSet::from([0])),
-            "section 4 should be dirty (only item 0 needed); got {:?}",
+        // The standalone record type loc must NOT be in the closure.
+        let record_loc = all_type_locs[1];
+        assert!(
+            !deps
+                .needed
+                .get(&record_loc.0)
+                .is_some_and(|s| s.contains(&record_loc.1)),
+            "standalone record type at {:?} should be dropped, got {:?}",
+            record_loc,
             deps.needed
         );
-
-        // sections 0 / 1 / 5 / 6 — handler closure tail, all needed
-        assert!(deps.needed.contains_key(&0), "types-instance type missing");
-        assert!(deps.needed.contains_key(&1), "types-instance import missing");
-        assert!(deps.needed.contains_key(&5), "handler type missing");
-        assert!(deps.needed.contains_key(&6), "handler import missing");
     }
 
     /// Fan-in fixture that exercises the alias-outer chain — the case the
@@ -884,35 +860,177 @@ mod tests {
     #[test]
     fn alias_outer_fanin_follows_chain_to_types_instance() {
         let bytes = fanin_with_alias_outer();
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
+        let layout = BinaryLayout::from_bytes(&bytes);
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
+            .expect("dep walk");
 
-        assert!(!deps.is_empty(), "handler import should have been found");
+        // The expected closure pulls in everything reachable from
+        // the handler import via the alias-outer chain back to the
+        // wasi:http/types instance, but leaves the unrelated
+        // messenger interface alone.
+        //
+        // We ask the layout for every named item by name, and grab
+        // both the types-instance and handler-instance types
+        // positionally — those are the FIRST and SECOND of the
+        // three top-level instance types in the fixture. The
+        // messenger instance type is the third top-level type and
+        // must be excluded; we assert that separately.
+        let request = layout.alias_loc("request").expect("request alias");
+        let response = layout.alias_loc("response").expect("response alias");
+        let error_info = layout.alias_loc("error-info").expect("error-info alias");
+        let types_import = layout
+            .import_loc("wasi:http/types")
+            .expect("types import");
+        let handler_import = layout
+            .import_loc("wasi:http/handler")
+            .expect("handler import");
 
-        // Section 0 (types instance type) — needed (transitively, via the
-        // alias chain back to the types import).
-        assert!(deps.needed.contains_key(&0), "missing types-instance type section: {:?}", deps.needed);
-        // Section 1 (types instance import) — needed (the alias section
-        // resolves through it).
-        assert!(deps.needed.contains_key(&1), "missing types-instance import section: {:?}", deps.needed);
-        // Section 2 (the three aliases) — needed.
-        assert!(deps.needed.contains_key(&2), "missing alias section: {:?}", deps.needed);
-        // Section 3 (handler instance type) — needed.
-        assert!(deps.needed.contains_key(&3), "missing handler type section: {:?}", deps.needed);
-        // Section 4 (handler import) — needed.
-        assert!(deps.needed.contains_key(&4), "missing handler import section: {:?}", deps.needed);
+        let all_type_locs = layout.type_locs();
+        let types_instance_type = all_type_locs[0];
+        let handler_instance_type = all_type_locs[1];
+        let messenger_instance_type = all_type_locs[2];
 
-        // Section 5 / 6 (messenger type + import) — must be dropped.
-        assert!(!deps.needed.contains_key(&5), "should have dropped messenger type section");
-        assert!(!deps.needed.contains_key(&6), "should have dropped messenger import section");
+        let expected = vec![
+            types_instance_type,
+            types_import,
+            request,
+            response,
+            error_info,
+            handler_instance_type,
+            handler_import,
+        ];
+        assert_deps_match(&deps, &expected);
 
-        // The alias section should have all three of its items (request,
-        // response, error-info), since the handler type body references all
-        // three via alias outer.
-        assert_eq!(
-            deps.needed.get(&2),
-            Some(&BTreeSet::from([0, 1, 2])),
-            "alias section closure mismatch"
+        // The unrelated messenger pieces must be excluded — verify
+        // by name and position.
+        assert!(
+            layout.import_loc("my:service/messenger").is_some(),
+            "fixture should contain the messenger import"
         );
+        let messenger_import = layout
+            .import_loc("my:service/messenger")
+            .expect("messenger import");
+        assert!(
+            !deps
+                .needed
+                .get(&messenger_import.0)
+                .is_some_and(|s| s.contains(&messenger_import.1)),
+            "messenger import should be dropped"
+        );
+        assert!(
+            !deps
+                .needed
+                .get(&messenger_instance_type.0)
+                .is_some_and(|s| s.contains(&messenger_instance_type.1)),
+            "messenger instance type should be dropped"
+        );
+    }
+
+    /// Top-level **defined types** with field refs to other top-level
+    /// types exercise the `visit_comp_type` leaf handler. The handler
+    /// calls `referenced_indices()`, which walks the compound type
+    /// structure (record, variant, list, option, …) and returns refs
+    /// to embedded type indices. The dep walker should follow those
+    /// refs transitively into the closure.
+    ///
+    /// Verified by closure-shape assertions only — the reassembled
+    /// component model bytes wouldn't necessarily validate (the
+    /// component model has strict rules about which compound shapes
+    /// are allowed at the top level of imports), but the dep walker
+    /// is what we're testing, not the import-validity rules.
+    #[test]
+    fn defined_type_field_refs_follow_into_closure() {
+        // Component-scope types:
+        //   0: record { x: string }   ← leaf defined type
+        //   1: record { y: 0 }        ← compound; field "y" references type 0
+        //   2: instance type { alias outer 1 1 (type); export "thing" (eq 0) }
+        // Handler import references type 2.
+        //
+        // Closure walk: handler import → type 2 → type 1 (via alias
+        // outer in body) → type 0 (via field "y" — this is the link
+        // that visit_comp_type's add_refs path is responsible for).
+        // If add_refs doesn't follow the field ref, type 0 is
+        // dropped from the closure.
+        let bytes = wat(r#"
+            (component
+              (type (record (field "x" string)))
+              (type (record (field "y" 0)))
+              (type (instance
+                (alias outer 1 1 (type))
+                (export "thing" (type (eq 0)))))
+              (import "my:foo/handler" (instance (type 2))))
+        "#);
+
+        // Independently parse with wasmparser. The fixture defines
+        // 3 top-level types and 1 import — but we don't hardcode
+        // section ordinals; we ask the layout where they actually
+        // live.
+        let layout = BinaryLayout::from_bytes(&bytes);
+        let all_type_locs = layout.type_locs();
+        assert_eq!(
+            all_type_locs.len(),
+            3,
+            "fixture should define exactly three top-level types"
+        );
+        let target_loc = layout
+            .import_loc("my:foo/handler")
+            .expect("handler import in layout");
+
+        let deps = find_handler_deps_in_bytes(&bytes, "my:foo/handler")
+            .expect("dep walk");
+
+        // Expected closure: every top-level type plus the handler
+        // import. The critical link is the leaf record (the first
+        // type) — if the dep walker's leaf-type handler doesn't
+        // follow the field ref from the second record, the leaf
+        // type's loc would be missing from the closure and
+        // `assert_deps_match` would surface the diff.
+        let mut expected: Vec<(usize, usize)> = all_type_locs;
+        expected.push(target_loc);
+        assert_deps_match(&deps, &expected);
+    }
+
+    /// When two imports reference the same type, dropping the
+    /// non-target one must NOT drop the shared type — the target
+    /// still depends on it. Verifies that the closure walker scopes
+    /// "is this type needed?" by reachability from the target, not
+    /// by counting how many imports reference it.
+    ///
+    /// Test expectations are derived from the actual binary layout
+    /// via [`BinaryLayout`] rather than from positional assumptions
+    /// about the fixture, so a layout shift surfaces as a clear
+    /// shape error before any closure-shape assertions run.
+    #[test]
+    fn shared_type_ref_preserved_when_one_consumer_dropped() {
+        let bytes = wat(r#"
+            (component
+              (type (instance (export "fn" (func))))
+              (import "my:other/thing" (instance (type 0)))
+              (import "my:foo/handler" (instance (type 0))))
+        "#);
+
+        // Independently parse the fixture with wasmparser to know
+        // exactly which section each item lives in.
+        let layout = BinaryLayout::from_bytes(&bytes);
+        assert_layout_kinds(
+            &layout,
+            &[BinarySectionKind::Type, BinarySectionKind::Import],
+        );
+        let type_locs = layout.type_locs();
+        assert_eq!(type_locs.len(), 1, "fixture should define exactly one type");
+        let shared_type_loc = type_locs[0];
+        let target_loc = layout
+            .import_loc("my:foo/handler")
+            .expect("handler import in layout");
+
+        let deps = find_handler_deps_in_bytes(&bytes, "my:foo/handler")
+            .expect("dep walk");
+
+        // Closure: shared type (because the handler depends on it)
+        // + handler import. The non-target "my:other/thing" import
+        // is reachable from nothing in the closure and must be
+        // dropped — `assert_deps_match` enforces this because
+        // `expected_locs` doesn't include it.
+        assert_deps_match(&deps, &[shared_type_loc, target_loc]);
     }
 }

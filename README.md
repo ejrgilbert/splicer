@@ -33,7 +33,7 @@ Instead of manually restructuring component wiring, you define:
 And `splicer` generates the modified composition plan.
 
 A demo of `splicer` can be run using: `cargo run --example demo`
-
+A more in-depth usage of `splicer` is done in the external [`component-interposition`](https://github.com/ejrgilbert/component-interposition) repo.
 ---
 
 # Installation

@@ -22,6 +22,8 @@
 
 pub(crate) mod raw_sections_reencoder;
 pub(crate) mod section_filter;
+#[cfg(test)]
+mod test_helpers;
 
 pub(crate) use raw_sections_reencoder::{extract_filtered_sections, FilteredSections};
 pub(crate) use section_filter::{find_handler_deps, HandlerDeps};

@@ -128,6 +128,7 @@ pub(crate) fn extract_filtered_sections(
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.context("parsing split for re-encode")?;
         reencoder.current_section_idx = section_idx;
+        eprintln!("[reencoder.driver] section_idx={} payload variant", section_idx);
         match payload {
             // ─── sections we filter + emit ───────────────────────────
             Payload::ComponentTypeSection(section) => {
@@ -593,6 +594,7 @@ fn alias_namespace(alias: &ComponentAlias<'_>) -> AliasSpaceKind {
 #[cfg(test)]
 mod tests {
     use super::super::section_filter::find_handler_deps_in_bytes;
+    use super::super::test_helpers::BinaryLayout;
     use super::*;
 
     /// Convert WAT source to component bytes (test helper).
@@ -812,39 +814,71 @@ mod tests {
         // instance, the types-instance import, all three resource
         // aliases, the handler instance type, and the handler import.
         // The messenger type + import must be dropped.
-        let (filtered, reassembled) = run_filter(alias_outer_fanin(), "wasi:http/handler");
+        let bytes = wat(alias_outer_fanin());
 
-        // 2 component types kept (types instance + handler instance)
-        // 3 alias-produced types kept (request, response, error-info)
-        // → 5 types total
+        // Sanity-check the input fixture's layout up front so a
+        // wat or wirm change surfaces here, not as a confusing
+        // count mismatch deep in the test.
+        let in_layout = BinaryLayout::from_bytes(&bytes);
         assert_eq!(
-            filtered.type_count, 5,
-            "expected 2 type-section types + 3 alias types, got {}",
-            filtered.type_count
+            in_layout.type_locs().len(),
+            3,
+            "fixture should define 3 top-level instance types"
         );
-        // 2 instances kept (wasi:http/types import + handler import)
+        assert!(in_layout.alias_loc("request").is_some());
+        assert!(in_layout.alias_loc("response").is_some());
+        assert!(in_layout.alias_loc("error-info").is_some());
+        assert!(in_layout.import_loc("wasi:http/types").is_some());
+        assert!(in_layout.import_loc("wasi:http/handler").is_some());
+        assert!(in_layout.import_loc("my:service/messenger").is_some());
+
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
+            .expect("dep walk");
+        let filtered = extract_filtered_sections(&bytes, &deps).expect("reencode");
+        let reassembled = wrap_as_component(&filtered.raw_sections);
+
+        // 2 instance types (types-instance + handler) + 3 alias
+        // resources = 5 types in the closure. 2 instance imports
+        // (types + handler). The messenger type and import are
+        // dropped.
+        assert_eq!(filtered.type_count, 5);
         assert_eq!(filtered.instance_count, 2);
         assert_eq!(
             filtered.import_names,
             vec!["wasi:http/types".to_string(), "wasi:http/handler".to_string()]
         );
 
-        let (types, imports, aliases) = count_top_level_items(&reassembled);
-        assert_eq!(types, 2, "type sections: types instance + handler instance");
-        assert_eq!(imports, 2, "imports: wasi:http/types + wasi:http/handler");
-        assert_eq!(aliases, 3, "aliases: request + response + error-info");
-
+        // The reassembled output: ask its OWN layout for the
+        // surviving items rather than counting via a separate path.
+        let out_layout = BinaryLayout::from_bytes(&reassembled);
         assert_eq!(
-            collect_import_names(&reassembled),
-            vec!["wasi:http/types", "wasi:http/handler"]
+            out_layout.type_locs().len(),
+            2,
+            "filtered output should have exactly 2 type-section items \
+             (types-instance and handler-instance); got {:?}",
+            out_layout.type_locs()
+        );
+        assert_eq!(
+            out_layout.alias_locs().len(),
+            3,
+            "filtered output should have exactly 3 alias items \
+             (request, response, error-info)"
+        );
+        assert!(out_layout.alias_loc("request").is_some());
+        assert!(out_layout.alias_loc("response").is_some());
+        assert!(out_layout.alias_loc("error-info").is_some());
+        assert!(out_layout.import_loc("wasi:http/types").is_some());
+        assert!(out_layout.import_loc("wasi:http/handler").is_some());
+        assert!(
+            out_layout.import_loc("my:service/messenger").is_none(),
+            "messenger should be dropped from the filtered output"
         );
 
         // The renumbering invariant: the handler import's type ref
-        // must point at the second type in the filtered output (the
-        // handler instance type, now at idx 1), AND the alias outer
-        // refs inside the handler body must climb out of the body
-        // and land on the renumbered alias-produced types. If any
-        // of those translations is wrong, validation fails.
+        // must point at the renumbered handler instance type, AND
+        // the alias outer refs inside the handler body must climb
+        // out of the body and land on the renumbered alias-produced
+        // types. If any translation is wrong, validation fails.
         validate_component(&reassembled);
     }
 
@@ -918,5 +952,305 @@ mod tests {
         assert_eq!(filtered.instance_count, 0);
         assert!(filtered.raw_sections.is_empty());
         assert!(filtered.import_names.is_empty());
+    }
+
+    /// Top-level **type** imports (not instance imports) hit a
+    /// different branch of `parse_component_import_section` that
+    /// bumps `orig_type` instead of `orig_inst`. None of the other
+    /// fixtures exercise this — they all use instance imports.
+    /// This test confirms a type import in the closure round-trips
+    /// through the reencoder with correct index translation, and
+    /// that an alias-outer ref *to* the type import in the handler
+    /// body resolves through the translation map after filtering.
+    #[test]
+    fn type_import_survives_reencode() {
+        // Component-scope types:
+        //   0: imported resource type "my:thing/widget"   ← TYPE IMPORT
+        //   1: handler instance type
+        // Handler body uses alias outer to bring type 0 into its
+        // body, so the type import is reachable from the handler in
+        // the dep closure.
+        let (filtered, reassembled) = run_filter(
+            r#"
+            (component
+              (import "my:thing/widget" (type (sub resource)))
+              (type (instance
+                (alias outer 1 0 (type))
+                (export "use" (type (eq 0)))))
+              (import "my:thing/handler" (instance (type 1))))
+            "#,
+            "my:thing/handler",
+        );
+
+        // The type import contributes 1 to type_count (the imported
+        // resource type), the handler instance type contributes 1
+        // more → 2 component-level types.
+        assert_eq!(filtered.type_count, 2);
+        // Only the handler is in the *instance* space — the type
+        // import lives in the type space, so instance_count is 1.
+        assert_eq!(filtered.instance_count, 1);
+        // import_names tracks instance imports only — type imports
+        // aren't pushed because they don't add to the instance
+        // namespace the adapter wires up.
+        assert_eq!(
+            filtered.import_names,
+            vec!["my:thing/handler".to_string()],
+            "type imports are not surfaced in import_names; only the handler should be there"
+        );
+
+        let (types, imports, aliases) = count_top_level_items(&reassembled);
+        // 1 type section (handler instance type), 2 imports (the
+        // resource type import + the handler import), 0 aliases.
+        assert_eq!(types, 1);
+        assert_eq!(imports, 2);
+        assert_eq!(aliases, 0);
+
+        // The reassembled output should validate — index translation
+        // through the type-import branch and the alias-outer ref in
+        // the handler body must both line up.
+        validate_component(&reassembled);
+    }
+
+    // ─── reencoder mirrors of dep walker scrub tests ─────────────────────
+    //
+    // The dep walker (section_filter::tests) covers the full clean /
+    // dirty / skip matrix against `alias_section_fixture`. Those
+    // tests verify the closure is correct. The reencoder is what then
+    // turns that closure into actual emitted bytes — index translation,
+    // wasm_encoder shim correctness, body-local vs cross-scope refs.
+    // The mirrors below run the full pipeline against the same
+    // fixtures and validate the output bytes.
+
+    use super::super::test_helpers::alias_section_fixture;
+
+    /// End-to-end helper for the scrub matrix: build the fixture,
+    /// run the dep walker, run the reencoder, validate output, and
+    /// return both the filtered sections and the assembled component
+    /// for assertions.
+    fn run_alias_scrub(num_aliases: usize, handler_uses: &[usize]) -> (FilteredSections, Vec<u8>) {
+        let bytes = alias_section_fixture(num_aliases, handler_uses);
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
+            .expect("dep walk");
+        let filtered = extract_filtered_sections(&bytes, &deps).expect("reencode");
+        let reassembled = wrap_as_component(&filtered.raw_sections);
+        validate_component(&reassembled);
+        (filtered, reassembled)
+    }
+
+    #[test]
+    fn reencode_alias_section_all_clean() {
+        // 4 aliases, handler uses every one — section is fully clean.
+        let (filtered, reassembled) = run_alias_scrub(4, &[0, 1, 2, 3]);
+        let (types, imports, aliases) = count_top_level_items(&reassembled);
+        // 1 types-instance type + 4 alias-produced types + 1 handler
+        // instance type = 6 component-level types.
+        assert_eq!(filtered.type_count, 6);
+        assert_eq!(filtered.instance_count, 2);
+        assert_eq!(types, 2, "types instance + handler instance");
+        assert_eq!(imports, 2, "wasi:http/types + wasi:http/handler");
+        assert_eq!(aliases, 4, "all 4 alias items survive");
+    }
+
+    #[test]
+    fn reencode_alias_section_dirty_scrub_first() {
+        // Drop item 0, keep items 1, 2, 3.
+        let (filtered, reassembled) = run_alias_scrub(4, &[1, 2, 3]);
+        // 1 + 3 + 1 = 5 types
+        assert_eq!(filtered.type_count, 5);
+        let (_, _, aliases) = count_top_level_items(&reassembled);
+        assert_eq!(aliases, 3, "items 1, 2, 3 survive");
+    }
+
+    #[test]
+    fn reencode_alias_section_dirty_scrub_middle() {
+        // Keep first and last, drop the two middle items.
+        let (filtered, reassembled) = run_alias_scrub(4, &[0, 3]);
+        // 1 + 2 + 1 = 4 types
+        assert_eq!(filtered.type_count, 4);
+        let (_, _, aliases) = count_top_level_items(&reassembled);
+        assert_eq!(aliases, 2, "items 0 and 3 survive");
+    }
+
+    #[test]
+    fn reencode_alias_section_dirty_scrub_last() {
+        // Keep items 0, 1, 2; drop the trailing item.
+        let (filtered, reassembled) = run_alias_scrub(4, &[0, 1, 2]);
+        // 1 + 3 + 1 = 5 types
+        assert_eq!(filtered.type_count, 5);
+        let (_, _, aliases) = count_top_level_items(&reassembled);
+        assert_eq!(aliases, 3, "items 0, 1, 2 survive");
+    }
+
+    #[test]
+    fn reencode_alias_section_dirty_single_needed_among_many() {
+        // 5 items, only the middle one is referenced.
+        let (filtered, reassembled) = run_alias_scrub(5, &[2]);
+        // 1 + 1 + 1 = 3 types
+        assert_eq!(filtered.type_count, 3);
+        let (_, _, aliases) = count_top_level_items(&reassembled);
+        assert_eq!(aliases, 1, "only item 2 survives");
+    }
+
+    #[test]
+    fn reencode_alias_section_dirty_all_but_one() {
+        // 5 items, only the last is dropped.
+        let (filtered, reassembled) = run_alias_scrub(5, &[0, 1, 2, 3]);
+        // 1 + 4 + 1 = 6 types
+        assert_eq!(filtered.type_count, 6);
+        let (_, _, aliases) = count_top_level_items(&reassembled);
+        assert_eq!(aliases, 4, "items 0, 1, 2, 3 survive");
+    }
+
+    // ─── cross-call fold regression ──────────────────────────────────────
+    //
+    // Real wac-composed splits emit each item as its own binary section
+    // — three resource aliases land as three separate
+    // ComponentAliasSection payloads, not as one section with three
+    // items. `wat::parse_str` always merges consecutive same-kind decls
+    // into one section, so no WAT-based fixture can ever produce this
+    // shape. This regression test uses `wasm_encoder` directly to build
+    // the layout, then runs the full pipeline end-to-end.
+    //
+    // The bug it defends against: wirm's `add_to_sections` used to fold
+    // consecutive same-kind binary sections into a single
+    // `(count, kind)` entry, which made wirm's `cx.curr_section_idx()`
+    // disagree with any wasmparser-based consumer (like the reencoder
+    // here) walking the same binary. The handler import would land at
+    // section_idx 4 in wirm's view but section_idx 6 in the
+    // reencoder's, the lookup would miss, and the handler would be
+    // silently dropped from the filtered output.
+    //
+    // The wirm-side root invariant has its own regression test in
+    // `wirm/src/ir/component/tests.rs::section_count_invariant_*`.
+    // This is the downstream symptom test.
+
+    /// Build a synthetic split with `n` separate single-item alias
+    /// sections. The handler instance type uses `alias outer` to bring
+    /// each aliased resource into its body, so all of them land in the
+    /// closure for the handler import.
+    fn split_with_separate_alias_sections(n: u32) -> Vec<u8> {
+        use wasm_encoder::{
+            Alias, Component, ComponentAliasSection, ComponentExportKind,
+            ComponentImportSection, ComponentOuterAliasKind, ComponentTypeRef,
+            ComponentTypeSection, InstanceType, TypeBounds,
+        };
+
+        let names: Vec<String> = (0..n).map(|i| format!("r{i}")).collect();
+
+        let mut comp = Component::new();
+
+        // Type 0: types-instance type exporting `n` resources.
+        {
+            let mut types = ComponentTypeSection::new();
+            let mut inst = InstanceType::new();
+            for name in &names {
+                inst.export(name, ComponentTypeRef::Type(TypeBounds::SubResource));
+            }
+            types.instance(&inst);
+            comp.section(&types);
+        }
+
+        // Import the types instance.
+        {
+            let mut imports = ComponentImportSection::new();
+            imports.import("wasi:http/types", ComponentTypeRef::Instance(0));
+            comp.section(&imports);
+        }
+
+        // `n` separate alias sections, each with a single
+        // instance-export-of-type alias. Each one is its own binary
+        // section — the layout the bug couldn't survive.
+        for name in &names {
+            let mut aliases = ComponentAliasSection::new();
+            aliases.alias(Alias::InstanceExport {
+                instance: 0,
+                kind: ComponentExportKind::Type,
+                name,
+            });
+            comp.section(&aliases);
+        }
+
+        // Handler instance type: uses alias outer to bring each
+        // aliased resource into its body, then exports them. The
+        // `alias outer` decls are what make the resources reachable
+        // from the handler import in the dep walker's closure.
+        {
+            let mut types = ComponentTypeSection::new();
+            let mut inst = InstanceType::new();
+            for i in 0..n {
+                // Aliased resource types live at component-scope
+                // type idx 1..=n (type 0 was the types-instance type).
+                inst.alias(Alias::Outer {
+                    kind: ComponentOuterAliasKind::Type,
+                    count: 1,
+                    index: i + 1,
+                });
+                // Export the body-local copy so the instance type
+                // body has at least one decl per resource.
+                inst.export(
+                    &format!("e{i}"),
+                    ComponentTypeRef::Type(TypeBounds::Eq(i)),
+                );
+            }
+            types.instance(&inst);
+            comp.section(&types);
+        }
+
+        // Handler import — references the trailing instance type.
+        // Component-scope types: 0 = types-instance, 1..=n = aliased
+        // resources, n+1 = handler instance type.
+        {
+            let mut imports = ComponentImportSection::new();
+            imports.import("wasi:http/handler", ComponentTypeRef::Instance(n + 1));
+            comp.section(&imports);
+        }
+
+        comp.finish()
+    }
+
+    /// Regression test for the cross-call fold bug. The synthetic
+    /// fixture has 3 separate alias sections — the exact layout that
+    /// caused the dep walker's `section_idx` to disagree with the
+    /// reencoder's `current_section_idx`, which dropped the handler
+    /// import from the filtered output. After the wirm fix, both
+    /// walkers count each binary section payload as one ordinal,
+    /// they agree, and the handler import survives.
+    #[test]
+    fn cross_call_fold_regression_separate_alias_sections() {
+        let bytes = split_with_separate_alias_sections(3);
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
+            .expect("dep walk");
+        assert!(!deps.is_empty(), "dep walker should find the handler import");
+
+        let filtered = extract_filtered_sections(&bytes, &deps).expect("reencode");
+
+        assert!(
+            filtered
+                .import_names
+                .contains(&"wasi:http/handler".to_string()),
+            "handler import should survive the reencode — if this fails, \
+             wirm and the reencoder have diverged on section_idx for binaries \
+             with multiple separate single-item alias sections (the cross-call \
+             fold bug). See wirm's section_count_invariant_* tests.\n\
+             Got import_names = {:?}",
+            filtered.import_names
+        );
+
+        // Both wasi:http/types and wasi:http/handler should be in the
+        // closure — types because the handler's body alias-outers
+        // depend on it transitively, handler because it's the target.
+        assert_eq!(
+            filtered.import_names,
+            vec![
+                "wasi:http/types".to_string(),
+                "wasi:http/handler".to_string()
+            ]
+        );
+
+        // 1 types-instance type + 3 alias-produced types + 1 handler
+        // instance type = 5 component-level types in the filtered
+        // output.
+        assert_eq!(filtered.type_count, 5);
+        assert_eq!(filtered.instance_count, 2);
     }
 }
