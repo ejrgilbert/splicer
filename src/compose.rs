@@ -637,15 +637,19 @@ mod tests {
             "missing export line:\n{wac}"
         );
 
-        assert_eq!(out.cmd_args.len(), 2, "expected 2 cmd_args entries");
-        let paths: Vec<&str> = out.cmd_args.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(out.wac_deps.len(), 2, "expected 2 wac_deps entries");
+        let paths: Vec<String> = out
+            .wac_deps
+            .values()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert!(
-            paths.contains(&"provider-a.wasm"),
-            "provider-a.wasm missing from cmd_args"
+            paths.iter().any(|p| p == "provider-a.wasm"),
+            "provider-a.wasm missing from wac_deps"
         );
         assert!(
-            paths.contains(&"consumer.wasm"),
-            "consumer.wasm missing from cmd_args"
+            paths.iter().any(|p| p == "consumer.wasm"),
+            "consumer.wasm missing from wac_deps"
         );
 
         Ok(())
@@ -691,7 +695,7 @@ mod tests {
             wac.contains(r#"export consumer["my:consumer/app@0.1.0"];"#),
             "missing export line:\n{wac}"
         );
-        assert_eq!(out.cmd_args.len(), 4, "expected 4 cmd_args entries");
+        assert_eq!(out.wac_deps.len(), 4, "expected 4 wac_deps entries");
 
         Ok(())
     }
@@ -728,7 +732,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_cmd_args_contain_correct_paths() -> anyhow::Result<()> {
+    fn roundtrip_wac_deps_contain_correct_paths() -> anyhow::Result<()> {
         let comps = vec![
             mk("path/to/provider-a.wasm", WAT_PROVIDER_A),
             mk("path/to/consumer.wasm", WAT_SIMPLE_CONSUMER),
@@ -743,14 +747,18 @@ mod tests {
             "test:pkg",
         )?;
 
-        let paths: HashSet<&str> = out.cmd_args.iter().map(|(_, p)| p.as_str()).collect();
+        let paths: HashSet<String> = out
+            .wac_deps
+            .values()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert!(
             paths.contains("path/to/provider-a.wasm"),
-            "expected path/to/provider-a.wasm in cmd_args, got: {paths:?}"
+            "expected path/to/provider-a.wasm in wac_deps, got: {paths:?}"
         );
         assert!(
             paths.contains("path/to/consumer.wasm"),
-            "expected path/to/consumer.wasm in cmd_args, got: {paths:?}"
+            "expected path/to/consumer.wasm in wac_deps, got: {paths:?}"
         );
 
         Ok(())

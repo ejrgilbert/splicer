@@ -25,9 +25,8 @@
 use cviz::model::ExportInfo;
 use cviz::parse::component::parse_component;
 use cviz::parse::json::parse_json_str;
-use splicer::contract::{validate_contract, ContractResult};
-use splicer::parse::config::{parse_yaml, Injection};
-use splicer::wac::generate_wac;
+use splicer::lowlevel::{generate_wac, parse_yaml, validate_contract, Injection};
+use splicer::types::ContractResult;
 use std::collections::{BTreeMap, HashMap};
 
 // ─── JSON graph fixtures ──────────────────────────────────────────────────
@@ -164,11 +163,7 @@ rules:
 const CHAIN_FP: &str = "sha256-abc123-fake-fingerprint";
 
 fn injection(name: &str) -> Injection {
-    Injection {
-        name: name.to_string(),
-        adapter_info: None,
-        path: None,
-    }
+    Injection::from_name(name)
 }
 
 fn cache_with_fp(mw: &str, fp: &str) -> HashMap<String, BTreeMap<String, ExportInfo>> {
@@ -253,11 +248,7 @@ fn run_type_check_full(mw_wat: &str, temp_name: &str) -> Vec<ContractResult> {
     let tmp_path = std::env::temp_dir().join(temp_name);
     std::fs::write(&tmp_path, &mw_bytes).expect("write temp wasm");
 
-    let inj = Injection {
-        name: "mw".to_string(),
-        adapter_info: None,
-        path: Some(tmp_path.to_str().unwrap().to_string()),
-    };
+    let inj = Injection::from_path("mw", tmp_path.to_str().unwrap());
 
     let mut cache = HashMap::new();
     validate_contract(&[inj], LOG_IFACE, &chain_fp, &mut cache)

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -15,9 +16,16 @@ pub fn split_out_composition(
     } else {
         PATH_TO_SPLITS.to_string()
     };
-    fs::create_dir_all(output.clone())?;
-    let buff = fs::read(wasm_path)?;
-    let component = Component::parse(&buff, false, false).expect("Unable to parse");
+    fs::create_dir_all(&output)
+        .with_context(|| format!("Failed to create splits directory: {output}"))?;
+    let buff = fs::read(wasm_path)
+        .with_context(|| format!("Failed to read composition wasm: {}", wasm_path.display()))?;
+    let component = Component::parse(&buff, false, false).with_context(|| {
+        format!(
+            "Failed to parse composition wasm as a component: {}",
+            wasm_path.display()
+        )
+    })?;
 
     let mut visitor = EmitVisitor::new(&output);
     walk_structural(&component, &mut visitor);

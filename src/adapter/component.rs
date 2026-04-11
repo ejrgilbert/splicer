@@ -331,7 +331,7 @@ fn emit_imports_from_consumer_split(
     iface_ty: &InterfaceType,
     split: &SplitImports,
     any_has_resources: bool,
-) -> ImportsOutcome {
+) -> anyhow::Result<ImportsOutcome> {
     // Strategy-internal counters: we start by claiming the index space the
     // raw sections we just copied already consumed.
     let mut type_count: u32;
@@ -565,7 +565,7 @@ fn emit_imports_from_consumer_split(
         }
     }
 
-    ImportsOutcome {
+    Ok(ImportsOutcome {
         handler_func_base,
         before_comp_func,
         after_comp_func,
@@ -576,7 +576,7 @@ fn emit_imports_from_consumer_split(
         type_count,
         instance_count,
         func_count,
-    }
+    })
 }
 
 /// State that survives the import-emission phase and is consumed by the
@@ -632,7 +632,7 @@ fn emit_imports_via_types_iface(
     has_blocking: bool,
     arena: &TypeArena,
     iface_ty: &InterfaceType,
-) -> ImportsOutcome {
+) -> anyhow::Result<ImportsOutcome> {
     let mut type_count: u32 = 0;
     let mut instance_count: u32 = 0;
     let mut func_count: u32 = 0;
@@ -647,8 +647,12 @@ fn emit_imports_via_types_iface(
     let comp_resource_indices: Vec<u32>;
     let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
 
-    let types_interface = derive_types_interface(target_interface)
-        .expect("Cannot derive types interface name from target");
+    let types_interface = derive_types_interface(target_interface).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot derive 'types' interface name from target interface '{target_interface}': \
+             expected a name with a '/' separator (e.g. 'wasi:http/handler@1.0')"
+        )
+    })?;
 
     // We use a static empty map as fallback for the (unreachable in this
     // strategy) non-instance interface case.
@@ -819,7 +823,7 @@ fn emit_imports_via_types_iface(
         component.section(&aliases);
     }
 
-    ImportsOutcome {
+    Ok(ImportsOutcome {
         handler_func_base,
         before_comp_func,
         after_comp_func,
@@ -830,7 +834,7 @@ fn emit_imports_via_types_iface(
         type_count,
         instance_count,
         func_count,
-    }
+    })
 }
 
 /// Strategy: inline resources in a single self-contained handler instance type.
@@ -850,7 +854,7 @@ fn emit_imports_inline_resources(
     has_after: bool,
     has_blocking: bool,
     arena: &TypeArena,
-) -> ImportsOutcome {
+) -> anyhow::Result<ImportsOutcome> {
     let mut type_count: u32 = 0;
     let mut instance_count: u32 = 0;
     let mut func_count: u32 = 0;
@@ -947,7 +951,7 @@ fn emit_imports_inline_resources(
         component.section(&aliases);
     }
 
-    ImportsOutcome {
+    Ok(ImportsOutcome {
         handler_func_base,
         before_comp_func,
         after_comp_func,
@@ -958,7 +962,7 @@ fn emit_imports_inline_resources(
         type_count,
         instance_count,
         func_count,
-    }
+    })
 }
 
 /// Pure data describing the dispatch module's linear-memory layout
@@ -1844,7 +1848,7 @@ pub(super) fn build_adapter_bytes(
             iface_ty,
             split,
             any_has_resources,
-        )
+        )?
     } else if any_has_resources && has_type_exports {
         emit_imports_via_types_iface(
             &mut component,
@@ -1855,7 +1859,7 @@ pub(super) fn build_adapter_bytes(
             has_blocking,
             arena,
             iface_ty,
-        )
+        )?
     } else {
         emit_imports_inline_resources(
             &mut component,
@@ -1865,7 +1869,7 @@ pub(super) fn build_adapter_bytes(
             has_after,
             has_blocking,
             arena,
-        )
+        )?
     };
 
     instance_count = instance_count_after;

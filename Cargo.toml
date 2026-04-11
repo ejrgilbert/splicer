@@ -24,6 +24,10 @@ path = "src/lib.rs"
 name = "demo"
 path = "examples/demo.rs"
 
+[[example]]
+name = "wac_compose"
+path = "examples/wac_compose.rs"
+
 [dependencies]
 colored = "3.1.1"
 #cviz = "2.0.0-rc2"
@@ -40,3 +44,8 @@ wirm = { path = "../../research/compilers/wirm" }
 [dev-dependencies]
 wat = "1"
 tempfile = "3"
+# Used by the `wac_compose` example to demonstrate driving the
+# `wac` crates programmatically with splicer's output.
+wac-parser = "0.9"
+wac-resolver = "0.9"
+wac-graph = "0.9"

@@ -32,7 +32,7 @@ pub const TIER1_INTERFACES: &[&str] = &[
 ];
 
 /// The outcome of a single middleware contract check.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ContractResult {
     /// The middleware exports the interface and the type fingerprints match.
     Ok,

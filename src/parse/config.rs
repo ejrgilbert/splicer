@@ -67,9 +67,36 @@ pub struct AdapterInjectionInfo {
 pub struct Injection {
     pub name: String,
     pub path: Option<String>,
-    /// Populated at runtime (not from config) when this injection is a tier-1 adapter.
+    /// Populated at runtime by `add_to_inject_plan` when this injection
+    /// is resolved as a tier-1 adapter. Not part of the YAML config and
+    /// not user-settable — use the `generated_adapters` field on
+    /// [`crate::api::SpliceOutput`] for the structured view of which
+    /// adapters splicer wrote.
     #[serde(skip)]
-    pub adapter_info: Option<AdapterInjectionInfo>,
+    pub(crate) adapter_info: Option<AdapterInjectionInfo>,
+}
+
+impl Injection {
+    /// Construct an [`Injection`] for a middleware that should be
+    /// loaded from a `.wasm` file at `path`.
+    pub fn from_path(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: Some(path.into()),
+            adapter_info: None,
+        }
+    }
+
+    /// Construct an [`Injection`] referencing a middleware by name
+    /// only — useful for the limited subset of contract checks that
+    /// can run without loading the middleware bytes.
+    pub fn from_name(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: None,
+            adapter_info: None,
+        }
+    }
 }
 
 /// --- Normalized rule type for Rust usage ---
