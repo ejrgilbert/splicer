@@ -56,6 +56,12 @@ pub(super) struct AdapterFunc {
     /// memory. 8 for simple (fits in one register), 512 for
     /// complex (pointer-based) results.
     pub async_result_mem_size: u32,
+    /// For sync functions with complex results (`result_is_complex`):
+    /// the byte offset within the dispatch module's memory where the
+    /// wrapper stores the result buffer address that canon lift reads
+    /// from. `None` for async functions or sync functions with simple
+    /// (single-value) results.
+    pub sync_result_mem_offset: Option<u32>,
 }
 
 impl AdapterFunc {
@@ -131,18 +137,12 @@ pub(super) fn extract_adapter_funcs(
             let rid = sig.results[0];
             let flat = flat_types_for(rid, arena);
             let is_complex = flat.len() > 1;
-            // Sync multi-value results would need retptr handling
-            // — not yet implemented.
-            if !sig.is_async && is_complex {
-                anyhow::bail!(
-                    "Function '{}' has a multi-value result ({} flat values) which is not \
-                     yet supported for sync tier-1 adapter generation.",
-                    name,
-                    flat.len()
-                );
-            }
-            // Store full flat types; `task.return` uses these as
-            // params (up to MAX_FLAT_PARAMS=16).
+            // Store full flat types. For async functions `task.return`
+            // uses these as params (up to MAX_FLAT_PARAMS=16). For sync
+            // functions with `is_complex`, the canonical ABI uses a
+            // retptr pattern: an extra i32 param is appended and the
+            // function returns void (results are written at the retptr
+            // by the callee).
             (Some(rid), is_complex, flat)
         };
 
@@ -156,6 +156,25 @@ pub(super) fn extract_adapter_funcs(
             } else {
                 (None, 0)
             };
+
+        // For sync functions with complex results (> MAX_FLAT_RESULTS),
+        // reserve a result buffer in linear memory. The wrapper stores
+        // handler output here and returns the buffer address to canon lift.
+        // Size: 4 bytes per I32/F32, 8 bytes per I64/F64.
+        let sync_result_mem_offset = if !sig.is_async && result_is_complex {
+            let size: u32 = core_results
+                .iter()
+                .map(|vt| match vt {
+                    ValType::I64 | ValType::F64 => 8u32,
+                    _ => 4u32,
+                })
+                .sum();
+            let aligned = (async_result_cursor + 3) & !3;
+            async_result_cursor = aligned + size;
+            Some(aligned)
+        } else {
+            None
+        };
 
         let name_len = name.len() as u32;
         funcs.push(AdapterFunc {
@@ -171,6 +190,7 @@ pub(super) fn extract_adapter_funcs(
             name_len,
             async_result_mem_offset,
             async_result_mem_size,
+            sync_result_mem_offset,
         });
         name_offset += name_len;
     }

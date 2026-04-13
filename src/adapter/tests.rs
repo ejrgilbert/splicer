@@ -86,6 +86,57 @@ fn test_adapter_sync_primitives() {
     validate_component(&bytes);
 }
 
+// ── Tier 1: sync string return (retptr pattern) ─────────────────────
+
+#[test]
+fn test_adapter_sync_string_return() {
+    let mut arena = TypeArena::default();
+    let string = arena.intern_val(ValueType::String);
+    let iface = make_iface(vec![("get-msg", sig(false, &[], vec![], vec![string]))]);
+    let bytes = gen_adapter(
+        "test:pkg/messenger@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+    );
+    validate_component(&bytes);
+}
+
+// ── Tier 1: sync string param + string return ───────────────────────
+
+#[test]
+fn test_adapter_sync_string_roundtrip() {
+    let mut arena = TypeArena::default();
+    let string = arena.intern_val(ValueType::String);
+    let iface = make_iface(vec![(
+        "echo",
+        sig(false, &["input"], vec![string], vec![string]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/echo@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+    );
+    validate_component(&bytes);
+}
+
+// ── Tier 1: async string return ──────────────────────────────────────
+
+#[test]
+fn test_adapter_async_string_return() {
+    let mut arena = TypeArena::default();
+    let string = arena.intern_val(ValueType::String);
+    let iface = make_iface(vec![("get-msg", sig(true, &[], vec![], vec![string]))]);
+    let bytes = gen_adapter(
+        "test:pkg/messenger@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+    );
+    validate_component(&bytes);
+}
+
 // ── Tier 1: async void with string param ─────────────────────────────
 
 #[test]

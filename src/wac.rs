@@ -925,14 +925,17 @@ fn create_tier1_mdl(
     ));
 
     // Proxy — wires the downstream target interface and the tier-1 hook interfaces
-    // from the real middleware instance.
+    // from the real middleware instance. The adapter's hook imports are versioned,
+    // so the WAC lines use the versioned names to match both sides.
+    use crate::contract::{versioned_interface, TIER1_VERSION};
     let mut adapter_line = format!(
         "let {adapter_var} = new {INST_PREFIX}:{adapter_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
         iface = interface.name,
     );
     for tier1_iface in &adapter_info.tier1_interfaces {
+        let versioned = versioned_interface(tier1_iface, TIER1_VERSION);
         adapter_line.push_str(&format!(
-            "\n    \"{tier1_iface}\": {real_var}[\"{tier1_iface}\"],"
+            "\n    \"{versioned}\": {real_var}[\"{versioned}\"],"
         ));
     }
     adapter_line.push_str("\n    ...\n};");

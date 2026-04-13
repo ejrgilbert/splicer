@@ -56,7 +56,9 @@ pub mod types {
 pub mod lowlevel {
     pub use crate::adapter::generate_tier1_adapter;
     pub use crate::compose::build_graph_from_components;
-    pub use crate::contract::{validate_contract, ContractResult, TIER1_INTERFACES};
+    pub use crate::contract::{
+        validate_contract, versioned_interface, ContractResult, TIER1_INTERFACES,
+    };
     pub use crate::parse::config::{parse_yaml, Injection, SpliceRule};
     pub use crate::split::{gen_split_path, split_out_composition, PATH_TO_SPLITS};
     pub use crate::wac::{generate_wac, GeneratedAdapter, WacOutput, INST_PREFIX};

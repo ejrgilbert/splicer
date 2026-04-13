@@ -224,8 +224,12 @@ fn emit_hook_inst_types(
 }
 
 /// Append (optional) imports for the tier-1 hook instances
-/// (`splicer:tier1/{before,after,blocking}`) and return the
+/// (e.g. `splicer:tier1/before@0.1.0`) and return the
 /// component-scope instance index for each.
+///
+/// The import names are versioned (`iface@version`) so they match the
+/// middleware component's versioned exports exactly — `wac compose`
+/// requires an exact name match when wiring instances.
 fn emit_hook_imports(
     imports: &mut ComponentImportSection,
     instance_count: &mut u32,
@@ -233,24 +237,35 @@ fn emit_hook_imports(
     after_ty: Option<u32>,
     blocking_ty: Option<u32>,
 ) -> (Option<u32>, Option<u32>, Option<u32>) {
-    use crate::contract::{TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING};
+    use crate::contract::{
+        versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
+    };
 
     let before_inst = before_ty.map(|ty_idx| {
         let idx = *instance_count;
         *instance_count += 1;
-        imports.import(TIER1_BEFORE, ComponentTypeRef::Instance(ty_idx));
+        imports.import(
+            &versioned_interface(TIER1_BEFORE, TIER1_VERSION),
+            ComponentTypeRef::Instance(ty_idx),
+        );
         idx
     });
     let after_inst = after_ty.map(|ty_idx| {
         let idx = *instance_count;
         *instance_count += 1;
-        imports.import(TIER1_AFTER, ComponentTypeRef::Instance(ty_idx));
+        imports.import(
+            &versioned_interface(TIER1_AFTER, TIER1_VERSION),
+            ComponentTypeRef::Instance(ty_idx),
+        );
         idx
     });
     let blocking_inst = blocking_ty.map(|ty_idx| {
         let idx = *instance_count;
         *instance_count += 1;
-        imports.import(TIER1_BLOCKING, ComponentTypeRef::Instance(ty_idx));
+        imports.import(
+            &versioned_interface(TIER1_BLOCKING, TIER1_VERSION),
+            ComponentTypeRef::Instance(ty_idx),
+        );
         idx
     });
     (before_inst, after_inst, blocking_inst)

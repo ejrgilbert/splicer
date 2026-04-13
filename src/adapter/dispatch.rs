@@ -124,21 +124,44 @@ fn emit_task_return_loads(
             }
         }
         _ => {
-            // For non-result types with multi-value: just push zeros.
-            // This is a fallback; extend as needed for other compound types.
+            // For non-result types with multi-value (e.g. bare string,
+            // tuple, record): load each flat value from the result
+            // buffer at sequential offsets.
+            let mut byte_offset: u32 = 0;
             for vt in core_results.iter() {
+                f.instruction(&Instruction::I32Const(result_ptr as i32));
                 match vt {
                     ValType::I64 => {
-                        f.instruction(&Instruction::I64Const(0));
+                        f.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                            offset: byte_offset as u64,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                        byte_offset += 8;
                     }
                     ValType::F32 => {
-                        f.instruction(&Instruction::F32Const(0.0f32.into()));
+                        f.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
+                            offset: byte_offset as u64,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                        byte_offset += 4;
                     }
                     ValType::F64 => {
-                        f.instruction(&Instruction::F64Const(0.0f64.into()));
+                        f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                            offset: byte_offset as u64,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                        byte_offset += 8;
                     }
                     _ => {
-                        f.instruction(&Instruction::I32Const(0));
+                        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                            offset: byte_offset as u64,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                        byte_offset += 4;
                     }
                 }
             }
@@ -291,6 +314,8 @@ pub(super) fn build_dispatch_module(
 
     // Async handler call type indices, parallel to funcs (None for sync funcs).
     let mut async_ds_tys: Vec<Option<u32>> = vec![None; funcs.len()];
+    // Sync-complex handler import type indices (None for simple/async).
+    let mut sync_complex_handler_tys: Vec<Option<u32>> = vec![None; funcs.len()];
     // Async builtin type indices.
     let waitable_new_ty: u32;
     let waitable_join_ty: u32;
@@ -318,16 +343,39 @@ pub(super) fn build_dispatch_module(
             .ty()
             .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
 
-        // wrapper types: async wrappers are void, sync wrappers return results
+        // wrapper types (what canon lift expects from our exported wrapper):
+        //   - async: (flat_params...) -> void
+        //   - sync simple: (flat_params...) -> (flat_results...)
+        //   - sync complex: (flat_params...) -> (i32)  [returns result ptr]
         for func in funcs {
             ty_idx += 1;
             if func.is_async {
                 types.ty().function(func.core_params.iter().copied(), []);
+            } else if func.result_is_complex {
+                // canon lift for multi-value results: the core function
+                // returns a single i32 — a pointer to the flat results
+                // in linear memory. The runtime reads from there.
+                types
+                    .ty()
+                    .function(func.core_params.iter().copied(), [ValType::I32]);
             } else {
                 types.ty().function(
                     func.core_params.iter().copied(),
                     func.core_results.iter().copied(),
                 );
+            }
+        }
+
+        // Sync-complex handler import types: canon lower uses the
+        // retptr pattern (extra i32 param, void return) — different
+        // from the wrapper type which returns an i32 pointer.
+        for (i, func) in funcs.iter().enumerate() {
+            if !func.is_async && func.result_is_complex {
+                sync_complex_handler_tys[i] = Some(ty_idx);
+                ty_idx += 1;
+                let mut params: Vec<ValType> = func.core_params.clone();
+                params.push(ValType::I32); // retptr
+                types.ty().function(params.iter().copied(), []);
             }
         }
 
@@ -468,11 +516,17 @@ pub(super) fn build_dispatch_module(
             None
         };
 
-        // Downstream funcs — type is wrapper_ty for sync, async_ds_ty for async.
+        // Handler funcs — type depends on calling convention:
+        //   - sync simple: same as wrapper type (single-value or void)
+        //   - sync complex: separate type (canon lower uses retptr
+        //     pattern: params + retptr → void; wrapper returns ptr)
+        //   - async: separate async_ds_ty (canon lower async)
         handler_import_fn_base = fn_idx;
         for (i, func) in funcs.iter().enumerate() {
             let ty = if func.is_async {
                 async_ds_tys[i].expect("async_ds_ty must be set for async func")
+            } else if let Some(handler_ty) = sync_complex_handler_tys[i] {
+                handler_ty
             } else {
                 wrapper_ty_base + i as u32
             };
@@ -642,10 +696,9 @@ pub(super) fn build_dispatch_module(
                     func.name
                 );
             }
-            // ── Async wrapper ──────────────────────────────────────────────
-            // Core sig: (flat_params...) -> ()
-            // Locals beyond params: [subtask: i32, ws: i32]
-            // subtask/ws are reused sequentially for hook and handler waits.
+            // Locals beyond params: [subtask: i32, ws: i32] for
+            // async/hook machinery. Sync-complex wrappers don't need
+            // extra locals — the result buffer is at a fixed address.
             let first_local = func.core_params.len() as u32;
             let subtask_local = first_local;
             let ws_local = first_local + 1;
@@ -709,17 +762,36 @@ pub(super) fn build_dispatch_module(
                 f.instruction(&Instruction::Call(handler_fn));
                 f.instruction(&Instruction::LocalSet(subtask_local));
                 emit_wait_loop!(f, subtask_local, ws_local);
+            } else if func.result_is_complex {
+                // ── Sync wrapper with complex result ──────────────────────────
+                //
+                // canon lift expects: `(core_params) -> (i32)` — the
+                // wrapper returns a pointer to the flat results in
+                // linear memory.
+                //
+                // canon lower produces: `(core_params, retptr: i32) -> ()`
+                // — the handler takes an extra retptr and writes the
+                // flat results there.
+                //
+                // The wrapper calls the handler with a known result-
+                // buffer address and returns that address.
+                let handler_fn = handler_import_fn_base + fi as u32;
+                let result_buf = func
+                    .sync_result_mem_offset
+                    .expect("sync_result_mem_offset must be set for sync complex");
+
+                // 3. Call handler with params + result buffer address
+                for (pi, _) in func.core_params.iter().enumerate() {
+                    f.instruction(&Instruction::LocalGet(pi as u32));
+                }
+                f.instruction(&Instruction::I32Const(result_buf as i32));
+                f.instruction(&Instruction::Call(handler_fn));
+                // Handler wrote flat results at result_buf.
             } else {
-                // ── Sync wrapper ───────────────────────────────────────────────
-                let mut locals: Vec<(u32, ValType)> = Vec::new();
-                // TODO: multi-value results (e.g. string → ptr+len) with has_after need
-                // multiple locals saved, one per core_results entry, not just the first.
+                // ── Sync wrapper (single-value or void result) ────────────────
                 if has_after && has_result {
                     let result_val_type = func.core_results[0];
                     result_local_idx = Some(func.core_params.len() as u32);
-                    locals.push((1, result_val_type));
-                } else {
-                    result_local_idx = None;
                 }
 
                 // 3. Call handler
@@ -790,8 +862,14 @@ pub(super) fn build_dispatch_module(
                     // Void async: task.return with no args (still required before End).
                     f.instruction(&Instruction::Call(tr_fn));
                 }
+            } else if func.result_is_complex {
+                // 5. Sync complex: return the result buffer pointer.
+                let result_buf = func
+                    .sync_result_mem_offset
+                    .expect("sync_result_mem_offset must be set for sync complex");
+                f.instruction(&Instruction::I32Const(result_buf as i32));
             } else {
-                // 5. return with result (if any)
+                // 5. Sync single-value: return the result (if any).
                 if let Some(local_idx) = result_local_idx {
                     f.instruction(&Instruction::LocalGet(local_idx));
                 }

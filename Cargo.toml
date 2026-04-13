@@ -35,6 +35,7 @@ cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"  # or serde_toml if you prefer TOML
 anyhow = "1.0.86"
+semver = "1"
 clap = { version = "4.5.58", features = ["derive"] }
 wasmparser = "0.245.1"
 wasm-encoder = { version = "0.245.1", features = ["wasmparser"] }
