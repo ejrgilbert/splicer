@@ -234,13 +234,13 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
         // return aligned
         let mut code_section = CodeSection::new();
         let mut rf = Function::new(vec![(1u32, ValType::I32)]); // local 4: aligned
-        // mask = ~(align - 1) = (align - 1) ^ -1
+                                                                // mask = ~(align - 1) = (align - 1) ^ -1
         rf.instruction(&Instruction::LocalGet(2)); // align
         rf.instruction(&Instruction::I32Const(1));
         rf.instruction(&Instruction::I32Sub);
         rf.instruction(&Instruction::I32Const(-1));
         rf.instruction(&Instruction::I32Xor); // ~(align - 1)
-        // bump_ptr + align - 1
+                                              // bump_ptr + align - 1
         rf.instruction(&Instruction::GlobalGet(0));
         rf.instruction(&Instruction::LocalGet(2));
         rf.instruction(&Instruction::I32Const(1));
@@ -278,6 +278,7 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
 /// `event_ptr` is the memory offset reserved for `waitable-set.wait` event output.
 /// `needs_realloc` is true when any async function has string params (canon lift async requires Realloc).
 /// `bump_start` is the first free byte in linear memory for the bump allocator (after static data).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_dispatch_module(
     funcs: &[AdapterFunc],
     has_before: bool,

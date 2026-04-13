@@ -54,7 +54,7 @@ pub(super) fn build_types_instance_type(
         .map(|(name, &vid)| (vid, name.as_str()))
         .collect();
 
-    for (_name, &vid) in type_exports {
+    for &vid in type_exports.values() {
         encode_types_inst_cv(vid, &mut inst, arena, &mut cache, &name_map)?;
     }
 
@@ -96,20 +96,29 @@ pub(super) fn encode_types_inst_cv(
         ValueType::Record(ref fields) => {
             let mut encoded: Vec<(String, ComponentValType)> = Vec::new();
             for (name, fid) in fields {
-                encoded.push((name.clone(), encode_types_inst_cv(*fid, inst, arena, cache, name_map)?));
+                encoded.push((
+                    name.clone(),
+                    encode_types_inst_cv(*fid, inst, arena, cache, name_map)?,
+                ));
             }
             let idx = inst.type_count();
-            inst.ty().defined_type().record(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
+            inst.ty()
+                .defined_type()
+                .record(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
             idx
         }
         ValueType::Variant(ref cases) => {
             let mut encoded: Vec<(String, Option<ComponentValType>)> = Vec::new();
             for (name, opt_id) in cases {
-                let opt_cv = opt_id.map(|fid| encode_types_inst_cv(fid, inst, arena, cache, name_map)).transpose()?;
+                let opt_cv = opt_id
+                    .map(|fid| encode_types_inst_cv(fid, inst, arena, cache, name_map))
+                    .transpose()?;
                 encoded.push((name.clone(), opt_cv));
             }
             let idx = inst.type_count();
-            inst.ty().defined_type().variant(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
+            inst.ty()
+                .defined_type()
+                .variant(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
             idx
         }
         ValueType::Option(inner) => {
@@ -119,8 +128,12 @@ pub(super) fn encode_types_inst_cv(
             idx
         }
         ValueType::Result { ok, err } => {
-            let ok_cv = ok.map(|fid| encode_types_inst_cv(fid, inst, arena, cache, name_map)).transpose()?;
-            let err_cv = err.map(|fid| encode_types_inst_cv(fid, inst, arena, cache, name_map)).transpose()?;
+            let ok_cv = ok
+                .map(|fid| encode_types_inst_cv(fid, inst, arena, cache, name_map))
+                .transpose()?;
+            let err_cv = err
+                .map(|fid| encode_types_inst_cv(fid, inst, arena, cache, name_map))
+                .transpose()?;
             let idx = inst.type_count();
             inst.ty().defined_type().result(ok_cv, err_cv);
             idx
@@ -131,7 +144,7 @@ pub(super) fn encode_types_inst_cv(
                 encoded.push(encode_types_inst_cv(*fid, inst, arena, cache, name_map)?);
             }
             let idx = inst.type_count();
-            inst.ty().defined_type().tuple(encoded.into_iter());
+            inst.ty().defined_type().tuple(encoded);
             idx
         }
         ValueType::List(inner) => {
@@ -142,12 +155,16 @@ pub(super) fn encode_types_inst_cv(
         }
         ValueType::Enum(ref tags) => {
             let idx = inst.type_count();
-            inst.ty().defined_type().enum_type(tags.iter().map(|s| s.as_str()));
+            inst.ty()
+                .defined_type()
+                .enum_type(tags.iter().map(|s| s.as_str()));
             idx
         }
         ValueType::Flags(ref names) => {
             let idx = inst.type_count();
-            inst.ty().defined_type().flags(names.iter().map(|s| s.as_str()));
+            inst.ty()
+                .defined_type()
+                .flags(names.iter().map(|s| s.as_str()));
             idx
         }
         other => anyhow::bail!(
@@ -158,13 +175,14 @@ pub(super) fn encode_types_inst_cv(
         ),
     };
 
-    let needs_export = name_map.contains_key(&id)
-        || matches!(vt, ValueType::Record(_) | ValueType::Variant(_));
+    let needs_export =
+        name_map.contains_key(&id) || matches!(vt, ValueType::Record(_) | ValueType::Variant(_));
 
     if needs_export {
-        let name = name_map.get(&id).copied().unwrap_or_else(|| {
-            Box::leak(format!("type-{}", raw_idx).into_boxed_str())
-        });
+        let name = name_map
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| Box::leak(format!("type-{}", raw_idx).into_boxed_str()));
         let export_idx = inst.type_count();
         inst.export(name, ComponentTypeRef::Type(TypeBounds::Eq(raw_idx)));
         let cv = ComponentValType::Type(export_idx);
@@ -272,7 +290,10 @@ impl InstTypeCtx {
                         name.clone()
                     };
                     let res_local = inst.type_count();
-                    inst.export(&export_name, ComponentTypeRef::Type(TypeBounds::SubResource));
+                    inst.export(
+                        &export_name,
+                        ComponentTypeRef::Type(TypeBounds::SubResource),
+                    );
                     let own_local = inst.type_count();
                     inst.ty().defined_type().own(res_local);
                     self.resource_exports
@@ -296,7 +317,10 @@ impl InstTypeCtx {
                 } else {
                     let export_name = format!("res-{}", self.resource_exports.len());
                     let res_local = inst.type_count();
-                    inst.export(&export_name, ComponentTypeRef::Type(TypeBounds::SubResource));
+                    inst.export(
+                        &export_name,
+                        ComponentTypeRef::Type(TypeBounds::SubResource),
+                    );
                     let own_local = inst.type_count();
                     inst.ty().defined_type().own(res_local);
                     self.resource_exports
@@ -353,7 +377,7 @@ impl InstTypeCtx {
                     encoded.push(self.encode_cv(*id, inst, arena)?);
                 }
                 let idx = inst.type_count();
-                inst.ty().defined_type().tuple(encoded.into_iter());
+                inst.ty().defined_type().tuple(encoded);
                 idx
             }
 
@@ -440,10 +464,28 @@ pub(super) fn encode_comp_cv(
         }
         ValueType::Result { ok, err } => {
             let ok_cv = ok
-                .map(|id| encode_comp_cv(id, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache))
+                .map(|id| {
+                    encode_comp_cv(
+                        id,
+                        arena,
+                        comp_types,
+                        comp_type_count,
+                        comp_own_by_vid,
+                        comp_cache,
+                    )
+                })
                 .transpose()?;
             let err_cv = err
-                .map(|id| encode_comp_cv(id, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache))
+                .map(|id| {
+                    encode_comp_cv(
+                        id,
+                        arena,
+                        comp_types,
+                        comp_type_count,
+                        comp_own_by_vid,
+                        comp_cache,
+                    )
+                })
                 .transpose()?;
             let idx = *comp_type_count;
             *comp_type_count += 1;
@@ -452,7 +494,14 @@ pub(super) fn encode_comp_cv(
             Ok(ComponentValType::Type(idx))
         }
         ValueType::Option(inner_id) => {
-            let inner_cv = encode_comp_cv(inner_id, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache)?;
+            let inner_cv = encode_comp_cv(
+                inner_id,
+                arena,
+                comp_types,
+                comp_type_count,
+                comp_own_by_vid,
+                comp_cache,
+            )?;
             let idx = *comp_type_count;
             *comp_type_count += 1;
             comp_types.defined_type().option(inner_cv);
@@ -463,40 +512,77 @@ pub(super) fn encode_comp_cv(
             let mut encoded: Vec<(String, Option<ComponentValType>)> = Vec::new();
             for (name, opt_id) in &cases {
                 let opt_cv = opt_id
-                    .map(|id| encode_comp_cv(id, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache))
+                    .map(|id| {
+                        encode_comp_cv(
+                            id,
+                            arena,
+                            comp_types,
+                            comp_type_count,
+                            comp_own_by_vid,
+                            comp_cache,
+                        )
+                    })
                     .transpose()?;
                 encoded.push((name.clone(), opt_cv));
             }
             let idx = *comp_type_count;
             *comp_type_count += 1;
-            comp_types.defined_type().variant(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
+            comp_types
+                .defined_type()
+                .variant(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
             comp_cache.insert(id, idx);
             Ok(ComponentValType::Type(idx))
         }
         ValueType::Record(fields) => {
             let mut encoded: Vec<(String, ComponentValType)> = Vec::new();
             for (name, fid) in &fields {
-                encoded.push((name.clone(), encode_comp_cv(*fid, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache)?));
+                encoded.push((
+                    name.clone(),
+                    encode_comp_cv(
+                        *fid,
+                        arena,
+                        comp_types,
+                        comp_type_count,
+                        comp_own_by_vid,
+                        comp_cache,
+                    )?,
+                ));
             }
             let idx = *comp_type_count;
             *comp_type_count += 1;
-            comp_types.defined_type().record(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
+            comp_types
+                .defined_type()
+                .record(encoded.iter().map(|(n, cv)| (n.as_str(), *cv)));
             comp_cache.insert(id, idx);
             Ok(ComponentValType::Type(idx))
         }
         ValueType::Tuple(ids) => {
             let mut encoded: Vec<ComponentValType> = Vec::new();
             for fid in &ids {
-                encoded.push(encode_comp_cv(*fid, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache)?);
+                encoded.push(encode_comp_cv(
+                    *fid,
+                    arena,
+                    comp_types,
+                    comp_type_count,
+                    comp_own_by_vid,
+                    comp_cache,
+                )?);
             }
             let idx = *comp_type_count;
             *comp_type_count += 1;
-            comp_types.defined_type().tuple(encoded.into_iter());
+            comp_types.defined_type().tuple(encoded);
             comp_cache.insert(id, idx);
             Ok(ComponentValType::Type(idx))
         }
         ValueType::List(inner_id) => {
-            let inner_cv = encode_comp_cv(inner_id, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache)?;
+            let inner_cv = encode_comp_cv(
+                inner_id,
+                arena,
+                comp_types,
+                comp_type_count,
+                comp_own_by_vid,
+                comp_cache,
+            )?;
             let idx = *comp_type_count;
             *comp_type_count += 1;
             comp_types.defined_type().list(inner_cv);
@@ -504,7 +590,14 @@ pub(super) fn encode_comp_cv(
             Ok(ComponentValType::Type(idx))
         }
         ValueType::FixedSizeList(inner_id, _n) => {
-            let inner_cv = encode_comp_cv(inner_id, arena, comp_types, comp_type_count, comp_own_by_vid, comp_cache)?;
+            let inner_cv = encode_comp_cv(
+                inner_id,
+                arena,
+                comp_types,
+                comp_type_count,
+                comp_own_by_vid,
+                comp_cache,
+            )?;
             let idx = *comp_type_count;
             *comp_type_count += 1;
             comp_types.defined_type().list(inner_cv);
@@ -514,14 +607,18 @@ pub(super) fn encode_comp_cv(
         ValueType::Enum(tags) => {
             let idx = *comp_type_count;
             *comp_type_count += 1;
-            comp_types.defined_type().enum_type(tags.iter().map(|s| s.as_str()));
+            comp_types
+                .defined_type()
+                .enum_type(tags.iter().map(|s| s.as_str()));
             comp_cache.insert(id, idx);
             Ok(ComponentValType::Type(idx))
         }
         ValueType::Flags(names) => {
             let idx = *comp_type_count;
             *comp_type_count += 1;
-            comp_types.defined_type().flags(names.iter().map(|s| s.as_str()));
+            comp_types
+                .defined_type()
+                .flags(names.iter().map(|s| s.as_str()));
             comp_cache.insert(id, idx);
             Ok(ComponentValType::Type(idx))
         }

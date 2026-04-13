@@ -826,8 +826,7 @@ mod tests {
         assert!(in_layout.import_loc("wasi:http/handler").is_some());
         assert!(in_layout.import_loc("my:service/messenger").is_some());
 
-        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
         let filtered = extract_filtered_sections(&bytes, &deps).expect("reencode");
         let reassembled = wrap_as_component(&filtered.raw_sections);
 
@@ -839,7 +838,10 @@ mod tests {
         assert_eq!(filtered.instance_count, 2);
         assert_eq!(
             filtered.import_names,
-            vec!["wasi:http/types".to_string(), "wasi:http/handler".to_string()]
+            vec![
+                "wasi:http/types".to_string(),
+                "wasi:http/handler".to_string()
+            ]
         );
 
         // The reassembled output: ask its OWN layout for the
@@ -922,7 +924,10 @@ mod tests {
         assert_eq!(filtered.instance_count, 2);
         assert_eq!(
             filtered.import_names,
-            vec!["wasi:http/types".to_string(), "wasi:http/handler".to_string()]
+            vec![
+                "wasi:http/types".to_string(),
+                "wasi:http/handler".to_string()
+            ]
         );
 
         let (types, imports, aliases) = count_top_level_items(&reassembled);
@@ -1023,8 +1028,7 @@ mod tests {
     /// for assertions.
     fn run_alias_scrub(num_aliases: usize, handler_uses: &[usize]) -> (FilteredSections, Vec<u8>) {
         let bytes = alias_section_fixture(num_aliases, handler_uses);
-        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
         let filtered = extract_filtered_sections(&bytes, &deps).expect("reencode");
         let reassembled = wrap_as_component(&filtered.raw_sections);
         validate_component(&reassembled);
@@ -1124,9 +1128,9 @@ mod tests {
     /// closure for the handler import.
     fn split_with_separate_alias_sections(n: u32) -> Vec<u8> {
         use wasm_encoder::{
-            Alias, Component, ComponentAliasSection, ComponentExportKind,
-            ComponentImportSection, ComponentOuterAliasKind, ComponentTypeRef,
-            ComponentTypeSection, InstanceType, TypeBounds,
+            Alias, Component, ComponentAliasSection, ComponentExportKind, ComponentImportSection,
+            ComponentOuterAliasKind, ComponentTypeRef, ComponentTypeSection, InstanceType,
+            TypeBounds,
         };
 
         let names: Vec<String> = (0..n).map(|i| format!("r{i}")).collect();
@@ -1181,10 +1185,7 @@ mod tests {
                 });
                 // Export the body-local copy so the instance type
                 // body has at least one decl per resource.
-                inst.export(
-                    &format!("e{i}"),
-                    ComponentTypeRef::Type(TypeBounds::Eq(i)),
-                );
+                inst.export(&format!("e{i}"), ComponentTypeRef::Type(TypeBounds::Eq(i)));
             }
             types.instance(&inst);
             comp.section(&types);
@@ -1212,9 +1213,11 @@ mod tests {
     #[test]
     fn cross_call_fold_regression_separate_alias_sections() {
         let bytes = split_with_separate_alias_sections(3);
-        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
-            .expect("dep walk");
-        assert!(!deps.is_empty(), "dep walker should find the handler import");
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
+        assert!(
+            !deps.is_empty(),
+            "dep walker should find the handler import"
+        );
 
         let filtered = extract_filtered_sections(&bytes, &deps).expect("reencode");
 

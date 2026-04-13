@@ -16,20 +16,14 @@ use std::collections::BTreeMap;
 
 /// Helper: validate that bytes form a valid component-model binary.
 fn validate_component(bytes: &[u8]) {
-    let mut validator =
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
     validator
         .validate_all(bytes)
         .expect("generated adapter should be a valid component");
 }
 
 /// Helper: generate an adapter and return the raw bytes.
-fn gen_adapter(
-    target: &str,
-    hooks: &[&str],
-    iface: &InterfaceType,
-    arena: &TypeArena,
-) -> Vec<u8> {
+fn gen_adapter(target: &str, hooks: &[&str], iface: &InterfaceType, arena: &TypeArena) -> Vec<u8> {
     let tmp = tempfile::tempdir().unwrap();
     let hook_strings: Vec<String> = hooks.iter().map(|s| s.to_string()).collect();
     let path = generate_tier1_adapter(
@@ -48,10 +42,7 @@ fn gen_adapter(
 
 fn make_iface(funcs: Vec<(&str, FuncSignature)>) -> InterfaceType {
     InterfaceType::Instance(InstanceInterface {
-        functions: funcs
-            .into_iter()
-            .map(|(n, s)| (n.to_string(), s))
-            .collect(),
+        functions: funcs.into_iter().map(|(n, s)| (n.to_string(), s)).collect(),
         type_exports: BTreeMap::new(),
     })
 }
@@ -76,7 +67,10 @@ fn sig(
 fn test_adapter_sync_primitives() {
     let mut arena = TypeArena::default();
     let s32 = arena.intern_val(ValueType::S32);
-    let iface = make_iface(vec![("add", sig(false, &["a", "b"], vec![s32, s32], vec![s32]))]);
+    let iface = make_iface(vec![(
+        "add",
+        sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
+    )]);
     let bytes = gen_adapter(
         "test:pkg/adder@1.0.0",
         &["splicer:tier1/before", "splicer:tier1/after"],
@@ -280,12 +274,10 @@ fn test_adapter_blocking() {
 fn test_adapter_no_hooks() {
     let mut arena = TypeArena::default();
     let s32 = arena.intern_val(ValueType::S32);
-    let iface = make_iface(vec![("add", sig(false, &["a", "b"], vec![s32, s32], vec![s32]))]);
-    let bytes = gen_adapter(
-        "test:pkg/adder@1.0.0",
-        &[],
-        &iface,
-        &arena,
-    );
+    let iface = make_iface(vec![(
+        "add",
+        sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
+    )]);
+    let bytes = gen_adapter("test:pkg/adder@1.0.0", &[], &iface, &arena);
     validate_component(&bytes);
 }

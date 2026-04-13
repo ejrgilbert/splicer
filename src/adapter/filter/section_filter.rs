@@ -86,9 +86,7 @@ use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use wirm::ir::component::idx_spaces::Space;
 use wirm::ir::component::refs::ReferencedIndices;
-use wirm::ir::component::visitor::{
-    walk_structural, ComponentVisitor, ItemKind, VisitCtx,
-};
+use wirm::ir::component::visitor::{walk_structural, ComponentVisitor, ItemKind, VisitCtx};
 use wirm::wasmparser::{
     ComponentAlias, ComponentImport, ComponentType, ComponentTypeDeclaration,
     InstanceTypeDeclaration,
@@ -235,7 +233,6 @@ fn item_kind_to_space(kind: ItemKind) -> ItemSpace {
     }
 }
 
-
 impl DepCollector {
     fn new(target: &str) -> Self {
         Self {
@@ -262,12 +259,7 @@ impl DepCollector {
     /// stash the type/instance-space lookup so future ref resolutions can find
     /// it, and return the location for the caller to use as the dep-graph key.
     /// Returns `None` if we're not inside a section (root component event).
-    fn record_top_level(
-        &mut self,
-        cx: &VisitCtx,
-        space: ItemSpace,
-        id: u32,
-    ) -> Option<ItemLoc> {
+    fn record_top_level(&mut self, cx: &VisitCtx, space: ItemSpace, id: u32) -> Option<ItemLoc> {
         let section_idx = cx.curr_section_idx()?;
         let loc = self.alloc_loc(section_idx);
         match space {
@@ -345,12 +337,7 @@ impl DepCollector {
 impl<'a> ComponentVisitor<'a> for DepCollector {
     // ─── leaf component types (Defined / Func / Resource) ────────────────
 
-    fn visit_comp_type(
-        &mut self,
-        cx: &VisitCtx<'a>,
-        id: u32,
-        item: &ComponentType<'a>,
-    ) {
+    fn visit_comp_type(&mut self, cx: &VisitCtx<'a>, id: u32, item: &ComponentType<'a>) {
         // Only record this item if it's a top-level type in a section. Leaf
         // types nested inside an instance/component type body are private to
         // their parent and don't get their own slot in our graph.
@@ -367,12 +354,7 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
 
     // ─── instance / component type bodies ────────────────────────────────
 
-    fn enter_component_type_inst(
-        &mut self,
-        cx: &VisitCtx<'a>,
-        id: u32,
-        _ty: &ComponentType<'a>,
-    ) {
+    fn enter_component_type_inst(&mut self, cx: &VisitCtx<'a>, id: u32, _ty: &ComponentType<'a>) {
         // Top-level instance types only contribute deps via cross-scope refs
         // inside their body — those arrive through `visit_inst_type_decl`
         // (alias outer with depth ≥ 1). Calling `referenced_indices` on the
@@ -388,24 +370,14 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         self.nesting_depth += 1;
     }
 
-    fn exit_component_type_inst(
-        &mut self,
-        _: &VisitCtx<'a>,
-        _: u32,
-        _: &ComponentType<'a>,
-    ) {
+    fn exit_component_type_inst(&mut self, _: &VisitCtx<'a>, _: u32, _: &ComponentType<'a>) {
         self.nesting_depth -= 1;
         if self.nesting_depth == 0 {
             self.type_body_stack.pop();
         }
     }
 
-    fn enter_component_type_comp(
-        &mut self,
-        cx: &VisitCtx<'a>,
-        id: u32,
-        _ty: &ComponentType<'a>,
-    ) {
+    fn enter_component_type_comp(&mut self, cx: &VisitCtx<'a>, id: u32, _ty: &ComponentType<'a>) {
         if self.nesting_depth == 0 {
             if let Some(loc) = self.record_top_level(cx, ItemSpace::Type, id) {
                 self.type_body_stack.push(loc);
@@ -414,12 +386,7 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         self.nesting_depth += 1;
     }
 
-    fn exit_component_type_comp(
-        &mut self,
-        _: &VisitCtx<'a>,
-        _: u32,
-        _: &ComponentType<'a>,
-    ) {
+    fn exit_component_type_comp(&mut self, _: &VisitCtx<'a>, _: u32, _: &ComponentType<'a>) {
         self.nesting_depth -= 1;
         if self.nesting_depth == 0 {
             self.type_body_stack.pop();
@@ -590,8 +557,7 @@ mod tests {
         let bytes = simple_fanin();
         let layout = BinaryLayout::from_bytes(&bytes);
         let expected = simple_fanin_closure_for(&layout, "my:service/adder");
-        let deps =
-            find_handler_deps_in_bytes(&bytes, "my:service/adder").expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "my:service/adder").expect("dep walk");
         assert_deps_match(&deps, &expected);
     }
 
@@ -602,8 +568,7 @@ mod tests {
         let bytes = simple_fanin();
         let layout = BinaryLayout::from_bytes(&bytes);
         let expected = simple_fanin_closure_for(&layout, "my:service/messenger");
-        let deps = find_handler_deps_in_bytes(&bytes, "my:service/messenger")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "my:service/messenger").expect("dep walk");
         assert_deps_match(&deps, &expected);
     }
 
@@ -628,8 +593,8 @@ mod tests {
     // surface Step 3's byte slicer needs.
 
     use super::super::test_helpers::{
-        alias_section_expected_locs, alias_section_fixture, assert_deps_match,
-        assert_layout_kinds, BinaryLayout, BinarySectionKind,
+        alias_section_expected_locs, alias_section_fixture, assert_deps_match, assert_layout_kinds,
+        BinaryLayout, BinarySectionKind,
     };
 
     /// Run the dep walker against an [`alias_section_fixture`] and
@@ -639,8 +604,7 @@ mod tests {
         let bytes = alias_section_fixture(num_aliases, handler_uses);
         let layout = BinaryLayout::from_bytes(&bytes);
         let expected = alias_section_expected_locs(&layout, handler_uses);
-        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
         assert_deps_match(&deps, &expected);
     }
 
@@ -717,8 +681,7 @@ mod tests {
         "#);
 
         let layout = BinaryLayout::from_bytes(&bytes);
-        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
 
         // Build the expected closure by name, asking the layout
         // for each item's actual loc:
@@ -749,13 +712,7 @@ mod tests {
         // Instead, we EXPECT the closure to contain all type locs
         // EXCEPT exactly one — and we verify the exact "minus one"
         // by checking the dep walker's output directly.
-        let mut expected: Vec<(usize, usize)> = vec![
-            r0,
-            r1,
-            r2,
-            types_import,
-            handler_import,
-        ];
+        let mut expected: Vec<(usize, usize)> = vec![r0, r1, r2, types_import, handler_import];
         // Add the two top-level instance types from the layout.
         // The record type is the third type by source order, so
         // it's at index 1 in `type_locs` (between the types-inst
@@ -767,10 +724,7 @@ mod tests {
 
         // And r3 must NOT be in the closure (the dropped item).
         assert!(
-            !deps
-                .needed
-                .get(&r3.0)
-                .is_some_and(|s| s.contains(&r3.1)),
+            !deps.needed.get(&r3.0).is_some_and(|s| s.contains(&r3.1)),
             "r3 should be dropped, but it's in {:?}",
             deps.needed
         );
@@ -853,8 +807,7 @@ mod tests {
     fn alias_outer_fanin_follows_chain_to_types_instance() {
         let bytes = fanin_with_alias_outer();
         let layout = BinaryLayout::from_bytes(&bytes);
-        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
 
         // The expected closure pulls in everything reachable from
         // the handler import via the alias-outer chain back to the
@@ -870,9 +823,7 @@ mod tests {
         let request = layout.alias_loc("request").expect("request alias");
         let response = layout.alias_loc("response").expect("response alias");
         let error_info = layout.alias_loc("error-info").expect("error-info alias");
-        let types_import = layout
-            .import_loc("wasi:http/types")
-            .expect("types import");
+        let types_import = layout.import_loc("wasi:http/types").expect("types import");
         let handler_import = layout
             .import_loc("wasi:http/handler")
             .expect("handler import");
@@ -968,8 +919,7 @@ mod tests {
             .import_loc("my:foo/handler")
             .expect("handler import in layout");
 
-        let deps = find_handler_deps_in_bytes(&bytes, "my:foo/handler")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "my:foo/handler").expect("dep walk");
 
         // Expected closure: every top-level type plus the handler
         // import. The critical link is the leaf record (the first
@@ -1015,8 +965,7 @@ mod tests {
             .import_loc("my:foo/handler")
             .expect("handler import in layout");
 
-        let deps = find_handler_deps_in_bytes(&bytes, "my:foo/handler")
-            .expect("dep walk");
+        let deps = find_handler_deps_in_bytes(&bytes, "my:foo/handler").expect("dep walk");
 
         // Closure: shared type (because the handler depends on it)
         // + handler import. The non-target "my:other/thing" import

@@ -1,5 +1,5 @@
-use crate::contract::{validate_contract, ContractResult};
 use crate::adapter::generate_tier1_adapter;
+use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
 use cviz::model::{
     ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection, InterfaceType, InternedId,
@@ -12,7 +12,7 @@ use wasmparser::collections::IndexSet;
 
 pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
-use crate::parse::config::{Injection, AdapterInjectionInfo, SpliceRule};
+use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
 use crate::split::gen_split_path;
 
 // chain_idx -> set of middlewares to inject AFTER
@@ -653,9 +653,8 @@ fn apply_rule_between(
                     (inner_id, inner_alias.clone()),
                     (outer_id, outer_alias.clone()),
                 ];
-                let consumer_path = chain.consumer_split_path(
-                    i + 1, composition, splits_path, shim_comps,
-                );
+                let consumer_path =
+                    chain.consumer_split_path(i + 1, composition, splits_path, shim_comps);
                 contract_results.extend(add_to_inject_plan(
                     interface,
                     inject,
@@ -714,9 +713,8 @@ fn apply_rule_before(
             }
             full_match = true;
             let new_aliases = vec![(*id, provider_alias.clone())];
-            let consumer_path = chain.consumer_split_path(
-                i + 1, composition, splits_path, shim_comps,
-            );
+            let consumer_path =
+                chain.consumer_split_path(i + 1, composition, splits_path, shim_comps);
             contract_results.extend(add_to_inject_plan(
                 interface,
                 inject,

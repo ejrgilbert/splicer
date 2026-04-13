@@ -22,9 +22,7 @@ fn submodule_ready() -> bool {
     let run_sh = Path::new(SUBMODULE_PATH).join("run.sh");
     let fixtures = Path::new(SUBMODULE_PATH).join("fixtures");
     if !run_sh.exists() {
-        eprintln!(
-            "Submodule not initialized. Run:\n  git submodule update --init"
-        );
+        eprintln!("Submodule not initialized. Run:\n  git submodule update --init");
         return false;
     }
     if !fixtures.exists() || !fixtures.is_dir() {

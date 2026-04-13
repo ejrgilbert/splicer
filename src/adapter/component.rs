@@ -56,10 +56,10 @@ use std::collections::{BTreeMap, HashMap};
 use cviz::model::{InterfaceType, TypeArena, ValueType, ValueTypeId};
 use wasm_encoder::{
     Alias, CanonicalFunctionSection, CanonicalOption, Component, ComponentAliasSection,
-    ComponentExportKind, ComponentExportSection, ComponentImportSection,
-    ComponentInstanceSection, ComponentOuterAliasKind, ComponentSectionId, ComponentTypeRef,
-    ComponentTypeSection, ComponentValType, ExportKind, InstanceSection, InstanceType,
-    ModuleSection, PrimitiveValType, RawSection,
+    ComponentExportKind, ComponentExportSection, ComponentImportSection, ComponentInstanceSection,
+    ComponentOuterAliasKind, ComponentSectionId, ComponentTypeRef, ComponentTypeSection,
+    ComponentValType, ExportKind, InstanceSection, InstanceType, ModuleSection, PrimitiveValType,
+    RawSection,
 };
 
 use super::dispatch::{build_dispatch_module, build_mem_module};
@@ -339,6 +339,7 @@ fn emit_func_aliases(
 /// the shared types from the raw sections (if the consumer split itself
 /// re-exports the target interface). After the handler is in place, hook
 /// instance types/imports and func aliases are added on top.
+#[allow(clippy::too_many_arguments)]
 fn emit_imports_from_consumer_split(
     component: &mut Component,
     target_interface: &str,
@@ -539,7 +540,10 @@ fn emit_imports_from_consumer_split(
             let mut imports = ComponentImportSection::new();
             handler_inst = instance_count;
             instance_count += 1;
-            imports.import(target_interface, ComponentTypeRef::Instance(handler_inst_ty));
+            imports.import(
+                target_interface,
+                ComponentTypeRef::Instance(handler_inst_ty),
+            );
             (before_inst, after_inst, blocking_inst) = emit_hook_imports(
                 &mut imports,
                 &mut instance_count,
@@ -642,6 +646,7 @@ struct ImportsOutcome {
 /// aliased types — so the handler signature shares the *same* resource
 /// types as the types interface, instead of declaring fresh `SubResource`
 /// definitions.
+#[allow(clippy::too_many_arguments)]
 fn emit_imports_via_types_iface(
     component: &mut Component,
     target_interface: &str,
@@ -663,7 +668,6 @@ fn emit_imports_via_types_iface(
     let before_comp_func: Option<u32>;
     let after_comp_func: Option<u32>;
     let blocking_comp_func: Option<u32>;
-    let comp_resource_indices: Vec<u32>;
     let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
 
     let types_interface = derive_types_interface(target_interface).ok_or_else(|| {
@@ -719,7 +723,7 @@ fn emit_imports_via_types_iface(
     let mut comp_type_export_indices: HashMap<String, u32> = HashMap::new();
     {
         let mut aliases = ComponentAliasSection::new();
-        for (export_name, _vid) in type_exports_ref {
+        for export_name in type_exports_ref.keys() {
             let comp_idx = type_count;
             type_count += 1;
             aliases.alias(Alias::InstanceExport {
@@ -737,7 +741,7 @@ fn emit_imports_via_types_iface(
     // instance type can reference the aliased resources via alias outer
     // instead of declaring fresh SubResources.
     let mut outer_res_map: HashMap<ValueTypeId, u32> = HashMap::new();
-    let mut cri: Vec<u32> = Vec::new();
+    let mut comp_resource_indices: Vec<u32> = Vec::new();
     for (export_name, &vid) in type_exports_ref {
         if let Some(&comp_idx) = comp_type_export_indices.get(export_name) {
             comp_aliased_types.insert(vid, comp_idx);
@@ -746,11 +750,10 @@ fn emit_imports_via_types_iface(
                 ValueType::Resource(_) | ValueType::AsyncHandle
             ) {
                 outer_res_map.insert(vid, comp_idx);
-                cri.push(comp_idx);
+                comp_resource_indices.push(comp_idx);
             }
         }
     }
-    comp_resource_indices = cri;
 
     // Section 1d: handler instance type (with alias outer) + hook inst types.
     let (before_inst_ty, after_inst_ty, blocking_inst_ty);
@@ -810,7 +813,10 @@ fn emit_imports_via_types_iface(
         let mut imports = ComponentImportSection::new();
         handler_inst = instance_count;
         instance_count += 1;
-        imports.import(target_interface, ComponentTypeRef::Instance(handler_inst_ty));
+        imports.import(
+            target_interface,
+            ComponentTypeRef::Instance(handler_inst_ty),
+        );
         (before_inst, after_inst, blocking_inst) = emit_hook_imports(
             &mut imports,
             &mut instance_count,
@@ -923,7 +929,10 @@ fn emit_imports_inline_resources(
         let mut imports = ComponentImportSection::new();
         handler_inst = instance_count;
         instance_count += 1;
-        imports.import(target_interface, ComponentTypeRef::Instance(handler_inst_ty));
+        imports.import(
+            target_interface,
+            ComponentTypeRef::Instance(handler_inst_ty),
+        );
         (before_inst, after_inst, blocking_inst) = emit_hook_imports(
             &mut imports,
             &mut instance_count,
@@ -1187,22 +1196,17 @@ fn emit_canon_lower(
     comp_result_cvs: &[Option<ComponentValType>],
     mut core_func_count: u32,
 ) -> CanonLowerOutcome {
-    let core_before_func: Option<u32>;
-    let core_after_func: Option<u32>;
-    let core_blocking_func: Option<u32>;
-    let core_handler_func_base: u32;
     let core_waitable_new: Option<u32>;
     let core_waitable_join: Option<u32>;
     let core_waitable_wait: Option<u32>;
     let core_waitable_drop: Option<u32>;
     let core_subtask_drop: Option<u32>;
-    let core_task_return_funcs: Vec<Option<u32>>;
 
     let mut canons = CanonicalFunctionSection::new();
 
     // Hooks are async-lowered: needs Async + Memory (for string params /
     // bool result) + UTF8.
-    core_before_func = before_comp_func.map(|comp_f| {
+    let core_before_func = before_comp_func.map(|comp_f| {
         let idx = core_func_count;
         core_func_count += 1;
         canons.lower(
@@ -1216,7 +1220,7 @@ fn emit_canon_lower(
         idx
     });
 
-    core_after_func = after_comp_func.map(|comp_f| {
+    let core_after_func = after_comp_func.map(|comp_f| {
         let idx = core_func_count;
         core_func_count += 1;
         canons.lower(
@@ -1230,7 +1234,7 @@ fn emit_canon_lower(
         idx
     });
 
-    core_blocking_func = blocking_comp_func.map(|comp_f| {
+    let core_blocking_func = blocking_comp_func.map(|comp_f| {
         let idx = core_func_count;
         core_func_count += 1;
         canons.lower(
@@ -1246,7 +1250,7 @@ fn emit_canon_lower(
 
     // Lower each handler function. For functions with resources/strings:
     // need Memory + UTF8 + Realloc. For async: also need Async flag.
-    core_handler_func_base = core_func_count;
+    let core_handler_func_base = core_func_count;
     for (i, func) in funcs.iter().enumerate() {
         core_func_count += 1;
         let hs = func_has_strings[i];
@@ -1305,7 +1309,7 @@ fn emit_canon_lower(
     // task.return canonicals — one per async func (void or not). For
     // functions with resources/complex results: needs Memory + UTF8 for
     // lifting.
-    core_task_return_funcs = funcs
+    let core_task_return_funcs: Vec<Option<u32>> = funcs
         .iter()
         .enumerate()
         .map(|(fi, func)| {
@@ -1650,6 +1654,16 @@ struct HandlerTypesOutcome {
     comp_result_cvs: Vec<Option<ComponentValType>>,
 }
 
+struct FuncSig {
+    params: Vec<(String, ComponentValType)>,
+    result: Option<ComponentValType>,
+}
+impl FuncSig {
+    fn new(params: Vec<(String, ComponentValType)>, result: Option<ComponentValType>) -> FuncSig {
+        FuncSig { params, result }
+    }
+}
+
 /// Sections 3b + 3c. Emit the `own<T>` types for each aliased resource
 /// (3b) and the per-function component-level function types used by the
 /// canon-lift phase (3c). The two sections are tightly coupled because
@@ -1717,14 +1731,17 @@ fn emit_handler_resource_types(
         // results. This must happen BEFORE setting target_func_ty_base
         // so that compound type definitions are emitted into func_types
         // before the function type declarations.
-        let mut pre_encoded: Vec<(Vec<(String, ComponentValType)>, Option<ComponentValType>)> =
-            Vec::new();
+        let mut pre_encoded: Vec<FuncSig> = Vec::new();
         for func in funcs.iter() {
             let mut params: Vec<(String, ComponentValType)> = Vec::new();
             for (n, &id) in func.param_names.iter().zip(func.param_type_ids.iter()) {
                 let cv = encode_comp_cv(
-                    id, arena, &mut func_types, &mut type_count,
-                    &comp_own_by_vid, &mut comp_cv_cache,
+                    id,
+                    arena,
+                    &mut func_types,
+                    &mut type_count,
+                    &comp_own_by_vid,
+                    &mut comp_cv_cache,
                 )?;
                 params.push((n.clone(), cv));
             }
@@ -1732,12 +1749,16 @@ fn emit_handler_resource_types(
                 .result_type_id
                 .map(|id| {
                     encode_comp_cv(
-                        id, arena, &mut func_types, &mut type_count,
-                        &comp_own_by_vid, &mut comp_cv_cache,
+                        id,
+                        arena,
+                        &mut func_types,
+                        &mut type_count,
+                        &comp_own_by_vid,
+                        &mut comp_cv_cache,
                     )
                 })
                 .transpose()?;
-            pre_encoded.push((params, result_cv));
+            pre_encoded.push(FuncSig::new(params, result_cv));
         }
 
         // Second pass: declare function types. target_func_ty_base is
@@ -1745,15 +1766,15 @@ fn emit_handler_resource_types(
         // func_types.
         target_func_ty_base = type_count;
         let mut result_cvs: Vec<Option<ComponentValType>> = Vec::new();
-        for (func, (params, result_cv)) in funcs.iter().zip(pre_encoded.into_iter()) {
+        for (func, FuncSig { params, result }) in funcs.iter().zip(pre_encoded.into_iter()) {
             type_count += 1;
-            result_cvs.push(result_cv);
+            result_cvs.push(result);
             let mut fty = func_types.function();
             if func.is_async {
                 fty.async_(true);
             }
             fty.params(params.iter().map(|(n, cv)| (n.as_str(), *cv)))
-                .result(result_cv);
+                .result(result);
         }
 
         comp_result_cvs = result_cvs;
@@ -1773,6 +1794,7 @@ fn emit_handler_resource_types(
 /// Uses `wasm_encoder::Component` with explicit section management so that
 /// we can create a component instance from exported items (a capability not
 /// exposed as a public method by `ComponentBuilder`).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_adapter_bytes(
     target_interface: &str,
     funcs: &[AdapterFunc],
@@ -1783,17 +1805,6 @@ pub(super) fn build_adapter_bytes(
     iface_ty: &InterfaceType,
     split_imports: Option<&SplitImports>,
 ) -> anyhow::Result<Vec<u8>> {
-    // ── Index counters ─────────────────────────────────────────────────────
-    //
-    // `func_count` and `instance_count` are initialised from the
-    // import-strategy outcome below — they're declared here only for
-    // visibility into the post-strategy phases (`func_count` is read by
-    // canon-lift, `instance_count` is read by the export phase). The
-    // core-* counters are owned by the phase functions that produce
-    // them; the orchestrator only carries the values it has to forward.
-    let func_count: u32;
-    let instance_count: u32;
-
     // Per-function: does any param/result require Memory+UTF8?
     // Uses deep string check (traverses compound types).
     let func_has_strings: Vec<bool> = funcs.iter().map(|f| f.has_strings(arena)).collect();
@@ -1882,8 +1893,16 @@ pub(super) fn build_adapter_bytes(
         )?
     };
 
-    instance_count = instance_count_after;
-    func_count = func_count_after;
+    // ── Index counters ─────────────────────────────────────────────────────
+    //
+    // `func_count` and `instance_count` are initialised from the
+    // import-strategy outcome below — they're declared here only for
+    // visibility into the post-strategy phases (`func_count` is read by
+    // canon-lift, `instance_count` is read by the export phase). The
+    // core-* counters are owned by the phase functions that produce
+    // them; the orchestrator only carries the values it has to forward.
+    let instance_count = instance_count_after;
+    let func_count = func_count_after;
 
     let HandlerTypesOutcome {
         target_func_ty_base,

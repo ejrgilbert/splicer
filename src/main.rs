@@ -108,11 +108,7 @@ fn main() -> Result<()> {
             })?;
 
             print_diagnostics(&out.diagnostics, skip_type_check);
-            write_and_announce(
-                &out.wac,
-                output_wac,
-                |path| out.wac_compose_cmd(path),
-            )
+            write_and_announce(&out.wac, output_wac, |path| out.wac_compose_cmd(path))
         }
 
         Command::Compose {
@@ -146,11 +142,7 @@ fn main() -> Result<()> {
             })?;
 
             print_diagnostics(&out.diagnostics, false);
-            write_and_announce(
-                &out.wac,
-                output_wac,
-                |path| out.wac_compose_cmd(path),
-            )
+            write_and_announce(&out.wac, output_wac, |path| out.wac_compose_cmd(path))
         }
     }
 }

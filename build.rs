@@ -138,10 +138,7 @@ fn parse_package_decl(src: &str, path: &Path) -> (String, String) {
             );
         }
     }
-    panic!(
-        "No `package` declaration found in {}",
-        path.display()
-    );
+    panic!("No `package` declaration found in {}", path.display());
 }
 
 /// Extract all `interface <name>` declarations from a WIT source string.

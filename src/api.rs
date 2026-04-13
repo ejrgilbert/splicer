@@ -279,14 +279,7 @@ pub fn splice(req: SpliceRequest) -> Result<SpliceOutput> {
     let (splits_path, shim_comps) =
         split_out_composition(&composition_wasm, &Some(splits_dir_str))?;
 
-    let out = generate_wac(
-        shim_comps,
-        &splits_path,
-        &graph,
-        &cfg,
-        None,
-        &package_name,
-    )?;
+    let out = generate_wac(shim_comps, &splits_path, &graph, &cfg, None, &package_name)?;
 
     if !skip_type_check {
         for diag in &out.diagnostics {
@@ -324,9 +317,7 @@ pub fn compose(req: ComposeRequest) -> Result<ComposeOutput> {
     // and check for name conflicts before any composition work.
     let mut resolved: Vec<(String, PathBuf, Vec<u8>)> = Vec::with_capacity(components.len());
     for ComponentInput { alias, path } in &components {
-        let name = alias
-            .clone()
-            .unwrap_or_else(|| filename_from_path(path));
+        let name = alias.clone().unwrap_or_else(|| filename_from_path(path));
         let bytes = std::fs::read(path)
             .with_context(|| format!("Failed to read Wasm component: {}", path.display()))?;
         resolved.push((name, path.clone(), bytes));

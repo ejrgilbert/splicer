@@ -33,9 +33,7 @@ mod tests;
 mod ty;
 use component::build_adapter_bytes;
 #[allow(unused_imports)]
-use filter::{
-    extract_filtered_sections, find_handler_deps, FilteredSections, HandlerDeps,
-};
+use filter::{extract_filtered_sections, find_handler_deps, FilteredSections, HandlerDeps};
 use func::extract_adapter_funcs;
 use split_imports::{extract_split_imports, SplitImports};
 
@@ -54,6 +52,7 @@ use split_imports::{extract_split_imports, SplitImports};
 ///   4. Calls `after-call(fn_name)` if the middleware exports it
 ///
 /// Returns the path to the generated adapter `.wasm` file.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_tier1_adapter(
     middleware_name: &str,
     _middleware_path: Option<&str>,
@@ -102,7 +101,9 @@ pub fn generate_tier1_adapter(
         } else {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("Failed to read consumer split at '{}'", path))?;
-            Some(SplitImports::from(extract_filtered_sections(&bytes, &deps)?))
+            Some(SplitImports::from(extract_filtered_sections(
+                &bytes, &deps,
+            )?))
         }
     } else {
         None

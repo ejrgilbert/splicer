@@ -78,7 +78,10 @@ fn main() -> Result<()> {
     std::fs::write(&provider_path, &provider_bytes).context("write provider wasm")?;
     std::fs::write(&consumer_path, &consumer_bytes).context("write consumer wasm")?;
 
-    println!("✓ wrote provider and consumer wasm to {}", tmp.path().display());
+    println!(
+        "✓ wrote provider and consumer wasm to {}",
+        tmp.path().display()
+    );
 
     // ── 2. Run splicer::compose ──────────────────────────────────────────
     //
@@ -99,7 +102,10 @@ fn main() -> Result<()> {
         package_name: "example:composition".to_string(),
     })?;
 
-    println!("✓ splicer::compose produced {} bytes of WAC source", out.wac.len());
+    println!(
+        "✓ splicer::compose produced {} bytes of WAC source",
+        out.wac.len()
+    );
     println!("  wac_deps:");
     for (key, path) in &out.wac_deps {
         println!("    {key} = {}", path.display());
@@ -134,11 +140,13 @@ fn main() -> Result<()> {
     let composed: Vec<u8> = resolution
         .encode(EncodeOptions::default())
         .context("encode composed component")?;
-    println!("✓ resolution.encode produced {} bytes of composed wasm", composed.len());
+    println!(
+        "✓ resolution.encode produced {} bytes of composed wasm",
+        composed.len()
+    );
 
     // ── 7. Validate the composed bytes ──────────────────────────────────
-    let mut validator =
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
     validator
         .validate_all(&composed)
         .context("validate composed component bytes")?;

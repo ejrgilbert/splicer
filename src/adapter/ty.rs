@@ -41,7 +41,7 @@ pub(super) fn flat_types_for(id: ValueTypeId, arena: &TypeArena) -> Vec<ValType>
         ValueType::Resource(_) | ValueType::AsyncHandle => vec![ValType::I32],
         ValueType::Enum(_) => vec![ValType::I32],
         ValueType::Flags(names) => {
-            let n_words = (names.len() + 31) / 32;
+            let n_words = names.len().div_ceil(32);
             vec![ValType::I32; n_words]
         }
         ValueType::Record(fields) => fields
@@ -112,13 +112,13 @@ pub(super) fn join_val_type(a: ValType, b: ValType) -> ValType {
 pub(super) fn type_has_strings(id: ValueTypeId, arena: &TypeArena) -> bool {
     match arena.lookup_val(id) {
         ValueType::String => true,
-        ValueType::Record(fields) => fields
-            .iter()
-            .any(|(_, id)| type_has_strings(*id, arena)),
+        ValueType::Record(fields) => fields.iter().any(|(_, id)| type_has_strings(*id, arena)),
         ValueType::Tuple(ids) => ids.iter().any(|id| type_has_strings(*id, arena)),
-        ValueType::Variant(cases) => cases
-            .iter()
-            .any(|(_, opt_id)| opt_id.map(|id| type_has_strings(id, arena)).unwrap_or(false)),
+        ValueType::Variant(cases) => cases.iter().any(|(_, opt_id)| {
+            opt_id
+                .map(|id| type_has_strings(id, arena))
+                .unwrap_or(false)
+        }),
         ValueType::Option(inner) => type_has_strings(*inner, arena),
         ValueType::Result { ok, err } => {
             ok.map(|id| type_has_strings(id, arena)).unwrap_or(false)
@@ -136,13 +136,13 @@ pub(super) fn type_has_strings(id: ValueTypeId, arena: &TypeArena) -> bool {
 pub(super) fn type_has_resources(id: ValueTypeId, arena: &TypeArena) -> bool {
     match arena.lookup_val(id) {
         ValueType::Resource(_) | ValueType::AsyncHandle => true,
-        ValueType::Record(fields) => fields
-            .iter()
-            .any(|(_, id)| type_has_resources(*id, arena)),
+        ValueType::Record(fields) => fields.iter().any(|(_, id)| type_has_resources(*id, arena)),
         ValueType::Tuple(ids) => ids.iter().any(|id| type_has_resources(*id, arena)),
-        ValueType::Variant(cases) => cases
-            .iter()
-            .any(|(_, opt_id)| opt_id.map(|id| type_has_resources(id, arena)).unwrap_or(false)),
+        ValueType::Variant(cases) => cases.iter().any(|(_, opt_id)| {
+            opt_id
+                .map(|id| type_has_resources(id, arena))
+                .unwrap_or(false)
+        }),
         ValueType::Option(inner) => type_has_resources(*inner, arena),
         ValueType::Result { ok, err } => {
             ok.map(|id| type_has_resources(id, arena)).unwrap_or(false)

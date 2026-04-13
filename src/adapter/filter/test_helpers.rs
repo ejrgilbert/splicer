@@ -8,8 +8,6 @@
 //! their fixtures rather than from positional assumptions about
 //! what `wat::parse_str` produced.
 
-#![cfg(test)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::HandlerDeps;
@@ -156,12 +154,7 @@ impl BinaryLayout {
                     let items = reader
                         .into_iter()
                         .map(|im| BinaryItem {
-                            name: Some(
-                                im.expect("import")
-                                    .name
-                                    .0
-                                    .to_string(),
-                            ),
+                            name: Some(im.expect("import").name.0.to_string()),
                         })
                         .collect();
                     (BinarySectionKind::Import, items)
