@@ -793,7 +793,6 @@ pub(super) fn build_dispatch_module(
             } else {
                 // ── Sync wrapper (single-value or void result) ────────────────
                 if has_after && has_result {
-                    let result_val_type = func.core_results[0];
                     result_local_idx = Some(func.core_params.len() as u32);
                 }
 

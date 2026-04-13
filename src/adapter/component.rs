@@ -124,18 +124,18 @@ fn build_handler_inst_type(
     inst: &mut InstanceType,
     funcs: &[AdapterFunc],
     arena: &TypeArena,
-) {
+) -> anyhow::Result<()> {
     let mut pp_cvs: Vec<Vec<ComponentValType>> = Vec::new();
     let mut pr_cv: Vec<Option<ComponentValType>> = Vec::new();
     for func in funcs.iter() {
-        let p_cvs: Vec<ComponentValType> = func
-            .param_type_ids
-            .iter()
-            .map(|&id| ctx.encode_cv(id, inst, arena))
-            .collect();
+        let mut p_cvs = Vec::new();
+        for &id in &func.param_type_ids {
+            p_cvs.push(ctx.encode_cv(id, inst, arena)?);
+        }
         let r_cv = func
             .result_type_id
-            .map(|id| ctx.encode_cv(id, inst, arena));
+            .map(|id| ctx.encode_cv(id, inst, arena))
+            .transpose()?;
         pp_cvs.push(p_cvs);
         pr_cv.push(r_cv);
     }
@@ -154,6 +154,7 @@ fn build_handler_inst_type(
         fty.params(params.iter().copied()).result(pr_cv[fi]);
         inst.export(&func.name, ComponentTypeRef::Func(fn_ty_local_idx));
     }
+    Ok(())
 }
 
 /// Append the (optional) before/after/blocking instance types to `types` and
@@ -443,7 +444,7 @@ fn emit_imports_from_consumer_split(
         {
             let mut ctx = InstTypeCtx::new();
             let mut dummy_inst = InstanceType::new();
-            build_handler_inst_type(&mut ctx, &mut dummy_inst, funcs, arena);
+            build_handler_inst_type(&mut ctx, &mut dummy_inst, funcs, arena)?;
             inst_ctx = ctx;
         }
 
@@ -508,7 +509,7 @@ fn emit_imports_from_consumer_split(
             // Resources are defined in the raw sections but we don't have
             // their type indices. Use the simple SubResource path instead —
             // the types instance from the raw sections provides the context.
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena);
+            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
             handler_inst_ty = type_count;
             type_count += 1;
             inst_ctx = ctx;
@@ -516,7 +517,7 @@ fn emit_imports_from_consumer_split(
         } else {
             let mut ctx = InstTypeCtx::new();
             let mut inst = InstanceType::new();
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena);
+            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
             handler_inst_ty = type_count;
             type_count += 1;
             inst_ctx = ctx;
@@ -696,7 +697,7 @@ fn emit_imports_via_types_iface(
             // Use the export-aware encoder that interleaves type
             // definitions and exports, ensuring references use export
             // indices.
-            let inst = build_types_instance_type(type_exports_ref, arena);
+            let inst = build_types_instance_type(type_exports_ref, arena)?;
             types.instance(&inst);
         }
         component.section(&types);
@@ -786,7 +787,7 @@ fn emit_imports_via_types_iface(
                 }
             }
 
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena);
+            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
             inst_ctx = ctx;
             types.instance(&inst);
         }
@@ -900,7 +901,7 @@ fn emit_imports_inline_resources(
         {
             let mut ctx = InstTypeCtx::new();
             let mut inst = InstanceType::new();
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena);
+            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
             inst_ctx = ctx;
             types.instance(&inst);
         }
@@ -1661,7 +1662,7 @@ fn emit_handler_resource_types(
     comp_resource_indices: &[u32],
     comp_aliased_types: &HashMap<ValueTypeId, u32>,
     type_count_in: u32,
-) -> HandlerTypesOutcome {
+) -> anyhow::Result<HandlerTypesOutcome> {
     let mut type_count = type_count_in;
     // ── 3b. Type section B: own<T> types for each aliased resource ─────────
     //
@@ -1719,32 +1720,23 @@ fn emit_handler_resource_types(
         let mut pre_encoded: Vec<(Vec<(String, ComponentValType)>, Option<ComponentValType>)> =
             Vec::new();
         for func in funcs.iter() {
-            let params: Vec<(String, ComponentValType)> = func
-                .param_names
-                .iter()
-                .zip(func.param_type_ids.iter())
-                .map(|(n, &id)| {
-                    let cv = encode_comp_cv(
-                        id,
-                        arena,
-                        &mut func_types,
-                        &mut type_count,
-                        &comp_own_by_vid,
-                        &mut comp_cv_cache,
-                    );
-                    (n.clone(), cv)
+            let mut params: Vec<(String, ComponentValType)> = Vec::new();
+            for (n, &id) in func.param_names.iter().zip(func.param_type_ids.iter()) {
+                let cv = encode_comp_cv(
+                    id, arena, &mut func_types, &mut type_count,
+                    &comp_own_by_vid, &mut comp_cv_cache,
+                )?;
+                params.push((n.clone(), cv));
+            }
+            let result_cv = func
+                .result_type_id
+                .map(|id| {
+                    encode_comp_cv(
+                        id, arena, &mut func_types, &mut type_count,
+                        &comp_own_by_vid, &mut comp_cv_cache,
+                    )
                 })
-                .collect();
-            let result_cv = func.result_type_id.map(|id| {
-                encode_comp_cv(
-                    id,
-                    arena,
-                    &mut func_types,
-                    &mut type_count,
-                    &comp_own_by_vid,
-                    &mut comp_cv_cache,
-                )
-            });
+                .transpose()?;
             pre_encoded.push((params, result_cv));
         }
 
@@ -1768,12 +1760,12 @@ fn emit_handler_resource_types(
         component.section(&func_types);
     }
 
-    let _ = comp_own_by_vid; // consumed by `encode_comp_cv` above; not needed downstream
-    let _ = type_count;       // type_count is not read after section 3c
-    HandlerTypesOutcome {
+    let _ = comp_own_by_vid;
+    let _ = type_count;
+    Ok(HandlerTypesOutcome {
         target_func_ty_base,
         comp_result_cvs,
-    }
+    })
 }
 
 /// Build the full Wasm component binary for the tier-1 adapter.
@@ -1904,7 +1896,7 @@ pub(super) fn build_adapter_bytes(
         &comp_resource_indices,
         &comp_aliased_types,
         type_count_after,
-    );
+    )?;
 
     let layout = compute_memory_layout(
         funcs,
