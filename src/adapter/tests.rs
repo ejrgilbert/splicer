@@ -79,7 +79,7 @@ fn test_adapter_sync_primitives() {
     let iface = make_iface(vec![("add", sig(false, &["a", "b"], vec![s32, s32], vec![s32]))]);
     let bytes = gen_adapter(
         "test:pkg/adder@1.0.0",
-        &["splicer:adapter/before", "splicer:adapter/after"],
+        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
     );
@@ -95,7 +95,7 @@ fn test_adapter_async_void_string() {
     let iface = make_iface(vec![("print", sig(true, &["msg"], vec![string], vec![]))]);
     let bytes = gen_adapter(
         "test:pkg/printer@1.0.0",
-        &["splicer:adapter/before", "splicer:adapter/after"],
+        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
     );
@@ -143,7 +143,7 @@ fn test_adapter_resource_handler() {
 
     let bytes = gen_adapter(
         "wasi:http/handler@0.3.0-rc-2026-01-06",
-        &["splicer:adapter/before", "splicer:adapter/after"],
+        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
     );
@@ -164,7 +164,7 @@ fn test_adapter_multi_func() {
     ]);
     let bytes = gen_adapter(
         "test:pkg/mixed@1.0.0",
-        &["splicer:adapter/before", "splicer:adapter/after"],
+        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
     );
@@ -180,7 +180,7 @@ fn test_adapter_before_only() {
     let iface = make_iface(vec![("get", sig(false, &[], vec![], vec![s32]))]);
     let bytes = gen_adapter(
         "test:pkg/getter@1.0.0",
-        &["splicer:adapter/before"],
+        &["splicer:tier1/before"],
         &iface,
         &arena,
     );
@@ -196,7 +196,7 @@ fn test_adapter_after_only() {
     let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![s32]))]);
     let bytes = gen_adapter(
         "test:pkg/getter@1.0.0",
-        &["splicer:adapter/after"],
+        &["splicer:tier1/after"],
         &iface,
         &arena,
     );
@@ -213,9 +213,9 @@ fn test_adapter_blocking() {
     let bytes = gen_adapter(
         "test:pkg/fire@1.0.0",
         &[
-            "splicer:adapter/before",
-            "splicer:adapter/blocking",
-            "splicer:adapter/after",
+            "splicer:tier1/before",
+            "splicer:tier1/blocking",
+            "splicer:tier1/after",
         ],
         &iface,
         &arena,

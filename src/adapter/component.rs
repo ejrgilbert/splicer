@@ -223,8 +223,9 @@ fn emit_hook_inst_types(
     (before_inst_ty, after_inst_ty, blocking_inst_ty)
 }
 
-/// Append (optional) imports for the splicer:adapter/{before,after,blocking}
-/// instances and return the component-scope instance index for each.
+/// Append (optional) imports for the tier-1 hook instances
+/// (`splicer:tier1/{before,after,blocking}`) and return the
+/// component-scope instance index for each.
 fn emit_hook_imports(
     imports: &mut ComponentImportSection,
     instance_count: &mut u32,
@@ -232,22 +233,24 @@ fn emit_hook_imports(
     after_ty: Option<u32>,
     blocking_ty: Option<u32>,
 ) -> (Option<u32>, Option<u32>, Option<u32>) {
+    use crate::contract::{TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING};
+
     let before_inst = before_ty.map(|ty_idx| {
         let idx = *instance_count;
         *instance_count += 1;
-        imports.import("splicer:adapter/before", ComponentTypeRef::Instance(ty_idx));
+        imports.import(TIER1_BEFORE, ComponentTypeRef::Instance(ty_idx));
         idx
     });
     let after_inst = after_ty.map(|ty_idx| {
         let idx = *instance_count;
         *instance_count += 1;
-        imports.import("splicer:adapter/after", ComponentTypeRef::Instance(ty_idx));
+        imports.import(TIER1_AFTER, ComponentTypeRef::Instance(ty_idx));
         idx
     });
     let blocking_inst = blocking_ty.map(|ty_idx| {
         let idx = *instance_count;
         *instance_count += 1;
-        imports.import("splicer:adapter/blocking", ComponentTypeRef::Instance(ty_idx));
+        imports.import(TIER1_BLOCKING, ComponentTypeRef::Instance(ty_idx));
         idx
     });
     (before_inst, after_inst, blocking_inst)

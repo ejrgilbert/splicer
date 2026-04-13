@@ -153,8 +153,8 @@ pub struct SpliceOutput {
     /// disk while resolving the splice rules. Empty when no rule
     /// matched a tier-1 type-erased middleware. Each entry names
     /// the on-disk path, the wrapped middleware, the target interface,
-    /// and which tier-1 hook interfaces (`splicer:adapter/before`,
-    /// `splicer:adapter/after`, `splicer:adapter/blocking`) the
+    /// and which tier-1 hook interfaces (`splicer:tier1/before`,
+    /// `splicer:tier1/after`, `splicer:tier1/blocking`) the
     /// middleware exports.
     ///
     /// Adapter paths are also present in [`SpliceOutput::wac_deps`]

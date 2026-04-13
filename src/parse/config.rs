@@ -59,7 +59,7 @@ pub struct YamlProviderOpt {
 pub struct AdapterInjectionInfo {
     /// Path to the generated adapter `.wasm` file.
     pub adapter_path: String,
-    /// Tier-1 interfaces the middleware exports (e.g. `"splicer:adapter/before"`).
+    /// Tier-1 interfaces the middleware exports (e.g. `"splicer:tier1/before"`).
     pub tier1_interfaces: Vec<String>,
 }
 

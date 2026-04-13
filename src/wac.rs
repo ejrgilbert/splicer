@@ -66,7 +66,7 @@ pub struct GeneratedAdapter {
     /// `"wasi:http/handler@0.3.0-rc-2026-01-06"`).
     pub target_interface: String,
     /// Tier-1 hook interfaces the wrapped middleware exports
-    /// (e.g. `"splicer:adapter/before"`).
+    /// (e.g. `"splicer:tier1/before"`).
     pub tier1_interfaces: Vec<String>,
 }
 
