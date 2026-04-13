@@ -691,8 +691,10 @@ pub(super) fn build_dispatch_module(
             if has_blocking && has_result && !func.is_async {
                 anyhow::bail!(
                     "Function '{}' returns a value but the middleware exports \
-                     `should-block-call`. Blocking is only supported for void-returning \
-                     functions in this version.",
+                     `should-block-call`. Tier-1 blocking is only supported for \
+                     void-returning functions because the adapter cannot synthesize \
+                     a return value when the call is blocked. Tier-3 (read-write \
+                     interception) will support this in the future.",
                     func.name
                 );
             }
@@ -719,8 +721,9 @@ pub(super) fn build_dispatch_module(
                 if has_result {
                     anyhow::bail!(
                         "Function '{}' is async with a return value and the middleware \
-                             exports `should-block-call`. Blocking is not supported for \
-                             async functions with results.",
+                             exports `should-block-call`. Tier-1 blocking is not supported \
+                             for async functions with results. Tier-3 (read-write \
+                             interception) will support this in the future.",
                         func.name
                     );
                 }

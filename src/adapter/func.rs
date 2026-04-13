@@ -95,7 +95,8 @@ pub(super) fn extract_adapter_funcs(
         InterfaceType::Instance(i) => i,
         InterfaceType::Func(_) => anyhow::bail!(
             "Expected an instance-type interface for tier-1 adapter generation; \
-             bare function-type interfaces are not supported."
+             bare function-type interfaces are not yet supported. If you need this, \
+             please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues"
         ),
     };
 
@@ -125,7 +126,8 @@ pub(super) fn extract_adapter_funcs(
         if sig.results.len() > 1 {
             anyhow::bail!(
                 "Function '{}' has {} results; only 0 or 1 results are supported \
-                 for tier-1 adapter generation in this version.",
+                 for tier-1 adapter generation. If you need multi-result support, \
+                 please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
                 name,
                 sig.results.len()
             );

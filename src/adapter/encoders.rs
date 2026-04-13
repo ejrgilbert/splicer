@@ -416,8 +416,12 @@ impl InstTypeCtx {
                 idx
             }
 
-            // TODO: Map, ErrorContext — not yet supported as component-level types.
-            other => panic!("InstTypeCtx::encode_cv: unsupported type {:?}", other),
+            other => panic!(
+                "InstTypeCtx::encode_cv: unsupported type {:?}. \
+                 If you need support for this type in tier-1 adapters, \
+                 please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
+                other
+            ),
         };
 
         self.cache.insert(id, local_idx);
@@ -614,7 +618,11 @@ pub(super) fn encode_comp_cv(
             comp_cache.insert(id, idx);
             ComponentValType::Type(idx)
         }
-        // Primitives already handled above; ErrorContext/Map not supported as component-level types.
-        other => panic!("encode_comp_cv: unsupported type {:?}", other),
+        other => panic!(
+            "encode_comp_cv: unsupported type {:?}. \
+             If you need support for this type in tier-1 adapters, \
+             please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
+            other
+        ),
     }
 }
