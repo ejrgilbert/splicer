@@ -5,8 +5,14 @@ use std::path::PathBuf;
 use wirm::ir::component::visitor::{walk_structural, ComponentVisitor, VisitCtx};
 use wirm::{Component, Module};
 
+/// Default directory where split sub-components are written.
 pub const PATH_TO_SPLITS: &str = "./splits";
 
+/// Split a composed Wasm component into its sub-components, writing
+/// one `.wasm` file per nested component into the splits directory.
+/// Returns `(splits_dir, shim_map)` where `shim_map` records which
+/// splits are shim components that should be replaced by their outer
+/// component.
 pub fn split_out_composition(
     wasm_path: &PathBuf,
     splits_path: &Option<String>,
@@ -109,6 +115,7 @@ impl ComponentVisitor<'_> for EmitVisitor {
     }
 }
 
+/// Build the filesystem path for a split sub-component by index.
 pub fn gen_split_path(splits_path: &str, comp_id: usize) -> String {
     format!("{splits_path}/split{comp_id}.wasm")
 }

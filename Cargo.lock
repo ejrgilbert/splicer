@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "cviz"
-version = "2.0.0-rc2"
+version = "2.0.0-rc3"
 dependencies = [
  "anyhow",
  "clap",
@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "wirm"
-version = "4.0.0-rc2"
+version = "4.0.0-rc3"
 dependencies = [
  "log",
  "serde_json",

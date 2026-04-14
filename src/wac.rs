@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use wasmparser::collections::IndexSet;
 
+/// Package prefix used for WAC instance variables (e.g. `"my:srv-a"`).
 pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
 use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
