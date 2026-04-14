@@ -41,6 +41,64 @@ use wasm_encoder::{
 use super::func::AdapterFunc;
 use super::ty::{align_to_val, canonical_align};
 
+/// Byte size of a core Wasm value type in linear memory.
+/// Exhaustive so the compiler catches new `ValType` variants.
+fn val_type_byte_size(vt: &ValType) -> u32 {
+    match vt {
+        ValType::I32 | ValType::F32 => 4,
+        ValType::I64 | ValType::F64 => 8,
+        ValType::V128 => 16,
+        ValType::Ref(_) => 4, // reference types are pointer-sized
+    }
+}
+
+/// Emit a typed load instruction at `offset` within the address
+/// already on top of the stack. Returns the byte size consumed so
+/// the caller can advance the offset.
+///
+/// The caller is responsible for pushing the base address (via
+/// `I32Const` or `LocalGet`) before calling this.
+fn emit_load(f: &mut Function, offset: u32, vt: &ValType) -> u32 {
+    match vt {
+        ValType::I32 | ValType::Ref(_) => {
+            f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index: 0,
+            }));
+        }
+        ValType::I64 => {
+            f.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
+        ValType::F32 => {
+            f.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index: 0,
+            }));
+        }
+        ValType::F64 => {
+            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
+        ValType::V128 => {
+            f.instruction(&Instruction::V128Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 4,
+                memory_index: 0,
+            }));
+        }
+    }
+    val_type_byte_size(vt)
+}
+
 /// Emit Wasm instructions that push the flat values for a multi-value task.return
 /// by reading from the canonical ABI memory layout at `result_ptr`.
 ///
@@ -73,36 +131,7 @@ fn emit_task_return_loads(
             // flat[1]: first payload value
             if core_results.len() > 1 {
                 f.instruction(&Instruction::I32Const(result_ptr as i32));
-                match core_results[1] {
-                    ValType::I64 => {
-                        f.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
-                            offset: payload_offset as u64,
-                            align: 3,
-                            memory_index: 0,
-                        }));
-                    }
-                    ValType::F32 => {
-                        f.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
-                            offset: payload_offset as u64,
-                            align: 2,
-                            memory_index: 0,
-                        }));
-                    }
-                    ValType::F64 => {
-                        f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                            offset: payload_offset as u64,
-                            align: 3,
-                            memory_index: 0,
-                        }));
-                    }
-                    _ => {
-                        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                            offset: payload_offset as u64,
-                            align: 2,
-                            memory_index: 0,
-                        }));
-                    }
-                }
+                emit_load(f, payload_offset, &core_results[1]);
             }
 
             // flat[2..]: zero remaining values (handles Ok and simple Err cases)
@@ -130,40 +159,7 @@ fn emit_task_return_loads(
             let mut byte_offset: u32 = 0;
             for vt in core_results.iter() {
                 f.instruction(&Instruction::I32Const(result_ptr as i32));
-                match vt {
-                    ValType::I64 => {
-                        f.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
-                            offset: byte_offset as u64,
-                            align: 3,
-                            memory_index: 0,
-                        }));
-                        byte_offset += 8;
-                    }
-                    ValType::F32 => {
-                        f.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
-                            offset: byte_offset as u64,
-                            align: 2,
-                            memory_index: 0,
-                        }));
-                        byte_offset += 4;
-                    }
-                    ValType::F64 => {
-                        f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                            offset: byte_offset as u64,
-                            align: 3,
-                            memory_index: 0,
-                        }));
-                        byte_offset += 8;
-                    }
-                    _ => {
-                        f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                            offset: byte_offset as u64,
-                            align: 2,
-                            memory_index: 0,
-                        }));
-                        byte_offset += 4;
-                    }
-                }
+                byte_offset += emit_load(f, byte_offset, vt);
             }
         }
     }
@@ -835,29 +831,7 @@ pub(super) fn build_dispatch_module(
                         } else {
                             // Simple (single value): load from memory.
                             f.instruction(&Instruction::I32Const(result_ptr as i32));
-                            let load_instr = match func.core_results.first() {
-                                Some(ValType::I64) => Instruction::I64Load(wasm_encoder::MemArg {
-                                    offset: 0,
-                                    align: 3,
-                                    memory_index: 0,
-                                }),
-                                Some(ValType::F32) => Instruction::F32Load(wasm_encoder::MemArg {
-                                    offset: 0,
-                                    align: 2,
-                                    memory_index: 0,
-                                }),
-                                Some(ValType::F64) => Instruction::F64Load(wasm_encoder::MemArg {
-                                    offset: 0,
-                                    align: 3,
-                                    memory_index: 0,
-                                }),
-                                _ => Instruction::I32Load(wasm_encoder::MemArg {
-                                    offset: 0,
-                                    align: 2,
-                                    memory_index: 0,
-                                }),
-                            };
-                            f.instruction(&load_instr);
+                            emit_load(&mut f, 0, &func.core_results[0]);
                         }
                         f.instruction(&Instruction::Call(tr_fn));
                     }

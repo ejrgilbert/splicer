@@ -148,13 +148,26 @@ pub(super) fn extract_adapter_funcs(
             (Some(rid), is_complex, flat)
         };
 
-        // For async functions with a result, reserve memory.
+        // Compute the exact byte size needed to store the flat result
+        // values in linear memory. Exhaustive match so the compiler
+        // catches any new ValType variants added to wasm_encoder.
+        let result_byte_size: u32 = core_results
+            .iter()
+            .map(|vt| match vt {
+                ValType::I32 | ValType::F32 => 4u32,
+                ValType::I64 | ValType::F64 => 8u32,
+                ValType::V128 => 16u32,
+                ValType::Ref(_) => 4u32, // reference types are pointer-sized
+            })
+            .sum();
+
+        // For async functions with a result, reserve memory for the
+        // async-lowered handler to write into.
         let (async_result_mem_offset, async_result_mem_size) =
             if sig.is_async && result_type_id.is_some() {
-                let size = if result_is_complex { 512u32 } else { 8u32 };
                 let off = async_result_cursor;
-                async_result_cursor += size;
-                (Some(off), size)
+                async_result_cursor += result_byte_size;
+                (Some(off), result_byte_size)
             } else {
                 (None, 0)
             };
@@ -162,17 +175,9 @@ pub(super) fn extract_adapter_funcs(
         // For sync functions with complex results (> MAX_FLAT_RESULTS),
         // reserve a result buffer in linear memory. The wrapper stores
         // handler output here and returns the buffer address to canon lift.
-        // Size: 4 bytes per I32/F32, 8 bytes per I64/F64.
         let sync_result_mem_offset = if !sig.is_async && result_is_complex {
-            let size: u32 = core_results
-                .iter()
-                .map(|vt| match vt {
-                    ValType::I64 | ValType::F64 => 8u32,
-                    _ => 4u32,
-                })
-                .sum();
             let aligned = (async_result_cursor + 3) & !3;
-            async_result_cursor = aligned + size;
+            async_result_cursor = aligned + result_byte_size;
             Some(aligned)
         } else {
             None
