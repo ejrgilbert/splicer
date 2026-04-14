@@ -42,10 +42,11 @@ I have thought of the following approaches, but am open to more ideas (especiall
 3. Wasm component creation (like from the bottom up using `wirm` library)
 
 The best approach depends on the middleware tier (see Middleware Tiers below). For Tier 1 and Tier 2
-proxy generation, use `wirm` as this stress-tests the codegen side of the crate and the complexity is
-manageable since no value construction from scratch is required. For one-per-sig middleware,
+adapter generation, use `wasm_encoder` to build the component binary directly — the adapter is
+pure dispatch glue with no value construction from scratch, and `wasm_encoder`'s
+`ReencodeComponent` trait handles the fiddly index-translation work. For one-per-sig middleware,
 use the [`proxy-component`] approach (`syn`/`quote` Rust codegen)! Attempting to do type-aware value
-generation in raw Wasm bytecode via `wirm` would be orders of magnitude more complex with no benefit.
+generation in raw Wasm bytecode would be orders of magnitude more complex with no benefit.
 
 # Middleware Tiers
 
@@ -165,8 +166,8 @@ of which needs to be re-implemented.
 
 | Middleware tier      | Generation approach                                          | Rationale                                                                    |
 |----------------------|--------------------------------------------------------------|------------------------------------------------------------------------------|
-| Tier 1 (type-erased) | `wirm`                                                       | Pure dispatch, no value construction; good wirm codegen stress-test          |
-| Tier 2 (value-aware) | `wirm`                                                       | Dispatch + WAVE encode/decode; still no value construction from scratch      |
+| Tier 1 (type-erased) | `wasm_encoder`                                               | Pure dispatch, no value construction; direct binary construction is simplest |
+| Tier 2 (value-aware) | `wasm_encoder`                                               | Dispatch + WAVE encode/decode; still no value construction from scratch      |
 | One-per-sig          | Rust codegen via `syn`/`quote` + `wit-bindgen` + `arbitrary` | `arbitrary` derive handles all type complexity for free; codegen stays small |
 
 For natively-provided one-per-sig middleware (fuzzer, mock, property harness), splicer generates
