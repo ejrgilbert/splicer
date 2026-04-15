@@ -34,15 +34,16 @@
 //! several unrelated interfaces:
 //!
 //! ```text
-//!     caller-1 ──▶ ┐
-//!     caller-2 ──▶ ├──▶ middleware-a ──▶ service-b
-//!     caller-3 ──▶ ┘                          │
-//!                       (split)               │
-//!                          │                  │
-//!                          ▼                  │
-//!              wasi:http/handler               │   ◀── target
-//!              wasi:http/types                 │   ◀── handler dependency
-//!              my:service/messenger-async  ────┘   ◀── unrelated! must NOT
+//!     caller-1 ──────── mdl-a ────▶ ──┐
+//!     caller-2 ───────────────────▶ ──├──▶ service-b
+//!     caller-3 ───────────────────▶ ──┘       │
+//!                                             │
+//!                                          (split)
+//!                                             │
+//!                                             │
+//!              wasi:http/handler              │   ◀── target
+//!              wasi:http/types                │   ◀── handler dependency
+//!              my:service/messenger-async  ───┘   ◀── unrelated! must NOT
 //!                                                       leak into the adapter
 //! ```
 //!
