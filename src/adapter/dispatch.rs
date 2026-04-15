@@ -52,35 +52,35 @@ fn emit_load(f: &mut Function, offset: u32, vt: &ValType) -> u32 {
         ValType::I32 | ValType::Ref(_) => {
             f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                 offset: offset as u64,
-                align: 2,
+                align: 0,
                 memory_index: 0,
             }));
         }
         ValType::I64 => {
             f.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
                 offset: offset as u64,
-                align: 3,
+                align: 0,
                 memory_index: 0,
             }));
         }
         ValType::F32 => {
             f.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
                 offset: offset as u64,
-                align: 2,
+                align: 0,
                 memory_index: 0,
             }));
         }
         ValType::F64 => {
             f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
                 offset: offset as u64,
-                align: 3,
+                align: 0,
                 memory_index: 0,
             }));
         }
         ValType::V128 => {
             f.instruction(&Instruction::V128Load(wasm_encoder::MemArg {
                 offset: offset as u64,
-                align: 4,
+                align: 0,
                 memory_index: 0,
             }));
         }
@@ -710,7 +710,7 @@ pub(super) fn build_dispatch_module(
                 f.instruction(&Instruction::I32Const(blk_ptr as i32));
                 f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
                     offset: 0,
-                    align: 2,
+                    align: 0,
                     memory_index: 0,
                 }));
                 f.instruction(&Instruction::If(BlockType::Empty));
