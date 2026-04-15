@@ -6,9 +6,9 @@ use super::filter::FilteredSections;
 /// Extracted import structure from a consumer split component.
 /// Raw section bytes are copied verbatim into the adapter.
 pub(crate) struct SplitImports {
-    /// Raw section bytes (section_id, data) for all type + import + alias sections,
-    /// in order. These define the split's full import structure.
-    pub raw_sections: Vec<(u8, Vec<u8>)>,
+    /// Raw section bytes `(section_kind, data)` for all type + import + alias
+    /// sections, in order. These define the split's full import structure.
+    pub raw_sections: Vec<(ComponentSectionId, Vec<u8>)>,
     /// Names of imported instances, in order of their instance index.
     pub import_names: Vec<String>,
     /// Total number of component-level types declared across all sections.
@@ -47,7 +47,7 @@ pub(crate) fn extract_split_imports(split_path: &str) -> anyhow::Result<SplitImp
                 type_count += reader.count();
                 let range = reader.range();
                 raw_sections.push((
-                    ComponentSectionId::Type as u8,
+                    ComponentSectionId::Type,
                     bytes[range.start..range.end].to_vec(),
                 ));
             }
@@ -61,7 +61,7 @@ pub(crate) fn extract_split_imports(split_path: &str) -> anyhow::Result<SplitImp
                     }
                 }
                 raw_sections.push((
-                    ComponentSectionId::Import as u8,
+                    ComponentSectionId::Import,
                     bytes[range.start..range.end].to_vec(),
                 ));
             }
@@ -83,7 +83,7 @@ pub(crate) fn extract_split_imports(split_path: &str) -> anyhow::Result<SplitImp
                     }
                 }
                 raw_sections.push((
-                    ComponentSectionId::Alias as u8,
+                    ComponentSectionId::Alias,
                     bytes[range.start..range.end].to_vec(),
                 ));
             }

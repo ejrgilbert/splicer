@@ -97,10 +97,10 @@ use super::section_filter::HandlerDeps;
 /// this filtered path with minimal code changes.
 #[derive(Debug)]
 pub(crate) struct FilteredSections {
-    /// `(section_id, content_bytes)` pairs in source order.
+    /// `(section_kind, content_bytes)` pairs in source order.
     /// `content_bytes` is the section *content* (item count + items),
-    /// suitable to feed to `wasm_encoder::RawSection { id, data: &content_bytes }`.
-    pub raw_sections: Vec<(u8, Vec<u8>)>,
+    /// suitable to feed to `wasm_encoder::RawSection { id: kind as u8, data: &content_bytes }`.
+    pub raw_sections: Vec<(ComponentSectionId, Vec<u8>)>,
     /// Names of surviving instance imports, in source order.
     pub import_names: Vec<String>,
     /// Total component-level types contributed by the surviving items.
@@ -221,7 +221,7 @@ pub(crate) fn extract_filtered_sections(
 /// for every type/import/alias section, where `content` is the section's
 /// item count + items (i.e. exactly what `wasm_encoder::RawSection.data`
 /// expects).
-fn peel_section_contents(bytes: &[u8]) -> anyhow::Result<Vec<(u8, Vec<u8>)>> {
+fn peel_section_contents(bytes: &[u8]) -> anyhow::Result<Vec<(ComponentSectionId, Vec<u8>)>> {
     let mut out = Vec::new();
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.context("re-parsing filtered output")?;
@@ -229,21 +229,21 @@ fn peel_section_contents(bytes: &[u8]) -> anyhow::Result<Vec<(u8, Vec<u8>)>> {
             Payload::ComponentTypeSection(reader) => {
                 let range = reader.range();
                 out.push((
-                    ComponentSectionId::Type as u8,
+                    ComponentSectionId::Type,
                     bytes[range.start..range.end].to_vec(),
                 ));
             }
             Payload::ComponentImportSection(reader) => {
                 let range = reader.range();
                 out.push((
-                    ComponentSectionId::Import as u8,
+                    ComponentSectionId::Import,
                     bytes[range.start..range.end].to_vec(),
                 ));
             }
             Payload::ComponentAliasSection(reader) => {
                 let range = reader.range();
                 out.push((
-                    ComponentSectionId::Alias as u8,
+                    ComponentSectionId::Alias,
                     bytes[range.start..range.end].to_vec(),
                 ));
             }
@@ -599,11 +599,11 @@ mod tests {
     /// Wrap a list of `(section_id, content)` pairs in a complete
     /// component header so we can re-parse the result with wasmparser
     /// and assert against its structure.
-    fn wrap_as_component(raw_sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    fn wrap_as_component(raw_sections: &[(ComponentSectionId, Vec<u8>)]) -> Vec<u8> {
         // Component preamble: magic + layer + version
         let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
-        for (id, content) in raw_sections {
-            bytes.push(*id);
+        for (kind, content) in raw_sections {
+            bytes.push(*kind as u8);
             // LEB128-encode the content length
             let mut n = content.len() as u32;
             loop {

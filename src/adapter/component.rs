@@ -372,9 +372,10 @@ fn emit_imports_from_consumer_split(
     let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
 
     // Copy raw type/import/alias sections from the split.
-    for (section_id, data) in &split.raw_sections {
+    for (section_kind, data) in &split.raw_sections {
+        // RawSection::id is u8 (wasm-encoder's API), so convert at the boundary.
         component.section(&RawSection {
-            id: *section_id,
+            id: *section_kind as u8,
             data,
         });
     }
