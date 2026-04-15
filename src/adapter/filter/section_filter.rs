@@ -278,9 +278,25 @@ impl DepCollector {
     /// Walk an item's `referenced_indices()` and record any resolvable deps
     /// against `owner` in the graph.
     fn add_refs<T: ReferencedIndices>(&mut self, cx: &VisitCtx, owner: ItemLoc, item: &T) {
+        self.add_refs_filtered(cx, owner, item, false);
+    }
+
+    /// Like [`Self::add_refs`] but when `cross_scope_only` is true, only
+    /// references that cross a scope boundary (`!depth.is_curr()`) are
+    /// included. Used inside type bodies where body-local refs are
+    /// private to the parent type and would collide with our
+    /// component-scope location keys.
+    fn add_refs_filtered<T: ReferencedIndices>(
+        &mut self,
+        cx: &VisitCtx,
+        owner: ItemLoc,
+        item: &T,
+        cross_scope_only: bool,
+    ) {
         let resolved_locs: BTreeSet<ItemLoc> = item
             .referenced_indices()
             .iter()
+            .filter(|r| !cross_scope_only || !r.ref_.depth.is_curr())
             .filter_map(|r| {
                 let resolved = cx.resolve(&r.ref_);
                 self.lookup_loc(resolved.space(), resolved.idx())
@@ -402,25 +418,8 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         _parent: &ComponentType<'a>,
         decl: &InstanceTypeDeclaration<'a>,
     ) {
-        // We're inside an instance type body. The only deps we care about
-        // here are cross-scope ones — alias-outer-type refs that point at
-        // items in the enclosing component scope. Body-local refs (depth=0)
-        // are private to the parent type and would collide with our
-        // component-scope `type_to_loc` keys.
-        let Some(&top_loc) = self.type_body_stack.last() else {
-            return;
-        };
-        let new_deps: BTreeSet<ItemLoc> = decl
-            .referenced_indices()
-            .iter()
-            .filter(|r| !r.ref_.depth.is_curr())
-            .filter_map(|r| {
-                let resolved = cx.resolve(&r.ref_);
-                self.lookup_loc(resolved.space(), resolved.idx())
-            })
-            .collect();
-        if !new_deps.is_empty() {
-            self.deps.entry(top_loc).or_default().extend(new_deps);
+        if let Some(&top_loc) = self.type_body_stack.last() {
+            self.add_refs_filtered(cx, top_loc, decl, true);
         }
     }
 
@@ -432,20 +431,8 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         _parent: &ComponentType<'a>,
         decl: &ComponentTypeDeclaration<'a>,
     ) {
-        let Some(&top_loc) = self.type_body_stack.last() else {
-            return;
-        };
-        let new_deps: BTreeSet<ItemLoc> = decl
-            .referenced_indices()
-            .iter()
-            .filter(|r| !r.ref_.depth.is_curr())
-            .filter_map(|r| {
-                let resolved = cx.resolve(&r.ref_);
-                self.lookup_loc(resolved.space(), resolved.idx())
-            })
-            .collect();
-        if !new_deps.is_empty() {
-            self.deps.entry(top_loc).or_default().extend(new_deps);
+        if let Some(&top_loc) = self.type_body_stack.last() {
+            self.add_refs_filtered(cx, top_loc, decl, true);
         }
     }
 
