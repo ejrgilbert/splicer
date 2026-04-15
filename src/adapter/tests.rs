@@ -28,7 +28,6 @@ fn gen_adapter(target: &str, hooks: &[&str], iface: &InterfaceType, arena: &Type
     let hook_strings: Vec<String> = hooks.iter().map(|s| s.to_string()).collect();
     let path = generate_tier1_adapter(
         "test-mdl",
-        None,
         target,
         &hook_strings,
         Some(iface),

@@ -408,8 +408,8 @@ pub fn generate_wac(
                 // Through doing this, the order of middlewares invoked will follow the order of declaration in the configuration.
                 let reversed_list = reverse_set(middlewares);
                 for mdl in reversed_list.iter() {
-                    // instantiate
                     if let Some(adapter_info) = &mdl.adapter_info {
+                        // instantiate the middleware+adapter in wac script
                         let (adapter_var, extra_args) = create_tier1_mdl(
                             &last,
                             mdl,
@@ -420,6 +420,7 @@ pub fn generate_wac(
                         last = adapter_var;
                         used_middlewares.extend(extra_args);
                     } else {
+                        // instantiate the middleware in wac script
                         last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
                         used_middlewares.push((
                             last.clone(),
@@ -774,7 +775,6 @@ fn add_to_inject_plan(
             ContractResult::Tier1Compatible(matched_interfaces) => {
                 let adapter_path = generate_tier1_adapter(
                     &injection.name,
-                    injection.path.as_deref(),
                     interface_name,
                     &matched_interfaces,
                     interface_type,

@@ -55,7 +55,6 @@ use split_imports::{extract_split_imports, SplitImports};
 #[allow(clippy::too_many_arguments)]
 pub fn generate_tier1_adapter(
     middleware_name: &str,
-    _middleware_path: Option<&str>,
     target_interface: &str,
     middleware_interfaces: &[String],
     interface_type: Option<&InterfaceType>,
