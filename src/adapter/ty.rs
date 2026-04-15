@@ -13,7 +13,7 @@
 //!   — predicates that recurse through compound types so the
 //!   adapter knows whether it needs `memory` / `realloc` /
 //!   `string-encoding` canonical options.
-//! - **Layout** ([`canonical_align`], [`disc_align`],
+//! - **Layout** ([`canonical_align`], [`discriminant_align`],
 //!   [`align_to_val`]) — alignment math for the canonical ABI.
 //! - **Conversion** ([`prim_cv`]) — turn a primitive `ValueType`
 //!   into a `wasm_encoder::ComponentValType`.
@@ -185,7 +185,7 @@ pub(super) fn canonical_align(id: ValueTypeId, arena: &TypeArena) -> u32 {
                 .filter_map(|(_, opt_id)| opt_id.map(|id| canonical_align(id, arena)))
                 .max()
                 .unwrap_or(1);
-            std::cmp::max(disc_align(cases.len()), payload_align)
+            std::cmp::max(discriminant_align(cases.len()), payload_align)
         }
         ValueType::Option(inner) => std::cmp::max(1, canonical_align(*inner, arena)),
         ValueType::Result { ok, err } => {
@@ -193,7 +193,7 @@ pub(super) fn canonical_align(id: ValueTypeId, arena: &TypeArena) -> u32 {
             let err_a = err.map(|id| canonical_align(id, arena)).unwrap_or(1);
             std::cmp::max(1, std::cmp::max(ok_a, err_a))
         }
-        ValueType::Enum(tags) => disc_align(tags.len()),
+        ValueType::Enum(tags) => discriminant_align(tags.len()),
         ValueType::Flags(names) => {
             if names.len() > 16 {
                 4
@@ -207,14 +207,33 @@ pub(super) fn canonical_align(id: ValueTypeId, arena: &TypeArena) -> u32 {
     }
 }
 
-/// Discriminant alignment for a variant/enum with `n` cases.
-pub(super) fn disc_align(n: usize) -> u32 {
+/// Discriminant alignment (in bytes) for a variant/enum with `n` cases.
+///
+/// The canonical ABI encodes a variant's discriminant as the smallest
+/// unsigned integer type that can represent all case indices:
+///
+/// - `n <= 256` (fits in u8) → 1-byte discriminant, 1-byte alignment
+/// - `n <= 65536` (fits in u16) → 2-byte discriminant, 2-byte alignment
+/// - `n <= 2^32` (fits in u32) → 4-byte discriminant, 4-byte alignment
+///
+/// The component model caps variant cases at `u32::MAX`, so u32 is the
+/// largest discriminant type. Inputs exceeding that are rejected.
+///
+/// See [`discriminant_type`] in the canonical ABI spec.
+///
+/// [`discriminant_type`]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/canonical-abi/definitions.py
+pub(super) fn discriminant_align(n: usize) -> u32 {
     if n <= 256 {
         1
-    } else if n <= 65536 {
+    } else if n <= 65_536 {
         2
-    } else {
+    } else if n <= u32::MAX as usize {
         4
+    } else {
+        panic!(
+            "Variant/enum has {n} cases, which exceeds the component model's \
+             u32::MAX limit. This should be unreachable for valid components."
+        )
     }
 }
 
