@@ -3,7 +3,7 @@
 //! Most users only need the two top-level entry points:
 //!
 //! - [`splice`] — splice middleware into an existing composition.
-//! - [`compose`] — synthesise a composition from N components.
+//! - [`compose`] — synthesize a composition from N components.
 //!
 //! Both take a typed request struct and return a typed output struct
 //! whose `wac_deps` field is shaped to be handed straight to

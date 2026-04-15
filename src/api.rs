@@ -212,7 +212,7 @@ pub fn splice(req: SpliceRequest) -> Result<SpliceOutput> {
     })
 }
 
-/// Synthesise a composition from N individual components.
+/// Synthesize a composition from N individual components.
 ///
 /// Equivalent to the `splicer compose` CLI subcommand. Reads each
 /// component file, builds a composition graph by matching their

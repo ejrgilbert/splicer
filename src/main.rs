@@ -56,7 +56,7 @@ enum Command {
         skip_type_check: bool,
     },
 
-    /// Synthesise a composition from N individual Wasm components.
+    /// Synthesize a composition from N individual Wasm components.
     ///
     /// Matches each component's exports to the imports of the others,
     /// topologically sorts them, and emits a WAC file + the `wac compose`

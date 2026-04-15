@@ -32,7 +32,7 @@
 //! 7.  **`canon lower`** — lower the hook funcs, the handler funcs,
 //!     and the async builtins into core funcs.
 //! 8.  Build and embed the **dispatch module** (Core module 1).
-//! 9.  Build the **`env` core instance** (synthesised from the
+//! 9.  Build the **`env` core instance** (synthesized from the
 //!     lowered funcs above) and instantiate the dispatch module
 //!     against it (Core instances 1 + 2).
 //! 10. Alias the dispatch module's wrapper exports into core funcs.
@@ -1365,7 +1365,7 @@ struct DispatchPhaseOutcome {
 }
 
 /// Sections 8 + 9. Embed the dispatch core module bytes (built by
-/// [`build_dispatch_module`]) and instantiate it against a synthesised
+/// [`build_dispatch_module`]) and instantiate it against a synthesized
 /// `env` core instance whose exports are the canon-lowered hook funcs,
 /// handler funcs, and async builtins from section 7.
 #[allow(clippy::too_many_arguments)]
@@ -1896,7 +1896,7 @@ pub(super) fn build_adapter_bytes(
 
     // ── Index counters ─────────────────────────────────────────────────────
     //
-    // `func_count` and `instance_count` are initialised from the
+    // `func_count` and `instance_count` are initialized from the
     // import-strategy outcome below — they're declared here only for
     // visibility into the post-strategy phases (`func_count` is read by
     // canon-lift, `instance_count` is read by the export phase). The
