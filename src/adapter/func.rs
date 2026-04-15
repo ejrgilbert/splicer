@@ -14,7 +14,7 @@
 use cviz::model::{InterfaceType, TypeArena, ValueTypeId};
 use wasm_encoder::ValType;
 
-use super::ty::{flat_types_for, type_has_strings};
+use super::ty::{align_to_val, flat_types_for, type_has_strings};
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
@@ -102,11 +102,14 @@ pub(super) fn extract_adapter_funcs(
 
     let mut funcs = Vec::new();
     let mut name_offset: u32 = 0;
-    // Async result storage lives right after the concatenated
-    // function-name bytes, rounded up to 4-byte alignment.
+    // Result buffer storage lives right after the concatenated
+    // function-name bytes, aligned up to 4 bytes so that i32/f32
+    // loads and stores are naturally aligned. This cursor tracks
+    // the next free byte for both async result buffers and
+    // sync-complex retptr buffers.
     let total_name_bytes: u32 = inst.functions.keys().map(|n| n.len() as u32).sum();
-    let async_result_base: u32 = (total_name_bytes + 3) & !3;
-    let mut async_result_cursor: u32 = async_result_base;
+    let result_buf_base: u32 = align_to_val(total_name_bytes, 4);
+    let mut result_buf_cursor: u32 = result_buf_base;
 
     for (name, sig) in &inst.functions {
         let mut param_names = Vec::new();
@@ -165,8 +168,8 @@ pub(super) fn extract_adapter_funcs(
         // async-lowered handler to write into.
         let (async_result_mem_offset, async_result_mem_size) =
             if sig.is_async && result_type_id.is_some() {
-                let off = async_result_cursor;
-                async_result_cursor += result_byte_size;
+                let off = result_buf_cursor;
+                result_buf_cursor += result_byte_size;
                 (Some(off), result_byte_size)
             } else {
                 (None, 0)
@@ -176,8 +179,8 @@ pub(super) fn extract_adapter_funcs(
         // reserve a result buffer in linear memory. The wrapper stores
         // handler output here and returns the buffer address to canon lift.
         let sync_result_mem_offset = if !sig.is_async && result_is_complex {
-            let aligned = (async_result_cursor + 3) & !3;
-            async_result_cursor = aligned + result_byte_size;
+            let aligned = align_to_val(result_buf_cursor, 4);
+            result_buf_cursor = aligned + result_byte_size;
             Some(aligned)
         } else {
             None

@@ -219,8 +219,23 @@ pub(super) fn disc_align(n: usize) -> u32 {
 }
 
 /// Round `offset` up to the nearest multiple of `align`.
+///
+/// Wasm linear memory loads and stores require naturally aligned
+/// addresses — an `i32.load` needs a 4-byte-aligned address, an
+/// `i64.load` needs 8-byte-aligned, etc. Misaligned access traps.
+///
+/// This function is used whenever a region of raw bytes (e.g. the
+/// function-name blob) is followed by typed values that need
+/// alignment. For example, if the names total 7 bytes:
+///
+/// ```text
+/// align_to_val(7, 4) → 8    // next multiple of 4 after 7
+/// align_to_val(8, 4) → 8    // already aligned, no change
+/// align_to_val(9, 4) → 12
+/// ```
+///
 pub(super) fn align_to_val(offset: u32, align: u32) -> u32 {
-    (offset + align - 1) & !(align - 1)
+    offset.div_ceil(align) * align
 }
 
 /// Convert a primitive `ValueType` into a wasm-encoder
