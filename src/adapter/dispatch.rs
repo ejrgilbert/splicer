@@ -39,18 +39,7 @@ use wasm_encoder::{
 };
 
 use super::func::AdapterFunc;
-use super::ty::{align_to_val, canonical_align};
-
-/// Byte size of a core Wasm value type in linear memory.
-/// Exhaustive so the compiler catches new `ValType` variants.
-fn val_type_byte_size(vt: &ValType) -> u32 {
-    match vt {
-        ValType::I32 | ValType::F32 => 4,
-        ValType::I64 | ValType::F64 => 8,
-        ValType::V128 => 16,
-        ValType::Ref(_) => 4, // reference types are pointer-sized
-    }
-}
+use super::ty::{val_type_byte_size, FlatLayout};
 
 /// Emit a typed load instruction at `offset` within the address
 /// already on top of the stack. Returns the byte size consumed so
@@ -99,12 +88,13 @@ fn emit_load(f: &mut Function, offset: u32, vt: &ValType) -> u32 {
     val_type_byte_size(vt)
 }
 
-/// Emit Wasm instructions that push the flat values for a multi-value task.return
-/// by reading from the canonical ABI memory layout at `result_ptr`.
+/// Emit Wasm instructions that load the flat values of a multi-value
+/// result from the canonical ABI memory layout at `result_ptr` and
+/// push them onto the value stack (for `task.return`).
 ///
-/// For `result<T, E>`: reads discriminant (u8 at offset 0) and first payload (at
-/// computed payload offset), then pushes zeros for remaining flat values.
-/// This handles the Ok case correctly; Err cases without payloads also work.
+/// Uses [`FlatLayout`] to compute byte offsets for all slot types,
+/// including `result<T, E>` (discriminant byte + aligned payload)
+/// and non-result types (sequential naturally-aligned values).
 fn emit_task_return_loads(
     f: &mut Function,
     result_ptr: u32,
@@ -112,55 +102,40 @@ fn emit_task_return_loads(
     core_results: &[ValType],
     arena: &TypeArena,
 ) {
-    let vt = arena.lookup_val(result_type_id).clone();
-    match vt {
-        ValueType::Result { ok, err } => {
-            // flat[0]: result discriminant (u8 at offset 0 → i32)
-            f.instruction(&Instruction::I32Const(result_ptr as i32));
+    let layout = FlatLayout::new(result_type_id, core_results, arena);
+
+    for slot in &layout.slots {
+        f.instruction(&Instruction::I32Const(result_ptr as i32));
+        if slot.is_discriminant {
+            // Result discriminant is stored as u8, loaded via i32.load8_u.
             f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
                 offset: 0,
                 align: 0,
                 memory_index: 0,
             }));
-
-            // Compute payload offset: align_to(1, max(ok_align, err_align))
-            let ok_a = ok.map(|id| canonical_align(id, arena)).unwrap_or(1);
-            let err_a = err.map(|id| canonical_align(id, arena)).unwrap_or(1);
-            let payload_offset = align_to_val(1, std::cmp::max(ok_a, err_a));
-
-            // flat[1]: first payload value
-            if core_results.len() > 1 {
-                f.instruction(&Instruction::I32Const(result_ptr as i32));
-                emit_load(f, payload_offset, &core_results[1]);
-            }
-
-            // flat[2..]: zero remaining values (handles Ok and simple Err cases)
-            for vt in core_results.iter().skip(2) {
-                match vt {
-                    ValType::I64 => {
-                        f.instruction(&Instruction::I64Const(0));
-                    }
-                    ValType::F32 => {
-                        f.instruction(&Instruction::F32Const(0.0f32.into()));
-                    }
-                    ValType::F64 => {
-                        f.instruction(&Instruction::F64Const(0.0f64.into()));
-                    }
-                    _ => {
-                        f.instruction(&Instruction::I32Const(0));
-                    }
-                }
-            }
+        } else {
+            emit_load(f, slot.byte_offset, &slot.val_type);
         }
-        _ => {
-            // For non-result types with multi-value (e.g. bare string,
-            // tuple, record): load each flat value from the result
-            // buffer at sequential offsets.
-            let mut byte_offset: u32 = 0;
-            for vt in core_results.iter() {
-                f.instruction(&Instruction::I32Const(result_ptr as i32));
-                byte_offset += emit_load(f, byte_offset, vt);
-            }
+    }
+}
+
+/// Emit a zero constant of the appropriate type onto the value stack.
+fn emit_zero(f: &mut Function, vt: &ValType) {
+    match vt {
+        ValType::I32 | ValType::Ref(_) => {
+            f.instruction(&Instruction::I32Const(0));
+        }
+        ValType::I64 => {
+            f.instruction(&Instruction::I64Const(0));
+        }
+        ValType::F32 => {
+            f.instruction(&Instruction::F32Const(0.0f32.into()));
+        }
+        ValType::F64 => {
+            f.instruction(&Instruction::F64Const(0.0f64.into()));
+        }
+        ValType::V128 => {
+            f.instruction(&Instruction::V128Const(0));
         }
     }
 }

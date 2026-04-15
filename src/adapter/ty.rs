@@ -257,6 +257,167 @@ pub(super) fn align_to_val(offset: u32, align: u32) -> u32 {
     offset.div_ceil(align) * align
 }
 
+// ─── FlatLayout: canonical ABI memory layout for flat values ─────────────
+
+/// One slot in the flat memory layout of a component value type.
+#[derive(Clone, Debug)]
+pub(super) struct FlatSlot {
+    /// Byte offset of this value within the layout.
+    pub byte_offset: u32,
+    /// Core Wasm value type of this slot.
+    pub val_type: ValType,
+    /// `true` when the discriminant is stored as a u8 and must be
+    /// loaded via `i32.load8_u` instead of a regular `i32.load`.
+    /// Only set for the discriminant slot of `result<T, E>`.
+    pub is_discriminant: bool,
+}
+
+/// Pre-computed byte-level layout of a component value type's flat
+/// representation in linear memory.
+///
+/// Modeled after wasmtime-environ's `TypeInformation` / `FlatTypes`
+/// and wasmparser's `LoweredTypes`, but simplified to our use case:
+/// byte offsets + val types so we can emit load instructions for
+/// `task.return` and sync-complex retptr patterns.
+///
+/// # How `result<T, E>` is flattened
+///
+/// The canonical ABI flattens `result<ok_type, err_type>` into:
+///
+/// ```text
+/// flat_types = [discriminant, ...joined_payload_slots...]
+/// ```
+///
+/// - **discriminant** (i32): 0 = Ok arm, 1 = Err arm.
+/// - **joined_payload_slots**: the element-wise type-join of
+///   `flatten(ok_type)` and `flatten(err_type)`, padded to the max
+///   length of the two. For example, `result<u32, string>` flattens
+///   to `[i32, i32, i32]` — discriminant + join(\[i32\], \[i32, i32\]).
+///
+/// In memory, the layout is:
+/// - offset 0: discriminant (stored as u8, loaded as i32)
+/// - offset `align_to(1, max(ok_align, err_align))`: payload values
+///   at sequential naturally-aligned offsets from there
+///
+/// # Other types
+///
+/// For non-result types (string, tuple, record, etc.), the flat values
+/// are laid out sequentially at naturally-aligned offsets from byte 0.
+///
+/// # Construction
+///
+/// Use [`FlatLayout::new`], passing the component-level type id and
+/// the pre-flattened `ValType` slice. The constructor inspects the
+/// type to choose the right layout strategy.
+#[derive(Clone, Debug)]
+pub(super) struct FlatLayout {
+    pub slots: Vec<FlatSlot>,
+    /// Total byte size of the layout (available for buffer allocation).
+    pub total_bytes: u32,
+}
+
+/// Byte size of a core Wasm value type in linear memory.
+/// Exhaustive so the compiler catches new `ValType` variants.
+pub(super) fn val_type_byte_size(vt: &ValType) -> u32 {
+    match vt {
+        ValType::I32 | ValType::F32 => 4,
+        ValType::I64 | ValType::F64 => 8,
+        ValType::V128 => 16,
+        ValType::Ref(_) => 4,
+    }
+}
+
+impl FlatLayout {
+    /// Build a layout for any component value type.
+    ///
+    /// - For `result<T, E>`: the first slot is the discriminant (1
+    ///   byte, loaded as i32 via `i32.load8_u`). The remaining slots
+    ///   are the joined payload, starting at an aligned offset after
+    ///   the discriminant. All payload slots are loaded from memory.
+    /// - For everything else (string, tuple, record, etc.): slots are
+    ///   laid out sequentially at naturally-aligned offsets from byte 0.
+    pub fn new(
+        type_id: ValueTypeId,
+        flat_types: &[ValType],
+        arena: &TypeArena,
+    ) -> Self {
+        let vt = arena.lookup_val(type_id);
+        match vt {
+            ValueType::Result { ok, err } => {
+                Self::build_result_layout(flat_types, *ok, *err, arena)
+            }
+            _ => Self::build_sequential_layout(flat_types),
+        }
+    }
+
+    /// Append sequential naturally-aligned slots starting at `offset`.
+    /// Returns the byte offset past the last slot.
+    fn append_sequential(
+        slots: &mut Vec<FlatSlot>,
+        flat_types: &[ValType],
+        mut offset: u32,
+    ) -> u32 {
+        for vt in flat_types {
+            let size = val_type_byte_size(vt);
+            offset = align_to_val(offset, size);
+            slots.push(FlatSlot {
+                byte_offset: offset,
+                val_type: *vt,
+                is_discriminant: false,
+            });
+            offset += size;
+        }
+        offset
+    }
+
+    /// Sequential layout: each flat value at naturally-aligned offsets
+    /// starting from byte 0.
+    fn build_sequential_layout(flat_types: &[ValType]) -> Self {
+        let mut slots = Vec::with_capacity(flat_types.len());
+        let total_bytes = Self::append_sequential(&mut slots, flat_types, 0);
+        FlatLayout { slots, total_bytes }
+    }
+
+    /// Result layout: discriminant byte + aligned payload.
+    ///
+    /// The canonical ABI stores `result<T, E>` as:
+    /// - offset 0: discriminant (u8)
+    /// - offset `align_to(1, max(ok_align, err_align))`: payload
+    ///   values laid out sequentially from there
+    fn build_result_layout(
+        flat_types: &[ValType],
+        ok_id: Option<ValueTypeId>,
+        err_id: Option<ValueTypeId>,
+        arena: &TypeArena,
+    ) -> Self {
+        if flat_types.is_empty() {
+            return FlatLayout {
+                slots: vec![],
+                total_bytes: 0,
+            };
+        }
+
+        let mut slots = Vec::with_capacity(flat_types.len());
+
+        // Slot 0: discriminant (u8 at offset 0, loaded as i32).
+        slots.push(FlatSlot {
+            byte_offset: 0,
+            val_type: ValType::I32,
+            is_discriminant: true,
+        });
+
+        // Payload starts after the 1-byte discriminant, aligned to
+        // the strictest alignment of the Ok/Err arms.
+        let ok_a = ok_id.map(|id| canonical_align(id, arena)).unwrap_or(1);
+        let err_a = err_id.map(|id| canonical_align(id, arena)).unwrap_or(1);
+        let payload_start = align_to_val(1, std::cmp::max(ok_a, err_a));
+
+        let total_bytes =
+            Self::append_sequential(&mut slots, &flat_types[1..], payload_start);
+        FlatLayout { slots, total_bytes }
+    }
+}
+
 /// Convert a primitive `ValueType` into a wasm-encoder
 /// `ComponentValType`. Returns `None` for non-primitive variants.
 pub(super) fn prim_cv(vt: &ValueType) -> Option<ComponentValType> {

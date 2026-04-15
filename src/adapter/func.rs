@@ -14,7 +14,7 @@
 use cviz::model::{InterfaceType, TypeArena, ValueTypeId};
 use wasm_encoder::ValType;
 
-use super::ty::{align_to_val, flat_types_for, type_has_strings};
+use super::ty::{align_to_val, flat_types_for, type_has_strings, val_type_byte_size};
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
@@ -152,17 +152,8 @@ pub(super) fn extract_adapter_funcs(
         };
 
         // Compute the exact byte size needed to store the flat result
-        // values in linear memory. Exhaustive match so the compiler
-        // catches any new ValType variants added to wasm_encoder.
-        let result_byte_size: u32 = core_results
-            .iter()
-            .map(|vt| match vt {
-                ValType::I32 | ValType::F32 => 4u32,
-                ValType::I64 | ValType::F64 => 8u32,
-                ValType::V128 => 16u32,
-                ValType::Ref(_) => 4u32, // reference types are pointer-sized
-            })
-            .sum();
+        // values in linear memory.
+        let result_byte_size: u32 = core_results.iter().map(val_type_byte_size).sum();
 
         // For async functions with a result, reserve memory for the
         // async-lowered handler to write into.
