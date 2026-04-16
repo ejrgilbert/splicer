@@ -49,7 +49,6 @@ use super::encoders::{encode_comp_cv, InstTypeCtx};
 use super::filter::FilteredSections;
 use super::func::AdapterFunc;
 use super::mem_layout::MemoryLayoutBuilder;
-use super::ty::type_has_resources;
 
 // ─── Section-emit helpers ──────────────────────────────────────────────────
 //
@@ -108,60 +107,26 @@ fn emit_hook_inst_types(
     has_after: bool,
     has_blocking: bool,
 ) -> (Option<u32>, Option<u32>, Option<u32>) {
-    let before_inst_ty = if has_before {
+    // All three hooks share the shape `async func(name: string) -> result?`,
+    // differing only in the export name and whether they return a bool.
+    let string_cv = ComponentValType::Primitive(PrimitiveValType::String);
+    let bool_cv = ComponentValType::Primitive(PrimitiveValType::Bool);
+    let mut emit_hook_ty = |export_name: &str, result: Option<ComponentValType>| {
         let idx = *type_count;
         *type_count += 1;
         let mut inst = InstanceType::new();
         inst.ty()
             .function()
             .async_(true)
-            .params([(
-                "name",
-                ComponentValType::Primitive(PrimitiveValType::String),
-            )])
-            .result(None);
-        inst.export("before-call", ComponentTypeRef::Func(0));
+            .params([("name", string_cv)])
+            .result(result);
+        inst.export(export_name, ComponentTypeRef::Func(0));
         types.instance(&inst);
-        Some(idx)
-    } else {
-        None
+        idx
     };
-    let after_inst_ty = if has_after {
-        let idx = *type_count;
-        *type_count += 1;
-        let mut inst = InstanceType::new();
-        inst.ty()
-            .function()
-            .async_(true)
-            .params([(
-                "name",
-                ComponentValType::Primitive(PrimitiveValType::String),
-            )])
-            .result(None);
-        inst.export("after-call", ComponentTypeRef::Func(0));
-        types.instance(&inst);
-        Some(idx)
-    } else {
-        None
-    };
-    let blocking_inst_ty = if has_blocking {
-        let idx = *type_count;
-        *type_count += 1;
-        let mut inst = InstanceType::new();
-        inst.ty()
-            .function()
-            .async_(true)
-            .params([(
-                "name",
-                ComponentValType::Primitive(PrimitiveValType::String),
-            )])
-            .result(Some(ComponentValType::Primitive(PrimitiveValType::Bool)));
-        inst.export("should-block-call", ComponentTypeRef::Func(0));
-        types.instance(&inst);
-        Some(idx)
-    } else {
-        None
-    };
+    let before_inst_ty = has_before.then(|| emit_hook_ty("before-call", None));
+    let after_inst_ty = has_after.then(|| emit_hook_ty("after-call", None));
+    let blocking_inst_ty = has_blocking.then(|| emit_hook_ty("should-block-call", Some(bool_cv)));
     (before_inst_ty, after_inst_ty, blocking_inst_ty)
 }
 
@@ -183,33 +148,18 @@ fn emit_hook_imports(
         versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
     };
 
-    let before_inst = before_ty.map(|ty_idx| {
+    let mut import_hook = |ty_idx: u32, iface: &str| {
         let idx = *instance_count;
         *instance_count += 1;
         imports.import(
-            &versioned_interface(TIER1_BEFORE, TIER1_VERSION),
+            &versioned_interface(iface, TIER1_VERSION),
             ComponentTypeRef::Instance(ty_idx),
         );
         idx
-    });
-    let after_inst = after_ty.map(|ty_idx| {
-        let idx = *instance_count;
-        *instance_count += 1;
-        imports.import(
-            &versioned_interface(TIER1_AFTER, TIER1_VERSION),
-            ComponentTypeRef::Instance(ty_idx),
-        );
-        idx
-    });
-    let blocking_inst = blocking_ty.map(|ty_idx| {
-        let idx = *instance_count;
-        *instance_count += 1;
-        imports.import(
-            &versioned_interface(TIER1_BLOCKING, TIER1_VERSION),
-            ComponentTypeRef::Instance(ty_idx),
-        );
-        idx
-    });
+    };
+    let before_inst = before_ty.map(|ty| import_hook(ty, TIER1_BEFORE));
+    let after_inst = after_ty.map(|ty| import_hook(ty, TIER1_AFTER));
+    let blocking_inst = blocking_ty.map(|ty| import_hook(ty, TIER1_BLOCKING));
     (before_inst, after_inst, blocking_inst)
 }
 
@@ -226,44 +176,23 @@ fn emit_func_aliases(
     blocking_inst: Option<u32>,
 ) -> (u32, Option<u32>, Option<u32>, Option<u32>) {
     let handler_func_base = *func_count;
+    let mut alias_func = |inst_idx: u32, name: &str| {
+        let idx = *func_count;
+        *func_count += 1;
+        aliases.alias(Alias::InstanceExport {
+            instance: inst_idx,
+            kind: ComponentExportKind::Func,
+            name,
+        });
+        idx
+    };
+
     for func in funcs {
-        aliases.alias(Alias::InstanceExport {
-            instance: handler_inst,
-            kind: ComponentExportKind::Func,
-            name: &func.name,
-        });
-        *func_count += 1;
+        alias_func(handler_inst, &func.name);
     }
-    let before_comp_func = before_inst.map(|inst_idx| {
-        let idx = *func_count;
-        *func_count += 1;
-        aliases.alias(Alias::InstanceExport {
-            instance: inst_idx,
-            kind: ComponentExportKind::Func,
-            name: "before-call",
-        });
-        idx
-    });
-    let after_comp_func = after_inst.map(|inst_idx| {
-        let idx = *func_count;
-        *func_count += 1;
-        aliases.alias(Alias::InstanceExport {
-            instance: inst_idx,
-            kind: ComponentExportKind::Func,
-            name: "after-call",
-        });
-        idx
-    });
-    let blocking_comp_func = blocking_inst.map(|inst_idx| {
-        let idx = *func_count;
-        *func_count += 1;
-        aliases.alias(Alias::InstanceExport {
-            instance: inst_idx,
-            kind: ComponentExportKind::Func,
-            name: "should-block-call",
-        });
-        idx
-    });
+    let before_comp_func = before_inst.map(|i| alias_func(i, "before-call"));
+    let after_comp_func = after_inst.map(|i| alias_func(i, "after-call"));
+    let blocking_comp_func = blocking_inst.map(|i| alias_func(i, "should-block-call"));
     (
         handler_func_base,
         before_comp_func,
@@ -680,8 +609,6 @@ fn compute_memory_layout(
     has_before: bool,
     has_after: bool,
     has_blocking: bool,
-    func_has_strings: &[bool],
-    any_has_resources: bool,
 ) -> MemoryLayout {
     let has_async = funcs.iter().any(|f| f.is_async);
     let has_async_machinery = has_async || has_before || has_after || has_blocking;
@@ -693,7 +620,7 @@ fn compute_memory_layout(
     // lower (for handler functions with complex result types that contain
     // strings/resources). When needed, it lives in the memory module so
     // it's available for both lowering and lifting.
-    let needs_realloc = func_has_strings.iter().any(|&b| b) || any_has_resources;
+    let needs_realloc = funcs.iter().any(|f| f.has_strings || f.has_resources);
 
     let bump_start = layout.finish_as_bump_start();
 
@@ -822,8 +749,6 @@ struct CanonLowerOutcome {
 fn emit_canon_lower(
     component: &mut Component,
     funcs: &[AdapterFunc],
-    func_has_strings: &[bool],
-    func_has_resources: &[bool],
     handler_func_base: u32,
     before_comp_func: Option<u32>,
     after_comp_func: Option<u32>,
@@ -842,9 +767,10 @@ fn emit_canon_lower(
 
     let mut canons = CanonicalFunctionSection::new();
 
-    // Hooks are async-lowered: needs Async + Memory (for string params /
-    // bool result) + UTF8.
-    let core_before_func = before_comp_func.map(|comp_f| {
+    // Hooks are async-lowered — every tier-1 hook takes a `string`
+    // name param (requiring `Memory` + `UTF8`) and fires async, so
+    // the three canonicals are shape-identical.
+    let mut lower_hook = |comp_f: u32| {
         let idx = core_func_count;
         core_func_count += 1;
         canons.lower(
@@ -856,43 +782,18 @@ fn emit_canon_lower(
             ],
         );
         idx
-    });
-
-    let core_after_func = after_comp_func.map(|comp_f| {
-        let idx = core_func_count;
-        core_func_count += 1;
-        canons.lower(
-            comp_f,
-            [
-                CanonicalOption::Async,
-                CanonicalOption::Memory(mem_core_mem),
-                CanonicalOption::UTF8,
-            ],
-        );
-        idx
-    });
-
-    let core_blocking_func = blocking_comp_func.map(|comp_f| {
-        let idx = core_func_count;
-        core_func_count += 1;
-        canons.lower(
-            comp_f,
-            [
-                CanonicalOption::Async,
-                CanonicalOption::Memory(mem_core_mem),
-                CanonicalOption::UTF8,
-            ],
-        );
-        idx
-    });
+    };
+    let core_before_func = before_comp_func.map(&mut lower_hook);
+    let core_after_func = after_comp_func.map(&mut lower_hook);
+    let core_blocking_func = blocking_comp_func.map(&mut lower_hook);
 
     // Lower each handler function. For functions with resources/strings:
     // need Memory + UTF8 + Realloc. For async: also need Async flag.
     let core_handler_func_base = core_func_count;
     for (i, func) in funcs.iter().enumerate() {
         core_func_count += 1;
-        let hs = func_has_strings[i];
-        let hr = func_has_resources[i];
+        let hs = func.has_strings;
+        let hr = func.has_resources;
         let needs_mem = func.is_async && func.result_type_id.is_some() || hs || hr;
         let needs_utf8 = hs || hr;
         let needs_ra = hr || (hs && func.result_is_complex);
@@ -955,8 +856,8 @@ fn emit_canon_lower(
                 let idx = core_func_count;
                 core_func_count += 1;
                 let tr_result_cv = comp_result_cvs[fi];
-                let hr = func_has_resources[fi];
-                let hs = func_has_strings[fi];
+                let hr = func.has_resources;
+                let hs = func.has_strings;
                 let needs_mem = hr || (hs && func.result_is_complex);
                 let mut opts: Vec<CanonicalOption> = Vec::new();
                 if needs_mem {
@@ -1135,8 +1036,6 @@ struct CanonLiftOutcome {
 fn emit_canon_lift_phase(
     component: &mut Component,
     funcs: &[AdapterFunc],
-    func_has_strings: &[bool],
-    func_has_resources: &[bool],
     dispatch_core_inst: u32,
     target_func_ty_base: u32,
     mem_core_mem: u32,
@@ -1171,8 +1070,8 @@ fn emit_canon_lift_phase(
             } else {
                 vec![]
             };
-            let hs = func_has_strings[i];
-            let hr = func_has_resources[i];
+            let hs = func.has_strings;
+            let hr = func.has_resources;
             let needs_mem = hs || hr || func.result_is_complex;
             if needs_mem {
                 opts.push(CanonicalOption::Memory(mem_core_mem));
@@ -1440,24 +1339,6 @@ pub(super) fn build_adapter_bytes(
     split: &FilteredSections,
     layout: MemoryLayoutBuilder,
 ) -> anyhow::Result<Vec<u8>> {
-    // Per-function: does any param/result require Memory+UTF8?
-    // Uses deep string check (traverses compound types).
-    let func_has_strings: Vec<bool> = funcs.iter().map(|f| f.has_strings(arena)).collect();
-
-    // Per-function: does any param/result contain a resource type?
-    let func_has_resources: Vec<bool> = funcs
-        .iter()
-        .map(|f| {
-            f.param_type_ids
-                .iter()
-                .any(|&id| type_has_resources(id, arena))
-                || f.result_type_id
-                    .map(|id| type_has_resources(id, arena))
-                    .unwrap_or(false)
-        })
-        .collect();
-    let any_has_resources = func_has_resources.iter().any(|&b| b);
-
     let mut component = Component::new();
 
     // ── 1–3. Type / Import / Alias sections ─────────────────────────────────
@@ -1512,15 +1393,7 @@ pub(super) fn build_adapter_bytes(
         type_count_after,
     )?;
 
-    let layout = compute_memory_layout(
-        funcs,
-        layout,
-        has_before,
-        has_after,
-        has_blocking,
-        &func_has_strings,
-        any_has_resources,
-    );
+    let layout = compute_memory_layout(funcs, layout, has_before, has_after, has_blocking);
 
     let MemoryProviderOutcome {
         mem_core_mem,
@@ -1532,8 +1405,6 @@ pub(super) fn build_adapter_bytes(
     let canon_lower = emit_canon_lower(
         &mut component,
         funcs,
-        &func_has_strings,
-        &func_has_resources,
         handler_func_base,
         before_comp_func,
         after_comp_func,
@@ -1568,8 +1439,6 @@ pub(super) fn build_adapter_bytes(
     } = emit_canon_lift_phase(
         &mut component,
         funcs,
-        &func_has_strings,
-        &func_has_resources,
         dispatch_core_inst,
         target_func_ty_base,
         mem_core_mem,

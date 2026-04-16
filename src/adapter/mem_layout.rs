@@ -14,12 +14,12 @@
 //!
 //! ```text
 //! [0 .. total_name_bytes)        concatenated UTF-8 function names
-//! [4-aligned .. …)               per-func result buffers
+//! [i32-aligned .. …)             per-func result buffers
 //!                                  - async results pack contiguously
-//!                                  - sync-complex results re-align to 4
-//! [… .. +8)                      event slot (if has_async_machinery)
-//! [… .. +4)                      block slot (if has_blocking)
-//! 8-aligned upward               bump_start (consumed on finish)
+//!                                  - sync-complex results re-align to i32
+//! [… .. +sum(EVENT_RECORD_SHAPE)) event slot (if has_async_machinery)
+//! [… .. +sum(BLOCK_RESULT_SHAPE)) block slot (if has_blocking)
+//! i64-aligned upward             bump_start (consumed on finish)
 //! ```
 //!
 //! Call ordering matters: the builder is single-cursor across the
@@ -28,40 +28,36 @@
 //! name + per-func result passes; [`super::component`] finishes the
 //! layout with the event / block / bump calls.
 
-use super::ty::align_to_val;
+use wasm_encoder::ValType;
 
-// ─── Slot sizes + alignments ───────────────────────────────────────────────
+use super::ty::{align_to_val, val_type_byte_size};
+
+// ─── Slot shapes ───────────────────────────────────────────────────────────
 //
-// Every hard-coded number the memory layout depends on lives here, named
-// for the canonical-ABI feature that pins it. Each constant is used by
-// exactly one allocation method below; if you're tempted to sprinkle a
-// literal `4` or `8` into adapter code, the right answer is almost
-// always a named constant added to this table.
+// Every fixed slot the builder reserves in the post-name region
+// corresponds to a canonical-ABI record with a known flat core-Wasm
+// shape. We declare the SHAPE here; [`MemoryLayoutBuilder::alloc_record`]
+// derives size and natural alignment from the shape so the numbers
+// the allocator uses can't drift out of sync with the dispatch
+// module's loads/stores that read and write those bytes.
+//
+// Per-region alignment choices live inline in the allocator methods
+// below, each expressed as `val_type_byte_size(&ValType::<the
+// relevant slot type>)` — so "4" and "8" never appear as raw literals;
+// the numbers fall out of the ValTypes they belong to.
 
-/// Size of the event record `waitable-set.wait` writes into memory:
-/// a pair of i32s — `(event_code, waitable_handle)` — for 8 bytes
-/// total. The wait loop in the dispatch module reads both halves,
-/// but the allocator only needs the total to reserve the slot.
-const EVENT_RECORD_BYTES: u32 = 8;
+/// Flat shape of the event record `waitable-set.wait` writes:
+/// `(event_code: i32, waitable_handle: i32)`. The wait-loop in the
+/// dispatch module reads both halves via `i32.load` at
+/// `event_ptr + 0` and `event_ptr + 4`.
+const EVENT_RECORD_SHAPE: &[ValType] = &[ValType::I32, ValType::I32];
 
-/// Size of the bool slot `should-block-call` writes. The canonical
-/// ABI stores a bool as an i32 (4 bytes). The wait loop reads this
-/// via `i32.load` and branches on zero / non-zero.
-const BLOCK_RESULT_BYTES: u32 = 4;
-
-/// Minimum alignment for everything in the post-name region:
-/// per-func result buffers, the event record, the block-result
-/// slot. Pinned by i32 / f32 loads and stores, which require 4-byte
-/// alignment; wider slots (i64 / f64) are handled inside the
-/// per-func buffers by [`super::ty::FlatLayout`].
-const RESULT_REGION_ALIGN: u32 = 4;
-
-/// Alignment of the bump-allocator start. The canonical-ABI
-/// `realloc` can be called with up to 8-byte alignment requests
-/// (for i64 / f64-bearing strings and records), and starting the
-/// bump region on an 8-aligned boundary lets the allocator satisfy
-/// those on the first call without burning an alignment jump.
-const BUMP_START_ALIGN: u32 = 8;
+/// Flat shape of the bool slot `should-block-call` writes. The
+/// canonical ABI stores a bool as an i32; the blocking phase
+/// (see `super::dispatch::emit_blocking_phase`) reads it via
+/// `i32.load` at `block_result_ptr + 0` and branches on zero /
+/// non-zero.
+const BLOCK_RESULT_SHAPE: &[ValType] = &[ValType::I32];
 
 /// Byte-offset bookkeeper for the dispatch module's linear memory.
 /// See the module docs for the overall layout and call-ordering rules.
@@ -70,17 +66,22 @@ pub(super) struct MemoryLayoutBuilder {
     /// [`alloc_name`](Self::alloc_name).
     name_cursor: u32,
     /// Running cursor for everything AFTER the name region.
-    /// Initialized to `align_to_val(total_name_bytes, RESULT_REGION_ALIGN)`
-    /// so the first post-name allocation lands on boundary; subsequent
+    /// Initialized to i32-aligned past the names so the first
+    /// post-name allocation lands on an i32 boundary; subsequent
     /// allocations each re-align as their own contracts require.
     post_name_cursor: u32,
 }
 
 impl MemoryLayoutBuilder {
     pub fn new(total_name_bytes: u32) -> Self {
+        // i32 is the narrowest slot we load from in the post-name
+        // region (block-result bool, event-record fields, canon-lift
+        // result pointers), so everything must start on that
+        // boundary at minimum.
+        let post_name_align = val_type_byte_size(&ValType::I32);
         Self {
             name_cursor: 0,
-            post_name_cursor: align_to_val(total_name_bytes, RESULT_REGION_ALIGN),
+            post_name_cursor: align_to_val(total_name_bytes, post_name_align),
         }
     }
 
@@ -104,33 +105,43 @@ impl MemoryLayoutBuilder {
         off
     }
 
-    /// Reserve `size` bytes for a sync-complex retptr buffer. The
-    /// canon-lower retptr pattern requires `RESULT_REGION_ALIGN`-byte
-    /// alignment at the start of the buffer.
+    /// Reserve `size` bytes for a sync-complex retptr buffer. Canon
+    /// lower's retptr pattern requires the buffer to start on an i32
+    /// boundary so the first `(i32.store / f32.store)` inside the
+    /// buffer is naturally aligned; wider stores (i64 / f64) re-align
+    /// internally via [`super::ty::FlatLayout`].
     pub fn alloc_sync_result(&mut self, size: u32) -> u32 {
-        self.alloc_aligned(size, RESULT_REGION_ALIGN)
+        self.alloc_aligned(size, val_type_byte_size(&ValType::I32))
     }
 
-    /// Reserve the fixed `EVENT_RECORD_BYTES`-byte slot for the
-    /// `waitable-set.wait` event record. Called once per adapter
-    /// when any async or hook machinery is present.
+    /// Reserve the event-record slot written by `waitable-set.wait`.
+    /// Size and alignment fall out of [`EVENT_RECORD_SHAPE`].
     pub fn alloc_event_slot(&mut self) -> u32 {
-        self.alloc_aligned(EVENT_RECORD_BYTES, RESULT_REGION_ALIGN)
+        self.alloc_record(EVENT_RECORD_SHAPE)
     }
 
-    /// Reserve the fixed `BLOCK_RESULT_BYTES`-byte slot for the
-    /// bool result of `should_block_call`. Called only when the
-    /// middleware exports `splicer:tier1/blocking`.
+    /// Reserve the bool-result slot written by `should_block_call`.
+    /// Size and alignment fall out of [`BLOCK_RESULT_SHAPE`].
     pub fn alloc_block_result(&mut self) -> u32 {
-        self.alloc_aligned(BLOCK_RESULT_BYTES, RESULT_REGION_ALIGN)
+        self.alloc_record(BLOCK_RESULT_SHAPE)
     }
 
     /// Finalize the layout and return the first free byte for the
-    /// bump allocator, aligned up to `BUMP_START_ALIGN` so `realloc`
-    /// calls with up-to-8-byte-aligned requests land on boundary on
-    /// their first invocation.
+    /// bump allocator. Aligned up to the widest canonical-ABI scalar
+    /// (i64 / f64 — both 8 bytes) so the allocator can satisfy
+    /// 8-byte-aligned `realloc` requests on its first call without
+    /// burning an alignment jump.
     pub fn finish_as_bump_start(self) -> u32 {
-        align_to_val(self.post_name_cursor, BUMP_START_ALIGN)
+        align_to_val(self.post_name_cursor, val_type_byte_size(&ValType::I64))
+    }
+
+    /// Reserve one canonical-ABI record with a fixed flat shape.
+    /// Size is the sum of the flat slot sizes; natural alignment is
+    /// the widest slot.
+    fn alloc_record(&mut self, flat: &[ValType]) -> u32 {
+        let size: u32 = flat.iter().map(val_type_byte_size).sum();
+        let align: u32 = flat.iter().map(val_type_byte_size).max().unwrap_or(1);
+        self.alloc_aligned(size, align)
     }
 
     /// Shared helper: align the post-name cursor up to `align`, then

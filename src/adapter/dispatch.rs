@@ -541,17 +541,19 @@ fn emit_wait_loop(f: &mut Function, st: u32, ws: u32, ctx: &WaitLoopCtx) {
 struct DispatchCodeCtx<'a> {
     before_import_fn: Option<u32>,
     after_import_fn: Option<u32>,
-    blocking_import_fn: Option<u32>,
+    blocking: Option<BlockingConfig>,
     handler_import_fn_base: u32,
     /// `task_return_fns[i]` is the `task_return_f{i}` import index for
     /// async func `i`, or `None` for sync funcs.
     task_return_fns: &'a [Option<u32>],
-    /// Memory offset for the `should_block_call` bool result. Must be
-    /// `Some` whenever `blocking_import_fn` is `Some`.
-    block_result_ptr: Option<u32>,
-    has_blocking: bool,
     wait: WaitLoopCtx,
     arena: &'a TypeArena,
+}
+
+/// Present only when the middleware exports `splicer:tier1/blocking`.
+struct BlockingConfig {
+    import_fn: u32,
+    result_ptr: u32,
 }
 
 /// Emit the full wrapper body for func `fi`, including all five
@@ -569,7 +571,7 @@ fn emit_wrapper_body(
     // fabricate a replacement return value when the call is skipped.
     // Blocking + async-with-result hits the same wall inside
     // emit_blocking_phase below.
-    if ctx.has_blocking && has_result && !func.is_async {
+    if ctx.blocking.is_some() && has_result && !func.is_async {
         anyhow::bail!(
             "Function '{}' returns a value but the middleware exports \
              `should-block-call`. Tier-1 blocking is only supported for \
@@ -633,7 +635,11 @@ fn emit_blocking_phase(
     subtask_local: u32,
     ws_local: u32,
 ) -> anyhow::Result<()> {
-    let Some(block_fn) = ctx.blocking_import_fn else {
+    let Some(BlockingConfig {
+        import_fn: block_fn,
+        result_ptr: blk_ptr,
+    }) = ctx.blocking
+    else {
         return Ok(());
     };
     if func.result_type_id.is_some() {
@@ -645,9 +651,6 @@ fn emit_blocking_phase(
             func.name
         );
     }
-    let blk_ptr = ctx
-        .block_result_ptr
-        .expect("block_result_ptr set when has_blocking");
     f.instruction(&Instruction::I32Const(func.name_offset as i32));
     f.instruction(&Instruction::I32Const(func.name_len as i32));
     f.instruction(&Instruction::I32Const(blk_ptr as i32));
@@ -655,6 +658,9 @@ fn emit_blocking_phase(
     f.instruction(&Instruction::LocalSet(subtask_local));
     emit_wait_loop(f, subtask_local, ws_local, &ctx.wait);
     // Load the bool result and conditionally return (block the call).
+    // Reads slot 0 of the canonical-ABI block-result record reserved
+    // in memory by `MemoryLayoutBuilder::alloc_block_result` — see
+    // `mem_layout::BLOCK_RESULT_SHAPE` for the record layout.
     f.instruction(&Instruction::I32Const(blk_ptr as i32));
     f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
         offset: 0,
@@ -1123,14 +1129,18 @@ pub(super) fn build_dispatch_module(
 
     // ── Code section ──────────────────────────────────────────────────────
 
+    let blocking = blocking_import_fn
+        .zip(block_result_ptr)
+        .map(|(import_fn, result_ptr)| BlockingConfig {
+            import_fn,
+            result_ptr,
+        });
     let code_ctx = DispatchCodeCtx {
         before_import_fn,
         after_import_fn,
-        blocking_import_fn,
+        blocking,
         handler_import_fn_base,
         task_return_fns: &task_return_fns,
-        block_result_ptr,
-        has_blocking,
         wait: WaitLoopCtx {
             waitable_new_fn,
             waitable_join_fn,

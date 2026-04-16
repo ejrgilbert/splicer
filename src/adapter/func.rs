@@ -15,7 +15,7 @@ use cviz::model::{FuncSignature, InterfaceType, TypeArena, ValueTypeId};
 use wasm_encoder::ValType;
 
 use super::mem_layout::MemoryLayoutBuilder;
-use super::ty::{flat_types_for, type_has_strings, FlatLayout};
+use super::ty::{flat_types_for, type_has_resources, type_has_strings, FlatLayout};
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
@@ -59,19 +59,14 @@ pub(super) struct AdapterFunc {
     /// from. `None` for async functions or sync functions with simple
     /// (single-value) results.
     pub sync_result_mem_offset: Option<u32>,
-}
-
-impl AdapterFunc {
-    /// Returns true if any parameter or the result contains a string
-    /// type (deep check — traverses compound types).
-    pub fn has_strings(&self, arena: &TypeArena) -> bool {
-        self.param_type_ids
-            .iter()
-            .any(|&id| type_has_strings(id, arena))
-            || self
-                .result_type_id
-                .is_some_and(|id| type_has_strings(id, arena))
-    }
+    /// True when any parameter or the result contains a string
+    /// (deep check; traverses compound types). Drives the
+    /// canon-lift/lower `realloc` option.
+    pub has_strings: bool,
+    /// True when any parameter or the result contains a resource
+    /// handle (deep check). Drives `own<>` alias emission and the
+    /// needs-realloc decision.
+    pub has_resources: bool,
 }
 
 /// Resolve a cviz `InterfaceType::Instance` into a list of
@@ -123,6 +118,12 @@ pub(super) fn extract_adapter_funcs(
         let sync_result_mem_offset = (!extracted.is_async && extracted.result_is_complex)
             .then(|| layout.alloc_sync_result(extracted.result_byte_size));
 
+        let param_ids = extracted.param_type_ids.iter().copied();
+        let result_id = extracted.result_type_id.into_iter();
+        let all_ids: Vec<ValueTypeId> = param_ids.chain(result_id).collect();
+        let has_strings = all_ids.iter().any(|&id| type_has_strings(id, arena));
+        let has_resources = all_ids.iter().any(|&id| type_has_resources(id, arena));
+
         funcs.push(AdapterFunc {
             name: name.clone(),
             is_async: extracted.is_async,
@@ -136,6 +137,8 @@ pub(super) fn extract_adapter_funcs(
             name_len,
             async_result_mem_offset,
             sync_result_mem_offset,
+            has_strings,
+            has_resources,
         });
     }
     // The builder is returned (not dropped) so the adapter builder
