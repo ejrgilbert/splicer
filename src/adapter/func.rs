@@ -81,6 +81,17 @@ impl AdapterFunc {
 /// [`AdapterFunc`]s with both component-level type ids and
 /// canonical-ABI core-Wasm flattening pre-computed.
 ///
+/// The returned `Vec` has **one entry per function in the target
+/// interface**. A "target interface" is an instance type, and an
+/// instance type can export any number of functions — e.g.
+/// `wasi:http/handler` exports just `handle`, but a hypothetical
+/// `my:service/math` could export `add`, `sub`, `mul`, `div`. The
+/// tier-1 adapter interposes on *all* of them uniformly: it emits a
+/// dispatch wrapper per function, each invoking the same
+/// `before-call(name) / after-call(name) / should-block-call(name)`
+/// hook imports with the function's own name as the string arg — so
+/// the middleware can discriminate per-func via that `name`.
+///
 /// Errors when:
 /// - The interface is not an instance type (bare function
 ///   interfaces aren't supported by the tier-1 adapter generator)

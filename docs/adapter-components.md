@@ -36,6 +36,48 @@ A middleware is tier-1 compatible when it exports **at least one** of the
 interfaces defined in the tier-1 WIT package. The generated adapter only wires
 up the hooks that are actually present, any non-empty subset is valid.
 
+#### What "interface" means here (one middleware wraps N functions)
+
+The unit of interposition is a **WIT interface**, not a single function. An
+interface is an instance type that can export any number of functions.
+Splicer's adapter wraps **every** function in the target interface with the
+same middleware — the middleware doesn't get to pick and choose, but it can
+discriminate at runtime via the `name` parameter the hooks receive.
+
+Concrete shapes:
+
+| Target interface       | Functions in it            | Adapter generates |
+|------------------------|----------------------------|-------------------|
+| `wasi:http/handler`    | `handle`                   | 1 wrapper         |
+| `my:service/adder`     | `add`                      | 1 wrapper         |
+| `my:service/math`      | `add`, `sub`, `mul`, `div` | 4 wrappers        |
+
+All the wrappers share the same hook imports (`splicer:tier1/before` etc.).
+When `add` is called, the adapter calls `before-call("add")`; when `div` is
+called, the adapter calls `before-call("div")`. The middleware sees one
+stream of hook calls with the function name as the discriminator — one
+middleware, N functions.
+
+##### If your middleware only cares about some of the functions
+
+Because the adapter invokes every hook your middleware exports on
+every wrapped call, **you pay the before/after/block round-trip
+uniformly**, even for the calls your middleware will immediately
+no-op. For a 4-function interface where your logging middleware only
+cares about one, `before-call` still fires 4 × per mixed workload and
+you filter by name inside the middleware. Typical per-hook cost is an
+async subtask + name-string lower/lift; small in isolation, but it
+scales linearly with the number of interposed functions the
+middleware ignores.
+
+There's no config-level way to restrict which functions are wrapped
+yet — if you have a concrete use case (large fan-out interface,
+per-function policy, measurable overhead on ignored calls), **please
+[open an issue](https://github.com/ejrgilbert/splicer/issues)** with
+details. A config-level `funcs: [...]` filter is on the roadmap (see
+[`docs/adapter-comp-planning.md`](./adapter-comp-planning.md)) and
+real use cases drive the priority.
+
 **What the generated adapter does:**
 
 For each function in the target interface, the adapter:
