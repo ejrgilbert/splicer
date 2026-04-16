@@ -9,7 +9,7 @@
 //!   [`join_val_type`]) — turn a component-level value type into
 //!   the flat sequence of core-Wasm `ValType`s the canonical ABI
 //!   uses for parameters and return slots.
-//! - **Inspection** ([`type_has_strings`], [`type_has_resources`])
+//! - **Inspection** ([`type_has_strings`], [`type_has_lists`])
 //!   — predicates that recurse through compound types so the
 //!   adapter knows whether it needs `memory` / `realloc` /
 //!   `string-encoding` canonical options.
@@ -156,32 +156,31 @@ pub(super) fn type_has_strings(id: ValueTypeId, arena: &TypeArena) -> bool {
 }
 
 /// Returns true if the type (or any type it transitively contains)
-/// is a resource handle.
+/// is a list. Drives the `needs_realloc` decision: canon lower
+/// allocates memory via realloc to marshal list contents (both
+/// dynamic `list<T>` and fixed-size `list<T, N>`), so any function
+/// with a list param or result needs the memory provider to export
+/// `realloc`.
 ///
 /// Match is exhaustive — see [`type_has_strings`] for the same
 /// rationale.
-pub(super) fn type_has_resources(id: ValueTypeId, arena: &TypeArena) -> bool {
+pub(super) fn type_has_lists(id: ValueTypeId, arena: &TypeArena) -> bool {
     match arena.lookup_val(id) {
-        ValueType::Resource(_) | ValueType::AsyncHandle => true,
+        ValueType::List(_) | ValueType::FixedSizeList(..) => true,
 
-        ValueType::Record(fields) => fields.iter().any(|(_, id)| type_has_resources(*id, arena)),
-        ValueType::Tuple(ids) => ids.iter().any(|id| type_has_resources(*id, arena)),
-        ValueType::Variant(cases) => cases.iter().any(|(_, opt_id)| {
-            opt_id
-                .map(|id| type_has_resources(id, arena))
-                .unwrap_or(false)
-        }),
-        ValueType::Option(inner) => type_has_resources(*inner, arena),
+        ValueType::Record(fields) => fields.iter().any(|(_, id)| type_has_lists(*id, arena)),
+        ValueType::Tuple(ids) => ids.iter().any(|id| type_has_lists(*id, arena)),
+        ValueType::Variant(cases) => cases
+            .iter()
+            .any(|(_, opt_id)| opt_id.map(|id| type_has_lists(id, arena)).unwrap_or(false)),
+        ValueType::Option(inner) => type_has_lists(*inner, arena),
         ValueType::Result { ok, err } => {
-            ok.map(|id| type_has_resources(id, arena)).unwrap_or(false)
-                || err.map(|id| type_has_resources(id, arena)).unwrap_or(false)
+            ok.map(|id| type_has_lists(id, arena)).unwrap_or(false)
+                || err.map(|id| type_has_lists(id, arena)).unwrap_or(false)
         }
-        ValueType::List(inner) | ValueType::FixedSizeList(inner, _) => {
-            type_has_resources(*inner, arena)
-        }
-        ValueType::Map(k, v) => type_has_resources(*k, arena) || type_has_resources(*v, arena),
+        ValueType::Map(k, v) => type_has_lists(*k, arena) || type_has_lists(*v, arena),
 
-        // Leaf non-resource types.
+        // Leaf non-list types.
         ValueType::Bool
         | ValueType::S8
         | ValueType::U8
@@ -196,6 +195,8 @@ pub(super) fn type_has_resources(id: ValueTypeId, arena: &TypeArena) -> bool {
         | ValueType::Char
         | ValueType::String
         | ValueType::ErrorContext
+        | ValueType::Resource(_)
+        | ValueType::AsyncHandle
         | ValueType::Enum(_)
         | ValueType::Flags(_) => false,
     }

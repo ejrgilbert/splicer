@@ -15,7 +15,7 @@ use cviz::model::{FuncSignature, InterfaceType, TypeArena, ValueTypeId};
 use wasm_encoder::ValType;
 
 use super::mem_layout::MemoryLayoutBuilder;
-use super::ty::{flat_types_for, type_has_resources, type_has_strings, FlatLayout};
+use super::ty::{flat_types_for, type_has_lists, type_has_strings, FlatLayout};
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
@@ -63,10 +63,51 @@ pub(super) struct AdapterFunc {
     /// (deep check; traverses compound types). Drives the
     /// canon-lift/lower `realloc` option.
     pub has_strings: bool,
-    /// True when any parameter or the result contains a resource
-    /// handle (deep check). Drives `own<>` alias emission and the
-    /// needs-realloc decision.
-    pub has_resources: bool,
+    /// True when any parameter or the result contains a list
+    /// (`list<T>` or `list<T, N>`, deep check). Drives the
+    /// needs-realloc decision — canon lower allocates memory via
+    /// realloc to marshal list contents.
+    pub has_lists: bool,
+}
+
+impl AdapterFunc {
+    /// True when any canon operation on this function needs the
+    /// `Memory(_)` option — i.e. when at least one param or result
+    /// is marshaled through linear memory. Covers:
+    /// - strings / lists (`(ptr, len)` body in memory)
+    /// - sync-complex results (retptr pattern)
+    /// - async functions with any result (written to the pre-reserved
+    ///   async result buffer)
+    ///
+    /// Bare resource handles don't need memory on their own — they're
+    /// `i32` values on the wire. A resource inside a compound that
+    /// goes through retptr is caught by `result_is_complex`, and a
+    /// resource in an async result is caught by the async-with-result
+    /// clause.
+    pub fn canon_needs_memory(&self) -> bool {
+        self.has_strings
+            || self.has_lists
+            || self.result_is_complex
+            || (self.is_async && self.result_type_id.is_some())
+    }
+
+    /// True when any canon operation on this function may need to
+    /// allocate memory via `realloc` — strings and lists, which the
+    /// canonical ABI marshals as `(ptr, len)` pairs written into
+    /// memory by the lowering side. Bare resource handles (`own<T>`)
+    /// don't need realloc — they're just `i32` values on the wire
+    /// and never allocate.
+    pub fn canon_needs_realloc(&self) -> bool {
+        self.has_strings || self.has_lists
+    }
+
+    /// True when any canon operation on this function uses UTF-8 for
+    /// string encoding. UTF-8 is only relevant when a string is
+    /// actually present — resources and lists of non-string types
+    /// don't need it.
+    pub fn canon_needs_utf8(&self) -> bool {
+        self.has_strings
+    }
 }
 
 /// Resolve a cviz `InterfaceType::Instance` into a list of
@@ -122,7 +163,7 @@ pub(super) fn extract_adapter_funcs(
         let result_id = extracted.result_type_id.into_iter();
         let all_ids: Vec<ValueTypeId> = param_ids.chain(result_id).collect();
         let has_strings = all_ids.iter().any(|&id| type_has_strings(id, arena));
-        let has_resources = all_ids.iter().any(|&id| type_has_resources(id, arena));
+        let has_lists = all_ids.iter().any(|&id| type_has_lists(id, arena));
 
         funcs.push(AdapterFunc {
             name: name.clone(),
@@ -138,7 +179,7 @@ pub(super) fn extract_adapter_funcs(
             async_result_mem_offset,
             sync_result_mem_offset,
             has_strings,
-            has_resources,
+            has_lists,
         });
     }
     // The builder is returned (not dropped) so the adapter builder

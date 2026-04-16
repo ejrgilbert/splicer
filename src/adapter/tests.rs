@@ -42,8 +42,9 @@ fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
         ValueType::Bool => "bool".into(),
         ValueType::Char => "char".into(),
         ValueType::String => "string".into(),
+        ValueType::List(inner) => format!("(list {})", wat_type(*inner, arena)),
         other => panic!(
-            "wat_type: synth split helper only supports primitive + string types, \
+            "wat_type: synth split helper only supports primitive + string + list types, \
              got {other:?}. For richer shapes, add a dedicated WAT template."
         ),
     }
@@ -103,11 +104,14 @@ fn wat_consumer_primitive_only(
     iface: &InstanceInterface,
     arena: &TypeArena,
 ) -> String {
+    // Named-type refs ($fn_{name}) instead of numeric indices, so
+    // inline compound types like `(list u32)` — which the WAT
+    // parser allocates their own type slots for — don't shift the
+    // numbering and break later references.
     let mut body = String::new();
-    let mut func_type_for: Vec<(String, u32)> = Vec::new();
+    let mut export_lines = String::new();
 
-    for (type_idx, (name, sig)) in iface.functions.iter().enumerate() {
-        let type_idx = type_idx as u32;
+    for (name, sig) in &iface.functions {
         let params: Vec<String> = sig
             .param_names
             .iter()
@@ -119,18 +123,19 @@ fn wat_consumer_primitive_only(
             None => String::new(),
         };
         let async_kw = if sig.is_async { "async " } else { "" };
+        let func_ty_id = format!("$fn_{}", name.replace('-', "_"));
         body.push_str(&format!(
-            "      (type (;{type_idx};) (func {async_kw}{}{result}))\n",
+            "      (type {func_ty_id} (func {async_kw}{}{result}))\n",
             params.join(" "),
         ));
-        func_type_for.push((name.clone(), type_idx));
+        export_lines.push_str(&format!(
+            "      (export \"{name}\" (func (type {func_ty_id})))\n"
+        ));
     }
-    for (name, fty) in &func_type_for {
-        body.push_str(&format!("      (export \"{name}\" (func (type {fty})))\n"));
-    }
+    body.push_str(&export_lines);
 
     format!(
-        "(component\n  (type (;0;) (instance\n{body}  ))\n  (import \"{target}\" (instance (type 0)))\n)\n"
+        "(component\n  (type $iface (instance\n{body}  ))\n  (import \"{target}\" (instance (type $iface)))\n)\n"
     )
 }
 
@@ -488,6 +493,76 @@ fn test_adapter_resource_handler() {
     let iface = build_http_handler_iface(&mut arena);
     let bytes = gen_adapter(
         "wasi:http/handler@0.3.0-rc-2026-01-06",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+// ── Tier 1: list<T> (needs_realloc detection) ────────────────────────
+
+/// Regression test for the `needs_realloc` rule: a function with a
+/// `list<u32>` parameter requires canon lower to allocate memory for
+/// the marshaled list contents. Before the fix, the rule only
+/// detected strings and resources, so `list<T>` functions had
+/// `needs_realloc = false` → memory module emitted without realloc →
+/// canon lower fails at component-model validation.
+#[test]
+fn test_adapter_list_param_sync() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let list_u32 = arena.intern_val(ValueType::List(u32_id));
+    let iface = make_iface(vec![(
+        "sum",
+        sig(false, &["xs"], vec![list_u32], vec![u32_id]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/summer@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// List-as-result path: the canon lift (export side) needs the
+/// `Memory` and `Realloc` options to lift `list<u32>` results too.
+#[test]
+fn test_adapter_list_result_sync() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let list_u32 = arena.intern_val(ValueType::List(u32_id));
+    let iface = make_iface(vec![(
+        "range",
+        sig(false, &["n"], vec![u32_id], vec![list_u32]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/ranger@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Async path with a list parameter — exercises the list-detection
+/// through the async canon-lower and task.return emission, not just
+/// the sync canon-lift path.
+#[test]
+fn test_adapter_list_param_async() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let list_u32 = arena.intern_val(ValueType::List(u32_id));
+    let iface = make_iface(vec![(
+        "process",
+        sig(true, &["xs"], vec![list_u32], vec![]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/processor@1.0.0",
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,

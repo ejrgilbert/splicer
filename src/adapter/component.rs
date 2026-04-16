@@ -627,11 +627,15 @@ fn compute_memory_layout(
     let event_ptr = layout.alloc_event_slot();
     let block_result_ptr = has_blocking.then(|| layout.alloc_block_result());
 
-    // Realloc is needed by canon lift (for string params) AND by canon
-    // lower (for handler functions with complex result types that contain
-    // strings/resources). When needed, it lives in the memory module so
-    // it's available for both lowering and lifting.
-    let needs_realloc = funcs.iter().any(|f| f.has_strings || f.has_resources);
+    // Realloc is needed by canon lift and canon lower to allocate
+    // memory for any value whose canonical-ABI form is a
+    // pointer-to-bytes: strings (variable-length UTF-8) and lists
+    // (both `list<T>` and `list<T, N>` — our current
+    // `flat_types_for` treats both as `(ptr, len)`). Bare resource
+    // handles don't need realloc — they're i32 values on the wire.
+    // When needed, realloc lives in the memory module so it's
+    // available for both lowering and lifting.
+    let needs_realloc = funcs.iter().any(|f| f.canon_needs_realloc());
 
     let bump_start = layout.finish_as_bump_start();
 
@@ -784,27 +788,24 @@ fn emit_canon_lower(
     let core_after_func = after_comp_func.map(&mut lower_hook);
     let core_blocking_func = blocking_comp_func.map(&mut lower_hook);
 
-    // Lower each handler function. For functions with resources/strings:
-    // need Memory + UTF8 + Realloc. For async: also need Async flag.
+    // Lower each handler function. The canon options are driven by
+    // the `canon_needs_*` helpers on `AdapterFunc` so the memory /
+    // realloc / utf8 decisions stay in one place; see those methods
+    // for what each flag covers.
     let core_handler_func_base = indices.core_func;
     for (i, func) in funcs.iter().enumerate() {
         indices.core_func += 1;
-        let hs = func.has_strings;
-        let hr = func.has_resources;
-        let needs_mem = func.is_async && func.result_type_id.is_some() || hs || hr;
-        let needs_utf8 = hs || hr;
-        let needs_ra = hr || (hs && func.result_is_complex);
         let mut opts: Vec<CanonicalOption> = Vec::new();
         if func.is_async {
             opts.push(CanonicalOption::Async);
         }
-        if needs_mem {
+        if func.canon_needs_memory() {
             opts.push(CanonicalOption::Memory(mem_core_mem));
         }
-        if needs_utf8 {
+        if func.canon_needs_utf8() {
             opts.push(CanonicalOption::UTF8);
         }
-        if needs_ra {
+        if func.canon_needs_realloc() {
             if let Some(ra) = mem_core_realloc {
                 opts.push(CanonicalOption::Realloc(ra));
             }
@@ -837,9 +838,11 @@ fn emit_canon_lower(
         core_subtask_drop = None;
     }
 
-    // task.return canonicals — one per async func (void or not). For
-    // functions with resources/complex results: needs Memory + UTF8 for
-    // lifting.
+    // task.return canonicals — one per async func (void or not).
+    // `task.return` lifts the flat return values into a
+    // component-level result; it needs Memory + UTF8 whenever the
+    // result type pulls bytes through linear memory. Driven by the
+    // same `canon_needs_*` helpers as canon-lower.
     let core_task_return_funcs: Vec<Option<u32>> = funcs
         .iter()
         .enumerate()
@@ -847,12 +850,11 @@ fn emit_canon_lower(
             if func.is_async {
                 let idx = indices.alloc_core_func();
                 let tr_result_cv = comp_result_cvs[fi];
-                let hr = func.has_resources;
-                let hs = func.has_strings;
-                let needs_mem = hr || (hs && func.result_is_complex);
                 let mut opts: Vec<CanonicalOption> = Vec::new();
-                if needs_mem {
+                if func.canon_needs_memory() {
                     opts.push(CanonicalOption::Memory(mem_core_mem));
+                }
+                if func.canon_needs_utf8() {
                     opts.push(CanonicalOption::UTF8);
                 }
                 canons.task_return(tr_result_cv, opts);
@@ -1035,6 +1037,8 @@ fn emit_canon_lift_phase(
     }
 
     // ── 11. Canon lift: wrapper core funcs → component funcs ──────────
+    // Options driven by the `canon_needs_*` helpers on `AdapterFunc`;
+    // see those methods for what each flag covers.
     let wrapped_func_base: u32;
     {
         let mut canons = CanonicalFunctionSection::new();
@@ -1045,16 +1049,13 @@ fn emit_canon_lift_phase(
             } else {
                 vec![]
             };
-            let hs = func.has_strings;
-            let hr = func.has_resources;
-            let needs_mem = hs || hr || func.result_is_complex;
-            if needs_mem {
+            if func.canon_needs_memory() {
                 opts.push(CanonicalOption::Memory(mem_core_mem));
             }
-            if hs || hr {
+            if func.canon_needs_utf8() {
                 opts.push(CanonicalOption::UTF8);
             }
-            if needs_realloc && (hs || hr) {
+            if needs_realloc && func.canon_needs_realloc() {
                 if let Some(ra) = mem_core_realloc {
                     opts.push(CanonicalOption::Realloc(ra));
                 }

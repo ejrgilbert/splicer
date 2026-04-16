@@ -313,29 +313,66 @@ each at its site, not via a pre-pass:
   fallback. Currently unreachable (flat_types_for only produces
   I32/I64/F32/F64) but worth making exhaustive for future-proofing.
 
-- [ ] **`FlatLayout::new` only handles `Result<T, E>`; `Option` /
-  `Variant` / `Enum` fall through to `build_sequential_layout` and
-  silently mis-compute memory offsets.** (`src/adapter/ty.rs` lines
-  343–351.) The canonical ABI stores a variant-shaped type as a
-  subword discriminant (1 byte for ≤256 cases, 2 bytes for ≤65_536,
-  4 bytes above that) followed by the payload at
-  `align_to(discriminant_size, payload_align)`. `build_sequential_layout`
-  instead uses the flat-widened `[I32, ...payload_flat]`, placing the
-  payload at offset 4 unconditionally. Matches the canonical layout
-  when `align(payload) ≥ 4` (common case — `Option<u32>`,
-  `Option<u64>`, most records) and is why wasi:http/handler's
-  `result<own<response>, error-code>` works today even without going
-  through `build_result_layout`. Breaks for: `Option<u8>` /
-  `Option<u16>` (payload at offset 1 or 2, not 4); `Variant` / `Enum`
-  with small payloads or bool fields; any `Variant` with >256 cases
-  (multi-byte discriminant). **Fix**: generalize `build_result_layout`
-  into `build_discriminated_layout(disc_byte_size, payload_align,
-  payload_flat_types)` and dispatch `FlatLayout::new` on the arena
-  value-type for `Result` / `Option` / `Variant` / `Enum`;
-  `build_sequential_layout` stays but only for truly sequential
-  types (record, tuple, string, list, primitives). Add tests with
-  `Option<u8>` and a small-payload variant as top-level async
-  results — both should currently fail at the i32.load offset.
+- [ ] **`FlatLayout::new` mis-computes memory offsets for
+  discriminated and subword-containing types.** (`src/adapter/ty.rs`
+  lines 343–401.) The actual bug scope is wider than the original
+  sketch; in-scope fix needs real implementation of each case, not
+  stubs/panics. Concrete shapes broken today:
+
+  1. **Multi-byte discriminants**: `Variant` with >256 cases has a
+     u16 discriminant (2 bytes), >65_536 has u32 (4 bytes).
+     `build_sequential_layout` treats the disc slot as full i32
+     regardless, so a stale byte 2–3 from prior memory could
+     corrupt the widened disc value. Also the sequential fallback
+     doesn't call `i32.load16_u` / `i32.load8_u` for narrower discs.
+  2. **Subword payload alignment**: `Option<u8>` / `Option<u16>`,
+     `Result<u8, u8>`, `Variant { case u8 }` — the canonical ABI
+     stores the payload at `align_to(disc_size, canonical_align(T))`
+     (offset 1 for `Option<u8>`, offset 2 for `Option<u16>`), but
+     `append_sequential` aligns every I32 slot to 4 bytes regardless
+     of the original type's canonical alignment. So we load the
+     payload from the wrong offset (4 instead of 1/2), reading
+     adjacent garbage.
+  3. **Subword value loads**: even at the right offset, an I32 slot
+     representing a u8 needs `i32.load8_u` (1 byte → widened), not
+     `i32.load` (reads 4 bytes, high 3 are adjacent memory).
+  4. **Heterogeneous variant arms (joined-flat)**: `Variant { case
+     u8, case u64 }` — at flat position 1, the joined type is I64.
+     Canon lower writes either 1 byte (u8 case) or 8 bytes (u64
+     case) depending on which arm is active. Loading as i64 from
+     the common offset reads wrong bytes for the u8 arm. Correct
+     handling needs runtime dispatch on the disc to load the active
+     arm's canonical layout and widen to joined flat positions —
+     genuinely complex code-emit, not a layout math tweak.
+  5. **Subword fields in records / tuples**: `Record { a: bool, b:
+     bool }` — canonical layout puts `b` at offset 1; flat-widened
+     puts it at offset 4. Same class as (2).
+
+  **Why it doesn't bite in practice today**: the bump-allocator
+  memory is zero-init on first allocation, so subword reads get
+  `u8_value | (0 << 8) | (0 << 16) | (0 << 24)` = correct widened
+  i32. Fragile to any allocator reuse pattern and spec-non-compliant,
+  but currently passes tests by accident.
+
+  **Fix scope**: real implementations of each case, per explicit
+  user ask ("don't just panic"). The fix needs:
+  - `FlatSlot` to track canonical byte size (not just flat val type)
+    so loads use the right width (`i32.load8_u` / `i32.load16_u` /
+    `i32.load` / `i64.load`).
+  - Layout walk that uses canonical-ABI alignment throughout, threaded
+    from the original `ValueType`, not `val_type_byte_size`.
+  - Discriminated-type handling for `Result` / `Option` / `Variant`
+    / `Enum` via a unified `build_discriminated_layout`.
+  - For heterogeneous variant arms, the dispatch code in
+    `emit_task_return_loads` needs a runtime branch on disc to load
+    each arm's canonical layout and widen. This is the biggest
+    piece — likely a new emit helper, not just a layout builder.
+  - Subword-field handling in records/tuples: the sequential layout
+    builder must use canonical alignment, not val-type alignment.
+  Add tests across all five shape categories, each with a
+  non-zero-init memory assertion (fill memory with `0xFF` before
+  the test and verify the widened value still comes back correctly)
+  so the bug actually surfaces when broken.
 
 - [ ] **`FixedSizeList(T, N)` silently encoded as dynamic `list<T>`;
   element count `N` discarded.** (`src/adapter/encoders.rs` lines
@@ -360,21 +397,26 @@ each at its site, not via a pre-pass:
   **Fix**: in `flat_types_for`, emit `flat_types_for(inner)` repeated
   `n` times; in `canonical_align`, return `canonical_align(inner)`.
 
-- [ ] **`needs_realloc` misses `list<T>` types entirely.**
-  (`src/adapter/component.rs` line 634:
-  `needs_realloc = funcs.iter().any(|f| f.has_strings ||
-  f.has_resources)`.) The rule catches strings and resources but not
-  lists. A function with `list<u32>` param or result would have
-  `needs_realloc=false`, and canon lower needs `realloc` to marshal
-  the list contents. Validation fails at adapter generation, or
-  worse, the adapter emits without realloc and fails at load time.
-  **Fix**: add `type_has_lists` alongside `type_has_strings` /
-  `type_has_resources` in `src/adapter/ty.rs`, add matching
-  `has_lists: bool` on `AdapterFunc`, and extend the `needs_realloc`
-  rule. Consider whether `has_resources` is actually needed for
-  realloc — a bare `own<T>` is just an i32 handle and shouldn't
-  require it (the current rule may be over-conservative, though
-  that's a false-positive, not a correctness bug).
+- [x] **`needs_realloc` misses `list<T>` types entirely.** _Landed._
+  Added `type_has_lists` in `src/adapter/ty.rs` (exhaustive match,
+  covers both `List(_)` and `FixedSizeList(..)`), `has_lists: bool`
+  on `AdapterFunc`, and a trio of `canon_needs_memory()` /
+  `canon_needs_realloc()` / `canon_needs_utf8()` helpers that
+  centralize the per-function canon-option decisions. Updated all
+  three canon sites in `src/adapter/component.rs` (handler canon
+  lower, `task.return`, canon lift for exports) to use those
+  helpers. Tightened the rules: `has_resources` no longer forces
+  memory or realloc (bare `own<T>` is an `i32` handle with no
+  memory access; resource-in-compound cases are caught by
+  `result_is_complex`, and async-result cases by `is_async &&
+  has_result`). `type_has_resources` and the `has_resources` bool
+  on `AdapterFunc` are now removed — they were only feeding the
+  over-conservative rules. Also fixed a latent WAT-template bug in
+  the consumer synth split where inline compound types (e.g.
+  `(list u32)` in a func param) shifted the numeric type
+  indices — switched to named types (`$fn_<name>`). New tests
+  cover `list<u32>` as param (sync), as result (sync canon-lift
+  path), and as async param (task.return path).
 
 - [ ] **Flat params and flat results >16 silently declare the wrong
   core type.** (`src/adapter/func.rs` lines 188–197;
@@ -395,19 +437,13 @@ each at its site, not via a pre-pass:
   flag and emits pointer-form signatures; memory layout needs a
   corresponding buffer reservation for the spilled args.
 
-- [ ] **Silent fallback to `U32` for unregistered resources.**
-  (`src/adapter/encoders.rs` lines 313–318 in `encode_comp_cv`.) If
-  a `Resource` or `AsyncHandle` value-type-id isn't found in
-  `comp_own_by_vid`, the encoder returns
-  `Primitive(PrimitiveValType::U32)` — losing the `own<T>` typing
-  entirely and emitting a bare integer where the interface says
-  `own<T>`. Probably unreachable given the preamble registers every
-  resource up front, but if it ever fires it'll produce an adapter
-  that type-checks but encodes the wrong interface. **Fix**: replace
-  the fallback with `anyhow::bail!("resource {vid:?} not registered
-  in comp_own_by_vid — this is a bug in the adapter generator")`.
-  A hard error here will surface the missing registration the first
-  time it happens, rather than shipping a silently-wrong adapter.
+- [x] **Silent fallback to `U32` for unregistered resources.**
+  _Landed with the fail-closed pass above._ The
+  `encode_comp_cv` fallback at `src/adapter/encoders.rs:313` now
+  bails with `"internal error: resource {id:?} not registered in
+  comp_own_by_vid — the handler-import phase must declare every
+  resource before encode_comp_cv references it"`. All existing tests
+  pass, confirming the fallback was unreachable today.
 
 ### To do
 
