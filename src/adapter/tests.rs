@@ -51,7 +51,7 @@ fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
 }
 
 /// Which shape of split to synthesize. The two code paths through
-/// [`super::component::emit_imports_from_consumer_split`] — `handler_in_split`
+/// [`super::component::emit_imports_from_split`] — `handler_in_split`
 /// true vs false — are exercised by whether the target interface
 /// appears as an import or an export in the split, so we test both.
 #[derive(Clone, Copy)]
@@ -195,7 +195,7 @@ fn wat_consumer_http_handler_shape(target: &str) -> String {
 
 /// WAT for a provider split that **exports** the target interface with
 /// a trivial primitive signature. Exercises the `handler_in_split = false`
-/// path in [`super::component::emit_imports_from_consumer_split`].
+/// path in [`super::component::emit_imports_from_split`].
 ///
 /// Restricted to a single sync function of shape
 /// `(param s32 s32) (result s32)` — richer provider shapes are covered
@@ -265,7 +265,7 @@ fn wat_provider_primitive_only(
 /// walker seeds BFS from the export and pulls the same preamble a real
 /// provider component would carry. The neighbor import has a
 /// non-target name, so `handler_in_split` stays false and the
-/// `emit_imports_from_consumer_split` provider branch runs.
+/// `emit_imports_from_split` provider branch runs.
 fn wat_provider_http_handler_shape(target: &str) -> String {
     format!(
         r#"(component
@@ -671,7 +671,7 @@ fn test_adapter_no_hooks() {
 // ── Tier 1: provider split (handler exported, not imported) ──────────
 
 /// Exercises the `!handler_in_split` branch of
-/// [`super::component::emit_imports_from_consumer_split`] with an
+/// [`super::component::emit_imports_from_split`] with an
 /// empty preamble: the split *exports* the target interface instead of
 /// importing it, so the adapter builds a fresh handler import type
 /// rather than copying the one from the split's raw sections. For a

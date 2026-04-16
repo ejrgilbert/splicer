@@ -249,16 +249,24 @@ fn emit_func_aliases(
     )
 }
 
-/// Strategy: pass-through consumer split imports.
+/// Emit the adapter's type / import / alias sections on top of a
+/// (consumer or provider) filtered split's raw sections.
 ///
-/// Copies the consumer split's type/import/alias sections verbatim, then
-/// either reuses the handler import the split already declares (if the split
-/// imports the target interface) or builds a fresh handler import on top of
-/// the shared types from the raw sections (if the consumer split itself
-/// re-exports the target interface). After the handler is in place, hook
-/// instance types/imports and func aliases are added on top.
+/// Copies the split's preamble verbatim, seeds the index allocator,
+/// and dispatches to the strategy that matches how the split carries
+/// the target interface:
+///
+/// - **Consumer split**: the split already imports `target_interface`.
+///   [`emit_imports_consumer_split`] reuses that handler import,
+///   emits the hook types/imports/aliases on top, and aliases the
+///   handler's resource + compound type exports for later phases.
+/// - **Provider split**: the split *exports* `target_interface`. The
+///   preamble carries the supporting type imports (types instance,
+///   aliased resources). [`emit_imports_provider_split`] builds a
+///   fresh handler import type that references those preamble
+///   aliases via `alias outer`.
 #[allow(clippy::too_many_arguments)]
-fn emit_imports_from_consumer_split(
+fn emit_imports_from_split(
     component: &mut Component,
     target_interface: &str,
     funcs: &[AdapterFunc],
@@ -270,20 +278,8 @@ fn emit_imports_from_consumer_split(
     split: &FilteredSections,
     indices: &mut ComponentIndices,
 ) -> anyhow::Result<ImportsOutcome> {
-    // Strategy-internal handles to the handler instance import. They never
-    // escape because the post-strategy phases only need the handler
-    // *function* aliases (in handler_func_base), not the handler instance
-    // index itself.
-    let handler_inst: u32;
-    let inst_ctx: InstTypeCtx;
-    let handler_func_base: u32;
-    let before_comp_func: Option<u32>;
-    let after_comp_func: Option<u32>;
-    let blocking_comp_func: Option<u32>;
-    let comp_resource_indices: Vec<u32>;
-    let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
-
-    // Copy raw type/import/alias sections from the split.
+    // Copy raw type/import/alias sections from the split. Both
+    // strategies below assume these are already present.
     for (section_kind, data) in &split.raw_sections {
         // RawSection::id is u8 (wasm-encoder's API), so convert at the boundary.
         component.section(&RawSection {
@@ -297,262 +293,308 @@ fn emit_imports_from_consumer_split(
     indices.ty = split.type_count;
     indices.inst = split.instance_count;
 
-    // Check if the handler is already imported by the split.
-    let handler_in_split = split.import_names.iter().any(|n| n == target_interface);
+    if let Some(handler_idx) = split
+        .import_names
+        .iter()
+        .position(|n| n == target_interface)
+    {
+        emit_imports_consumer_split(
+            component,
+            funcs,
+            has_before,
+            has_after,
+            has_blocking,
+            arena,
+            iface_ty,
+            split,
+            indices,
+            handler_idx as u32,
+        )
+    } else {
+        emit_imports_provider_split(
+            component,
+            target_interface,
+            funcs,
+            has_before,
+            has_after,
+            has_blocking,
+            arena,
+            iface_ty,
+            split,
+            indices,
+        )
+    }
+}
 
-    if handler_in_split {
-        // Handler import came from the raw sections — find its instance index.
-        let handler_idx = split
-            .import_names
-            .iter()
-            .position(|n| n == target_interface)
-            .unwrap() as u32;
-        handler_inst = handler_idx;
+/// Consumer-split strategy: the raw sections already include an import
+/// for `target_interface`. Reuse its instance index, emit the hook
+/// types/imports/aliases, and alias the handler's type exports
+/// (resources + compound types) into component scope for the
+/// canon-lift / export phases to reference.
+#[allow(clippy::too_many_arguments)]
+fn emit_imports_consumer_split(
+    component: &mut Component,
+    funcs: &[AdapterFunc],
+    has_before: bool,
+    has_after: bool,
+    has_blocking: bool,
+    arena: &TypeArena,
+    iface_ty: &InterfaceType,
+    split: &FilteredSections,
+    indices: &mut ComponentIndices,
+    handler_inst: u32,
+) -> anyhow::Result<ImportsOutcome> {
+    // Hook types + imports.
+    let mut types = ComponentTypeSection::new();
+    let (before_inst_ty, after_inst_ty, blocking_inst_ty) =
+        emit_hook_inst_types(&mut types, indices, has_before, has_after, has_blocking);
+    component.section(&types);
 
-        // Hook types + imports.
-        let (before_inst_ty, after_inst_ty, blocking_inst_ty);
-        {
-            let mut types = ComponentTypeSection::new();
-            (before_inst_ty, after_inst_ty, blocking_inst_ty) =
-                emit_hook_inst_types(&mut types, indices, has_before, has_after, has_blocking);
-            component.section(&types);
-        }
-        let (before_inst, after_inst, blocking_inst);
-        {
-            let mut imports = ComponentImportSection::new();
-            (before_inst, after_inst, blocking_inst) = emit_hook_imports(
-                &mut imports,
-                indices,
-                before_inst_ty,
-                after_inst_ty,
-                blocking_inst_ty,
-            );
-            component.section(&imports);
-        }
+    let mut imports = ComponentImportSection::new();
+    let (before_inst, after_inst, blocking_inst) = emit_hook_imports(
+        &mut imports,
+        indices,
+        before_inst_ty,
+        after_inst_ty,
+        blocking_inst_ty,
+    );
+    component.section(&imports);
 
-        // Alias funcs from the handler instance + hooks.
-        {
-            let mut aliases = ComponentAliasSection::new();
-            (
-                handler_func_base,
-                before_comp_func,
-                after_comp_func,
-                blocking_comp_func,
-            ) = emit_func_aliases(
-                &mut aliases,
-                indices,
-                funcs,
-                handler_inst,
-                before_inst,
-                after_inst,
-                blocking_inst,
-            );
-            component.section(&aliases);
-        }
+    // Alias funcs from the handler instance + hooks.
+    let mut aliases = ComponentAliasSection::new();
+    let (handler_func_base, before_comp_func, after_comp_func, blocking_comp_func) =
+        emit_func_aliases(
+            &mut aliases,
+            indices,
+            funcs,
+            handler_inst,
+            before_inst,
+            after_inst,
+            blocking_inst,
+        );
+    component.section(&aliases);
 
-        // Build inst_ctx to discover resource exports (needed for sections
-        // 3b/3c), but DON'T emit the instance type — it came from the raw
-        // sections.
-        {
-            let mut ctx = InstTypeCtx::new();
-            let mut dummy_inst = InstanceType::new();
-            build_handler_inst_type(&mut ctx, &mut dummy_inst, funcs, arena)?;
-            inst_ctx = ctx;
-        }
+    // Build inst_ctx to discover resource exports (needed for sections
+    // 3b/3c), but DON'T emit the instance type — it came from the raw
+    // sections.
+    let mut inst_ctx = InstTypeCtx::new();
+    {
+        let mut dummy_inst = InstanceType::new();
+        build_handler_inst_type(&mut inst_ctx, &mut dummy_inst, funcs, arena)?;
+    }
 
-        // Alias ALL type exports from the handler instance — both resources
-        // (request, response) and compound types (error-code). This ensures
-        // the adapter's exported function type references the same types as
-        // the handler import.
-        {
-            let mut aliases = ComponentAliasSection::new();
-            let mut res_vec: Vec<u32> = Vec::new();
+    // Alias ALL type exports from the handler instance — both resources
+    // (request, response) and compound types (error-code). This ensures
+    // the adapter's exported function type references the same types as
+    // the handler import.
+    let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
+    let mut comp_resource_indices: Vec<u32> = Vec::new();
+    let mut export_aliases = ComponentAliasSection::new();
 
-            // Alias resources.
-            for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
+    // Alias resources.
+    for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
+        let comp_idx = indices.alloc_ty();
+        export_aliases.alias(Alias::InstanceExport {
+            instance: handler_inst,
+            kind: ComponentExportKind::Type,
+            name: export_name,
+        });
+        comp_resource_indices.push(comp_idx);
+    }
+
+    // Alias compound type exports (e.g. error-code).
+    if let InterfaceType::Instance(inst) = iface_ty {
+        for (export_name, &vid) in &inst.type_exports {
+            if !matches!(
+                arena.lookup_val(vid),
+                ValueType::Resource(_) | ValueType::AsyncHandle
+            ) {
                 let comp_idx = indices.alloc_ty();
-                aliases.alias(Alias::InstanceExport {
+                export_aliases.alias(Alias::InstanceExport {
                     instance: handler_inst,
                     kind: ComponentExportKind::Type,
                     name: export_name,
                 });
-                res_vec.push(comp_idx);
+                comp_aliased_types.insert(vid, comp_idx);
             }
-            comp_resource_indices = res_vec;
-
-            // Alias compound type exports (e.g. error-code).
-            if let InterfaceType::Instance(inst) = iface_ty {
-                for (export_name, &vid) in &inst.type_exports {
-                    if !matches!(
-                        arena.lookup_val(vid),
-                        ValueType::Resource(_) | ValueType::AsyncHandle
-                    ) {
-                        let comp_idx = indices.alloc_ty();
-                        aliases.alias(Alias::InstanceExport {
-                            instance: handler_inst,
-                            kind: ComponentExportKind::Type,
-                            name: export_name,
-                        });
-                        comp_aliased_types.insert(vid, comp_idx);
-                    }
-                }
-            }
-
-            if indices.ty > split.type_count {
-                component.section(&aliases);
-            }
-        }
-    } else {
-        // Provider split: the handler is exported, not imported. The
-        // preamble sections provide the supporting imports (types-instance,
-        // WASI interfaces) with aliased resource types. Build only the
-        // handler import type fresh, referencing those aliased resources
-        // via alias-outer.
-        let handler_inst_ty: u32;
-        let mut types = ComponentTypeSection::new();
-
-        // Build map of every interface type export that has a matching
-        // aliased type in the preamble. Both resources (request/response)
-        // and compound types (error-code, DNS-error-payload, …) are
-        // pre-aliased at component scope; the handler instance type body
-        // must reference them all via `alias outer` so it's
-        // type-identical to what the provider's handler actually exports
-        // — otherwise the component model validator sees the import type
-        // as a fresh redefinition incompatible with the underlying
-        // resource/variant identity.
-        let mut outer_aliased: HashMap<ValueTypeId, u32> = HashMap::new();
-        if let InterfaceType::Instance(inst_iface) = iface_ty {
-            for (name, &vid) in &inst_iface.type_exports {
-                if let Some(&comp_idx) = split.aliased_type_exports.get(name) {
-                    outer_aliased.insert(vid, comp_idx);
-                }
-            }
-        }
-
-        {
-            // `outer_resources` in the ctx is narrowly used for the
-            // own<>/SubResource emission path — only keep resource-kind
-            // entries there. Compound types that need alias-outer flow
-            // through `alias_locals` below; the encoder picks them up
-            // before falling into inline encoding.
-            let outer_res_map: HashMap<ValueTypeId, u32> = outer_aliased
-                .iter()
-                .filter(|(&vid, _)| {
-                    matches!(
-                        arena.lookup_val(vid),
-                        ValueType::Resource(_) | ValueType::AsyncHandle
-                    )
-                })
-                .map(|(k, v)| (*k, *v))
-                .collect();
-            let mut ctx = if outer_res_map.is_empty() {
-                InstTypeCtx::new()
-            } else {
-                InstTypeCtx::with_outer_resources(outer_res_map)
-            };
-            let mut inst = InstanceType::new();
-
-            // Emit `alias outer 1 <comp_idx>` for every aliased type
-            // (resource + compound) and record its instance-local index
-            // so the encoder can reference it instead of re-encoding.
-            for (&vid, &comp_idx) in &outer_aliased {
-                let local_idx = inst.type_count();
-                inst.alias(Alias::Outer {
-                    kind: ComponentOuterAliasKind::Type,
-                    count: 1,
-                    index: comp_idx,
-                });
-                ctx.alias_locals.insert(vid, local_idx);
-            }
-
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
-            handler_inst_ty = indices.alloc_ty();
-            inst_ctx = ctx;
-            types.instance(&inst);
-        }
-
-        let (before_inst_ty, after_inst_ty, blocking_inst_ty) =
-            emit_hook_inst_types(&mut types, indices, has_before, has_after, has_blocking);
-        component.section(&types);
-
-        // Import handler + hooks.
-        let (before_inst, after_inst, blocking_inst);
-        {
-            let mut imports = ComponentImportSection::new();
-            handler_inst = indices.alloc_inst();
-            imports.import(
-                target_interface,
-                ComponentTypeRef::Instance(handler_inst_ty),
-            );
-            (before_inst, after_inst, blocking_inst) = emit_hook_imports(
-                &mut imports,
-                indices,
-                before_inst_ty,
-                after_inst_ty,
-                blocking_inst_ty,
-            );
-            component.section(&imports);
-        }
-
-        // Alias funcs + resource types.
-        {
-            let mut aliases = ComponentAliasSection::new();
-            (
-                handler_func_base,
-                before_comp_func,
-                after_comp_func,
-                blocking_comp_func,
-            ) = emit_func_aliases(
-                &mut aliases,
-                indices,
-                funcs,
-                handler_inst,
-                before_inst,
-                after_inst,
-                blocking_inst,
-            );
-
-            // In the provider-split case the handler's resource types
-            // came from the preamble's aliased types (we emitted
-            // `alias outer` for them inside the handler instance type).
-            // They therefore DON'T appear as SubResource exports on the
-            // handler instance, and aliasing them via InstanceExport
-            // would fail. Reuse the preamble's component-scope indices
-            // directly.
-            let mut res_vec: Vec<u32> = Vec::new();
-            for (vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
-                if let Some(&comp_idx) = outer_aliased.get(vid) {
-                    res_vec.push(comp_idx);
-                } else {
-                    let comp_res_idx = indices.alloc_ty();
-                    aliases.alias(Alias::InstanceExport {
-                        instance: handler_inst,
-                        kind: ComponentExportKind::Type,
-                        name: export_name,
-                    });
-                    res_vec.push(comp_res_idx);
-                }
-            }
-            // Compound types (error-code, DNS-error-payload, …) came
-            // from the preamble too; they're not exports on the handler
-            // instance, so reuse those indices for the
-            // `comp_aliased_types` map consumed by section 3c.
-            if let InterfaceType::Instance(inst_iface) = iface_ty {
-                for &vid in inst_iface.type_exports.values() {
-                    if !matches!(
-                        arena.lookup_val(vid),
-                        ValueType::Resource(_) | ValueType::AsyncHandle
-                    ) {
-                        if let Some(&comp_idx) = outer_aliased.get(&vid) {
-                            comp_aliased_types.insert(vid, comp_idx);
-                        }
-                    }
-                }
-            }
-            comp_resource_indices = res_vec;
-            component.section(&aliases);
         }
     }
+
+    if indices.ty > split.type_count {
+        component.section(&export_aliases);
+    }
+
+    Ok(ImportsOutcome {
+        handler_func_base,
+        before_comp_func,
+        after_comp_func,
+        blocking_comp_func,
+        inst_ctx,
+        comp_resource_indices,
+        comp_aliased_types,
+    })
+}
+
+/// Provider-split strategy: the handler isn't imported by the split
+/// (it's exported). Build a fresh handler import type whose body
+/// references the preamble's aliased types via `alias outer`, then
+/// emit the import alongside the hook imports.
+///
+/// Resources and compound types are wired differently from the
+/// consumer case: they come from the preamble (at component scope),
+/// not from SubResource exports on the handler instance, so we reuse
+/// those preamble indices for `comp_resource_indices` and
+/// `comp_aliased_types` instead of aliasing them off the handler
+/// instance (which would fail — the preamble-derived resource types
+/// aren't SubResource exports on the handler instance type).
+#[allow(clippy::too_many_arguments)]
+fn emit_imports_provider_split(
+    component: &mut Component,
+    target_interface: &str,
+    funcs: &[AdapterFunc],
+    has_before: bool,
+    has_after: bool,
+    has_blocking: bool,
+    arena: &TypeArena,
+    iface_ty: &InterfaceType,
+    split: &FilteredSections,
+    indices: &mut ComponentIndices,
+) -> anyhow::Result<ImportsOutcome> {
+    // Build map of every interface type export that has a matching
+    // aliased type in the preamble. Both resources (request/response)
+    // and compound types (error-code, DNS-error-payload, …) are
+    // pre-aliased at component scope; the handler instance type body
+    // must reference them all via `alias outer` so it's type-identical
+    // to what the provider's handler actually exports — otherwise the
+    // component model validator sees the import type as a fresh
+    // redefinition incompatible with the underlying resource / variant
+    // identity.
+    let mut outer_aliased: HashMap<ValueTypeId, u32> = HashMap::new();
+    if let InterfaceType::Instance(inst_iface) = iface_ty {
+        for (name, &vid) in &inst_iface.type_exports {
+            if let Some(&comp_idx) = split.aliased_type_exports.get(name) {
+                outer_aliased.insert(vid, comp_idx);
+            }
+        }
+    }
+
+    let handler_inst_ty: u32;
+    let inst_ctx: InstTypeCtx;
+    let mut types = ComponentTypeSection::new();
+    {
+        // `outer_resources` in the ctx is narrowly used for the
+        // own<>/SubResource emission path — only keep resource-kind
+        // entries there. Compound types that need alias-outer flow
+        // through `alias_locals` below; the encoder picks them up
+        // before falling into inline encoding.
+        let outer_res_map: HashMap<ValueTypeId, u32> = outer_aliased
+            .iter()
+            .filter(|(&vid, _)| {
+                matches!(
+                    arena.lookup_val(vid),
+                    ValueType::Resource(_) | ValueType::AsyncHandle
+                )
+            })
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        let mut ctx = if outer_res_map.is_empty() {
+            InstTypeCtx::new()
+        } else {
+            InstTypeCtx::with_outer_resources(outer_res_map)
+        };
+        let mut inst = InstanceType::new();
+
+        // Emit `alias outer 1 <comp_idx>` for every aliased type
+        // (resource + compound) and record its instance-local index
+        // so the encoder can reference it instead of re-encoding.
+        for (&vid, &comp_idx) in &outer_aliased {
+            let local_idx = inst.type_count();
+            inst.alias(Alias::Outer {
+                kind: ComponentOuterAliasKind::Type,
+                count: 1,
+                index: comp_idx,
+            });
+            ctx.alias_locals.insert(vid, local_idx);
+        }
+
+        build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
+        handler_inst_ty = indices.alloc_ty();
+        inst_ctx = ctx;
+        types.instance(&inst);
+    }
+
+    let (before_inst_ty, after_inst_ty, blocking_inst_ty) =
+        emit_hook_inst_types(&mut types, indices, has_before, has_after, has_blocking);
+    component.section(&types);
+
+    // Import handler + hooks.
+    let mut imports = ComponentImportSection::new();
+    let handler_inst = indices.alloc_inst();
+    imports.import(
+        target_interface,
+        ComponentTypeRef::Instance(handler_inst_ty),
+    );
+    let (before_inst, after_inst, blocking_inst) = emit_hook_imports(
+        &mut imports,
+        indices,
+        before_inst_ty,
+        after_inst_ty,
+        blocking_inst_ty,
+    );
+    component.section(&imports);
+
+    // Alias funcs + resource types.
+    let mut aliases = ComponentAliasSection::new();
+    let (handler_func_base, before_comp_func, after_comp_func, blocking_comp_func) =
+        emit_func_aliases(
+            &mut aliases,
+            indices,
+            funcs,
+            handler_inst,
+            before_inst,
+            after_inst,
+            blocking_inst,
+        );
+
+    // In the provider-split case the handler's resource types came
+    // from the preamble's aliased types (we emitted `alias outer` for
+    // them inside the handler instance type). They therefore DON'T
+    // appear as SubResource exports on the handler instance, and
+    // aliasing them via InstanceExport would fail. Reuse the
+    // preamble's component-scope indices directly.
+    let mut comp_resource_indices: Vec<u32> = Vec::new();
+    for (vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
+        if let Some(&comp_idx) = outer_aliased.get(vid) {
+            comp_resource_indices.push(comp_idx);
+        } else {
+            let comp_res_idx = indices.alloc_ty();
+            aliases.alias(Alias::InstanceExport {
+                instance: handler_inst,
+                kind: ComponentExportKind::Type,
+                name: export_name,
+            });
+            comp_resource_indices.push(comp_res_idx);
+        }
+    }
+
+    // Compound types (error-code, DNS-error-payload, …) came from
+    // the preamble too; they're not exports on the handler instance,
+    // so reuse those indices for the `comp_aliased_types` map
+    // consumed by section 3c.
+    let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
+    if let InterfaceType::Instance(inst_iface) = iface_ty {
+        for &vid in inst_iface.type_exports.values() {
+            if !matches!(
+                arena.lookup_val(vid),
+                ValueType::Resource(_) | ValueType::AsyncHandle
+            ) {
+                if let Some(&comp_idx) = outer_aliased.get(&vid) {
+                    comp_aliased_types.insert(vid, comp_idx);
+                }
+            }
+        }
+    }
+    component.section(&aliases);
 
     Ok(ImportsOutcome {
         handler_func_base,
@@ -903,6 +945,93 @@ struct DispatchPhaseOutcome {
     dispatch_core_inst: u32,
 }
 
+/// Collect the `env` core instance's exports.
+///
+/// The env instance bridges the outer component's canon-lowered
+/// funcs (produced by [`emit_canon_lower`]) to the inner dispatch
+/// module's imports (declared in [`build_dispatch_module`]). Every
+/// name here must match a matching `imports.import("env", ...)` call
+/// on the dispatch side — see [`super::names`] and `TIER1_*_ENV_SLOTS`
+/// in [`crate::contract`] for the single source of truth for each
+/// string.
+///
+/// Each `Option<u32>` on [`CanonLowerOutcome`] is a "did we produce
+/// this canon-lowered func?" switch; when `None`, the corresponding
+/// slot is omitted from the env (and the dispatch module also didn't
+/// import it). This must-match-on-both-sides contract is why the
+/// construction is extracted: it's the one place where the full list
+/// of env slots is visible alongside the conditions that gate each.
+fn build_env_exports(
+    canon_lower: &CanonLowerOutcome,
+    funcs: &[AdapterFunc],
+    mem_core_mem: u32,
+) -> Vec<(String, ExportKind, u32)> {
+    use crate::contract::{
+        TIER1_AFTER_ENV_SLOTS, TIER1_BEFORE_ENV_SLOTS, TIER1_BLOCKING_ENV_SLOTS,
+    };
+
+    let mut env_exports: Vec<(String, ExportKind, u32)> = Vec::new();
+    env_exports.push((
+        names::ENV_MEMORY.to_string(),
+        ExportKind::Memory,
+        mem_core_mem,
+    ));
+
+    // Middleware hooks (optional per-middleware).
+    if let Some(idx) = canon_lower.core_before_func {
+        env_exports.push((TIER1_BEFORE_ENV_SLOTS[0].to_string(), ExportKind::Func, idx));
+    }
+    if let Some(idx) = canon_lower.core_after_func {
+        env_exports.push((TIER1_AFTER_ENV_SLOTS[0].to_string(), ExportKind::Func, idx));
+    }
+    if let Some(idx) = canon_lower.core_blocking_func {
+        env_exports.push((
+            TIER1_BLOCKING_ENV_SLOTS[0].to_string(),
+            ExportKind::Func,
+            idx,
+        ));
+    }
+
+    // Target interface's handler funcs (one per func, always present).
+    for (i, _) in funcs.iter().enumerate() {
+        env_exports.push((
+            names::env_handler_fn(i),
+            ExportKind::Func,
+            canon_lower.core_handler_func_base + i as u32,
+        ));
+    }
+
+    // Async builtins (waitable/subtask), emitted only when the dispatch
+    // module has any async handler calls or async hook invocations to
+    // await. Same set of Option<u32>s drives what the dispatch module
+    // imported, so the OR-none shape is identical on both sides.
+    if let Some(idx) = canon_lower.core_waitable_new {
+        env_exports.push((names::ENV_WAITABLE_NEW.to_string(), ExportKind::Func, idx));
+    }
+    if let Some(idx) = canon_lower.core_waitable_join {
+        env_exports.push((names::ENV_WAITABLE_JOIN.to_string(), ExportKind::Func, idx));
+    }
+    if let Some(idx) = canon_lower.core_waitable_wait {
+        env_exports.push((names::ENV_WAITABLE_WAIT.to_string(), ExportKind::Func, idx));
+    }
+    if let Some(idx) = canon_lower.core_waitable_drop {
+        env_exports.push((names::ENV_WAITABLE_DROP.to_string(), ExportKind::Func, idx));
+    }
+    if let Some(idx) = canon_lower.core_subtask_drop {
+        env_exports.push((names::ENV_SUBTASK_DROP.to_string(), ExportKind::Func, idx));
+    }
+
+    // task.return funcs — one per async func (None entries are sync
+    // funcs, which don't need task.return).
+    for (i, tr_idx) in canon_lower.core_task_return_funcs.iter().enumerate() {
+        if let Some(idx) = tr_idx {
+            env_exports.push((names::env_task_return_fn(i), ExportKind::Func, *idx));
+        }
+    }
+
+    env_exports
+}
+
 /// Sections 8 + 9. Embed the dispatch core module bytes (built by
 /// [`build_dispatch_module`]) and instantiate it against a synthesized
 /// `env` core instance whose exports are the canon-lowered hook funcs,
@@ -945,64 +1074,7 @@ fn emit_dispatch_phase(
 
         // Core instance 1: env (export items that dispatch imports).
         let env_inst = indices.alloc_core_inst();
-
-        // Names come from `super::names` (splicer-internal slots) and
-        // from `crate::contract` (WIT-derived hook env-slot names).
-        // Both sides of the component/core boundary reference the
-        // same constants, so a rename only has to happen in one
-        // place.
-        use crate::contract::{
-            TIER1_AFTER_ENV_SLOTS, TIER1_BEFORE_ENV_SLOTS, TIER1_BLOCKING_ENV_SLOTS,
-        };
-
-        let mut env_exports: Vec<(String, ExportKind, u32)> = Vec::new();
-        env_exports.push((
-            names::ENV_MEMORY.to_string(),
-            ExportKind::Memory,
-            mem_core_mem,
-        ));
-        if let Some(idx) = canon_lower.core_before_func {
-            env_exports.push((TIER1_BEFORE_ENV_SLOTS[0].to_string(), ExportKind::Func, idx));
-        }
-        if let Some(idx) = canon_lower.core_after_func {
-            env_exports.push((TIER1_AFTER_ENV_SLOTS[0].to_string(), ExportKind::Func, idx));
-        }
-        if let Some(idx) = canon_lower.core_blocking_func {
-            env_exports.push((
-                TIER1_BLOCKING_ENV_SLOTS[0].to_string(),
-                ExportKind::Func,
-                idx,
-            ));
-        }
-        for (i, _) in funcs.iter().enumerate() {
-            env_exports.push((
-                names::env_handler_fn(i),
-                ExportKind::Func,
-                canon_lower.core_handler_func_base + i as u32,
-            ));
-        }
-        // Async builtins.
-        if let Some(idx) = canon_lower.core_waitable_new {
-            env_exports.push((names::ENV_WAITABLE_NEW.to_string(), ExportKind::Func, idx));
-        }
-        if let Some(idx) = canon_lower.core_waitable_join {
-            env_exports.push((names::ENV_WAITABLE_JOIN.to_string(), ExportKind::Func, idx));
-        }
-        if let Some(idx) = canon_lower.core_waitable_wait {
-            env_exports.push((names::ENV_WAITABLE_WAIT.to_string(), ExportKind::Func, idx));
-        }
-        if let Some(idx) = canon_lower.core_waitable_drop {
-            env_exports.push((names::ENV_WAITABLE_DROP.to_string(), ExportKind::Func, idx));
-        }
-        if let Some(idx) = canon_lower.core_subtask_drop {
-            env_exports.push((names::ENV_SUBTASK_DROP.to_string(), ExportKind::Func, idx));
-        }
-        for (i, tr_idx) in canon_lower.core_task_return_funcs.iter().enumerate() {
-            if let Some(idx) = tr_idx {
-                env_exports.push((names::env_task_return_fn(i), ExportKind::Func, *idx));
-            }
-        }
-
+        let env_exports = build_env_exports(canon_lower, funcs, mem_core_mem);
         instances.export_items(
             env_exports
                 .iter()
@@ -1363,7 +1435,7 @@ pub(super) fn build_adapter_bytes(
         inst_ctx,
         comp_resource_indices,
         comp_aliased_types,
-    } = emit_imports_from_consumer_split(
+    } = emit_imports_from_split(
         &mut component,
         target_interface,
         funcs,
