@@ -90,11 +90,10 @@ use wasmparser::{
 use super::section_filter::HandlerDeps;
 
 /// Filtered and reindexed type/import/alias section bytes ready to be
-/// injected into an adapter component.
-///
-/// Mirrors the shape of [`crate::adapter::split_imports::SplitImports`]
-/// so the adapter consumer can swap between the verbatim-copy path and
-/// this filtered path with minimal code changes.
+/// injected into an adapter component. This is the full input the
+/// adapter builder (`component::build_adapter_bytes`) needs to stamp
+/// out a preamble identical to the split's for the target interface
+/// closure.
 #[derive(Debug)]
 pub(crate) struct FilteredSections {
     /// `(section_kind, content_bytes)` pairs in source order.

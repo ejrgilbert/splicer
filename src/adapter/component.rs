@@ -46,8 +46,8 @@ use wasm_encoder::{
 
 use super::dispatch::{build_dispatch_module, build_mem_module};
 use super::encoders::{encode_comp_cv, InstTypeCtx};
+use super::filter::FilteredSections;
 use super::func::AdapterFunc;
-use super::split_imports::SplitImports;
 use super::ty::type_has_resources;
 
 // ─── Section-emit helpers ──────────────────────────────────────────────────
@@ -289,7 +289,7 @@ fn emit_imports_from_consumer_split(
     has_blocking: bool,
     arena: &TypeArena,
     iface_ty: &InterfaceType,
-    split: &SplitImports,
+    split: &FilteredSections,
 ) -> anyhow::Result<ImportsOutcome> {
     // Strategy-internal counters: we start by claiming the index space the
     // raw sections we just copied already consumed.
@@ -1225,7 +1225,7 @@ fn emit_export_phase(
     target_interface: &str,
     funcs: &[AdapterFunc],
     iface_ty: &InterfaceType,
-    split: &SplitImports,
+    split: &FilteredSections,
     inst_ctx: &InstTypeCtx,
     comp_resource_indices: &[u32],
     comp_aliased_types: &HashMap<ValueTypeId, u32>,
@@ -1449,7 +1449,7 @@ pub(super) fn build_adapter_bytes(
     has_blocking: bool,
     arena: &TypeArena,
     iface_ty: &InterfaceType,
-    split: &SplitImports,
+    split: &FilteredSections,
 ) -> anyhow::Result<Vec<u8>> {
     // Per-function: does any param/result require Memory+UTF8?
     // Uses deep string check (traverses compound types).

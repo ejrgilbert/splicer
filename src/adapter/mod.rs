@@ -11,11 +11,10 @@
 //!   and instance-level type sections.
 //! - [`filter`] — closure-based dependency walker + raw-sections
 //!   re-encoder that scopes the split's import preamble to exactly the
-//!   sections the target interface transitively depends on.
+//!   sections the target interface transitively depends on; produces
+//!   the [`filter::FilteredSections`] that the adapter builder consumes.
 //! - [`func`] — the [`AdapterFunc`] value object and the cviz →
 //!   `Vec<AdapterFunc>` extraction.
-//! - [`split_imports`] — the [`SplitImports`] wrapper that carries the
-//!   filtered sections + metadata the adapter builder consumes.
 //! - [`ty`] — canonical-ABI type analysis helpers (flattening,
 //!   alignment, resource collection).
 
@@ -27,14 +26,12 @@ mod dispatch;
 mod encoders;
 mod filter;
 mod func;
-mod split_imports;
 #[cfg(test)]
 mod tests;
 mod ty;
 use component::build_adapter_bytes;
 use filter::{extract_filtered_sections, find_handler_deps};
 use func::extract_adapter_funcs;
-use split_imports::SplitImports;
 
 /// Generate a tier-1 adapter component that wraps `middleware_name` and adapts it to
 /// export `target_interface`.
@@ -99,7 +96,7 @@ pub fn generate_tier1_adapter(
     }
     let bytes = std::fs::read(split_path)
         .with_context(|| format!("Failed to read split at '{split_path}'"))?;
-    let split_imports = SplitImports::from(extract_filtered_sections(&bytes, &deps)?);
+    let split = extract_filtered_sections(&bytes, &deps)?;
 
     let bytes = build_adapter_bytes(
         target_interface,
@@ -109,7 +106,7 @@ pub fn generate_tier1_adapter(
         has_blocking,
         arena,
         iface_ty,
-        &split_imports,
+        &split,
     )?;
 
     let out_path = format!(
