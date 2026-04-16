@@ -26,7 +26,7 @@ fn validate_component(bytes: &[u8]) {
 /// when rendering function parameter / result types in the synth split.
 /// Panics on anything non-primitive — the synth split generator
 /// expects the resource-handler case to go through the hardcoded WAT
-/// template in [`synth_consumer_split`].
+/// template in [`synth_split`].
 fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
     match arena.lookup_val(id) {
         ValueType::S32 => "s32".into(),
@@ -49,35 +49,45 @@ fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
     }
 }
 
-/// Build a minimal consumer-split component that imports `target` as an
-/// instance. Written as WAT and parsed with `wat::parse_str` — easier
-/// to audit than wasm_encoder for a fixture whose shape we want to
-/// match the convention a real production consumer split uses.
-///
-/// Two shapes supported:
-///
-/// - **Primitives-only** (no `type_exports`): every function's params
-///   and result are primitives/strings, so the instance type body is a
-///   straight `(func …)` + `(export "name" (func (type …)))` listing.
-/// - **wasi:http/handler-shape** (the only non-primitive shape used by
-///   the tests): hardcoded WAT that mirrors `service_a.comp.wasm`'s
-///   handler import — a separate `wasi:http/types`-style instance
-///   import provides request / response / error-code, the handler
-///   instance type aliases-outer them and re-exports via `(type (eq))`.
-fn synth_consumer_split(
+/// Which shape of split to synthesize. The two code paths through
+/// [`super::component::emit_imports_from_consumer_split`] — `handler_in_split`
+/// true vs false — are exercised by whether the target interface
+/// appears as an import or an export in the split, so we test both.
+#[derive(Clone, Copy)]
+enum SplitKind {
+    /// The split imports the target interface (middleware-style).
+    /// Exercises the `handler_in_split = true` path: the adapter
+    /// copies the handler import + types verbatim and aliases its
+    /// exports.
+    Consumer,
+    /// The split exports the target interface (outermost-provider
+    /// style). Exercises the `handler_in_split = false` path: the
+    /// closure walker finds the target as an export, the adapter
+    /// builds a fresh handler import type on top of the preamble's
+    /// aliased types.
+    Provider,
+}
+
+/// Build a minimal split component for the given `kind`. Written as
+/// WAT and parsed with `wat::parse_str` — easier to audit than
+/// wasm_encoder for a fixture whose shape we want to match the
+/// convention a real production split uses.
+fn synth_split(
     target: &str,
     iface: &InterfaceType,
     arena: &TypeArena,
+    kind: SplitKind,
 ) -> tempfile::NamedTempFile {
     let iface_inst = match iface {
         InterfaceType::Instance(i) => i,
-        _ => panic!("synth_consumer_split: bare function interfaces not supported"),
+        _ => panic!("synth_split: bare function interfaces not supported"),
     };
 
-    let wat = if iface_inst.type_exports.is_empty() {
-        wat_primitive_only(target, iface_inst, arena)
-    } else {
-        wat_http_handler_shape(target)
+    let wat = match (kind, iface_inst.type_exports.is_empty()) {
+        (SplitKind::Consumer, true) => wat_consumer_primitive_only(target, iface_inst, arena),
+        (SplitKind::Consumer, false) => wat_consumer_http_handler_shape(target),
+        (SplitKind::Provider, true) => wat_provider_primitive_only(target, iface_inst, arena),
+        (SplitKind::Provider, false) => wat_provider_http_handler_shape(target),
     };
 
     let bytes = wat::parse_str(&wat).unwrap_or_else(|e| {
@@ -88,7 +98,7 @@ fn synth_consumer_split(
     tmp
 }
 
-fn wat_primitive_only(target: &str, iface: &InstanceInterface, arena: &TypeArena) -> String {
+fn wat_consumer_primitive_only(target: &str, iface: &InstanceInterface, arena: &TypeArena) -> String {
     let mut body = String::new();
     let mut func_type_for: Vec<(String, u32)> = Vec::new();
 
@@ -125,7 +135,7 @@ fn wat_primitive_only(target: &str, iface: &InstanceInterface, arena: &TypeArena
 /// real handler import structure: a types instance with request /
 /// response resources + the error-code variant, then a handler
 /// instance type that `alias outer`s each and re-exports via `eq`.
-fn wat_http_handler_shape(target: &str) -> String {
+fn wat_consumer_http_handler_shape(target: &str) -> String {
     // Note: when the types instance is used as an IMPORT, each compound
     // type referenced by a variant case payload must be surfaced as an
     // `(export "name" (type (eq N)))` first — the component-model
@@ -174,11 +184,131 @@ fn wat_http_handler_shape(target: &str) -> String {
     )
 }
 
+/// WAT for a provider split that **exports** the target interface with
+/// a trivial primitive signature. Exercises the `handler_in_split = false`
+/// path in [`super::component::emit_imports_from_consumer_split`].
+///
+/// Restricted to a single sync function of shape
+/// `(param s32 s32) (result s32)` — richer provider shapes are covered
+/// by the integration tests under `tests/component-interposition`. The
+/// body is a minimal `i32.add` core module; the implementation only has
+/// to type-check for the split to parse and the closure walker to find
+/// the target as an export.
+fn wat_provider_primitive_only(
+    target: &str,
+    iface: &InstanceInterface,
+    arena: &TypeArena,
+) -> String {
+    assert_eq!(
+        iface.functions.len(),
+        1,
+        "provider primitive helper: single-function ifaces only"
+    );
+    let (name, sig) = iface.functions.iter().next().unwrap();
+    assert!(!sig.is_async, "provider primitive helper: sync funcs only");
+    assert_eq!(
+        sig.params.len(),
+        2,
+        "provider primitive helper: 2-param funcs only"
+    );
+    assert!(
+        sig.params
+            .iter()
+            .all(|&p| matches!(arena.lookup_val(p), ValueType::S32)),
+        "provider primitive helper: s32 params only"
+    );
+    assert_eq!(sig.results.len(), 1);
+    assert!(
+        matches!(arena.lookup_val(sig.results[0]), ValueType::S32),
+        "provider primitive helper: s32 result only"
+    );
+
+    let pa = &sig.param_names[0];
+    let pb = &sig.param_names[1];
+    format!(
+        r#"(component
+  (core module (;0;)
+    (func (export "{name}") (param i32 i32) (result i32)
+      local.get 0
+      local.get 1
+      i32.add))
+  (core instance (;0;) (instantiate 0))
+  (alias core export 0 "{name}" (core func (;0;)))
+  (type (;0;) (func (param "{pa}" s32) (param "{pb}" s32) (result s32)))
+  (func (;0;) (type 0) (canon lift (core func 0)))
+  (instance (;0;) (export "{name}" (func 0)))
+  (export "{target}" (instance 0))
+)
+"#
+    )
+}
+
+/// WAT for a provider split that **exports** an HTTP-handler-shape
+/// interface. Mirrors [`wat_consumer_http_handler_shape`]'s preamble
+/// (types instance with request/response resources + the error-code
+/// variant, aliased at component scope, and a handler instance type
+/// that references them via `alias outer`) but flips the handler from
+/// import to export.
+///
+/// To avoid hand-rolling an async canon lift + realloc for
+/// `result<own<response>, error-code>`, the provider re-exports an
+/// imported instance from a neighbor interface. The adapter's closure
+/// walker seeds BFS from the export and pulls the same preamble a real
+/// provider component would carry. The neighbor import has a
+/// non-target name, so `handler_in_split` stays false and the
+/// `emit_imports_from_consumer_split` provider branch runs.
+fn wat_provider_http_handler_shape(target: &str) -> String {
+    format!(
+        r#"(component
+  (type (;0;) (instance
+    (export "request" (type (sub resource)))
+    (export "response" (type (sub resource)))
+    (type (option string))
+    (type (option u16))
+    (type (record (field "rcode" 2) (field "info-code" 3)))
+    (export "DNS-error-payload" (type (eq 4)))
+    (type (variant
+      (case "DNS-timeout")
+      (case "DNS-error" 5)
+      (case "connection-refused")
+      (case "internal-error" 2)))
+    (export "error-code" (type (eq 6)))
+  ))
+  (import "synth:test/types" (instance (;0;) (type 0)))
+  (alias export 0 "request" (type (;1;)))
+  (alias export 0 "response" (type (;2;)))
+  (alias export 0 "error-code" (type (;3;)))
+  (type (;4;) (instance
+    (alias outer 1 1 (type (;0;)))
+    (export "request" (type (eq 0)))
+    (alias outer 1 2 (type (;2;)))
+    (export "response" (type (eq 2)))
+    (alias outer 1 3 (type (;4;)))
+    (export "error-code" (type (eq 4)))
+    (type (;6;) (own 1))
+    (type (;7;) (own 3))
+    (type (;8;) (result 7 (error 5)))
+    (type (;9;) (func async (param "request" 6) (result 8)))
+    (export "handle" (func (type 9)))
+  ))
+  (import "impl:test/handler" (instance (;1;) (type 4)))
+  (export "{target}" (instance 1))
+)
+"#
+    )
+}
+
 /// Helper: generate an adapter and return the raw bytes.
-fn gen_adapter(target: &str, hooks: &[&str], iface: &InterfaceType, arena: &TypeArena) -> Vec<u8> {
+fn gen_adapter(
+    target: &str,
+    hooks: &[&str],
+    iface: &InterfaceType,
+    arena: &TypeArena,
+    kind: SplitKind,
+) -> Vec<u8> {
     let tmp = tempfile::tempdir().unwrap();
     let hook_strings: Vec<String> = hooks.iter().map(|s| s.to_string()).collect();
-    let split = synth_consumer_split(target, iface, arena);
+    let split = synth_split(target, iface, arena, kind);
     let split_path = split.path().to_str().expect("tempfile path utf-8");
     let path = generate_tier1_adapter(
         "test-mdl",
@@ -229,6 +359,7 @@ fn test_adapter_sync_primitives() {
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -245,6 +376,7 @@ fn test_adapter_sync_string_return() {
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -264,6 +396,7 @@ fn test_adapter_sync_string_roundtrip() {
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -280,6 +413,7 @@ fn test_adapter_async_string_return() {
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -296,17 +430,19 @@ fn test_adapter_async_void_string() {
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
 
-// ── Tier 1: async with resource types (HTTP handler pattern) ─────────
-
-#[test]
-fn test_adapter_resource_handler() {
-    let mut arena = TypeArena::default();
-
-    // Build the error-code variant (simplified)
+/// Build an HTTP-handler-shape interface matching the WAT emitted by
+/// [`wat_consumer_http_handler_shape`] / [`wat_provider_http_handler_shape`]:
+/// `request` and `response` resources, an `error-code` variant (with a
+/// DNS-error-payload record case), and an async
+/// `handle(request) -> result<response, error-code>`. Shared by the
+/// consumer- and provider-side resource-handler tests so both exercise
+/// the exact same type graph.
+fn build_http_handler_iface(arena: &mut TypeArena) -> InterfaceType {
     let string_id = arena.intern_val(ValueType::String);
     let opt_string = arena.intern_val(ValueType::Option(string_id));
     let u16_id = arena.intern_val(ValueType::U16);
@@ -330,20 +466,28 @@ fn test_adapter_resource_handler() {
     });
 
     let func = sig(true, &["request"], vec![request], vec![result_ty]);
-    let iface = InterfaceType::Instance(InstanceInterface {
+    InterfaceType::Instance(InstanceInterface {
         functions: BTreeMap::from([("handle".to_string(), func)]),
         type_exports: BTreeMap::from([
             ("request".to_string(), request),
             ("response".to_string(), response),
             ("error-code".to_string(), error_code),
         ]),
-    });
+    })
+}
 
+// ── Tier 1: async with resource types (HTTP handler pattern) ─────────
+
+#[test]
+fn test_adapter_resource_handler() {
+    let mut arena = TypeArena::default();
+    let iface = build_http_handler_iface(&mut arena);
     let bytes = gen_adapter(
         "wasi:http/handler@0.3.0-rc-2026-01-06",
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -365,6 +509,7 @@ fn test_adapter_multi_func() {
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -381,6 +526,7 @@ fn test_adapter_before_only() {
         &["splicer:tier1/before"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -397,6 +543,7 @@ fn test_adapter_after_only() {
         &["splicer:tier1/after"],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -417,6 +564,7 @@ fn test_adapter_blocking() {
         ],
         &iface,
         &arena,
+        SplitKind::Consumer,
     );
     validate_component(&bytes);
 }
@@ -431,6 +579,58 @@ fn test_adapter_no_hooks() {
         "add",
         sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
     )]);
-    let bytes = gen_adapter("test:pkg/adder@1.0.0", &[], &iface, &arena);
+    let bytes = gen_adapter("test:pkg/adder@1.0.0", &[], &iface, &arena, SplitKind::Consumer);
+    validate_component(&bytes);
+}
+
+// ── Tier 1: provider split (handler exported, not imported) ──────────
+
+/// Exercises the `!handler_in_split` branch of
+/// [`super::component::emit_imports_from_consumer_split`] with an
+/// empty preamble: the split *exports* the target interface instead of
+/// importing it, so the adapter builds a fresh handler import type
+/// rather than copying the one from the split's raw sections. For a
+/// primitive-only interface the preamble is empty, so `outer_aliased`
+/// stays empty and the adapter's import type contains only the handler
+/// func signature.
+#[test]
+fn test_adapter_provider_split_primitive() {
+    let mut arena = TypeArena::default();
+    let s32 = arena.intern_val(ValueType::S32);
+    let iface = make_iface(vec![(
+        "add",
+        sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/adder@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Provider,
+    );
+    validate_component(&bytes);
+}
+
+/// Exercises the `!handler_in_split` branch with a populated preamble:
+/// the provider split exports an HTTP-handler-shape interface whose
+/// resource types (`request`, `response`) and compound type
+/// (`error-code` variant) are aliased at component scope. The adapter
+/// must route those aliased types through `outer_aliased` into the
+/// fresh handler import type's body via `alias outer`, and reuse the
+/// preamble's component-scope indices for the dispatch phase rather
+/// than aliasing them off the handler instance (which wouldn't work —
+/// the resources came from the preamble, not from the handler
+/// instance's SubResource exports).
+#[test]
+fn test_adapter_provider_split_resource_handler() {
+    let mut arena = TypeArena::default();
+    let iface = build_http_handler_iface(&mut arena);
+    let bytes = gen_adapter(
+        "wasi:http/handler@0.3.0-rc-2026-01-06",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Provider,
+    );
     validate_component(&bytes);
 }
