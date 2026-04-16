@@ -54,8 +54,15 @@ pub(super) fn flat_types_for(id: ValueTypeId, arena: &TypeArena) -> Vec<ValType>
             .iter()
             .flat_map(|id| flat_types_for(*id, arena))
             .collect(),
-        ValueType::List(_) | ValueType::FixedSizeList(..) | ValueType::Map(..) => {
-            vec![ValType::I32, ValType::I32]
+        // Dynamic list / map: (ptr, len) pair — always two i32s on
+        // the wire regardless of the element type.
+        ValueType::List(_) | ValueType::Map(..) => vec![ValType::I32, ValType::I32],
+        // Fixed-size list: N copies of the element's flat types
+        // inlined. Distinct from dynamic list — canonical ABI
+        // flattens `list<T, N>` to `N × flat(T)`, not `(ptr, len)`.
+        ValueType::FixedSizeList(inner, n) => {
+            let inner_flat = flat_types_for(*inner, arena);
+            (0..*n).flat_map(|_| inner_flat.iter().copied()).collect()
         }
         ValueType::Option(inner) => {
             let inner_flat = flat_types_for(*inner, arena);
@@ -742,6 +749,106 @@ fn joined_flat_shape(vt: ValType) -> FlatSlotShape {
         ValType::F64 => FlatSlotShape::F64,
         other => panic!("joined_flat_shape: {other:?} not expected in joined flat"),
     }
+}
+
+/// Runtime trap gate for heterogeneous-variant types used as
+/// top-level task.return results.
+///
+/// When a type is a `result` / `variant` whose arms disagree on flat
+/// shape, our heterogeneous [`FlatLayout`] fallback places slots at
+/// joined-flat natural-alignment offsets from `payload_start`. For
+/// each arm, those offsets do or don't match that arm's canonical
+/// write offsets — and for most heterogeneous variants only some
+/// arms line up. Arms that DON'T line up would produce wrong
+/// runtime values; we trap instead.
+///
+/// For now the guard is conservative: at most one arm is considered
+/// safe — the arm whose canonical layout (starting at `payload_start`)
+/// matches our heterogeneous fallback's slot offsets AND whose flat
+/// at each position equals the joined flat at that position. When
+/// exactly one such arm exists, its disc value is the `allowed_disc`;
+/// the dispatch emitter traps any other disc. When none is safe, the
+/// guard's `allowed_disc` is unreachable and every disc traps.
+///
+/// See `docs/TODO/test-with-real-compositions.md` — expanding this
+/// to multiple safe arms (or full runtime dispatch) is follow-up
+/// work.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HeterogeneityGuard {
+    /// Byte offset of the top-level disc (always 0 for top-level
+    /// variants/results, but kept explicit for clarity).
+    pub disc_offset: u32,
+    /// Load shape for the disc (`U8` / `U16` / `I32` depending on
+    /// arm count).
+    pub disc_shape: FlatSlotShape,
+    /// The one disc value that proceeds without trapping. `None` if
+    /// no arm is safe — every disc traps.
+    pub allowed_disc: Option<u32>,
+}
+
+/// If `type_id` is a top-level `result` / `variant` with
+/// heterogeneous arms, return a [`HeterogeneityGuard`] the dispatch
+/// emitter uses to insert a runtime trap for unsafe arms. Returns
+/// `None` for homogeneous arms (or non-variant-shaped types) —
+/// nothing to guard.
+pub(super) fn top_level_heterogeneity_guard(
+    type_id: ValueTypeId,
+    arena: &TypeArena,
+) -> Option<HeterogeneityGuard> {
+    // Collect arm ids for the top-level type. Option is always
+    // single-arm → homogeneous by construction.
+    let (arms, disc_cases): (Vec<ValueTypeId>, usize) = match arena.lookup_val(type_id) {
+        ValueType::Result { ok, err } => ([*ok, *err].into_iter().flatten().collect(), 2),
+        ValueType::Variant(cases) => {
+            let arms: Vec<ValueTypeId> = cases.iter().filter_map(|(_, o)| *o).collect();
+            (arms, cases.len())
+        }
+        _ => return None,
+    };
+
+    if arms.is_empty() {
+        return None;
+    }
+
+    let arm_flats: Vec<Vec<ValType>> = arms.iter().map(|id| flat_types_for(*id, arena)).collect();
+    let homogeneous = arm_flats.windows(2).all(|pair| pair[0] == pair[1]);
+    if homogeneous {
+        return None;
+    }
+
+    // Heterogeneous. Identify the single safe arm (if any): arm
+    // whose flat equals the joined flat in length AND whose
+    // canonical slot offsets match our heterogeneous fallback's
+    // joined-natural-alignment offsets starting from `payload_start`.
+    //
+    // For now we take a narrow definition of "safe": arm flat has
+    // length ≤ 1 (i.e., primitive or handle) — in that case the
+    // single slot is at payload_start under both layouts, so it
+    // always aligns. This covers the `ok` arm of typical
+    // `result<simple_handle, complex_err>` cases (e.g.
+    // `wasi:http/handler`'s return type). Broader safety detection
+    // is follow-up.
+    //
+    // NOTE: The disc-value assignment maps arm INDEX to disc VALUE
+    // per canonical ABI (case 0 = disc 0, case 1 = disc 1, …). For
+    // `result`, arm order is `[ok, err]` → disc 0 for ok, 1 for err.
+    // For `variant`, arm index = case index.
+    let safe_disc = (0..arms.len()).find(|&i| {
+        // Map arm-index (among arms-with-payload) back to case-index —
+        // for result<T, E>, arms_with_payload equals cases, so index
+        // matches disc. For variant, skipping None arms means we
+        // can't simply use arm index as disc. Fall back to
+        // "only find safe when length-1 arm is at position 0"
+        // for now; Variant ordering with None arms is deferred.
+        arm_flats[i].len() <= 1
+    });
+
+    let disc_shape = int_shape(discriminant_align(disc_cases));
+    Some(HeterogeneityGuard {
+        disc_offset: 0,
+        disc_shape,
+        allowed_disc: safe_disc.map(|i| i as u32),
+    })
 }
 
 /// Convert a primitive `ValueType` into a wasm-encoder

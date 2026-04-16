@@ -43,6 +43,9 @@ fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
         ValueType::Char => "char".into(),
         ValueType::String => "string".into(),
         ValueType::List(inner) => format!("(list {})", wat_type(*inner, arena)),
+        ValueType::FixedSizeList(inner, n) => {
+            format!("(list {} {n})", wat_type(*inner, arena))
+        }
         ValueType::Option(inner) => format!("(option {})", wat_type(*inner, arena)),
         ValueType::Result { ok, err } => {
             let ok_str = ok.map(|id| wat_type(id, arena));
@@ -582,6 +585,27 @@ fn test_adapter_list_result_sync() {
     )]);
     let bytes = gen_adapter(
         "test:pkg/ranger@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Fixed-size-list param — exercises the `list<T, N>` encoders at
+/// both `InstTypeCtx::encode_cv` and `encode_comp_cv`, plus the
+/// `N × flat(T)` flattening in `flat_types_for`. Before the fix,
+/// both sites silently emitted dynamic `list<T>` (dropping `N`) and
+/// the flat shape was `(ptr, len)` instead of the inlined repeats.
+#[test]
+fn test_adapter_fixed_size_list_param_sync() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let fsl = arena.intern_val(ValueType::FixedSizeList(u32_id, 4));
+    let iface = make_iface(vec![("take", sig(false, &["buf"], vec![fsl], vec![]))]);
+    let bytes = gen_adapter(
+        "test:pkg/taker@1.0.0",
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,

@@ -242,10 +242,10 @@ impl InstTypeCtx {
                 idx
             }
 
-            ValueType::FixedSizeList(inner_id, _n) => {
+            ValueType::FixedSizeList(inner_id, n) => {
                 let inner_cv = self.encode_cv(inner_id, inst, arena)?;
                 let idx = inst.type_count();
-                inst.ty().defined_type().list(inner_cv);
+                inst.ty().defined_type().fixed_length_list(inner_cv, n);
                 idx
             }
 
@@ -454,7 +454,7 @@ pub(super) fn encode_comp_cv(
             comp_cache.insert(id, idx);
             Ok(ComponentValType::Type(idx))
         }
-        ValueType::FixedSizeList(inner_id, _n) => {
+        ValueType::FixedSizeList(inner_id, n) => {
             let inner_cv = encode_comp_cv(
                 inner_id,
                 arena,
@@ -465,7 +465,7 @@ pub(super) fn encode_comp_cv(
             )?;
             let idx = *comp_type_count;
             *comp_type_count += 1;
-            comp_types.defined_type().list(inner_cv);
+            comp_types.defined_type().fixed_length_list(inner_cv, n);
             comp_cache.insert(id, idx);
             Ok(ComponentValType::Type(idx))
         }

@@ -140,12 +140,51 @@ fn emit_load_slot(f: &mut Function, slot: &super::ty::FlatSlot) {
 /// Emit Wasm instructions that load every flat slot of a value from
 /// `result_ptr` and push the values onto the stack (for
 /// `task.return`). One `(I32Const result_ptr) + load` pair per slot.
+///
+/// For heterogeneous top-level `result` / `variant` results, a
+/// runtime trap gate is emitted first: load the disc and trap
+/// (`unreachable`) when it doesn't match the one safe arm. Arms
+/// whose canonical layout matches our heterogeneous-fallback offsets
+/// proceed; others fail loud at runtime instead of producing
+/// silently-wrong values. See
+/// [`super::ty::top_level_heterogeneity_guard`].
 fn emit_task_return_loads(
     f: &mut Function,
     result_ptr: u32,
     result_type_id: ValueTypeId,
     arena: &TypeArena,
 ) {
+    // Heterogeneous-variant trap gate (if applicable).
+    if let Some(guard) = super::ty::top_level_heterogeneity_guard(result_type_id, arena) {
+        // Load the disc and branch:
+        //   disc != allowed → unreachable
+        //   disc == allowed → fall through to slot loads
+        //
+        // When no arm is safe, `allowed_disc` is None; we emit an
+        // unconditional trap (no disc compare needed).
+        match guard.allowed_disc {
+            Some(allowed) => {
+                let disc_slot = super::ty::FlatSlot {
+                    byte_offset: result_ptr + guard.disc_offset,
+                    shape: guard.disc_shape,
+                };
+                f.instruction(&Instruction::I32Const(0));
+                emit_load_slot(f, &disc_slot);
+                f.instruction(&Instruction::I32Const(allowed as i32));
+                f.instruction(&Instruction::I32Ne);
+                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+            }
+            None => {
+                // No safe arm — any disc traps. Emit unconditional
+                // `unreachable`; the dead code after it is never
+                // reached but the type-section still type-checks.
+                f.instruction(&Instruction::Unreachable);
+            }
+        }
+    }
+
     let layout = FlatLayout::new(result_type_id, arena);
     for slot in &layout.slots {
         f.instruction(&Instruction::I32Const(result_ptr as i32));
