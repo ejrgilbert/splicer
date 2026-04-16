@@ -237,3 +237,239 @@ include-list is a solution looking for a problem.
   well-defined at config time and a bounded list is unambiguous.
 - Interaction with tier-2 / tier-3 (where filtering also affects
   whether we need to lift/lower payloads) — spec this then.
+
+## Audit follow-ups (tier-1 cleanup stack)
+
+Pulled from a structural code audit of `src/adapter/`. These are
+concrete items the module would benefit from, ranked by leverage.
+
+### Correctness (latent bugs, fix before they bite)
+
+All of these are real issues that have never surfaced because the
+test suite exercises wasi:http/handler-shaped interfaces and closely
+related primitive shapes. They'd all bite the first time someone
+points splicer at a different interface shape.
+
+- [x] **Exhaustive matches on `ValueType`; silent-resource `bail!`.**
+  _Landed._ Two compile-time / immediate-error wins that don't add
+  maintenance burden for the correctness items below:
+
+  **(a) Exhaustive matches on `ValueType`.** Three sites had
+  `_ => false` or `_ => build_sequential_layout(...)` wildcard arms
+  that would silently swallow a new `ValueType` variant if cviz ever
+  grew one: `type_has_strings` and `type_has_resources` at
+  `src/adapter/ty.rs:112` / `:154`, and `FlatLayout::new` at
+  `src/adapter/ty.rs:343`. All three are now explicit per-variant
+  matches — a new cviz variant will force an explicit decision at
+  compile time.
+
+  **(b) Silent `Primitive(U32)` resource fallback → `bail!`.**
+  `encode_comp_cv` at `src/adapter/encoders.rs:313` used to fall back
+  to `Primitive(U32)` when a resource's `ValueTypeId` wasn't
+  registered in `comp_own_by_vid`, silently losing the `own<T>`
+  typing. Now it bails with `"internal error: resource {id:?} not
+  registered in comp_own_by_vid — the handler-import phase must
+  declare every resource before encode_comp_cv references it"`. All
+  existing tests pass, confirming the fallback was unreachable today
+  — but the error now surfaces immediately if registration ever
+  drifts out of sync with the encoder.
+
+  **What was considered and dropped:** an upfront
+  `validate_iface_supported` pre-pass. Each correctness item below
+  is going to add its own proper handling (or explicit `bail!`) at
+  the fix site; a pre-pass duplicates those errors and becomes stale
+  work — every accepted shape has to be un-rejected in two places.
+  The exhaustive matches above give the same compile-time safety
+  without the maintenance shadow.
+
+### Remaining silent-fallback audit (handle at the fix site)
+
+The fail-closed pass above covered `ValueType` matches and the
+resource registration. Several other silent fallbacks remain in the
+filter / reencoder / wac — they don't affect correctness under
+today's test fixtures, but an upstream change (wasmparser / wirm
+adding a new enum variant) could silently drop tracked items. Fix
+each at its site, not via a pre-pass:
+
+- `src/adapter/filter/section_filter.rs:253` — `ItemKind → ItemSpace::Other`
+- `src/adapter/filter/section_filter.rs:340` — `Space → None` in `lookup_loc`
+- `src/adapter/filter/raw_sections_reencoder.rs:414` — export kind
+  count bump (`Func`/`Module`/`Component`/`Value` ignored; comment
+  flags this as "room to grow")
+- `src/adapter/filter/raw_sections_reencoder.rs:671, 675` —
+  `ComponentExternalKind` / `ComponentOuterAliasKind` →
+  `AliasSpaceKind::Other`
+- `src/adapter/filter/raw_sections_reencoder.rs:434, 444, 462, 470` —
+  `self.type_map.get(&ty).copied().unwrap_or(ty)` falls back to the
+  *original* index if the lookup misses. The comment says downstream
+  wasm validation will catch misuse, but a stale-but-valid index
+  could still type-check and silently reference the wrong thing. Fix
+  by changing `unwrap_or(ty)` to
+  `.ok_or_else(|| anyhow!("type {ty} expected in filtered map but
+  missing — closure walker bug"))`.
+- `src/wac.rs:192` — `InternedId → None` fallback when looking up
+  export types (minor).
+- `src/adapter/dispatch.rs:464` — `core_results[0] → void_i32_ty`
+  fallback. Currently unreachable (flat_types_for only produces
+  I32/I64/F32/F64) but worth making exhaustive for future-proofing.
+
+- [ ] **`FlatLayout::new` only handles `Result<T, E>`; `Option` /
+  `Variant` / `Enum` fall through to `build_sequential_layout` and
+  silently mis-compute memory offsets.** (`src/adapter/ty.rs` lines
+  343–351.) The canonical ABI stores a variant-shaped type as a
+  subword discriminant (1 byte for ≤256 cases, 2 bytes for ≤65_536,
+  4 bytes above that) followed by the payload at
+  `align_to(discriminant_size, payload_align)`. `build_sequential_layout`
+  instead uses the flat-widened `[I32, ...payload_flat]`, placing the
+  payload at offset 4 unconditionally. Matches the canonical layout
+  when `align(payload) ≥ 4` (common case — `Option<u32>`,
+  `Option<u64>`, most records) and is why wasi:http/handler's
+  `result<own<response>, error-code>` works today even without going
+  through `build_result_layout`. Breaks for: `Option<u8>` /
+  `Option<u16>` (payload at offset 1 or 2, not 4); `Variant` / `Enum`
+  with small payloads or bool fields; any `Variant` with >256 cases
+  (multi-byte discriminant). **Fix**: generalize `build_result_layout`
+  into `build_discriminated_layout(disc_byte_size, payload_align,
+  payload_flat_types)` and dispatch `FlatLayout::new` on the arena
+  value-type for `Result` / `Option` / `Variant` / `Enum`;
+  `build_sequential_layout` stays but only for truly sequential
+  types (record, tuple, string, list, primitives). Add tests with
+  `Option<u8>` and a small-payload variant as top-level async
+  results — both should currently fail at the i32.load offset.
+
+- [ ] **`FixedSizeList(T, N)` silently encoded as dynamic `list<T>`;
+  element count `N` discarded.** (`src/adapter/encoders.rs` lines
+  246–251 in `InstTypeCtx::encode_cv` and lines 447–461 in
+  `encode_comp_cv`.) Both sites call `defined_type().list(inner_cv)`,
+  dropping `N`. wasm-encoder has `defined_type().fixed_size_list(cv,
+  elements)` — it's simply not being used. The generated adapter's
+  interface type claims `list<T>` where the real interface has
+  `list<T, N>`, producing a type mismatch at composition time against
+  any real provider/consumer that uses fixed-size lists. **Fix**:
+  match on `ValueType::FixedSizeList(inner, n)` and call
+  `fixed_size_list(inner_cv, n)` at both sites.
+
+- [ ] **`flat_types_for(FixedSizeList)` returns `[I32, I32]`;
+  canonical ABI says `N × flat(T)` inlined.** (`src/adapter/ty.rs`
+  line 55.) `FixedSizeList(T, N)` is treated the same as dynamic
+  `List(T)` — a `(ptr, len)` pair on the wire. Canonical ABI
+  flattens `list<T, N>` to `N` repetitions of `flat(T)` inlined;
+  `canonical_align` has the same bug (line 171 returns 4 instead of
+  `align(T)`). Any sync-complex or async result of type `list<T, N>`
+  would mis-size its buffer and mis-offset its memory reads.
+  **Fix**: in `flat_types_for`, emit `flat_types_for(inner)` repeated
+  `n` times; in `canonical_align`, return `canonical_align(inner)`.
+
+- [ ] **`needs_realloc` misses `list<T>` types entirely.**
+  (`src/adapter/component.rs` line 634:
+  `needs_realloc = funcs.iter().any(|f| f.has_strings ||
+  f.has_resources)`.) The rule catches strings and resources but not
+  lists. A function with `list<u32>` param or result would have
+  `needs_realloc=false`, and canon lower needs `realloc` to marshal
+  the list contents. Validation fails at adapter generation, or
+  worse, the adapter emits without realloc and fails at load time.
+  **Fix**: add `type_has_lists` alongside `type_has_strings` /
+  `type_has_resources` in `src/adapter/ty.rs`, add matching
+  `has_lists: bool` on `AdapterFunc`, and extend the `needs_realloc`
+  rule. Consider whether `has_resources` is actually needed for
+  realloc — a bare `own<T>` is just an i32 handle and shouldn't
+  require it (the current rule may be over-conservative, though
+  that's a false-positive, not a correctness bug).
+
+- [ ] **Flat params and flat results >16 silently declare the wrong
+  core type.** (`src/adapter/func.rs` lines 188–197;
+  `src/adapter/dispatch.rs` lines 317–333 wrapper types, 340–391
+  handler + task.return types.) `core_params.extend(flat_types_for(id))`
+  and `types.ty().function(core_results.iter().copied(), [])`
+  produce verbatim flat-types signatures. Canonical ABI rule:
+  when total flat params/results > MAX_FLAT_PARAMS (16), the core
+  signature collapses to `(i32)` pointer form with the arguments
+  marshaled in memory. Our wrapper / handler / task.return type
+  declarations would mismatch what canon lift/lower produces at the
+  component level, failing at link time. Latent for any function
+  with >16 flat params or any async result whose flat form exceeds
+  16 values (e.g. a record with 20 u32 fields). **Fix**: in
+  `extract_func_sig`, if the accumulated flat length exceeds 16,
+  collapse to `[I32]` and record a flag (`params_are_ptr: bool`,
+  `results_are_ptr: bool`). Each emitter in dispatch.rs checks the
+  flag and emits pointer-form signatures; memory layout needs a
+  corresponding buffer reservation for the spilled args.
+
+- [ ] **Silent fallback to `U32` for unregistered resources.**
+  (`src/adapter/encoders.rs` lines 313–318 in `encode_comp_cv`.) If
+  a `Resource` or `AsyncHandle` value-type-id isn't found in
+  `comp_own_by_vid`, the encoder returns
+  `Primitive(PrimitiveValType::U32)` — losing the `own<T>` typing
+  entirely and emitting a bare integer where the interface says
+  `own<T>`. Probably unreachable given the preamble registers every
+  resource up front, but if it ever fires it'll produce an adapter
+  that type-checks but encodes the wrong interface. **Fix**: replace
+  the fallback with `anyhow::bail!("resource {vid:?} not registered
+  in comp_own_by_vid — this is a bug in the adapter generator")`.
+  A hard error here will surface the missing registration the first
+  time it happens, rather than shipping a silently-wrong adapter.
+
+### To do
+
+- [ ] **Split `emit_imports_from_consumer_split` in two.** The function
+  (`src/adapter/component.rs` ≈ lines 249–554) is 300+ lines with
+  two independent branches on `handler_in_split`. Each branch has
+  different invariants (consumer: re-export handler types via
+  `InstanceExport`; provider: reuse preamble-aliased types via
+  `alias outer`). Extract `emit_imports_consumer_split` and
+  `emit_imports_provider_split`, each returning `ImportsOutcome`;
+  the top-level dispatcher becomes a one-line `if`. Halves each
+  function's surface area and lets each strategy be reasoned
+  about in isolation. (Highest leverage.)
+- [ ] **Centralize hook / env-slot name constants.** Today the
+  component-scope import name `"before-call"` and the core-instance
+  env-export name `"before_call"` (hyphen vs. underscore) are
+  hardcoded in separate places — `emit_hook_imports` vs.
+  `emit_dispatch_phase`'s env-export construction. A typo in either
+  fails at module-instantiation time with an unhelpful error. Stand
+  up a small `mod names` with `BEFORE_HOOK_COMPONENT` /
+  `BEFORE_HOOK_ENV_EXPORT` (and after / blocking) so both sides
+  reference the same constants.
+- [ ] **Pass hook flags into `compute_memory_layout`.** The caller
+  in `build_adapter_bytes` already computes `has_before` /
+  `has_after` / `has_blocking`; `compute_memory_layout` re-derives
+  `has_async_machinery` from `funcs` again. Pass the flags through
+  so the "async machinery depends on hooks + async funcs" relation
+  is explicit in the signature rather than buried inside the
+  function body.
+
+### Upstream (wirm / cviz)
+
+- [ ] **wirm's concretization has silent `_ => ConcreteValType::Resource`
+  fallbacks that defeat splicer's fail-closed boundary.** (`~/git/research/compilers/wirm/src/ir/component/concrete.rs`
+  lines 613, 629, 841, 845, 849, 853.) Multiple arms in
+  `concretize_from_resolved` / `concretize_comp_type_to_val` /
+  `concretize_instance_type_from_import` return
+  `ConcreteValType::Resource` whenever the walker can't find what it
+  expects — the `TODO(beyond-wit)` comments acknowledge these are
+  placeholders for shapes outside valid WIT but there's no assertion
+  that input is WIT-compliant. If any of these arms fire, wirm hands
+  splicer a bogus `Resource` value-type instead of an error, and
+  splicer's own `validate_iface_supported` pre-pass can't detect it
+  (the lie already happened upstream). **Fix**: in wirm, replace the
+  silent fallbacks with `bail!("non-WIT val-type kind at {ref_}")` so
+  the error surfaces at concretization time with a pointer to the
+  offending ref. Splicer-side defense: when concretizing an interface
+  whose type-exports include a `Resource(name)` for a name that
+  wasn't declared as a resource export, surface the discrepancy
+  (complements upstream fix, catches the case where wirm is out of
+  date).
+
+### To investigate
+
+- [ ] **Extract `build_env_exports` from `emit_dispatch_phase`.** The
+  dispatch phase builds the env instance by conditionally pushing
+  tuples for memory / hooks / task.return funcs / async builtins
+  (≈ lines 935–980 of `component.rs`). If this block genuinely
+  encodes the contract between canon-lower and dispatch, pulling
+  it into a dedicated `fn build_env_exports(canon_lower, funcs,
+  mem_core_mem) -> Vec<(String, ExportKind, u32)>` makes that
+  contract explicit and gives the dispatch phase a single
+  responsibility. Needs a read-through first to confirm it's
+  tangled enough to be worth extracting — if the shape is simple
+  enough that inline is clearer, skip.

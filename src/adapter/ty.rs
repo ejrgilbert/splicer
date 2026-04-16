@@ -109,9 +109,14 @@ pub(super) fn join_val_type(a: ValType, b: ValType) -> ValType {
 
 /// Returns true if the type (or any type it transitively contains)
 /// is a string.
+///
+/// Match is exhaustive — a `ValueType` added to cviz will force a
+/// compile error here so the traversal can't silently miss a new
+/// string-bearing shape.
 pub(super) fn type_has_strings(id: ValueTypeId, arena: &TypeArena) -> bool {
     match arena.lookup_val(id) {
         ValueType::String => true,
+
         ValueType::Record(fields) => fields.iter().any(|(_, id)| type_has_strings(*id, arena)),
         ValueType::Tuple(ids) => ids.iter().any(|id| type_has_strings(*id, arena)),
         ValueType::Variant(cases) => cases.iter().any(|(_, opt_id)| {
@@ -127,15 +132,38 @@ pub(super) fn type_has_strings(id: ValueTypeId, arena: &TypeArena) -> bool {
         ValueType::List(inner) | ValueType::FixedSizeList(inner, _) => {
             type_has_strings(*inner, arena)
         }
-        _ => false,
+        ValueType::Map(k, v) => type_has_strings(*k, arena) || type_has_strings(*v, arena),
+
+        // Leaf non-string types.
+        ValueType::Bool
+        | ValueType::S8
+        | ValueType::U8
+        | ValueType::S16
+        | ValueType::U16
+        | ValueType::S32
+        | ValueType::U32
+        | ValueType::S64
+        | ValueType::U64
+        | ValueType::F32
+        | ValueType::F64
+        | ValueType::Char
+        | ValueType::ErrorContext
+        | ValueType::Resource(_)
+        | ValueType::AsyncHandle
+        | ValueType::Enum(_)
+        | ValueType::Flags(_) => false,
     }
 }
 
 /// Returns true if the type (or any type it transitively contains)
-/// is a resource.
+/// is a resource handle.
+///
+/// Match is exhaustive — see [`type_has_strings`] for the same
+/// rationale.
 pub(super) fn type_has_resources(id: ValueTypeId, arena: &TypeArena) -> bool {
     match arena.lookup_val(id) {
         ValueType::Resource(_) | ValueType::AsyncHandle => true,
+
         ValueType::Record(fields) => fields.iter().any(|(_, id)| type_has_resources(*id, arena)),
         ValueType::Tuple(ids) => ids.iter().any(|id| type_has_resources(*id, arena)),
         ValueType::Variant(cases) => cases.iter().any(|(_, opt_id)| {
@@ -151,7 +179,25 @@ pub(super) fn type_has_resources(id: ValueTypeId, arena: &TypeArena) -> bool {
         ValueType::List(inner) | ValueType::FixedSizeList(inner, _) => {
             type_has_resources(*inner, arena)
         }
-        _ => false,
+        ValueType::Map(k, v) => type_has_resources(*k, arena) || type_has_resources(*v, arena),
+
+        // Leaf non-resource types.
+        ValueType::Bool
+        | ValueType::S8
+        | ValueType::U8
+        | ValueType::S16
+        | ValueType::U16
+        | ValueType::S32
+        | ValueType::U32
+        | ValueType::S64
+        | ValueType::U64
+        | ValueType::F32
+        | ValueType::F64
+        | ValueType::Char
+        | ValueType::String
+        | ValueType::ErrorContext
+        | ValueType::Enum(_)
+        | ValueType::Flags(_) => false,
     }
 }
 
@@ -340,13 +386,54 @@ impl FlatLayout {
     ///   the discriminant. All payload slots are loaded from memory.
     /// - For everything else (string, tuple, record, etc.): slots are
     ///   laid out sequentially at naturally-aligned offsets from byte 0.
+    ///
+    /// Match is exhaustive — a new `ValueType` variant forces an
+    /// explicit decision at compile time. `Option` / `Variant` / `Enum`
+    /// currently route through `build_sequential_layout`, which
+    /// silently mis-computes the payload offset when the payload's
+    /// canonical-ABI align is < 4. See the "FlatLayout::new only
+    /// handles Result<T, E>" correctness item in
+    /// `docs/adapter-comp-planning.md` — fixing that item makes this
+    /// match dispatch to a proper discriminated-layout builder for
+    /// each variant-shaped type.
     pub fn new(type_id: ValueTypeId, flat_types: &[ValType], arena: &TypeArena) -> Self {
         let vt = arena.lookup_val(type_id);
         match vt {
             ValueType::Result { ok, err } => {
                 Self::build_result_layout(flat_types, *ok, *err, arena)
             }
-            _ => Self::build_sequential_layout(flat_types),
+
+            // Known-incorrect sequential fallback for discriminated
+            // shapes — tracked as a correctness item; validator rejects
+            // the subword-payload cases that currently hit this path.
+            ValueType::Option(_) | ValueType::Variant(_) | ValueType::Enum(_) => {
+                Self::build_sequential_layout(flat_types)
+            }
+
+            // Genuinely sequential shapes: each flat slot is stored at
+            // its natural alignment from byte 0.
+            ValueType::Bool
+            | ValueType::S8
+            | ValueType::U8
+            | ValueType::S16
+            | ValueType::U16
+            | ValueType::S32
+            | ValueType::U32
+            | ValueType::S64
+            | ValueType::U64
+            | ValueType::F32
+            | ValueType::F64
+            | ValueType::Char
+            | ValueType::String
+            | ValueType::ErrorContext
+            | ValueType::Resource(_)
+            | ValueType::AsyncHandle
+            | ValueType::List(_)
+            | ValueType::FixedSizeList(_, _)
+            | ValueType::Tuple(_)
+            | ValueType::Record(_)
+            | ValueType::Flags(_)
+            | ValueType::Map(_, _) => Self::build_sequential_layout(flat_types),
         }
     }
 

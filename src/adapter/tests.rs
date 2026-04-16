@@ -98,7 +98,11 @@ fn synth_split(
     tmp
 }
 
-fn wat_consumer_primitive_only(target: &str, iface: &InstanceInterface, arena: &TypeArena) -> String {
+fn wat_consumer_primitive_only(
+    target: &str,
+    iface: &InstanceInterface,
+    arena: &TypeArena,
+) -> String {
     let mut body = String::new();
     let mut func_type_for: Vec<(String, u32)> = Vec::new();
 
@@ -579,7 +583,13 @@ fn test_adapter_no_hooks() {
         "add",
         sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
     )]);
-    let bytes = gen_adapter("test:pkg/adder@1.0.0", &[], &iface, &arena, SplitKind::Consumer);
+    let bytes = gen_adapter(
+        "test:pkg/adder@1.0.0",
+        &[],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
     validate_component(&bytes);
 }
 

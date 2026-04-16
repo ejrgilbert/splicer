@@ -25,8 +25,7 @@ use std::collections::HashMap;
 
 use cviz::model::{TypeArena, ValueType, ValueTypeId};
 use wasm_encoder::{
-    ComponentTypeRef, ComponentTypeSection, ComponentValType, InstanceType, PrimitiveValType,
-    TypeBounds,
+    ComponentTypeRef, ComponentTypeSection, ComponentValType, InstanceType, TypeBounds,
 };
 
 use super::ty::prim_cv;
@@ -311,11 +310,22 @@ pub(super) fn encode_comp_cv(
 
     match vt {
         ValueType::Resource(_) | ValueType::AsyncHandle => {
-            if let Some(&own_idx) = comp_own_by_vid.get(&id) {
-                Ok(ComponentValType::Type(own_idx))
-            } else {
-                Ok(ComponentValType::Primitive(PrimitiveValType::U32))
-            }
+            // Every resource the encoder sees must have been registered
+            // in `comp_own_by_vid` by the handler-import phase (which
+            // emits the component-scope `own<T>` for each resource
+            // export). A missing entry here means the registration
+            // phase and the encoder disagree about which resources
+            // exist — a bug in the adapter builder. Bailing surfaces
+            // it immediately instead of silently emitting a bare `u32`
+            // where the interface says `own<T>`.
+            let own_idx = comp_own_by_vid.get(&id).copied().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "internal error: resource/async-handle {id:?} not registered in \
+                     comp_own_by_vid — the handler-import phase must declare every \
+                     resource before encode_comp_cv references it"
+                )
+            })?;
+            Ok(ComponentValType::Type(own_idx))
         }
         ValueType::Result { ok, err } => {
             let ok_cv = ok
