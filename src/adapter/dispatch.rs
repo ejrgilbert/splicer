@@ -1,14 +1,36 @@
 //! Core-Wasm modules nested inside the tier-1 adapter component:
 //! the **memory module** and the **dispatch module**.
 //!
-//! - [`build_mem_module`] emits a tiny core module that exports a
-//!   1-page linear memory (and optionally a bump-allocator `realloc`)
-//!   under the names `mem` / `realloc`. The dispatch module imports
-//!   this memory so the canonical-ABI lift/lower options
-//!   (`memory $0` / `realloc $f`) have something to point at.
+//! ## Why a tier-1 adapter needs core Wasm at all
 //!
-//! - [`build_dispatch_module`] emits the core module that holds the
-//!   adapter's per-function wrapper bodies. Each wrapper:
+//! The adapter sits between a caller and a handler, both of which
+//! speak component-level values (strings, records, resources, …).
+//! Those values can't be passed directly between core-Wasm functions
+//! — core Wasm only knows i32/i64/f32/f64. The component model's
+//! **canonical ABI** bridges the two by copying the bytes of a
+//! component value through a linear memory and representing them at
+//! the core level as `(ptr, len, …)` tuples.
+//!
+//! So even though the adapter's *user-visible* surface is entirely
+//! component-level (it imports the handler + hook interfaces and
+//! exports the target interface), the wiring underneath is two core
+//! Wasm modules:
+//!
+//! - [`build_mem_module`] — a tiny core module that exports a 1-page
+//!   linear memory (and, when any func has a string/list/record/
+//!   variant/resource, a bump-allocator `realloc`) under the names
+//!   `mem` / `realloc`. This is the scratch buffer the canonical-ABI
+//!   lift/lower options (`memory $0` / `realloc $f`) write into and
+//!   read out of — the *same* memory on both sides of the dispatch
+//!   module, so a lowered param arg and a later lifted result both
+//!   live in the same address space. Bump allocation is enough
+//!   because the adapter's memory lives for one invocation and then
+//!   the instance tears down.
+//!
+//! - [`build_dispatch_module`] — the per-function wrapper bodies.
+//!   When the outside world calls the adapter's exported `handle`,
+//!   the outer Component's `canon lift` copies the caller's args into
+//!   `mem` and invokes the wrapper. The wrapper:
 //!     1. (optional) calls the `before_call(name)` hook and waits on
 //!        the returned subtask handle if the hook is async-lowered;
 //!     2. (optional) calls `should_block_call(name, result_ptr)` and,
@@ -28,6 +50,17 @@
 //! memory layout the async lowering wrote at `result_ptr`. It's
 //! private to dispatch because no other phase needs to peek inside an
 //! async result frame.
+//!
+//! ## "Async" is just an async-shaped canon lift/lower
+//!
+//! Nothing in the dispatch module cares about async vs sync at the
+//! memory level — both variants pass args/results through `mem` the
+//! same way. The async shape differs only in the *control flow*: the
+//! canon-lowered handler import returns a packed subtask handle that
+//! the wrapper has to await (via `waitable-set.wait` or similar), and
+//! the wrapper produces its final result via `task.return` instead of
+//! a plain function return. The memory/realloc machinery is
+//! identical either way.
 //!
 //! Both builders return raw core-Wasm bytes; the component-builder
 //! wraps them in a `ModuleSection` of the outer Component.
@@ -119,9 +152,40 @@ fn emit_task_return_loads(
     }
 }
 
-/// Build a tiny core Wasm module that exports one 1-page memory as "mem".
-/// When `with_realloc` is true, also exports a bump-allocator "realloc" function.
-/// This memory is shared with the dispatch module for string passing and result buffers.
+/// Build the **memory-provider** core module: one 1-page linear memory
+/// exported as `mem`, plus — when `with_realloc` — a bump-allocator
+/// `realloc` with the canonical-ABI signature
+/// `(old_ptr, old_size, align, new_size) -> new_ptr`.
+///
+/// ## When realloc is needed
+///
+/// The canonical ABI calls `realloc` whenever it needs scratch space
+/// for a value that can't fit in core args directly — strings, lists,
+/// records, variants, resource handles. Primitive-only signatures
+/// (`s32 + s32 -> s32`, `bool`, `f64`, …) pass entirely on the core
+/// value stack and don't need a realloc at all, so the adapter emits
+/// a memory-only module in that case (`with_realloc = false`).
+///
+/// ## When realloc fires during an invocation
+///
+/// - **On call-in** (`canon lift` of the adapter's exports): the
+///   caller hands in component-level args, the lift copies string/
+///   list bodies into `mem` via `realloc`, then invokes the
+///   dispatch-module wrapper with core (ptr, len, …) tuples.
+/// - **On call-out** (`canon lower` of the adapter's handler/hook
+///   imports): the wrapper hands core (ptr, len, …) to the import,
+///   the lower reads the bytes out of `mem`, calls the
+///   component-level import, then copies any component-level result
+///   back into `mem` via `realloc` for the wrapper to read.
+///
+/// ## Why bump allocation suffices
+///
+/// Every adapter instance lives for a single top-level call (the
+/// inbound `handle`), and then the instance is torn down along with
+/// its memory. So the allocator never needs to free — it just hands
+/// out fresh aligned chunks and advances a pointer. `old_ptr` and
+/// `old_size` are accepted (the canonical ABI insists on the full
+/// signature) but ignored.
 pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
     let mut module = Module::new();
 
@@ -178,31 +242,50 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
     }
 
     if with_realloc {
-        // Code section (10): bump allocator
-        // aligned = (bump_ptr + align - 1) & ~(align - 1)
-        // bump_ptr = aligned + new_size
-        // return aligned
+        // ── Code section (10): bump allocator body ─────────────────
+        //
+        // Locals / params:
+        //   local 0 = old_ptr    (ignored — we never "realloc")
+        //   local 1 = old_size   (ignored)
+        //   local 2 = align      (power of 2)
+        //   local 3 = new_size
+        //   local 4 = scratch for the aligned pointer
+        //   global 0 = bump pointer
+        //
+        // Pseudocode:
+        //   aligned  = (bump_ptr + (align - 1)) & ~(align - 1)
+        //   bump_ptr = aligned + new_size
+        //   return aligned
+        //
+        // The `+ (align - 1)` before the mask is the round-UP trick
+        // — without it, ANDing with the mask would round *down* for
+        // values that aren't already aligned.
         let mut code_section = CodeSection::new();
         let mut rf = Function::new(vec![(1u32, ValType::I32)]); // local 4: aligned
-                                                                // mask = ~(align - 1) = (align - 1) ^ -1
+
+        // mask = ~(align - 1) = (align - 1) ^ -1
         rf.instruction(&Instruction::LocalGet(2)); // align
         rf.instruction(&Instruction::I32Const(1));
         rf.instruction(&Instruction::I32Sub);
         rf.instruction(&Instruction::I32Const(-1));
         rf.instruction(&Instruction::I32Xor); // ~(align - 1)
-                                              // bump_ptr + align - 1
+
+        // bump_ptr + (align - 1)
         rf.instruction(&Instruction::GlobalGet(0));
         rf.instruction(&Instruction::LocalGet(2));
         rf.instruction(&Instruction::I32Const(1));
         rf.instruction(&Instruction::I32Sub);
         rf.instruction(&Instruction::I32Add);
-        // aligned = and
+
+        // aligned = (bump_ptr + align - 1) & mask   ;; round up to align
         rf.instruction(&Instruction::I32And);
         rf.instruction(&Instruction::LocalTee(4));
+
         // bump_ptr = aligned + new_size
         rf.instruction(&Instruction::LocalGet(3));
         rf.instruction(&Instruction::I32Add);
         rf.instruction(&Instruction::GlobalSet(0));
+
         // return aligned
         rf.instruction(&Instruction::LocalGet(4));
         rf.instruction(&Instruction::End);
@@ -276,7 +359,6 @@ pub(super) fn build_dispatch_module(
     let void_i64_ty: u32;
     let void_f32_ty: u32;
     let void_f64_ty: u32;
-    // NOTE: realloc is now in the memory module; realloc_ty no longer needed here.
 
     {
         let mut types = TypeSection::new();
