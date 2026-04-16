@@ -73,7 +73,7 @@ use wasm_encoder::{
 
 use super::func::AdapterFunc;
 use super::names;
-use super::ty::{val_type_byte_size, FlatLayout};
+use super::ty::FlatLayout;
 
 /// Running index allocators for the dispatch core module's type and
 /// function spaces. Scoped to a single call of [`build_dispatch_module`].
@@ -115,81 +115,41 @@ impl DispatchIndices {
     }
 }
 
-/// Emit a typed load instruction at `offset` within the address
-/// already on top of the stack. Returns the byte size consumed so
-/// the caller can advance the offset.
-///
-/// The caller is responsible for pushing the base address (via
-/// `I32Const` or `LocalGet`) before calling this.
-fn emit_load(f: &mut Function, offset: u32, vt: &ValType) -> u32 {
-    match vt {
-        ValType::I32 | ValType::Ref(_) => {
-            f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                offset: offset as u64,
-                align: 0,
-                memory_index: 0,
-            }));
-        }
-        ValType::I64 => {
-            f.instruction(&Instruction::I64Load(wasm_encoder::MemArg {
-                offset: offset as u64,
-                align: 0,
-                memory_index: 0,
-            }));
-        }
-        ValType::F32 => {
-            f.instruction(&Instruction::F32Load(wasm_encoder::MemArg {
-                offset: offset as u64,
-                align: 0,
-                memory_index: 0,
-            }));
-        }
-        ValType::F64 => {
-            f.instruction(&Instruction::F64Load(wasm_encoder::MemArg {
-                offset: offset as u64,
-                align: 0,
-                memory_index: 0,
-            }));
-        }
-        ValType::V128 => {
-            f.instruction(&Instruction::V128Load(wasm_encoder::MemArg {
-                offset: offset as u64,
-                align: 0,
-                memory_index: 0,
-            }));
-        }
-    }
-    val_type_byte_size(vt)
+/// Emit the load instruction for a [`FlatSlot`] against a base
+/// address already on the value stack. Instruction choice is driven
+/// by the slot's [`FlatSlotShape`]; the byte offset is the
+/// instruction's static `memarg.offset`.
+fn emit_load_slot(f: &mut Function, slot: &super::ty::FlatSlot) {
+    use super::ty::FlatSlotShape;
+    let mem_arg = wasm_encoder::MemArg {
+        offset: slot.byte_offset as u64,
+        align: 0,
+        memory_index: 0,
+    };
+    let inst = match slot.shape {
+        FlatSlotShape::U8 => Instruction::I32Load8U(mem_arg),
+        FlatSlotShape::U16 => Instruction::I32Load16U(mem_arg),
+        FlatSlotShape::I32 => Instruction::I32Load(mem_arg),
+        FlatSlotShape::I64 => Instruction::I64Load(mem_arg),
+        FlatSlotShape::F32 => Instruction::F32Load(mem_arg),
+        FlatSlotShape::F64 => Instruction::F64Load(mem_arg),
+    };
+    f.instruction(&inst);
 }
 
-/// Emit Wasm instructions that load the flat values of a multi-value
-/// result from the canonical ABI memory layout at `result_ptr` and
-/// push them onto the value stack (for `task.return`).
-///
-/// Uses [`FlatLayout`] to compute byte offsets for all slot types,
-/// including `result<T, E>` (discriminant byte + aligned payload)
-/// and non-result types (sequential naturally-aligned values).
+/// Emit Wasm instructions that load every flat slot of a value from
+/// `result_ptr` and push the values onto the stack (for
+/// `task.return`). One `(I32Const result_ptr) + load` pair per slot.
 fn emit_task_return_loads(
     f: &mut Function,
     result_ptr: u32,
     result_type_id: ValueTypeId,
-    core_results: &[ValType],
     arena: &TypeArena,
 ) {
-    let layout = FlatLayout::new(result_type_id, core_results, arena);
-
+    let layout = FlatLayout::new(result_type_id, arena);
     for slot in &layout.slots {
         f.instruction(&Instruction::I32Const(result_ptr as i32));
-        if slot.is_discriminant {
-            // Result discriminant is stored as u8, loaded via i32.load8_u.
-            f.instruction(&Instruction::I32Load8U(wasm_encoder::MemArg {
-                offset: 0,
-                align: 0,
-                memory_index: 0,
-            }));
-        } else {
-            emit_load(f, slot.byte_offset, &slot.val_type);
-        }
+        emit_load_slot(f, slot);
     }
 }
 
@@ -836,18 +796,11 @@ fn emit_return_phase(
     if func.is_async {
         if let Some(result_ptr) = func.async_result_mem_offset {
             if let Some(tr_fn) = ctx.task_return_fns[fi] {
-                if func.result_is_complex {
-                    emit_task_return_loads(
-                        f,
-                        result_ptr,
-                        func.result_type_id.unwrap(),
-                        &func.core_results,
-                        ctx.arena,
-                    );
-                } else {
-                    f.instruction(&Instruction::I32Const(result_ptr as i32));
-                    emit_load(f, 0, &func.core_results[0]);
-                }
+                // Unified: the `FlatLayout` walk produces 1 slot for
+                // simple single-flat-value results and N slots for
+                // complex ones. Same `emit_task_return_loads` handles
+                // both.
+                emit_task_return_loads(f, result_ptr, func.result_type_id.unwrap(), ctx.arena);
                 f.instruction(&Instruction::Call(tr_fn));
             }
         } else if let Some(tr_fn) = ctx.task_return_fns[fi] {

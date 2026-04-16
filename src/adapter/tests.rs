@@ -43,9 +43,50 @@ fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
         ValueType::Char => "char".into(),
         ValueType::String => "string".into(),
         ValueType::List(inner) => format!("(list {})", wat_type(*inner, arena)),
+        ValueType::Option(inner) => format!("(option {})", wat_type(*inner, arena)),
+        ValueType::Result { ok, err } => {
+            let ok_str = ok.map(|id| wat_type(id, arena));
+            let err_str = err.map(|id| wat_type(id, arena));
+            match (ok_str, err_str) {
+                (Some(o), Some(e)) => format!("(result {o} (error {e}))"),
+                (Some(o), None) => format!("(result {o})"),
+                (None, Some(e)) => format!("(result (error {e}))"),
+                (None, None) => "(result)".into(),
+            }
+        }
+        ValueType::Tuple(ids) => {
+            let inner: Vec<String> = ids.iter().map(|id| wat_type(*id, arena)).collect();
+            format!("(tuple {})", inner.join(" "))
+        }
+        ValueType::Record(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(name, id)| format!(r#"(field "{name}" {})"#, wat_type(*id, arena)))
+                .collect();
+            format!("(record {})", inner.join(" "))
+        }
+        ValueType::Variant(cases) => {
+            let inner: Vec<String> = cases
+                .iter()
+                .map(|(name, opt_id)| match opt_id {
+                    Some(id) => format!(r#"(case "{name}" {})"#, wat_type(*id, arena)),
+                    None => format!(r#"(case "{name}")"#),
+                })
+                .collect();
+            format!("(variant {})", inner.join(" "))
+        }
+        ValueType::Enum(tags) => {
+            let inner: Vec<String> = tags.iter().map(|t| format!(r#""{t}""#)).collect();
+            format!("(enum {})", inner.join(" "))
+        }
+        ValueType::Flags(names) => {
+            let inner: Vec<String> = names.iter().map(|n| format!(r#""{n}""#)).collect();
+            format!("(flags {})", inner.join(" "))
+        }
         other => panic!(
-            "wat_type: synth split helper only supports primitive + string + list types, \
-             got {other:?}. For richer shapes, add a dedicated WAT template."
+            "wat_type: synth split helper only supports primitive + string + \
+             list + compound (option/result/tuple/record/variant/enum/flags) \
+             types, got {other:?}. For resources, use a dedicated WAT template."
         ),
     }
 }
@@ -563,6 +604,66 @@ fn test_adapter_list_param_async() {
     )]);
     let bytes = gen_adapter(
         "test:pkg/processor@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+// ── Tier 1: subword-aligned shapes (FlatLayout correctness) ──────────
+//
+// These shapes were silently mis-laid-out before the FlatLayout
+// rewrite: `Option<u8>`/`Option<u16>`/`Result<u8,u8>`/records with
+// subword fields all have canonical-ABI payload offsets that don't
+// match `val_type_byte_size`-based offsets. The tests validate that
+// generation succeeds and the binary structurally validates — actual
+// runtime correctness would need execution, not just wasmparser.
+
+#[test]
+fn test_adapter_option_u8_async_result() {
+    let mut arena = TypeArena::default();
+    let u8_id = arena.intern_val(ValueType::U8);
+    let opt_u8 = arena.intern_val(ValueType::Option(u8_id));
+    let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![opt_u8]))]);
+    let bytes = gen_adapter(
+        "test:pkg/get@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+#[test]
+fn test_adapter_option_u16_async_result() {
+    let mut arena = TypeArena::default();
+    let u16_id = arena.intern_val(ValueType::U16);
+    let opt_u16 = arena.intern_val(ValueType::Option(u16_id));
+    let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![opt_u16]))]);
+    let bytes = gen_adapter(
+        "test:pkg/get@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+#[test]
+fn test_adapter_result_u8_u8_async_result() {
+    let mut arena = TypeArena::default();
+    let u8_id = arena.intern_val(ValueType::U8);
+    let result = arena.intern_val(ValueType::Result {
+        ok: Some(u8_id),
+        err: Some(u8_id),
+    });
+    let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![result]))]);
+    let bytes = gen_adapter(
+        "test:pkg/get@1.0.0",
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,

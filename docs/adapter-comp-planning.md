@@ -313,8 +313,34 @@ each at its site, not via a pre-pass:
   fallback. Currently unreachable (flat_types_for only produces
   I32/I64/F32/F64) but worth making exhaustive for future-proofing.
 
-- [ ] **`FlatLayout::new` mis-computes memory offsets for
-  discriminated and subword-containing types.** (`src/adapter/ty.rs`
+- [x] **`FlatLayout::new` mis-computes memory offsets for
+  discriminated and subword-containing types.** _Largely landed._
+  Rewrote `FlatLayout::new` to walk the `ValueType` structure
+  directly using `canonical_size_and_align` — every slot's
+  `byte_offset` now matches what `canon lower` writes.
+  `FlatSlot`'s `(val_type, load_byte_size)` pair was replaced with a
+  single `FlatSlotShape` enum (6 variants, one per valid load
+  instruction: `U8`/`U16`/`I32`/`I64`/`F32`/`F64`), making the
+  "valid combos only" invariant type-level and dropping the
+  unreachable-arm panic from `emit_load_slot`. Subword loads
+  (`i32.load8_u`/`i32.load16_u`) now emit at canonical payload
+  offsets (1 for `option<u8>`, 2 for `option<u16>`, etc.), and
+  discriminator loads match the variant's case-count-derived width.
+  New tests: `option<u8>` / `option<u16>` / `result<u8, u8>` as
+  async results — all pass. Deferred sub-items:
+  - **Heterogeneous variant arms** (e.g. `variant { u8, u64 }`)
+    use the longest-flat arm's layout at the payload offset; reads
+    for shorter arms pick up the canonical bytes plus
+    canon-lower's (zero-init) padding, which canon lift truncates
+    back on the receiving side. Spec-non-compliant if memory is
+    ever reused in a non-zero-init pattern. Proper fix needs
+    runtime dispatch on the discriminator — bigger change in
+    `emit_task_return_loads`.
+  - **Record / Tuple / Variant / Enum as top-level results** now
+    lay out correctly, but tests for those shapes need a richer
+    consumer-WAT template (compound types used in import instance
+    types need to be pre-exported with `(eq N)`). Coverage
+    deferred to a template rewrite. (`src/adapter/ty.rs`
   lines 343–401.) The actual bug scope is wider than the original
   sketch; in-scope fix needs real implementation of each case, not
   stubs/panics. Concrete shapes broken today:
@@ -418,24 +444,24 @@ each at its site, not via a pre-pass:
   cover `list<u32>` as param (sync), as result (sync canon-lift
   path), and as async param (task.return path).
 
-- [ ] **Flat params and flat results >16 silently declare the wrong
-  core type.** (`src/adapter/func.rs` lines 188–197;
-  `src/adapter/dispatch.rs` lines 317–333 wrapper types, 340–391
-  handler + task.return types.) `core_params.extend(flat_types_for(id))`
-  and `types.ty().function(core_results.iter().copied(), [])`
-  produce verbatim flat-types signatures. Canonical ABI rule:
-  when total flat params/results > MAX_FLAT_PARAMS (16), the core
-  signature collapses to `(i32)` pointer form with the arguments
-  marshaled in memory. Our wrapper / handler / task.return type
-  declarations would mismatch what canon lift/lower produces at the
-  component level, failing at link time. Latent for any function
-  with >16 flat params or any async result whose flat form exceeds
-  16 values (e.g. a record with 20 u32 fields). **Fix**: in
-  `extract_func_sig`, if the accumulated flat length exceeds 16,
-  collapse to `[I32]` and record a flag (`params_are_ptr: bool`,
-  `results_are_ptr: bool`). Each emitter in dispatch.rs checks the
-  flag and emits pointer-form signatures; memory layout needs a
-  corresponding buffer reservation for the spilled args.
+  - [ ] **Flat params and flat results >16 silently declare the wrong
+    core type.** (`src/adapter/func.rs` lines 188–197;
+    `src/adapter/dispatch.rs` lines 317–333 wrapper types, 340–391
+    handler + task.return types.) `core_params.extend(flat_types_for(id))`
+    and `types.ty().function(core_results.iter().copied(), [])`
+    produce verbatim flat-types signatures. Canonical ABI rule:
+    when total flat params/results > MAX_FLAT_PARAMS (16), the core
+    signature collapses to `(i32)` pointer form with the arguments
+    marshaled in memory. Our wrapper / handler / task.return type
+    declarations would mismatch what canon lift/lower produces at the
+    component level, failing at link time. Latent for any function
+    with >16 flat params or any async result whose flat form exceeds
+    16 values (e.g. a record with 20 u32 fields). **Fix**: in
+    `extract_func_sig`, if the accumulated flat length exceeds 16,
+    collapse to `[I32]` and record a flag (`params_are_ptr: bool`,
+    `results_are_ptr: bool`). Each emitter in dispatch.rs checks the
+    flag and emits pointer-form signatures; memory layout needs a
+    corresponding buffer reservation for the spilled args.
 
 - [x] **Silent fallback to `U32` for unregistered resources.**
   _Landed with the fail-closed pass above._ The
@@ -447,16 +473,17 @@ each at its site, not via a pre-pass:
 
 ### To do
 
-- [ ] **Split `emit_imports_from_consumer_split` in two.** The function
-  (`src/adapter/component.rs` ≈ lines 249–554) is 300+ lines with
-  two independent branches on `handler_in_split`. Each branch has
-  different invariants (consumer: re-export handler types via
-  `InstanceExport`; provider: reuse preamble-aliased types via
-  `alias outer`). Extract `emit_imports_consumer_split` and
-  `emit_imports_provider_split`, each returning `ImportsOutcome`;
-  the top-level dispatcher becomes a one-line `if`. Halves each
-  function's surface area and lets each strategy be reasoned
-  about in isolation. (Highest leverage.)
+- [x] **Split `emit_imports_from_consumer_split` in two.** _Landed._
+  Renamed the top-level dispatcher to `emit_imports_from_split`
+  (the old name was a misnomer after the split handled both
+  variants). The dispatcher now just copies the raw sections, seeds
+  the index allocator, and calls
+  `emit_imports_consumer_split` (when `target_interface` is in
+  `split.import_names`) or `emit_imports_provider_split` (otherwise).
+  Each strategy owns its own `ImportsOutcome` construction, so the
+  consumer path (re-export handler types via `InstanceExport`) and
+  provider path (reuse preamble-aliased types via `alias outer`) can
+  be read in isolation. No behavior change; 116 tests pass.
 - [x] **Centralize hook / env-slot name constants.** _Landed._ Two
   sources of truth now:
   - **`build.rs`** extracts function names from
@@ -481,46 +508,41 @@ each at its site, not via a pre-pass:
   names come from WIT automatically via `build.rs`, the canon-
   lowered flat shapes (`(i32, i32) → i32` etc.) are still spelled
   out in Rust and would need updating if the WIT signatures change.
-- [ ] **Pass hook flags into `compute_memory_layout`.** The caller
-  in `build_adapter_bytes` already computes `has_before` /
-  `has_after` / `has_blocking`; `compute_memory_layout` re-derives
-  `has_async_machinery` from `funcs` again. Pass the flags through
-  so the "async machinery depends on hooks + async funcs" relation
-  is explicit in the signature rather than buried inside the
-  function body.
+- [~] **~~Pass hook flags into `compute_memory_layout`.~~** _Dropped
+  after attempting._ The audit claim (`has_async_machinery`
+  "re-derives" from `funcs`) was misread — there's only ONE site
+  computing it (inside `compute_memory_layout`). No duplication to
+  eliminate. Attempted refactors (hoisting to caller, extracting to
+  `needs_async_machinery()` helper) turned one readable inline line
+  into a rename or a call site with the same meaning — pure noise.
+  The original inline definition reads fine and stays as-is.
 
 ### Upstream (wirm / cviz)
 
-- [ ] **wirm's concretization has silent `_ => ConcreteValType::Resource`
-  fallbacks that defeat splicer's fail-closed boundary.** (`~/git/research/compilers/wirm/src/ir/component/concrete.rs`
-  lines 613, 629, 841, 845, 849, 853.) Multiple arms in
-  `concretize_from_resolved` / `concretize_comp_type_to_val` /
-  `concretize_instance_type_from_import` return
-  `ConcreteValType::Resource` whenever the walker can't find what it
-  expects — the `TODO(beyond-wit)` comments acknowledge these are
-  placeholders for shapes outside valid WIT but there's no assertion
-  that input is WIT-compliant. If any of these arms fire, wirm hands
-  splicer a bogus `Resource` value-type instead of an error, and
-  splicer's own `validate_iface_supported` pre-pass can't detect it
-  (the lie already happened upstream). **Fix**: in wirm, replace the
-  silent fallbacks with `bail!("non-WIT val-type kind at {ref_}")` so
-  the error surfaces at concretization time with a pointer to the
-  offending ref. Splicer-side defense: when concretizing an interface
-  whose type-exports include a `Resource(name)` for a name that
-  wasn't declared as a resource export, surface the discrepancy
-  (complements upstream fix, catches the case where wirm is out of
-  date).
+- [x] **wirm's concretization had silent `_ => ConcreteValType::Resource`
+  fallbacks that defeated splicer's fail-closed boundary.** _Landed
+  in wirm._ All six sites in
+  `~/git/research/compilers/wirm/src/ir/component/concrete.rs`
+  (`concretize_from_resolved`,
+  `concretize_comp_type_to_val`,
+  `resolve_type_from_import_instance`) and the
+  `InstanceExport`-as-val-type match on lines 578–597 now panic with
+  `"invalid component: …"` messages describing the specific
+  invariant that failed, instead of fabricating a bogus `Resource`.
+  Framing is component-model-spec-level, not WIT-specific — the val
+  types list comes straight from the spec. 102 wirm tests pass, 116
+  splicer tests pass; the fallbacks were unreachable from today's
+  test fixtures, which confirms the silent-fallback was pure dead
+  weight (and a bug waiting to happen).
 
 ### To investigate
 
-- [ ] **Extract `build_env_exports` from `emit_dispatch_phase`.** The
-  dispatch phase builds the env instance by conditionally pushing
-  tuples for memory / hooks / task.return funcs / async builtins
-  (≈ lines 935–980 of `component.rs`). If this block genuinely
-  encodes the contract between canon-lower and dispatch, pulling
-  it into a dedicated `fn build_env_exports(canon_lower, funcs,
-  mem_core_mem) -> Vec<(String, ExportKind, u32)>` makes that
-  contract explicit and gives the dispatch phase a single
-  responsibility. Needs a read-through first to confirm it's
-  tangled enough to be worth extracting — if the shape is simple
-  enough that inline is clearer, skip.
+- [x] **Extract `build_env_exports` from `emit_dispatch_phase`.**
+  _Landed._ The 47-line conditional-push block that built the env
+  instance's exports is now a dedicated
+  `fn build_env_exports(canon_lower, funcs, mem_core_mem) -> Vec<...>`.
+  `emit_dispatch_phase` collapses its env-construction to a one-line
+  call. The contract "these names MUST match the dispatch module's
+  imports, and the `Option<u32>`s on each side must agree on which
+  slots exist" is now documented once at the extracted function and
+  referenced by both sides. No behavior change; 116 tests pass.

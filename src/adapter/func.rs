@@ -15,7 +15,7 @@ use cviz::model::{FuncSignature, InterfaceType, TypeArena, ValueTypeId};
 use wasm_encoder::ValType;
 
 use super::mem_layout::MemoryLayoutBuilder;
-use super::ty::{flat_types_for, type_has_lists, type_has_strings, FlatLayout};
+use super::ty::{canonical_size_and_align, flat_types_for, type_has_lists, type_has_strings};
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
@@ -254,12 +254,12 @@ fn extract_func_sig(
             let rid = sig.results[0];
             let flat = flat_types_for(rid, arena);
             let is_complex = flat.len() > 1;
-            // `FlatLayout::total_bytes` accounts for the
-            // discriminant-and-padding shape of `result<T, E>` and
-            // inter-slot natural alignment (`[i32, i64]` is 16 bytes,
-            // not 12), so every result-buffer allocation uses the
-            // same byte size the dispatch module's loads assume.
-            let total_bytes = FlatLayout::new(rid, &flat, arena).total_bytes;
+            // Canonical-ABI memory size for the result — accounts for
+            // the discriminant-and-padding shape of `result<T, E>`
+            // and inter-field natural alignment (`record { i32, i64 }`
+            // is 16 bytes, not 12). The dispatch module's loads use
+            // this exact size when sizing the result buffer.
+            let (total_bytes, _) = canonical_size_and_align(rid, arena);
             // Store full flat types. For async functions `task.return`
             // uses these as params (up to MAX_FLAT_PARAMS=16). For sync
             // functions with `is_complex`, the canonical ABI uses a
