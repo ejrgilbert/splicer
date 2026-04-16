@@ -296,6 +296,536 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
     module
 }
 
+// ─── Type-section emitters ─────────────────────────────────────────────────
+//
+// Each helper appends one logical group of types to the dispatch
+// module's TypeSection and bumps `ty_idx` accordingly. They must be
+// called in the order below — wasm type indices are positional and
+// downstream imports/wrappers reference exact slots
+// (`wrapper_ty_base + i`, etc.).
+
+/// Emit one wrapper function type per target func, in contiguous
+/// index order. Wrapper type shape depends on the calling convention:
+///
+/// - **async**: `(flat_params…) -> ()` — async canon lift returns
+///   nothing, the wrapper produces its result via `task.return`.
+/// - **sync complex** (multi-value result): `(flat_params…) -> (i32)`
+///   — the wrapper returns a pointer to the flat results in linear
+///   memory for canon lift to read from.
+/// - **sync simple**: `(flat_params…) -> (flat_results…)` — the
+///   straight-through single-value / void case.
+fn emit_wrapper_types(types: &mut TypeSection, ty_idx: &mut u32, funcs: &[AdapterFunc]) {
+    for func in funcs {
+        if func.is_async {
+            types.ty().function(func.core_params.iter().copied(), []);
+        } else if func.result_is_complex {
+            types
+                .ty()
+                .function(func.core_params.iter().copied(), [ValType::I32]);
+        } else {
+            types.ty().function(
+                func.core_params.iter().copied(),
+                func.core_results.iter().copied(),
+            );
+        }
+        *ty_idx += 1;
+    }
+}
+
+/// Emit a retptr-pattern handler import type for each sync func with
+/// a complex (multi-value) result. Canon lower uses
+/// `(core_params…, retptr) -> ()` here, distinct from the wrapper's
+/// `(core_params…) -> (i32)`. Records the assigned type index in
+/// `out[i]` for sync-complex funcs; other entries are left untouched.
+fn emit_sync_complex_handler_types(
+    types: &mut TypeSection,
+    ty_idx: &mut u32,
+    funcs: &[AdapterFunc],
+    out: &mut [Option<u32>],
+) {
+    for (i, func) in funcs.iter().enumerate() {
+        if !func.is_async && func.result_is_complex {
+            out[i] = Some(*ty_idx);
+            *ty_idx += 1;
+            let mut params: Vec<ValType> = func.core_params.clone();
+            params.push(ValType::I32); // retptr
+            types.ty().function(params, []);
+        }
+    }
+}
+
+/// Emit an async-lowered handler call type for each async func:
+/// `(core_params…, result_ptr?) -> (i32)` where `result_ptr` is
+/// appended only when the func has a non-void result and the return
+/// value is a packed subtask handle the wrapper awaits via the
+/// waitable-set machinery. Records the assigned type index in
+/// `out[i]` for async funcs.
+fn emit_async_handler_types(
+    types: &mut TypeSection,
+    ty_idx: &mut u32,
+    funcs: &[AdapterFunc],
+    out: &mut [Option<u32>],
+) {
+    for (i, func) in funcs.iter().enumerate() {
+        if func.is_async {
+            out[i] = Some(*ty_idx);
+            *ty_idx += 1;
+            let mut params: Vec<ValType> = func.core_params.clone();
+            if func.result_type_id.is_some() {
+                params.push(ValType::I32); // result_ptr
+            }
+            types.ty().function(params, [ValType::I32]);
+        }
+    }
+}
+
+/// Emit one `(core_results…) -> ()` task.return type per async func
+/// whose result has >1 flat value. Single-value and void async funcs
+/// use the shared `void_i32_ty` / `void_void_ty` slots emitted
+/// earlier, so they don't appear here.
+fn emit_custom_task_return_types(types: &mut TypeSection, funcs: &[AdapterFunc]) {
+    for func in funcs {
+        if func.is_async && func.result_is_complex {
+            types.ty().function(func.core_results.iter().copied(), []);
+        }
+    }
+}
+
+// ─── Import-section emitters ───────────────────────────────────────────────
+
+/// Import `env/handler_f{i}` for each target func, picking the type
+/// slot that matches its calling convention (sync-simple reuses the
+/// wrapper type; sync-complex uses its retptr type; async uses its
+/// async-lowered type). Bumps `fn_idx` by `funcs.len()` and returns
+/// the base function index so the caller can reference individual
+/// handler imports as `base + i`.
+#[allow(clippy::too_many_arguments)]
+fn emit_handler_imports(
+    imports: &mut ImportSection,
+    fn_idx: &mut u32,
+    funcs: &[AdapterFunc],
+    wrapper_ty_base: u32,
+    async_ds_tys: &[Option<u32>],
+    sync_complex_handler_tys: &[Option<u32>],
+) -> u32 {
+    let base = *fn_idx;
+    for (i, func) in funcs.iter().enumerate() {
+        let ty = if func.is_async {
+            async_ds_tys[i].expect("async_ds_ty must be set for async func")
+        } else if let Some(handler_ty) = sync_complex_handler_tys[i] {
+            handler_ty
+        } else {
+            wrapper_ty_base + i as u32
+        };
+        imports.import("env", &format!("handler_f{i}"), EntityType::Function(ty));
+    }
+    *fn_idx += funcs.len() as u32;
+    base
+}
+
+/// Import `env/task_return_f{i}` for each async func. Returns a vec
+/// paralleling `funcs` where index `i` is `Some(fn_idx)` for async
+/// funcs and `None` otherwise. Type selection:
+///
+/// - Void async:        `void_void_ty` — `() -> ()`
+/// - Single-value async: matching `void_{i32,i64,f32,f64}_ty`
+/// - Multi-value async: per-func custom type living right after
+///   `void_void_ty` (see [`emit_custom_task_return_types`]), assigned
+///   in the same order async-complex funcs appear in `funcs`.
+#[allow(clippy::too_many_arguments)]
+fn emit_task_return_imports(
+    imports: &mut ImportSection,
+    fn_idx: &mut u32,
+    funcs: &[AdapterFunc],
+    void_void_ty: u32,
+    void_i32_ty: u32,
+    void_i64_ty: u32,
+    void_f32_ty: u32,
+    void_f64_ty: u32,
+) -> Vec<Option<u32>> {
+    let mut trf: Vec<Option<u32>> = vec![None; funcs.len()];
+    let mut custom_tr_ty_idx = void_void_ty + 1;
+    for (i, func) in funcs.iter().enumerate() {
+        if !func.is_async {
+            continue;
+        }
+        let tr_ty = if func.result_type_id.is_none() {
+            void_void_ty
+        } else if func.result_is_complex {
+            let ty = custom_tr_ty_idx;
+            custom_tr_ty_idx += 1;
+            ty
+        } else {
+            match func.core_results.first() {
+                Some(ValType::I32) => void_i32_ty,
+                Some(ValType::I64) => void_i64_ty,
+                Some(ValType::F32) => void_f32_ty,
+                Some(ValType::F64) => void_f64_ty,
+                _ => void_i32_ty,
+            }
+        };
+        trf[i] = Some(*fn_idx);
+        *fn_idx += 1;
+        imports.import(
+            "env",
+            &format!("task_return_f{i}"),
+            EntityType::Function(tr_ty),
+        );
+    }
+    trf
+}
+
+// ─── Code-section emitters ─────────────────────────────────────────────────
+
+/// Function indices + scratch offset needed by [`emit_wait_loop`] and
+/// [`emit_wrapper_body`]. Bundling them keeps the phase helpers from
+/// each growing a list of near-identical handle-dropper / event-ptr
+/// parameters.
+struct WaitLoopCtx {
+    waitable_new_fn: u32,
+    waitable_join_fn: u32,
+    waitable_wait_fn: u32,
+    subtask_drop_fn: u32,
+    waitable_drop_fn: u32,
+    /// Memory offset that `waitable-set.wait` writes its completion
+    /// event into. The wrapper allocates this once in `extract_adapter_funcs`
+    /// and reuses it across every awaited subtask.
+    event_ptr: u32,
+}
+
+/// Await a packed return value from `canon lower async` currently
+/// stored in local `st` (subtask). Uses local `ws` (waitable-set) as
+/// scratch. After this helper returns, the instruction stream has:
+///
+/// - Extracted the raw subtask handle (`packed >> 4`) into `st`.
+/// - If the handle is nonzero (task still pending): created a new
+///   waitable-set, joined the subtask to it, waited until the
+///   `event_ptr` buffer is populated, then dropped both the subtask
+///   and the waitable-set.
+///
+/// `canon lower async` returns a packed i32: low 4 bits are the
+/// Status tag (`Returned=2` means sync-done; `Started=1` means
+/// pending) and the upper 28 bits hold the raw subtask handle
+/// (`0` when sync-done). Shifting right by 4 discards the tag.
+fn emit_wait_loop(f: &mut Function, st: u32, ws: u32, ctx: &WaitLoopCtx) {
+    // Extract raw handle from packed value: handle = packed >> 4
+    f.instruction(&Instruction::LocalGet(st));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32ShrU);
+    f.instruction(&Instruction::LocalSet(st));
+    // If handle != 0 (task is still pending), wait for it.
+    f.instruction(&Instruction::LocalGet(st));
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Call(ctx.waitable_new_fn));
+    f.instruction(&Instruction::LocalSet(ws));
+    // waitable.join(waitable_handle, set_handle)
+    f.instruction(&Instruction::LocalGet(st));
+    f.instruction(&Instruction::LocalGet(ws));
+    f.instruction(&Instruction::Call(ctx.waitable_join_fn));
+    f.instruction(&Instruction::LocalGet(ws));
+    f.instruction(&Instruction::I32Const(ctx.event_ptr as i32));
+    f.instruction(&Instruction::Call(ctx.waitable_wait_fn));
+    f.instruction(&Instruction::Drop);
+    // Drop subtask first (it is a child of ws in the resource table).
+    f.instruction(&Instruction::LocalGet(st));
+    f.instruction(&Instruction::Call(ctx.subtask_drop_fn));
+    f.instruction(&Instruction::LocalGet(ws));
+    f.instruction(&Instruction::Call(ctx.waitable_drop_fn));
+    f.instruction(&Instruction::End);
+}
+
+/// Everything the code-section phase helpers thread through on every
+/// wrapper body they build. Populated once in [`build_dispatch_module`]
+/// after the types/imports sections finish, then passed by reference
+/// into [`emit_wrapper_body`].
+struct DispatchCodeCtx<'a> {
+    before_import_fn: Option<u32>,
+    after_import_fn: Option<u32>,
+    blocking_import_fn: Option<u32>,
+    handler_import_fn_base: u32,
+    /// `task_return_fns[i]` is the `task_return_f{i}` import index for
+    /// async func `i`, or `None` for sync funcs.
+    task_return_fns: &'a [Option<u32>],
+    /// Memory offset for the `should_block_call` bool result. Must be
+    /// `Some` whenever `blocking_import_fn` is `Some`.
+    block_result_ptr: Option<u32>,
+    has_blocking: bool,
+    wait: WaitLoopCtx,
+    arena: &'a TypeArena,
+}
+
+/// Emit the full wrapper body for func `fi`, including all five
+/// phases (before, blocking, handler call, after, return) and the
+/// final `End` opcode.
+fn emit_wrapper_body(
+    f: &mut Function,
+    fi: usize,
+    func: &AdapterFunc,
+    ctx: &DispatchCodeCtx<'_>,
+) -> anyhow::Result<()> {
+    let has_result = func.result_type_id.is_some();
+
+    // Blocking + non-void sync is rejected — the adapter can't
+    // fabricate a replacement return value when the call is skipped.
+    // Blocking + async-with-result hits the same wall inside
+    // emit_blocking_phase below.
+    if ctx.has_blocking && has_result && !func.is_async {
+        anyhow::bail!(
+            "Function '{}' returns a value but the middleware exports \
+             `should-block-call`. Tier-1 blocking is only supported for \
+             void-returning functions because the adapter cannot synthesize \
+             a return value when the call is blocked. Tier-3 (read-write \
+             interception) will support this in the future.",
+            func.name
+        );
+    }
+
+    // Locals beyond params: [subtask: i32, ws: i32] for async/hook
+    // machinery. Sync-complex wrappers don't need extra locals — the
+    // result buffer is at a fixed address.
+    let first_local = func.core_params.len() as u32;
+    let subtask_local = first_local;
+    let ws_local = first_local + 1;
+
+    emit_before_phase(f, func, ctx, subtask_local, ws_local);
+    emit_blocking_phase(f, fi, func, ctx, subtask_local, ws_local)?;
+    let result_local_idx = emit_handler_call_phase(f, fi, func, ctx, subtask_local, ws_local);
+    emit_after_phase(f, func, ctx, subtask_local, ws_local);
+    emit_return_phase(f, fi, func, ctx, result_local_idx);
+
+    f.instruction(&Instruction::End);
+    Ok(())
+}
+
+/// Phase 1: call `before_call(name_ptr, name_len)` and await the
+/// returned subtask handle. No-op when the middleware doesn't export
+/// `splicer:tier1/before`.
+fn emit_before_phase(
+    f: &mut Function,
+    func: &AdapterFunc,
+    ctx: &DispatchCodeCtx<'_>,
+    subtask_local: u32,
+    ws_local: u32,
+) {
+    if let Some(before_fn) = ctx.before_import_fn {
+        f.instruction(&Instruction::I32Const(func.name_offset as i32));
+        f.instruction(&Instruction::I32Const(func.name_len as i32));
+        f.instruction(&Instruction::Call(before_fn));
+        f.instruction(&Instruction::LocalSet(subtask_local));
+        emit_wait_loop(f, subtask_local, ws_local, &ctx.wait);
+    }
+}
+
+/// Phase 2: call `should_block_call(name_ptr, name_len, result_ptr)`,
+/// await it, read the bool at `result_ptr`, and `return` early (after
+/// calling `task.return` for async-void) if the middleware said to
+/// block. No-op when the middleware doesn't export
+/// `splicer:tier1/blocking`.
+///
+/// Errors if the target func is async with a non-void result — tier-1
+/// blocking can only synthesize a return for void funcs. Tier-3 is
+/// the path for "block + synthesize a result".
+fn emit_blocking_phase(
+    f: &mut Function,
+    fi: usize,
+    func: &AdapterFunc,
+    ctx: &DispatchCodeCtx<'_>,
+    subtask_local: u32,
+    ws_local: u32,
+) -> anyhow::Result<()> {
+    let Some(block_fn) = ctx.blocking_import_fn else {
+        return Ok(());
+    };
+    if func.result_type_id.is_some() {
+        anyhow::bail!(
+            "Function '{}' is async with a return value and the middleware \
+             exports `should-block-call`. Tier-1 blocking is not supported \
+             for async functions with results. Tier-3 (read-write \
+             interception) will support this in the future.",
+            func.name
+        );
+    }
+    let blk_ptr = ctx
+        .block_result_ptr
+        .expect("block_result_ptr set when has_blocking");
+    f.instruction(&Instruction::I32Const(func.name_offset as i32));
+    f.instruction(&Instruction::I32Const(func.name_len as i32));
+    f.instruction(&Instruction::I32Const(blk_ptr as i32));
+    f.instruction(&Instruction::Call(block_fn));
+    f.instruction(&Instruction::LocalSet(subtask_local));
+    emit_wait_loop(f, subtask_local, ws_local, &ctx.wait);
+    // Load the bool result and conditionally return (block the call).
+    f.instruction(&Instruction::I32Const(blk_ptr as i32));
+    f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::If(BlockType::Empty));
+    // Async-lifted functions MUST call task.return before returning.
+    // For void async: task.return with no args.
+    // (Blocking with a result-returning async function is rejected above.)
+    if let Some(tr_fn) = ctx.task_return_fns[fi] {
+        f.instruction(&Instruction::Call(tr_fn));
+    }
+    f.instruction(&Instruction::Return);
+    f.instruction(&Instruction::End);
+    Ok(())
+}
+
+/// Phase 3: call the target func's handler import. Three shapes:
+///
+/// - **async**: params (+ optional `result_ptr`) → subtask handle,
+///   awaited via [`emit_wait_loop`].
+/// - **sync complex** (multi-value result): params + `retptr` → `()`;
+///   the handler writes flat results at the adapter's pre-reserved
+///   result buffer, which phase 5 returns.
+/// - **sync simple**: params → flat results; when an after-call hook
+///   will fire before the return, stash the result into a local.
+///
+/// Returns `Some(local_idx)` when phase 5 needs to re-push the stashed
+/// sync-simple result (only when `after_call` is present and the func
+/// has a result), `None` otherwise.
+fn emit_handler_call_phase(
+    f: &mut Function,
+    fi: usize,
+    func: &AdapterFunc,
+    ctx: &DispatchCodeCtx<'_>,
+    subtask_local: u32,
+    ws_local: u32,
+) -> Option<u32> {
+    let handler_fn = ctx.handler_import_fn_base + fi as u32;
+
+    if func.is_async {
+        // async: (flat_params...[, result_ptr]) -> subtask
+        for (pi, _) in func.core_params.iter().enumerate() {
+            f.instruction(&Instruction::LocalGet(pi as u32));
+        }
+        if let Some(result_ptr) = func.async_result_mem_offset {
+            f.instruction(&Instruction::I32Const(result_ptr as i32));
+        }
+        f.instruction(&Instruction::Call(handler_fn));
+        f.instruction(&Instruction::LocalSet(subtask_local));
+        emit_wait_loop(f, subtask_local, ws_local, &ctx.wait);
+        None
+    } else if func.result_is_complex {
+        // sync complex: canon lift expects `(core_params) -> (i32)`
+        // and canon lower produces `(core_params, retptr: i32) -> ()`.
+        // We call the handler with a pre-reserved result-buffer
+        // address; phase 5 returns that address.
+        let result_buf = func
+            .sync_result_mem_offset
+            .expect("sync_result_mem_offset must be set for sync complex");
+        for (pi, _) in func.core_params.iter().enumerate() {
+            f.instruction(&Instruction::LocalGet(pi as u32));
+        }
+        f.instruction(&Instruction::I32Const(result_buf as i32));
+        f.instruction(&Instruction::Call(handler_fn));
+        None
+    } else {
+        // sync simple: call handler, stash result if after-call will
+        // fire before the return (otherwise leave it on the stack).
+        let result_local = if ctx.after_import_fn.is_some() && func.result_type_id.is_some() {
+            Some(func.core_params.len() as u32)
+        } else {
+            None
+        };
+
+        for (pi, _) in func.core_params.iter().enumerate() {
+            f.instruction(&Instruction::LocalGet(pi as u32));
+        }
+        f.instruction(&Instruction::Call(handler_fn));
+
+        if let Some(local_idx) = result_local {
+            f.instruction(&Instruction::LocalSet(local_idx));
+        }
+        result_local
+    }
+}
+
+/// Phase 4: call `after_call(name_ptr, name_len)` and await the
+/// returned subtask handle. No-op when the middleware doesn't export
+/// `splicer:tier1/after`.
+fn emit_after_phase(
+    f: &mut Function,
+    func: &AdapterFunc,
+    ctx: &DispatchCodeCtx<'_>,
+    subtask_local: u32,
+    ws_local: u32,
+) {
+    if let Some(after_fn) = ctx.after_import_fn {
+        f.instruction(&Instruction::I32Const(func.name_offset as i32));
+        f.instruction(&Instruction::I32Const(func.name_len as i32));
+        f.instruction(&Instruction::Call(after_fn));
+        f.instruction(&Instruction::LocalSet(subtask_local));
+        emit_wait_loop(f, subtask_local, ws_local, &ctx.wait);
+    }
+}
+
+/// Phase 5: produce the wrapper's return value. Three shapes,
+/// mirroring phase 3:
+///
+/// - **async**: call `task.return`, loading flat result values from
+///   `async_result_mem_offset` first for non-void results (via
+///   [`emit_task_return_loads`] for multi-value results). Async lifts
+///   MUST call `task.return` before the function's `End`, even for
+///   void results.
+/// - **sync complex**: push the result-buffer pointer as the wrapper's
+///   single i32 return.
+/// - **sync simple**: re-push the stashed result local (if any) so
+///   canon lift sees the original handler return.
+fn emit_return_phase(
+    f: &mut Function,
+    fi: usize,
+    func: &AdapterFunc,
+    ctx: &DispatchCodeCtx<'_>,
+    result_local_idx: Option<u32>,
+) {
+    if func.is_async {
+        if let Some(result_ptr) = func.async_result_mem_offset {
+            if let Some(tr_fn) = ctx.task_return_fns[fi] {
+                if func.result_is_complex {
+                    emit_task_return_loads(
+                        f,
+                        result_ptr,
+                        func.result_type_id.unwrap(),
+                        &func.core_results,
+                        ctx.arena,
+                    );
+                } else {
+                    f.instruction(&Instruction::I32Const(result_ptr as i32));
+                    emit_load(f, 0, &func.core_results[0]);
+                }
+                f.instruction(&Instruction::Call(tr_fn));
+            }
+        } else if let Some(tr_fn) = ctx.task_return_fns[fi] {
+            // Void async: task.return with no args (still required before End).
+            f.instruction(&Instruction::Call(tr_fn));
+        }
+    } else if func.result_is_complex {
+        let result_buf = func
+            .sync_result_mem_offset
+            .expect("sync_result_mem_offset must be set for sync complex");
+        f.instruction(&Instruction::I32Const(result_buf as i32));
+    } else if let Some(local_idx) = result_local_idx {
+        f.instruction(&Instruction::LocalGet(local_idx));
+    }
+}
+
+/// Emit the function-name blob as an active data segment starting at
+/// memory offset 0. Each [`AdapterFunc`] has `name_offset` / `name_len`
+/// pre-computed against this layout, so the wrappers can pass
+/// `(name_ptr, name_len)` to the hooks as raw memory slices.
+fn emit_function_name_data(module: &mut Module, funcs: &[AdapterFunc]) {
+    let mut data_section = DataSection::new();
+    let all_names: Vec<u8> = funcs
+        .iter()
+        .flat_map(|f| f.name.as_bytes().iter().copied())
+        .collect();
+    data_section.active(0, &wasm_encoder::ConstExpr::i32_const(0), all_names);
+    module.section(&data_section);
+}
+
 /// Build the dispatch core Wasm module.
 ///
 /// Handles both sync and async functions in the same module.
@@ -319,8 +849,6 @@ pub(super) fn build_dispatch_module(
     has_blocking: bool,
     event_ptr: u32,
     block_result_ptr: Option<u32>,
-    needs_realloc: bool,
-    bump_start: u32,
     arena: &TypeArena,
 ) -> anyhow::Result<Vec<u8>> {
     let has_async = funcs.iter().any(|f| f.is_async);
@@ -376,58 +904,20 @@ pub(super) fn build_dispatch_module(
             .ty()
             .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
 
-        // wrapper types (what canon lift expects from our exported wrapper):
-        //   - async: (flat_params...) -> void
-        //   - sync simple: (flat_params...) -> (flat_results...)
-        //   - sync complex: (flat_params...) -> (i32)  [returns result ptr]
-        for func in funcs {
-            ty_idx += 1;
-            if func.is_async {
-                types.ty().function(func.core_params.iter().copied(), []);
-            } else if func.result_is_complex {
-                // canon lift for multi-value results: the core function
-                // returns a single i32 — a pointer to the flat results
-                // in linear memory. The runtime reads from there.
-                types
-                    .ty()
-                    .function(func.core_params.iter().copied(), [ValType::I32]);
-            } else {
-                types.ty().function(
-                    func.core_params.iter().copied(),
-                    func.core_results.iter().copied(),
-                );
-            }
-        }
-
-        // Sync-complex handler import types: canon lower uses the
-        // retptr pattern (extra i32 param, void return) — different
-        // from the wrapper type which returns an i32 pointer.
-        for (i, func) in funcs.iter().enumerate() {
-            if !func.is_async && func.result_is_complex {
-                sync_complex_handler_tys[i] = Some(ty_idx);
-                ty_idx += 1;
-                let mut params: Vec<ValType> = func.core_params.clone();
-                params.push(ValType::I32); // retptr
-                types.ty().function(params.iter().copied(), []);
-            }
-        }
+        // Wrapper types (slots 2..2+N), then sync-complex handler
+        // import types, then — only when any async/hook machinery is
+        // in play — async handler types + the shared async builtin
+        // types + per-func custom task.return types.
+        emit_wrapper_types(&mut types, &mut ty_idx, funcs);
+        emit_sync_complex_handler_types(
+            &mut types,
+            &mut ty_idx,
+            funcs,
+            &mut sync_complex_handler_tys,
+        );
 
         if has_async_machinery {
-            // Async handler call types: (flat_params..., result_ptr?) -> i32
-            let mut async_count: u32 = 0;
-            for (i, func) in funcs.iter().enumerate() {
-                if func.is_async {
-                    async_ds_tys[i] = Some(ty_idx);
-                    ty_idx += 1;
-                    async_count += 1;
-                    let mut params: Vec<ValType> = func.core_params.clone();
-                    if func.result_type_id.is_some() {
-                        params.push(ValType::I32); // result_ptr
-                    }
-                    types.ty().function(params, [ValType::I32]);
-                }
-            }
-            let _ = async_count;
+            emit_async_handler_types(&mut types, &mut ty_idx, funcs, &mut async_ds_tys);
 
             waitable_new_ty = ty_idx;
             ty_idx += 1;
@@ -463,16 +953,10 @@ pub(super) fn build_dispatch_module(
             // No further reads of ty_idx after this point — the per-function
             // custom task.return types live at indices `void_void_ty + 1 + N`
             // and are tracked separately in the import phase via
-            // `custom_tr_ty_idx` (see line ~515).
+            // `custom_tr_ty_idx` inside emit_task_return_imports.
             types.ty().function([], []);
 
-            // Per-function custom task.return types for multi-value results.
-            // Only emitted for async funcs with result_is_complex (>1 flat value).
-            for func in funcs.iter() {
-                if func.is_async && func.result_is_complex {
-                    types.ty().function(func.core_results.iter().copied(), []);
-                }
-            }
+            emit_custom_task_return_types(&mut types, funcs);
         } else {
             // Placeholders — never used when has_async is false.
             waitable_new_ty = 0;
@@ -484,10 +968,6 @@ pub(super) fn build_dispatch_module(
             void_f64_ty = 0;
             void_void_ty = 0;
         }
-
-        // NOTE: realloc type is now in the memory module, not here.
-        let _ = needs_realloc;
-        let _ = bump_start;
 
         module.section(&types);
     }
@@ -549,23 +1029,14 @@ pub(super) fn build_dispatch_module(
             None
         };
 
-        // Handler funcs — type depends on calling convention:
-        //   - sync simple: same as wrapper type (single-value or void)
-        //   - sync complex: separate type (canon lower uses retptr
-        //     pattern: params + retptr → void; wrapper returns ptr)
-        //   - async: separate async_ds_ty (canon lower async)
-        handler_import_fn_base = fn_idx;
-        for (i, func) in funcs.iter().enumerate() {
-            let ty = if func.is_async {
-                async_ds_tys[i].expect("async_ds_ty must be set for async func")
-            } else if let Some(handler_ty) = sync_complex_handler_tys[i] {
-                handler_ty
-            } else {
-                wrapper_ty_base + i as u32
-            };
-            imports.import("env", &format!("handler_f{i}"), EntityType::Function(ty));
-        }
-        fn_idx += funcs.len() as u32;
+        handler_import_fn_base = emit_handler_imports(
+            &mut imports,
+            &mut fn_idx,
+            funcs,
+            wrapper_ty_base,
+            &async_ds_tys,
+            &sync_complex_handler_tys,
+        );
 
         // Async builtins — only imported if needed.
         if has_async_machinery {
@@ -597,39 +1068,16 @@ pub(super) fn build_dispatch_module(
             fn_idx += 1;
             imports.import("env", "subtask_drop", EntityType::Function(void_i32_ty));
 
-            // task.return per async func (void or non-void).
-            // Multi-value results use custom types emitted after void_void_ty.
-            let mut trf: Vec<Option<u32>> = vec![None; funcs.len()];
-            // The custom multi-value task.return types start after void_void_ty + 1.
-            let mut custom_tr_ty_idx = void_void_ty + 1;
-            for (i, func) in funcs.iter().enumerate() {
-                if func.is_async {
-                    let tr_ty = if func.result_type_id.is_none() {
-                        void_void_ty
-                    } else if func.result_is_complex {
-                        // Multi-value: use per-function custom type.
-                        let ty = custom_tr_ty_idx;
-                        custom_tr_ty_idx += 1;
-                        ty
-                    } else {
-                        // Single-value: use the matching primitive type.
-                        match func.core_results.first() {
-                            Some(ValType::I32) => void_i32_ty,
-                            Some(ValType::I64) => void_i64_ty,
-                            Some(ValType::F32) => void_f32_ty,
-                            Some(ValType::F64) => void_f64_ty,
-                            _ => void_i32_ty,
-                        }
-                    };
-                    trf[i] = Some(fn_idx);
-                    fn_idx += 1;
-                    imports.import(
-                        "env",
-                        &format!("task_return_f{i}"),
-                        EntityType::Function(tr_ty),
-                    );
-                }
-            }
+            let trf = emit_task_return_imports(
+                &mut imports,
+                &mut fn_idx,
+                funcs,
+                void_void_ty,
+                void_i32_ty,
+                void_i64_ty,
+                void_f32_ty,
+                void_f64_ty,
+            );
             task_return_fns = trf;
         } else {
             waitable_new_fn = 0;
@@ -663,8 +1111,6 @@ pub(super) fn build_dispatch_module(
         module.section(&fn_section);
     }
 
-    // NOTE: Global section for bump allocator is now in the memory module.
-
     // ── Export section ────────────────────────────────────────────────────
 
     {
@@ -677,237 +1123,41 @@ pub(super) fn build_dispatch_module(
 
     // ── Code section ──────────────────────────────────────────────────────
 
+    let code_ctx = DispatchCodeCtx {
+        before_import_fn,
+        after_import_fn,
+        blocking_import_fn,
+        handler_import_fn_base,
+        task_return_fns: &task_return_fns,
+        block_result_ptr,
+        has_blocking,
+        wait: WaitLoopCtx {
+            waitable_new_fn,
+            waitable_join_fn,
+            waitable_wait_fn,
+            subtask_drop_fn,
+            waitable_drop_fn,
+            event_ptr,
+        },
+        arena,
+    };
     {
         let mut code_section = CodeSection::new();
-
-        // Macro: await a packed return value from `canon lower async` stored in `$st`.
-        //
-        // `canon lower async` returns a packed i32:
-        //   low 4 bits = Status (Returned=2 means sync-done; Started=1 means pending)
-        //   upper 28 bits = raw subtask handle (0 when done synchronously)
-        //
-        // We shift right by 4 to get the raw handle. Handle=0 → already done, skip wait.
-        // Handle != 0 → add to a new waitable-set and block until the event fires.
-        // After this macro, `$st` holds the (possibly 0) raw handle (already dropped).
-        macro_rules! emit_wait_loop {
-            ($f:expr, $st:expr, $ws:expr) => {{
-                // Extract raw handle from packed value: handle = packed >> 4
-                $f.instruction(&Instruction::LocalGet($st));
-                $f.instruction(&Instruction::I32Const(4));
-                $f.instruction(&Instruction::I32ShrU);
-                $f.instruction(&Instruction::LocalSet($st));
-                // If handle != 0 (task is still pending), wait for it.
-                $f.instruction(&Instruction::LocalGet($st));
-                $f.instruction(&Instruction::If(BlockType::Empty));
-                $f.instruction(&Instruction::Call(waitable_new_fn));
-                $f.instruction(&Instruction::LocalSet($ws));
-                // waitable.join(waitable_handle, set_handle)
-                $f.instruction(&Instruction::LocalGet($st));
-                $f.instruction(&Instruction::LocalGet($ws));
-                $f.instruction(&Instruction::Call(waitable_join_fn));
-                $f.instruction(&Instruction::LocalGet($ws));
-                $f.instruction(&Instruction::I32Const(event_ptr as i32));
-                $f.instruction(&Instruction::Call(waitable_wait_fn));
-                $f.instruction(&Instruction::Drop);
-                // Drop subtask first (it is a child of ws in the resource table).
-                $f.instruction(&Instruction::LocalGet($st));
-                $f.instruction(&Instruction::Call(subtask_drop_fn));
-                $f.instruction(&Instruction::LocalGet($ws));
-                $f.instruction(&Instruction::Call(waitable_drop_fn));
-                $f.instruction(&Instruction::End);
-            }};
-        }
-
         for (fi, func) in funcs.iter().enumerate() {
-            let has_result = func.result_type_id.is_some();
-
-            if has_blocking && has_result && !func.is_async {
-                anyhow::bail!(
-                    "Function '{}' returns a value but the middleware exports \
-                     `should-block-call`. Tier-1 blocking is only supported for \
-                     void-returning functions because the adapter cannot synthesize \
-                     a return value when the call is blocked. Tier-3 (read-write \
-                     interception) will support this in the future.",
-                    func.name
-                );
-            }
-            // Locals beyond params: [subtask: i32, ws: i32] for
-            // async/hook machinery. Sync-complex wrappers don't need
-            // extra locals — the result buffer is at a fixed address.
-            let first_local = func.core_params.len() as u32;
-            let subtask_local = first_local;
-            let ws_local = first_local + 1;
-            let locals: Vec<(u32, ValType)> = vec![(2, ValType::I32)];
-            let mut f = Function::new(locals);
-
-            // 1. before-call (async: returns subtask handle)
-            if let Some(before_fn) = before_import_fn {
-                f.instruction(&Instruction::I32Const(func.name_offset as i32));
-                f.instruction(&Instruction::I32Const(func.name_len as i32));
-                f.instruction(&Instruction::Call(before_fn));
-                f.instruction(&Instruction::LocalSet(subtask_local));
-                emit_wait_loop!(f, subtask_local, ws_local);
-            }
-
-            // 2. blocking (void async only; async: returns subtask + writes bool to result_ptr)
-            if let Some(block_fn) = blocking_import_fn {
-                if has_result {
-                    anyhow::bail!(
-                        "Function '{}' is async with a return value and the middleware \
-                             exports `should-block-call`. Tier-1 blocking is not supported \
-                             for async functions with results. Tier-3 (read-write \
-                             interception) will support this in the future.",
-                        func.name
-                    );
-                }
-                let blk_ptr = block_result_ptr.expect("block_result_ptr set when has_blocking");
-                f.instruction(&Instruction::I32Const(func.name_offset as i32));
-                f.instruction(&Instruction::I32Const(func.name_len as i32));
-                f.instruction(&Instruction::I32Const(blk_ptr as i32));
-                f.instruction(&Instruction::Call(block_fn));
-                f.instruction(&Instruction::LocalSet(subtask_local));
-                emit_wait_loop!(f, subtask_local, ws_local);
-                // Load the bool result and conditionally return (block the call).
-                f.instruction(&Instruction::I32Const(blk_ptr as i32));
-                f.instruction(&Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: 0,
-                    align: 0,
-                    memory_index: 0,
-                }));
-                f.instruction(&Instruction::If(BlockType::Empty));
-                // Async-lifted functions MUST call task.return before returning.
-                // For void async: task.return with no args.
-                // (Blocking with a result-returning async function is rejected earlier.)
-                if let Some(tr_fn) = task_return_fns[fi] {
-                    f.instruction(&Instruction::Call(tr_fn));
-                }
-                f.instruction(&Instruction::Return);
-                f.instruction(&Instruction::End);
-            }
-
-            let mut result_local_idx = None;
-            if func.is_async {
-                // 3. Call async-lowered handler: (flat_params...[, result_ptr]) -> subtask
-                let handler_fn = handler_import_fn_base + fi as u32;
-                for (pi, _) in func.core_params.iter().enumerate() {
-                    f.instruction(&Instruction::LocalGet(pi as u32));
-                }
-                if let Some(result_ptr) = func.async_result_mem_offset {
-                    f.instruction(&Instruction::I32Const(result_ptr as i32));
-                }
-                f.instruction(&Instruction::Call(handler_fn));
-                f.instruction(&Instruction::LocalSet(subtask_local));
-                emit_wait_loop!(f, subtask_local, ws_local);
-            } else if func.result_is_complex {
-                // ── Sync wrapper with complex result ──────────────────────────
-                //
-                // canon lift expects: `(core_params) -> (i32)` — the
-                // wrapper returns a pointer to the flat results in
-                // linear memory.
-                //
-                // canon lower produces: `(core_params, retptr: i32) -> ()`
-                // — the handler takes an extra retptr and writes the
-                // flat results there.
-                //
-                // The wrapper calls the handler with a known result-
-                // buffer address and returns that address.
-                let handler_fn = handler_import_fn_base + fi as u32;
-                let result_buf = func
-                    .sync_result_mem_offset
-                    .expect("sync_result_mem_offset must be set for sync complex");
-
-                // 3. Call handler with params + result buffer address
-                for (pi, _) in func.core_params.iter().enumerate() {
-                    f.instruction(&Instruction::LocalGet(pi as u32));
-                }
-                f.instruction(&Instruction::I32Const(result_buf as i32));
-                f.instruction(&Instruction::Call(handler_fn));
-                // Handler wrote flat results at result_buf.
-            } else {
-                // ── Sync wrapper (single-value or void result) ────────────────
-                if has_after && has_result {
-                    result_local_idx = Some(func.core_params.len() as u32);
-                }
-
-                // 3. Call handler
-                let handler_fn = handler_import_fn_base + fi as u32;
-                for (pi, _) in func.core_params.iter().enumerate() {
-                    f.instruction(&Instruction::LocalGet(pi as u32));
-                }
-                f.instruction(&Instruction::Call(handler_fn));
-
-                if let Some(local_idx) = result_local_idx {
-                    f.instruction(&Instruction::LocalSet(local_idx));
-                }
-            }
-
-            // 4. after-call (async: returns subtask handle)
-            if let Some(after_fn) = after_import_fn {
-                f.instruction(&Instruction::I32Const(func.name_offset as i32));
-                f.instruction(&Instruction::I32Const(func.name_len as i32));
-                f.instruction(&Instruction::Call(after_fn));
-                f.instruction(&Instruction::LocalSet(subtask_local));
-                emit_wait_loop!(f, subtask_local, ws_local);
-            }
-
-            if func.is_async {
-                // 5. task.return — required for ALL async-lifted wrappers before End.
-                if let Some(result_ptr) = func.async_result_mem_offset {
-                    if let Some(tr_fn) = task_return_fns[fi] {
-                        if func.result_is_complex {
-                            // Multi-value result: read flat values from memory.
-                            // For result<T, E>: read discriminant + first payload, zero rest.
-                            emit_task_return_loads(
-                                &mut f,
-                                result_ptr,
-                                func.result_type_id.unwrap(),
-                                &func.core_results,
-                                arena,
-                            );
-                        } else {
-                            // Simple (single value): load from memory.
-                            f.instruction(&Instruction::I32Const(result_ptr as i32));
-                            emit_load(&mut f, 0, &func.core_results[0]);
-                        }
-                        f.instruction(&Instruction::Call(tr_fn));
-                    }
-                } else if let Some(tr_fn) = task_return_fns[fi] {
-                    // Void async: task.return with no args (still required before End).
-                    f.instruction(&Instruction::Call(tr_fn));
-                }
-            } else if func.result_is_complex {
-                // 5. Sync complex: return the result buffer pointer.
-                let result_buf = func
-                    .sync_result_mem_offset
-                    .expect("sync_result_mem_offset must be set for sync complex");
-                f.instruction(&Instruction::I32Const(result_buf as i32));
-            } else {
-                // 5. Sync single-value: return the result (if any).
-                if let Some(local_idx) = result_local_idx {
-                    f.instruction(&Instruction::LocalGet(local_idx));
-                }
-            }
-
-            f.instruction(&Instruction::End);
+            // Every wrapper reserves two scratch i32 locals after its
+            // params: subtask handle + waitable-set handle. Used by
+            // the hook-await path; harmless (but unused) for
+            // sync-simple funcs without any hooks.
+            let mut f = Function::new(vec![(2, ValType::I32)]);
+            emit_wrapper_body(&mut f, fi, func, &code_ctx)?;
             code_section.function(&f);
         }
-
-        // NOTE: realloc is now in the memory module, not here.
-
         module.section(&code_section);
-
-        // ── Data section ──────────────────────────────────────────────────────
-
-        {
-            let mut data_section = DataSection::new();
-            let all_names: Vec<u8> = funcs
-                .iter()
-                .flat_map(|f| f.name.as_bytes().iter().copied())
-                .collect();
-            data_section.active(0, &wasm_encoder::ConstExpr::i32_const(0), all_names);
-            module.section(&data_section);
-        }
     }
+
+    // ── Data section ──────────────────────────────────────────────────────
+
+    emit_function_name_data(&mut module, funcs);
 
     Ok(module.finish().to_vec())
 }

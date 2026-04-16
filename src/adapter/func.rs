@@ -11,10 +11,11 @@
 //! [`extract_adapter_funcs`] turns a cviz `InterfaceType::Instance`
 //! into a `Vec<AdapterFunc>` ready to feed to the builders.
 
-use cviz::model::{InterfaceType, TypeArena, ValueTypeId};
+use cviz::model::{FuncSignature, InterfaceType, TypeArena, ValueTypeId};
 use wasm_encoder::ValType;
 
-use super::ty::{align_to_val, flat_types_for, type_has_strings, val_type_byte_size};
+use super::mem_layout::MemoryLayoutBuilder;
+use super::ty::{flat_types_for, type_has_strings, FlatLayout};
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
@@ -52,10 +53,6 @@ pub(super) struct AdapterFunc {
     /// be written by the async-lowered handler call. `None` for
     /// sync functions or async void functions.
     pub async_result_mem_offset: Option<u32>,
-    /// Number of bytes reserved for the async result in linear
-    /// memory. 8 for simple (fits in one register), 512 for
-    /// complex (pointer-based) results.
-    pub async_result_mem_size: u32,
     /// For sync functions with complex results (`result_is_complex`):
     /// the byte offset within the dispatch module's memory where the
     /// wrapper stores the result buffer address that canon lift reads
@@ -101,7 +98,7 @@ impl AdapterFunc {
 pub(super) fn extract_adapter_funcs(
     iface_ty: &InterfaceType,
     arena: &TypeArena,
-) -> anyhow::Result<Vec<AdapterFunc>> {
+) -> anyhow::Result<(Vec<AdapterFunc>, MemoryLayoutBuilder)> {
     let inst = match iface_ty {
         InterfaceType::Instance(i) => i,
         InterfaceType::Func(_) => anyhow::bail!(
@@ -111,100 +108,131 @@ pub(super) fn extract_adapter_funcs(
         ),
     };
 
-    let mut funcs = Vec::new();
-    let mut name_offset: u32 = 0;
-    // Result buffer storage lives right after the concatenated
-    // function-name bytes, aligned up to 4 bytes so that i32/f32
-    // loads and stores are naturally aligned. This cursor tracks
-    // the next free byte for both async result buffers and
-    // sync-complex retptr buffers.
     let total_name_bytes: u32 = inst.functions.keys().map(|n| n.len() as u32).sum();
-    let result_buf_base: u32 = align_to_val(total_name_bytes, 4);
-    let mut result_buf_cursor: u32 = result_buf_base;
+    let mut layout = MemoryLayoutBuilder::new(total_name_bytes);
+    let mut funcs = Vec::with_capacity(inst.functions.len());
 
     for (name, sig) in &inst.functions {
-        let mut param_names = Vec::new();
-        let mut param_type_ids = Vec::new();
-        let mut core_params = Vec::new();
-        for (i, &id) in sig.params.iter().enumerate() {
-            let pname = if i < sig.param_names.len() {
-                sig.param_names[i].clone()
-            } else {
-                format!("p{i}")
-            };
-            param_names.push(pname);
-            param_type_ids.push(id);
-            core_params.extend(flat_types_for(id, arena));
-        }
+        let extracted = extract_func_sig(name, sig, arena)?;
+        let name_len = name.len() as u32;
+        let name_offset = layout.alloc_name(name_len);
 
-        if sig.results.len() > 1 {
-            anyhow::bail!(
-                "Function '{}' has {} results; only 0 or 1 results are supported \
-                 for tier-1 adapter generation. If you need multi-result support, \
-                 please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
-                name,
-                sig.results.len()
-            );
-        }
+        let has_result = extracted.result_type_id.is_some();
+        let async_result_mem_offset = (extracted.is_async && has_result)
+            .then(|| layout.alloc_async_result(extracted.result_byte_size));
+        let sync_result_mem_offset = (!extracted.is_async && extracted.result_is_complex)
+            .then(|| layout.alloc_sync_result(extracted.result_byte_size));
 
-        let (result_type_id, result_is_complex, core_results) = if sig.results.is_empty() {
-            (None, false, vec![])
+        funcs.push(AdapterFunc {
+            name: name.clone(),
+            is_async: extracted.is_async,
+            param_names: extracted.param_names,
+            param_type_ids: extracted.param_type_ids,
+            result_type_id: extracted.result_type_id,
+            result_is_complex: extracted.result_is_complex,
+            core_params: extracted.core_params,
+            core_results: extracted.core_results,
+            name_offset,
+            name_len,
+            async_result_mem_offset,
+            sync_result_mem_offset,
+        });
+    }
+    // The builder is returned (not dropped) so the adapter builder
+    // can continue appending fixed slots — event record, block
+    // result, bump_start — without re-deriving the post-func cursor
+    // from the funcs table.
+    Ok((funcs, layout))
+}
+
+/// Intermediate value: everything pulled out of a single cviz
+/// [`FuncSignature`] that doesn't depend on where the func ends up in
+/// the dispatch module's memory layout. Produced by
+/// [`extract_func_sig`], consumed by [`extract_adapter_funcs`] as it
+/// interleaves signature data with per-func memory-offset allocation.
+struct ExtractedSig {
+    is_async: bool,
+    param_names: Vec<String>,
+    param_type_ids: Vec<ValueTypeId>,
+    result_type_id: Option<ValueTypeId>,
+    /// `true` when the flat result won't fit in `MAX_FLAT_RESULTS`
+    /// core values and canon lift/lower fall back to the retptr
+    /// pattern.
+    result_is_complex: bool,
+    core_params: Vec<ValType>,
+    core_results: Vec<ValType>,
+    /// Pre-summed byte size of `core_results`, used by the memory
+    /// layout builder to size the async/sync-complex result buffer.
+    result_byte_size: u32,
+}
+
+/// Resolve a single cviz [`FuncSignature`] into the core-Wasm shape
+/// the adapter builders consume: param-name/type parallel vectors
+/// with a `p{i}` fallback for unnamed params, canonical-ABI flat
+/// types for both params and result, and the
+/// `MAX_FLAT_RESULTS`-based complexity flag.
+///
+/// Errors when a function declares more than one result — we only
+/// support 0 or 1 results today.
+fn extract_func_sig(
+    name: &str,
+    sig: &FuncSignature,
+    arena: &TypeArena,
+) -> anyhow::Result<ExtractedSig> {
+    let mut param_names = Vec::with_capacity(sig.params.len());
+    let mut param_type_ids = Vec::with_capacity(sig.params.len());
+    let mut core_params = Vec::new();
+    for (i, &id) in sig.params.iter().enumerate() {
+        let pname = if i < sig.param_names.len() {
+            sig.param_names[i].clone()
+        } else {
+            format!("p{i}")
+        };
+        param_names.push(pname);
+        param_type_ids.push(id);
+        core_params.extend(flat_types_for(id, arena));
+    }
+
+    if sig.results.len() > 1 {
+        anyhow::bail!(
+            "Function '{}' has {} results; only 0 or 1 results are supported \
+             for tier-1 adapter generation. If you need multi-result support, \
+             please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
+            name,
+            sig.results.len()
+        );
+    }
+
+    let (result_type_id, result_is_complex, core_results, result_byte_size) =
+        if sig.results.is_empty() {
+            (None, false, vec![], 0)
         } else {
             let rid = sig.results[0];
             let flat = flat_types_for(rid, arena);
             let is_complex = flat.len() > 1;
+            // `FlatLayout::total_bytes` accounts for the
+            // discriminant-and-padding shape of `result<T, E>` and
+            // inter-slot natural alignment (`[i32, i64]` is 16 bytes,
+            // not 12), so every result-buffer allocation uses the
+            // same byte size the dispatch module's loads assume.
+            let total_bytes = FlatLayout::new(rid, &flat, arena).total_bytes;
             // Store full flat types. For async functions `task.return`
             // uses these as params (up to MAX_FLAT_PARAMS=16). For sync
             // functions with `is_complex`, the canonical ABI uses a
             // retptr pattern: an extra i32 param is appended and the
             // function returns void (results are written at the retptr
             // by the callee).
-            (Some(rid), is_complex, flat)
+            (Some(rid), is_complex, flat, total_bytes)
         };
 
-        // Compute the exact byte size needed to store the flat result
-        // values in linear memory.
-        let result_byte_size: u32 = core_results.iter().map(val_type_byte_size).sum();
-
-        // For async functions with a result, reserve memory for the
-        // async-lowered handler to write into.
-        let (async_result_mem_offset, async_result_mem_size) =
-            if sig.is_async && result_type_id.is_some() {
-                let off = result_buf_cursor;
-                result_buf_cursor += result_byte_size;
-                (Some(off), result_byte_size)
-            } else {
-                (None, 0)
-            };
-
-        // For sync functions with complex results (> MAX_FLAT_RESULTS),
-        // reserve a result buffer in linear memory. The wrapper stores
-        // handler output here and returns the buffer address to canon lift.
-        let sync_result_mem_offset = if !sig.is_async && result_is_complex {
-            let aligned = align_to_val(result_buf_cursor, 4);
-            result_buf_cursor = aligned + result_byte_size;
-            Some(aligned)
-        } else {
-            None
-        };
-
-        let name_len = name.len() as u32;
-        funcs.push(AdapterFunc {
-            name: name.clone(),
-            is_async: sig.is_async,
-            param_names,
-            param_type_ids,
-            result_type_id,
-            result_is_complex,
-            core_params,
-            core_results,
-            name_offset,
-            name_len,
-            async_result_mem_offset,
-            async_result_mem_size,
-            sync_result_mem_offset,
-        });
-        name_offset += name_len;
-    }
-    Ok(funcs)
+    Ok(ExtractedSig {
+        is_async: sig.is_async,
+        param_names,
+        param_type_ids,
+        result_type_id,
+        result_is_complex,
+        core_params,
+        core_results,
+        result_byte_size,
+    })
 }

@@ -15,6 +15,8 @@
 //!   the [`filter::FilteredSections`] that the adapter builder consumes.
 //! - [`func`] — the [`AdapterFunc`] value object and the cviz →
 //!   `Vec<AdapterFunc>` extraction.
+//! - [`mem_layout`] — [`mem_layout::MemoryLayoutBuilder`], the single
+//!   byte-offset allocator shared by extraction and build phases.
 //! - [`ty`] — canonical-ABI type analysis helpers (flattening,
 //!   alignment, resource collection).
 
@@ -26,6 +28,7 @@ mod dispatch;
 mod encoders;
 mod filter;
 mod func;
+mod mem_layout;
 #[cfg(test)]
 mod tests;
 mod ty;
@@ -66,7 +69,7 @@ pub fn generate_tier1_adapter(
         )
     })?;
 
-    let funcs = extract_adapter_funcs(iface_ty, arena)?;
+    let (funcs, layout) = extract_adapter_funcs(iface_ty, arena)?;
 
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
@@ -107,6 +110,7 @@ pub fn generate_tier1_adapter(
         arena,
         iface_ty,
         &split,
+        layout,
     )?;
 
     let out_path = format!(

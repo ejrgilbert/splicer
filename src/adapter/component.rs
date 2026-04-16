@@ -48,6 +48,7 @@ use super::dispatch::{build_dispatch_module, build_mem_module};
 use super::encoders::{encode_comp_cv, InstTypeCtx};
 use super::filter::FilteredSections;
 use super::func::AdapterFunc;
+use super::mem_layout::MemoryLayoutBuilder;
 use super::ty::type_has_resources;
 
 // ─── Section-emit helpers ──────────────────────────────────────────────────
@@ -663,10 +664,19 @@ struct MemoryLayout {
     has_async_machinery: bool,
 }
 
-/// Compute the dispatch module's static memory layout from the function
-/// table and the hook flags. Pure: no `Component` mutation, no I/O.
+/// Finish the dispatch module's static memory layout: append the
+/// fixed post-func slots (event record, optional block result) and
+/// compute the bump-allocator start. Also derives the
+/// flag-dependent switches (`needs_realloc`, `has_async_machinery`)
+/// the canon-lower / dispatch phases consult.
+///
+/// `layout` is the builder handed over from
+/// [`super::func::extract_adapter_funcs`], with the per-func name
+/// and result-buffer slots already allocated. This function consumes
+/// it.
 fn compute_memory_layout(
     funcs: &[AdapterFunc],
+    mut layout: MemoryLayoutBuilder,
     has_before: bool,
     has_after: bool,
     has_blocking: bool,
@@ -676,24 +686,8 @@ fn compute_memory_layout(
     let has_async = funcs.iter().any(|f| f.is_async);
     let has_async_machinery = has_async || has_before || has_after || has_blocking;
 
-    let event_ptr: u32 = {
-        let total_name_bytes: u32 = funcs.iter().map(|f| f.name_len).sum();
-        let async_result_base = (total_name_bytes + 3) & !3;
-        funcs
-            .iter()
-            .filter_map(|f| {
-                f.async_result_mem_offset
-                    .map(|off| off + f.async_result_mem_size)
-            })
-            .max()
-            .unwrap_or(async_result_base)
-    };
-
-    let block_result_ptr: Option<u32> = if has_blocking {
-        Some(event_ptr + 8)
-    } else {
-        None
-    };
+    let event_ptr = layout.alloc_event_slot();
+    let block_result_ptr = has_blocking.then(|| layout.alloc_block_result());
 
     // Realloc is needed by canon lift (for string params) AND by canon
     // lower (for handler functions with complex result types that contain
@@ -701,11 +695,7 @@ fn compute_memory_layout(
     // it's available for both lowering and lifting.
     let needs_realloc = func_has_strings.iter().any(|&b| b) || any_has_resources;
 
-    // bump_start: first free byte in linear memory after all static data.
-    let bump_start: u32 = {
-        let after_block = event_ptr + 8 + if has_blocking { 4 } else { 0 };
-        (after_block + 7) & !7
-    };
+    let bump_start = layout.finish_as_bump_start();
 
     MemoryLayout {
         event_ptr,
@@ -1037,8 +1027,6 @@ fn emit_dispatch_phase(
             has_blocking,
             layout.event_ptr,
             layout.block_result_ptr,
-            layout.needs_realloc,
-            layout.bump_start,
             arena,
         )?;
         // Use RawSection to embed the pre-built module bytes directly.
@@ -1450,6 +1438,7 @@ pub(super) fn build_adapter_bytes(
     arena: &TypeArena,
     iface_ty: &InterfaceType,
     split: &FilteredSections,
+    layout: MemoryLayoutBuilder,
 ) -> anyhow::Result<Vec<u8>> {
     // Per-function: does any param/result require Memory+UTF8?
     // Uses deep string check (traverses compound types).
@@ -1525,6 +1514,7 @@ pub(super) fn build_adapter_bytes(
 
     let layout = compute_memory_layout(
         funcs,
+        layout,
         has_before,
         has_after,
         has_blocking,

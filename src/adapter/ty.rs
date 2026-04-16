@@ -312,8 +312,11 @@ pub(super) struct FlatSlot {
 #[derive(Clone, Debug)]
 pub(super) struct FlatLayout {
     pub slots: Vec<FlatSlot>,
-    /// Total byte size of the layout (available for buffer allocation).
-    #[allow(dead_code)]
+    /// Total byte size of the layout. Used by
+    /// [`super::func::extract_func_sig`] to size async / sync-complex
+    /// result buffers; accounts for the discriminant+padding in
+    /// `result<T, E>` and inter-slot natural alignment (so an
+    /// `[i32, i64]` flat result allocates 16 bytes, not 12).
     pub total_bytes: u32,
 }
 
