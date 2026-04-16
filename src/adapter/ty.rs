@@ -337,11 +337,7 @@ impl FlatLayout {
     ///   the discriminant. All payload slots are loaded from memory.
     /// - For everything else (string, tuple, record, etc.): slots are
     ///   laid out sequentially at naturally-aligned offsets from byte 0.
-    pub fn new(
-        type_id: ValueTypeId,
-        flat_types: &[ValType],
-        arena: &TypeArena,
-    ) -> Self {
+    pub fn new(type_id: ValueTypeId, flat_types: &[ValType], arena: &TypeArena) -> Self {
         let vt = arena.lookup_val(type_id);
         match vt {
             ValueType::Result { ok, err } => {
@@ -413,8 +409,7 @@ impl FlatLayout {
         let err_a = err_id.map(|id| canonical_align(id, arena)).unwrap_or(1);
         let payload_start = align_to_val(1, std::cmp::max(ok_a, err_a));
 
-        let total_bytes =
-            Self::append_sequential(&mut slots, &flat_types[1..], payload_start);
+        let total_bytes = Self::append_sequential(&mut slots, &flat_types[1..], payload_start);
         FlatLayout { slots, total_bytes }
     }
 }

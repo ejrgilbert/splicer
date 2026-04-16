@@ -22,17 +22,171 @@ fn validate_component(bytes: &[u8]) {
         .expect("generated adapter should be a valid component");
 }
 
+/// Map a primitive or String `ValueType` to its WAT spelling, for use
+/// when rendering function parameter / result types in the synth split.
+/// Panics on anything non-primitive — the synth split generator
+/// expects the resource-handler case to go through the hardcoded WAT
+/// template in [`synth_consumer_split`].
+fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
+    match arena.lookup_val(id) {
+        ValueType::S32 => "s32".into(),
+        ValueType::U32 => "u32".into(),
+        ValueType::S64 => "s64".into(),
+        ValueType::U64 => "u64".into(),
+        ValueType::S8 => "s8".into(),
+        ValueType::U8 => "u8".into(),
+        ValueType::S16 => "s16".into(),
+        ValueType::U16 => "u16".into(),
+        ValueType::F32 => "f32".into(),
+        ValueType::F64 => "f64".into(),
+        ValueType::Bool => "bool".into(),
+        ValueType::Char => "char".into(),
+        ValueType::String => "string".into(),
+        other => panic!(
+            "wat_type: synth split helper only supports primitive + string types, \
+             got {other:?}. For richer shapes, add a dedicated WAT template."
+        ),
+    }
+}
+
+/// Build a minimal consumer-split component that imports `target` as an
+/// instance. Written as WAT and parsed with `wat::parse_str` — easier
+/// to audit than wasm_encoder for a fixture whose shape we want to
+/// match the convention a real production consumer split uses.
+///
+/// Two shapes supported:
+///
+/// - **Primitives-only** (no `type_exports`): every function's params
+///   and result are primitives/strings, so the instance type body is a
+///   straight `(func …)` + `(export "name" (func (type …)))` listing.
+/// - **wasi:http/handler-shape** (the only non-primitive shape used by
+///   the tests): hardcoded WAT that mirrors `service_a.comp.wasm`'s
+///   handler import — a separate `wasi:http/types`-style instance
+///   import provides request / response / error-code, the handler
+///   instance type aliases-outer them and re-exports via `(type (eq))`.
+fn synth_consumer_split(
+    target: &str,
+    iface: &InterfaceType,
+    arena: &TypeArena,
+) -> tempfile::NamedTempFile {
+    let iface_inst = match iface {
+        InterfaceType::Instance(i) => i,
+        _ => panic!("synth_consumer_split: bare function interfaces not supported"),
+    };
+
+    let wat = if iface_inst.type_exports.is_empty() {
+        wat_primitive_only(target, iface_inst, arena)
+    } else {
+        wat_http_handler_shape(target)
+    };
+
+    let bytes = wat::parse_str(&wat).unwrap_or_else(|e| {
+        panic!("synth split WAT failed to parse: {e}\n\n--- WAT ---\n{wat}\n--- end ---")
+    });
+    let mut tmp = tempfile::NamedTempFile::new().expect("make tempfile");
+    std::io::Write::write_all(&mut tmp, &bytes).expect("write synth split");
+    tmp
+}
+
+fn wat_primitive_only(target: &str, iface: &InstanceInterface, arena: &TypeArena) -> String {
+    let mut body = String::new();
+    let mut func_type_for: Vec<(String, u32)> = Vec::new();
+
+    for (type_idx, (name, sig)) in iface.functions.iter().enumerate() {
+        let type_idx = type_idx as u32;
+        let params: Vec<String> = sig
+            .param_names
+            .iter()
+            .zip(sig.params.iter())
+            .map(|(pname, &pid)| format!(r#"(param "{pname}" {})"#, wat_type(pid, arena)))
+            .collect();
+        let result = match sig.results.first() {
+            Some(&rid) => format!(" (result {})", wat_type(rid, arena)),
+            None => String::new(),
+        };
+        let async_kw = if sig.is_async { "async " } else { "" };
+        body.push_str(&format!(
+            "      (type (;{type_idx};) (func {async_kw}{}{result}))\n",
+            params.join(" "),
+        ));
+        func_type_for.push((name.clone(), type_idx));
+    }
+    for (name, fty) in &func_type_for {
+        body.push_str(&format!("      (export \"{name}\" (func (type {fty})))\n"));
+    }
+
+    format!(
+        "(component\n  (type (;0;) (instance\n{body}  ))\n  (import \"{target}\" (instance (type 0)))\n)\n"
+    )
+}
+
+/// WAT for the wasi:http/handler-shape fixture used by
+/// `test_adapter_resource_handler`. Mirrors `service_a.comp.wasm`'s
+/// real handler import structure: a types instance with request /
+/// response resources + the error-code variant, then a handler
+/// instance type that `alias outer`s each and re-exports via `eq`.
+fn wat_http_handler_shape(target: &str) -> String {
+    // Note: when the types instance is used as an IMPORT, each compound
+    // type referenced by a variant case payload must be surfaced as an
+    // `(export "name" (type (eq N)))` first — the component-model
+    // validator rejects variants whose cases carry *anonymous* record
+    // payloads in an instance type used at the import boundary. We
+    // mirror the convention the real WIT-standard HTTP bindings use
+    // (see `fixtures/service_a.comp.wasm`): the record is exported as
+    // `DNS-error-payload`, and the variant's `DNS-error` case then
+    // references that export's index.
+    format!(
+        r#"(component
+  (type (;0;) (instance
+    (export "request" (type (sub resource)))
+    (export "response" (type (sub resource)))
+    (type (option string))
+    (type (option u16))
+    (type (record (field "rcode" 2) (field "info-code" 3)))
+    (export "DNS-error-payload" (type (eq 4)))
+    (type (variant
+      (case "DNS-timeout")
+      (case "DNS-error" 5)
+      (case "connection-refused")
+      (case "internal-error" 2)))
+    (export "error-code" (type (eq 6)))
+  ))
+  (import "synth:test/types" (instance (;0;) (type 0)))
+  (alias export 0 "request" (type (;1;)))
+  (alias export 0 "response" (type (;2;)))
+  (alias export 0 "error-code" (type (;3;)))
+  (type (;4;) (instance
+    (alias outer 1 1 (type (;0;)))
+    (export "request" (type (eq 0)))
+    (alias outer 1 2 (type (;2;)))
+    (export "response" (type (eq 2)))
+    (alias outer 1 3 (type (;4;)))
+    (export "error-code" (type (eq 4)))
+    (type (;6;) (own 1))
+    (type (;7;) (own 3))
+    (type (;8;) (result 7 (error 5)))
+    (type (;9;) (func async (param "request" 6) (result 8)))
+    (export "handle" (func (type 9)))
+  ))
+  (import "{target}" (instance (;1;) (type 4)))
+)
+"#
+    )
+}
+
 /// Helper: generate an adapter and return the raw bytes.
 fn gen_adapter(target: &str, hooks: &[&str], iface: &InterfaceType, arena: &TypeArena) -> Vec<u8> {
     let tmp = tempfile::tempdir().unwrap();
     let hook_strings: Vec<String> = hooks.iter().map(|s| s.to_string()).collect();
+    let split = synth_consumer_split(target, iface, arena);
+    let split_path = split.path().to_str().expect("tempfile path utf-8");
     let path = generate_tier1_adapter(
         "test-mdl",
         target,
         &hook_strings,
         Some(iface),
         tmp.path().to_str().unwrap(),
-        None, // no consumer split in unit tests
+        split_path,
         arena,
     )
     .expect("adapter generation should succeed");

@@ -596,12 +596,7 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         self.add_refs(cx, loc, alias);
     }
 
-    fn visit_comp_instance(
-        &mut self,
-        cx: &VisitCtx<'a>,
-        id: u32,
-        inst: &ComponentInstance<'a>,
-    ) {
+    fn visit_comp_instance(&mut self, cx: &VisitCtx<'a>, id: u32, inst: &ComponentInstance<'a>) {
         if self.comp_depth > 0 {
             return;
         }

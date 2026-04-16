@@ -148,13 +148,11 @@ pub(crate) fn extract_filtered_sections(
         let payload = payload.context("parsing split for re-encode")?;
 
         // Pop nesting first — `End` closes the most-recently-opened
-        // component. The outer component's final `End` underflows; we
-        // guard against that so the root's closing marker is simply
-        // ignored.
+        // component. The outer component's final `End` would underflow
+        // `comp_depth`, so saturate at 0 to leave the root's closing
+        // marker harmless.
         if matches!(payload, Payload::End(_)) {
-            if comp_depth > 0 {
-                comp_depth -= 1;
-            }
+            comp_depth = comp_depth.saturating_sub(1);
             continue;
         }
 
@@ -607,8 +605,7 @@ impl<'a> ReencodeComponent for ClosureReencoder<'a> {
                             ..
                         } = &alias
                         {
-                            self.aliased_type_exports
-                                .insert(name.to_string(), new_idx);
+                            self.aliased_type_exports.insert(name.to_string(), new_idx);
                         }
                     }
                     self.orig_type += 1;

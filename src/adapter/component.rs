@@ -5,26 +5,16 @@
 //! linear phases (numbered in the source comments below), each
 //! emitting one or more sections of the outer Component:
 //!
-//! 1–3. **Type / Import / Alias sections.** This is the only phase
-//!    that branches: it picks one of three strategies depending on
-//!    what context it has about the target interface:
-//!    - **From consumer split** — `split_imports` was supplied, so
-//!      copy the consumer split's raw type/import/alias bytes
-//!      verbatim and either reuse the handler import (if the split
-//!      imports it) or build a fresh handler instance type
-//!      referencing the shared types from the raw sections.
-//!    - **Via separate types interface** — the target interface has
-//!      resource types and named type exports; emit a separate
-//!      types-instance import and an `alias outer` handler instance
-//!      type that refers back to it.
-//!    - **Inline resources** — no resources; emit one self-contained
-//!      handler instance type with `SubResource` exports.
-//!
+//! 1–3. **Type / Import / Alias sections.** Copy the split's
+//!     closure-filtered type/import/alias bytes verbatim, then either
+//!     reuse the handler import (if the split imported it) or build a
+//!     fresh handler instance type that references the preamble's
+//!     aliased types via `alias outer`.
 //! 3b. **`own<T>` types** for each aliased resource (component-level
 //!     `own` definitions referencing the aliased resource indices).
 //! 3c. **Component-level function types** for the canon-lift phase
 //!     (declared after the `own<T>` types so they can reference them).
-//!     Uses [`encode_comp_cv`] to materialise compound parameter and
+//!     Uses [`encode_comp_cv`] to materialize compound parameter and
 //!     result types into the same `ComponentTypeSection`.
 //! 4.  Build and embed the **memory module** (Core module 0).
 //! 5.  Instantiate the memory module (Core instance 0).
@@ -42,16 +32,8 @@
 //!     funcs (and any handler-from-split type exports) under the
 //!     target interface name.
 //! 13. **Export** that instance from the outer Component.
-//!
-//! Several small `fn` helpers are nested inside `build_adapter_bytes`
-//! for now (`emit_hook_func_types`, `build_handler_inst_type`,
-//! `emit_hook_inst_types`, `emit_hook_imports`, `emit_func_aliases`).
-//! They are short and only used by the path branches; pulling them
-//! to module scope would mean threading more parameters and isn't
-//! worth the code-motion churn until the path branches themselves
-//! are extracted.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use cviz::model::{InterfaceType, TypeArena, ValueType, ValueTypeId};
 use wasm_encoder::{
@@ -63,57 +45,15 @@ use wasm_encoder::{
 };
 
 use super::dispatch::{build_dispatch_module, build_mem_module};
-use super::encoders::{build_types_instance_type, encode_comp_cv, InstTypeCtx};
+use super::encoders::{encode_comp_cv, InstTypeCtx};
 use super::func::AdapterFunc;
 use super::split_imports::SplitImports;
 use super::ty::type_has_resources;
 
-/// Derive the "types" interface name from a target interface name.
-/// e.g. "wasi:http/handler@0.3.0-rc-2026-01-06" → "wasi:http/types@0.3.0-rc-2026-01-06"
-fn derive_types_interface(target: &str) -> Option<String> {
-    if let Some(at_pos) = target.find('@') {
-        let (path, version) = target.split_at(at_pos);
-        if let Some(slash_pos) = path.rfind('/') {
-            return Some(format!("{}/types{}", &path[..slash_pos], version));
-        }
-    }
-    if let Some(slash_pos) = target.rfind('/') {
-        return Some(format!("{}/types", &target[..slash_pos]));
-    }
-    None
-}
-
-// ─── Section-emit helpers shared by the three path branches ────────────────
+// ─── Section-emit helpers ──────────────────────────────────────────────────
 //
 // Each helper appends a section's worth of items and either updates an
 // `&mut counter` for indices it produced or returns the indices directly.
-// They're all small enough to inline but extracting them here keeps each
-// path branch focused on the wiring it controls rather than repeating the
-// hook/types/import/alias scaffolding.
-
-/// Append the two type-erased hook function types to `types`. The caller
-/// is responsible for incrementing its own type counter by 2 — they always
-/// land at the next two type indices.
-fn emit_hook_func_types(types: &mut ComponentTypeSection) {
-    // type N: async func(name: string) -> ()
-    types
-        .function()
-        .async_(true)
-        .params([(
-            "name",
-            ComponentValType::Primitive(PrimitiveValType::String),
-        )])
-        .result(None);
-    // type N+1: async func(name: string) -> bool
-    types
-        .function()
-        .async_(true)
-        .params([(
-            "name",
-            ComponentValType::Primitive(PrimitiveValType::String),
-        )])
-        .result(Some(ComponentValType::Primitive(PrimitiveValType::Bool)));
-}
 
 /// Encode each function's params + result into `inst` (using `ctx` to manage
 /// resource handling) and append a typed export for each. The caller may
@@ -637,7 +577,7 @@ fn emit_imports_from_consumer_split(
             // instance, so reuse those indices for the
             // `comp_aliased_types` map consumed by section 3c.
             if let InterfaceType::Instance(inst_iface) = iface_ty {
-                for (_name, &vid) in &inst_iface.type_exports {
+                for &vid in inst_iface.type_exports.values() {
                     if !matches!(
                         arena.lookup_val(vid),
                         ValueType::Resource(_) | ValueType::AsyncHandle
@@ -699,363 +639,6 @@ struct ImportsOutcome {
     type_count: u32,
     instance_count: u32,
     func_count: u32,
-}
-
-/// Strategy: import the target interface via a separate types-instance
-/// (the WIT-standard split-interface pattern).
-///
-/// This strategy is used when the target interface has resource types and
-/// named type exports. It emits a separate types-instance import (e.g.
-/// `wasi:http/types`), aliases all type exports out of it, then declares
-/// the handler instance type using `alias outer` references back to those
-/// aliased types — so the handler signature shares the *same* resource
-/// types as the types interface, instead of declaring fresh `SubResource`
-/// definitions.
-#[allow(clippy::too_many_arguments)]
-fn emit_imports_via_types_iface(
-    component: &mut Component,
-    target_interface: &str,
-    funcs: &[AdapterFunc],
-    has_before: bool,
-    has_after: bool,
-    has_blocking: bool,
-    arena: &TypeArena,
-    iface_ty: &InterfaceType,
-) -> anyhow::Result<ImportsOutcome> {
-    let mut type_count: u32 = 0;
-    let mut instance_count: u32 = 0;
-    let mut func_count: u32 = 0;
-
-    let handler_inst_ty: u32;
-    let handler_inst: u32;
-    let inst_ctx: InstTypeCtx;
-    let handler_func_base: u32;
-    let before_comp_func: Option<u32>;
-    let after_comp_func: Option<u32>;
-    let blocking_comp_func: Option<u32>;
-    let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
-
-    let types_interface = derive_types_interface(target_interface).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Cannot derive 'types' interface name from target interface '{target_interface}': \
-             expected a name with a '/' separator (e.g. 'wasi:http/handler@1.0')"
-        )
-    })?;
-
-    // We use a static empty map as fallback for the (unreachable in this
-    // strategy) non-instance interface case.
-    let empty_te: BTreeMap<String, ValueTypeId> = BTreeMap::new();
-    let type_exports_ref = if let InterfaceType::Instance(inst) = iface_ty {
-        &inst.type_exports
-    } else {
-        &empty_te
-    };
-
-    // Section 1a: hook func types + types instance type.
-    // The types instance exports resources AND named compound types
-    // (records, variants).
-    let types_inst_ty: u32;
-    {
-        let mut types = ComponentTypeSection::new();
-        emit_hook_func_types(&mut types);
-        type_count += 2;
-
-        types_inst_ty = type_count;
-        type_count += 1;
-        {
-            // Use the export-aware encoder that interleaves type
-            // definitions and exports, ensuring references use export
-            // indices.
-            let inst = build_types_instance_type(type_exports_ref, arena)?;
-            types.instance(&inst);
-        }
-        component.section(&types);
-    }
-
-    // Section 1b: import types instance.
-    let types_inst: u32;
-    {
-        let mut imports = ComponentImportSection::new();
-        types_inst = instance_count;
-        instance_count += 1;
-        imports.import(&types_interface, ComponentTypeRef::Instance(types_inst_ty));
-        component.section(&imports);
-    }
-
-    // Section 1c: alias ALL type exports from types instance → component
-    // scope. Build a name → index map so section 1d can reference each
-    // export by its component-scope index.
-    let mut comp_type_export_indices: HashMap<String, u32> = HashMap::new();
-    {
-        let mut aliases = ComponentAliasSection::new();
-        for export_name in type_exports_ref.keys() {
-            let comp_idx = type_count;
-            type_count += 1;
-            aliases.alias(Alias::InstanceExport {
-                instance: types_inst,
-                kind: ComponentExportKind::Type,
-                name: export_name,
-            });
-            comp_type_export_indices.insert(export_name.clone(), comp_idx);
-        }
-        component.section(&aliases);
-    }
-
-    // Build maps: resource vid → comp scope index, compound vid → comp
-    // scope index. The resource map gets fed to InstTypeCtx so the handler
-    // instance type can reference the aliased resources via alias outer
-    // instead of declaring fresh SubResources.
-    let mut outer_res_map: HashMap<ValueTypeId, u32> = HashMap::new();
-    let mut comp_resource_indices: Vec<u32> = Vec::new();
-    for (export_name, &vid) in type_exports_ref {
-        if let Some(&comp_idx) = comp_type_export_indices.get(export_name) {
-            comp_aliased_types.insert(vid, comp_idx);
-            if matches!(
-                arena.lookup_val(vid),
-                ValueType::Resource(_) | ValueType::AsyncHandle
-            ) {
-                outer_res_map.insert(vid, comp_idx);
-                comp_resource_indices.push(comp_idx);
-            }
-        }
-    }
-
-    // Section 1d: handler instance type (with alias outer) + hook inst types.
-    let (before_inst_ty, after_inst_ty, blocking_inst_ty);
-    {
-        let mut types = ComponentTypeSection::new();
-
-        // Handler instance type: uses alias outer for ALL type exports.
-        handler_inst_ty = type_count;
-        type_count += 1;
-        {
-            let mut ctx = InstTypeCtx::with_outer_resources(outer_res_map);
-            let mut inst = InstanceType::new();
-
-            // Emit alias outer for each type export into the handler
-            // instance type.
-            for (export_name, &vid) in type_exports_ref {
-                if let Some(&comp_idx) = comp_type_export_indices.get(export_name) {
-                    let local_idx = inst.type_count();
-                    inst.alias(Alias::Outer {
-                        kind: ComponentOuterAliasKind::Type,
-                        count: 1,
-                        index: comp_idx,
-                    });
-                    if matches!(
-                        arena.lookup_val(vid),
-                        ValueType::Resource(_) | ValueType::AsyncHandle
-                    ) {
-                        ctx.alias_locals.insert(vid, local_idx);
-                    } else {
-                        // For compound types, cache the alias index so
-                        // encode_cv doesn't re-define them inline.
-                        ctx.cache.insert(vid, local_idx);
-                    }
-                }
-            }
-
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
-            inst_ctx = ctx;
-            types.instance(&inst);
-        }
-
-        // Hook instance types.
-        (before_inst_ty, after_inst_ty, blocking_inst_ty) = emit_hook_inst_types(
-            &mut types,
-            &mut type_count,
-            has_before,
-            has_after,
-            has_blocking,
-        );
-
-        component.section(&types);
-    }
-
-    // Section 2: import handler + hooks.
-    let (before_inst, after_inst, blocking_inst);
-    {
-        let mut imports = ComponentImportSection::new();
-        handler_inst = instance_count;
-        instance_count += 1;
-        imports.import(
-            target_interface,
-            ComponentTypeRef::Instance(handler_inst_ty),
-        );
-        (before_inst, after_inst, blocking_inst) = emit_hook_imports(
-            &mut imports,
-            &mut instance_count,
-            before_inst_ty,
-            after_inst_ty,
-            blocking_inst_ty,
-        );
-        component.section(&imports);
-    }
-
-    // Section 3: alias funcs from handler + hooks (no resource aliases
-    // needed — section 1c already aliased them).
-    {
-        let mut aliases = ComponentAliasSection::new();
-        (
-            handler_func_base,
-            before_comp_func,
-            after_comp_func,
-            blocking_comp_func,
-        ) = emit_func_aliases(
-            &mut aliases,
-            &mut func_count,
-            funcs,
-            handler_inst,
-            before_inst,
-            after_inst,
-            blocking_inst,
-        );
-        component.section(&aliases);
-    }
-
-    Ok(ImportsOutcome {
-        handler_func_base,
-        before_comp_func,
-        after_comp_func,
-        blocking_comp_func,
-        inst_ctx,
-        comp_resource_indices,
-        comp_aliased_types,
-        type_count,
-        instance_count,
-        func_count,
-    })
-}
-
-/// Strategy: inline resources in a single self-contained handler instance type.
-///
-/// This is the simplest strategy and the fallback when neither a consumer
-/// split nor a separate types interface is available. The handler instance
-/// type declares its resources directly via `SubResource` exports, so the
-/// adapter doesn't need any external types-instance import. After the
-/// handler import goes in, hook instance types/imports and func aliases
-/// are layered on top, and resource types are aliased out of the handler
-/// instance for use by the section 3b `own<T>` declarations.
-fn emit_imports_inline_resources(
-    component: &mut Component,
-    target_interface: &str,
-    funcs: &[AdapterFunc],
-    has_before: bool,
-    has_after: bool,
-    has_blocking: bool,
-    arena: &TypeArena,
-) -> anyhow::Result<ImportsOutcome> {
-    let mut type_count: u32 = 0;
-    let mut instance_count: u32 = 0;
-    let mut func_count: u32 = 0;
-
-    let handler_inst_ty: u32;
-    let handler_inst: u32;
-    let inst_ctx: InstTypeCtx;
-    let handler_func_base: u32;
-    let before_comp_func: Option<u32>;
-    let after_comp_func: Option<u32>;
-    let blocking_comp_func: Option<u32>;
-    let comp_resource_indices: Vec<u32>;
-    let comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
-
-    // Section 1: all types in one section.
-    let (before_inst_ty, after_inst_ty, blocking_inst_ty);
-    {
-        let mut types = ComponentTypeSection::new();
-        emit_hook_func_types(&mut types);
-        type_count += 2;
-
-        // Handler instance type with SubResource exports.
-        handler_inst_ty = type_count;
-        type_count += 1;
-        {
-            let mut ctx = InstTypeCtx::new();
-            let mut inst = InstanceType::new();
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
-            inst_ctx = ctx;
-            types.instance(&inst);
-        }
-
-        (before_inst_ty, after_inst_ty, blocking_inst_ty) = emit_hook_inst_types(
-            &mut types,
-            &mut type_count,
-            has_before,
-            has_after,
-            has_blocking,
-        );
-
-        component.section(&types);
-    }
-
-    // Section 2: imports.
-    let (before_inst, after_inst, blocking_inst);
-    {
-        let mut imports = ComponentImportSection::new();
-        handler_inst = instance_count;
-        instance_count += 1;
-        imports.import(
-            target_interface,
-            ComponentTypeRef::Instance(handler_inst_ty),
-        );
-        (before_inst, after_inst, blocking_inst) = emit_hook_imports(
-            &mut imports,
-            &mut instance_count,
-            before_inst_ty,
-            after_inst_ty,
-            blocking_inst_ty,
-        );
-        component.section(&imports);
-    }
-
-    // Section 3: alias funcs + resource types from the handler instance.
-    {
-        let mut aliases = ComponentAliasSection::new();
-        (
-            handler_func_base,
-            before_comp_func,
-            after_comp_func,
-            blocking_comp_func,
-        ) = emit_func_aliases(
-            &mut aliases,
-            &mut func_count,
-            funcs,
-            handler_inst,
-            before_inst,
-            after_inst,
-            blocking_inst,
-        );
-
-        // Alias resource types from the handler instance so section 3b
-        // can build `own<T>` definitions referencing them.
-        let mut res_vec: Vec<u32> = Vec::new();
-        for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
-            let comp_res_idx = type_count;
-            type_count += 1;
-            aliases.alias(Alias::InstanceExport {
-                instance: handler_inst,
-                kind: ComponentExportKind::Type,
-                name: export_name,
-            });
-            res_vec.push(comp_res_idx);
-        }
-        comp_resource_indices = res_vec;
-
-        component.section(&aliases);
-    }
-
-    Ok(ImportsOutcome {
-        handler_func_base,
-        before_comp_func,
-        after_comp_func,
-        blocking_comp_func,
-        inst_ctx,
-        comp_resource_indices,
-        comp_aliased_types,
-        type_count,
-        instance_count,
-        func_count,
-    })
 }
 
 /// Pure data describing the dispatch module's linear-memory layout
@@ -1525,7 +1108,7 @@ fn emit_dispatch_phase(
         // Note: we deliberately do NOT increment core_instance_count for
         // this instance — the original code didn't either, and nothing
         // downstream reads the post-phase value. Preserving the original
-        // behaviour keeps the orchestrator's counter handling identical.
+        // behavior keeps the orchestrator's counter handling identical.
         dispatch_core_inst = core_instance_count;
         instances.instantiate(1u32, [("env", wasm_encoder::ModuleArg::Instance(env_inst))]);
 
@@ -1559,7 +1142,7 @@ struct CanonLiftOutcome {
 /// Note: this phase does NOT update `core_func_count` or `func_count`
 /// — the original implementation didn't either, and nothing downstream
 /// reads those counter values after this point. Preserving the original
-/// behaviour keeps the byte output identical.
+/// behavior keeps the byte output identical.
 #[allow(clippy::too_many_arguments)]
 fn emit_canon_lift_phase(
     component: &mut Component,
@@ -1642,7 +1225,7 @@ fn emit_export_phase(
     target_interface: &str,
     funcs: &[AdapterFunc],
     iface_ty: &InterfaceType,
-    split_imports: Option<&SplitImports>,
+    split: &SplitImports,
     inst_ctx: &InstTypeCtx,
     comp_resource_indices: &[u32],
     comp_aliased_types: &HashMap<ValueTypeId, u32>,
@@ -1660,9 +1243,7 @@ fn emit_export_phase(
         // When the handler import came from raw consumer-split sections,
         // re-export its type exports so the adapter's handler export
         // matches what consumers expect.
-        let handler_from_split = split_imports
-            .map(|s| s.import_names.iter().any(|n| n == target_interface))
-            .unwrap_or(false);
+        let handler_from_split = split.import_names.iter().any(|n| n == target_interface);
         if handler_from_split {
             for (i, (_vid, export_name, _res_local, _own_local)) in
                 inst_ctx.resource_exports.iter().enumerate()
@@ -1868,7 +1449,7 @@ pub(super) fn build_adapter_bytes(
     has_blocking: bool,
     arena: &TypeArena,
     iface_ty: &InterfaceType,
-    split_imports: Option<&SplitImports>,
+    split: &SplitImports,
 ) -> anyhow::Result<Vec<u8>> {
     // Per-function: does any param/result require Memory+UTF8?
     // Uses deep string check (traverses compound types).
@@ -1892,25 +1473,9 @@ pub(super) fn build_adapter_bytes(
 
     // ── 1–3. Type / Import / Alias sections ─────────────────────────────────
     //
-    // Three strategies for emitting the consumer-side import preamble. The
-    // strategy is picked based on what we know about the target interface:
-    //
-    //   - If we have a consumer split's bytes, copy its type/import/alias
-    //     sections verbatim and either reuse or rebuild the handler import
-    //     on top of them.
-    //   - If the target has resources AND named type exports, import a
-    //     separate types-instance and `alias outer` it into the handler
-    //     instance type (the WIT-standard split-types pattern).
-    //   - Otherwise, emit a single self-contained handler instance type
-    //     with `SubResource` exports inline.
-    //
-    // Each strategy returns an `ImportsOutcome` with the indices and
-    // counter values the post-strategy phases need.
-    let has_type_exports = match iface_ty {
-        InterfaceType::Instance(inst) => !inst.type_exports.is_empty(),
-        _ => false,
-    };
-
+    // Copy the consumer (or provider) split's type/import/alias sections
+    // verbatim, then either reuse the handler import already present
+    // there or build one fresh on top of the preamble's aliased types.
     let ImportsOutcome {
         handler_func_base,
         before_comp_func,
@@ -1922,40 +1487,17 @@ pub(super) fn build_adapter_bytes(
         type_count: type_count_after,
         instance_count: instance_count_after,
         func_count: func_count_after,
-    } = if let Some(split) = split_imports {
-        emit_imports_from_consumer_split(
-            &mut component,
-            target_interface,
-            funcs,
-            has_before,
-            has_after,
-            has_blocking,
-            arena,
-            iface_ty,
-            split,
-        )?
-    } else if any_has_resources && has_type_exports {
-        emit_imports_via_types_iface(
-            &mut component,
-            target_interface,
-            funcs,
-            has_before,
-            has_after,
-            has_blocking,
-            arena,
-            iface_ty,
-        )?
-    } else {
-        emit_imports_inline_resources(
-            &mut component,
-            target_interface,
-            funcs,
-            has_before,
-            has_after,
-            has_blocking,
-            arena,
-        )?
-    };
+    } = emit_imports_from_consumer_split(
+        &mut component,
+        target_interface,
+        funcs,
+        has_before,
+        has_after,
+        has_blocking,
+        arena,
+        iface_ty,
+        split,
+    )?;
 
     // ── Index counters ─────────────────────────────────────────────────────
     //
@@ -2052,7 +1594,7 @@ pub(super) fn build_adapter_bytes(
         target_interface,
         funcs,
         iface_ty,
-        split_imports,
+        split,
         &inst_ctx,
         &comp_resource_indices,
         &comp_aliased_types,

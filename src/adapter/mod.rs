@@ -10,12 +10,12 @@
 //! - [`encoders`] — recursive value-type encoders for component-level
 //!   and instance-level type sections.
 //! - [`filter`] — closure-based dependency walker + raw-sections
-//!   re-encoder used to filter a consumer split's import preamble.
+//!   re-encoder that scopes the split's import preamble to exactly the
+//!   sections the target interface transitively depends on.
 //! - [`func`] — the [`AdapterFunc`] value object and the cviz →
 //!   `Vec<AdapterFunc>` extraction.
-//! - [`split_imports`] — the legacy verbatim-copy path that ships the
-//!   consumer split's whole import preamble (used as a fallback
-//!   when the closure walker decides the target isn't in the split).
+//! - [`split_imports`] — the [`SplitImports`] wrapper that carries the
+//!   filtered sections + metadata the adapter builder consumes.
 //! - [`ty`] — canonical-ABI type analysis helpers (flattening,
 //!   alignment, resource collection).
 
@@ -57,8 +57,8 @@ pub fn generate_tier1_adapter(
     target_interface: &str,
     middleware_interfaces: &[String],
     interface_type: Option<&InterfaceType>,
-    splits_path: &str,
-    split_path: Option<&str>,
+    splits_output_path: &str,
+    split_path: &str,
     arena: &TypeArena,
 ) -> anyhow::Result<String> {
     let iface_ty = interface_type.ok_or_else(|| {
@@ -88,27 +88,18 @@ pub fn generate_tier1_adapter(
     // as an instance import (it wasn't one), and the adapter builder
     // will synthesize a fresh handler import type referencing the
     // preamble's types.
-    //
-    // When no split path is provided (unit tests only), fall back to
-    // synthesizing the handler import from interface type info.
-    let split_imports = if let Some(path) = split_path {
-        let deps = find_handler_deps(path, target_interface)?;
-        if deps.not_found() {
-            anyhow::bail!(
-                "Split at '{}' neither imports nor exports interface '{}'. \
-                 Please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
-                path,
-                target_interface
-            );
-        }
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read split at '{path}'"))?;
-        Some(SplitImports::from(extract_filtered_sections(
-            &bytes, &deps,
-        )?))
-    } else {
-        None
-    };
+    let deps = find_handler_deps(split_path, target_interface)?;
+    if deps.not_found() {
+        anyhow::bail!(
+            "Split at '{}' neither imports nor exports interface '{}'. \
+             Please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
+            split_path,
+            target_interface
+        );
+    }
+    let bytes = std::fs::read(split_path)
+        .with_context(|| format!("Failed to read split at '{split_path}'"))?;
+    let split_imports = SplitImports::from(extract_filtered_sections(&bytes, &deps)?);
 
     let bytes = build_adapter_bytes(
         target_interface,
@@ -118,11 +109,11 @@ pub fn generate_tier1_adapter(
         has_blocking,
         arena,
         iface_ty,
-        split_imports.as_ref(),
+        &split_imports,
     )?;
 
     let out_path = format!(
-        "{splits_path}/splicer_adapter_{}_{}.wasm",
+        "{splits_output_path}/splicer_adapter_{}_{}.wasm",
         sanitize_name(middleware_name),
         sanitize_name(target_interface)
     );

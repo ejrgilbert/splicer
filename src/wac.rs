@@ -806,13 +806,28 @@ fn add_to_inject_plan(
     for (injection, result) in to_inject.iter().zip(contract_results.into_iter()) {
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
+                // `consumer_split` is the split the adapter inherits
+                // its import preamble from. Callers upstream (the chain
+                // walker in `apply_rule_before`) fall back from the
+                // consumer at `i + 1` to the provider at `i`, so this
+                // should always be `Some` for a valid composition. If
+                // it isn't, something upstream shipped us a broken
+                // chain and we can't generate a sound adapter.
+                let consumer_split_path = consumer_split.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No consumer/provider split available for interface '{interface_name}' \
+                         while generating adapter for middleware '{}'. Please open an issue \
+                         with a repro at https://github.com/ejrgilbert/splicer/issues",
+                        injection.name
+                    )
+                })?;
                 let adapter_path = generate_tier1_adapter(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
                     interface_type,
                     splits_path,
-                    consumer_split.as_deref(),
+                    consumer_split_path,
                     arena,
                 )?;
                 generated_adapters.push(GeneratedAdapter {
