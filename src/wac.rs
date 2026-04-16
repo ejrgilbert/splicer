@@ -105,6 +105,12 @@ pub fn generate_wac(
     node_paths: Option<&HashMap<u32, PathBuf>>,
     pkg_name: &str,
 ) -> anyhow::Result<WacOutput> {
+    // Emit the "shim split defaulting" WARN(s) exactly once up-front.
+    // Without this, the notice would fire twice — once from the adapter
+    // generator's `consumer_split_path` lookup, once from the wac-dep
+    // map — because both paths call `resolve_shim` for the same shim.
+    warn_about_shim_resolutions(&shim_comps);
+
     let mut wac_lines = vec![format!("package {pkg_name};")];
 
     let mut handled_interfaces = HashSet::new();
@@ -590,17 +596,38 @@ fn gen_wac_args(
 
     deps
 }
+/// Pure: follow the shim chain until landing on a non-shim split.
+/// See [`warn_about_shim_resolutions`] for the user-facing notice that
+/// fires once per non-trivial resolution at the top of [`generate_wac`].
 fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) -> usize {
-    let original_num = component_num;
     while is_shim_split_num(component_num, shim_comps) {
         component_num = shim_comps[&component_num];
     }
-    if component_num != original_num {
-        eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{original_num} is a shim component,\n\
-                                                     \tdefaulting to split{component_num} instead in the generated wac command!\n\
-                                                     \tIf this assumption is incorrect, modify the generated wac command.").yellow());
-    }
     component_num
+}
+
+/// Emit one WARN per non-trivial `shim → resolved` mapping in
+/// `shim_comps`. Called once at the start of [`generate_wac`] so the
+/// same assumption isn't announced twice when both the adapter-gen and
+/// wac-dep paths later call [`resolve_shim`] for the same shim.
+fn warn_about_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
+    let mut shim_keys: Vec<usize> = shim_comps.keys().copied().collect();
+    shim_keys.sort();
+    for shim_num in shim_keys {
+        let resolved = resolve_shim(shim_num, shim_comps);
+        if resolved != shim_num {
+            eprintln!(
+                "{}: {}",
+                "WARN".yellow().bold(),
+                format!(
+                    "\tAssumption made! It is likely that split{shim_num} is a shim component,\n\
+                     \tdefaulting to split{resolved} instead in the generated wac command!\n\
+                     \tIf this assumption is incorrect, modify the generated wac command."
+                )
+                .yellow()
+            );
+        }
+    }
 }
 
 /// Return value from rule application functions.
