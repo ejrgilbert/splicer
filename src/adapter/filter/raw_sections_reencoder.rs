@@ -107,6 +107,12 @@ pub(crate) struct FilteredSections {
     pub type_count: u32,
     /// Total component instances contributed by the surviving items.
     pub instance_count: u32,
+    /// `type_export_name → new component-scope type index` for every
+    /// surviving `alias export <inst> "<name>" (type …)`. The adapter
+    /// builder consults this when the handler is imported in the
+    /// filtered output via a fresh instance-type declaration that
+    /// needs `alias outer` to reach preamble-level resource types.
+    pub aliased_type_exports: HashMap<String, u32>,
 }
 
 /// Drive the closure re-encoder over a consumer split.
@@ -125,9 +131,53 @@ pub(crate) fn extract_filtered_sections(
     let mut out = wasm_encoder::Component::new();
 
     let mut section_idx = 0usize;
+    // Track nested-component depth so the `section_idx` we pass to
+    // `reencoder.current_section_idx` stays in lockstep with wirm's
+    // **root-component** section ordinals (wirm's `curr_section_idx`
+    // is per-component; when it recurses into a nested component, it
+    // uses that component's own `sections` Vec).
+    //
+    // wasmparser's `parse_all` yields payloads flat, including the
+    // nested component's sections, so a naive counter would race
+    // ahead of wirm once the first nested component appears — causing
+    // the `deps.needed` map (keyed by wirm's section ordinal) to point
+    // at the wrong payloads on this side. Skipping payloads inside
+    // nested components keeps the two walks aligned.
+    let mut comp_depth = 0usize;
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.context("parsing split for re-encode")?;
+
+        // Pop nesting first — `End` closes the most-recently-opened
+        // component. The outer component's final `End` underflows; we
+        // guard against that so the root's closing marker is simply
+        // ignored.
+        if matches!(payload, Payload::End(_)) {
+            if comp_depth > 0 {
+                comp_depth -= 1;
+            }
+            continue;
+        }
+
+        if comp_depth > 0 {
+            // Inside a nested component or module: don't emit or
+            // count. Still watch for further nesting so the depth
+            // stays correct.
+            if matches!(
+                &payload,
+                Payload::ComponentSection { .. } | Payload::ModuleSection { .. }
+            ) {
+                comp_depth += 1;
+            }
+            continue;
+        }
+
         reencoder.current_section_idx = section_idx;
+        tracing::trace!(
+            target: "splicer::adapter::filter",
+            section = section_idx,
+            kind = payload_kind(&payload),
+            "reencoder visiting payload"
+        );
         match payload {
             // ─── sections we filter + emit ───────────────────────────
             Payload::ComponentTypeSection(section) => {
@@ -181,11 +231,20 @@ pub(crate) fn extract_filtered_sections(
             // None of these contribute items to spaces our closure
             // walker tracks (CompType / CompInst), so we just need to
             // keep section_idx aligned with wirm's count.
+            Payload::ComponentSection { .. } | Payload::ModuleSection { .. } => {
+                // A nested sub-component or module: its payloads
+                // follow in the same parse_all stream. Bump our
+                // root-component section counter once for the slot
+                // itself (to match wirm, which records a
+                // `ComponentSection::Component` / `::Module` entry),
+                // then enter the nested scope so we skip everything
+                // until matching `End`.
+                section_idx += 1;
+                comp_depth += 1;
+            }
             Payload::ComponentCanonicalSection(_)
             | Payload::CoreTypeSection(_)
             | Payload::InstanceSection(_)
-            | Payload::ModuleSection { .. }
-            | Payload::ComponentSection { .. }
             | Payload::ComponentStartSection { .. }
             | Payload::CustomSection(_) => {
                 section_idx += 1;
@@ -200,6 +259,7 @@ pub(crate) fn extract_filtered_sections(
     let type_count = reencoder.type_map.len() as u32;
     let instance_count = reencoder.instance_map.len() as u32;
     let import_names = reencoder.import_names;
+    let aliased_type_exports = reencoder.aliased_type_exports;
 
     // Re-parse the freshly-built component to peel each section's
     // content range out of the byte stream. We can't access
@@ -214,6 +274,7 @@ pub(crate) fn extract_filtered_sections(
         import_names,
         type_count,
         instance_count,
+        aliased_type_exports,
     })
 }
 
@@ -292,6 +353,10 @@ struct ClosureReencoder<'a> {
 
     /// Names of surviving instance imports, in source order.
     import_names: Vec<String>,
+
+    /// `type_export_name → new component-scope type index` for every
+    /// kept `alias export <inst> "<name>" (type …)`.
+    aliased_type_exports: HashMap<String, u32>,
 }
 
 impl<'a> ClosureReencoder<'a> {
@@ -305,6 +370,7 @@ impl<'a> ClosureReencoder<'a> {
             current_section_idx: 0,
             body_depth: 0,
             import_names: Vec::new(),
+            aliased_type_exports: HashMap::new(),
         }
     }
 
@@ -526,12 +592,24 @@ impl<'a> ReencodeComponent for ClosureReencoder<'a> {
 
             // Each alias contributes to one space based on its kind.
             // We bump the original counter for the appropriate space
-            // whether or not the item is kept.
+            // whether the item is kept.
             match alias_namespace(&alias) {
                 AliasSpaceKind::Type => {
                     if kept {
                         let new_idx = self.type_map.len() as u32;
                         self.type_map.insert(self.orig_type, new_idx);
+                        // Capture `alias export <inst> "<name>" (type …)`
+                        // entries so the adapter builder can reach
+                        // preamble-level resource types by name.
+                        if let ComponentAlias::InstanceExport {
+                            kind: ComponentExternalKind::Type,
+                            name,
+                            ..
+                        } = &alias
+                        {
+                            self.aliased_type_exports
+                                .insert(name.to_string(), new_idx);
+                        }
                     }
                     self.orig_type += 1;
                 }
@@ -564,10 +642,29 @@ impl<'a> ReencodeComponent for ClosureReencoder<'a> {
 /// What namespace an alias item contributes to. Mirrors `IndexSpaceOf`
 /// for `ComponentAlias` but only the variants we care about for
 /// filtering.
+#[derive(Debug)]
 enum AliasSpaceKind {
     Type,
     Instance,
     Other,
+}
+
+fn payload_kind(payload: &Payload<'_>) -> &'static str {
+    match payload {
+        Payload::ComponentTypeSection(_) => "ComponentType",
+        Payload::ComponentImportSection(_) => "ComponentImport",
+        Payload::ComponentAliasSection(_) => "ComponentAlias",
+        Payload::ComponentInstanceSection(_) => "ComponentInstance",
+        Payload::ComponentExportSection(_) => "ComponentExport",
+        Payload::ComponentCanonicalSection(_) => "ComponentCanonical",
+        Payload::CoreTypeSection(_) => "CoreType",
+        Payload::InstanceSection(_) => "Instance",
+        Payload::ModuleSection { .. } => "Module",
+        Payload::ComponentSection { .. } => "Component",
+        Payload::ComponentStartSection { .. } => "ComponentStart",
+        Payload::CustomSection(_) => "Custom",
+        _ => "Other",
+    }
 }
 
 fn alias_namespace(alias: &ComponentAlias<'_>) -> AliasSpaceKind {
@@ -1215,7 +1312,7 @@ mod tests {
         let bytes = split_with_separate_alias_sections(3);
         let deps = find_handler_deps_in_bytes(&bytes, "wasi:http/handler").expect("dep walk");
         assert!(
-            !deps.is_empty(),
+            !deps.not_found(),
             "dep walker should find the handler import"
         );
 

@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::HandlerDeps;
+use super::section_filter::HandlerDeps;
 
 /// Build a fixture where the handler imports references the resource
 /// aliases at the given positions in `[0, num_aliases)`. Section

@@ -715,8 +715,14 @@ fn apply_rule_before(
             }
             full_match = true;
             let new_aliases = vec![(*id, provider_alias.clone())];
-            let consumer_path =
-                chain.consumer_split_path(i + 1, composition, splits_path, shim_comps);
+            // Prefer the consumer's split (i+1) so the adapter copies
+            // its import surface. At the outermost chain position
+            // there's no consumer, so fall back to the provider's own
+            // split (i) — the adapter mirrors the provider's full
+            // import topology.
+            let consumer_path = chain
+                .consumer_split_path(i + 1, composition, splits_path, shim_comps)
+                .or_else(|| chain.consumer_split_path(i, composition, splits_path, shim_comps));
             contract_results.extend(add_to_inject_plan(
                 interface,
                 inject,

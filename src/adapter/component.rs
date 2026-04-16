@@ -350,7 +350,6 @@ fn emit_imports_from_consumer_split(
     arena: &TypeArena,
     iface_ty: &InterfaceType,
     split: &SplitImports,
-    any_has_resources: bool,
 ) -> anyhow::Result<ImportsOutcome> {
     // Strategy-internal counters: we start by claiming the index space the
     // raw sections we just copied already consumed.
@@ -495,30 +494,68 @@ fn emit_imports_from_consumer_split(
             }
         }
     } else {
-        // The consumer split exports the handler rather than importing it
-        // (it consumes some of the same shared types and re-exports the
-        // target interface). Build the handler import type from the
-        // interface type information. The raw sections already provide
-        // shared type definitions (e.g. wasi:http/types) that the handler
-        // references.
+        // Provider split: the handler is exported, not imported. The
+        // preamble sections provide the supporting imports (types-instance,
+        // WASI interfaces) with aliased resource types. Build only the
+        // handler import type fresh, referencing those aliased resources
+        // via alias-outer.
         let handler_inst_ty: u32;
         let mut types = ComponentTypeSection::new();
 
-        if any_has_resources {
-            // Build handler instance type with alias outer for resources.
-            let mut ctx = InstTypeCtx::with_outer_resources(HashMap::new());
+        // Build map of every interface type export that has a matching
+        // aliased type in the preamble. Both resources (request/response)
+        // and compound types (error-code, DNS-error-payload, …) are
+        // pre-aliased at component scope; the handler instance type body
+        // must reference them all via `alias outer` so it's
+        // type-identical to what the provider's handler actually exports
+        // — otherwise the component model validator sees the import type
+        // as a fresh redefinition incompatible with the underlying
+        // resource/variant identity.
+        let mut outer_aliased: HashMap<ValueTypeId, u32> = HashMap::new();
+        if let InterfaceType::Instance(inst_iface) = iface_ty {
+            for (name, &vid) in &inst_iface.type_exports {
+                if let Some(&comp_idx) = split.aliased_type_exports.get(name) {
+                    outer_aliased.insert(vid, comp_idx);
+                }
+            }
+        }
+
+        {
+            // `outer_resources` in the ctx is narrowly used for the
+            // own<>/SubResource emission path — only keep resource-kind
+            // entries there. Compound types that need alias-outer flow
+            // through `alias_locals` below; the encoder picks them up
+            // before falling into inline encoding.
+            let outer_res_map: HashMap<ValueTypeId, u32> = outer_aliased
+                .iter()
+                .filter(|(&vid, _)| {
+                    matches!(
+                        arena.lookup_val(vid),
+                        ValueType::Resource(_) | ValueType::AsyncHandle
+                    )
+                })
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            let mut ctx = if outer_res_map.is_empty() {
+                InstTypeCtx::new()
+            } else {
+                InstTypeCtx::with_outer_resources(outer_res_map)
+            };
             let mut inst = InstanceType::new();
-            // Resources are defined in the raw sections but we don't have
-            // their type indices. Use the simple SubResource path instead —
-            // the types instance from the raw sections provides the context.
-            build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
-            handler_inst_ty = type_count;
-            type_count += 1;
-            inst_ctx = ctx;
-            types.instance(&inst);
-        } else {
-            let mut ctx = InstTypeCtx::new();
-            let mut inst = InstanceType::new();
+
+            // Emit `alias outer 1 <comp_idx>` for every aliased type
+            // (resource + compound) and record its instance-local index
+            // so the encoder can reference it instead of re-encoding.
+            for (&vid, &comp_idx) in &outer_aliased {
+                let local_idx = inst.type_count();
+                inst.alias(Alias::Outer {
+                    kind: ComponentOuterAliasKind::Type,
+                    count: 1,
+                    index: comp_idx,
+                });
+                ctx.alias_locals.insert(vid, local_idx);
+            }
+
             build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
             handler_inst_ty = type_count;
             type_count += 1;
@@ -573,16 +610,43 @@ fn emit_imports_from_consumer_split(
                 blocking_inst,
             );
 
+            // In the provider-split case the handler's resource types
+            // came from the preamble's aliased types (we emitted
+            // `alias outer` for them inside the handler instance type).
+            // They therefore DON'T appear as SubResource exports on the
+            // handler instance, and aliasing them via InstanceExport
+            // would fail. Reuse the preamble's component-scope indices
+            // directly.
             let mut res_vec: Vec<u32> = Vec::new();
-            for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
-                let comp_res_idx = type_count;
-                type_count += 1;
-                aliases.alias(Alias::InstanceExport {
-                    instance: handler_inst,
-                    kind: ComponentExportKind::Type,
-                    name: export_name,
-                });
-                res_vec.push(comp_res_idx);
+            for (vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
+                if let Some(&comp_idx) = outer_aliased.get(vid) {
+                    res_vec.push(comp_idx);
+                } else {
+                    let comp_res_idx = type_count;
+                    type_count += 1;
+                    aliases.alias(Alias::InstanceExport {
+                        instance: handler_inst,
+                        kind: ComponentExportKind::Type,
+                        name: export_name,
+                    });
+                    res_vec.push(comp_res_idx);
+                }
+            }
+            // Compound types (error-code, DNS-error-payload, …) came
+            // from the preamble too; they're not exports on the handler
+            // instance, so reuse those indices for the
+            // `comp_aliased_types` map consumed by section 3c.
+            if let InterfaceType::Instance(inst_iface) = iface_ty {
+                for (_name, &vid) in &inst_iface.type_exports {
+                    if !matches!(
+                        arena.lookup_val(vid),
+                        ValueType::Resource(_) | ValueType::AsyncHandle
+                    ) {
+                        if let Some(&comp_idx) = outer_aliased.get(&vid) {
+                            comp_aliased_types.insert(vid, comp_idx);
+                        }
+                    }
+                }
             }
             comp_resource_indices = res_vec;
             component.section(&aliases);
@@ -1869,7 +1933,6 @@ pub(super) fn build_adapter_bytes(
             arena,
             iface_ty,
             split,
-            any_has_resources,
         )?
     } else if any_has_resources && has_type_exports {
         emit_imports_via_types_iface(

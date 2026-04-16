@@ -313,6 +313,7 @@ pub(super) struct FlatSlot {
 pub(super) struct FlatLayout {
     pub slots: Vec<FlatSlot>,
     /// Total byte size of the layout (available for buffer allocation).
+    #[allow(dead_code)]
     pub total_bytes: u32,
 }
 

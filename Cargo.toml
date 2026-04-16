@@ -39,6 +39,8 @@ semver = "1"
 clap = { version = "4.5.58", features = ["derive"] }
 wasmparser = "0.245.1"
 wasm-encoder = { version = "0.245.1", features = ["wasmparser"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 #wirm = "3.0.0"
 wirm = { path = "../../research/compilers/wirm" }
 

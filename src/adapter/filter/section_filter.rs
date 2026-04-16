@@ -88,9 +88,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use wirm::ir::component::idx_spaces::Space;
 use wirm::ir::component::refs::ReferencedIndices;
 use wirm::ir::component::visitor::{walk_structural, ComponentVisitor, ItemKind, VisitCtx};
+use wirm::ir::component::Component;
 use wirm::wasmparser::{
-    ComponentAlias, ComponentImport, ComponentType, ComponentTypeDeclaration,
-    InstanceTypeDeclaration,
+    ComponentAlias, ComponentExport, ComponentImport, ComponentInstance, ComponentType,
+    ComponentTypeDeclaration, InstanceTypeDeclaration,
 };
 
 /// Result of a wirm-based handler dependency walk.
@@ -117,14 +118,18 @@ use wirm::wasmparser::{
 #[derive(Debug, Default)]
 pub(crate) struct HandlerDeps {
     pub needed: BTreeMap<usize, BTreeSet<usize>>,
+    /// `true` when the target was found as a component **export** rather
+    /// than an import. The dependency closure is computed the same way in
+    /// both cases — the only observable difference is that the filtered
+    /// output won't include the target as an instance import (it wasn't
+    /// one), and the caller must build the handler import type fresh.
+    pub found_as_export: bool,
 }
 
 impl HandlerDeps {
-    /// `true` when the wirm walk did not find an import matching the requested
-    /// target interface name. Caller may treat this as "fall back to the
-    /// existing copy-everything path".
-    pub fn is_empty(&self) -> bool {
-        self.needed.is_empty()
+    /// `true` when the target was not found as either an import or export.
+    pub fn not_found(&self) -> bool {
+        self.needed.is_empty() && !self.found_as_export
     }
 }
 
@@ -215,6 +220,21 @@ struct DepCollector {
     /// inside. Only the outermost (depth 0) item counts as a top-level
     /// section item; nested types are private to their parent and skipped.
     nesting_depth: usize,
+
+    /// Set to `true` when the target is found as a component export
+    /// (not an import). The caller should copy all import-preamble
+    /// sections verbatim.
+    found_as_export: bool,
+
+    /// Nesting depth inside sub-components. The walker recurses into
+    /// sub-component definitions (e.g. wit-component's generated shim
+    /// component) and the `section_idx` inside them restarts from 0,
+    /// so any callback we honor at depth > 0 would contaminate our
+    /// parent-component bookkeeping. We only want the shim's outer
+    /// *instantiation* as a CompInst item and the refs threaded
+    /// through its `with` bindings, both of which live in the root
+    /// component and fire at depth 0.
+    comp_depth: usize,
 }
 
 /// What kind of name space (if any) a wirm `ItemKind` contributes to that we
@@ -245,6 +265,8 @@ impl DepCollector {
             target_loc: None,
             type_body_stack: Vec::new(),
             nesting_depth: 0,
+            found_as_export: false,
+            comp_depth: 0,
         }
     }
 
@@ -319,13 +341,17 @@ impl DepCollector {
         }
     }
 
-    /// BFS from the target import's location and bucket the resulting set of
-    /// needed locations by section.
+    /// BFS from the target's location (whether import or export) and bucket
+    /// the resulting set of needed locations by section.
     fn into_handler_deps(self) -> HandlerDeps {
         let Some(start) = self.target_loc else {
-            // Target import not found in this split — caller decides how to
-            // handle the empty result.
-            return HandlerDeps::default();
+            // Neither import nor export hit — return empty with
+            // found_as_export preserved so the caller can distinguish
+            // "not found" from "found but seed loc missing" (a bug).
+            return HandlerDeps {
+                needed: BTreeMap::new(),
+                found_as_export: self.found_as_export,
+            };
         };
 
         let mut needed: BTreeSet<ItemLoc> = BTreeSet::new();
@@ -347,18 +373,52 @@ impl DepCollector {
         for (sec, item) in needed {
             by_section.entry(sec).or_default().insert(item);
         }
-        HandlerDeps { needed: by_section }
+        tracing::debug!(
+            target: "splicer::adapter::filter",
+            sections_touched = by_section.len(),
+            found_as_export = self.found_as_export,
+            "closure walk complete"
+        );
+        for (sec, items) in &by_section {
+            tracing::trace!(
+                target: "splicer::adapter::filter",
+                section = sec,
+                ?items,
+                "section kept in closure"
+            );
+        }
+        HandlerDeps {
+            needed: by_section,
+            found_as_export: self.found_as_export,
+        }
     }
 }
 
 impl<'a> ComponentVisitor<'a> for DepCollector {
+    // ─── sub-component bookkeeping ────────────────────────────────────────
+    //
+    // The walker recurses into sub-component definitions and their
+    // section_idx / type-space / instance-space restart from 0 inside.
+    // Honoring any callback at sub-component depth would contaminate the
+    // parent's bookkeeping, and none of those nested items live in the
+    // preamble sections we filter anyway. So we gate every item-level
+    // callback on `comp_depth == 0`.
+
+    fn enter_component(&mut self, _cx: &VisitCtx<'a>, _id: u32, _component: &Component<'a>) {
+        self.comp_depth += 1;
+    }
+
+    fn exit_component(&mut self, _cx: &VisitCtx<'a>, _id: u32, _component: &Component<'a>) {
+        self.comp_depth -= 1;
+    }
+
     // ─── leaf component types (Defined / Func / Resource) ────────────────
 
     fn visit_comp_type(&mut self, cx: &VisitCtx<'a>, id: u32, item: &ComponentType<'a>) {
         // Only record this item if it's a top-level type in a section. Leaf
         // types nested inside an instance/component type body are private to
         // their parent and don't get their own slot in our graph.
-        if self.nesting_depth > 0 {
+        if self.comp_depth > 0 || self.nesting_depth > 0 {
             return;
         }
         let Some(loc) = self.record_top_level(cx, ItemSpace::Type, id) else {
@@ -379,7 +439,7 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         // which collide with component-scope IDs in `type_to_loc` and
         // produce false positives. So we record the loc and rely on the
         // decl callbacks to pick up real cross-scope deps.
-        if self.nesting_depth == 0 {
+        if self.comp_depth == 0 && self.nesting_depth == 0 {
             if let Some(loc) = self.record_top_level(cx, ItemSpace::Type, id) {
                 self.type_body_stack.push(loc);
             }
@@ -389,13 +449,13 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
 
     fn exit_component_type_inst(&mut self, _: &VisitCtx<'a>, _: u32, _: &ComponentType<'a>) {
         self.nesting_depth -= 1;
-        if self.nesting_depth == 0 {
+        if self.comp_depth == 0 && self.nesting_depth == 0 {
             self.type_body_stack.pop();
         }
     }
 
     fn enter_component_type_comp(&mut self, cx: &VisitCtx<'a>, id: u32, _ty: &ComponentType<'a>) {
-        if self.nesting_depth == 0 {
+        if self.comp_depth == 0 && self.nesting_depth == 0 {
             if let Some(loc) = self.record_top_level(cx, ItemSpace::Type, id) {
                 self.type_body_stack.push(loc);
             }
@@ -405,7 +465,7 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
 
     fn exit_component_type_comp(&mut self, _: &VisitCtx<'a>, _: u32, _: &ComponentType<'a>) {
         self.nesting_depth -= 1;
-        if self.nesting_depth == 0 {
+        if self.comp_depth == 0 && self.nesting_depth == 0 {
             self.type_body_stack.pop();
         }
     }
@@ -418,6 +478,9 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         _parent: &ComponentType<'a>,
         decl: &InstanceTypeDeclaration<'a>,
     ) {
+        if self.comp_depth > 0 {
+            return;
+        }
         if let Some(&top_loc) = self.type_body_stack.last() {
             self.add_refs_filtered(cx, top_loc, decl, true);
         }
@@ -431,6 +494,9 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         _parent: &ComponentType<'a>,
         decl: &ComponentTypeDeclaration<'a>,
     ) {
+        if self.comp_depth > 0 {
+            return;
+        }
         if let Some(&top_loc) = self.type_body_stack.last() {
             self.add_refs_filtered(cx, top_loc, decl, true);
         }
@@ -445,13 +511,73 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         id: u32,
         import: &ComponentImport<'a>,
     ) {
+        if self.comp_depth > 0 {
+            return;
+        }
         let Some(loc) = self.record_top_level(cx, item_kind_to_space(kind), id) else {
             return;
         };
         if import.name.0 == self.target {
+            tracing::debug!(
+                target: "splicer::adapter::filter",
+                name = %import.name.0,
+                ?loc,
+                "target found as import — BFS seed"
+            );
             self.target_loc = Some(loc);
         }
         self.add_refs(cx, loc, import);
+    }
+
+    fn visit_comp_export(
+        &mut self,
+        cx: &VisitCtx<'a>,
+        _kind: ItemKind,
+        _id: u32,
+        export: &ComponentExport<'a>,
+    ) {
+        if self.comp_depth > 0 {
+            return;
+        }
+        // An export doesn't live in the type/import/alias sections we
+        // emit, so we don't allocate a loc for the export itself. But
+        // the export's referenced instance/type IS in a section we
+        // track (an imported instance, an `instantiate` result, a
+        // defined type, or a post-preamble alias), and that section
+        // item — together with its transitive deps — is exactly the
+        // preamble we need the adapter to inherit.
+        //
+        // Seed the BFS from the resolved loc of the export's item ref.
+        // The component model validator requires every ref to point at
+        // an earlier item, so by the time this callback fires, the
+        // referenced instance/type has already been visited and its
+        // location is in `instance_to_loc` / `type_to_loc`.
+        if export.name.0 != self.target || self.target_loc.is_some() {
+            return;
+        }
+        self.found_as_export = true;
+        for r in export.referenced_indices() {
+            let resolved = cx.resolve(&r.ref_);
+            if let Some(loc) = self.lookup_loc(resolved.space(), resolved.idx()) {
+                tracing::debug!(
+                    target: "splicer::adapter::filter",
+                    name = %export.name.0,
+                    space = ?resolved.space(),
+                    idx = resolved.idx(),
+                    ?loc,
+                    "target found as export — BFS seed"
+                );
+                self.target_loc = Some(loc);
+                return;
+            }
+            tracing::trace!(
+                target: "splicer::adapter::filter",
+                name = %export.name.0,
+                space = ?resolved.space(),
+                idx = resolved.idx(),
+                "export ref not in tracked locs (likely a core/func ref)"
+            );
+        }
     }
 
     fn visit_alias(
@@ -461,10 +587,39 @@ impl<'a> ComponentVisitor<'a> for DepCollector {
         id: u32,
         alias: &ComponentAlias<'a>,
     ) {
+        if self.comp_depth > 0 {
+            return;
+        }
         let Some(loc) = self.record_top_level(cx, item_kind_to_space(kind), id) else {
             return;
         };
         self.add_refs(cx, loc, alias);
+    }
+
+    fn visit_comp_instance(
+        &mut self,
+        cx: &VisitCtx<'a>,
+        id: u32,
+        inst: &ComponentInstance<'a>,
+    ) {
+        if self.comp_depth > 0 {
+            return;
+        }
+        // Record instances created by `instantiate` (and `from exports`)
+        // so the BFS can traverse from an exported instance back through
+        // its `with`-binding args to the types/instances they reference,
+        // eventually landing on the preamble imports the handler depends
+        // on.
+        //
+        // The instance lives in a `ComponentInstanceSection`, which the
+        // byte slicer `absorbs` rather than emits — so marking this
+        // section's items as needed is harmless for the emitted output;
+        // what matters is that BFS can cross through them to reach the
+        // preamble alias/import sections on the other side.
+        let Some(loc) = self.record_top_level(cx, ItemSpace::Instance, id) else {
+            return;
+        };
+        self.add_refs(cx, loc, inst);
     }
 }
 
@@ -560,13 +715,13 @@ mod tests {
         assert_deps_match(&deps, &expected);
     }
 
-    /// Targeting an interface that doesn't exist in the split should yield an
-    /// empty [`HandlerDeps`] so the caller can fall back to the legacy path.
+    /// Targeting an interface that doesn't exist in the split should yield a
+    /// `not_found` result so the caller can bail with a clear error.
     #[test]
     fn missing_target_yields_empty_deps() {
         let bytes = simple_fanin();
         let deps = find_handler_deps_in_bytes(&bytes, "no:such/iface").expect("dep walk");
-        assert!(deps.is_empty());
+        assert!(deps.not_found());
     }
 
     // ─── multi-item alias section coverage ───────────────────────────────

@@ -32,7 +32,7 @@
 //! Both builders return raw core-Wasm bytes; the component-builder
 //! wraps them in a `ModuleSection` of the outer Component.
 
-use cviz::model::{TypeArena, ValueType, ValueTypeId};
+use cviz::model::{TypeArena, ValueTypeId};
 use wasm_encoder::{
     BlockType, CodeSection, DataSection, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, ImportSection, Instruction, MemoryType, Module, TypeSection, ValType,
@@ -115,27 +115,6 @@ fn emit_task_return_loads(
             }));
         } else {
             emit_load(f, slot.byte_offset, &slot.val_type);
-        }
-    }
-}
-
-/// Emit a zero constant of the appropriate type onto the value stack.
-fn emit_zero(f: &mut Function, vt: &ValType) {
-    match vt {
-        ValType::I32 | ValType::Ref(_) => {
-            f.instruction(&Instruction::I32Const(0));
-        }
-        ValType::I64 => {
-            f.instruction(&Instruction::I64Const(0));
-        }
-        ValType::F32 => {
-            f.instruction(&Instruction::F32Const(0.0f32.into()));
-        }
-        ValType::F64 => {
-            f.instruction(&Instruction::F64Const(0.0f64.into()));
-        }
-        ValType::V128 => {
-            f.instruction(&Instruction::V128Const(0));
         }
     }
 }

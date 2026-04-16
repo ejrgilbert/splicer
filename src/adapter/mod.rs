@@ -32,10 +32,9 @@ mod split_imports;
 mod tests;
 mod ty;
 use component::build_adapter_bytes;
-#[allow(unused_imports)]
-use filter::{extract_filtered_sections, find_handler_deps, FilteredSections, HandlerDeps};
+use filter::{extract_filtered_sections, find_handler_deps};
 use func::extract_adapter_funcs;
-use split_imports::{extract_split_imports, SplitImports};
+use split_imports::SplitImports;
 
 /// Generate a tier-1 adapter component that wraps `middleware_name` and adapts it to
 /// export `target_interface`.
@@ -59,7 +58,7 @@ pub fn generate_tier1_adapter(
     middleware_interfaces: &[String],
     interface_type: Option<&InterfaceType>,
     splits_path: &str,
-    consumer_split_path: Option<&str>,
+    split_path: Option<&str>,
     arena: &TypeArena,
 ) -> anyhow::Result<String> {
     let iface_ty = interface_type.ok_or_else(|| {
@@ -78,32 +77,35 @@ pub fn generate_tier1_adapter(
         .iter()
         .any(|i| i.contains("/blocking"));
 
-    // Extract the consumer split's import structure if available.
+    // Compute the dependency closure of the target interface in the
+    // split. `find_handler_deps` walks the split and finds the target
+    // as either an **import** (consumer split — common case) or an
+    // **export** (provider split — outermost chain position). Either
+    // way, BFS from the target's loc yields the same shape of result:
+    // the set of preamble type/import/alias items the target
+    // transitively depends on. The only observable difference is that
+    // the provider split's filtered output won't include the handler
+    // as an instance import (it wasn't one), and the adapter builder
+    // will synthesize a fresh handler import type referencing the
+    // preamble's types.
     //
-    // We run the closure-based filter (find_handler_deps + the
-    // raw-section reencoder) so that fan-in splits — where the target
-    // interface is one of several unrelated imports in the split — only
-    // contribute the items the target actually depends on. For chain
-    // splits the closure is the entire import preamble, so the filter
-    // is a (mostly) no-op pass-through that re-encodes the same items
-    // it walked. The reencoded bytes may differ at the LEB128 level
-    // from the original verbatim bytes but are semantically identical.
-    let split_imports = if let Some(path) = consumer_split_path {
+    // When no split path is provided (unit tests only), fall back to
+    // synthesizing the handler import from interface type info.
+    let split_imports = if let Some(path) = split_path {
         let deps = find_handler_deps(path, target_interface)?;
-        if deps.is_empty() {
-            // Target import not present in the split (e.g. the split
-            // exports the handler instead of importing it). Fall back
-            // to the verbatim-copy path so the existing
-            // handler-from-export codepath still has the import
-            // metadata it needs.
-            Some(extract_split_imports(path)?)
-        } else {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("Failed to read consumer split at '{}'", path))?;
-            Some(SplitImports::from(extract_filtered_sections(
-                &bytes, &deps,
-            )?))
+        if deps.not_found() {
+            anyhow::bail!(
+                "Split at '{}' neither imports nor exports interface '{}'. \
+                 Please open an issue with a repro at https://github.com/ejrgilbert/splicer/issues",
+                path,
+                target_interface
+            );
         }
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read split at '{path}'"))?;
+        Some(SplitImports::from(extract_filtered_sections(
+            &bytes, &deps,
+        )?))
     } else {
         None
     };

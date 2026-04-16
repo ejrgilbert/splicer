@@ -260,6 +260,25 @@ impl InstTypeCtx {
             return Ok(ComponentValType::Type(local_idx));
         }
 
+        // Pre-aliased at the component scope. For **non-resource**
+        // types (variants, records, etc.), the alias local IS the type
+        // — return it directly so the instance body stays
+        // type-identical to the outer definition. (Resources still fall
+        // through to the SubResource/own<> branch below; that branch
+        // looks up the same `alias_locals` entry and emits the
+        // `own<alias_local>` wrapper callers expect in function
+        // signatures.)
+        if let Some(&alias_local) = self.alias_locals.get(&id) {
+            let is_resource = matches!(
+                arena.lookup_val(id),
+                ValueType::Resource(_) | ValueType::AsyncHandle
+            );
+            if !is_resource {
+                self.cache.insert(id, alias_local);
+                return Ok(ComponentValType::Type(alias_local));
+            }
+        }
+
         // Clone to avoid borrow conflicts during recursion.
         let vt = arena.lookup_val(id).clone();
 

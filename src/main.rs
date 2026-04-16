@@ -86,6 +86,18 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // Diagnostics off by default. Users opt in via `RUST_LOG` — e.g.
+    // `RUST_LOG=splicer::adapter::filter=debug splicer splice …` to see
+    // the closure walker's decisions, or `RUST_LOG=splicer=debug` for the
+    // full pipeline. Writes to stderr so normal stdout output is unaffected.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     match Args::parse().command {
         Command::Splice {
             splice_cfg_file,
