@@ -50,10 +50,49 @@ use super::filter::FilteredSections;
 use super::func::AdapterFunc;
 use super::mem_layout::MemoryLayoutBuilder;
 
+/// Running index allocators for the adapter's component-level and
+/// core-level namespaces. One instance lives in [`build_adapter_bytes`]
+/// and is threaded through every phase by `&mut`, so phases no longer
+/// need to carry "where did we leave the type counter?" state in
+/// their outcome structs.
+#[derive(Default)]
+struct ComponentIndices {
+    pub ty: u32,
+    pub inst: u32,
+    pub func: u32,
+    pub core_inst: u32,
+    pub core_func: u32,
+}
+
+impl ComponentIndices {
+    fn alloc_ty(&mut self) -> u32 {
+        let idx = self.ty;
+        self.ty += 1;
+        idx
+    }
+    fn alloc_inst(&mut self) -> u32 {
+        let idx = self.inst;
+        self.inst += 1;
+        idx
+    }
+    fn alloc_func(&mut self) -> u32 {
+        let idx = self.func;
+        self.func += 1;
+        idx
+    }
+    fn alloc_core_inst(&mut self) -> u32 {
+        let idx = self.core_inst;
+        self.core_inst += 1;
+        idx
+    }
+    fn alloc_core_func(&mut self) -> u32 {
+        let idx = self.core_func;
+        self.core_func += 1;
+        idx
+    }
+}
+
 // ─── Section-emit helpers ──────────────────────────────────────────────────
-//
-// Each helper appends a section's worth of items and either updates an
-// `&mut counter` for indices it produced or returns the indices directly.
 
 /// Encode each function's params + result into `inst` (using `ctx` to manage
 /// resource handling) and append a typed export for each. The caller may
@@ -102,7 +141,7 @@ fn build_handler_inst_type(
 /// per emitted instance type.
 fn emit_hook_inst_types(
     types: &mut ComponentTypeSection,
-    type_count: &mut u32,
+    indices: &mut ComponentIndices,
     has_before: bool,
     has_after: bool,
     has_blocking: bool,
@@ -112,8 +151,7 @@ fn emit_hook_inst_types(
     let string_cv = ComponentValType::Primitive(PrimitiveValType::String);
     let bool_cv = ComponentValType::Primitive(PrimitiveValType::Bool);
     let mut emit_hook_ty = |export_name: &str, result: Option<ComponentValType>| {
-        let idx = *type_count;
-        *type_count += 1;
+        let idx = indices.alloc_ty();
         let mut inst = InstanceType::new();
         inst.ty()
             .function()
@@ -139,7 +177,7 @@ fn emit_hook_inst_types(
 /// requires an exact name match when wiring instances.
 fn emit_hook_imports(
     imports: &mut ComponentImportSection,
-    instance_count: &mut u32,
+    indices: &mut ComponentIndices,
     before_ty: Option<u32>,
     after_ty: Option<u32>,
     blocking_ty: Option<u32>,
@@ -149,8 +187,7 @@ fn emit_hook_imports(
     };
 
     let mut import_hook = |ty_idx: u32, iface: &str| {
-        let idx = *instance_count;
-        *instance_count += 1;
+        let idx = indices.alloc_inst();
         imports.import(
             &versioned_interface(iface, TIER1_VERSION),
             ComponentTypeRef::Instance(ty_idx),
@@ -168,17 +205,16 @@ fn emit_hook_imports(
 /// component scope.  Returns `(handler_func_base, before, after, blocking)`.
 fn emit_func_aliases(
     aliases: &mut ComponentAliasSection,
-    func_count: &mut u32,
+    indices: &mut ComponentIndices,
     funcs: &[AdapterFunc],
     handler_inst: u32,
     before_inst: Option<u32>,
     after_inst: Option<u32>,
     blocking_inst: Option<u32>,
 ) -> (u32, Option<u32>, Option<u32>, Option<u32>) {
-    let handler_func_base = *func_count;
+    let handler_func_base = indices.func;
     let mut alias_func = |inst_idx: u32, name: &str| {
-        let idx = *func_count;
-        *func_count += 1;
+        let idx = indices.alloc_func();
         aliases.alias(Alias::InstanceExport {
             instance: inst_idx,
             kind: ComponentExportKind::Func,
@@ -220,13 +256,8 @@ fn emit_imports_from_consumer_split(
     arena: &TypeArena,
     iface_ty: &InterfaceType,
     split: &FilteredSections,
+    indices: &mut ComponentIndices,
 ) -> anyhow::Result<ImportsOutcome> {
-    // Strategy-internal counters: we start by claiming the index space the
-    // raw sections we just copied already consumed.
-    let mut type_count: u32;
-    let mut instance_count: u32;
-    let mut func_count: u32 = 0;
-
     // Strategy-internal handles to the handler instance import. They never
     // escape because the post-strategy phases only need the handler
     // *function* aliases (in handler_func_base), not the handler instance
@@ -248,8 +279,11 @@ fn emit_imports_from_consumer_split(
             data,
         });
     }
-    type_count = split.type_count;
-    instance_count = split.instance_count;
+    // The filtered split already consumed `split.type_count` type slots
+    // and `split.instance_count` instance slots — seed the allocator
+    // so our subsequent emits land on the right indices.
+    indices.ty = split.type_count;
+    indices.inst = split.instance_count;
 
     // Check if the handler is already imported by the split.
     let handler_in_split = split.import_names.iter().any(|n| n == target_interface);
@@ -267,13 +301,8 @@ fn emit_imports_from_consumer_split(
         let (before_inst_ty, after_inst_ty, blocking_inst_ty);
         {
             let mut types = ComponentTypeSection::new();
-            (before_inst_ty, after_inst_ty, blocking_inst_ty) = emit_hook_inst_types(
-                &mut types,
-                &mut type_count,
-                has_before,
-                has_after,
-                has_blocking,
-            );
+            (before_inst_ty, after_inst_ty, blocking_inst_ty) =
+                emit_hook_inst_types(&mut types, indices, has_before, has_after, has_blocking);
             component.section(&types);
         }
         let (before_inst, after_inst, blocking_inst);
@@ -281,7 +310,7 @@ fn emit_imports_from_consumer_split(
             let mut imports = ComponentImportSection::new();
             (before_inst, after_inst, blocking_inst) = emit_hook_imports(
                 &mut imports,
-                &mut instance_count,
+                indices,
                 before_inst_ty,
                 after_inst_ty,
                 blocking_inst_ty,
@@ -299,7 +328,7 @@ fn emit_imports_from_consumer_split(
                 blocking_comp_func,
             ) = emit_func_aliases(
                 &mut aliases,
-                &mut func_count,
+                indices,
                 funcs,
                 handler_inst,
                 before_inst,
@@ -329,8 +358,7 @@ fn emit_imports_from_consumer_split(
 
             // Alias resources.
             for (_vid, export_name, _res_local, _own_local) in &inst_ctx.resource_exports {
-                let comp_idx = type_count;
-                type_count += 1;
+                let comp_idx = indices.alloc_ty();
                 aliases.alias(Alias::InstanceExport {
                     instance: handler_inst,
                     kind: ComponentExportKind::Type,
@@ -347,8 +375,7 @@ fn emit_imports_from_consumer_split(
                         arena.lookup_val(vid),
                         ValueType::Resource(_) | ValueType::AsyncHandle
                     ) {
-                        let comp_idx = type_count;
-                        type_count += 1;
+                        let comp_idx = indices.alloc_ty();
                         aliases.alias(Alias::InstanceExport {
                             instance: handler_inst,
                             kind: ComponentExportKind::Type,
@@ -359,7 +386,7 @@ fn emit_imports_from_consumer_split(
                 }
             }
 
-            if type_count > split.type_count {
+            if indices.ty > split.type_count {
                 component.section(&aliases);
             }
         }
@@ -427,34 +454,27 @@ fn emit_imports_from_consumer_split(
             }
 
             build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
-            handler_inst_ty = type_count;
-            type_count += 1;
+            handler_inst_ty = indices.alloc_ty();
             inst_ctx = ctx;
             types.instance(&inst);
         }
 
-        let (before_inst_ty, after_inst_ty, blocking_inst_ty) = emit_hook_inst_types(
-            &mut types,
-            &mut type_count,
-            has_before,
-            has_after,
-            has_blocking,
-        );
+        let (before_inst_ty, after_inst_ty, blocking_inst_ty) =
+            emit_hook_inst_types(&mut types, indices, has_before, has_after, has_blocking);
         component.section(&types);
 
         // Import handler + hooks.
         let (before_inst, after_inst, blocking_inst);
         {
             let mut imports = ComponentImportSection::new();
-            handler_inst = instance_count;
-            instance_count += 1;
+            handler_inst = indices.alloc_inst();
             imports.import(
                 target_interface,
                 ComponentTypeRef::Instance(handler_inst_ty),
             );
             (before_inst, after_inst, blocking_inst) = emit_hook_imports(
                 &mut imports,
-                &mut instance_count,
+                indices,
                 before_inst_ty,
                 after_inst_ty,
                 blocking_inst_ty,
@@ -472,7 +492,7 @@ fn emit_imports_from_consumer_split(
                 blocking_comp_func,
             ) = emit_func_aliases(
                 &mut aliases,
-                &mut func_count,
+                indices,
                 funcs,
                 handler_inst,
                 before_inst,
@@ -492,8 +512,7 @@ fn emit_imports_from_consumer_split(
                 if let Some(&comp_idx) = outer_aliased.get(vid) {
                     res_vec.push(comp_idx);
                 } else {
-                    let comp_res_idx = type_count;
-                    type_count += 1;
+                    let comp_res_idx = indices.alloc_ty();
                     aliases.alias(Alias::InstanceExport {
                         instance: handler_inst,
                         kind: ComponentExportKind::Type,
@@ -531,9 +550,6 @@ fn emit_imports_from_consumer_split(
         inst_ctx,
         comp_resource_indices,
         comp_aliased_types,
-        type_count,
-        instance_count,
-        func_count,
     })
 }
 
@@ -564,11 +580,6 @@ struct ImportsOutcome {
     /// `encode_comp_cv` cache with this so it reuses aliased indices
     /// instead of emitting fresh inline definitions.
     comp_aliased_types: HashMap<ValueTypeId, u32>,
-    /// Counter values after the strategy finished. Subsequent phases pick
-    /// up from here and continue mutating their own copies.
-    type_count: u32,
-    instance_count: u32,
-    func_count: u32,
 }
 
 /// Pure data describing the dispatch module's linear-memory layout
@@ -644,12 +655,6 @@ struct MemoryProviderOutcome {
     /// Component-scope core-func index of the aliased `realloc` export,
     /// or `None` when `needs_realloc` is false.
     mem_core_realloc: Option<u32>,
-    /// Counter values after the three sections were emitted. The dispatch
-    /// phase needs `core_instance_count` to know where to put the env
-    /// instance; the canon-lower phase needs `core_func_count` to know
-    /// where the lowered hook funcs go.
-    core_instance_count: u32,
-    core_func_count: u32,
 }
 
 /// Sections 4 + 5 + 6. Build the memory provider core module, instantiate
@@ -658,13 +663,12 @@ struct MemoryProviderOutcome {
 /// reference them via `CanonicalOption::Memory` / `Realloc`.
 fn emit_memory_provider(
     component: &mut Component,
+    indices: &mut ComponentIndices,
     needs_realloc: bool,
     bump_start: u32,
 ) -> MemoryProviderOutcome {
-    // The memory provider phase is the first phase that touches the
-    // core-* counters, so they all start at 0 here.
-    let mut core_instance_count: u32 = 0;
-    let mut core_func_count: u32 = 0;
+    // Core memory is its own index space — the adapter only has one memory
+    // (from this module), so it lives at index 0.
     let core_memory_count: u32 = 0;
 
     // ── 4. Core module 0: memory provider (+ optional realloc) ─────────
@@ -677,8 +681,7 @@ fn emit_memory_provider(
     let mem_core_inst: u32;
     {
         let mut instances = InstanceSection::new();
-        mem_core_inst = core_instance_count;
-        core_instance_count += 1;
+        mem_core_inst = indices.alloc_core_inst();
         instances.instantiate::<[(&str, wasm_encoder::ModuleArg); 0], &str>(0u32, []);
         component.section(&instances);
     }
@@ -695,8 +698,7 @@ fn emit_memory_provider(
             name: "mem",
         });
         mem_core_realloc = if needs_realloc {
-            let idx = core_func_count;
-            core_func_count += 1;
+            let idx = indices.alloc_core_func();
             aliases.alias(Alias::CoreInstanceExport {
                 instance: mem_core_inst,
                 kind: ExportKind::Func,
@@ -712,8 +714,6 @@ fn emit_memory_provider(
     MemoryProviderOutcome {
         mem_core_mem,
         mem_core_realloc,
-        core_instance_count,
-        core_func_count,
     }
 }
 
@@ -738,8 +738,6 @@ struct CanonLowerOutcome {
     /// Per-async-function `task.return` core-func indices, parallel to
     /// `funcs`. `None` for sync funcs.
     core_task_return_funcs: Vec<Option<u32>>,
-    /// Core-func counter after the section was emitted.
-    core_func_count: u32,
 }
 
 /// Section 7. Lower the hook funcs (before/after/blocking), the handler
@@ -748,6 +746,7 @@ struct CanonLowerOutcome {
 #[allow(clippy::too_many_arguments)]
 fn emit_canon_lower(
     component: &mut Component,
+    indices: &mut ComponentIndices,
     funcs: &[AdapterFunc],
     handler_func_base: u32,
     before_comp_func: Option<u32>,
@@ -757,7 +756,6 @@ fn emit_canon_lower(
     mem_core_realloc: Option<u32>,
     has_async_machinery: bool,
     comp_result_cvs: &[Option<ComponentValType>],
-    mut core_func_count: u32,
 ) -> CanonLowerOutcome {
     let core_waitable_new: Option<u32>;
     let core_waitable_join: Option<u32>;
@@ -771,8 +769,7 @@ fn emit_canon_lower(
     // name param (requiring `Memory` + `UTF8`) and fires async, so
     // the three canonicals are shape-identical.
     let mut lower_hook = |comp_f: u32| {
-        let idx = core_func_count;
-        core_func_count += 1;
+        let idx = indices.alloc_core_func();
         canons.lower(
             comp_f,
             [
@@ -789,9 +786,9 @@ fn emit_canon_lower(
 
     // Lower each handler function. For functions with resources/strings:
     // need Memory + UTF8 + Realloc. For async: also need Async flag.
-    let core_handler_func_base = core_func_count;
+    let core_handler_func_base = indices.core_func;
     for (i, func) in funcs.iter().enumerate() {
-        core_func_count += 1;
+        indices.core_func += 1;
         let hs = func.has_strings;
         let hr = func.has_resources;
         let needs_mem = func.is_async && func.result_type_id.is_some() || hs || hr;
@@ -818,24 +815,19 @@ fn emit_canon_lower(
     // Async canonical built-ins — emitted whenever async machinery is
     // needed.
     if has_async_machinery {
-        core_waitable_new = Some(core_func_count);
-        core_func_count += 1;
+        core_waitable_new = Some(indices.alloc_core_func());
         canons.waitable_set_new();
 
-        core_waitable_join = Some(core_func_count);
-        core_func_count += 1;
+        core_waitable_join = Some(indices.alloc_core_func());
         canons.waitable_join();
 
-        core_waitable_wait = Some(core_func_count);
-        core_func_count += 1;
+        core_waitable_wait = Some(indices.alloc_core_func());
         canons.waitable_set_wait(false, mem_core_mem);
 
-        core_waitable_drop = Some(core_func_count);
-        core_func_count += 1;
+        core_waitable_drop = Some(indices.alloc_core_func());
         canons.waitable_set_drop();
 
-        core_subtask_drop = Some(core_func_count);
-        core_func_count += 1;
+        core_subtask_drop = Some(indices.alloc_core_func());
         canons.subtask_drop();
     } else {
         core_waitable_new = None;
@@ -853,8 +845,7 @@ fn emit_canon_lower(
         .enumerate()
         .map(|(fi, func)| {
             if func.is_async {
-                let idx = core_func_count;
-                core_func_count += 1;
+                let idx = indices.alloc_core_func();
                 let tr_result_cv = comp_result_cvs[fi];
                 let hr = func.has_resources;
                 let hs = func.has_strings;
@@ -885,7 +876,6 @@ fn emit_canon_lower(
         core_waitable_drop,
         core_subtask_drop,
         core_task_return_funcs,
-        core_func_count,
     }
 }
 
@@ -897,9 +887,6 @@ struct DispatchPhaseOutcome {
     /// (Core instance 2). The canon-lift phase aliases each handler's
     /// wrapper export out of this instance.
     dispatch_core_inst: u32,
-    /// Core-instance counter after both env (Core instance 1) and
-    /// dispatch (Core instance 2) instances were emitted.
-    core_instance_count: u32,
 }
 
 /// Sections 8 + 9. Embed the dispatch core module bytes (built by
@@ -909,6 +896,7 @@ struct DispatchPhaseOutcome {
 #[allow(clippy::too_many_arguments)]
 fn emit_dispatch_phase(
     component: &mut Component,
+    indices: &mut ComponentIndices,
     funcs: &[AdapterFunc],
     has_before: bool,
     has_after: bool,
@@ -917,7 +905,6 @@ fn emit_dispatch_phase(
     arena: &TypeArena,
     mem_core_mem: u32,
     canon_lower: &CanonLowerOutcome,
-    mut core_instance_count: u32,
 ) -> anyhow::Result<DispatchPhaseOutcome> {
     // ── 8. Core module 1: dispatch ─────────────────────────────────────
     {
@@ -943,8 +930,7 @@ fn emit_dispatch_phase(
         let mut instances = InstanceSection::new();
 
         // Core instance 1: env (export items that dispatch imports).
-        let env_inst = core_instance_count;
-        core_instance_count += 1;
+        let env_inst = indices.alloc_core_inst();
 
         let mut env_exports: Vec<(String, ExportKind, u32)> = Vec::new();
         env_exports.push(("mem".to_string(), ExportKind::Memory, mem_core_mem));
@@ -994,20 +980,13 @@ fn emit_dispatch_phase(
         );
 
         // Core instance 2: dispatch (instantiate with env).
-        // Note: we deliberately do NOT increment core_instance_count for
-        // this instance — the original code didn't either, and nothing
-        // downstream reads the post-phase value. Preserving the original
-        // behavior keeps the orchestrator's counter handling identical.
-        dispatch_core_inst = core_instance_count;
+        dispatch_core_inst = indices.alloc_core_inst();
         instances.instantiate(1u32, [("env", wasm_encoder::ModuleArg::Instance(env_inst))]);
 
         component.section(&instances);
     }
 
-    Ok(DispatchPhaseOutcome {
-        dispatch_core_inst,
-        core_instance_count,
-    })
+    Ok(DispatchPhaseOutcome { dispatch_core_inst })
 }
 
 /// State produced by [`emit_canon_lift_phase`] for use by the export
@@ -1017,10 +996,6 @@ struct CanonLiftOutcome {
     /// First component-scope func index of the lifted wrapper funcs.
     /// Per-handler indices live at `wrapped_func_base + i`.
     wrapped_func_base: u32,
-    /// Core-func counter after the wrapper aliases were emitted.
-    core_func_count: u32,
-    /// Component-scope func counter after the lift section was emitted.
-    func_count: u32,
 }
 
 /// Sections 10 + 11. Alias the dispatch core instance's wrapper exports
@@ -1028,27 +1003,27 @@ struct CanonLiftOutcome {
 /// wrapper into a component-scope function of the matching target
 /// function type from section 3c.
 ///
-/// Note: this phase does NOT update `core_func_count` or `func_count`
-/// — the original implementation didn't either, and nothing downstream
-/// reads those counter values after this point. Preserving the original
-/// behavior keeps the byte output identical.
+/// Note: this phase does NOT advance `indices.core_func` or
+/// `indices.func` past the section it emits — the original
+/// implementation didn't either, and nothing downstream reads the
+/// counters after this point. Preserving that keeps the byte output
+/// identical.
 #[allow(clippy::too_many_arguments)]
 fn emit_canon_lift_phase(
     component: &mut Component,
+    indices: &ComponentIndices,
     funcs: &[AdapterFunc],
     dispatch_core_inst: u32,
     target_func_ty_base: u32,
     mem_core_mem: u32,
     mem_core_realloc: Option<u32>,
     needs_realloc: bool,
-    core_func_count: u32,
-    func_count: u32,
 ) -> CanonLiftOutcome {
     // ── 10. Alias core wrapper functions from dispatch instance ────────
     let core_wrapper_func_base: u32;
     {
         let mut aliases = ComponentAliasSection::new();
-        core_wrapper_func_base = core_func_count;
+        core_wrapper_func_base = indices.core_func;
         for func in funcs {
             aliases.alias(Alias::CoreInstanceExport {
                 instance: dispatch_core_inst,
@@ -1063,7 +1038,7 @@ fn emit_canon_lift_phase(
     let wrapped_func_base: u32;
     {
         let mut canons = CanonicalFunctionSection::new();
-        wrapped_func_base = func_count;
+        wrapped_func_base = indices.func;
         for (i, func) in funcs.iter().enumerate() {
             let mut opts: Vec<CanonicalOption> = if func.is_async {
                 vec![CanonicalOption::Async]
@@ -1093,11 +1068,7 @@ fn emit_canon_lift_phase(
         component.section(&canons);
     }
 
-    CanonLiftOutcome {
-        wrapped_func_base,
-        core_func_count,
-        func_count,
-    }
+    CanonLiftOutcome { wrapped_func_base }
 }
 
 /// Sections 12 + 13. Build the export instance that re-exports the
@@ -1109,6 +1080,7 @@ fn emit_canon_lift_phase(
 #[allow(clippy::too_many_arguments)]
 fn emit_export_phase(
     component: &mut Component,
+    indices: &ComponentIndices,
     target_interface: &str,
     funcs: &[AdapterFunc],
     iface_ty: &InterfaceType,
@@ -1116,14 +1088,13 @@ fn emit_export_phase(
     inst_ctx: &InstTypeCtx,
     comp_resource_indices: &[u32],
     comp_aliased_types: &HashMap<ValueTypeId, u32>,
-    instance_count: u32,
     wrapped_func_base: u32,
 ) {
     // ── 12. Component instance: export instance for target interface ──
     let export_inst: u32;
     {
         let mut comp_instances = ComponentInstanceSection::new();
-        export_inst = instance_count;
+        export_inst = indices.inst;
 
         let mut export_items: Vec<(&str, ComponentExportKind, u32)> = Vec::new();
 
@@ -1208,9 +1179,8 @@ fn emit_handler_resource_types(
     inst_ctx: &InstTypeCtx,
     comp_resource_indices: &[u32],
     comp_aliased_types: &HashMap<ValueTypeId, u32>,
-    type_count_in: u32,
+    indices: &mut ComponentIndices,
 ) -> anyhow::Result<HandlerTypesOutcome> {
-    let mut type_count = type_count_in;
     // ── 3b. Type section B: own<T> types for each aliased resource ─────────
     //
     // Maps ValueTypeId → component-level own<T> type index. Named
@@ -1225,8 +1195,7 @@ fn emit_handler_resource_types(
             inst_ctx.resource_exports.iter().enumerate()
         {
             let comp_res_idx = comp_resource_indices[i];
-            let own_idx = type_count;
-            type_count += 1;
+            let own_idx = indices.alloc_ty();
             own_types.defined_type().own(comp_res_idx);
             own_map.insert(*vid, own_idx);
         }
@@ -1272,7 +1241,7 @@ fn emit_handler_resource_types(
                     id,
                     arena,
                     &mut func_types,
-                    &mut type_count,
+                    &mut indices.ty,
                     &comp_own_by_vid,
                     &mut comp_cv_cache,
                 )?;
@@ -1285,7 +1254,7 @@ fn emit_handler_resource_types(
                         id,
                         arena,
                         &mut func_types,
-                        &mut type_count,
+                        &mut indices.ty,
                         &comp_own_by_vid,
                         &mut comp_cv_cache,
                     )
@@ -1297,10 +1266,10 @@ fn emit_handler_resource_types(
         // Second pass: declare function types. target_func_ty_base is
         // set HERE, after all compound types have been added to
         // func_types.
-        target_func_ty_base = type_count;
+        target_func_ty_base = indices.ty;
         let mut result_cvs: Vec<Option<ComponentValType>> = Vec::new();
         for (func, FuncSig { params, result }) in funcs.iter().zip(pre_encoded.into_iter()) {
-            type_count += 1;
+            indices.ty += 1;
             result_cvs.push(result);
             let mut fty = func_types.function();
             if func.is_async {
@@ -1315,7 +1284,6 @@ fn emit_handler_resource_types(
     }
 
     let _ = comp_own_by_vid;
-    let _ = type_count;
     Ok(HandlerTypesOutcome {
         target_func_ty_base,
         comp_result_cvs,
@@ -1341,6 +1309,11 @@ pub(super) fn build_adapter_bytes(
 ) -> anyhow::Result<Vec<u8>> {
     let mut component = Component::new();
 
+    // Shared index allocator — threaded by `&mut` through every
+    // phase below. Phases no longer return counter values; they
+    // mutate `indices` in place.
+    let mut indices = ComponentIndices::default();
+
     // ── 1–3. Type / Import / Alias sections ─────────────────────────────────
     //
     // Copy the consumer (or provider) split's type/import/alias sections
@@ -1354,9 +1327,6 @@ pub(super) fn build_adapter_bytes(
         inst_ctx,
         comp_resource_indices,
         comp_aliased_types,
-        type_count: type_count_after,
-        instance_count: instance_count_after,
-        func_count: func_count_after,
     } = emit_imports_from_consumer_split(
         &mut component,
         target_interface,
@@ -1367,18 +1337,8 @@ pub(super) fn build_adapter_bytes(
         arena,
         iface_ty,
         split,
+        &mut indices,
     )?;
-
-    // ── Index counters ─────────────────────────────────────────────────────
-    //
-    // `func_count` and `instance_count` are initialized from the
-    // import-strategy outcome below — they're declared here only for
-    // visibility into the post-strategy phases (`func_count` is read by
-    // canon-lift, `instance_count` is read by the export phase). The
-    // core-* counters are owned by the phase functions that produce
-    // them; the orchestrator only carries the values it has to forward.
-    let instance_count = instance_count_after;
-    let func_count = func_count_after;
 
     let HandlerTypesOutcome {
         target_func_ty_base,
@@ -1390,7 +1350,7 @@ pub(super) fn build_adapter_bytes(
         &inst_ctx,
         &comp_resource_indices,
         &comp_aliased_types,
-        type_count_after,
+        &mut indices,
     )?;
 
     let layout = compute_memory_layout(funcs, layout, has_before, has_after, has_blocking);
@@ -1398,12 +1358,16 @@ pub(super) fn build_adapter_bytes(
     let MemoryProviderOutcome {
         mem_core_mem,
         mem_core_realloc,
-        core_instance_count: core_instance_count_after_mem,
-        core_func_count: core_func_count_after_mem,
-    } = emit_memory_provider(&mut component, layout.needs_realloc, layout.bump_start);
+    } = emit_memory_provider(
+        &mut component,
+        &mut indices,
+        layout.needs_realloc,
+        layout.bump_start,
+    );
 
     let canon_lower = emit_canon_lower(
         &mut component,
+        &mut indices,
         funcs,
         handler_func_base,
         before_comp_func,
@@ -1413,14 +1377,11 @@ pub(super) fn build_adapter_bytes(
         mem_core_realloc,
         layout.has_async_machinery,
         &comp_result_cvs,
-        core_func_count_after_mem,
     );
 
-    let DispatchPhaseOutcome {
-        dispatch_core_inst,
-        core_instance_count: _core_instance_count_after_dispatch,
-    } = emit_dispatch_phase(
+    let DispatchPhaseOutcome { dispatch_core_inst } = emit_dispatch_phase(
         &mut component,
+        &mut indices,
         funcs,
         has_before,
         has_after,
@@ -1429,27 +1390,22 @@ pub(super) fn build_adapter_bytes(
         arena,
         mem_core_mem,
         &canon_lower,
-        core_instance_count_after_mem,
     )?;
 
-    let CanonLiftOutcome {
-        wrapped_func_base,
-        core_func_count: _core_func_count_after_lift,
-        func_count: _func_count_after_lift,
-    } = emit_canon_lift_phase(
+    let CanonLiftOutcome { wrapped_func_base } = emit_canon_lift_phase(
         &mut component,
+        &indices,
         funcs,
         dispatch_core_inst,
         target_func_ty_base,
         mem_core_mem,
         mem_core_realloc,
         layout.needs_realloc,
-        canon_lower.core_func_count,
-        func_count,
     );
 
     emit_export_phase(
         &mut component,
+        &indices,
         target_interface,
         funcs,
         iface_ty,
@@ -1457,7 +1413,6 @@ pub(super) fn build_adapter_bytes(
         &inst_ctx,
         &comp_resource_indices,
         &comp_aliased_types,
-        instance_count,
         wrapped_func_base,
     );
 
