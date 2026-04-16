@@ -75,6 +75,46 @@ use super::func::AdapterFunc;
 use super::names;
 use super::ty::{val_type_byte_size, FlatLayout};
 
+/// Running index allocators for the dispatch core module's type and
+/// function spaces. Scoped to a single call of [`build_dispatch_module`].
+///
+/// These are CORE-MODULE-INTERNAL indices. The dispatch module is a
+/// self-contained core wasm module that only communicates with the
+/// outer component through named env imports (`env/mem`,
+/// `env/handler_f{i}`, …), so its type and function tables have no
+/// relationship to the outer component's indices tracked by
+/// [`super::component::ComponentIndices`]. Keeping them in a separate
+/// struct makes the "two different index spaces" explicit and saves
+/// every type/import emitter from threading its own `&mut u32`.
+struct DispatchIndices {
+    /// Next free slot in the core module's `TypeSection`.
+    ty: u32,
+    /// Next free index in the core module's function space. Imports
+    /// come first (contiguous from 0), then the defined wrapper funcs
+    /// in the code section (contiguous after the last import).
+    func: u32,
+}
+
+impl DispatchIndices {
+    fn new() -> Self {
+        Self { ty: 0, func: 0 }
+    }
+
+    /// Reserve the next type-section slot and return its index.
+    fn alloc_ty(&mut self) -> u32 {
+        let idx = self.ty;
+        self.ty += 1;
+        idx
+    }
+
+    /// Reserve the next function-index slot and return its index.
+    fn alloc_func(&mut self) -> u32 {
+        let idx = self.func;
+        self.func += 1;
+        idx
+    }
+}
+
 /// Emit a typed load instruction at `offset` within the address
 /// already on top of the stack. Returns the byte size consumed so
 /// the caller can advance the offset.
@@ -300,9 +340,9 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
 // ─── Type-section emitters ─────────────────────────────────────────────────
 //
 // Each helper appends one logical group of types to the dispatch
-// module's TypeSection and bumps `ty_idx` accordingly. They must be
-// called in the order below — wasm type indices are positional and
-// downstream imports/wrappers reference exact slots
+// module's TypeSection and bumps `indices.ty` accordingly. They must
+// be called in the order below — wasm type indices are positional
+// and downstream imports/wrappers reference exact slots
 // (`wrapper_ty_base + i`, etc.).
 
 /// Emit one wrapper function type per target func, in contiguous
@@ -315,7 +355,11 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
 ///   memory for canon lift to read from.
 /// - **sync simple**: `(flat_params…) -> (flat_results…)` — the
 ///   straight-through single-value / void case.
-fn emit_wrapper_types(types: &mut TypeSection, ty_idx: &mut u32, funcs: &[AdapterFunc]) {
+fn emit_wrapper_types(
+    types: &mut TypeSection,
+    indices: &mut DispatchIndices,
+    funcs: &[AdapterFunc],
+) {
     for func in funcs {
         if func.is_async {
             types.ty().function(func.core_params.iter().copied(), []);
@@ -329,7 +373,7 @@ fn emit_wrapper_types(types: &mut TypeSection, ty_idx: &mut u32, funcs: &[Adapte
                 func.core_results.iter().copied(),
             );
         }
-        *ty_idx += 1;
+        indices.alloc_ty();
     }
 }
 
@@ -340,14 +384,13 @@ fn emit_wrapper_types(types: &mut TypeSection, ty_idx: &mut u32, funcs: &[Adapte
 /// `out[i]` for sync-complex funcs; other entries are left untouched.
 fn emit_sync_complex_handler_types(
     types: &mut TypeSection,
-    ty_idx: &mut u32,
+    indices: &mut DispatchIndices,
     funcs: &[AdapterFunc],
     out: &mut [Option<u32>],
 ) {
     for (i, func) in funcs.iter().enumerate() {
         if !func.is_async && func.result_is_complex {
-            out[i] = Some(*ty_idx);
-            *ty_idx += 1;
+            out[i] = Some(indices.alloc_ty());
             let mut params: Vec<ValType> = func.core_params.clone();
             params.push(ValType::I32); // retptr
             types.ty().function(params, []);
@@ -363,14 +406,13 @@ fn emit_sync_complex_handler_types(
 /// `out[i]` for async funcs.
 fn emit_async_handler_types(
     types: &mut TypeSection,
-    ty_idx: &mut u32,
+    indices: &mut DispatchIndices,
     funcs: &[AdapterFunc],
     out: &mut [Option<u32>],
 ) {
     for (i, func) in funcs.iter().enumerate() {
         if func.is_async {
-            out[i] = Some(*ty_idx);
-            *ty_idx += 1;
+            out[i] = Some(indices.alloc_ty());
             let mut params: Vec<ValType> = func.core_params.clone();
             if func.result_type_id.is_some() {
                 params.push(ValType::I32); // result_ptr
@@ -397,19 +439,19 @@ fn emit_custom_task_return_types(types: &mut TypeSection, funcs: &[AdapterFunc])
 /// Import `env/handler_f{i}` for each target func, picking the type
 /// slot that matches its calling convention (sync-simple reuses the
 /// wrapper type; sync-complex uses its retptr type; async uses its
-/// async-lowered type). Bumps `fn_idx` by `funcs.len()` and returns
-/// the base function index so the caller can reference individual
-/// handler imports as `base + i`.
+/// async-lowered type). Allocates `funcs.len()` function indices via
+/// `indices.alloc_func()` and returns the base so the caller can
+/// reference individual handler imports as `base + i`.
 #[allow(clippy::too_many_arguments)]
 fn emit_handler_imports(
     imports: &mut ImportSection,
-    fn_idx: &mut u32,
+    indices: &mut DispatchIndices,
     funcs: &[AdapterFunc],
     wrapper_ty_base: u32,
     async_ds_tys: &[Option<u32>],
     sync_complex_handler_tys: &[Option<u32>],
 ) -> u32 {
-    let base = *fn_idx;
+    let base = indices.func;
     for (i, func) in funcs.iter().enumerate() {
         let ty = if func.is_async {
             async_ds_tys[i].expect("async_ds_ty must be set for async func")
@@ -418,13 +460,13 @@ fn emit_handler_imports(
         } else {
             wrapper_ty_base + i as u32
         };
+        indices.alloc_func();
         imports.import(
             names::ENV_INSTANCE,
             &names::env_handler_fn(i),
             EntityType::Function(ty),
         );
     }
-    *fn_idx += funcs.len() as u32;
     base
 }
 
@@ -440,7 +482,7 @@ fn emit_handler_imports(
 #[allow(clippy::too_many_arguments)]
 fn emit_task_return_imports(
     imports: &mut ImportSection,
-    fn_idx: &mut u32,
+    indices: &mut DispatchIndices,
     funcs: &[AdapterFunc],
     void_void_ty: u32,
     void_i32_ty: u32,
@@ -469,8 +511,7 @@ fn emit_task_return_imports(
                 _ => void_i32_ty,
             }
         };
-        trf[i] = Some(*fn_idx);
-        *fn_idx += 1;
+        trf[i] = Some(indices.alloc_func());
         imports.import(
             names::ENV_INSTANCE,
             &names::env_task_return_fn(i),
@@ -881,9 +922,14 @@ pub(super) fn build_dispatch_module(
     //   slot 2+N+A+5: (f32) -> ()       (task_return_f32, if used)
     //   slot 2+N+A+6: (f64) -> ()       (task_return_f64, if used)
 
-    let hook_ty: u32 = 0;
-    let block_ty: u32 = 1;
-    let wrapper_ty_base: u32 = 2;
+    // Single index allocator for both types and functions. Threaded
+    // through every type/import emitter so no helper owns its own
+    // counter.
+    let mut indices = DispatchIndices::new();
+
+    let hook_ty: u32;
+    let block_ty: u32;
+    let wrapper_ty_base: u32;
 
     // Async handler call type indices, parallel to funcs (None for sync funcs).
     let mut async_ds_tys: Vec<Option<u32>> = vec![None; funcs.len()];
@@ -901,7 +947,6 @@ pub(super) fn build_dispatch_module(
 
     {
         let mut types = TypeSection::new();
-        let mut ty_idx: u32 = 0;
 
         // slot 0: async-lowered hook (before/after): (ptr, len) -> subtask_handle.
         // This is canon lower of `async func(name: string)` from
@@ -910,7 +955,7 @@ pub(super) fn build_dispatch_module(
         // tier-1 hook signatures change in the WIT, update both this
         // type and the matching component-level InstanceType in
         // `component::emit_hook_inst_types`.
-        ty_idx += 1;
+        hook_ty = indices.alloc_ty();
         types
             .ty()
             .function([ValType::I32, ValType::I32], [ValType::I32]);
@@ -920,7 +965,7 @@ pub(super) fn build_dispatch_module(
         // `async func(name: string) -> bool` — bool result gets the
         // async retptr form (the extra i32). Same WIT-source caveat
         // as the slot-0 hook type above.
-        ty_idx += 1;
+        block_ty = indices.alloc_ty();
         types
             .ty()
             .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
@@ -929,52 +974,46 @@ pub(super) fn build_dispatch_module(
         // import types, then — only when any async/hook machinery is
         // in play — async handler types + the shared async builtin
         // types + per-func custom task.return types.
-        emit_wrapper_types(&mut types, &mut ty_idx, funcs);
+        wrapper_ty_base = indices.ty;
+        emit_wrapper_types(&mut types, &mut indices, funcs);
         emit_sync_complex_handler_types(
             &mut types,
-            &mut ty_idx,
+            &mut indices,
             funcs,
             &mut sync_complex_handler_tys,
         );
 
         if has_async_machinery {
-            emit_async_handler_types(&mut types, &mut ty_idx, funcs, &mut async_ds_tys);
+            emit_async_handler_types(&mut types, &mut indices, funcs, &mut async_ds_tys);
 
-            waitable_new_ty = ty_idx;
-            ty_idx += 1;
+            waitable_new_ty = indices.alloc_ty();
             types.ty().function([], [ValType::I32]);
 
-            waitable_join_ty = ty_idx;
-            ty_idx += 1;
+            waitable_join_ty = indices.alloc_ty();
             types.ty().function([ValType::I32, ValType::I32], []);
 
-            waitable_wait_ty = ty_idx;
-            ty_idx += 1;
+            waitable_wait_ty = indices.alloc_ty();
             types
                 .ty()
                 .function([ValType::I32, ValType::I32], [ValType::I32]);
 
-            void_i32_ty = ty_idx;
-            ty_idx += 1;
+            void_i32_ty = indices.alloc_ty();
             types.ty().function([ValType::I32], []);
 
-            void_i64_ty = ty_idx;
-            ty_idx += 1;
+            void_i64_ty = indices.alloc_ty();
             types.ty().function([ValType::I64], []);
 
-            void_f32_ty = ty_idx;
-            ty_idx += 1;
+            void_f32_ty = indices.alloc_ty();
             types.ty().function([ValType::F32], []);
 
-            void_f64_ty = ty_idx;
-            ty_idx += 1;
+            void_f64_ty = indices.alloc_ty();
             types.ty().function([ValType::F64], []);
 
-            void_void_ty = ty_idx;
-            // No further reads of ty_idx after this point — the per-function
-            // custom task.return types live at indices `void_void_ty + 1 + N`
-            // and are tracked separately in the import phase via
-            // `custom_tr_ty_idx` inside emit_task_return_imports.
+            void_void_ty = indices.alloc_ty();
+            // The per-function custom task.return types live at
+            // indices `void_void_ty + 1 + N` and are tracked
+            // separately in the import phase via `custom_tr_ty_idx`
+            // inside emit_task_return_imports.
             types.ty().function([], []);
 
             emit_custom_task_return_types(&mut types, funcs);
@@ -1017,8 +1056,8 @@ pub(super) fn build_dispatch_module(
         };
 
         let mut imports = ImportSection::new();
-        let mut fn_idx: u32 = 0;
 
+        // Memory import doesn't consume a function-index slot.
         imports.import(
             names::ENV_INSTANCE,
             names::ENV_MEMORY,
@@ -1032,8 +1071,7 @@ pub(super) fn build_dispatch_module(
         );
 
         before_import_fn = if has_before {
-            let idx = fn_idx;
-            fn_idx += 1;
+            let idx = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 TIER1_BEFORE_ENV_SLOTS[0],
@@ -1045,8 +1083,7 @@ pub(super) fn build_dispatch_module(
         };
 
         after_import_fn = if has_after {
-            let idx = fn_idx;
-            fn_idx += 1;
+            let idx = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 TIER1_AFTER_ENV_SLOTS[0],
@@ -1058,8 +1095,7 @@ pub(super) fn build_dispatch_module(
         };
 
         blocking_import_fn = if has_blocking {
-            let idx = fn_idx;
-            fn_idx += 1;
+            let idx = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 TIER1_BLOCKING_ENV_SLOTS[0],
@@ -1072,7 +1108,7 @@ pub(super) fn build_dispatch_module(
 
         handler_import_fn_base = emit_handler_imports(
             &mut imports,
-            &mut fn_idx,
+            &mut indices,
             funcs,
             wrapper_ty_base,
             &async_ds_tys,
@@ -1081,40 +1117,35 @@ pub(super) fn build_dispatch_module(
 
         // Async builtins — only imported if needed.
         if has_async_machinery {
-            waitable_new_fn = fn_idx;
-            fn_idx += 1;
+            waitable_new_fn = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 names::ENV_WAITABLE_NEW,
                 EntityType::Function(waitable_new_ty),
             );
 
-            waitable_join_fn = fn_idx;
-            fn_idx += 1;
+            waitable_join_fn = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 names::ENV_WAITABLE_JOIN,
                 EntityType::Function(waitable_join_ty),
             );
 
-            waitable_wait_fn = fn_idx;
-            fn_idx += 1;
+            waitable_wait_fn = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 names::ENV_WAITABLE_WAIT,
                 EntityType::Function(waitable_wait_ty),
             );
 
-            waitable_drop_fn = fn_idx;
-            fn_idx += 1;
+            waitable_drop_fn = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 names::ENV_WAITABLE_DROP,
                 EntityType::Function(void_i32_ty),
             );
 
-            subtask_drop_fn = fn_idx;
-            fn_idx += 1;
+            subtask_drop_fn = indices.alloc_func();
             imports.import(
                 names::ENV_INSTANCE,
                 names::ENV_SUBTASK_DROP,
@@ -1123,7 +1154,7 @@ pub(super) fn build_dispatch_module(
 
             let trf = emit_task_return_imports(
                 &mut imports,
-                &mut fn_idx,
+                &mut indices,
                 funcs,
                 void_void_ty,
                 void_i32_ty,
