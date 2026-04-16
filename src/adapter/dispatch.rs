@@ -72,6 +72,7 @@ use wasm_encoder::{
 };
 
 use super::func::AdapterFunc;
+use super::names;
 use super::ty::{val_type_byte_size, FlatLayout};
 
 /// Emit a typed load instruction at `offset` within the address
@@ -234,9 +235,9 @@ pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
     // Export section (7)
     {
         let mut exports = ExportSection::new();
-        exports.export("mem", ExportKind::Memory, 0);
+        exports.export(names::ENV_MEMORY, ExportKind::Memory, 0);
         if with_realloc {
-            exports.export("realloc", ExportKind::Func, 0);
+            exports.export(names::ENV_REALLOC, ExportKind::Func, 0);
         }
         module.section(&exports);
     }
@@ -417,7 +418,11 @@ fn emit_handler_imports(
         } else {
             wrapper_ty_base + i as u32
         };
-        imports.import("env", &format!("handler_f{i}"), EntityType::Function(ty));
+        imports.import(
+            names::ENV_INSTANCE,
+            &names::env_handler_fn(i),
+            EntityType::Function(ty),
+        );
     }
     *fn_idx += funcs.len() as u32;
     base
@@ -467,8 +472,8 @@ fn emit_task_return_imports(
         trf[i] = Some(*fn_idx);
         *fn_idx += 1;
         imports.import(
-            "env",
-            &format!("task_return_f{i}"),
+            names::ENV_INSTANCE,
+            &names::env_task_return_fn(i),
             EntityType::Function(tr_ty),
         );
     }
@@ -898,13 +903,23 @@ pub(super) fn build_dispatch_module(
         let mut types = TypeSection::new();
         let mut ty_idx: u32 = 0;
 
-        // slot 0: async-lowered hook (before/after): (ptr, len) -> subtask_handle
+        // slot 0: async-lowered hook (before/after): (ptr, len) -> subtask_handle.
+        // This is canon lower of `async func(name: string)` from
+        // `wit/tier1/world.wit` — string flattens to (ptr, len) and
+        // the async lowering adds the subtask handle return. If the
+        // tier-1 hook signatures change in the WIT, update both this
+        // type and the matching component-level InstanceType in
+        // `component::emit_hook_inst_types`.
         ty_idx += 1;
         types
             .ty()
             .function([ValType::I32, ValType::I32], [ValType::I32]);
 
-        // slot 1: async-lowered block (should-block-call): (ptr, len, result_ptr) -> subtask_handle
+        // slot 1: async-lowered block (should-block-call):
+        // (ptr, len, result_ptr) -> subtask_handle. Canon lower of
+        // `async func(name: string) -> bool` — bool result gets the
+        // async retptr form (the extra i32). Same WIT-source caveat
+        // as the slot-0 hook type above.
         ty_idx += 1;
         types
             .ty()
@@ -993,12 +1008,20 @@ pub(super) fn build_dispatch_module(
     let task_return_fns: Vec<Option<u32>>;
 
     {
+        // Names come from `super::names` (splicer-internal slots) and
+        // `crate::contract` (WIT-derived hook env-slot names). Each
+        // string matches an export declared on the outer component's
+        // env core instance — see `component::emit_dispatch_phase`.
+        use crate::contract::{
+            TIER1_AFTER_ENV_SLOTS, TIER1_BEFORE_ENV_SLOTS, TIER1_BLOCKING_ENV_SLOTS,
+        };
+
         let mut imports = ImportSection::new();
         let mut fn_idx: u32 = 0;
 
         imports.import(
-            "env",
-            "mem",
+            names::ENV_INSTANCE,
+            names::ENV_MEMORY,
             EntityType::Memory(MemoryType {
                 minimum: 1,
                 maximum: None,
@@ -1011,7 +1034,11 @@ pub(super) fn build_dispatch_module(
         before_import_fn = if has_before {
             let idx = fn_idx;
             fn_idx += 1;
-            imports.import("env", "before_call", EntityType::Function(hook_ty));
+            imports.import(
+                names::ENV_INSTANCE,
+                TIER1_BEFORE_ENV_SLOTS[0],
+                EntityType::Function(hook_ty),
+            );
             Some(idx)
         } else {
             None
@@ -1020,7 +1047,11 @@ pub(super) fn build_dispatch_module(
         after_import_fn = if has_after {
             let idx = fn_idx;
             fn_idx += 1;
-            imports.import("env", "after_call", EntityType::Function(hook_ty));
+            imports.import(
+                names::ENV_INSTANCE,
+                TIER1_AFTER_ENV_SLOTS[0],
+                EntityType::Function(hook_ty),
+            );
             Some(idx)
         } else {
             None
@@ -1029,7 +1060,11 @@ pub(super) fn build_dispatch_module(
         blocking_import_fn = if has_blocking {
             let idx = fn_idx;
             fn_idx += 1;
-            imports.import("env", "should_block_call", EntityType::Function(block_ty));
+            imports.import(
+                names::ENV_INSTANCE,
+                TIER1_BLOCKING_ENV_SLOTS[0],
+                EntityType::Function(block_ty),
+            );
             Some(idx)
         } else {
             None
@@ -1048,31 +1083,43 @@ pub(super) fn build_dispatch_module(
         if has_async_machinery {
             waitable_new_fn = fn_idx;
             fn_idx += 1;
-            imports.import("env", "waitable_new", EntityType::Function(waitable_new_ty));
+            imports.import(
+                names::ENV_INSTANCE,
+                names::ENV_WAITABLE_NEW,
+                EntityType::Function(waitable_new_ty),
+            );
 
             waitable_join_fn = fn_idx;
             fn_idx += 1;
             imports.import(
-                "env",
-                "waitable_join",
+                names::ENV_INSTANCE,
+                names::ENV_WAITABLE_JOIN,
                 EntityType::Function(waitable_join_ty),
             );
 
             waitable_wait_fn = fn_idx;
             fn_idx += 1;
             imports.import(
-                "env",
-                "waitable_wait",
+                names::ENV_INSTANCE,
+                names::ENV_WAITABLE_WAIT,
                 EntityType::Function(waitable_wait_ty),
             );
 
             waitable_drop_fn = fn_idx;
             fn_idx += 1;
-            imports.import("env", "waitable_drop", EntityType::Function(void_i32_ty));
+            imports.import(
+                names::ENV_INSTANCE,
+                names::ENV_WAITABLE_DROP,
+                EntityType::Function(void_i32_ty),
+            );
 
             subtask_drop_fn = fn_idx;
             fn_idx += 1;
-            imports.import("env", "subtask_drop", EntityType::Function(void_i32_ty));
+            imports.import(
+                names::ENV_INSTANCE,
+                names::ENV_SUBTASK_DROP,
+                EntityType::Function(void_i32_ty),
+            );
 
             let trf = emit_task_return_imports(
                 &mut imports,

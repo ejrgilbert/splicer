@@ -29,6 +29,7 @@ mod encoders;
 mod filter;
 mod func;
 mod mem_layout;
+mod names;
 #[cfg(test)]
 mod tests;
 mod ty;

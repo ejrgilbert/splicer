@@ -457,15 +457,30 @@ each at its site, not via a pre-pass:
   the top-level dispatcher becomes a one-line `if`. Halves each
   function's surface area and lets each strategy be reasoned
   about in isolation. (Highest leverage.)
-- [ ] **Centralize hook / env-slot name constants.** Today the
-  component-scope import name `"before-call"` and the core-instance
-  env-export name `"before_call"` (hyphen vs. underscore) are
-  hardcoded in separate places — `emit_hook_imports` vs.
-  `emit_dispatch_phase`'s env-export construction. A typo in either
-  fails at module-instantiation time with an unhelpful error. Stand
-  up a small `mod names` with `BEFORE_HOOK_COMPONENT` /
-  `BEFORE_HOOK_ENV_EXPORT` (and after / blocking) so both sides
-  reference the same constants.
+- [x] **Centralize hook / env-slot name constants.** _Landed._ Two
+  sources of truth now:
+  - **`build.rs`** extracts function names from
+    `wit/tier1/world.wit` and emits both `TIER1_{IFACE}_FNS` (WIT
+    hyphenated names like `"before-call"`) and
+    `TIER1_{IFACE}_ENV_SLOTS` (underscored mirrors like
+    `"before_call"` for use in env core-instance slots). Accessible
+    via `crate::contract::...`.
+  - **`src/adapter/names.rs`** holds splicer-internal env-slot
+    names that aren't derived from WIT: `ENV_INSTANCE` (`"env"`,
+    the module arg name for the dispatch module), `ENV_MEMORY`,
+    `ENV_REALLOC`, the async-builtin names
+    (`ENV_WAITABLE_NEW` etc.), and the indexed-name helpers
+    (`env_handler_fn(i)`, `env_task_return_fn(i)`).
+  Both `component::emit_hook_inst_types` /
+  `component::emit_dispatch_phase` and `dispatch::build_dispatch_module`
+  now reference the same constants — a rename only has to happen in
+  one place. Doc comments on `component::emit_hook_inst_types` and
+  on the `hook_ty` / `block_ty` declarations in
+  `dispatch::build_dispatch_module` point at `wit/tier1/world.wit`
+  as the source of truth for the hook *signature shape* — while the
+  names come from WIT automatically via `build.rs`, the canon-
+  lowered flat shapes (`(i32, i32) → i32` etc.) are still spelled
+  out in Rust and would need updating if the WIT signatures change.
 - [ ] **Pass hook flags into `compute_memory_layout`.** The caller
   in `build_adapter_bytes` already computes `has_before` /
   `has_after` / `has_blocking`; `compute_memory_layout` re-derives

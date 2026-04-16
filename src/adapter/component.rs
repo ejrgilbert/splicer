@@ -49,6 +49,7 @@ use super::encoders::{encode_comp_cv, InstTypeCtx};
 use super::filter::FilteredSections;
 use super::func::AdapterFunc;
 use super::mem_layout::MemoryLayoutBuilder;
+use super::names;
 
 /// Running index allocators for the adapter's component-level and
 /// core-level namespaces. One instance lives in [`build_adapter_bytes`]
@@ -146,8 +147,16 @@ fn emit_hook_inst_types(
     has_after: bool,
     has_blocking: bool,
 ) -> (Option<u32>, Option<u32>, Option<u32>) {
+    use crate::contract::{TIER1_AFTER_FNS, TIER1_BEFORE_FNS, TIER1_BLOCKING_FNS};
+
     // All three hooks share the shape `async func(name: string) -> result?`,
     // differing only in the export name and whether they return a bool.
+    //
+    // The SIGNATURE SHAPE here mirrors `wit/tier1/world.wit` — if the
+    // tier-1 hook signatures ever change (e.g. a new param is added),
+    // update the `.params([...])` / `.result(...)` call below. The
+    // EXPORT NAMES come from the WIT file via `TIER1_*_FNS`, so they
+    // stay in sync automatically.
     let string_cv = ComponentValType::Primitive(PrimitiveValType::String);
     let bool_cv = ComponentValType::Primitive(PrimitiveValType::Bool);
     let mut emit_hook_ty = |export_name: &str, result: Option<ComponentValType>| {
@@ -162,9 +171,9 @@ fn emit_hook_inst_types(
         types.instance(&inst);
         idx
     };
-    let before_inst_ty = has_before.then(|| emit_hook_ty("before-call", None));
-    let after_inst_ty = has_after.then(|| emit_hook_ty("after-call", None));
-    let blocking_inst_ty = has_blocking.then(|| emit_hook_ty("should-block-call", Some(bool_cv)));
+    let before_inst_ty = has_before.then(|| emit_hook_ty(TIER1_BEFORE_FNS[0], None));
+    let after_inst_ty = has_after.then(|| emit_hook_ty(TIER1_AFTER_FNS[0], None));
+    let blocking_inst_ty = has_blocking.then(|| emit_hook_ty(TIER1_BLOCKING_FNS[0], Some(bool_cv)));
     (before_inst_ty, after_inst_ty, blocking_inst_ty)
 }
 
@@ -226,9 +235,12 @@ fn emit_func_aliases(
     for func in funcs {
         alias_func(handler_inst, &func.name);
     }
-    let before_comp_func = before_inst.map(|i| alias_func(i, "before-call"));
-    let after_comp_func = after_inst.map(|i| alias_func(i, "after-call"));
-    let blocking_comp_func = blocking_inst.map(|i| alias_func(i, "should-block-call"));
+    // Hook fn names come from `wit/tier1/world.wit` via `build.rs` —
+    // see [`crate::contract::TIER1_BEFORE_FNS`] etc.
+    use crate::contract::{TIER1_AFTER_FNS, TIER1_BEFORE_FNS, TIER1_BLOCKING_FNS};
+    let before_comp_func = before_inst.map(|i| alias_func(i, TIER1_BEFORE_FNS[0]));
+    let after_comp_func = after_inst.map(|i| alias_func(i, TIER1_AFTER_FNS[0]));
+    let blocking_comp_func = blocking_inst.map(|i| alias_func(i, TIER1_BLOCKING_FNS[0]));
     (
         handler_func_base,
         before_comp_func,
@@ -699,14 +711,14 @@ fn emit_memory_provider(
         aliases.alias(Alias::CoreInstanceExport {
             instance: mem_core_inst,
             kind: ExportKind::Memory,
-            name: "mem",
+            name: names::ENV_MEMORY,
         });
         mem_core_realloc = if needs_realloc {
             let idx = indices.alloc_core_func();
             aliases.alias(Alias::CoreInstanceExport {
                 instance: mem_core_inst,
                 kind: ExportKind::Func,
-                name: "realloc",
+                name: names::ENV_REALLOC,
             });
             Some(idx)
         } else {
@@ -934,43 +946,60 @@ fn emit_dispatch_phase(
         // Core instance 1: env (export items that dispatch imports).
         let env_inst = indices.alloc_core_inst();
 
+        // Names come from `super::names` (splicer-internal slots) and
+        // from `crate::contract` (WIT-derived hook env-slot names).
+        // Both sides of the component/core boundary reference the
+        // same constants, so a rename only has to happen in one
+        // place.
+        use crate::contract::{
+            TIER1_AFTER_ENV_SLOTS, TIER1_BEFORE_ENV_SLOTS, TIER1_BLOCKING_ENV_SLOTS,
+        };
+
         let mut env_exports: Vec<(String, ExportKind, u32)> = Vec::new();
-        env_exports.push(("mem".to_string(), ExportKind::Memory, mem_core_mem));
+        env_exports.push((
+            names::ENV_MEMORY.to_string(),
+            ExportKind::Memory,
+            mem_core_mem,
+        ));
         if let Some(idx) = canon_lower.core_before_func {
-            env_exports.push(("before_call".to_string(), ExportKind::Func, idx));
+            env_exports.push((TIER1_BEFORE_ENV_SLOTS[0].to_string(), ExportKind::Func, idx));
         }
         if let Some(idx) = canon_lower.core_after_func {
-            env_exports.push(("after_call".to_string(), ExportKind::Func, idx));
+            env_exports.push((TIER1_AFTER_ENV_SLOTS[0].to_string(), ExportKind::Func, idx));
         }
         if let Some(idx) = canon_lower.core_blocking_func {
-            env_exports.push(("should_block_call".to_string(), ExportKind::Func, idx));
+            env_exports.push((
+                TIER1_BLOCKING_ENV_SLOTS[0].to_string(),
+                ExportKind::Func,
+                idx,
+            ));
         }
         for (i, _) in funcs.iter().enumerate() {
             env_exports.push((
-                format!("handler_f{i}"),
+                names::env_handler_fn(i),
                 ExportKind::Func,
                 canon_lower.core_handler_func_base + i as u32,
             ));
         }
         // Async builtins.
         if let Some(idx) = canon_lower.core_waitable_new {
-            env_exports.push(("waitable_new".to_string(), ExportKind::Func, idx));
+            env_exports.push((names::ENV_WAITABLE_NEW.to_string(), ExportKind::Func, idx));
         }
         if let Some(idx) = canon_lower.core_waitable_join {
-            env_exports.push(("waitable_join".to_string(), ExportKind::Func, idx));
+            env_exports.push((names::ENV_WAITABLE_JOIN.to_string(), ExportKind::Func, idx));
         }
         if let Some(idx) = canon_lower.core_waitable_wait {
-            env_exports.push(("waitable_wait".to_string(), ExportKind::Func, idx));
+            env_exports.push((names::ENV_WAITABLE_WAIT.to_string(), ExportKind::Func, idx));
         }
         if let Some(idx) = canon_lower.core_waitable_drop {
-            env_exports.push(("waitable_drop".to_string(), ExportKind::Func, idx));
+            env_exports.push((names::ENV_WAITABLE_DROP.to_string(), ExportKind::Func, idx));
         }
         if let Some(idx) = canon_lower.core_subtask_drop {
-            env_exports.push(("subtask_drop".to_string(), ExportKind::Func, idx));
+            env_exports.push((names::ENV_SUBTASK_DROP.to_string(), ExportKind::Func, idx));
         }
         for (i, tr_idx) in canon_lower.core_task_return_funcs.iter().enumerate() {
             if let Some(idx) = tr_idx {
-                env_exports.push((format!("task_return_f{i}"), ExportKind::Func, *idx));
+                env_exports.push((names::env_task_return_fn(i), ExportKind::Func, *idx));
             }
         }
 
@@ -983,7 +1012,13 @@ fn emit_dispatch_phase(
 
         // Core instance 2: dispatch (instantiate with env).
         dispatch_core_inst = indices.alloc_core_inst();
-        instances.instantiate(1u32, [("env", wasm_encoder::ModuleArg::Instance(env_inst))]);
+        instances.instantiate(
+            1u32,
+            [(
+                names::ENV_INSTANCE,
+                wasm_encoder::ModuleArg::Instance(env_inst),
+            )],
+        );
 
         component.section(&instances);
     }

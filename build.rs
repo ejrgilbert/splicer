@@ -5,11 +5,13 @@
 //! For each `wit/tierN/world.wit` file, we parse:
 //!   - the `package` declaration → e.g. `splicer:tier1@0.1.0`
 //!   - every `interface <name>` declaration → e.g. `before`, `after`, `blocking`
+//!   - every `<fn-name>: [async] func(...)` line inside each interface
 //!
 //! and generate a Rust source file at `$OUT_DIR/tier_interfaces.rs` with:
 //!   - `TIER{N}_PACKAGE: &str` — the unversioned package key
 //!   - `TIER{N}_VERSION: &str` — the semver version
 //!   - `TIER{N}_INTERFACES: &[&str]` — fully-qualified interface names
+//!   - `TIER{N}_{IFACE}_FNS: &[&str]` — function names inside each interface
 
 use std::fs;
 use std::path::Path;
@@ -69,8 +71,10 @@ fn main() {
         // Parse `package splicer:tier1@0.1.0;`
         let (pkg_unversioned, pkg_version) = parse_package_decl(&wit_src, &world_path);
 
-        // Parse every `interface <name> {` declaration.
-        let iface_names = parse_interface_names(&wit_src);
+        // Parse every `interface <name> { ... }` block, capturing the
+        // function names declared inside each.
+        let ifaces = parse_interfaces(&wit_src);
+        let iface_names: Vec<String> = ifaces.iter().map(|(n, _)| n.clone()).collect();
 
         // Build the fully-qualified interface names: "splicer:tier1/before" etc.
         let fq_names: Vec<String> = iface_names
@@ -88,16 +92,49 @@ fn main() {
              pub const TIER{upper}_VERSION: &str = \"{pkg_version}\";\n\n"
         ));
 
-        // Per-interface named constants (e.g. TIER1_BEFORE, TIER1_AFTER).
-        for (name, fq) in iface_names.iter().zip(fq_names.iter()) {
-            let const_name = format!(
-                "TIER{upper}_{iface_upper}",
-                iface_upper = name.to_uppercase()
-            );
+        // Per-interface named constants (e.g. TIER1_BEFORE, TIER1_AFTER)
+        // plus the list of function names declared inside each.
+        for ((name, fns), fq) in ifaces.iter().zip(fq_names.iter()) {
+            let iface_upper = name.to_uppercase().replace('-', "_");
+            let const_name = format!("TIER{upper}_{iface_upper}");
             generated.push_str(&format!(
                 "/// Fully-qualified name of the `{name}` interface in the tier-{tier_num} WIT package.\n\
                  /// Derived from `wit/{dir_name}/world.wit` at build time.\n\
                  pub const {const_name}: &str = \"{fq}\";\n\n"
+            ));
+
+            let fns_const = format!("TIER{upper}_{iface_upper}_FNS");
+            let fns_joined = fns
+                .iter()
+                .map(|f| format!("\"{f}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            generated.push_str(&format!(
+                "/// Function names declared inside the `{name}` interface.\n\
+                 /// Derived from `wit/{dir_name}/world.wit` at build time — the\n\
+                 /// adapter aliases these names out of the imported hook instance.\n\
+                 #[allow(dead_code)]\n\
+                 pub const {fns_const}: &[&str] = &[{fns_joined}];\n\n"
+            ));
+
+            // Mirror of the function names with hyphens replaced by
+            // underscores. Core-wasm identifiers conventionally use
+            // underscores, so when the adapter bridges a hook function
+            // across the component/core boundary (as an env-instance
+            // slot), it uses this underscored form.
+            let env_slots_const = format!("TIER{upper}_{iface_upper}_ENV_SLOTS");
+            let env_slots_joined = fns
+                .iter()
+                .map(|f| format!("\"{}\"", f.replace('-', "_")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            generated.push_str(&format!(
+                "/// Core-wasm env-instance slot names for the `{name}` interface —\n\
+                 /// each {fns_const} entry with hyphens replaced by underscores.\n\
+                 /// Used when the adapter exposes a canon-lowered hook function\n\
+                 /// to its inner dispatch module via the `env` core instance.\n\
+                 #[allow(dead_code)]\n\
+                 pub const {env_slots_const}: &[&str] = &[{env_slots_joined}];\n\n"
             ));
         }
 
@@ -108,10 +145,8 @@ fn main() {
              pub const TIER{upper}_INTERFACES: &[&str] = &[\n"
         ));
         for name in &iface_names {
-            let const_name = format!(
-                "TIER{upper}_{iface_upper}",
-                iface_upper = name.to_uppercase()
-            );
+            let iface_upper = name.to_uppercase().replace('-', "_");
+            let const_name = format!("TIER{upper}_{iface_upper}");
             generated.push_str(&format!("    {const_name},\n"));
         }
         generated.push_str("];\n\n");
@@ -141,22 +176,78 @@ fn parse_package_decl(src: &str, path: &Path) -> (String, String) {
     panic!("No `package` declaration found in {}", path.display());
 }
 
-/// Extract all `interface <name>` declarations from a WIT source string.
-fn parse_interface_names(src: &str) -> Vec<String> {
-    let mut names = Vec::new();
+/// Extract every `interface <name> { ... }` block from a WIT source
+/// string, returning `(iface_name, fn_names)` pairs in declaration
+/// order. Function names are parsed with a line-based matcher —
+/// anything of the form `<name>: [async] func(...)` inside the
+/// interface body. This is deliberately narrow: full WIT type
+/// parsing (param/result types, compound signatures) is a separate
+/// project that would want `wit-parser`; here we only extract names
+/// the adapter needs to string-match against component exports at
+/// runtime.
+fn parse_interfaces(src: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+
     for line in src.lines() {
         let line = line.trim();
+
         if let Some(rest) = line.strip_prefix("interface ") {
-            // "interface before {" → extract "before"
+            // Starting a new interface block. If one was open (shouldn't
+            // happen in well-formed WIT), flush it first.
+            if let Some(prev) = current.take() {
+                out.push(prev);
+            }
             let name = rest
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
-                .trim_end_matches('{');
+                .trim_end_matches('{')
+                .to_string();
             if !name.is_empty() {
-                names.push(name.to_string());
+                current = Some((name, Vec::new()));
+            }
+            continue;
+        }
+
+        if line == "}" {
+            if let Some(iface) = current.take() {
+                out.push(iface);
+            }
+            continue;
+        }
+
+        if let Some((_, ref mut fns)) = current.as_mut() {
+            if let Some(fn_name) = parse_fn_decl_name(line) {
+                fns.push(fn_name);
             }
         }
     }
-    names
+
+    // A file missing a closing `}` still flushes a partial block, for
+    // sanity — malformed WIT should fail elsewhere.
+    if let Some(iface) = current {
+        out.push(iface);
+    }
+
+    out
+}
+
+/// Extract the function name from a line like
+/// `before-call: async func(name: string);` or
+/// `get-info: func() -> string;`. Returns `None` for anything that
+/// doesn't look like a function declaration.
+fn parse_fn_decl_name(line: &str) -> Option<String> {
+    // Must contain `func(` somewhere after a `:`.
+    let (lhs, rhs) = line.split_once(':')?;
+    let rhs = rhs.trim();
+    let rhs = rhs.strip_prefix("async ").unwrap_or(rhs);
+    if !rhs.starts_with("func(") && !rhs.starts_with("func ") {
+        return None;
+    }
+    let name = lhs.trim();
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(name.to_string())
 }
