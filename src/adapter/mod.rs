@@ -118,6 +118,7 @@ pub fn generate_tier1_adapter(
         iface_ty,
         &split,
         layout,
+        &bridge,
     )?;
 
     let out_path = format!(

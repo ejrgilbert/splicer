@@ -261,11 +261,21 @@ impl WitBridge {
         translated
     }
 
-    /// Allocate a `TypeDef` in the Resolve with defaulted
-    /// metadata, returning a `Type::Id` handle to it.
+    /// Allocate a `TypeDef` in the Resolve with a synthetic name,
+    /// returning a `Type::Id` handle to it.
+    ///
+    /// wit-bindgen-core's `read_from_memory` walk unwraps
+    /// `TypeDef::name` for compound types (records, tuples, variants,
+    /// flags, enums, options, results, handles) to populate the
+    /// `name` field on the abstract Instruction it emits — so every
+    /// compound TypeDef must have `Some(name)`. The name only appears
+    /// in binding-generator output (e.g. "MyRecord { … }" in
+    /// source-language backends); for our wasm-encoder backend it's
+    /// ignored. A synthetic name per id is sufficient.
     fn alloc(&mut self, kind: TypeDefKind) -> Type {
+        let synth = format!("t{}", self.resolve.types.len());
         let id = self.resolve.types.alloc(TypeDef {
-            name: None,
+            name: Some(synth),
             kind,
             owner: TypeOwner::None,
             docs: Docs::default(),

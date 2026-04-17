@@ -51,6 +51,7 @@ use super::func::AdapterFunc;
 use super::indices::ComponentIndices;
 use super::mem_layout::MemoryLayoutBuilder;
 use super::names;
+use super::wit_bridge::WitBridge;
 
 // ─── Section-emit helpers ──────────────────────────────────────────────────
 
@@ -1007,6 +1008,7 @@ fn emit_dispatch_phase(
     arena: &TypeArena,
     mem_core_mem: u32,
     canon_lower: &CanonLowerOutcome,
+    bridge: &WitBridge,
 ) -> anyhow::Result<DispatchPhaseOutcome> {
     // ── 8. Core module 1: dispatch ─────────────────────────────────────
     {
@@ -1018,6 +1020,7 @@ fn emit_dispatch_phase(
             layout.event_ptr,
             layout.block_result_ptr,
             arena,
+            bridge,
         )?;
         // Use RawSection to embed the pre-built module bytes directly.
         component.section(&RawSection {
@@ -1373,6 +1376,7 @@ pub(super) fn build_adapter_bytes(
     iface_ty: &InterfaceType,
     split: &FilteredSections,
     layout: MemoryLayoutBuilder,
+    bridge: &WitBridge,
 ) -> anyhow::Result<Vec<u8>> {
     let mut component = Component::new();
 
@@ -1457,6 +1461,7 @@ pub(super) fn build_adapter_bytes(
         arena,
         mem_core_mem,
         &canon_lower,
+        bridge,
     )?;
 
     let CanonLiftOutcome { wrapped_func_base } = emit_canon_lift_phase(

@@ -65,92 +65,48 @@
 //! Both builders return raw core-Wasm bytes; the component-builder
 //! wraps them in a `ModuleSection` of the outer Component.
 
-use cviz::model::{TypeArena, ValueTypeId};
+use cviz::model::TypeArena;
 use wasm_encoder::{
     BlockType, CodeSection, DataSection, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, ImportSection, Instruction, MemoryType, Module, TypeSection, ValType,
 };
 
+use super::bindgen::WasmEncoderBindgen;
 use super::func::AdapterFunc;
-use super::indices::DispatchIndices;
+use super::indices::{DispatchIndices, FunctionIndices};
 use super::names;
-use super::ty::FlatLayout;
+use super::wit_bridge::WitBridge;
+use wit_bindgen_core::abi::lift_from_memory;
 
-/// Emit the load instruction for a [`FlatSlot`] against a base
-/// address already on the value stack. Instruction choice is driven
-/// by the slot's [`FlatSlotShape`]; the byte offset is the
-/// instruction's static `memarg.offset`.
-fn emit_load_slot(f: &mut Function, slot: &super::ty::FlatSlot) {
-    use super::ty::FlatSlotShape;
-    let mem_arg = wasm_encoder::MemArg {
-        offset: slot.byte_offset as u64,
-        align: 0,
-        memory_index: 0,
-    };
-    let inst = match slot.shape {
-        FlatSlotShape::U8 => Instruction::I32Load8U(mem_arg),
-        FlatSlotShape::U16 => Instruction::I32Load16U(mem_arg),
-        FlatSlotShape::I32 => Instruction::I32Load(mem_arg),
-        FlatSlotShape::I64 => Instruction::I64Load(mem_arg),
-        FlatSlotShape::F32 => Instruction::F32Load(mem_arg),
-        FlatSlotShape::F64 => Instruction::F64Load(mem_arg),
-    };
-    f.instruction(&inst);
-}
-
-/// Emit Wasm instructions that load every flat slot of a value from
-/// `result_ptr` and push the values onto the stack (for
-/// `task.return`). One `(I32Const result_ptr) + load` pair per slot.
+/// Pre-compute the wasm instructions that load a single async-result
+/// value from `result_ptr` into the joined-flat representation on the
+/// wasm stack, ready for `task.return`. Allocates any locals the
+/// generator needs via the shared [`FunctionIndices`] so they can be
+/// declared on the target `Function` before emission.
 ///
-/// For heterogeneous top-level `result` / `variant` results, a
-/// runtime trap gate is emitted first: load the disc and trap
-/// (`unreachable`) when it doesn't match the one safe arm. Arms
-/// whose canonical layout matches our heterogeneous-fallback offsets
-/// proceed; others fail loud at runtime instead of producing
-/// silently-wrong values. See
-/// [`super::ty::top_level_heterogeneity_guard`].
-fn emit_task_return_loads(
-    f: &mut Function,
+/// Returns the accumulated instruction sequence — a prefix that stashes
+/// `result_ptr` into a freshly-allocated local, followed by the loads
+/// that `wit_bindgen_core::abi::lift_from_memory` emits against that
+/// local. The caller flushes this at the task-return point in
+/// [`emit_return_phase`].
+fn build_task_return_loads(
     result_ptr: u32,
-    result_type_id: ValueTypeId,
-    arena: &TypeArena,
-) {
-    // Heterogeneous-variant trap gate (if applicable).
-    if let Some(guard) = super::ty::top_level_heterogeneity_guard(result_type_id, arena) {
-        // Load the disc and branch:
-        //   disc != allowed → unreachable
-        //   disc == allowed → fall through to slot loads
-        //
-        // When no arm is safe, `allowed_disc` is None; we emit an
-        // unconditional trap (no disc compare needed).
-        match guard.allowed_disc {
-            Some(allowed) => {
-                let disc_slot = super::ty::FlatSlot {
-                    byte_offset: result_ptr + guard.disc_offset,
-                    shape: guard.disc_shape,
-                };
-                f.instruction(&Instruction::I32Const(0));
-                emit_load_slot(f, &disc_slot);
-                f.instruction(&Instruction::I32Const(allowed as i32));
-                f.instruction(&Instruction::I32Ne);
-                f.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-                f.instruction(&Instruction::Unreachable);
-                f.instruction(&Instruction::End);
-            }
-            None => {
-                // No safe arm — any disc traps. Emit unconditional
-                // `unreachable`; the dead code after it is never
-                // reached but the type-section still type-checks.
-                f.instruction(&Instruction::Unreachable);
-            }
-        }
-    }
+    result_type_id: cviz::model::ValueTypeId,
+    bridge: &WitBridge,
+    indices: &mut FunctionIndices,
+) -> Vec<Instruction<'static>> {
+    let addr_local = indices.alloc_local(ValType::I32);
+    let result_type = bridge.get(result_type_id);
 
-    let layout = FlatLayout::new(result_type_id, arena);
-    for slot in &layout.slots {
-        f.instruction(&Instruction::I32Const(result_ptr as i32));
-        emit_load_slot(f, slot);
-    }
+    let mut out: Vec<Instruction<'static>> = vec![
+        Instruction::I32Const(result_ptr as i32),
+        Instruction::LocalSet(addr_local),
+    ];
+
+    let mut bindgen = WasmEncoderBindgen::new(&bridge.sizes, addr_local, indices);
+    lift_from_memory(&bridge.resolve, &mut bindgen, (), &result_type);
+    out.extend(bindgen.into_instructions());
+    out
 }
 
 /// Build the **memory-provider** core module: one 1-page linear memory
@@ -572,6 +528,7 @@ fn emit_wrapper_body(
     ctx: &DispatchCodeCtx<'_>,
     subtask_local: u32,
     ws_local: u32,
+    task_return_loads: Option<&[Instruction<'static>]>,
 ) -> anyhow::Result<()> {
     let has_result = func.result_type_id.is_some();
 
@@ -594,7 +551,7 @@ fn emit_wrapper_body(
     emit_blocking_phase(f, fi, func, ctx, subtask_local, ws_local)?;
     let result_local_idx = emit_handler_call_phase(f, fi, func, ctx, subtask_local, ws_local);
     emit_after_phase(f, func, ctx, subtask_local, ws_local);
-    emit_return_phase(f, fi, func, ctx, result_local_idx);
+    emit_return_phase(f, fi, func, ctx, result_local_idx, task_return_loads);
 
     f.instruction(&Instruction::End);
     Ok(())
@@ -787,15 +744,22 @@ fn emit_return_phase(
     func: &AdapterFunc,
     ctx: &DispatchCodeCtx<'_>,
     result_local_idx: Option<u32>,
+    task_return_loads: Option<&[Instruction<'static>]>,
 ) {
     if func.is_async {
-        if let Some(result_ptr) = func.async_result_mem_offset {
+        if func.async_result_mem_offset.is_some() {
             if let Some(tr_fn) = ctx.task_return_fns[fi] {
-                // Unified: the `FlatLayout` walk produces 1 slot for
-                // simple single-flat-value results and N slots for
-                // complex ones. Same `emit_task_return_loads` handles
-                // both.
-                emit_task_return_loads(f, result_ptr, func.result_type_id.unwrap(), ctx.arena);
+                // Flush the pre-built load sequence produced by
+                // [`build_task_return_loads`] — it stashes result_ptr
+                // into a local and drives `lift_from_memory` to push
+                // the joined flat values on the stack. Same sequence
+                // handles simple single-flat-value and complex
+                // multi-value results uniformly.
+                let loads = task_return_loads
+                    .expect("async-with-result wrapper must have pre-built task_return_loads");
+                for inst in loads {
+                    f.instruction(inst);
+                }
                 f.instruction(&Instruction::Call(tr_fn));
             }
         } else if let Some(tr_fn) = ctx.task_return_fns[fi] {
@@ -850,6 +814,7 @@ pub(super) fn build_dispatch_module(
     event_ptr: u32,
     block_result_ptr: Option<u32>,
     arena: &TypeArena,
+    bridge: &WitBridge,
 ) -> anyhow::Result<Vec<u8>> {
     let has_async = funcs.iter().any(|f| f.is_async);
     let has_async_machinery = has_async || has_before || has_after || has_blocking;
@@ -1184,11 +1149,40 @@ pub(super) fn build_dispatch_module(
             // params: subtask handle + waitable-set handle. Used by
             // the hook-await path; harmless (but unused) for
             // sync-simple funcs without any hooks.
-            let mut indices = super::indices::FunctionIndices::new(func.core_params.len() as u32);
+            let mut indices = FunctionIndices::new(func.core_params.len() as u32);
             let subtask_local = indices.alloc_local(ValType::I32);
             let ws_local = indices.alloc_local(ValType::I32);
+
+            // Pre-build the task.return load sequence for async funcs
+            // with a non-void result. `lift_from_memory` allocates
+            // additional locals into `indices` as needed (a disc local
+            // per variant plus a local per joined-payload slot), so
+            // this must run before Function construction so every
+            // local is declared.
+            let task_return_loads: Option<Vec<Instruction<'static>>> = match (
+                func.is_async,
+                func.async_result_mem_offset,
+                func.result_type_id,
+            ) {
+                (true, Some(result_ptr), Some(rid)) => Some(build_task_return_loads(
+                    result_ptr,
+                    rid,
+                    bridge,
+                    &mut indices,
+                )),
+                _ => None,
+            };
+
             let mut f = Function::new_with_locals_types(indices.into_locals());
-            emit_wrapper_body(&mut f, fi, func, &code_ctx, subtask_local, ws_local)?;
+            emit_wrapper_body(
+                &mut f,
+                fi,
+                func,
+                &code_ctx,
+                subtask_local,
+                ws_local,
+                task_return_loads.as_deref(),
+            )?;
             code_section.function(&f);
         }
         module.section(&code_section);

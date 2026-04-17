@@ -23,10 +23,36 @@
 //! ## Block-capture IR
 //!
 //! Variant / option / result lifts require per-arm bodies that later
-//! get wrapped in a wasm `block ... br_table ... end` structure. When
-//! `push_block` fires we start a fresh buffer; emits redirect to the
-//! top-of-stack buffer; `finish_block` pops it to
-//! [`CompletedBlock`]s that the variant emit consumes.
+//! get wrapped in a wasm `block ... br_table ... end` structure.
+//! Fixed-size lists (see below) need the element-read body replayed
+//! N times with an advancing base address. Both cases use the same
+//! mechanism: when `push_block` fires we start a fresh buffer; emits
+//! redirect to the top-of-stack buffer; `finish_block` pops it to
+//! [`CompletedBlock`]s that the variant / list-lift emit consumes.
+//!
+//! ## Fixed-size vs dynamic lists
+//!
+//! `list<T>` (dynamic) flattens to `[i32 ptr, i32 len]` — a
+//! heap-like reference. `list<T, N>` (fixed-size) flattens to
+//! `N × flat(T)` inlined on the wasm stack, semantically like
+//! `tuple<T, …, T>`. When a fixed-size list is stored in memory
+//! we walk the N contiguous slots and push each element's flat
+//! values. See the `FixedLengthListLiftFromMemory` emit arm for
+//! the full rationale and emission strategy.
+//!
+//! ## Authoritative canonical-ABI references
+//!
+//! When in doubt, these docs are ground truth for flatten / load /
+//! store semantics that this Bindgen implements:
+//!
+//! - Spec narrative:
+//!   <https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md>
+//! - Python reference implementation (precise semantics):
+//!   <https://github.com/WebAssembly/component-model/blob/main/design/mvp/canonical-abi/definitions.py>
+//!
+//! Individual emit arms below link to the specific spec functions
+//! (`flatten_type`, `load`, `lift_flat`, etc.) they correspond to
+//! when the mapping isn't obvious from the Instruction name.
 
 use std::borrow::Cow;
 
@@ -43,17 +69,19 @@ pub(super) struct WasmEncoderBindgen<'a> {
     /// Top-level instruction buffer — the final output that goes into
     /// the target Function. Emits land here when no block is active.
     main: Vec<Instruction<'static>>,
-    /// Stack of active block buffers. When non-empty, emits go to the
-    /// top buffer instead of `main`. Populated by `push_block`, drained
-    /// by `finish_block`.
-    block_buffers: Vec<Vec<Instruction<'static>>>,
+    /// Stack of active blocks. When non-empty, emits go to the top
+    /// block's buffer instead of `main`. Populated by `push_block`,
+    /// drained by `finish_block`.
+    block_buffers: Vec<ActiveBlock>,
     /// Completed blocks waiting to be consumed by `VariantLift` /
-    /// `OptionLift` / `ResultLift`. LIFO order — last `finish_block`
-    /// is at the top.
+    /// `OptionLift` / `ResultLift` / `FixedLengthListLiftFromMemory`.
+    /// LIFO order — last `finish_block` is at the top.
     completed_blocks: Vec<CompletedBlock>,
     /// Canonical-ABI sizes, required by `Bindgen::sizes`.
     sizes: &'a SizeAlign,
-    /// Local index holding the base address for all loads.
+    /// Local index holding the base address for all loads at the
+    /// outermost scope. Iteration blocks override this via their own
+    /// `iter_addr_local`; see [`WasmEncoderBindgen::current_addr_local`].
     addr_local: u32,
     /// Shared local allocator — the bindgen routes its dynamic
     /// allocations through the same [`FunctionIndices`] the caller
@@ -62,12 +90,36 @@ pub(super) struct WasmEncoderBindgen<'a> {
     indices: &'a mut FunctionIndices,
 }
 
-/// A block body paired with the number of wasm values it leaves on
-/// the value stack. The value stack shape matters for variant emits
-/// that must widen each arm to the joined flat signature.
+/// An active block being captured. Tracks its instruction buffer and
+/// — for list / fixed-size-list iteration blocks — the i32 local that
+/// holds the current element's base address. When the block body
+/// emits loads, they read from this local (if set) rather than the
+/// outer `addr_local`.
+struct ActiveBlock {
+    buffer: Vec<Instruction<'static>>,
+    /// Allocated lazily on the first `IterBasePointer` emitted inside
+    /// this block. `None` for blocks that aren't iteration bodies
+    /// (e.g. variant arm blocks).
+    iter_addr_local: Option<u32>,
+}
+
+/// A captured block body — the wasm instructions emitted between a
+/// `push_block` / `finish_block` pair. The variant-lift emit splices
+/// these into the `block ... br_table ... end` dispatch structure;
+/// the fixed-size-list emit replays them N times with per-iteration
+/// base-address advancement.
+///
+/// We don't track the Bindgen operand count (`finish_block`'s
+/// `operand.len()`) here because it counts the generator's abstract
+/// operand stack — which collapses compound types via aggregate lifts
+/// like `RecordLift`. For our purposes the *wasm* stack count is what
+/// matters for widening, and that's driven by `push_flat(arm_type)`
+/// at variant-emit time, not by the block itself.
 struct CompletedBlock {
     body: Vec<Instruction<'static>>,
-    nresults: usize,
+    /// The iteration local the body's loads read from, if this was
+    /// an iteration block. `None` for variant-arm blocks.
+    iter_addr_local: Option<u32>,
 }
 
 impl<'a> WasmEncoderBindgen<'a> {
@@ -115,11 +167,32 @@ impl<'a> WasmEncoderBindgen<'a> {
     }
 
     fn active_buf(&mut self) -> &mut Vec<Instruction<'static>> {
-        self.block_buffers.last_mut().unwrap_or(&mut self.main)
+        match self.block_buffers.last_mut() {
+            Some(block) => &mut block.buffer,
+            None => &mut self.main,
+        }
+    }
+
+    /// Return the local index holding the current address for loads:
+    /// the innermost active iteration block's `iter_addr_local` if
+    /// any, otherwise the outer `addr_local`. Walks the block stack
+    /// so nested iteration / variant structures pick up the correct
+    /// scope — e.g. a variant arm inside a fixed-size list sees the
+    /// list's iter local, not the bindgen's top-level addr_local.
+    fn current_addr_local(&self) -> u32 {
+        for block in self.block_buffers.iter().rev() {
+            if let Some(idx) = block.iter_addr_local {
+                return idx;
+            }
+        }
+        self.addr_local
     }
 
     /// Emit `local.get $addr; <load>` for a memory load at the given
-    /// byte offset. All load emits funnel through this helper.
+    /// byte offset. All load emits funnel through this helper. The
+    /// address local comes from [`Self::current_addr_local`], so
+    /// loads inside a list iteration block read from the per-element
+    /// iter local rather than the outer base.
     fn emit_load(&mut self, offset: ArchitectureSize, load: LoadKind) {
         let off = offset.size_wasm32() as u64;
         let mem_arg = MemArg {
@@ -127,7 +200,7 @@ impl<'a> WasmEncoderBindgen<'a> {
             align: load.natural_align_log2(),
             memory_index: 0,
         };
-        let addr_local = self.addr_local;
+        let addr_local = self.current_addr_local();
         self.emit_one(Instruction::LocalGet(addr_local));
         self.emit_one(load.to_instruction(mem_arg));
     }
@@ -153,12 +226,15 @@ impl<'a> WasmEncoderBindgen<'a> {
                 self.emit_one(Instruction::I32WrapI64);
                 self.emit_one(Instruction::F32ReinterpretI32);
             }
-            // Pointer / Length / PointerOrI64 casts collapse to i32 /
-            // i64 at the wasm level on wasm32 — the type distinctions
-            // matter for provenance in bindings, not for emission.
+            // Wasm32 mapping: `Pointer` and `Length` are `i32`,
+            // `PointerOrI64` is `i64`. Casts between types that
+            // collapse to the same wasm type are genuine no-ops; the
+            // ones that cross the i32/i64 boundary need the
+            // corresponding wasm extend/wrap.
             PToI32 | I32ToP | I32ToL | LToI32 | PToL | LToP => {}
-            I64ToP64 | P64ToI64 | I64ToL | LToI64 => {}
-            PToP64 | P64ToP => {}
+            I64ToP64 | P64ToI64 => {}
+            PToP64 | LToI64 => self.emit_one(Instruction::I64ExtendI32U),
+            P64ToP | I64ToL => self.emit_one(Instruction::I32WrapI64),
             Sequence(pair) => {
                 let [a, b] = pair.as_ref();
                 self.emit_bitcast(a);
@@ -167,20 +243,26 @@ impl<'a> WasmEncoderBindgen<'a> {
         }
     }
 
-    /// Push a fresh block buffer onto the stack.
+    /// Push a fresh block onto the stack. `iter_addr_local` is
+    /// allocated lazily — only if this block turns out to be an
+    /// iteration body (i.e. emits an `IterBasePointer`).
     fn start_block(&mut self) {
-        self.block_buffers.push(Vec::new());
+        self.block_buffers.push(ActiveBlock {
+            buffer: Vec::new(),
+            iter_addr_local: None,
+        });
     }
 
-    /// Pop the top block buffer and record it as a completed block
-    /// with `nresults` wasm values on the stack at block exit.
-    fn finish_block_body(&mut self, nresults: usize) {
-        let body = self
+    /// Pop the top active block and record it as a completed block.
+    fn finish_block_body(&mut self) {
+        let active = self
             .block_buffers
             .pop()
             .expect("finish_block without matching push_block");
-        self.completed_blocks
-            .push(CompletedBlock { body, nresults });
+        self.completed_blocks.push(CompletedBlock {
+            body: active.buffer,
+            iter_addr_local: active.iter_addr_local,
+        });
     }
 
     /// Emit a zero constant for the given flat wasm type — used to
@@ -285,18 +367,19 @@ impl<'a> WasmEncoderBindgen<'a> {
         self.emit_one(Instruction::End); // close $case_0
 
         // Emit each arm body, widening + stashing into payload_locals.
+        // The widening loop's bounds come from `arm_flat.len()` — the
+        // count of values the arm body leaves on the *wasm* value
+        // stack — not from the generator's operand-stack view, which
+        // collapses compound types via aggregate lifts like
+        // `RecordLift`.
         for (i, arm) in arm_blocks.iter().enumerate() {
             let arm_flat = &arm_flats[i];
 
-            // Run the recorded arm body — pushes arm's natural flat.
+            // Run the recorded arm body — pushes arm's natural flat
+            // on the wasm value stack.
             for inst in &arm.body {
                 self.emit_one(inst.clone());
             }
-            debug_assert_eq!(
-                arm.nresults,
-                arm_flat.len(),
-                "arm block nresults must match arm natural flat length"
-            );
 
             // Widen from top of stack down. Each pop-widen-store
             // sequence peels one value off, so the ORDER is reverse
@@ -322,9 +405,12 @@ impl<'a> WasmEncoderBindgen<'a> {
             self.emit_one(Instruction::End);
         }
 
-        // $default body: unreachable (invalid disc traps).
+        // After the loop's n Ends, $case_0 / ... / $case_{n-1} /
+        // $default are all closed; control falls into $end's body
+        // area. Emit the default-path trap here (runs when disc was
+        // out of range, since all valid cases br'd to $end), then
+        // close $end.
         self.emit_one(Instruction::Unreachable);
-        self.emit_one(Instruction::End); // close $default
         self.emit_one(Instruction::End); // close $end
 
         // Re-push [disc, ...payload] to form the joined flat on the stack.
@@ -511,6 +597,100 @@ impl Bindgen for WasmEncoderBindgen<'_> {
                 produce_n(results, 1);
             }
 
+            // ── Fixed-size list lift ───────────────────────────
+            //
+            // The Canonical ABI treats `list<T, N>` (fixed-size)
+            // fundamentally differently from `list<T>` (dynamic):
+            //
+            // | Type       | Flat form        | In memory            |
+            // |------------|------------------|----------------------|
+            // | list<T>    | `[i32 ptr, i32 len]` | elements at `*ptr` |
+            // | list<T, N> | `N × flat(T)` inlined | N contiguous elements |
+            //
+            // The fixed-size variant is semantically a
+            // `tuple<T, …, T>` (N times), so it flattens the same
+            // way tuples do — every element becomes a value on the
+            // wasm stack (or in a retptr buffer if `N × flat(T)` >
+            // `MAX_FLAT_PARAMS`). The payoff is zero-copy passing
+            // of small fixed arrays (hashes, UUIDs, 3D vectors,
+            // small buffers) without the realloc + pointer-chase
+            // that dynamic lists require.
+            //
+            // When a fixed-size list lives inside a container
+            // (record field, async result buffer, …) it's stored
+            // as N contiguous element slots in memory. This
+            // instruction materializes the inlined flat form by
+            // reading N elements out.
+            //
+            // Emission strategy: the generator captures the
+            // per-element read as a block body (with
+            // `IterBasePointer` marking where the element base
+            // address is used), then fires this instruction to
+            // iterate. We unroll at emission time: allocate an
+            // iter local, initialize it to the list's base
+            // address, and replay the block body once per element
+            // with the local advanced by `elem_size` each step.
+            // Loads inside the block body reference the iter
+            // local via [`current_addr_local`] so they hit the
+            // right element.
+            //
+            // Dynamic lists (`list<T>` / `TypeDefKind::List`) hit
+            // the `PointerLoad` + `LengthLoad` pair in
+            // `read_list_from_memory` and then `ListCanonLift`
+            // above, which is a no-op in our emit — the `(ptr,
+            // len)` pair is already the flat form.
+            AbiInst::IterBasePointer => {
+                // Lazily allocate the iteration address local on the
+                // current active block — `FixedLengthListLiftFromMemory`
+                // reads it off the completed block below.
+                let need_alloc = self
+                    .block_buffers
+                    .last()
+                    .expect("IterBasePointer must fire inside a block")
+                    .iter_addr_local
+                    .is_none();
+                if need_alloc {
+                    let idx = self.indices.alloc_local(ValType::I32);
+                    self.block_buffers
+                        .last_mut()
+                        .expect("IterBasePointer must fire inside a block")
+                        .iter_addr_local = Some(idx);
+                }
+                produce_n(results, 1);
+            }
+            AbiInst::FixedLengthListLiftFromMemory { element, size, .. } => {
+                let elem_size = self.sizes.size(element).size_wasm32() as u32;
+                let block = self
+                    .completed_blocks
+                    .pop()
+                    .expect("FixedLengthListLiftFromMemory without a matching block");
+                let iter_addr = block.iter_addr_local.expect(
+                    "fixed-size-list block must have allocated an iter_addr_local via \
+                     IterBasePointer",
+                );
+                // Initialize iter_addr_local to the current base —
+                // the parent's address (outer addr_local, or a
+                // parent iteration's iter local for nested lists).
+                let parent_addr = self.current_addr_local();
+                self.emit_one(Instruction::LocalGet(parent_addr));
+                self.emit_one(Instruction::LocalSet(iter_addr));
+                for i in 0..*size {
+                    if i > 0 {
+                        // Advance by elem_size. `elem_size == 0` is
+                        // possible for zero-sized records; the add is
+                        // a no-op in that case but harmless.
+                        self.emit_one(Instruction::LocalGet(iter_addr));
+                        self.emit_one(Instruction::I32Const(elem_size as i32));
+                        self.emit_one(Instruction::I32Add);
+                        self.emit_one(Instruction::LocalSet(iter_addr));
+                    }
+                    for inst in &block.body {
+                        self.emit_one(inst.clone());
+                    }
+                }
+                produce_n(results, 1);
+            }
+
             // ── Instructions we don't expect on the lift-from-memory path ──
             other => unimplemented!(
                 "WasmEncoderBindgen::emit hit unsupported instruction: {:?}. \
@@ -521,7 +701,7 @@ impl Bindgen for WasmEncoderBindgen<'_> {
         }
     }
 
-    fn return_pointer(&mut self, _size: ArchitectureSize, _align: Alignment) -> () {
+    fn return_pointer(&mut self, _size: ArchitectureSize, _align: Alignment) {
         unimplemented!(
             "return_pointer is only called on lowering paths; \
              lift_from_memory never invokes it"
@@ -533,9 +713,10 @@ impl Bindgen for WasmEncoderBindgen<'_> {
     }
 
     fn finish_block(&mut self, operand: &mut Vec<()>) {
-        let nresults = operand.len();
+        // The generator's operand-stack count at block exit isn't
+        // meaningful for our wasm emission — see `CompletedBlock`.
         operand.clear();
-        self.finish_block_body(nresults);
+        self.finish_block_body();
     }
 
     fn sizes(&self) -> &SizeAlign {
@@ -593,7 +774,7 @@ mod tests {
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
-        let _ = lift_from_memory(&resolve, &mut bg, (), &Type::U32);
+        lift_from_memory(&resolve, &mut bg, (), &Type::U32);
 
         assert_eq!(count(&bg, |i| matches!(i, Instruction::LocalGet(_))), 1);
         assert_eq!(count(&bg, |i| matches!(i, Instruction::I32Load(_))), 1);
@@ -605,7 +786,7 @@ mod tests {
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(4);
         let mut bg = WasmEncoderBindgen::new(&sizes, 3, &mut indices);
-        let _ = lift_from_memory(&resolve, &mut bg, (), &Type::U64);
+        lift_from_memory(&resolve, &mut bg, (), &Type::U64);
 
         assert_eq!(count(&bg, |i| matches!(i, Instruction::I64Load(_))), 1);
         // addr_local=3 must show up in the LocalGet
@@ -646,7 +827,7 @@ mod tests {
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
-        let _ = lift_from_memory(&resolve, &mut bg, (), &Type::Id(record_id));
+        lift_from_memory(&resolve, &mut bg, (), &Type::Id(record_id));
 
         // 3 fields → 3 load instructions, each paired with a LocalGet
         assert_eq!(count(&bg, |i| matches!(i, Instruction::LocalGet(_))), 3);
@@ -661,7 +842,7 @@ mod tests {
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
-        let _ = lift_from_memory(&resolve, &mut bg, (), &Type::String);
+        lift_from_memory(&resolve, &mut bg, (), &Type::String);
 
         // String lifts as (ptr, len) — both i32 loads.
         assert_eq!(count(&bg, |i| matches!(i, Instruction::I32Load(_))), 2);
@@ -686,7 +867,7 @@ mod tests {
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
-        let _ = lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
+        lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
 
         // Disc load (1 byte) + one payload load per arm (2).
         assert_eq!(count(&bg, |i| matches!(i, Instruction::I32Load8U(_))), 1);
@@ -719,7 +900,7 @@ mod tests {
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
-        let _ = lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
+        lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
 
         // Widening bitcast i32 → i64 for the ok arm.
         assert_eq!(
@@ -747,7 +928,7 @@ mod tests {
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
-        let _ = lift_from_memory(&resolve, &mut bg, (), &Type::Id(opt_id));
+        lift_from_memory(&resolve, &mut bg, (), &Type::Id(opt_id));
 
         // None arm (no payload) emits `i32.const 0` zero-pad.
         assert!(
@@ -755,6 +936,119 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Instruction::I32Const(0))),
             "option's None arm should emit i32.const 0 to pad joined payload"
+        );
+    }
+
+    /// Regression test: `result<string, u64>` forces a
+    /// `Pointer → PointerOrI64` cast at payload position 0, because
+    /// ok's flat is `[Pointer, Length]` and err's flat is `[I64]` and
+    /// their positional join is `[PointerOrI64, Length]`. The ok arm
+    /// must emit `i64.extend_i32_u` to widen its i32 pointer to the
+    /// joined i64 slot. An earlier version of `emit_bitcast` treated
+    /// this cast as a no-op, producing a wasm module that failed
+    /// validation with "expected i64, found i32" (seen first via
+    /// wasi:http's error variant).
+    #[test]
+    fn lift_result_string_u64_widens_pointer_to_pointer_or_i64() {
+        let mut resolve = Resolve::default();
+        let result_id = resolve.types.alloc(TypeDef {
+            name: Some("r".to_string()),
+            kind: TypeDefKind::Result(wit_parser::Result_ {
+                ok: Some(Type::String),
+                err: Some(Type::U64),
+            }),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+        });
+        let sizes = new_sizes(&resolve);
+        let mut indices = FunctionIndices::new(1);
+        let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
+        lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
+
+        // Exactly one `i64.extend_i32_u`: ok arm widens its Pointer
+        // (i32) to the joined PointerOrI64 (i64) at position 0.
+        // (Length at position 1 stays i32 on both sides; err arm's
+        // I64 → PointerOrI64 is i64→i64, no instruction.)
+        assert_eq!(
+            count(&bg, |i| matches!(i, Instruction::I64ExtendI32U)),
+            1,
+            "ok (string) arm should widen Pointer to PointerOrI64"
+        );
+        let _insts = bg.into_instructions();
+        // Joined flat: [disc=i32, PointerOrI64→i64, Length→i32].
+        // Locals: disc(i32), payload[0]=i64, payload[1]=i32.
+        assert_eq!(
+            indices.into_locals(),
+            vec![ValType::I32, ValType::I64, ValType::I32]
+        );
+    }
+
+    /// `list<u32, 4>` — fixed-size list of 4 u32s. Should emit the
+    /// iteration init (`LocalGet $parent; LocalSet $iter`) plus 4
+    /// unrolled element loads with the iter local advanced by 4
+    /// bytes each time.
+    #[test]
+    fn lift_fixed_size_list_unrolls_n_loads() {
+        let mut resolve = Resolve::default();
+        let list_id = resolve.types.alloc(TypeDef {
+            name: Some("l".to_string()),
+            kind: TypeDefKind::FixedSizeList(Type::U32, 4),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+        });
+        let sizes = new_sizes(&resolve);
+        let mut indices = FunctionIndices::new(1);
+        let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
+        lift_from_memory(&resolve, &mut bg, (), &Type::Id(list_id));
+
+        // Four i32 loads, one per element.
+        assert_eq!(count(&bg, |i| matches!(i, Instruction::I32Load(_))), 4);
+        // Three `I32Add`s — advance iter_addr between iterations 0→1,
+        // 1→2, 2→3 (the first iteration reads at base, no advance).
+        assert_eq!(count(&bg, |i| matches!(i, Instruction::I32Add)), 3);
+        // One `I32Const(4)` per advance (elem_size = 4 for u32).
+        assert_eq!(count(&bg, |i| matches!(i, Instruction::I32Const(4))), 3);
+        // Bindgen allocated one i32 local for the iteration address.
+        let _insts = bg.into_instructions();
+        assert_eq!(indices.into_locals(), vec![ValType::I32]);
+    }
+
+    /// Regression test: `result<list<u8>, u64>` exercises the same
+    /// bitcast class as the string variant above — `list<T>`
+    /// flattens to `[Pointer, Length]` the same way `string` does.
+    /// Included separately so the assertion isolates list vs string
+    /// in case either path evolves independently.
+    #[test]
+    fn lift_result_list_u64_widens_pointer_to_pointer_or_i64() {
+        let mut resolve = Resolve::default();
+        let list_id = resolve.types.alloc(TypeDef {
+            name: Some("l".to_string()),
+            kind: TypeDefKind::List(Type::U8),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+        });
+        let result_id = resolve.types.alloc(TypeDef {
+            name: Some("r".to_string()),
+            kind: TypeDefKind::Result(wit_parser::Result_ {
+                ok: Some(Type::Id(list_id)),
+                err: Some(Type::U64),
+            }),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+        });
+        let sizes = new_sizes(&resolve);
+        let mut indices = FunctionIndices::new(1);
+        let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
+        lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
+
+        assert_eq!(
+            count(&bg, |i| matches!(i, Instruction::I64ExtendI32U)),
+            1,
+            "ok (list) arm should widen Pointer to PointerOrI64"
         );
     }
 }
