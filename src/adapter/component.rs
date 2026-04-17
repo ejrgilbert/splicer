@@ -643,9 +643,9 @@ fn compute_memory_layout(
 
     // Realloc is needed by canon lift and canon lower to allocate
     // memory for any value whose canonical-ABI form is a
-    // pointer-to-bytes: strings (variable-length UTF-8) and lists
-    // (both `list<T>` and `list<T, N>` — our current
-    // `flat_types_for` treats both as `(ptr, len)`). Bare resource
+    // pointer-to-bytes: strings (variable-length UTF-8) and lists.
+    // Both dynamic `list<T>` and fixed-size `list<T, N>` are covered
+    // by [`super::wit_bridge::WitBridge::has_lists`]. Bare resource
     // handles don't need realloc — they're i32 values on the wire.
     // When needed, realloc lives in the memory module so it's
     // available for both lowering and lifting.
@@ -1005,7 +1005,6 @@ fn emit_dispatch_phase(
     has_after: bool,
     has_blocking: bool,
     layout: &MemoryLayout,
-    arena: &TypeArena,
     mem_core_mem: u32,
     canon_lower: &CanonLowerOutcome,
     bridge: &WitBridge,
@@ -1019,7 +1018,6 @@ fn emit_dispatch_phase(
             has_blocking,
             layout.event_ptr,
             layout.block_result_ptr,
-            arena,
             bridge,
         )?;
         // Use RawSection to embed the pre-built module bytes directly.
@@ -1458,7 +1456,6 @@ pub(super) fn build_adapter_bytes(
         has_after,
         has_blocking,
         &layout,
-        arena,
         mem_core_mem,
         &canon_lower,
         bridge,

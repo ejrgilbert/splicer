@@ -96,9 +96,11 @@ impl MemoryLayoutBuilder {
 
     /// Reserve `size` bytes for an async-lowered handler's result
     /// buffer. The canon-lower-async machinery writes flat result
-    /// values here with natural per-slot alignment (handled inside
-    /// the buffer by [`super::ty::FlatLayout`]), so the allocator
-    /// itself doesn't re-align between async buffers.
+    /// values here with natural per-slot alignment (each slot's
+    /// offset driven by the canonical-ABI layout, which
+    /// [`super::bindgen::WasmEncoderBindgen`] honors when emitting
+    /// the `task.return` loads), so the allocator itself doesn't
+    /// re-align between async buffers.
     pub fn alloc_async_result(&mut self, size: u32) -> u32 {
         let off = self.post_name_cursor;
         self.post_name_cursor += size;
@@ -109,7 +111,7 @@ impl MemoryLayoutBuilder {
     /// lower's retptr pattern requires the buffer to start on an i32
     /// boundary so the first `(i32.store / f32.store)` inside the
     /// buffer is naturally aligned; wider stores (i64 / f64) re-align
-    /// internally via [`super::ty::FlatLayout`].
+    /// internally per the canonical ABI.
     pub fn alloc_sync_result(&mut self, size: u32) -> u32 {
         self.alloc_aligned(size, val_type_byte_size(&ValType::I32))
     }

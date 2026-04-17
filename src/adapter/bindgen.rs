@@ -939,15 +939,14 @@ mod tests {
         );
     }
 
-    /// Regression test: `result<string, u64>` forces a
-    /// `Pointer → PointerOrI64` cast at payload position 0, because
-    /// ok's flat is `[Pointer, Length]` and err's flat is `[I64]` and
-    /// their positional join is `[PointerOrI64, Length]`. The ok arm
-    /// must emit `i64.extend_i32_u` to widen its i32 pointer to the
-    /// joined i64 slot. An earlier version of `emit_bitcast` treated
-    /// this cast as a no-op, producing a wasm module that failed
-    /// validation with "expected i64, found i32" (seen first via
-    /// wasi:http's error variant).
+    /// `result<string, u64>` forces a `Pointer → PointerOrI64` cast
+    /// at payload position 0: ok's flat is `[Pointer, Length]`, err's
+    /// flat is `[I64]`, and their positional join is
+    /// `[PointerOrI64, Length]`. The ok arm must emit
+    /// `i64.extend_i32_u` to widen its i32 pointer up to the joined
+    /// i64 slot — without that, the stack type disagrees with the
+    /// joined-flat block signature and wasm validation rejects with
+    /// "expected i64, found i32".
     #[test]
     fn lift_result_string_u64_widens_pointer_to_pointer_or_i64() {
         let mut resolve = Resolve::default();
@@ -1015,11 +1014,11 @@ mod tests {
         assert_eq!(indices.into_locals(), vec![ValType::I32]);
     }
 
-    /// Regression test: `result<list<u8>, u64>` exercises the same
-    /// bitcast class as the string variant above — `list<T>`
-    /// flattens to `[Pointer, Length]` the same way `string` does.
-    /// Included separately so the assertion isolates list vs string
-    /// in case either path evolves independently.
+    /// Dynamic `list<T>` flattens to `[Pointer, Length]`, the same
+    /// shape as `string`, so `result<list<T>, u64>` exercises the
+    /// same `Pointer → PointerOrI64` widening as the string case.
+    /// Kept as a separate test so the assertion isolates the list
+    /// path in case list and string lowering evolve independently.
     #[test]
     fn lift_result_list_u64_widens_pointer_to_pointer_or_i64() {
         let mut resolve = Resolve::default();

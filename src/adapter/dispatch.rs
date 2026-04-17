@@ -65,7 +65,6 @@
 //! Both builders return raw core-Wasm bytes; the component-builder
 //! wraps them in a `ModuleSection` of the outer Component.
 
-use cviz::model::TypeArena;
 use wasm_encoder::{
     BlockType, CodeSection, DataSection, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, ImportSection, Instruction, MemoryType, Module, TypeSection, ValType,
@@ -509,7 +508,6 @@ struct DispatchCodeCtx<'a> {
     /// async func `i`, or `None` for sync funcs.
     task_return_fns: &'a [Option<u32>],
     wait: WaitLoopCtx,
-    arena: &'a TypeArena,
 }
 
 /// Present only when the middleware exports `splicer:tier1/blocking`.
@@ -813,7 +811,6 @@ pub(super) fn build_dispatch_module(
     has_blocking: bool,
     event_ptr: u32,
     block_result_ptr: Option<u32>,
-    arena: &TypeArena,
     bridge: &WitBridge,
 ) -> anyhow::Result<Vec<u8>> {
     let has_async = funcs.iter().any(|f| f.is_async);
@@ -1140,7 +1137,6 @@ pub(super) fn build_dispatch_module(
             waitable_drop_fn,
             event_ptr,
         },
-        arena,
     };
     {
         let mut code_section = CodeSection::new();

@@ -126,13 +126,6 @@ impl FunctionIndices {
         idx
     }
 
-    /// Next local index that would be allocated, without reserving.
-    /// Useful for pre-computing where a downstream emitter's locals
-    /// will land.
-    pub fn next_local_idx(&self) -> u32 {
-        self.base + self.locals.len() as u32
-    }
-
     /// Consume the allocator and return the locals vec for
     /// `Function::new_with_locals_types`.
     pub fn into_locals(self) -> Vec<ValType> {
@@ -147,11 +140,9 @@ mod tests {
     #[test]
     fn function_indices_allocate_contiguous_from_base() {
         let mut idx = FunctionIndices::new(3);
-        assert_eq!(idx.next_local_idx(), 3);
         assert_eq!(idx.alloc_local(ValType::I32), 3);
         assert_eq!(idx.alloc_local(ValType::I64), 4);
         assert_eq!(idx.alloc_local(ValType::I32), 5);
-        assert_eq!(idx.next_local_idx(), 6);
         assert_eq!(
             idx.into_locals(),
             vec![ValType::I32, ValType::I64, ValType::I32]
