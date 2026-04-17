@@ -238,311 +238,63 @@ include-list is a solution looking for a problem.
 - Interaction with tier-2 / tier-3 (where filtering also affects
   whether we need to lift/lower payloads) — spec this then.
 
-## Audit follow-ups (tier-1 cleanup stack)
+## Remaining work
 
-Pulled from a structural code audit of `src/adapter/`. These are
-concrete items the module would benefit from, ranked by leverage.
+### Canonical-ABI correctness
 
-### Correctness (latent bugs, fix before they bite)
+- [ ] **Heterogeneous variant arms — full runtime dispatch.** For
+  discriminated types (`result` / `variant`) where arms have
+  different flat shapes (e.g. `variant { u8, u64 }` where one
+  position joins to `i64`), `walk_discriminated_payload` falls back
+  to the joined-flat layout. `emit_task_return_loads` emits a
+  runtime trap gate that allows only the first safe arm (disc = 0)
+  through; other arms hit `unreachable`. Full per-arm dispatch
+  (branch on disc, load each arm's canonical layout, widen to
+  joined) is needed for complete correctness. wasi:http/handler
+  works today because only the ok arm (disc = 0) is exercised in
+  tests.
 
-All of these are real issues that have never surfaced because the
-test suite exercises wasi:http/handler-shaped interfaces and closely
-related primitive shapes. They'd all bite the first time someone
-points splicer at a different interface shape.
+- [ ] **Flat params / results > 16 — pointer-form lowering.** The
+  canonical ABI collapses to `(i32)` pointer form when flat
+  values exceed 16. `extract_func_sig` now bails with a clear
+  error at this boundary (instead of silently declaring wrong core
+  types). Implementing pointer-form requires: `params_are_ptr` /
+  `results_are_ptr` flags on `AdapterFunc`, pointer-form type
+  declarations in every dispatch emitter, and a memory-layout
+  buffer reservation for the spilled args.
 
-- [x] **Exhaustive matches on `ValueType`; silent-resource `bail!`.**
-  _Landed._ Two compile-time / immediate-error wins that don't add
-  maintenance burden for the correctness items below:
+- [ ] **Anonymous compound types as top-level results.** When a
+  Record / Variant / Enum appears as a func result but ISN'T in
+  `iface.type_exports` (unusual in WIT-compiled interfaces, but
+  legal at the component-model level), the adapter's export-instance
+  construction can't re-export the compound — the binary fails
+  validation with "instance not valid to be used as export."
+  Fix: synthesize names + auto-export in `emit_export_phase`.
+  Low priority since real WIT always names its compounds.
 
-  **(a) Exhaustive matches on `ValueType`.** Three sites had
-  `_ => false` or `_ => build_sequential_layout(...)` wildcard arms
-  that would silently swallow a new `ValueType` variant if cviz ever
-  grew one: `type_has_strings` and `type_has_resources` at
-  `src/adapter/ty.rs:112` / `:154`, and `FlatLayout::new` at
-  `src/adapter/ty.rs:343`. All three are now explicit per-variant
-  matches — a new cviz variant will force an explicit decision at
-  compile time.
+### Silent-fallback audit (filter / reencoder / wac)
 
-  **(b) Silent `Primitive(U32)` resource fallback → `bail!`.**
-  `encode_comp_cv` at `src/adapter/encoders.rs:313` used to fall back
-  to `Primitive(U32)` when a resource's `ValueTypeId` wasn't
-  registered in `comp_own_by_vid`, silently losing the `own<T>`
-  typing. Now it bails with `"internal error: resource {id:?} not
-  registered in comp_own_by_vid — the handler-import phase must
-  declare every resource before encode_comp_cv references it"`. All
-  existing tests pass, confirming the fallback was unreachable today
-  — but the error now surfaces immediately if registration ever
-  drifts out of sync with the encoder.
+These don't affect correctness under today's test fixtures, but
+an upstream change (wasmparser / wirm adding a new enum variant)
+could silently drop tracked items. Fix each at its site:
 
-  **What was considered and dropped:** an upfront
-  `validate_iface_supported` pre-pass. Each correctness item below
-  is going to add its own proper handling (or explicit `bail!`) at
-  the fix site; a pre-pass duplicates those errors and becomes stale
-  work — every accepted shape has to be un-rejected in two places.
-  The exhaustive matches above give the same compile-time safety
-  without the maintenance shadow.
-
-### Remaining silent-fallback audit (handle at the fix site)
-
-The fail-closed pass above covered `ValueType` matches and the
-resource registration. Several other silent fallbacks remain in the
-filter / reencoder / wac — they don't affect correctness under
-today's test fixtures, but an upstream change (wasmparser / wirm
-adding a new enum variant) could silently drop tracked items. Fix
-each at its site, not via a pre-pass:
-
-- `src/adapter/filter/section_filter.rs:253` — `ItemKind → ItemSpace::Other`
-- `src/adapter/filter/section_filter.rs:340` — `Space → None` in `lookup_loc`
-- `src/adapter/filter/raw_sections_reencoder.rs:414` — export kind
-  count bump (`Func`/`Module`/`Component`/`Value` ignored; comment
-  flags this as "room to grow")
-- `src/adapter/filter/raw_sections_reencoder.rs:671, 675` —
+- `filter/section_filter.rs:253` — `ItemKind → ItemSpace::Other`
+- `filter/section_filter.rs:340` — `Space → None` in `lookup_loc`
+- `filter/raw_sections_reencoder.rs:414` — export kind count bump
+- `filter/raw_sections_reencoder.rs:671, 675` —
   `ComponentExternalKind` / `ComponentOuterAliasKind` →
   `AliasSpaceKind::Other`
-- `src/adapter/filter/raw_sections_reencoder.rs:434, 444, 462, 470` —
-  `self.type_map.get(&ty).copied().unwrap_or(ty)` falls back to the
-  *original* index if the lookup misses. The comment says downstream
-  wasm validation will catch misuse, but a stale-but-valid index
-  could still type-check and silently reference the wrong thing. Fix
-  by changing `unwrap_or(ty)` to
-  `.ok_or_else(|| anyhow!("type {ty} expected in filtered map but
-  missing — closure walker bug"))`.
-- `src/wac.rs:192` — `InternedId → None` fallback when looking up
-  export types (minor).
-- `src/adapter/dispatch.rs:464` — `core_results[0] → void_i32_ty`
-  fallback. Currently unreachable (flat_types_for only produces
-  I32/I64/F32/F64) but worth making exhaustive for future-proofing.
+- `filter/raw_sections_reencoder.rs:434, 444, 462, 470` —
+  `type_map.get(&ty).unwrap_or(ty)` index fallback
+- `wac.rs:192` — `InternedId → None` fallback
+- `dispatch.rs:464` — `core_results[0] → void_i32_ty` fallback
 
-- [x] **`FlatLayout::new` mis-computes memory offsets for
-  discriminated and subword-containing types.** _Largely landed._
-  Rewrote `FlatLayout::new` to walk the `ValueType` structure
-  directly using `canonical_size_and_align` — every slot's
-  `byte_offset` now matches what `canon lower` writes.
-  `FlatSlot`'s `(val_type, load_byte_size)` pair was replaced with a
-  single `FlatSlotShape` enum (6 variants, one per valid load
-  instruction: `U8`/`U16`/`I32`/`I64`/`F32`/`F64`), making the
-  "valid combos only" invariant type-level and dropping the
-  unreachable-arm panic from `emit_load_slot`. Subword loads
-  (`i32.load8_u`/`i32.load16_u`) now emit at canonical payload
-  offsets (1 for `option<u8>`, 2 for `option<u16>`, etc.), and
-  discriminator loads match the variant's case-count-derived width.
-  New tests: `option<u8>` / `option<u16>` / `result<u8, u8>` as
-  async results — all pass. Deferred sub-items:
-  - **Heterogeneous variant arms** (e.g. `variant { u8, u64 }`)
-    use the longest-flat arm's layout at the payload offset; reads
-    for shorter arms pick up the canonical bytes plus
-    canon-lower's (zero-init) padding, which canon lift truncates
-    back on the receiving side. Spec-non-compliant if memory is
-    ever reused in a non-zero-init pattern. Proper fix needs
-    runtime dispatch on the discriminator — bigger change in
-    `emit_task_return_loads`.
-  - **Record / Tuple / Variant / Enum as top-level results** now
-    lay out correctly, but tests for those shapes need a richer
-    consumer-WAT template (compound types used in import instance
-    types need to be pre-exported with `(eq N)`). Coverage
-    deferred to a template rewrite. (`src/adapter/ty.rs`
-  lines 343–401.) The actual bug scope is wider than the original
-  sketch; in-scope fix needs real implementation of each case, not
-  stubs/panics. Concrete shapes broken today:
+### Strategic
 
-  1. **Multi-byte discriminants**: `Variant` with >256 cases has a
-     u16 discriminant (2 bytes), >65_536 has u32 (4 bytes).
-     `build_sequential_layout` treats the disc slot as full i32
-     regardless, so a stale byte 2–3 from prior memory could
-     corrupt the widened disc value. Also the sequential fallback
-     doesn't call `i32.load16_u` / `i32.load8_u` for narrower discs.
-  2. **Subword payload alignment**: `Option<u8>` / `Option<u16>`,
-     `Result<u8, u8>`, `Variant { case u8 }` — the canonical ABI
-     stores the payload at `align_to(disc_size, canonical_align(T))`
-     (offset 1 for `Option<u8>`, offset 2 for `Option<u16>`), but
-     `append_sequential` aligns every I32 slot to 4 bytes regardless
-     of the original type's canonical alignment. So we load the
-     payload from the wrong offset (4 instead of 1/2), reading
-     adjacent garbage.
-  3. **Subword value loads**: even at the right offset, an I32 slot
-     representing a u8 needs `i32.load8_u` (1 byte → widened), not
-     `i32.load` (reads 4 bytes, high 3 are adjacent memory).
-  4. **Heterogeneous variant arms (joined-flat)**: `Variant { case
-     u8, case u64 }` — at flat position 1, the joined type is I64.
-     Canon lower writes either 1 byte (u8 case) or 8 bytes (u64
-     case) depending on which arm is active. Loading as i64 from
-     the common offset reads wrong bytes for the u8 arm. Correct
-     handling needs runtime dispatch on the disc to load the active
-     arm's canonical layout and widen to joined flat positions —
-     genuinely complex code-emit, not a layout math tweak.
-  5. **Subword fields in records / tuples**: `Record { a: bool, b:
-     bool }` — canonical layout puts `b` at offset 1; flat-widened
-     puts it at offset 4. Same class as (2).
-
-  **Why it doesn't bite in practice today**: the bump-allocator
-  memory is zero-init on first allocation, so subword reads get
-  `u8_value | (0 << 8) | (0 << 16) | (0 << 24)` = correct widened
-  i32. Fragile to any allocator reuse pattern and spec-non-compliant,
-  but currently passes tests by accident.
-
-  **Fix scope**: real implementations of each case, per explicit
-  user ask ("don't just panic"). The fix needs:
-  - `FlatSlot` to track canonical byte size (not just flat val type)
-    so loads use the right width (`i32.load8_u` / `i32.load16_u` /
-    `i32.load` / `i64.load`).
-  - Layout walk that uses canonical-ABI alignment throughout, threaded
-    from the original `ValueType`, not `val_type_byte_size`.
-  - Discriminated-type handling for `Result` / `Option` / `Variant`
-    / `Enum` via a unified `build_discriminated_layout`.
-  - For heterogeneous variant arms, the dispatch code in
-    `emit_task_return_loads` needs a runtime branch on disc to load
-    each arm's canonical layout and widen. This is the biggest
-    piece — likely a new emit helper, not just a layout builder.
-  - Subword-field handling in records/tuples: the sequential layout
-    builder must use canonical alignment, not val-type alignment.
-  Add tests across all five shape categories, each with a
-  non-zero-init memory assertion (fill memory with `0xFF` before
-  the test and verify the widened value still comes back correctly)
-  so the bug actually surfaces when broken.
-
-- [ ] **`FixedSizeList(T, N)` silently encoded as dynamic `list<T>`;
-  element count `N` discarded.** (`src/adapter/encoders.rs` lines
-  246–251 in `InstTypeCtx::encode_cv` and lines 447–461 in
-  `encode_comp_cv`.) Both sites call `defined_type().list(inner_cv)`,
-  dropping `N`. wasm-encoder has `defined_type().fixed_size_list(cv,
-  elements)` — it's simply not being used. The generated adapter's
-  interface type claims `list<T>` where the real interface has
-  `list<T, N>`, producing a type mismatch at composition time against
-  any real provider/consumer that uses fixed-size lists. **Fix**:
-  match on `ValueType::FixedSizeList(inner, n)` and call
-  `fixed_size_list(inner_cv, n)` at both sites.
-
-- [ ] **`flat_types_for(FixedSizeList)` returns `[I32, I32]`;
-  canonical ABI says `N × flat(T)` inlined.** (`src/adapter/ty.rs`
-  line 55.) `FixedSizeList(T, N)` is treated the same as dynamic
-  `List(T)` — a `(ptr, len)` pair on the wire. Canonical ABI
-  flattens `list<T, N>` to `N` repetitions of `flat(T)` inlined;
-  `canonical_align` has the same bug (line 171 returns 4 instead of
-  `align(T)`). Any sync-complex or async result of type `list<T, N>`
-  would mis-size its buffer and mis-offset its memory reads.
-  **Fix**: in `flat_types_for`, emit `flat_types_for(inner)` repeated
-  `n` times; in `canonical_align`, return `canonical_align(inner)`.
-
-- [x] **`needs_realloc` misses `list<T>` types entirely.** _Landed._
-  Added `type_has_lists` in `src/adapter/ty.rs` (exhaustive match,
-  covers both `List(_)` and `FixedSizeList(..)`), `has_lists: bool`
-  on `AdapterFunc`, and a trio of `canon_needs_memory()` /
-  `canon_needs_realloc()` / `canon_needs_utf8()` helpers that
-  centralize the per-function canon-option decisions. Updated all
-  three canon sites in `src/adapter/component.rs` (handler canon
-  lower, `task.return`, canon lift for exports) to use those
-  helpers. Tightened the rules: `has_resources` no longer forces
-  memory or realloc (bare `own<T>` is an `i32` handle with no
-  memory access; resource-in-compound cases are caught by
-  `result_is_complex`, and async-result cases by `is_async &&
-  has_result`). `type_has_resources` and the `has_resources` bool
-  on `AdapterFunc` are now removed — they were only feeding the
-  over-conservative rules. Also fixed a latent WAT-template bug in
-  the consumer synth split where inline compound types (e.g.
-  `(list u32)` in a func param) shifted the numeric type
-  indices — switched to named types (`$fn_<name>`). New tests
-  cover `list<u32>` as param (sync), as result (sync canon-lift
-  path), and as async param (task.return path).
-
-  - [ ] **Flat params and flat results >16 silently declare the wrong
-    core type.** (`src/adapter/func.rs` lines 188–197;
-    `src/adapter/dispatch.rs` lines 317–333 wrapper types, 340–391
-    handler + task.return types.) `core_params.extend(flat_types_for(id))`
-    and `types.ty().function(core_results.iter().copied(), [])`
-    produce verbatim flat-types signatures. Canonical ABI rule:
-    when total flat params/results > MAX_FLAT_PARAMS (16), the core
-    signature collapses to `(i32)` pointer form with the arguments
-    marshaled in memory. Our wrapper / handler / task.return type
-    declarations would mismatch what canon lift/lower produces at the
-    component level, failing at link time. Latent for any function
-    with >16 flat params or any async result whose flat form exceeds
-    16 values (e.g. a record with 20 u32 fields). **Fix**: in
-    `extract_func_sig`, if the accumulated flat length exceeds 16,
-    collapse to `[I32]` and record a flag (`params_are_ptr: bool`,
-    `results_are_ptr: bool`). Each emitter in dispatch.rs checks the
-    flag and emits pointer-form signatures; memory layout needs a
-    corresponding buffer reservation for the spilled args.
-
-- [x] **Silent fallback to `U32` for unregistered resources.**
-  _Landed with the fail-closed pass above._ The
-  `encode_comp_cv` fallback at `src/adapter/encoders.rs:313` now
-  bails with `"internal error: resource {id:?} not registered in
-  comp_own_by_vid — the handler-import phase must declare every
-  resource before encode_comp_cv references it"`. All existing tests
-  pass, confirming the fallback was unreachable today.
-
-### To do
-
-- [x] **Split `emit_imports_from_consumer_split` in two.** _Landed._
-  Renamed the top-level dispatcher to `emit_imports_from_split`
-  (the old name was a misnomer after the split handled both
-  variants). The dispatcher now just copies the raw sections, seeds
-  the index allocator, and calls
-  `emit_imports_consumer_split` (when `target_interface` is in
-  `split.import_names`) or `emit_imports_provider_split` (otherwise).
-  Each strategy owns its own `ImportsOutcome` construction, so the
-  consumer path (re-export handler types via `InstanceExport`) and
-  provider path (reuse preamble-aliased types via `alias outer`) can
-  be read in isolation. No behavior change; 116 tests pass.
-- [x] **Centralize hook / env-slot name constants.** _Landed._ Two
-  sources of truth now:
-  - **`build.rs`** extracts function names from
-    `wit/tier1/world.wit` and emits both `TIER1_{IFACE}_FNS` (WIT
-    hyphenated names like `"before-call"`) and
-    `TIER1_{IFACE}_ENV_SLOTS` (underscored mirrors like
-    `"before_call"` for use in env core-instance slots). Accessible
-    via `crate::contract::...`.
-  - **`src/adapter/names.rs`** holds splicer-internal env-slot
-    names that aren't derived from WIT: `ENV_INSTANCE` (`"env"`,
-    the module arg name for the dispatch module), `ENV_MEMORY`,
-    `ENV_REALLOC`, the async-builtin names
-    (`ENV_WAITABLE_NEW` etc.), and the indexed-name helpers
-    (`env_handler_fn(i)`, `env_task_return_fn(i)`).
-  Both `component::emit_hook_inst_types` /
-  `component::emit_dispatch_phase` and `dispatch::build_dispatch_module`
-  now reference the same constants — a rename only has to happen in
-  one place. Doc comments on `component::emit_hook_inst_types` and
-  on the `hook_ty` / `block_ty` declarations in
-  `dispatch::build_dispatch_module` point at `wit/tier1/world.wit`
-  as the source of truth for the hook *signature shape* — while the
-  names come from WIT automatically via `build.rs`, the canon-
-  lowered flat shapes (`(i32, i32) → i32` etc.) are still spelled
-  out in Rust and would need updating if the WIT signatures change.
-- [~] **~~Pass hook flags into `compute_memory_layout`.~~** _Dropped
-  after attempting._ The audit claim (`has_async_machinery`
-  "re-derives" from `funcs`) was misread — there's only ONE site
-  computing it (inside `compute_memory_layout`). No duplication to
-  eliminate. Attempted refactors (hoisting to caller, extracting to
-  `needs_async_machinery()` helper) turned one readable inline line
-  into a rename or a call site with the same meaning — pure noise.
-  The original inline definition reads fine and stays as-is.
-
-### Upstream (wirm / cviz)
-
-- [x] **wirm's concretization had silent `_ => ConcreteValType::Resource`
-  fallbacks that defeated splicer's fail-closed boundary.** _Landed
-  in wirm._ All six sites in
-  `~/git/research/compilers/wirm/src/ir/component/concrete.rs`
-  (`concretize_from_resolved`,
-  `concretize_comp_type_to_val`,
-  `resolve_type_from_import_instance`) and the
-  `InstanceExport`-as-val-type match on lines 578–597 now panic with
-  `"invalid component: …"` messages describing the specific
-  invariant that failed, instead of fabricating a bogus `Resource`.
-  Framing is component-model-spec-level, not WIT-specific — the val
-  types list comes straight from the spec. 102 wirm tests pass, 116
-  splicer tests pass; the fallbacks were unreachable from today's
-  test fixtures, which confirms the silent-fallback was pure dead
-  weight (and a bug waiting to happen).
-
-### To investigate
-
-- [x] **Extract `build_env_exports` from `emit_dispatch_phase`.**
-  _Landed._ The 47-line conditional-push block that built the env
-  instance's exports is now a dedicated
-  `fn build_env_exports(canon_lower, funcs, mem_core_mem) -> Vec<...>`.
-  `emit_dispatch_phase` collapses its env-construction to a one-line
-  call. The contract "these names MUST match the dispatch module's
-  imports, and the `Option<u32>`s on each side must agree on which
-  slots exist" is now documented once at the extracted function and
-  referenced by both sides. No behavior change; 116 tests pass.
+- [ ] **Investigate reusing an existing canonical-ABI
+  implementation.** Hand-rolling canonical-ABI emit is the single
+  biggest source of correctness bugs. See
+  `docs/TODO/investigate-canonical-abi-reuse.md` for the full
+  investigation plan covering `wit-bindgen-core`,
+  `wit-component`, `proxy-component`, `wasmtime-environ`, and
+  `wit-dylib`. Time-boxed at 2-4 hours.

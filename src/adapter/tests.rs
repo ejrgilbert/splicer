@@ -12,14 +12,20 @@ use super::*;
 use cviz::model::{
     FuncSignature, InstanceInterface, InterfaceType, TypeArena, ValueType, ValueTypeId,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Helper: validate that bytes form a valid component-model binary.
 fn validate_component(bytes: &[u8]) {
     let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
-    validator
-        .validate_all(bytes)
-        .expect("generated adapter should be a valid component");
+    if let Err(e) = validator.validate_all(bytes) {
+        let dbg_path = std::env::temp_dir().join("splicer_failing_adapter.wasm");
+        let _ = std::fs::write(&dbg_path, bytes);
+        panic!(
+            "generated adapter should be a valid component: {e}\n\
+             (raw bytes written to {}, use `wasm-tools print` to inspect)",
+            dbg_path.display(),
+        );
+    }
 }
 
 /// Map a primitive or String `ValueType` to its WAT spelling, for use
@@ -128,11 +134,20 @@ fn synth_split(
         _ => panic!("synth_split: bare function interfaces not supported"),
     };
 
-    let wat = match (kind, iface_inst.type_exports.is_empty()) {
-        (SplitKind::Consumer, true) => wat_consumer_primitive_only(target, iface_inst, arena),
-        (SplitKind::Consumer, false) => wat_consumer_http_handler_shape(target),
-        (SplitKind::Provider, true) => wat_provider_primitive_only(target, iface_inst, arena),
-        (SplitKind::Provider, false) => wat_provider_http_handler_shape(target),
+    // Route to the HTTP-handler-shape template only when the
+    // interface has RESOURCE type exports (which need the special
+    // types-instance import + alias-outer preamble). Non-resource
+    // compounds (records, enums, variants in type_exports) are
+    // handled by the generic template via collect_compound_decls.
+    let has_resources = iface_inst
+        .type_exports
+        .values()
+        .any(|&vid| matches!(arena.lookup_val(vid), ValueType::Resource(_)));
+    let wat = match (kind, has_resources) {
+        (SplitKind::Consumer, false) => wat_consumer_primitive_only(target, iface_inst, arena),
+        (SplitKind::Consumer, true) => wat_consumer_http_handler_shape(target),
+        (SplitKind::Provider, false) => wat_provider_primitive_only(target, iface_inst, arena),
+        (SplitKind::Provider, true) => wat_provider_http_handler_shape(target),
     };
 
     let bytes = wat::parse_str(&wat).unwrap_or_else(|e| {
@@ -152,18 +167,56 @@ fn wat_consumer_primitive_only(
     // inline compound types like `(list u32)` — which the WAT
     // parser allocates their own type slots for — don't shift the
     // numbering and break later references.
-    let mut body = String::new();
-    let mut export_lines = String::new();
+    //
+    // Compound types (record / variant / enum / flags) used as
+    // param or result types would fail the component-model
+    // validator's rule that import instance types can't reference
+    // anonymous compounds. Pre-declare each such type as a named
+    // type, export with `(eq $name)`, and reference by $name from
+    // the function signatures.
 
+    // Pre-declare compound types from type_exports. The adapter
+    // aliases these by NAME from the handler instance, so export
+    // names must match the type_exports keys. Each compound gets
+    // TWO type-space slots: the inline declaration and the (eq N)
+    // export. Resources are skipped — the HTTP handler template
+    // handles those with the special alias-outer preamble.
+    let mut compounds: HashMap<ValueTypeId, u32> = HashMap::new();
+    let mut body = String::new();
+    let mut type_idx: u32 = 0;
+    for (export_name, &vid) in &iface.type_exports {
+        if matches!(
+            arena.lookup_val(vid),
+            ValueType::Resource(_) | ValueType::AsyncHandle
+        ) {
+            continue;
+        }
+        let body_str = wat_compound_body(vid, arena, &compounds);
+        body.push_str(&format!("      (type (;{type_idx};) {body_str})\n"));
+        let decl_idx = type_idx;
+        type_idx += 1;
+        body.push_str(&format!(
+            "      (export (;{type_idx};) \"{export_name}\" (type (eq {decl_idx})))\n"
+        ));
+        compounds.insert(vid, type_idx);
+        type_idx += 1;
+    }
+
+    let mut export_lines = String::new();
     for (name, sig) in &iface.functions {
         let params: Vec<String> = sig
             .param_names
             .iter()
             .zip(sig.params.iter())
-            .map(|(pname, &pid)| format!(r#"(param "{pname}" {})"#, wat_type(pid, arena)))
+            .map(|(pname, &pid)| {
+                format!(
+                    r#"(param "{pname}" {})"#,
+                    wat_type_ctx(pid, arena, &compounds)
+                )
+            })
             .collect();
         let result = match sig.results.first() {
-            Some(&rid) => format!(" (result {})", wat_type(rid, arena)),
+            Some(&rid) => format!(" (result {})", wat_type_ctx(rid, arena, &compounds)),
             None => String::new(),
         };
         let async_kw = if sig.is_async { "async " } else { "" };
@@ -181,6 +234,103 @@ fn wat_consumer_primitive_only(
     format!(
         "(component\n  (type $iface (instance\n{body}  ))\n  (import \"{target}\" (instance (type $iface)))\n)\n"
     )
+}
+
+/// Render the body of a compound type (what goes inside
+/// `(type (;N;) ...)`), with inner compound references resolved to
+/// their pre-declared export type indices via `compounds`.
+fn wat_compound_body(
+    id: ValueTypeId,
+    arena: &TypeArena,
+    compounds: &HashMap<ValueTypeId, u32>,
+) -> String {
+    match arena.lookup_val(id) {
+        ValueType::Record(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(name, fid)| {
+                    format!(
+                        r#"(field "{name}" {})"#,
+                        wat_type_ctx(*fid, arena, compounds)
+                    )
+                })
+                .collect();
+            format!("(record {})", inner.join(" "))
+        }
+        ValueType::Variant(cases) => {
+            let inner: Vec<String> = cases
+                .iter()
+                .map(|(name, opt)| match opt {
+                    Some(cid) => {
+                        format!(
+                            r#"(case "{name}" {})"#,
+                            wat_type_ctx(*cid, arena, compounds)
+                        )
+                    }
+                    None => format!(r#"(case "{name}")"#),
+                })
+                .collect();
+            format!("(variant {})", inner.join(" "))
+        }
+        ValueType::Enum(tags) => {
+            let items: Vec<String> = tags.iter().map(|t| format!(r#""{t}""#)).collect();
+            format!("(enum {})", items.join(" "))
+        }
+        ValueType::Flags(names) => {
+            let items: Vec<String> = names.iter().map(|n| format!(r#""{n}""#)).collect();
+            format!("(flags {})", items.join(" "))
+        }
+        other => panic!(
+            "wat_compound_body: {other:?} should not be in the compounds pre-declaration list"
+        ),
+    }
+}
+
+/// Like [`wat_type`] but substitutes a numeric type-index reference
+/// for any ValueTypeId found in `compounds` (pre-declared types)
+/// — the index is the EXPORT's slot (`(eq N)`), not the inline
+/// declaration, because component-model validation rejects
+/// anonymous compounds in import instance types.
+fn wat_type_ctx(
+    id: ValueTypeId,
+    arena: &TypeArena,
+    compounds: &HashMap<ValueTypeId, u32>,
+) -> String {
+    if let Some(idx) = compounds.get(&id) {
+        return idx.to_string();
+    }
+    match arena.lookup_val(id) {
+        // Containers — recurse into inner with context so nested
+        // compound refs also get substituted.
+        ValueType::List(inner) => format!("(list {})", wat_type_ctx(*inner, arena, compounds)),
+        ValueType::FixedSizeList(inner, n) => {
+            format!("(list {} {n})", wat_type_ctx(*inner, arena, compounds))
+        }
+        ValueType::Option(inner) => {
+            format!("(option {})", wat_type_ctx(*inner, arena, compounds))
+        }
+        ValueType::Result { ok, err } => {
+            let ok_str = ok.map(|id| wat_type_ctx(id, arena, compounds));
+            let err_str = err.map(|id| wat_type_ctx(id, arena, compounds));
+            match (ok_str, err_str) {
+                (Some(o), Some(e)) => format!("(result {o} (error {e}))"),
+                (Some(o), None) => format!("(result {o})"),
+                (None, Some(e)) => format!("(result (error {e}))"),
+                (None, None) => "(result)".into(),
+            }
+        }
+        ValueType::Tuple(ids) => {
+            let inner: Vec<String> = ids
+                .iter()
+                .map(|id| wat_type_ctx(*id, arena, compounds))
+                .collect();
+            format!("(tuple {})", inner.join(" "))
+        }
+        // Everything else defers to `wat_type` (primitives +
+        // compound-as-inline fallback, though compounds should have
+        // been caught by the `compounds.get` short-circuit above).
+        _ => wat_type(id, arena),
+    }
 }
 
 /// WAT for the wasi:http/handler-shape fixture used by
@@ -686,6 +836,60 @@ fn test_adapter_result_u8_u8_async_result() {
         err: Some(u8_id),
     });
     let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![result]))]);
+    let bytes = gen_adapter(
+        "test:pkg/get@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Record with subword fields as an async result — exercises the
+/// consumer-WAT template's compound-type pre-declaration and the
+/// adapter's `comp_aliased_types` re-export flow. Mirrors
+/// real-WIT shape by putting the record in `type_exports` (that's
+/// how cviz surfaces named compounds from compiled WIT).
+#[test]
+fn test_adapter_record_with_subword_fields_async_result() {
+    let mut arena = TypeArena::default();
+    let bool_id = arena.intern_val(ValueType::Bool);
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u16_id = arena.intern_val(ValueType::U16);
+    let record = arena.intern_val(ValueType::Record(vec![
+        ("flag".into(), bool_id),
+        ("count".into(), u32_id),
+        ("tag".into(), u16_id),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![record]))]),
+        type_exports: BTreeMap::from([("my-record".to_string(), record)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/get@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Enum as an async result — same pattern: enum is named in
+/// `type_exports`, matching how real WIT compiles.
+#[test]
+fn test_adapter_enum_async_result() {
+    let mut arena = TypeArena::default();
+    let en = arena.intern_val(ValueType::Enum(vec![
+        "red".into(),
+        "green".into(),
+        "blue".into(),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![en]))]),
+        type_exports: BTreeMap::from([("color".to_string(), en)]),
+    });
     let bytes = gen_adapter(
         "test:pkg/get@1.0.0",
         &["splicer:tier1/before", "splicer:tier1/after"],

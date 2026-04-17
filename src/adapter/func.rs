@@ -223,6 +223,8 @@ fn extract_func_sig(
     sig: &FuncSignature,
     arena: &TypeArena,
 ) -> anyhow::Result<ExtractedSig> {
+    const MAX_FLAT: usize = 16;
+
     let mut param_names = Vec::with_capacity(sig.params.len());
     let mut param_type_ids = Vec::with_capacity(sig.params.len());
     let mut core_params = Vec::new();
@@ -235,6 +237,14 @@ fn extract_func_sig(
         param_names.push(pname);
         param_type_ids.push(id);
         core_params.extend(flat_types_for(id, arena));
+    }
+    if core_params.len() > MAX_FLAT {
+        anyhow::bail!(
+            "Function '{name}' has {} flat parameter values (exceeds the \
+             canonical-ABI limit of {MAX_FLAT}). The pointer-form lowering \
+             required for >{MAX_FLAT} flat params is not yet implemented.",
+            core_params.len()
+        );
     }
 
     if sig.results.len() > 1 {
@@ -253,6 +263,15 @@ fn extract_func_sig(
         } else {
             let rid = sig.results[0];
             let flat = flat_types_for(rid, arena);
+            if flat.len() > MAX_FLAT {
+                anyhow::bail!(
+                    "Function '{name}' has a result that flattens to {} core \
+                     values (exceeds {MAX_FLAT}). The pointer-form lowering \
+                     required for >{MAX_FLAT} flat results is not yet \
+                     implemented.",
+                    flat.len()
+                );
+            }
             let is_complex = flat.len() > 1;
             // Canonical-ABI memory size for the result — accounts for
             // the discriminant-and-padding shape of `result<T, E>`
