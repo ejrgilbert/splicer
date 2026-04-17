@@ -39,7 +39,7 @@ use super::ty::prim_cv;
 /// - `resource_exports`: (vid, export_name, resource_local_idx, own_local_idx)
 /// - `outer_resources`: When non-empty, resources are resolved via `alias outer`
 ///   instead of being exported as SubResource.  Maps ValueTypeId → component-scope type index.
-pub(super) struct InstTypeCtx {
+pub(crate) struct InstTypeCtx {
     pub cache: HashMap<ValueTypeId, u32>,
     pub resource_exports: Vec<(ValueTypeId, String, u32, u32)>,
     /// Maps resource ValueTypeId → component-scope type index.
@@ -291,7 +291,7 @@ impl InstTypeCtx {
 /// `comp_type_count` tracks the running component-level type index (incremented for each new entry).
 /// `comp_cache` prevents redundant encoding of the same `ValueTypeId`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn encode_comp_cv(
+pub(crate) fn encode_comp_cv(
     id: ValueTypeId,
     arena: &TypeArena,
     comp_types: &mut ComponentTypeSection,

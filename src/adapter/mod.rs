@@ -2,38 +2,39 @@
 //! before/after/blocking hooks and re-exports the wrapped handler's
 //! target interface.
 //!
-//! Submodules:
-//! - [`component`] — orchestrates the full Component binary build
-//!   ([`build_adapter_bytes`]) across the 13 numbered phases.
-//! - [`dispatch`] — emits the two nested core-Wasm modules: the
-//!   memory provider and the per-function dispatch wrappers.
-//! - [`encoders`] — recursive value-type encoders for component-level
-//!   and instance-level type sections.
+//! The module is organized into two layered groups plus a handful of
+//! cross-cutting root files:
+//!
+//! - [`abi`] — canonical-ABI abstraction: type translation to
+//!   `wit-parser`, `Bindgen` impl for lift/lower codegen, verbatim
+//!   copies of a couple of private `wit-bindgen-core` helpers.
+//! - [`build`] — wasm binary emission: outer Component orchestration,
+//!   inner dispatch core module, component-level type encoders, and
+//!   the byte-offset allocator for the dispatch module's scratch
+//!   memory.
 //! - [`filter`] — closure-based dependency walker + raw-sections
 //!   re-encoder that scopes the split's import preamble to exactly the
-//!   sections the target interface transitively depends on; produces
-//!   the [`filter::FilteredSections`] that the adapter builder consumes.
-//! - [`func`] — the [`AdapterFunc`] value object and the cviz →
-//!   `Vec<AdapterFunc>` extraction.
-//! - [`mem_layout`] — [`mem_layout::MemoryLayoutBuilder`], the single
-//!   byte-offset allocator shared by extraction and build phases.
-//! - [`ty`] — canonical-ABI type analysis helpers (flattening,
-//!   alignment, resource collection).
+//!   sections the target interface transitively depends on.
+//! - [`func`] — the [`func::AdapterFunc`] value object and the cviz
+//!   → `Vec<AdapterFunc>` extraction.
+//! - [`indices`] — running-index trackers for component, core-module,
+//!   and function-local namespaces.
+//! - [`names`] — stable import/export name strings.
 
 use anyhow::Context;
 use cviz::model::{InterfaceType, TypeArena};
 
-mod component;
-mod dispatch;
-mod encoders;
+mod abi;
+mod build;
 mod filter;
 mod func;
-mod mem_layout;
+mod indices;
 mod names;
 #[cfg(test)]
 mod tests;
-mod ty;
-use component::build_adapter_bytes;
+
+use abi::WitBridge;
+use build::build_adapter_bytes;
 use filter::{extract_filtered_sections, find_handler_deps};
 use func::extract_adapter_funcs;
 
@@ -70,7 +71,8 @@ pub fn generate_tier1_adapter(
         )
     })?;
 
-    let (funcs, layout) = extract_adapter_funcs(iface_ty, arena)?;
+    let bridge = WitBridge::from_cviz(arena);
+    let (funcs, layout) = extract_adapter_funcs(iface_ty, &bridge)?;
 
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
@@ -112,6 +114,7 @@ pub fn generate_tier1_adapter(
         iface_ty,
         &split,
         layout,
+        &bridge,
     )?;
 
     let out_path = format!(

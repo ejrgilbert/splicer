@@ -697,12 +697,11 @@ fn test_adapter_resource_handler() {
 
 // ── Tier 1: list<T> (needs_realloc detection) ────────────────────────
 
-/// Regression test for the `needs_realloc` rule: a function with a
-/// `list<u32>` parameter requires canon lower to allocate memory for
-/// the marshaled list contents. Before the fix, the rule only
-/// detected strings and resources, so `list<T>` functions had
-/// `needs_realloc = false` → memory module emitted without realloc →
-/// canon lower fails at component-model validation.
+/// A function with a `list<u32>` parameter requires canon lower to
+/// allocate memory for the marshaled list contents, so the emitted
+/// memory module must include `realloc`. This verifies that the
+/// `needs_realloc` predicate detects lists (not just strings and
+/// resources) and that the resulting component validates end-to-end.
 #[test]
 fn test_adapter_list_param_sync() {
     let mut arena = TypeArena::default();
@@ -743,11 +742,12 @@ fn test_adapter_list_result_sync() {
     validate_component(&bytes);
 }
 
-/// Fixed-size-list param — exercises the `list<T, N>` encoders at
-/// both `InstTypeCtx::encode_cv` and `encode_comp_cv`, plus the
-/// `N × flat(T)` flattening in `flat_types_for`. Before the fix,
-/// both sites silently emitted dynamic `list<T>` (dropping `N`) and
-/// the flat shape was `(ptr, len)` instead of the inlined repeats.
+/// Fixed-size-list param — `list<T, N>` must flatten to `N × flat(T)`
+/// inlined on the wasm stack (not to a `(ptr, len)` pair like
+/// dynamic `list<T>`). This drives both component-level type encoders
+/// (`InstTypeCtx::encode_cv` and `encode_comp_cv`) and the
+/// `WitBridge::flat_types` flattening the adapter uses for
+/// canon-lift/lower.
 #[test]
 fn test_adapter_fixed_size_list_param_sync() {
     let mut arena = TypeArena::default();
@@ -786,14 +786,16 @@ fn test_adapter_list_param_async() {
     validate_component(&bytes);
 }
 
-// ── Tier 1: subword-aligned shapes (FlatLayout correctness) ──────────
+// ── Tier 1: subword-aligned shapes (canonical-ABI correctness) ───────
 //
-// These shapes were silently mis-laid-out before the FlatLayout
-// rewrite: `Option<u8>`/`Option<u16>`/`Result<u8,u8>`/records with
-// subword fields all have canonical-ABI payload offsets that don't
-// match `val_type_byte_size`-based offsets. The tests validate that
-// generation succeeds and the binary structurally validates — actual
-// runtime correctness would need execution, not just wasmparser.
+// These shapes test that the adapter's lift-from-memory path handles
+// non-4-byte payload offsets: `Option<u8>` / `Option<u16>` /
+// `Result<u8, u8>` / records with subword fields all have
+// canonical-ABI payload offsets that don't match simple
+// ValType-byte-width offsets. The tests validate that generation
+// succeeds and the binary structurally validates — actual runtime
+// correctness needs execution (covered by the __testme integration
+// suite in tests/component-interposition/).
 
 #[test]
 fn test_adapter_option_u8_async_result() {

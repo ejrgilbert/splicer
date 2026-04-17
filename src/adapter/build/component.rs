@@ -46,52 +46,12 @@ use wasm_encoder::{
 
 use super::dispatch::{build_dispatch_module, build_mem_module};
 use super::encoders::{encode_comp_cv, InstTypeCtx};
-use super::filter::FilteredSections;
-use super::func::AdapterFunc;
 use super::mem_layout::MemoryLayoutBuilder;
-use super::names;
-
-/// Running index allocators for the adapter's component-level and
-/// core-level namespaces. One instance lives in [`build_adapter_bytes`]
-/// and is threaded through every phase by `&mut`, so phases no longer
-/// need to carry "where did we leave the type counter?" state in
-/// their outcome structs.
-#[derive(Default)]
-struct ComponentIndices {
-    pub ty: u32,
-    pub inst: u32,
-    pub func: u32,
-    pub core_inst: u32,
-    pub core_func: u32,
-}
-
-impl ComponentIndices {
-    fn alloc_ty(&mut self) -> u32 {
-        let idx = self.ty;
-        self.ty += 1;
-        idx
-    }
-    fn alloc_inst(&mut self) -> u32 {
-        let idx = self.inst;
-        self.inst += 1;
-        idx
-    }
-    fn alloc_func(&mut self) -> u32 {
-        let idx = self.func;
-        self.func += 1;
-        idx
-    }
-    fn alloc_core_inst(&mut self) -> u32 {
-        let idx = self.core_inst;
-        self.core_inst += 1;
-        idx
-    }
-    fn alloc_core_func(&mut self) -> u32 {
-        let idx = self.core_func;
-        self.core_func += 1;
-        idx
-    }
-}
+use crate::adapter::abi::WitBridge;
+use crate::adapter::filter::FilteredSections;
+use crate::adapter::func::AdapterFunc;
+use crate::adapter::indices::ComponentIndices;
+use crate::adapter::names;
 
 // ─── Section-emit helpers ──────────────────────────────────────────────────
 
@@ -683,9 +643,9 @@ fn compute_memory_layout(
 
     // Realloc is needed by canon lift and canon lower to allocate
     // memory for any value whose canonical-ABI form is a
-    // pointer-to-bytes: strings (variable-length UTF-8) and lists
-    // (both `list<T>` and `list<T, N>` — our current
-    // `flat_types_for` treats both as `(ptr, len)`). Bare resource
+    // pointer-to-bytes: strings (variable-length UTF-8) and lists.
+    // Both dynamic `list<T>` and fixed-size `list<T, N>` are covered
+    // by [`super::wit_bridge::WitBridge::has_lists`]. Bare resource
     // handles don't need realloc — they're i32 values on the wire.
     // When needed, realloc lives in the memory module so it's
     // available for both lowering and lifting.
@@ -1045,9 +1005,9 @@ fn emit_dispatch_phase(
     has_after: bool,
     has_blocking: bool,
     layout: &MemoryLayout,
-    arena: &TypeArena,
     mem_core_mem: u32,
     canon_lower: &CanonLowerOutcome,
+    bridge: &WitBridge,
 ) -> anyhow::Result<DispatchPhaseOutcome> {
     // ── 8. Core module 1: dispatch ─────────────────────────────────────
     {
@@ -1058,7 +1018,7 @@ fn emit_dispatch_phase(
             has_blocking,
             layout.event_ptr,
             layout.block_result_ptr,
-            arena,
+            bridge,
         )?;
         // Use RawSection to embed the pre-built module bytes directly.
         component.section(&RawSection {
@@ -1404,7 +1364,7 @@ fn emit_handler_resource_types(
 /// we can create a component instance from exported items (a capability not
 /// exposed as a public method by `ComponentBuilder`).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_adapter_bytes(
+pub(crate) fn build_adapter_bytes(
     target_interface: &str,
     funcs: &[AdapterFunc],
     has_before: bool,
@@ -1414,6 +1374,7 @@ pub(super) fn build_adapter_bytes(
     iface_ty: &InterfaceType,
     split: &FilteredSections,
     layout: MemoryLayoutBuilder,
+    bridge: &WitBridge,
 ) -> anyhow::Result<Vec<u8>> {
     let mut component = Component::new();
 
@@ -1495,9 +1456,9 @@ pub(super) fn build_adapter_bytes(
         has_after,
         has_blocking,
         &layout,
-        arena,
         mem_core_mem,
         &canon_lower,
+        bridge,
     )?;
 
     let CanonLiftOutcome { wrapped_func_base } = emit_canon_lift_phase(
