@@ -3173,6 +3173,7 @@ dependencies = [
  "wasmparser 0.245.1",
  "wat",
  "wirm",
+ "wit-bindgen-core 0.52.0",
  "wit-parser",
 ]
 
@@ -4582,6 +4583,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen-core"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c15e7a56641cc9040480a26526a3229cbc4e8065adf98c9755d21c4c9b446c4c"
+dependencies = [
+ "anyhow",
+ "heck 0.5.0",
+ "wit-parser",
+]
+
+[[package]]
 name = "wit-bindgen-rust"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4593,7 +4605,7 @@ dependencies = [
  "prettyplease",
  "syn",
  "wasm-metadata",
- "wit-bindgen-core",
+ "wit-bindgen-core 0.51.0",
  "wit-component",
 ]
 
@@ -4608,7 +4620,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
- "wit-bindgen-core",
+ "wit-bindgen-core 0.51.0",
  "wit-bindgen-rust",
 ]
 

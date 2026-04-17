@@ -23,11 +23,14 @@
 use anyhow::Context;
 use cviz::model::{InterfaceType, TypeArena};
 
+mod bindgen;
+mod bindgen_compat;
 mod component;
 mod dispatch;
 mod encoders;
 mod filter;
 mod func;
+mod indices;
 mod mem_layout;
 mod names;
 #[cfg(test)]

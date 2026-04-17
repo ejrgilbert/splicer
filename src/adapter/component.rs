@@ -48,50 +48,9 @@ use super::dispatch::{build_dispatch_module, build_mem_module};
 use super::encoders::{encode_comp_cv, InstTypeCtx};
 use super::filter::FilteredSections;
 use super::func::AdapterFunc;
+use super::indices::ComponentIndices;
 use super::mem_layout::MemoryLayoutBuilder;
 use super::names;
-
-/// Running index allocators for the adapter's component-level and
-/// core-level namespaces. One instance lives in [`build_adapter_bytes`]
-/// and is threaded through every phase by `&mut`, so phases no longer
-/// need to carry "where did we leave the type counter?" state in
-/// their outcome structs.
-#[derive(Default)]
-struct ComponentIndices {
-    pub ty: u32,
-    pub inst: u32,
-    pub func: u32,
-    pub core_inst: u32,
-    pub core_func: u32,
-}
-
-impl ComponentIndices {
-    fn alloc_ty(&mut self) -> u32 {
-        let idx = self.ty;
-        self.ty += 1;
-        idx
-    }
-    fn alloc_inst(&mut self) -> u32 {
-        let idx = self.inst;
-        self.inst += 1;
-        idx
-    }
-    fn alloc_func(&mut self) -> u32 {
-        let idx = self.func;
-        self.func += 1;
-        idx
-    }
-    fn alloc_core_inst(&mut self) -> u32 {
-        let idx = self.core_inst;
-        self.core_inst += 1;
-        idx
-    }
-    fn alloc_core_func(&mut self) -> u32 {
-        let idx = self.core_func;
-        self.core_func += 1;
-        idx
-    }
-}
 
 // ─── Section-emit helpers ──────────────────────────────────────────────────
 

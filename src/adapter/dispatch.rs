@@ -72,48 +72,9 @@ use wasm_encoder::{
 };
 
 use super::func::AdapterFunc;
+use super::indices::DispatchIndices;
 use super::names;
 use super::ty::FlatLayout;
-
-/// Running index allocators for the dispatch core module's type and
-/// function spaces. Scoped to a single call of [`build_dispatch_module`].
-///
-/// These are CORE-MODULE-INTERNAL indices. The dispatch module is a
-/// self-contained core wasm module that only communicates with the
-/// outer component through named env imports (`env/mem`,
-/// `env/handler_f{i}`, …), so its type and function tables have no
-/// relationship to the outer component's indices tracked by
-/// [`super::component::ComponentIndices`]. Keeping them in a separate
-/// struct makes the "two different index spaces" explicit and saves
-/// every type/import emitter from threading its own `&mut u32`.
-struct DispatchIndices {
-    /// Next free slot in the core module's `TypeSection`.
-    ty: u32,
-    /// Next free index in the core module's function space. Imports
-    /// come first (contiguous from 0), then the defined wrapper funcs
-    /// in the code section (contiguous after the last import).
-    func: u32,
-}
-
-impl DispatchIndices {
-    fn new() -> Self {
-        Self { ty: 0, func: 0 }
-    }
-
-    /// Reserve the next type-section slot and return its index.
-    fn alloc_ty(&mut self) -> u32 {
-        let idx = self.ty;
-        self.ty += 1;
-        idx
-    }
-
-    /// Reserve the next function-index slot and return its index.
-    fn alloc_func(&mut self) -> u32 {
-        let idx = self.func;
-        self.func += 1;
-        idx
-    }
-}
 
 /// Emit the load instruction for a [`FlatSlot`] against a base
 /// address already on the value stack. Instruction choice is driven
@@ -609,6 +570,8 @@ fn emit_wrapper_body(
     fi: usize,
     func: &AdapterFunc,
     ctx: &DispatchCodeCtx<'_>,
+    subtask_local: u32,
+    ws_local: u32,
 ) -> anyhow::Result<()> {
     let has_result = func.result_type_id.is_some();
 
@@ -626,13 +589,6 @@ fn emit_wrapper_body(
             func.name
         );
     }
-
-    // Locals beyond params: [subtask: i32, ws: i32] for async/hook
-    // machinery. Sync-complex wrappers don't need extra locals — the
-    // result buffer is at a fixed address.
-    let first_local = func.core_params.len() as u32;
-    let subtask_local = first_local;
-    let ws_local = first_local + 1;
 
     emit_before_phase(f, func, ctx, subtask_local, ws_local);
     emit_blocking_phase(f, fi, func, ctx, subtask_local, ws_local)?;
@@ -1228,8 +1184,11 @@ pub(super) fn build_dispatch_module(
             // params: subtask handle + waitable-set handle. Used by
             // the hook-await path; harmless (but unused) for
             // sync-simple funcs without any hooks.
-            let mut f = Function::new(vec![(2, ValType::I32)]);
-            emit_wrapper_body(&mut f, fi, func, &code_ctx)?;
+            let mut indices = super::indices::FunctionIndices::new(func.core_params.len() as u32);
+            let subtask_local = indices.alloc_local(ValType::I32);
+            let ws_local = indices.alloc_local(ValType::I32);
+            let mut f = Function::new_with_locals_types(indices.into_locals());
+            emit_wrapper_body(&mut f, fi, func, &code_ctx, subtask_local, ws_local)?;
             code_section.function(&f);
         }
         module.section(&code_section);
