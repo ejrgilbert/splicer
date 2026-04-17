@@ -4,10 +4,10 @@
 //! needs them to widen heterogeneous variant arms to the joined flat
 //! representation before wasm block merge.
 //!
-//! **TODO (upstream):** flip `wit_bindgen_core::abi::cast` and
-//! `flat_types` to `pub` and delete this module. The `Bitcast` enum
-//! they return is already `pub`, so the visibility flip is semantically
-//! trivial. See splicer's `docs/TODO/investigate-canon-abi.md`.
+//! **Pending upstream visibility flip:**
+//! <https://github.com/bytecodealliance/wit-bindgen/pull/1597>. Once
+//! that PR lands, delete this module and import the symbols directly
+//! from `wit_bindgen_core::abi`.
 //!
 //! Source: `wit-bindgen-core-0.52.0/src/abi.rs` lines 2562-2627.
 

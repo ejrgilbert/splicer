@@ -232,5 +232,11 @@ parameters, functions with resource types, and functions with complex result
 types (like `result<response, error-code>`) — all transparently. The middleware
 component never needs to know about any of this.
 
-For implementation details, see the source in `src/adapter/` and the internal
-planning doc at `docs/adapter-comp-planning.md`.
+For a low-level architecture walkthrough of the generator itself — module
+layout, type-flow from cviz through `wit-parser` to emitted wasm, how
+`wit-bindgen-core::abi::lift_from_memory` drives the `task.return` loads,
+heterogeneous-variant widening, and what splicer still owns vs. inherits from
+upstream — see [`adapter-internals.md`](./adapter-internals.md).
+
+For broader planning notes on the tier-1 work, see
+[`docs/adapter-comp-planning.md`](./adapter-comp-planning.md).
