@@ -37,7 +37,7 @@ use wit_parser::{
 /// Owns a [`Resolve`] built from a cviz arena plus a pre-filled
 /// [`SizeAlign`]. Every adapter-gen pass builds one and threads it
 /// through the emitters.
-pub(super) struct WitBridge {
+pub(crate) struct WitBridge {
     pub resolve: Resolve,
     pub sizes: SizeAlign,
     type_map: HashMap<ValueTypeId, Type>,

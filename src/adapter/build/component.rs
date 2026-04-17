@@ -46,12 +46,12 @@ use wasm_encoder::{
 
 use super::dispatch::{build_dispatch_module, build_mem_module};
 use super::encoders::{encode_comp_cv, InstTypeCtx};
-use super::filter::FilteredSections;
-use super::func::AdapterFunc;
-use super::indices::ComponentIndices;
 use super::mem_layout::MemoryLayoutBuilder;
-use super::names;
-use super::wit_bridge::WitBridge;
+use crate::adapter::abi::WitBridge;
+use crate::adapter::filter::FilteredSections;
+use crate::adapter::func::AdapterFunc;
+use crate::adapter::indices::ComponentIndices;
+use crate::adapter::names;
 
 // ─── Section-emit helpers ──────────────────────────────────────────────────
 
@@ -1364,7 +1364,7 @@ fn emit_handler_resource_types(
 /// we can create a component instance from exported items (a capability not
 /// exposed as a public method by `ComponentBuilder`).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_adapter_bytes(
+pub(crate) fn build_adapter_bytes(
     target_interface: &str,
     funcs: &[AdapterFunc],
     has_before: bool,

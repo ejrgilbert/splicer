@@ -70,11 +70,10 @@ use wasm_encoder::{
     FunctionSection, ImportSection, Instruction, MemoryType, Module, TypeSection, ValType,
 };
 
-use super::bindgen::WasmEncoderBindgen;
-use super::func::AdapterFunc;
-use super::indices::{DispatchIndices, FunctionIndices};
-use super::names;
-use super::wit_bridge::WitBridge;
+use crate::adapter::abi::{WasmEncoderBindgen, WitBridge};
+use crate::adapter::func::AdapterFunc;
+use crate::adapter::indices::{DispatchIndices, FunctionIndices};
+use crate::adapter::names;
 use wit_bindgen_core::abi::lift_from_memory;
 
 /// Pre-compute the wasm instructions that load a single async-result
@@ -142,7 +141,7 @@ fn build_task_return_loads(
 /// out fresh aligned chunks and advances a pointer. `old_ptr` and
 /// `old_size` are accepted (the canonical ABI insists on the full
 /// signature) but ignored.
-pub(super) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
+pub(crate) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
     let mut module = Module::new();
 
     if with_realloc {
@@ -804,7 +803,7 @@ fn emit_function_name_data(module: &mut Module, funcs: &[AdapterFunc]) {
 /// `needs_realloc` is true when any async function has string params (canon lift async requires Realloc).
 /// `bump_start` is the first free byte in linear memory for the bump allocator (after static data).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn build_dispatch_module(
+pub(crate) fn build_dispatch_module(
     funcs: &[AdapterFunc],
     has_before: bool,
     has_after: bool,

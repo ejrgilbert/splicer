@@ -22,7 +22,7 @@ use wasm_encoder::ValType;
 /// need to carry "where did we leave the type counter?" state in
 /// their outcome structs.
 #[derive(Default)]
-pub(super) struct ComponentIndices {
+pub(crate) struct ComponentIndices {
     pub ty: u32,
     pub inst: u32,
     pub func: u32,
@@ -69,7 +69,7 @@ impl ComponentIndices {
 /// [`ComponentIndices`]. Keeping them in a separate struct makes the
 /// "two different index spaces" explicit and saves every type/import
 /// emitter from threading its own `&mut u32`.
-pub(super) struct DispatchIndices {
+pub(crate) struct DispatchIndices {
     /// Next free slot in the core module's `TypeSection`.
     pub ty: u32,
     /// Next free index in the core module's function space. Imports
@@ -101,7 +101,7 @@ impl DispatchIndices {
 /// Local-index allocator for one wasm function. `base` is the first
 /// free slot above the function's parameters; allocated locals count
 /// up from there.
-pub(super) struct FunctionIndices {
+pub(crate) struct FunctionIndices {
     /// First local index — one past the last parameter.
     base: u32,
     /// Types of locals in allocation order. Fed directly into

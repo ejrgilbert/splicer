@@ -19,7 +19,7 @@ use wasm_encoder::{ComponentValType, PrimitiveValType, ValType};
 /// Byte size of a core Wasm value type in linear memory. Exhaustive
 /// so the compiler catches new `ValType` variants when `wasm-encoder`
 /// grows one.
-pub(super) fn val_type_byte_size(vt: &ValType) -> u32 {
+pub(crate) fn val_type_byte_size(vt: &ValType) -> u32 {
     match vt {
         ValType::I32 | ValType::F32 => 4,
         ValType::I64 | ValType::F64 => 8,
@@ -43,13 +43,13 @@ pub(super) fn val_type_byte_size(vt: &ValType) -> u32 {
 /// align_to_val(8, 4) → 8    // already aligned, no change
 /// align_to_val(9, 4) → 12
 /// ```
-pub(super) fn align_to_val(offset: u32, align: u32) -> u32 {
+pub(crate) fn align_to_val(offset: u32, align: u32) -> u32 {
     offset.div_ceil(align) * align
 }
 
 /// Convert a primitive `ValueType` into a wasm-encoder
 /// `ComponentValType`. Returns `None` for non-primitive variants.
-pub(super) fn prim_cv(vt: &ValueType) -> Option<ComponentValType> {
+pub(crate) fn prim_cv(vt: &ValueType) -> Option<ComponentValType> {
     let pv = match vt {
         ValueType::Bool => PrimitiveValType::Bool,
         ValueType::U8 => PrimitiveValType::U8,

@@ -34,25 +34,25 @@
 /// lives. Referenced by `component::emit_dispatch_phase` when binding
 /// the env core instance as an arg to the dispatch module, and by
 /// every `imports.import("env", ...)` call in `dispatch.rs`.
-pub(super) const ENV_INSTANCE: &str = "env";
+pub(crate) const ENV_INSTANCE: &str = "env";
 
-pub(super) const ENV_MEMORY: &str = "mem";
-pub(super) const ENV_REALLOC: &str = "realloc";
+pub(crate) const ENV_MEMORY: &str = "mem";
+pub(crate) const ENV_REALLOC: &str = "realloc";
 
-pub(super) const ENV_WAITABLE_NEW: &str = "waitable_new";
-pub(super) const ENV_WAITABLE_JOIN: &str = "waitable_join";
-pub(super) const ENV_WAITABLE_WAIT: &str = "waitable_wait";
-pub(super) const ENV_WAITABLE_DROP: &str = "waitable_drop";
-pub(super) const ENV_SUBTASK_DROP: &str = "subtask_drop";
+pub(crate) const ENV_WAITABLE_NEW: &str = "waitable_new";
+pub(crate) const ENV_WAITABLE_JOIN: &str = "waitable_join";
+pub(crate) const ENV_WAITABLE_WAIT: &str = "waitable_wait";
+pub(crate) const ENV_WAITABLE_DROP: &str = "waitable_drop";
+pub(crate) const ENV_SUBTASK_DROP: &str = "subtask_drop";
 
 /// Per-function handler import/export name. `i` is the index of the
 /// function in `funcs` (parallel to [`super::func::AdapterFunc`]).
-pub(super) fn env_handler_fn(i: usize) -> String {
+pub(crate) fn env_handler_fn(i: usize) -> String {
     format!("handler_f{i}")
 }
 
 /// Per-function `task.return` import/export name. `i` matches
 /// [`env_handler_fn`].
-pub(super) fn env_task_return_fn(i: usize) -> String {
+pub(crate) fn env_task_return_fn(i: usize) -> String {
     format!("task_return_f{i}")
 }

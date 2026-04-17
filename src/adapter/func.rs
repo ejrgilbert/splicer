@@ -14,12 +14,12 @@
 use cviz::model::{FuncSignature, InterfaceType, ValueTypeId};
 use wasm_encoder::ValType;
 
-use super::mem_layout::MemoryLayoutBuilder;
-use super::wit_bridge::WitBridge;
+use super::abi::WitBridge;
+use super::build::MemoryLayoutBuilder;
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
-pub(super) struct AdapterFunc {
+pub(crate) struct AdapterFunc {
     /// The function's name in the interface.
     pub name: String,
     /// Whether this function is `async` in the component model.
@@ -131,7 +131,7 @@ impl AdapterFunc {
 /// - A function has more than one result
 /// - A sync function has a multi-value result (would need retptr
 ///   handling, not yet implemented)
-pub(super) fn extract_adapter_funcs(
+pub(crate) fn extract_adapter_funcs(
     iface_ty: &InterfaceType,
     bridge: &WitBridge,
 ) -> anyhow::Result<(Vec<AdapterFunc>, MemoryLayoutBuilder)> {

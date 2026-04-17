@@ -16,13 +16,13 @@ use wit_parser::{Resolve, Type};
 
 /// Canonical-ABI parameter flat-width cap — 16 core-wasm values before
 /// the ABI falls back to indirect-through-pointer lowering.
-pub(super) const MAX_FLAT_PARAMS: usize = 16;
+pub(crate) const MAX_FLAT_PARAMS: usize = 16;
 
 /// Canonical-ABI bitcast selector: the wasm conversion needed to move
 /// a value of flat type `from` into flat type `to`.
 ///
 /// Verbatim from `wit-bindgen-core/src/abi.rs:2562`.
-pub(super) fn cast(from: WasmType, to: WasmType) -> Bitcast {
+pub(crate) fn cast(from: WasmType, to: WasmType) -> Bitcast {
     use WasmType::*;
 
     match (from, to) {
@@ -83,7 +83,7 @@ pub(super) fn cast(from: WasmType, to: WasmType) -> Bitcast {
 ///
 /// Verbatim from `wit-bindgen-core/src/abi.rs:2622`, with the private
 /// `MAX_FLAT_PARAMS` constant replaced by the local copy above.
-pub(super) fn flat_types(
+pub(crate) fn flat_types(
     resolve: &Resolve,
     ty: &Type,
     max_params: Option<usize>,

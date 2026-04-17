@@ -61,7 +61,7 @@ const BLOCK_RESULT_SHAPE: &[ValType] = &[ValType::I32];
 
 /// Byte-offset bookkeeper for the dispatch module's linear memory.
 /// See the module docs for the overall layout and call-ordering rules.
-pub(super) struct MemoryLayoutBuilder {
+pub(crate) struct MemoryLayoutBuilder {
     /// Running cursor inside `[0 .. total_name_bytes)`. Bumped by
     /// [`alloc_name`](Self::alloc_name).
     name_cursor: u32,

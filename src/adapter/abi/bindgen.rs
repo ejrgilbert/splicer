@@ -60,12 +60,12 @@ use wasm_encoder::{BlockType, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::{Bindgen, Bitcast, Instruction as AbiInst, WasmType};
 use wit_parser::{Alignment, ArchitectureSize, Resolve, SizeAlign, Type};
 
-use super::bindgen_compat::{cast, flat_types};
-use super::indices::FunctionIndices;
+use super::compat::{cast, flat_types};
+use crate::adapter::indices::FunctionIndices;
 
 /// Bindgen that accumulates `wasm_encoder::Instruction`s into buffers,
 /// ready to be flushed into a `Function` by [`WasmEncoderBindgen::drain_into`].
-pub(super) struct WasmEncoderBindgen<'a> {
+pub(crate) struct WasmEncoderBindgen<'a> {
     /// Top-level instruction buffer — the final output that goes into
     /// the target Function. Emits land here when no block is active.
     main: Vec<Instruction<'static>>,
@@ -746,7 +746,7 @@ fn produce_n(results: &mut Vec<()>, n: usize) {
 impl WasmEncoderBindgen<'_> {
     /// Test-only: inspect the accumulated main-buffer instructions
     /// without draining them into a Function.
-    pub(super) fn instructions(&self) -> &[Instruction<'static>] {
+    pub(crate) fn instructions(&self) -> &[Instruction<'static>] {
         &self.main
     }
 }
