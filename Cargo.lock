@@ -3173,6 +3173,7 @@ dependencies = [
  "wasmparser 0.245.1",
  "wat",
  "wirm",
+ "wit-parser",
 ]
 
 [[package]]

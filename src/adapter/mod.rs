@@ -33,9 +33,11 @@ mod names;
 #[cfg(test)]
 mod tests;
 mod ty;
+mod wit_bridge;
 use component::build_adapter_bytes;
 use filter::{extract_filtered_sections, find_handler_deps};
 use func::extract_adapter_funcs;
+use wit_bridge::WitBridge;
 
 /// Generate a tier-1 adapter component that wraps `middleware_name` and adapts it to
 /// export `target_interface`.
@@ -70,7 +72,8 @@ pub fn generate_tier1_adapter(
         )
     })?;
 
-    let (funcs, layout) = extract_adapter_funcs(iface_ty, arena)?;
+    let bridge = WitBridge::from_cviz(arena);
+    let (funcs, layout) = extract_adapter_funcs(iface_ty, &bridge)?;
 
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));

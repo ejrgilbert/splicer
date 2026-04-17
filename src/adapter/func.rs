@@ -11,11 +11,11 @@
 //! [`extract_adapter_funcs`] turns a cviz `InterfaceType::Instance`
 //! into a `Vec<AdapterFunc>` ready to feed to the builders.
 
-use cviz::model::{FuncSignature, InterfaceType, TypeArena, ValueTypeId};
+use cviz::model::{FuncSignature, InterfaceType, ValueTypeId};
 use wasm_encoder::ValType;
 
 use super::mem_layout::MemoryLayoutBuilder;
-use super::ty::{canonical_size_and_align, flat_types_for, type_has_lists, type_has_strings};
+use super::wit_bridge::WitBridge;
 
 /// A function in the target interface, fully resolved to both
 /// component-level and core-Wasm types for adapter generation.
@@ -133,7 +133,7 @@ impl AdapterFunc {
 ///   handling, not yet implemented)
 pub(super) fn extract_adapter_funcs(
     iface_ty: &InterfaceType,
-    arena: &TypeArena,
+    bridge: &WitBridge,
 ) -> anyhow::Result<(Vec<AdapterFunc>, MemoryLayoutBuilder)> {
     let inst = match iface_ty {
         InterfaceType::Instance(i) => i,
@@ -149,7 +149,7 @@ pub(super) fn extract_adapter_funcs(
     let mut funcs = Vec::with_capacity(inst.functions.len());
 
     for (name, sig) in &inst.functions {
-        let extracted = extract_func_sig(name, sig, arena)?;
+        let extracted = extract_func_sig(name, sig, bridge)?;
         let name_len = name.len() as u32;
         let name_offset = layout.alloc_name(name_len);
 
@@ -162,8 +162,8 @@ pub(super) fn extract_adapter_funcs(
         let param_ids = extracted.param_type_ids.iter().copied();
         let result_id = extracted.result_type_id.into_iter();
         let all_ids: Vec<ValueTypeId> = param_ids.chain(result_id).collect();
-        let has_strings = all_ids.iter().any(|&id| type_has_strings(id, arena));
-        let has_lists = all_ids.iter().any(|&id| type_has_lists(id, arena));
+        let has_strings = all_ids.iter().any(|&id| bridge.has_strings(id));
+        let has_lists = all_ids.iter().any(|&id| bridge.has_lists(id));
 
         funcs.push(AdapterFunc {
             name: name.clone(),
@@ -221,7 +221,7 @@ struct ExtractedSig {
 fn extract_func_sig(
     name: &str,
     sig: &FuncSignature,
-    arena: &TypeArena,
+    bridge: &WitBridge,
 ) -> anyhow::Result<ExtractedSig> {
     const MAX_FLAT: usize = 16;
 
@@ -236,7 +236,7 @@ fn extract_func_sig(
         };
         param_names.push(pname);
         param_type_ids.push(id);
-        core_params.extend(flat_types_for(id, arena));
+        core_params.extend(bridge.flat_types(id));
     }
     if core_params.len() > MAX_FLAT {
         anyhow::bail!(
@@ -262,7 +262,7 @@ fn extract_func_sig(
             (None, false, vec![], 0)
         } else {
             let rid = sig.results[0];
-            let flat = flat_types_for(rid, arena);
+            let flat = bridge.flat_types(rid);
             if flat.len() > MAX_FLAT {
                 anyhow::bail!(
                     "Function '{name}' has a result that flattens to {} core \
@@ -278,7 +278,7 @@ fn extract_func_sig(
             // and inter-field natural alignment (`record { i32, i64 }`
             // is 16 bytes, not 12). The dispatch module's loads use
             // this exact size when sizing the result buffer.
-            let (total_bytes, _) = canonical_size_and_align(rid, arena);
+            let total_bytes = bridge.size_bytes(rid);
             // Store full flat types. For async functions `task.return`
             // uses these as params (up to MAX_FLAT_PARAMS=16). For sync
             // functions with `is_complex`, the canonical ABI uses a
