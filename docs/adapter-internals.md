@@ -386,5 +386,5 @@ error-code variant.
   — precise reference semantics.
 - `docs/TODO/investigate-canon-abi.md` — the decision / migration
   doc that drove the Bindgen adoption.
-- `docs/adapter-comp-planning.md` — broader planning notes on the
+- `docs/TODO/adapter-comp-planning.md` — broader planning notes on the
   tier-1 adapter.

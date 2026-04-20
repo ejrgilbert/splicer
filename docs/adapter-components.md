@@ -75,7 +75,7 @@ yet — if you have a concrete use case (large fan-out interface,
 per-function policy, measurable overhead on ignored calls), **please
 [open an issue](https://github.com/ejrgilbert/splicer/issues)** with
 details. A config-level `funcs: [...]` filter is on the roadmap (see
-[`docs/adapter-comp-planning.md`](./adapter-comp-planning.md)) and
+[`docs/TODO/adapter-comp-planning.md`](./TODO/adapter-comp-planning.md)) and
 real use cases drive the priority.
 
 **What the generated adapter does:**
@@ -239,4 +239,4 @@ heterogeneous-variant widening, and what splicer still owns vs. inherits from
 upstream — see [`adapter-internals.md`](./adapter-internals.md).
 
 For broader planning notes on the tier-1 work, see
-[`docs/adapter-comp-planning.md`](./adapter-comp-planning.md).
+[`docs/TODO/adapter-comp-planning.md`](./TODO/adapter-comp-planning.md).

@@ -17,7 +17,7 @@ are where the next class of silent bugs is hiding.
 
 A procedurally-generated fuzz harness that mechanizes this matrix
 is tracked under "Built-in middleware keyword" / fuzzing in
-[`docs/adapter-comp-planning.md`](../adapter-comp-planning.md).
+[`docs/TODO/adapter-comp-planning.md`](./adapter-comp-planning.md).
 
 ## Type-shape matrix (per-function result type)
 
