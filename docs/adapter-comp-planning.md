@@ -1,113 +1,43 @@
-# Generating a Proxy Component #
+# Adapter generator — planning and future work
 
-Right now, if someone wants to splice middleware on some function signature, the middleware has to import and export
-that exact function signature. This means there needs to be one middleware provided per unique function signature it
-runs on! This becomes unmanageable for any real-world application where middleware must be placed on every function
-call (e.g. a pluggable OpenTelemetry middleware).
+Forward-looking notes for the adapter-component generator. The
+currently-shipped tier-1 path is documented end-to-end in
+[`adapter-components.md`](./adapter-components.md) (user-facing) and
+[`adapter-internals.md`](./adapter-internals.md) (architecture). This
+file focuses on what hasn't been built yet.
 
-To help alleviate this developer burden, the next step in this project is to generate "proxy components" from middleware
-that needs to be adapted to fit on some function signature. The following constraints must hold true for a middleware
-to be eligible for generating a proxy component wrapper:
-1. The component can only import _from the host_
-2. TODO: Fill in constraints as more are discovered
+## Middleware tier roadmap
 
-Some resources that could be helpful here:
-- https://github.com/chenyan2002/proxy-component/tree/main/src
-- https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-dylib
-    - [Example that generates the lift](https://github.com/bytecodealliance/wasm-tools/blob/main/crates/wit-dylib/src/bindgen.rs#L768)
+Tier 1 is shipped. Tiers 2 and 3 are planned. Middleware capability
+strictly accumulates: a tier-N middleware can do everything an earlier
+tier can, plus one new thing.
 
-# Use cases
-I see the following requirements for middleware capabilities where a middleware can do none or all of these things.
+| Tier | New capability                       | Status      |
+|------|--------------------------------------|-------------|
+| 1    | see function names                   | **shipped** |
+| 2    | see arg / result values (serialized) | planned     |
+| 3    | modify arg / result values           | planned     |
 
-TODO: It's possible there are more cases, if so make sure to note them here!
+### Tier 2: value-aware middleware (planned)
 
-Timing
-1. Runs _before_
-2. Runs _after_
-3. Runs _before_ AND _after_
+The middleware gets access to arguments and return values, serialized
+as strings (e.g. WAVE-encoded). The adapter handles canonical-ABI
+lifting/lowering; the middleware works entirely with strings and
+never sees the typed values directly.
 
-Block
-1. Can _conditionally_ block the downstream call from being invoked
+Proposed WIT interface:
 
-Data flow (requires type-aware value access -- see Middleware Tiers below)
-1. **Inspect** the data being _passed to_ the downstream function
-2. **Modify** the data being _passed to_ the downstream function (must run _before_ the invocation)
-3. **Inspect** the data being _returned from_ the downstream function (must run _after_ the invocation)
-4. **Modify** the data being _returned from_ the downstream function (must run _after_ the invocation)
-
-# Approaches
-I have thought of the following approaches, but am open to more ideas (especially if they are cleaner to implement):
-1. Rust macros (that the middleware writer invokes)
-2. Rust meta-programming (similar to what is done here: `/Users/evgilber/git/research/proxy-component`)
-3. Wasm component creation (like from the bottom up using `wirm` library)
-
-The best approach depends on the middleware tier (see Middleware Tiers below). For Tier 1 and Tier 2
-adapter generation, use `wasm_encoder` to build the component binary directly — the adapter is
-pure dispatch glue with no value construction from scratch, and `wasm_encoder`'s
-`ReencodeComponent` trait handles the fiddly index-translation work. For one-per-sig middleware,
-use the [`proxy-component`] approach (`syn`/`quote` Rust codegen)! Attempting to do type-aware value
-generation in raw Wasm bytecode would be orders of magnitude more complex with no benefit.
-
-# Middleware Tiers
-
-Not all middleware needs the same level of access to function arguments and return values. Two tiers are
-proposed, each with its own middleware WIT interface. The generated proxy component knows which tier to
-use based on which interface the middleware exports.
-
-## Tier 1: Type-Erased Middleware
-
-The middleware only needs timing and/or blocking behavior. It never touches argument or return values.
-The proxy handles all type plumbing; the middleware just receives the function name.
-
-WIT interface:
-```wit
-interface type-erased-middleware {
-    before-call: func(name: string);
-    should-block-call: func(name: string) -> bool;  // true = block downstream
-    after-call: func(name: string);
-}
-```
-
-Generated proxy shape:
-```
-export handle(req: request) -> response:
-    middleware.before-call("handle")
-    proceed = middleware.should-block-call("handle")
-    if proceed:
-        result = downstream.handle(req)
-        middleware.after-call("handle")
-        return result
-    else:
-        // block case constraints apply (see above)
-```
-
-The block case has one wrinkle: if `should-block-call` returns `false`, you need to return something from the exported function
-without calling downstream. This is fine for:
-- `void functions`: just return
-- `result<T, E>` return types: return an Err (very common in WASI, e.g. wasi:http/handler)
-
-But for functions returning plain values (not wrapped in result), there's no sensible "blocked" value to synthesize.
-Worth documenting as a constraint on which interfaces support the block use case.
-
-**Suitable for**: OpenTelemetry tracing, logging, rate limiting, auth (allow/deny only).
-
-## Tier 2: Value-Aware Middleware
-
-The middleware needs access to serialized argument and return values (e.g. for caching or inspection).
-Arguments and results are passed as WAVE-encoded strings. The proxy handles canonical ABI
-lifting/lowering; the middleware works entirely with strings.
-
-WIT interface:
 ```wit
 interface value-aware-middleware {
-    // return some(wave-encoded-result) to short-circuit and skip downstream entirely
-    before-call: async func(name: string, args: string) -> option<string>
+    // return some(wave-encoded-result) to short-circuit and skip downstream
+    before-call: async func(name: string, args: string) -> option<string>;
     // return some(wave-encoded-result) to replace the downstream result
-    after-call: async func(name: string, result: string) -> option<string>
+    after-call: async func(name: string, result: string) -> option<string>;
 }
 ```
 
 Generated proxy shape:
+
 ```
 export handle(req: request) -> response:
     wave_args = wave_encode(req)
@@ -120,77 +50,109 @@ export handle(req: request) -> response:
     return wave_decode(override) if override is some else result
 ```
 
-**Suitable for**: memoizers, circuit breakers, result caching, mutation-based fuzzers.
+**Suitable for**: memoizers, result caching, circuit breakers with
+response replay, content-based routing, mutation-based fuzzers.
 
-## The "One-Per-Signature" Case
+### Tier 3: read-write middleware (planned)
 
-Some middleware genuinely cannot be expressed generically over serialized values because they must
-**fabricate structurally valid new values from scratch**. This requires knowing the full type structure
+Tier 2 but with modification authority over both inbound args and
+outbound results. Same serialized-string contract; the difference is
+that splicer decodes the middleware's returned string back into the
+canonical-ABI typed form before the call continues.
+
+**Suitable for**: request enrichment (injecting headers / context),
+response transformation, content filtering, A/B testing (routing
+request variants to the same downstream), mutation-testing
+frameworks.
+
+## The "one-per-signature" case
+
+Some middleware genuinely can't be expressed generically over
+serialized values because it must **fabricate structurally valid new
+values from scratch**. This requires knowing the full type structure
 at code-generation time, not just at runtime.
 
 Known one-per-sig cases:
-- **Type-generating fuzzer**: must construct valid values of every parameter type from raw random
-  bytes. Mutation-based fuzzers (start from a real value, perturb the WAVE string) fit in Tier 2.
-- **Mock/stub generator**: must return a valid fake value of the return type. (Replay from a
-  recorded trace is Tier 2 since the WAVE bytes already exist; mocks that synthesize responses
-  from scratch are one-per-sig.)
-- **Property-based test harness**: must generate and shrink typed counterexamples; shrinking
-  requires constructing smaller valid values, not just mutating existing ones.
-- **Argument defaulting/enrichment**: filling in missing or zero fields requires knowing which
-  fields are optional vs. required and what sensible defaults look like per type.
 
-### Why Rust codegen ([`proxy-component`] approach) is the right tool here
+- **Type-generating fuzzer** — must construct valid values of every
+  parameter type from raw random bytes. Mutation-based fuzzers (start
+  from a real value, perturb the WAVE string) fit in tier 2.
+- **Mock / stub generator** — must return a valid fake of the return
+  type. Replay from a recorded trace fits tier 2 (the WAVE bytes
+  already exist); mocks that synthesize responses from scratch are
+  one-per-sig.
+- **Property-based test harness** — must generate and shrink typed
+  counterexamples; shrinking requires constructing smaller valid
+  values, not just mutating existing ones.
+- **Argument defaulting / enrichment** — filling in missing or zero
+  fields requires knowing which fields are optional vs required and
+  what sensible defaults look like per type.
 
-The tempting alternative is to generate the Wasm component directly using `wirm`. However, that
-would require implementing, in raw Wasm bytecode:
-- Canonical ABI lowering/lifting per WIT type
-- Recursive valid-value construction per WIT type (records, variants, lists, options, resources...)
-- Random value generation over that construction
+### Implementation approach: Rust codegen, not raw wasm
 
-This is an enormous amount of work and very hard to get right.
+The tempting alternative is to generate the wasm component directly
+using `wirm` or `wasm-encoder`. For tiers 1 and 2 that's the right
+tool — the adapter is pure dispatch glue with no value construction
+from scratch. For the one-per-sig cases above it would be an enormous
+amount of work: canonical-ABI lowering/lifting per WIT type, recursive
+valid-value construction per WIT type (records, variants, lists,
+options, resources), and random value generation over all of that.
 
-The [`proxy-component`] project demonstrates a much leaner path: generate a small Rust file using `syn`/`quote`,
-then compile it with `cargo`. This works because `wit-bindgen` already derives `Arbitrary` on every generated type,
-so the entire type-correct random value construction reduces to:
+The [`proxy-component`](https://github.com/chenyan2002/proxy-component)
+project demonstrates a much leaner path: generate a small Rust file
+using `syn` / `quote`, then compile it with `cargo`. This works
+because `wit-bindgen` already derives `Arbitrary` on every generated
+type, so the entire type-correct random value construction reduces
+to:
 
 ```rust
 let mut u = Unstructured::new(&random_bytes);
 let value: SomeWitType = u.arbitrary().unwrap();
 ```
 
-The actual codegen in [`proxy-component`] (`generate_fuzz_func`) is only ~120 lines of `quote!` macros.
-The hard type-specific work is fully delegated to `wit-bindgen` + the `arbitrary` crate, neither
-of which needs to be re-implemented.
+The actual codegen in `proxy-component` (`generate_fuzz_func`) is
+only ~120 lines of `quote!` macros. The hard type-specific work is
+fully delegated to `wit-bindgen` + `arbitrary`, neither of which
+needs to be re-implemented.
 
-### The Implementation Split
+For natively-provided one-per-sig middleware (fuzzer, mock, property
+harness), splicer would generate the complete component. There is no
+separate "strategy" component. The algorithm lives in splicer's Rust
+code generator, and `wirm` is not involved. The cost is an external
+`cargo build` step, but since these are code-generation artifacts
+(not runtime operations), that's acceptable.
 
-| Middleware tier      | Generation approach                                          | Rationale                                                                    |
-|----------------------|--------------------------------------------------------------|------------------------------------------------------------------------------|
-| Tier 1 (type-erased) | `wasm_encoder`                                               | Pure dispatch, no value construction; direct binary construction is simplest |
-| Tier 2 (value-aware) | `wasm_encoder`                                               | Dispatch + WAVE encode/decode; still no value construction from scratch      |
-| One-per-sig          | Rust codegen via `syn`/`quote` + `wit-bindgen` + `arbitrary` | `arbitrary` derive handles all type complexity for free; codegen stays small |
+### Generation strategy summary
 
-For natively-provided one-per-sig middleware (fuzzer, mock, property harness), splicer generates
-the complete component. There is no separate "strategy" component. The algorithm lives in splicer's
-Rust code generator, and `wirm` is not involved. The cost is an external `cargo build` step, but
-since these are code-generation artifacts (not runtime operations), that is acceptable.
+| Middleware kind              | Generator approach                                           | Rationale                                                                        |
+|------------------------------|--------------------------------------------------------------|----------------------------------------------------------------------------------|
+| Tier 1 (type-erased)         | `wasm-encoder` + `wit-bindgen-core::abi` (shipped)           | Pure dispatch, no value construction; direct binary construction is simplest     |
+| Tier 2 (value-aware)         | `wasm-encoder` + WAVE encode/decode glue                     | Dispatch + serialization; still no value construction from scratch               |
+| Tier 3 (read-write)          | `wasm-encoder` + WAVE encode/decode glue + response injection | Same machinery as tier 2 plus a typed deserialization path                      |
+| One-per-sig (fuzzer / mock)  | Rust codegen via `syn` / `quote` + `wit-bindgen` + `arbitrary` | `arbitrary` derive handles all type complexity; codegen stays small at cost of a `cargo build` step |
 
-[`proxy-component`]: https://github.com/chenyan2002/proxy-component/tree/main
+Useful references for when tier-2/3 work starts:
 
-# Future Work
+- [`wit-dylib`](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-dylib)
+  — dynamic-linking bindings generator in `wasm-tools`. Has
+  canonical-ABI lift/lower codegen patterns worth studying.
+- [Example in `wit-dylib/src/bindgen.rs`](https://github.com/bytecodealliance/wasm-tools/blob/main/crates/wit-dylib/src/bindgen.rs#L768)
+  — how it generates lift code.
 
-## Per-function interposition filter (config-level allow-list)
+## Per-function interposition filter
 
-Today a tier-1 adapter wraps **every** exported function of the target
-interface with the same middleware. The middleware can filter at
-runtime via the `name` param, but the hook round-trip still fires on
-every call — including the ones the middleware immediately no-ops.
-That's fine for single-function interfaces (`wasi:http/handler`) but
-gets expensive and awkward as interfaces grow.
+Today a tier-1 adapter wraps **every** exported function of the
+target interface with the same middleware. The middleware can filter
+at runtime via the `name` param, but the hook round-trip still fires
+on every call — including the ones the middleware immediately no-ops.
+That's fine for single-function interfaces like `wasi:http/handler`
+but gets expensive as interfaces grow.
 
-Proposal: an optional `funcs: [...]` include-list per injection in the
-splice config. When present, the adapter emits a dispatch wrapper only
-for the listed functions; the rest become direct
+### Proposal
+
+Optional `funcs: [...]` include-list per injection in the splice
+config. When present, the adapter emits a dispatch wrapper only for
+the listed functions; the rest become direct
 `alias export <handler_inst> "<func_name>"` — zero runtime cost for
 excluded funcs, zero coupling between the middleware and specific
 target names.
@@ -205,96 +167,82 @@ rules:
         funcs: [add, div]   # only wrap these; sub/mul pass through
 ```
 
-**Impact is localized:**
+### Implementation sketch
 
-- `SpliceRule`/`Injection` grows an `Option<Vec<String>>`.
+- `SpliceRule` / `Injection` grows an `Option<Vec<String>>`.
 - `extract_adapter_funcs` partitions the interface's functions into
-  `(wrapped, passthrough)` using the filter. The passthrough list just
-  needs the name + signature enough for `alias export`.
-- `build_adapter_bytes` emits dispatch wrappers for `wrapped` (same as
-  today) and direct aliases for `passthrough`; both groups end up
+  `(wrapped, passthrough)` using the filter. The passthrough list
+  just needs the name + signature enough for `alias export`.
+- `build_adapter_bytes` emits dispatch wrappers for `wrapped` (same
+  as today) and direct aliases for `passthrough`; both groups end up
   under the same target-interface export instance.
-- `validate_contract` gets a new check: names in `funcs` must exist in
-  the target interface, reported next to the existing "available
+- `validate_contract` grows a new check: names in `funcs` must exist
+  in the target interface, reported next to the existing "available
   interfaces" diagnostic.
 
-**Nothing changes** in the closure walker, the canonical-ABI
-machinery, or the memory module — this is purely a phase-1 dispatch
-decision.
+Nothing changes in the closure walker, the canonical-ABI machinery,
+or the memory module — this is purely a phase-1 dispatch decision.
 
-**Hold off until:** there's a concrete multi-function target where
-the runtime-hook-per-excluded-call overhead is a real pain, or a user
+### When to build it
+
+Hold off until there's a concrete multi-function target where the
+runtime-hook-per-excluded-call overhead is a real pain, or a user
 hits the "my middleware shouldn't need to know the function names of
 every target it attaches to" decoupling problem. Until then the
 include-list is a solution looking for a problem.
 
-**Open design questions for when we revisit:**
+Open design questions for when we revisit:
 
-- Exclude-list form (`except_funcs: [...]`) as a convenience for the
-  common case of "wrap everything except these"? Keep to a single
-  form for v1.
+- Exclude-list form (`except_funcs: [...]`) as a convenience for
+  "wrap everything except these"? Keep to a single form for v1.
 - Glob / regex patterns? Probably not — function names are
   well-defined at config time and a bounded list is unambiguous.
-- Interaction with tier-2 / tier-3 (where filtering also affects
-  whether we need to lift/lower payloads) — spec this then.
+- Interaction with tier 2 / tier 3, where filtering also affects
+  whether we need to lift/lower payloads — spec this when we're
+  closer to tier 2.
 
-## Remaining work
+## Canonical-ABI gaps
 
-### Canonical-ABI correctness
+Two known limitations that still surface as `anyhow::bail!` errors:
 
-- [ ] **Heterogeneous variant arms — full runtime dispatch.** For
-  discriminated types (`result` / `variant`) where arms have
-  different flat shapes (e.g. `variant { u8, u64 }` where one
-  position joins to `i64`), `walk_discriminated_payload` falls back
-  to the joined-flat layout. `emit_task_return_loads` emits a
-  runtime trap gate that allows only the first safe arm (disc = 0)
-  through; other arms hit `unreachable`. Full per-arm dispatch
-  (branch on disc, load each arm's canonical layout, widen to
-  joined) is needed for complete correctness. wasi:http/handler
-  works today because only the ok arm (disc = 0) is exercised in
-  tests.
+- **Flat params / results > 16 — pointer-form lowering.** The
+  canonical ABI collapses to `(i32)` pointer form when a function's
+  flat representation exceeds 16 values. `func.rs::extract_func_sig`
+  currently bails at this boundary with a clear error (instead of
+  silently declaring wrong core types). Implementing pointer-form
+  needs: `params_are_ptr` / `results_are_ptr` flags on
+  `AdapterFunc`, pointer-form type declarations in every dispatch
+  emitter, and a memory-layout buffer reservation for the spilled
+  args.
 
-- [ ] **Flat params / results > 16 — pointer-form lowering.** The
-  canonical ABI collapses to `(i32)` pointer form when flat
-  values exceed 16. `extract_func_sig` now bails with a clear
-  error at this boundary (instead of silently declaring wrong core
-  types). Implementing pointer-form requires: `params_are_ptr` /
-  `results_are_ptr` flags on `AdapterFunc`, pointer-form type
-  declarations in every dispatch emitter, and a memory-layout
-  buffer reservation for the spilled args.
-
-- [ ] **Anonymous compound types as top-level results.** When a
-  Record / Variant / Enum appears as a func result but ISN'T in
+- **Anonymous compound types as top-level results.** When a Record
+  / Variant / Enum appears as a func result but isn't in
   `iface.type_exports` (unusual in WIT-compiled interfaces, but
   legal at the component-model level), the adapter's export-instance
   construction can't re-export the compound — the binary fails
-  validation with "instance not valid to be used as export."
-  Fix: synthesize names + auto-export in `emit_export_phase`.
+  validation with "instance not valid to be used as export." Fix:
+  synthesize names + auto-export in `component.rs::emit_export_phase`.
   Low priority since real WIT always names its compounds.
 
-### Silent-fallback audit (filter / reencoder / wac)
+## Silent-fallback audit
 
-These don't affect correctness under today's test fixtures, but
-an upstream change (wasmparser / wirm adding a new enum variant)
-could silently drop tracked items. Fix each at its site:
+Several sites across `filter/`, `wac.rs`, and `build/dispatch.rs`
+handle "unknown" enum discriminants or missing map entries with an
+`unwrap_or(Other)` / `unwrap_or(None)` / `unwrap_or(ty)` fallback.
+These don't affect correctness under today's test fixtures, but an
+upstream change — `wasmparser` or `wirm` adding a new enum variant,
+a new `ComponentExternalKind`, an `AliasSpaceKind` expansion — could
+silently drop tracked items without any loud failure.
 
-- `filter/section_filter.rs:253` — `ItemKind → ItemSpace::Other`
-- `filter/section_filter.rs:340` — `Space → None` in `lookup_loc`
-- `filter/raw_sections_reencoder.rs:414` — export kind count bump
-- `filter/raw_sections_reencoder.rs:671, 675` —
-  `ComponentExternalKind` / `ComponentOuterAliasKind` →
-  `AliasSpaceKind::Other`
-- `filter/raw_sections_reencoder.rs:434, 444, 462, 470` —
-  `type_map.get(&ty).unwrap_or(ty)` index fallback
-- `wac.rs:192` — `InternedId → None` fallback
-- `dispatch.rs:464` — `core_results[0] → void_i32_ty` fallback
+Audit pass to file when we next touch these files:
 
-### Strategic
+- Grep `src/adapter/filter/` and `src/wac.rs` for
+  `unwrap_or(`/`unwrap_or_else(`/`=> Other`/`=> None` on enum
+  discriminant or index-translation sites.
+- For each, replace the fallback with an explicit `anyhow::bail!`
+  that names the unexpected variant, so a future upstream addition
+  fails loud at the filter/reencoder layer instead of producing a
+  structurally-invalid adapter.
 
-- [ ] **Investigate reusing an existing canonical-ABI
-  implementation.** Hand-rolling canonical-ABI emit is the single
-  biggest source of correctness bugs. See
-  `docs/TODO/investigate-canonical-abi-reuse.md` for the full
-  investigation plan covering `wit-bindgen-core`,
-  `wit-component`, `proxy-component`, `wasmtime-environ`, and
-  `wit-dylib`. Time-boxed at 2-4 hours.
+No correctness impact today; prioritize when a new `wasmparser` /
+`wirm` major version lands.
