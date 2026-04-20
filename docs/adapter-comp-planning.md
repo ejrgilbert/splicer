@@ -201,6 +201,92 @@ Open design questions for when we revisit:
   whether we need to lift/lower payloads — spec this when we're
   closer to tier 2.
 
+## Built-in middleware keyword
+
+Today, adding any middleware means the user writes a component
+(`wit-bindgen::generate!`, implement the tier-1 guest traits, compile
+to wasm, point the YAML at the file). That's a lot of ceremony for
+well-known cases like tracing, logging, OpenTelemetry spans, or
+fuzzing where the middleware's behavior is entirely standard.
+
+### Sketch
+
+A `builtin:` keyword in the YAML that names a splicer-provided
+middleware. No file path, no hand-authored component:
+
+```yaml
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - builtin: logging
+      - builtin: otel
+        config:
+          endpoint: http://collector:4317
+          service_name: my-svc
+      - name: my-custom-mdl        # hand-authored still works alongside
+        path: ./mine.wasm
+```
+
+Splicer resolves `builtin: X` to either a pre-built component it
+ships with, or a generated one — transparently to the user. The
+interesting entries cover different mechanisms:
+
+- **`logging` / `tracing`** — pure tier 1 (name-only). Ship as
+  a bundled `.wasm` blob in the splicer binary.
+- **`otel`** — tier 2 (value-aware spans with request fields).
+  Gates on tier-2 work being shipped.
+- **`fuzz` / `mock`** — one-per-sig. Generated via the Rust-codegen
+  path described in the "one-per-signature" section above.
+
+### Open design questions for when we revisit
+
+- **Where do built-in components live?** Embedded in the splicer
+  binary (simple, but grows binary size and forces lockstep versioning)
+  vs. a separate registry of published components fetched on first
+  use (leaner binary, but adds a network + supply-chain surface) vs.
+  a sibling crate that builds them locally (clean from-source, awkward
+  for `cargo install` distribution).
+- **Typed vs free-form config.** Typed per-builtin gives us
+  compile-time-like validation of `config:` keys (misspell `endpoint`
+  as `endoint` and get a parse error, not a runtime surprise) but
+  requires a Serde schema per builtin. Free-form map is simpler to
+  implement but offers no validation. For the UX goal here, typed
+  seems to win.
+- **How does config reach the component at runtime?** `wasi:config/store`
+  imports, a bundled data segment, env vars, or custom component-level
+  imports splicer wires up at compose time. Each option has different
+  implications for what the built-in component itself looks like and
+  whether the same mechanism generalizes across all builtins.
+- **Do users see the tier?** `builtin: logging` vs. `builtin: { kind:
+  tier1, name: logging }`. The point of built-ins is UX, so leaning
+  transparent — the tier is a static property of the registry entry.
+- **Namespacing / extensibility.** `builtin: otel` (bare) vs.
+  `builtin: splicer:otel` (namespaced). Matters if we ever want
+  third-party built-in registries. For v1: bare names, splicer owns
+  the namespace, design extensibility later.
+- **Composition / ordering.** Already free via the existing
+  `inject: [...]` list — each entry picks `builtin:` or `name: +
+  path:` independently, ordering drives the call stack the same way
+  it does today.
+- **MVP scope.** Probably pick two that exercise different paths —
+  one bundled (`logging` proves the embedded-blob path) and one
+  generated (`fuzz` proves the Rust-codegen path) — so both arms of
+  the design land at once. `otel` is the obvious third but gates on
+  tier 2.
+
+### Interaction with other planning items
+
+- **Tier 2 / tier 3 roadmap** — built-ins that need value access
+  (otel, content-aware logging) can't ship until those tiers do.
+- **One-per-signature case** — `fuzz` / `mock` are the direct
+  motivating examples for that section's Rust-codegen path. If we
+  build built-ins before tier 2, the first generated built-in
+  exercises exactly that pipeline.
+- **Per-function interposition filter** — `funcs: [...]` should
+  compose with `builtin:` cleanly (e.g., run `otel` only on `handle`
+  but not `ping`). No design conflict, just a test-matrix entry.
+
 ## Canonical-ABI gaps
 
 Two known limitations that still surface as `anyhow::bail!` errors:

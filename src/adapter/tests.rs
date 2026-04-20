@@ -902,6 +902,191 @@ fn test_adapter_enum_async_result() {
     validate_component(&bytes);
 }
 
+// ── Tier 1: shape-matrix coverage ────────────────────────────────────
+//
+// Targeted tests for shapes called out in
+// docs/TODO/test-with-real-compositions.md that aren't exercised by
+// the wasi:http / primitives / subword coverage above. Each uses an
+// async result so the value flows through
+// `build_task_return_loads` → `lift_from_memory` — the code path most
+// exposed to canonical-ABI subtleties.
+
+/// Record result with every alignment boundary represented: 1-byte,
+/// 4-byte, 2-byte, 8-byte fields in an order that forces each field
+/// to pad up to its natural alignment. Pins the inter-field padding
+/// and subword-offset math.
+#[test]
+fn test_adapter_mixed_alignment_record_async_result() {
+    let mut arena = TypeArena::default();
+    let u8_id = arena.intern_val(ValueType::U8);
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u16_id = arena.intern_val(ValueType::U16);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let record = arena.intern_val(ValueType::Record(vec![
+        ("a".into(), u8_id),
+        ("b".into(), u32_id),
+        ("c".into(), u16_id),
+        ("d".into(), u64_id),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![record]))]),
+        type_exports: BTreeMap::from([("mixed".to_string(), record)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/mixed@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Variant with numerically heterogeneous arms: `u8` / `u64` / `f64`
+/// flatten to `[i32]` / `[i64]` / `[f64]`, joining to `[i64]` at the
+/// payload position. Exercises `cast(I32, I64)` and `cast(F64, I64)`
+/// in the same variant dispatch — cells of the bitcast table that
+/// wasi:http's error variant doesn't happen to hit.
+#[test]
+fn test_adapter_heterogeneous_numeric_variant_async_result() {
+    let mut arena = TypeArena::default();
+    let u8_id = arena.intern_val(ValueType::U8);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let f64_id = arena.intern_val(ValueType::F64);
+    let v = arena.intern_val(ValueType::Variant(vec![
+        ("x".into(), Some(u8_id)),
+        ("y".into(), Some(u64_id)),
+        ("z".into(), Some(f64_id)),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![v]))]),
+        type_exports: BTreeMap::from([("mixed-v".to_string(), v)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/mixed-v@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// A function with 17 flat params exceeds the canonical-ABI cap
+/// (`MAX_FLAT_PARAMS = 16`). Splicer currently bails at generation
+/// time with a clear error rather than emit invalid core-wasm; this
+/// test pins that contract so a future change that silently routes
+/// around the check (instead of implementing the retptr form) fails
+/// loud.
+#[test]
+fn test_adapter_too_many_flat_params_fails_cleanly() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let param_names: Vec<String> = (0..17).map(|i| format!("p{i}")).collect();
+    let iface = make_iface(vec![(
+        "many",
+        FuncSignature {
+            is_async: false,
+            param_names,
+            params: vec![u32_id; 17],
+            results: vec![],
+        },
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let split = synth_split("test:pkg/many@1.0.0", &iface, &arena, SplitKind::Consumer);
+    let err = generate_tier1_adapter(
+        "test-mdl",
+        "test:pkg/many@1.0.0",
+        &[],
+        Some(&iface),
+        tmp.path().to_str().unwrap(),
+        split.path().to_str().unwrap(),
+        &arena,
+    )
+    .expect_err("generation should fail when a function's flat arity exceeds MAX_FLAT_PARAMS");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("flat") || msg.contains("16"),
+        "error should mention the flat-param limit, got: {msg}"
+    );
+}
+
+/// Build, generate, and validate an async-result adapter whose result
+/// is a `flags` with `n` labels. Shared helper for the width-boundary
+/// tests below.
+fn gen_flags_adapter(n: usize) {
+    let mut arena = TypeArena::default();
+    let names: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
+    let flags = arena.intern_val(ValueType::Flags(names));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![flags]))]),
+        type_exports: BTreeMap::from([("fs".to_string(), flags)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/fs@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+// Flags storage widths per the canonical ABI:
+//   ≤ 8  labels → 1 byte    (i32.load8_u)
+//   ≤ 16 labels → 2 bytes   (i32.load16_u)
+//   ≤ 32 labels → 4 bytes   (single i32.load)
+// Each width is a different load shape in the Bindgen emit.
+//
+// The Component Model binary format caps `flags` at 32 members; a
+// 33-label flags type fails component-level validation at the type
+// section ("cannot have more than 32 flags"). wit-parser and the
+// canonical-ABI spec describe a multi-word encoding for 33+ flags
+// (FlagsRepr::U32(n)), but that encoding isn't reachable through the
+// component type system, so it can't be exercised here and isn't
+// tested below.
+
+#[test]
+fn test_adapter_flags_1_label_async_result() {
+    gen_flags_adapter(1);
+}
+#[test]
+fn test_adapter_flags_8_labels_async_result() {
+    gen_flags_adapter(8);
+}
+#[test]
+fn test_adapter_flags_16_labels_async_result() {
+    gen_flags_adapter(16);
+}
+#[test]
+fn test_adapter_flags_32_labels_async_result() {
+    gen_flags_adapter(32);
+}
+
+/// Variant with 300 cases — past the 256-case boundary, so the
+/// discriminant widens from `u8` to `u16` per the canonical ABI.
+/// The dispatch emits `i32.load16_u` for the disc instead of the
+/// `i32.load8_u` used by smaller variants. Pins that path.
+#[test]
+fn test_adapter_variant_over_256_cases_async_result() {
+    let mut arena = TypeArena::default();
+    let cases: Vec<(String, Option<ValueTypeId>)> =
+        (0..300).map(|i| (format!("c{i:03}"), None)).collect();
+    let v = arena.intern_val(ValueType::Variant(cases));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![v]))]),
+        type_exports: BTreeMap::from([("big-v".to_string(), v)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/big-v@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
 // ── Tier 1: multiple functions ───────────────────────────────────────
 
 #[test]
