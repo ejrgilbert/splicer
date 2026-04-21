@@ -1,4 +1,4 @@
-//! Phase 2 commit 3: parameterized runtime pipeline.
+//! Parameterized end-to-end runtime pipeline for the splicer.
 //!
 //! Scaffolds three Rust crates (provider, consumer, middleware) plus
 //! their WIT into a tempdir, runs the full splicer pipeline
@@ -35,10 +35,11 @@ use std::process::Command;
 // output (used only by the pre-splice sanity check).
 //
 // Compounds recurse: Option/List/Tuple wrap another Shape and Record
-// carries a named field list. This is the hardcoded pass — a
-// follow-up commit swaps `shape_catalog()` for an
-// `arbitrary::Arbitrary` impl so the same enum can be fuzzer-driven.
+// carries a named field list. `shape_catalog()` is the hardcoded
+// deterministic coverage; `gen_shape()` drives the same enum from an
+// `arbitrary::Unstructured` for the fuzz test below.
 
+#[derive(Clone)]
 enum Shape {
     Primitive {
         /// Short label used for logging + env-var filtering.
@@ -191,7 +192,10 @@ impl Shape {
     }
 }
 
-fn shape_catalog() -> Vec<Shape> {
+/// The primitive shapes that both the hardcoded catalog and the
+/// fuzz generator draw from. Kept as a function (not a const) because
+/// `Shape::Primitive` is not const-constructible with nested lifetimes.
+fn primitive_atoms() -> Vec<Shape> {
     vec![
         Shape::Primitive {
             name: "u32",
@@ -228,6 +232,12 @@ fn shape_catalog() -> Vec<Shape> {
             rust_literal: r#"String::from("hello")"#,
             expected_debug: r#""hello""#,
         },
+    ]
+}
+
+fn shape_catalog() -> Vec<Shape> {
+    let mut v = primitive_atoms();
+    v.extend(vec![
         Shape::Option(Box::new(Shape::Primitive {
             name: "u32",
             wit_type: "u32",
@@ -284,7 +294,102 @@ fn shape_catalog() -> Vec<Shape> {
                 ),
             ],
         },
-    ]
+    ]);
+    v
+}
+
+// ─── Arbitrary-driven generator (used by test_runtime_pipeline_fuzz) ─
+//
+// Generates `Shape` trees from an `arbitrary::Unstructured`. Records
+// can't nest inside other records — WIT only declares record types at
+// interface scope, so a field of type record would need its own top-
+// level decl, which we don't emit. `allow_record=false` is threaded
+// through when recursing into record fields.
+
+fn gen_shape(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    allow_record: bool,
+) -> arbitrary::Result<Shape> {
+    let can_recurse = max_depth > 0;
+    // 0=primitive, 1=option, 2=list, 3=tuple, 4=record
+    let max_kind: u8 = match (can_recurse, allow_record) {
+        (false, _) => 0,
+        (true, false) => 3,
+        (true, true) => 4,
+    };
+    let kind: u8 = u.int_in_range(0..=max_kind)?;
+    match kind {
+        0 => pick_primitive(u),
+        1 => Ok(Shape::Option(Box::new(gen_shape(
+            u,
+            max_depth - 1,
+            allow_record,
+        )?))),
+        2 => Ok(Shape::List(Box::new(gen_shape(
+            u,
+            max_depth - 1,
+            allow_record,
+        )?))),
+        3 => {
+            let n: usize = u.int_in_range(2..=3)?;
+            let parts: arbitrary::Result<Vec<Shape>> = (0..n)
+                .map(|_| gen_shape(u, max_depth - 1, allow_record))
+                .collect();
+            Ok(Shape::Tuple(parts?))
+        }
+        4 => {
+            const FIELD_NAMES: &[&str] = &["a", "b", "c"];
+            let n: usize = u.int_in_range(1..=3)?;
+            let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
+                .map(|i| {
+                    let fshape = gen_shape(u, max_depth - 1, false)?;
+                    Ok((FIELD_NAMES[i], fshape))
+                })
+                .collect();
+            Ok(Shape::Record {
+                wit_name: "rec",
+                rust_name: "Rec",
+                fields: fields?,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
+    let atoms = primitive_atoms();
+    let idx: usize = u.int_in_range(0..=atoms.len() - 1)?;
+    Ok(atoms[idx].clone())
+}
+
+/// Tiny inline SplitMix64: turns a u64 seed into a deterministic byte
+/// stream to feed `Unstructured`. Kept inline so we don't pull `rand`
+/// into dev-deps just for this.
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    fn fill(&mut self, buf: &mut [u8]) {
+        let mut i = 0;
+        while i < buf.len() {
+            let bytes = self.next_u64().to_le_bytes();
+            let take = (buf.len() - i).min(8);
+            buf[i..i + take].copy_from_slice(&bytes[..take]);
+            i += take;
+        }
+    }
 }
 
 // ─── Fixtures that don't vary per shape ────────────────────────────
@@ -568,6 +673,113 @@ fn test_runtime_pipeline() {
     }
 }
 
+/// Fuzz twin of `test_runtime_pipeline`: drives the same scaffold
+/// with shapes generated by `gen_shape()`. Also `#[ignore]`'d — each
+/// iteration rebuilds the provider crate, so a handful of iters is a
+/// minute of work.
+///
+/// Env vars:
+///   SPLICER_FUZZ_SEED   — base u64 seed (default: wall-clock nanos)
+///   SPLICER_FUZZ_ITERS  — iterations to run (default: 8)
+///   SPLICER_FUZZ_DEPTH  — max recursion depth per shape (default: 3)
+///
+/// Each iteration uses `base_seed.wrapping_add(iter_idx)` so any
+/// failure can be replayed with `SPLICER_FUZZ_SEED=<that> \
+/// SPLICER_FUZZ_ITERS=1`. The test prints that exact command on
+/// failure.
+#[test]
+#[ignore]
+fn test_runtime_pipeline_fuzz() {
+    require_tool("cargo");
+    require_tool("wasm-tools");
+    require_tool("wac");
+
+    let base_seed: u64 = std::env::var("SPLICER_FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        });
+    let iters: u32 = std::env::var("SPLICER_FUZZ_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let max_depth: u32 = std::env::var("SPLICER_FUZZ_DEPTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+
+    eprintln!(
+        "runtime_pipeline_fuzz: base seed = {base_seed}, iters = {iters}, max depth = {max_depth}"
+    );
+
+    let tmp = tempfile::tempdir().expect("mktempdir");
+    let root = tmp.path();
+    eprintln!("runtime_pipeline_fuzz: work dir = {}", root.display());
+    scaffold_common(root).expect("scaffold common");
+
+    // (iter_idx, iter_seed, shape_name, error_msg)
+    let mut failures: Vec<(u32, u64, String, String)> = Vec::new();
+
+    for i in 0..iters {
+        let iter_seed = base_seed.wrapping_add(i as u64);
+        let mut prng = SplitMix64::new(iter_seed);
+        let mut buf = vec![0u8; 4096];
+        prng.fill(&mut buf);
+        let mut u = arbitrary::Unstructured::new(&buf);
+
+        let shape = match gen_shape(&mut u, max_depth, true) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("\n=== iter {i} (seed={iter_seed}): gen_shape failed: {e} ===");
+                failures.push((i, iter_seed, "<gen>".into(), format!("gen_shape: {e}")));
+                continue;
+            }
+        };
+        let shape_name = shape.name();
+        eprintln!("\n=== iter {i} (seed={iter_seed}): {shape_name} ===");
+
+        if let Err(e) = write_per_shape_files(root, &shape) {
+            failures.push((
+                i,
+                iter_seed,
+                shape_name,
+                format!("write_per_shape_files: {e}"),
+            ));
+            continue;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pipeline_for_shape(root, &shape)
+        }));
+        if let Err(panic) = result {
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "<non-string panic>".into());
+            failures.push((i, iter_seed, shape_name.clone(), msg.clone()));
+            eprintln!("iter {i} (seed={iter_seed}) shape `{shape_name}`: FAILED — {msg}");
+        }
+    }
+
+    if !failures.is_empty() {
+        eprintln!("\n=== fuzz failures ===");
+        for (iter, iter_seed, shape_name, msg) in &failures {
+            eprintln!("  iter {iter} (seed={iter_seed}), shape `{shape_name}`:\n    {msg}");
+        }
+        let (first_iter, first_seed, _, _) = &failures[0];
+        eprintln!(
+            "\nTo reproduce iter {first_iter} alone:\n  \
+             SPLICER_FUZZ_SEED={first_seed} SPLICER_FUZZ_ITERS=1 \\\n      \
+             cargo test --test runtime_pipeline -- --ignored --nocapture test_runtime_pipeline_fuzz"
+        );
+        panic!("{} of {iters} fuzz iterations failed", failures.len());
+    }
+}
+
 /// Pick which shapes to run. Without the env var, the full
 /// `shape_catalog()`. With it, only shapes whose `name()` matches
 /// one of the comma-separated entries.
@@ -703,9 +915,7 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
             "post-splice trace missing marker `{marker}` for shape `{shape_name}`\n--- trace ---\n{captured}",
         );
     }
-    eprintln!(
-        "runtime_pipeline: all control-flow markers fired for shape `{shape_name}`",
-    );
+    eprintln!("runtime_pipeline: all control-flow markers fired for shape `{shape_name}`",);
 }
 
 /// Load the composed component, call `my:svc/app@1.0.0#run`, return
@@ -813,7 +1023,13 @@ fn run(cmd: &mut Command, label: &str) {
 fn scaffold_common(root: &Path) -> std::io::Result<()> {
     std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML)?;
 
-    write_crate(root, "provider", PROVIDER_CARGO_TOML, "// placeholder\n", &[])?;
+    write_crate(
+        root,
+        "provider",
+        PROVIDER_CARGO_TOML,
+        "// placeholder\n",
+        &[],
+    )?;
     write_crate(
         root,
         "consumer",
