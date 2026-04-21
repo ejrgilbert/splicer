@@ -30,8 +30,8 @@ path = "examples/wac_compose.rs"
 
 [dependencies]
 colored = "3.1.1"
-#cviz = "2.0.0-rc2"
-cviz = { path = "../cviz" }
+cviz = "2.0.0-rc3"
+#cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"  # or serde_toml if you prefer TOML
 anyhow = "1.0.86"
@@ -43,8 +43,8 @@ wit-parser = "0.244"
 wit-bindgen-core = "0.52"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-#wirm = "3.0.0"
-wirm = { path = "../../research/compilers/wirm" }
+wirm = "4.0.0-rc3"
+#wirm = { path = "../../research/compilers/wirm" }
 
 [dev-dependencies]
 wat = "1"
