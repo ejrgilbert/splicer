@@ -34,6 +34,44 @@ And `splicer` generates the modified composition plan.
 
 A demo of `splicer` can be run using: `cargo run --example demo`
 
+A more in-depth usage of `splicer` is done in the external [`component-interposition`](https://github.com/ejrgilbert/component-interposition) repo.
+
+---
+
+# Adapter Components
+
+Most middleware doesn't need to match the exact type signature of the interface
+it's being placed on. A logging middleware that prints "before" and "after"
+around every call works the same whether the target interface is
+`wasi:http/handler` or `my:service/adder`, it only needs the function name.
+
+Splicer generates **adapter components** that bridge between a generic
+middleware WIT interface and the specific target interface. The middleware author
+writes against a simple contract; splicer handles all the type plumbing at
+composition time.
+
+### Middleware Tiers
+
+| Tier       | Capability                                                                                                                       | WIT                                          | Status        |
+|------------|----------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|---------------|
+| **Tier 1** | Name-only hooks (`before-call`, `after-call`, `should-block-call`): middleware sees function names but not types or data         | [`wit/tier1/world.wit`](wit/tier1/world.wit) | **Supported** |
+| **Tier 2** | Read-only reflection: middleware can inspect the types and serialized data being passed to/from the target, but cannot modify it | `wit/tier2/world.wit` (planned)              | Planned       |
+| **Tier 3** | Read-write interception: middleware can inspect AND modify the data flowing through                                              | `wit/tier3/world.wit` (planned)              | Planned       |
+
+Each tier strictly adds one capability. Middleware written for a lower tier
+works unchanged when higher tiers become available.
+
+To write a tier-1 middleware, your component exports one or more of the
+interfaces defined in [`wit/tier1/world.wit`](wit/tier1/world.wit).
+
+When `splicer splice` detects that a middleware exports these interfaces (instead
+of the target interface directly), it automatically generates an adapter
+component and wires it into the composition.
+
+For the full guide — including how to write a tier-1 middleware, how adapter
+detection works, and what the generated adapter does internally — see
+[docs/adapter-components.md](docs/adapter-components.md).
+
 ---
 
 # Installation

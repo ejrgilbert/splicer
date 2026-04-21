@@ -2,6 +2,8 @@ use anyhow::bail;
 use serde::Deserialize;
 use std::collections::HashMap;
 
+/// Parse a YAML splice configuration string into a list of validated
+/// [`SpliceRule`]s ready to pass to [`crate::lowlevel::generate_wac`].
 pub fn parse_yaml(yaml_str: &str) -> anyhow::Result<Vec<SpliceRule>> {
     let config: ConfigFile = serde_yaml::from_str(yaml_str)?;
     config.validate()?;
@@ -53,27 +55,86 @@ pub struct YamlProviderOpt {
     alias: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Injection {
-    pub name: String,
-    pub path: Option<String>,
+/// Extra information stored on an [`Injection`] when it has been resolved as a
+/// tier-1 adapter by `add_to_inject_plan`.  Not present in the YAML config.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AdapterInjectionInfo {
+    /// Path to the generated adapter `.wasm` file.
+    pub adapter_path: String,
+    /// Tier-1 interfaces the middleware exports (e.g. `"splicer:tier1/before"`).
+    pub tier1_interfaces: Vec<String>,
 }
 
-/// --- Normalized rule type for Rust usage ---
+/// A middleware to inject at a splice point. Constructed from the YAML
+/// config `inject` list or programmatically via [`Injection::from_path`]
+/// / [`Injection::from_name`].
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Injection {
+    /// The middleware's logical name (used as the WAC variable).
+    pub name: String,
+    /// Path to the middleware `.wasm` file on disk. `None` when the
+    /// middleware is referenced by name only (contract checks will
+    /// produce a warning instead of a definitive result).
+    pub path: Option<String>,
+    /// Populated at runtime by `add_to_inject_plan` when this injection
+    /// is resolved as a tier-1 adapter. Not part of the YAML config and
+    /// not user-settable — use the `generated_adapters` field on
+    /// [`crate::api::SpliceOutput`] for the structured view of which
+    /// adapters splicer wrote.
+    #[serde(skip)]
+    pub(crate) adapter_info: Option<AdapterInjectionInfo>,
+}
+
+impl Injection {
+    /// Construct an [`Injection`] for a middleware that should be
+    /// loaded from a `.wasm` file at `path`.
+    pub fn from_path(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: Some(path.into()),
+            adapter_info: None,
+        }
+    }
+
+    /// Construct an [`Injection`] referencing a middleware by name
+    /// only — useful for the limited subset of contract checks that
+    /// can run without loading the middleware bytes.
+    pub fn from_name(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: None,
+            adapter_info: None,
+        }
+    }
+}
+
+/// A validated splice rule, normalized from the YAML config.
 #[derive(Debug)]
 pub enum SpliceRule {
+    /// Inject middleware before a provider on an interface edge.
     Before {
+        /// The interface to match (e.g. `"wasi:http/handler@0.3.0"`).
         interface: String,
+        /// Optional provider name to scope the match.
         provider_name: Option<String>,
+        /// Optional alias for the matched provider in the generated WAC.
         provider_alias: Option<String>,
+        /// Middleware to inject (in order).
         inject: Vec<Injection>,
     },
+    /// Inject middleware between two specific components on an interface edge.
     Between {
+        /// The interface to match.
         interface: String,
+        /// Name of the inner (provider-side) component.
         inner_name: String,
+        /// Optional alias for the inner component.
         inner_alias: Option<String>,
+        /// Name of the outer (consumer-side) component.
         outer_name: String,
+        /// Optional alias for the outer component.
         outer_alias: Option<String>,
+        /// Middleware to inject (in order).
         inject: Vec<Injection>,
     },
 }

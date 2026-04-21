@@ -112,14 +112,15 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let (wac, _, _) = wac::generate_wac(
+    let out = wac::generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
+    )?;
+    let wac = out.wac;
 
     // http-middleware is injected for the http chain
     assert!(
@@ -158,14 +159,15 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let (wac, _, _) = wac::generate_wac(
+    let out = wac::generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
+    )?;
+    let wac = out.wac;
 
     // http-middleware inserted before http-provider
     assert!(
@@ -207,14 +209,15 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let (wac, _, _) = wac::generate_wac(
+    let out = wac::generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
+    )?;
+    let wac = out.wac;
 
     let expected = r#"
 package example:composition;
@@ -254,14 +257,15 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_long_chain())?;
-    let (wac, _, _) = wac::generate_wac(
+    let out = wac::generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
+    )?;
+    let wac = out.wac;
 
     let expected = r#"
 package example:composition;
@@ -303,14 +307,15 @@ rules:
 "#;
     let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let (wac, _, _) = wac::generate_wac(
+    let out = wac::generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
+    )?;
+    let wac = out.wac;
 
     assert!(
         !wac.contains("http-middleware"),
@@ -374,42 +379,47 @@ rules:
     let mut graph = json::parse_json_str(testcases::json_log_short_chain())?;
     add_chain_fingerprint(&mut graph, "wasi:logging/log@0.1.0", "fake-fp-xyz");
 
-    let (wac, _, diagnostics) = wac::generate_wac(
+    let out = wac::generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
+    )?;
 
     // WAC is still generated — the Warn is advisory only
     assert!(
-        wac.contains("let log-middleware = new my:log-middleware {"),
+        out.wac
+            .contains("let log-middleware = new my:log-middleware {"),
         "WAC must be generated even when contract validation warns"
     );
     assert!(
-        wac.contains("let log-middleware-2 = new my:log-middleware-2 {"),
+        out.wac
+            .contains("let log-middleware-2 = new my:log-middleware-2 {"),
         "second middleware must also be injected"
     );
 
     // One Warn per middleware injection (2 middlewares, no paths → 2 Warns)
-    let warns: Vec<_> = diagnostics
+    let warns: Vec<_> = out
+        .diagnostics
         .iter()
         .filter(|d| matches!(d, crate::contract::ContractResult::Warn(_)))
         .collect();
     assert_eq!(
         warns.len(),
         2,
-        "expected one Warn per middleware without a path, got: {diagnostics:?}"
+        "expected one Warn per middleware without a path, got: {:?}",
+        out.diagnostics
     );
 
     // No errors or unexpected Ok results
     assert!(
-        diagnostics
+        out.diagnostics
             .iter()
             .all(|d| matches!(d, crate::contract::ContractResult::Warn(_))),
-        "all diagnostics should be Warn, got: {diagnostics:?}"
+        "all diagnostics should be Warn, got: {:?}",
+        out.diagnostics
     );
 
     Ok(())
@@ -425,14 +435,15 @@ fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _, _) = wac::generate_wac(
+        let out = wac::generate_wac(
             HashMap::new(),
             "placeholder",
             graph,
             &cfg,
             None,
             "example:composition",
-        );
+        )?;
+        let wac = out.wac;
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
@@ -474,14 +485,15 @@ fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()>
     }
 
     for (name, graph) in graphs.iter() {
-        let (wac, _, _) = wac::generate_wac(
+        let out = wac::generate_wac(
             HashMap::new(),
             "placeholder",
             graph,
             &cfg,
             None,
             "example:composition",
-        );
+        )?;
+        let wac = out.wac;
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
@@ -569,7 +581,8 @@ fn shim_exports_not_in_splice_roundtrip_wac() -> anyhow::Result<()> {
 
     let graph = parse_component(&bytes).expect("failed to parse composed binary");
 
-    let (wac, _, _) = wac::generate_wac(shim_comps, &splits_path, &graph, &[], None, "test:pkg");
+    let out = wac::generate_wac(shim_comps, &splits_path, &graph, &[], None, "test:pkg")?;
+    let wac = out.wac;
 
     // The service's interface MUST appear as a graph-level export statement.
     let has_service_export = wac

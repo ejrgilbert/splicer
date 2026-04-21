@@ -1,26 +1,15 @@
-mod compose;
-mod contract;
-mod parse;
-mod split;
-#[cfg(test)]
-mod tests;
-mod wac;
-
-use crate::contract::ContractResult;
-use crate::wac::INST_PREFIX;
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use colored::Colorize;
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::compose::filename_from_path;
-use crate::parse::config::SpliceRule;
-use crate::split::split_out_composition;
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use cviz::parse::component::parse_component;
+use splicer::types::ContractResult;
+use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
 
 const DEFAULT_PKG: &str = "example:composition";
+const DEFAULT_OUTPUT_WAC: &str = "output.wac";
+const DEFAULT_SPLITS_DIR: &str = "./splits";
 
 #[derive(Parser, Debug)]
 #[command(name = "splicer")]
@@ -67,7 +56,7 @@ enum Command {
         skip_type_check: bool,
     },
 
-    /// Synthesise a composition from N individual Wasm components.
+    /// Synthesize a composition from N individual Wasm components.
     ///
     /// Matches each component's exports to the imports of the others,
     /// topologically sorts them, and emits a WAC file + the `wac compose`
@@ -97,6 +86,18 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // Diagnostics off by default. Users opt in via `RUST_LOG` — e.g.
+    // `RUST_LOG=splicer::adapter::filter=debug splicer splice …` to see
+    // the closure walker's decisions, or `RUST_LOG=splicer=debug` for the
+    // full pipeline. Writes to stderr so normal stdout output is unaffected.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     match Args::parse().command {
         Command::Splice {
             splice_cfg_file,
@@ -106,35 +107,20 @@ fn main() -> Result<()> {
             package,
             skip_type_check,
         } => {
-            let yaml_str = fs::read_to_string(&splice_cfg_file)
+            let rules_yaml = fs::read_to_string(&splice_cfg_file)
                 .with_context(|| format!("Failed to read: {}", splice_cfg_file.display()))?;
-            let cfg = parse::config::parse_yaml(&yaml_str).with_context(|| {
-                format!(
-                    "Failed to parse splice configuration: {}",
-                    splice_cfg_file.display()
-                )
-            })?;
-
-            let bytes = fs::read(&comp_wasm)?;
-            let graph = parse_component(&bytes).with_context(|| {
-                format!(
-                    "Failed to parse composition graph from: {}",
-                    comp_wasm.display()
-                )
-            })?;
-
-            let (splits_path, shim_comps) = split_out_composition(&comp_wasm, &dir_splits)?;
-
-            run_wac(
-                shim_comps,
-                &splits_path,
-                &graph,
-                &cfg,
-                None,
-                &package,
-                output_wac,
+            let splits_dir =
+                PathBuf::from(dir_splits.unwrap_or_else(|| DEFAULT_SPLITS_DIR.to_string()));
+            let out = splice(SpliceRequest {
+                composition_wasm: comp_wasm,
+                rules_yaml,
+                package_name: package,
+                splits_dir,
                 skip_type_check,
-            )
+            })?;
+
+            print_diagnostics(&out.diagnostics, skip_type_check);
+            write_and_announce(&out.wac, output_wac, |path| out.wac_compose_cmd(path))
         }
 
         Command::Compose {
@@ -142,111 +128,87 @@ fn main() -> Result<()> {
             output_wac,
             package,
         } => {
-            // Parse each entry as `alias=path` or bare `path`, then validate
-            // that all resolved names are unique before any composition work.
-            let mut components: Vec<(String, PathBuf, Vec<u8>)> = Vec::with_capacity(wasms.len());
-
-            for entry in &wasms {
-                let (name, path) = if let Some((alias, rest)) = entry.split_once('=') {
-                    (alias.to_string(), PathBuf::from(rest))
-                } else {
-                    let path = PathBuf::from(entry);
-                    (filename_from_path(&path), path)
-                };
-
-                let bytes = fs::read(&path).with_context(|| {
-                    format!("Failed to read Wasm component: {}", path.display())
-                })?;
-                components.push((name, path, bytes));
-            }
-
-            // Duplicate-name check: surface a clear error before attempting
-            // composition so the user knows exactly what went wrong.
-            {
-                let mut seen: HashMap<&str, &PathBuf> = HashMap::new();
-                for (name, path, _) in &components {
-                    if let Some(prev) = seen.insert(name.as_str(), path) {
-                        anyhow::bail!(
-                            "Name conflict: '{}' and '{}' both resolve to the name '{}'.\n\
-                             Use aliases to disambiguate, e.g.:\n\
-                             \t{}0={} {}1={}",
-                            prev.display(),
-                            path.display(),
-                            name,
-                            name,
-                            prev.display(),
-                            name,
-                            path.display(),
-                        );
+            // Parse each entry as `alias=path` or bare `path`. The
+            // duplicate-name check + file reads happen inside
+            // `splicer::compose`.
+            let components: Vec<ComponentInput> = wasms
+                .iter()
+                .map(|entry| {
+                    if let Some((alias, rest)) = entry.split_once('=') {
+                        ComponentInput {
+                            alias: Some(alias.to_string()),
+                            path: PathBuf::from(rest),
+                        }
+                    } else {
+                        ComponentInput {
+                            alias: None,
+                            path: PathBuf::from(entry),
+                        }
                     }
-                }
-            }
+                })
+                .collect();
 
-            let (graph, node_paths) = compose::build_graph_from_components(&components)?;
+            let out = compose(ComposeRequest {
+                components,
+                package_name: package,
+            })?;
 
-            run_wac(
-                HashMap::new(),
-                "",
-                &graph,
-                &[],
-                Some(&node_paths),
-                &package,
-                output_wac,
-                false,
-            )
+            print_diagnostics(&out.diagnostics, false);
+            write_and_announce(&out.wac, output_wac, |path| out.wac_compose_cmd(path))
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_wac(
-    shim_comps: HashMap<usize, usize>,
-    splits_path: &str,
-    graph: &cviz::model::CompositionGraph,
-    rules: &[SpliceRule],
-    node_paths: Option<&HashMap<u32, PathBuf>>,
-    pkg_name: &str,
+/// Write the generated WAC source to disk and print the
+/// `wac compose` invocation that consumes it.
+fn write_and_announce(
+    wac: &str,
     output_wac: Option<PathBuf>,
-    skip_type_check: bool,
+    format_cmd: impl FnOnce(&str) -> String,
 ) -> Result<()> {
-    let (wac, cmd_args, diagnostics) =
-        wac::generate_wac(shim_comps, splits_path, graph, rules, node_paths, pkg_name);
-
-    for diag in diagnostics {
-        match diag {
-            ContractResult::Ok => {}
-            ContractResult::Warn(msg) => eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow()),
-            ContractResult::Error(msg) => {
-                if skip_type_check {
-                    eprintln!(
-                        "{}: type check skipped — {}",
-                        "WARN".yellow().bold(),
-                        msg.yellow()
-                    );
-                } else {
-                    panic!("ERROR: {msg}");
-                }
-            }
-        }
-    }
-
-    let output_path = output_wac.unwrap_or_else(|| PathBuf::from("output.wac"));
-    fs::write(&output_path, &wac)
+    let output_path = output_wac.unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_WAC));
+    fs::write(&output_path, wac)
         .with_context(|| format!("Failed to write output: {}", output_path.display()))?;
     eprintln!("Generated `wac` written to: {}\n", output_path.display());
-
-    let wac_cmd = gen_wac_cmd(output_path.into_os_string().to_str().unwrap(), cmd_args)?;
-    println!("{wac_cmd}");
-
+    let wac_path_str = output_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "output WAC path contains non-UTF-8 bytes: {}",
+            output_path.display()
+        )
+    })?;
+    println!("{}", format_cmd(wac_path_str));
     Ok(())
 }
 
-fn gen_wac_cmd(wac_path: &str, cmd_args: Vec<(String, String)>) -> Result<String> {
-    let mut cmd = format!("wac compose {wac_path} ");
-    for (srv_name, srv_path) in cmd_args {
-        cmd.push_str(&format!(
-            "\\\n    --dep {INST_PREFIX}:{srv_name}=\"{srv_path}\" "
-        ));
+/// Render the diagnostics list to stderr with the same colored
+/// styling the CLI has always used. Library callers (and
+/// `splicer::splice` / `splicer::compose`) handle their own
+/// diagnostics through the returned `Vec<ContractResult>`.
+fn print_diagnostics(diagnostics: &[ContractResult], skip_type_check: bool) {
+    for diag in diagnostics {
+        match diag {
+            ContractResult::Ok => {}
+            // Tier1Compatible is consumed inside `splicer::splice` /
+            // `splicer::compose` (the adapter is generated and the
+            // injection path is substituted), so it should never reach
+            // a user-facing diagnostic list.
+            ContractResult::Tier1Compatible(_) => unreachable!(
+                "Tier1Compatible should not surface in the diagnostics list returned by splicer::splice"
+            ),
+            ContractResult::Warn(msg) => {
+                eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow())
+            }
+            ContractResult::Error(msg) => {
+                // splicer::splice would have returned Err already
+                // unless skip_type_check was set, so seeing one here
+                // means the caller asked us to demote it.
+                let _ = skip_type_check;
+                eprintln!(
+                    "{}: type check skipped — {}",
+                    "WARN".yellow().bold(),
+                    msg.yellow()
+                );
+            }
+        }
     }
-    Ok(cmd)
 }

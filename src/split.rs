@@ -1,11 +1,18 @@
+use anyhow::Context;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use wirm::ir::component::visitor::{walk_structural, ComponentVisitor, VisitCtx};
 use wirm::{Component, Module};
 
+/// Default directory where split sub-components are written.
 pub const PATH_TO_SPLITS: &str = "./splits";
 
+/// Split a composed Wasm component into its sub-components, writing
+/// one `.wasm` file per nested component into the splits directory.
+/// Returns `(splits_dir, shim_map)` where `shim_map` records which
+/// splits are shim components that should be replaced by their outer
+/// component.
 pub fn split_out_composition(
     wasm_path: &PathBuf,
     splits_path: &Option<String>,
@@ -15,9 +22,16 @@ pub fn split_out_composition(
     } else {
         PATH_TO_SPLITS.to_string()
     };
-    fs::create_dir_all(output.clone())?;
-    let buff = fs::read(wasm_path)?;
-    let component = Component::parse(&buff, false, false).expect("Unable to parse");
+    fs::create_dir_all(&output)
+        .with_context(|| format!("Failed to create splits directory: {output}"))?;
+    let buff = fs::read(wasm_path)
+        .with_context(|| format!("Failed to read composition wasm: {}", wasm_path.display()))?;
+    let component = Component::parse(&buff, false, false).with_context(|| {
+        format!(
+            "Failed to parse composition wasm as a component: {}",
+            wasm_path.display()
+        )
+    })?;
 
     let mut visitor = EmitVisitor::new(&output);
     walk_structural(&component, &mut visitor);
@@ -101,6 +115,7 @@ impl ComponentVisitor<'_> for EmitVisitor {
     }
 }
 
+/// Build the filesystem path for a split sub-component by index.
 pub fn gen_split_path(splits_path: &str, comp_id: usize) -> String {
     format!("{splits_path}/split{comp_id}.wasm")
 }

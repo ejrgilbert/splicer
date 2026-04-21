@@ -1,14 +1,19 @@
+use crate::adapter::generate_tier1_adapter;
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
-use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
+use cviz::model::{
+    ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection, InterfaceType, InternedId,
+    TypeArena,
+};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use wasmparser::collections::IndexSet;
 
+/// Package prefix used for WAC instance variables (e.g. `"my:srv-a"`).
 pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
-use crate::parse::config::{Injection, SpliceRule};
+use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
 use crate::split::gen_split_path;
 
 // chain_idx -> set of middlewares to inject AFTER
@@ -22,17 +27,73 @@ struct Chain {
     inject_plan: InjectPlan,
 }
 
+impl Chain {
+    /// Returns the split path of the component that consumes the handler at
+    /// the given chain position.
+    ///
+    /// The consumer is the component that IMPORTS the handler interface —
+    /// the adapter copies its import structure to get the right types.
+    /// At `chain_idx`, the consumer is `chain[chain_idx]`.
+    fn consumer_split_path(
+        &self,
+        chain_idx: usize,
+        composition: &CompositionGraph,
+        splits_path: &str,
+        shim_comps: &HashMap<usize, usize>,
+    ) -> Option<String> {
+        let consumer_id = *self.chain.get(chain_idx)?;
+        let component_num = composition.nodes.get(&consumer_id)?.component_num + 1;
+        let split_to_use = resolve_shim(component_num as usize, shim_comps);
+        Some(gen_split_path(splits_path, split_to_use))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Contract {
     name: String,
     ty_fingerprint: Option<String>,
+    interface_type: Option<InterfaceType>,
+}
+
+/// One entry in [`WacOutput::generated_adapters`] — a tier-1 adapter
+/// component that splicer wrote to disk while resolving an injection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedAdapter {
+    /// Path on disk to the generated adapter `.wasm` file.
+    pub adapter_path: String,
+    /// Name of the middleware injection the adapter wraps.
+    pub middleware_name: String,
+    /// Target interface the adapter exports (e.g.
+    /// `"wasi:http/handler@0.3.0-rc-2026-01-06"`).
+    pub target_interface: String,
+    /// Tier-1 hook interfaces the wrapped middleware exports
+    /// (e.g. `"splicer:tier1/before"`).
+    pub tier1_interfaces: Vec<String>,
+}
+
+/// Output of [`generate_wac`].
+pub struct WacOutput {
+    /// The generated WAC source text.
+    pub wac: String,
+    /// Per-dependency `(package_key → wasm path)` map ready to feed to
+    /// `wac-resolver::FileSystemPackageResolver::new` as the `overrides`
+    /// argument, or to format into a `wac compose ... --dep <key>=<path>`
+    /// shell command.
+    ///
+    /// Keys are fully-qualified WAC package keys (e.g. `"my:srv-a"`) —
+    /// the same form that appears in the generated WAC source on the
+    /// right-hand side of `new`. Stored in a `BTreeMap` so the order
+    /// is deterministic across runs.
+    pub wac_deps: BTreeMap<String, PathBuf>,
+    /// Diagnostics from contract validation, one per middleware injection attempted.
+    pub diagnostics: Vec<ContractResult>,
+    /// Tier-1 adapter components that were generated and written to
+    /// disk while resolving the splice rules. Empty when no rule
+    /// matched a tier-1 type-erased middleware.
+    pub generated_adapters: Vec<GeneratedAdapter>,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
-/// Returns:
-/// - The generated Wac
-/// - A list of the `wac compose` args: (service-name, service-path)
-/// - Diagnostics from contract validation (one per middleware injection attempted)
 ///
 /// `node_paths` is `Some` for the multi-component path; when present each node's
 /// original `.wasm` path is used directly instead of deriving a split path.
@@ -43,7 +104,13 @@ pub fn generate_wac(
     rules: &[SpliceRule],
     node_paths: Option<&HashMap<u32, PathBuf>>,
     pkg_name: &str,
-) -> (String, Vec<(String, String)>, Vec<ContractResult>) {
+) -> anyhow::Result<WacOutput> {
+    // Emit the "shim split defaulting" WARN(s) exactly once up-front.
+    // Without this, the notice would fire twice — once from the adapter
+    // generator's `consumer_split_path` lookup, once from the wac-dep
+    // map — because both paths call `resolve_shim` for the same shim.
+    warn_about_shim_resolutions(&shim_comps);
+
     let mut wac_lines = vec![format!("package {pkg_name};")];
 
     let mut handled_interfaces = HashSet::new();
@@ -61,7 +128,7 @@ pub fn generate_wac(
             source_instance,
             is_host_import,
             fingerprint,
-            ..
+            interface_type: iface_ty,
         } in node.imports.iter()
         {
             let mut chain = vec![*outer_node_id];
@@ -93,6 +160,7 @@ pub fn generate_wac(
                     interface: Contract {
                         name: interface_name.to_string(),
                         ty_fingerprint: fingerprint.clone(),
+                        interface_type: iface_ty.clone(),
                     },
                     chain,
                     aliases: HashMap::new(),
@@ -109,19 +177,27 @@ pub fn generate_wac(
         ExportInfo {
             source_instance: source_inst,
             fingerprint,
-            ..
+            ty: export_ty,
         },
     ) in composition.component_exports.iter()
     {
         if handled_interfaces.contains(interface) {
             continue;
         }
+        // Resolve the interface type from the export info if available.
+        let interface_type = export_ty.and_then(|id| match id {
+            InternedId::Interface(iface_id) => {
+                Some(composition.arena.lookup_interface(iface_id).clone())
+            }
+            _ => None,
+        });
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
         chains.push(Chain {
             interface: Contract {
                 name: interface.to_string(),
                 ty_fingerprint: fingerprint.clone(),
+                interface_type,
             },
             chain: vec![*source_inst],
             aliases: HashMap::new(),
@@ -135,12 +211,29 @@ pub fn generate_wac(
     // Apply the rules in order of their declaration in the configuration.
     // This enforces an ordering semantic for the rule application.
     let mut diagnostics: Vec<ContractResult> = vec![];
+    let mut generated_adapters: Vec<GeneratedAdapter> = vec![];
     for (rule_idx, rule) in rules.iter().enumerate() {
         let mut any_interface_matched = false;
         let mut any_full_match = false;
         for chain in chains.iter_mut() {
-            let between = apply_rule_between(rule, chain, composition, &mut checked_middlewares);
-            let before = apply_rule_before(rule, chain, composition, &mut checked_middlewares);
+            let between = apply_rule_between(
+                rule,
+                chain,
+                composition,
+                splits_path,
+                &shim_comps,
+                &mut checked_middlewares,
+                &mut generated_adapters,
+            )?;
+            let before = apply_rule_before(
+                rule,
+                chain,
+                composition,
+                splits_path,
+                &shim_comps,
+                &mut checked_middlewares,
+                &mut generated_adapters,
+            )?;
             any_interface_matched |= between.interface_matched | before.interface_matched;
             any_full_match |= between.full_match | before.full_match;
             diagnostics.extend(between.contract_results);
@@ -321,15 +414,28 @@ pub fn generate_wac(
                 // Through doing this, the order of middlewares invoked will follow the order of declaration in the configuration.
                 let reversed_list = reverse_set(middlewares);
                 for mdl in reversed_list.iter() {
-                    // instantiate
-                    last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
-                    used_middlewares.push((
-                        last.clone(),
-                        mdl.path
-                            .as_ref()
-                            .cloned()
-                            .unwrap_or(PATH_PLACEHOLDER.to_string()),
-                    ));
+                    if let Some(adapter_info) = &mdl.adapter_info {
+                        // instantiate the middleware+adapter in wac script
+                        let (adapter_var, extra_args) = create_tier1_mdl(
+                            &last,
+                            mdl,
+                            chain_interface,
+                            adapter_info,
+                            &mut wac_lines,
+                        );
+                        last = adapter_var;
+                        used_middlewares.extend(extra_args);
+                    } else {
+                        // instantiate the middleware in wac script
+                        last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
+                        used_middlewares.push((
+                            last.clone(),
+                            mdl.path
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or(PATH_PLACEHOLDER.to_string()),
+                        ));
+                    }
                     mdl_override = Some((chain_interface.clone(), last.clone()));
                 }
             }
@@ -444,9 +550,18 @@ pub fn generate_wac(
         node_paths,
     );
 
-    (wac_lines.join("\n\n"), args, diagnostics)
+    Ok(WacOutput {
+        wac: wac_lines.join("\n\n"),
+        wac_deps: args,
+        diagnostics,
+        generated_adapters,
+    })
 }
 
+/// Build the dependency map: a `BTreeMap` keyed by the fully-qualified
+/// WAC package key (e.g. `"my:srv-a"`) so the result is directly
+/// consumable by `wac-resolver::FileSystemPackageResolver`. Sorted
+/// for deterministic shell-command formatting.
 fn gen_wac_args(
     shim_comps: HashMap<usize, usize>,
     splits_path: &str,
@@ -454,43 +569,65 @@ fn gen_wac_args(
     used_comps: &HashMap<u32, String>,
     used_mdls: &Vec<(String, String)>,
     node_paths: Option<&HashMap<u32, PathBuf>>,
-) -> Vec<(String, String)> {
-    // List of (used_name, path)
-    let mut args = vec![];
+) -> BTreeMap<String, PathBuf> {
+    let mut deps: BTreeMap<String, PathBuf> = BTreeMap::new();
 
     for (inst_id, name) in used_comps.iter() {
-        let comp_path = if let Some(paths) = node_paths {
+        let comp_path: PathBuf = if let Some(paths) = node_paths {
             // Multi-component mode: use the original wasm path directly.
             paths
                 .get(inst_id)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| PATH_PLACEHOLDER.to_string())
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from(PATH_PLACEHOLDER))
         } else {
             // Single-component mode: derive path from the split directory.
             // We reserve component 0 for the root component, so add one here.
             let component_num = graph.nodes[inst_id].component_num + 1;
             let split_to_use = resolve_shim(component_num as usize, &shim_comps);
-            gen_split_path(splits_path, split_to_use)
+            PathBuf::from(gen_split_path(splits_path, split_to_use))
         };
-        args.push((name.clone(), comp_path));
+        deps.insert(format!("{INST_PREFIX}:{name}"), comp_path);
     }
 
     // handle the used middlewares
-    args.extend(used_mdls.to_owned());
+    for (mw_name, mw_path) in used_mdls {
+        deps.insert(format!("{INST_PREFIX}:{mw_name}"), PathBuf::from(mw_path));
+    }
 
-    args
+    deps
 }
+/// Pure: follow the shim chain until landing on a non-shim split.
+/// See [`warn_about_shim_resolutions`] for the user-facing notice that
+/// fires once per non-trivial resolution at the top of [`generate_wac`].
 fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) -> usize {
-    let original_num = component_num;
     while is_shim_split_num(component_num, shim_comps) {
         component_num = shim_comps[&component_num];
     }
-    if component_num != original_num {
-        eprintln!("{}: {}", "WARN".yellow().bold(), format!("\tAssumption made! It is likely that split{original_num} is a shim component,\n\
-                                                     \tdefaulting to split{component_num} instead in the generated wac command!\n\
-                                                     \tIf this assumption is incorrect, modify the generated wac command.").yellow());
-    }
     component_num
+}
+
+/// Emit one WARN per non-trivial `shim → resolved` mapping in
+/// `shim_comps`. Called once at the start of [`generate_wac`] so the
+/// same assumption isn't announced twice when both the adapter-gen and
+/// wac-dep paths later call [`resolve_shim`] for the same shim.
+fn warn_about_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
+    let mut shim_keys: Vec<usize> = shim_comps.keys().copied().collect();
+    shim_keys.sort();
+    for shim_num in shim_keys {
+        let resolved = resolve_shim(shim_num, shim_comps);
+        if resolved != shim_num {
+            eprintln!(
+                "{}: {}",
+                "WARN".yellow().bold(),
+                format!(
+                    "\tAssumption made! It is likely that split{shim_num} is a shim component,\n\
+                     \tdefaulting to split{resolved} instead in the generated wac command!\n\
+                     \tIf this assumption is incorrect, modify the generated wac command."
+                )
+                .yellow()
+            );
+        }
+    }
 }
 
 /// Return value from rule application functions.
@@ -505,25 +642,19 @@ struct RuleApplyResult {
     full_match: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_rule_between(
     rule: &SpliceRule,
     chain: &mut Chain,
     composition: &CompositionGraph,
+    splits_path: &str,
+    shim_comps: &HashMap<usize, usize>,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> RuleApplyResult {
+    generated_adapters: &mut Vec<GeneratedAdapter>,
+) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
     let mut interface_matched = false;
     let mut full_match = false;
-    let Chain {
-        interface:
-            Contract {
-                name: chain_interface,
-                ty_fingerprint,
-            },
-        chain,
-        inject_plan,
-        aliases,
-    } = chain;
     if let SpliceRule::Between {
         interface,
         inner_name,
@@ -533,7 +664,7 @@ fn apply_rule_between(
         inject,
     } = rule
     {
-        for (i, window) in chain.windows(2).enumerate() {
+        for (i, window) in chain.chain.windows(2).enumerate() {
             let inner_id = window[0];
             let outer_id = window[1];
             let inner_node = &composition.nodes[&inner_id];
@@ -541,7 +672,7 @@ fn apply_rule_between(
 
             let inner_var = get_name(inner_node).to_string();
             let outer_var = get_name(outer_node).to_string();
-            if interface != chain_interface {
+            if *interface != chain.interface.name {
                 continue;
             }
             interface_matched = true;
@@ -551,45 +682,46 @@ fn apply_rule_between(
                     (inner_id, inner_alias.clone()),
                     (outer_id, outer_alias.clone()),
                 ];
+                let consumer_path =
+                    chain.consumer_split_path(i + 1, composition, splits_path, shim_comps);
                 contract_results.extend(add_to_inject_plan(
                     interface,
                     inject,
                     i + 1,
                     &new_aliases,
-                    aliases,
-                    inject_plan,
-                    ty_fingerprint,
+                    &mut chain.aliases,
+                    &mut chain.inject_plan,
+                    &chain.interface.ty_fingerprint,
+                    chain.interface.interface_type.as_ref(),
+                    splits_path,
+                    consumer_path,
+                    &composition.arena,
                     checked_middlewares,
-                ));
+                    generated_adapters,
+                )?);
             }
         }
     }
-    RuleApplyResult {
+    Ok(RuleApplyResult {
         contract_results,
         interface_matched,
         full_match,
-    }
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_rule_before(
     rule: &SpliceRule,
     chain: &mut Chain,
     composition: &CompositionGraph,
+    splits_path: &str,
+    shim_comps: &HashMap<usize, usize>,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> RuleApplyResult {
+    generated_adapters: &mut Vec<GeneratedAdapter>,
+) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
     let mut interface_matched = false;
     let mut full_match = false;
-    let Chain {
-        interface:
-            Contract {
-                name: chain_interface,
-                ty_fingerprint,
-            },
-        chain,
-        inject_plan,
-        aliases,
-    } = chain;
     if let SpliceRule::Before {
         interface,
         provider_name,
@@ -597,8 +729,8 @@ fn apply_rule_before(
         inject,
     } = rule
     {
-        for (i, id) in chain.iter().enumerate() {
-            if interface != chain_interface {
+        for (i, id) in chain.chain.iter().enumerate() {
+            if *interface != chain.interface.name {
                 continue;
             }
             interface_matched = true;
@@ -610,23 +742,36 @@ fn apply_rule_before(
             }
             full_match = true;
             let new_aliases = vec![(*id, provider_alias.clone())];
+            // Prefer the consumer's split (i+1) so the adapter copies
+            // its import surface. At the outermost chain position
+            // there's no consumer, so fall back to the provider's own
+            // split (i) — the adapter mirrors the provider's full
+            // import topology.
+            let consumer_path = chain
+                .consumer_split_path(i + 1, composition, splits_path, shim_comps)
+                .or_else(|| chain.consumer_split_path(i, composition, splits_path, shim_comps));
             contract_results.extend(add_to_inject_plan(
                 interface,
                 inject,
                 i + 1,
                 &new_aliases,
-                aliases,
-                inject_plan,
-                ty_fingerprint,
+                &mut chain.aliases,
+                &mut chain.inject_plan,
+                &chain.interface.ty_fingerprint,
+                chain.interface.interface_type.as_ref(),
+                splits_path,
+                consumer_path,
+                &composition.arena,
                 checked_middlewares,
-            ));
+                generated_adapters,
+            )?);
         }
     }
-    RuleApplyResult {
+    Ok(RuleApplyResult {
         contract_results,
         interface_matched,
         full_match,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -638,8 +783,13 @@ fn add_to_inject_plan(
     aliases: &mut HashMap<u32, Option<String>>,
     inject_plan: &mut InjectPlan,
     contract_fingerprint: &Option<String>,
+    interface_type: Option<&InterfaceType>,
+    splits_path: &str,
+    consumer_split: Option<String>,
+    arena: &TypeArena,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-) -> Vec<ContractResult> {
+    generated_adapters: &mut Vec<GeneratedAdapter>,
+) -> anyhow::Result<Vec<ContractResult>> {
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
     let contract_results = validate_contract(
@@ -649,21 +799,80 @@ fn add_to_inject_plan(
         checked_middlewares,
     );
 
+    // For tier-1 compatible middleware, generate a adapter component and substitute
+    // the injection path so the rest of the WAC generation uses the adapter.
+    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
+    let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
+    for (injection, result) in to_inject.iter().zip(contract_results) {
+        match result {
+            ContractResult::Tier1Compatible(matched_interfaces) => {
+                // `consumer_split` is the split the adapter inherits
+                // its import preamble from. Callers upstream (the chain
+                // walker in `apply_rule_before`) fall back from the
+                // consumer at `i + 1` to the provider at `i`, so this
+                // should always be `Some` for a valid composition. If
+                // it isn't, something upstream shipped us a broken
+                // chain and we can't generate a sound adapter.
+                let consumer_split_path = consumer_split.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No consumer/provider split available for interface '{interface_name}' \
+                         while generating adapter for middleware '{}'. Please open an issue \
+                         with a repro at https://github.com/ejrgilbert/splicer/issues",
+                        injection.name
+                    )
+                })?;
+                let adapter_path = generate_tier1_adapter(
+                    &injection.name,
+                    interface_name,
+                    &matched_interfaces,
+                    interface_type,
+                    splits_path,
+                    consumer_split_path,
+                    arena,
+                )?;
+                generated_adapters.push(GeneratedAdapter {
+                    adapter_path: adapter_path.clone(),
+                    middleware_name: injection.name.clone(),
+                    target_interface: interface_name.to_string(),
+                    tier1_interfaces: matched_interfaces.clone(),
+                });
+                resolved.push(Injection {
+                    name: injection.name.clone(),
+                    // Keep the original middleware path; adapter_path goes in adapter_info.
+                    path: injection.path.clone(),
+                    adapter_info: Some(AdapterInjectionInfo {
+                        adapter_path,
+                        tier1_interfaces: matched_interfaces,
+                    }),
+                });
+                // Tier1Compatible is fully handled here; no diagnostic needed upstream.
+            }
+            other => {
+                resolved.push(injection.clone());
+                final_results.push(other);
+            }
+        }
+    }
+
     let middlewares = inject_plan
         .entry(chain_idx)
-        .or_insert(IndexSet::from_iter(to_inject.iter().cloned()));
+        .or_insert(IndexSet::from_iter(resolved.iter().cloned()));
 
     for (inst_id, new_alias) in new_aliases {
         if let (Some(new_alias), Some(Some(configured_alias))) = (new_alias, aliases.get(inst_id)) {
             if new_alias != configured_alias {
-                panic!("ERROR: The alias for the interface '{interface_name}' was configured as {configured_alias}, but the tool prepared it as '{new_alias}' in some previous injection pass. Report this bug.");
+                anyhow::bail!(
+                    "Internal error: alias conflict for interface '{interface_name}' — \
+                     was configured as '{configured_alias}', but the tool prepared it as \
+                     '{new_alias}' in some previous injection pass. Please report this bug."
+                );
             }
         }
         aliases.insert(*inst_id, new_alias.clone());
     }
 
-    middlewares.extend(to_inject.iter().cloned());
-    contract_results
+    middlewares.extend(resolved);
+    Ok(final_results)
 }
 
 fn get_or_create_inst(
@@ -740,6 +949,56 @@ fn create_mdl(
     wac_lines.push(mw_line);
 
     mw.clone()
+}
+
+/// Emit WAC for a tier-1 adapter injection: two instances — the real middleware
+/// (host-imports only) and the generated adapter wrapper that wires both.
+///
+/// Returns `(adapter_var_name, [(pkg_name, path), ...])` where the vec has two
+/// entries: one for the real middleware and one for the adapter component.
+fn create_tier1_mdl(
+    downstream_inst: &str,
+    mdl: &Injection,
+    interface: &Contract,
+    adapter_info: &AdapterInjectionInfo,
+    wac_lines: &mut Vec<String>,
+) -> (String, Vec<(String, String)>) {
+    let real_var = mdl.name.clone();
+    let adapter_var = format!("{}-adapter", mdl.name);
+
+    // Real middleware — only has host imports, so no explicit wiring needed.
+    wac_lines.push(format!(
+        "let {real_var} = new {INST_PREFIX}:{real_var} {{ ... }};"
+    ));
+
+    // Proxy — wires the downstream target interface and the tier-1 hook interfaces
+    // from the real middleware instance. The adapter's hook imports are versioned,
+    // so the WAC lines use the versioned names to match both sides.
+    use crate::contract::{versioned_interface, TIER1_VERSION};
+    let mut adapter_line = format!(
+        "let {adapter_var} = new {INST_PREFIX}:{adapter_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
+        iface = interface.name,
+    );
+    for tier1_iface in &adapter_info.tier1_interfaces {
+        let versioned = versioned_interface(tier1_iface, TIER1_VERSION);
+        adapter_line.push_str(&format!(
+            "\n    \"{versioned}\": {real_var}[\"{versioned}\"],"
+        ));
+    }
+    adapter_line.push_str("\n    ...\n};");
+    wac_lines.push(adapter_line);
+
+    let used = vec![
+        (
+            real_var,
+            mdl.path
+                .as_ref()
+                .cloned()
+                .unwrap_or(PATH_PLACEHOLDER.to_string()),
+        ),
+        (adapter_var.clone(), adapter_info.adapter_path.clone()),
+    ];
+    (adapter_var, used)
 }
 
 fn rule_interface(rule: &SpliceRule) -> &str {

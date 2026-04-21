@@ -25,9 +25,8 @@
 use cviz::model::ExportInfo;
 use cviz::parse::component::parse_component;
 use cviz::parse::json::parse_json_str;
-use splicer::contract::{validate_contract, ContractResult};
-use splicer::parse::config::{parse_yaml, Injection};
-use splicer::wac::generate_wac;
+use splicer::lowlevel::{generate_wac, parse_yaml, validate_contract, Injection};
+use splicer::types::ContractResult;
 use std::collections::{BTreeMap, HashMap};
 
 // ─── JSON graph fixtures ──────────────────────────────────────────────────
@@ -92,15 +91,16 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_SHORT).unwrap();
-    let (wac, _, _) = generate_wac(
+    generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
-    wac
+    )
+    .unwrap()
+    .wac
 }
 
 /// 1b: inject `mw-a` before `log-provider-inner` (the deepest node) in a three-node chain.
@@ -117,15 +117,16 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
-    let (wac, _, _) = generate_wac(
+    generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
-    wac
+    )
+    .unwrap()
+    .wac
 }
 
 /// 1c: inject `mw-a` and `mw-b` between `log-provider-inner` and `log-provider`.
@@ -145,15 +146,16 @@ rules:
 "#;
     let cfg = parse_yaml(yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
-    let (wac, _, _) = generate_wac(
+    generate_wac(
         HashMap::new(),
         "placeholder",
         &graph,
         &cfg,
         None,
         "example:composition",
-    );
-    wac
+    )
+    .unwrap()
+    .wac
 }
 
 // ─── Phase 2 helpers ─────────────────────────────────────────────────────
@@ -161,10 +163,7 @@ rules:
 const CHAIN_FP: &str = "sha256-abc123-fake-fingerprint";
 
 fn injection(name: &str) -> Injection {
-    Injection {
-        name: name.to_string(),
-        path: None,
-    }
+    Injection::from_name(name)
 }
 
 fn cache_with_fp(mw: &str, fp: &str) -> HashMap<String, BTreeMap<String, ExportInfo>> {
@@ -249,10 +248,7 @@ fn run_type_check_full(mw_wat: &str, temp_name: &str) -> Vec<ContractResult> {
     let tmp_path = std::env::temp_dir().join(temp_name);
     std::fs::write(&tmp_path, &mw_bytes).expect("write temp wasm");
 
-    let inj = Injection {
-        name: "mw".to_string(),
-        path: Some(tmp_path.to_str().unwrap().to_string()),
-    };
+    let inj = Injection::from_path("mw", tmp_path.to_str().unwrap());
 
     let mut cache = HashMap::new();
     validate_contract(&[inj], LOG_IFACE, &chain_fp, &mut cache)
@@ -290,6 +286,9 @@ fn show_contract_result(result: &ContractResult) {
         ContractResult::Ok => println!("  ✔  Ok — types are compatible, injection confirmed safe"),
         ContractResult::Warn(msg) => println!("  ⚠  Warn — {msg}"),
         ContractResult::Error(msg) => println!("  ✘  Error — {msg}"),
+        ContractResult::Tier1Compatible(ifaces) => {
+            println!("  ↪  Tier1Compatible — middleware is type-erased; adapter component will be generated (hooks: {ifaces:?})")
+        }
     }
 }
 

@@ -52,3 +52,25 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-features --verbose --all-targets
+
+  # Integration tests using the component-interposition submodule.
+  # Runs the full splicer + wac + wasmtime pipeline against real components.
+  #
+  # Prerequisites: the submodule's fixtures/ must contain pre-built .comp.wasm
+  # files, and splicer, cviz-cli, wac, and wasm-tools must be installed.
+  # TODO: enable once component-interposition has fixtures/ merged.
+#   integration:
+#     name: Integration Tests
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#         with:
+#           submodules: recursive
+#       - uses: dtolnay/rust-toolchain@stable
+#       - uses: Swatinem/rust-cache@v2
+#       - name: Install tools
+#         run: |
+#           cargo install wac-cli wasm-tools
+#           cargo install splicer cviz-cli
+#       - name: Run integration tests
+#         run: cargo test --test integration -- --ignored

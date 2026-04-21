@@ -1,6 +1,6 @@
 [package]
 name = "splicer"
-version = "2.0.0-rc2"
+version = "2.0.0-rc3"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
 description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
@@ -24,16 +24,33 @@ path = "src/lib.rs"
 name = "demo"
 path = "examples/demo.rs"
 
+[[example]]
+name = "wac_compose"
+path = "examples/wac_compose.rs"
+
 [dependencies]
 colored = "3.1.1"
-cviz = "2.0.0-rc2"
+cviz = "2.0.0-rc3"
 #cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"  # or serde_toml if you prefer TOML
 anyhow = "1.0.86"
+semver = "1"
 clap = { version = "4.5.58", features = ["derive"] }
 wasmparser = "0.245.1"
-wirm = "3.0.0"
+wasm-encoder = { version = "0.245.1", features = ["wasmparser"] }
+wit-parser = "0.244"
+wit-bindgen-core = "0.52"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wirm = "4.0.0-rc3"
+#wirm = { path = "../../research/compilers/wirm" }
 
 [dev-dependencies]
 wat = "1"
+tempfile = "3"
+# Used by the `wac_compose` example to demonstrate driving the
+# `wac` crates programmatically with splicer's output.
+wac-parser = "0.9"
+wac-resolver = "0.9"
+wac-graph = "0.9"
