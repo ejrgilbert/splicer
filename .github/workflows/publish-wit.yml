@@ -77,17 +77,30 @@ jobs:
             -o "$GITHUB_WORKSPACE/splicer-${{ inputs.tier }}.wasm" \
             --wit-dir "wit/${{ inputs.tier }}"
 
+      # Done manually, not via bytecodealliance/wkg-github-action, because that
+      # action installs wkg unpinned via `cargo binstall wkg` (its `wkg` input
+      # is declared but unused). Using our pinned wkg ensures the published
+      # manifest/layer descriptors match what was built above.
+      # TODO use wkg action when merged: https://github.com/bytecodealliance/wkg-github-action/pull/12
       - name: Publish to GitHub Container Registry
         id: publish
-        uses: bytecodealliance/wkg-github-action@v5
-        with:
-          oci-reference-without-tag: "ghcr.io/${{ github.repository_owner }}/splicer/${{ inputs.tier }}"
-          file: "splicer-${{ inputs.tier }}.wasm"
-          description: ${{ inputs.description }}
-          source: "https://github.com/${{ github.repository }}"
-          homepage: "https://github.com/${{ github.repository }}"
-          version: ${{ steps.version.outputs.version }}
-          licenses: "Apache-2.0"
+        env:
+          REF: "ghcr.io/${{ github.repository_owner }}/splicer/${{ inputs.tier }}:${{ steps.version.outputs.version }}"
+          FILE: "splicer-${{ inputs.tier }}.wasm"
+        run: |
+          output=$(wkg oci push "$REF" "$FILE" \
+            --annotation "org.opencontainers.image.description=${{ inputs.description }}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.url=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.version=${{ steps.version.outputs.version }}" \
+            --annotation "org.opencontainers.image.licenses=Apache-2.0")
+          echo "$output"
+          digest=$(echo "$output" | grep -oE 'sha256:[0-9a-f]{64}' | head -n 1)
+          if [ -z "$digest" ]; then
+            echo "::error::Could not extract digest from wkg oci push output"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
