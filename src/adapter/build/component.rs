@@ -1336,7 +1336,7 @@ fn emit_handler_resource_types(
         // func_types.
         target_func_ty_base = indices.ty;
         let mut result_cvs: Vec<Option<ComponentValType>> = Vec::new();
-        for (func, FuncSig { params, result }) in funcs.iter().zip(pre_encoded.into_iter()) {
+        for (func, FuncSig { params, result }) in funcs.iter().zip(pre_encoded) {
             indices.ty += 1;
             result_cvs.push(result);
             let mut fty = func_types.function();

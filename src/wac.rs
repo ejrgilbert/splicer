@@ -803,7 +803,7 @@ fn add_to_inject_plan(
     // the injection path so the rest of the WAC generation uses the adapter.
     let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
     let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
-    for (injection, result) in to_inject.iter().zip(contract_results.into_iter()) {
+    for (injection, result) in to_inject.iter().zip(contract_results) {
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
                 // `consumer_split` is the split the adapter inherits
