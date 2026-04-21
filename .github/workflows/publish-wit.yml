@@ -92,3 +92,26 @@ jobs:
           subject-name: ghcr.io/${{ github.repository_owner }}/splicer/${{ inputs.tier }}
           subject-digest: ${{ steps.publish.outputs.digest }}
           push-to-registry: true
+
+      - name: Summarize published artifact
+        env:
+          REF: "ghcr.io/${{ github.repository_owner }}/splicer/${{ inputs.tier }}:${{ steps.version.outputs.version }}"
+          WEB_URL: "https://github.com/${{ github.repository_owner }}/splicer/pkgs/container/splicer%2F${{ inputs.tier }}"
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          {
+            echo "### Published WIT artifact"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| OCI reference | \`$REF\` |"
+            echo "| Digest | \`$DIGEST\` |"
+            echo "| Package page | $WEB_URL |"
+            echo ""
+            echo "Pull with:"
+            echo '```'
+            echo "wkg oci pull $REF"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Published $REF"
+          echo "See: $WEB_URL"
