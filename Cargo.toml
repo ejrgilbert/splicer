@@ -49,6 +49,7 @@ wirm = "4.0.0-rc3"
 [dev-dependencies]
 wat = "1"
 tempfile = "3"
+arbitrary = "1"
 # Used by the `wac_compose` example to demonstrate driving the
 # `wac` crates programmatically with splicer's output.
 wac-parser = "0.9"
