@@ -15,8 +15,13 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Mutex;
 
 const SUBMODULE_PATH: &str = "tests/component-interposition";
+
+// Configs share intermediate output dirs (compositions/, generated-wac/,
+// splits/) in the submodule, so concurrent invocations race. Serialize them.
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn submodule_ready() -> bool {
     let run_sh = Path::new(SUBMODULE_PATH).join("run.sh");
@@ -38,12 +43,16 @@ fn submodule_ready() -> bool {
 }
 
 fn run_config(opt: &str) {
+    // Recover from poisoned lock so one panicking test doesn't cascade.
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     if !submodule_ready() {
         panic!("component-interposition submodule not ready");
     }
+    // Fixtures are checked in, so the per-config build isn't needed.
     let status = Command::new("./run.sh")
         .arg("all")
         .arg(format!("--{}", opt))
+        .arg("--skip-build")
         .current_dir(SUBMODULE_PATH)
         .status()
         .unwrap_or_else(|e| panic!("failed to run ./run.sh all --{}: {}", opt, e));

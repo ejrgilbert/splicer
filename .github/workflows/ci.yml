@@ -55,10 +55,6 @@ jobs:
 
   # Integration tests using the component-interposition submodule.
   # Runs the full splicer + wac + wasmtime pipeline against real components.
-  #
-  # Prerequisites: the submodule's fixtures/ must contain pre-built .comp.wasm
-  # files, and splicer, cviz-cli, wac, and wasm-tools must be installed.
-  # TODO: enable once component-interposition has fixtures/ merged.
   integration:
    name: Integration Tests
    runs-on: ubuntu-latest
