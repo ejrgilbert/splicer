@@ -50,6 +50,13 @@ wirm = "4.0.0-rc3"
 wat = "1"
 tempfile = "3"
 arbitrary = "1"
+# Used only by tests/runtime_pipeline.rs to invoke the composed
+# component and capture stdout. The CLI `wasmtime run --invoke`
+# parser rejects colons in interface paths (e.g. `my:svc/app#run`),
+# so we drive wasmtime via its library API instead.
+wasmtime = { version = "41", features = ["component-model", "component-model-async", "async"] }
+wasmtime-wasi = "41"
+tokio = { version = "1", features = ["rt", "macros"] }
 # Used by the `wac_compose` example to demonstrate driving the
 # `wac` crates programmatically with splicer's output.
 wac-parser = "0.9"
