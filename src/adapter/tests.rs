@@ -12,7 +12,9 @@ use super::*;
 use cviz::model::{
     FuncSignature, InstanceInterface, InterfaceType, TypeArena, ValueType, ValueTypeId,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+mod fuzz;
 
 /// Helper: validate that bytes form a valid component-model binary.
 fn validate_component(bytes: &[u8]) {
@@ -25,78 +27,6 @@ fn validate_component(bytes: &[u8]) {
              (raw bytes written to {}, use `wasm-tools print` to inspect)",
             dbg_path.display(),
         );
-    }
-}
-
-/// Map a primitive or String `ValueType` to its WAT spelling, for use
-/// when rendering function parameter / result types in the synth split.
-/// Panics on anything non-primitive — the synth split generator
-/// expects the resource-handler case to go through the hardcoded WAT
-/// template in [`synth_split`].
-fn wat_type(id: ValueTypeId, arena: &TypeArena) -> String {
-    match arena.lookup_val(id) {
-        ValueType::S32 => "s32".into(),
-        ValueType::U32 => "u32".into(),
-        ValueType::S64 => "s64".into(),
-        ValueType::U64 => "u64".into(),
-        ValueType::S8 => "s8".into(),
-        ValueType::U8 => "u8".into(),
-        ValueType::S16 => "s16".into(),
-        ValueType::U16 => "u16".into(),
-        ValueType::F32 => "f32".into(),
-        ValueType::F64 => "f64".into(),
-        ValueType::Bool => "bool".into(),
-        ValueType::Char => "char".into(),
-        ValueType::String => "string".into(),
-        ValueType::List(inner) => format!("(list {})", wat_type(*inner, arena)),
-        ValueType::FixedSizeList(inner, n) => {
-            format!("(list {} {n})", wat_type(*inner, arena))
-        }
-        ValueType::Option(inner) => format!("(option {})", wat_type(*inner, arena)),
-        ValueType::Result { ok, err } => {
-            let ok_str = ok.map(|id| wat_type(id, arena));
-            let err_str = err.map(|id| wat_type(id, arena));
-            match (ok_str, err_str) {
-                (Some(o), Some(e)) => format!("(result {o} (error {e}))"),
-                (Some(o), None) => format!("(result {o})"),
-                (None, Some(e)) => format!("(result (error {e}))"),
-                (None, None) => "(result)".into(),
-            }
-        }
-        ValueType::Tuple(ids) => {
-            let inner: Vec<String> = ids.iter().map(|id| wat_type(*id, arena)).collect();
-            format!("(tuple {})", inner.join(" "))
-        }
-        ValueType::Record(fields) => {
-            let inner: Vec<String> = fields
-                .iter()
-                .map(|(name, id)| format!(r#"(field "{name}" {})"#, wat_type(*id, arena)))
-                .collect();
-            format!("(record {})", inner.join(" "))
-        }
-        ValueType::Variant(cases) => {
-            let inner: Vec<String> = cases
-                .iter()
-                .map(|(name, opt_id)| match opt_id {
-                    Some(id) => format!(r#"(case "{name}" {})"#, wat_type(*id, arena)),
-                    None => format!(r#"(case "{name}")"#),
-                })
-                .collect();
-            format!("(variant {})", inner.join(" "))
-        }
-        ValueType::Enum(tags) => {
-            let inner: Vec<String> = tags.iter().map(|t| format!(r#""{t}""#)).collect();
-            format!("(enum {})", inner.join(" "))
-        }
-        ValueType::Flags(names) => {
-            let inner: Vec<String> = names.iter().map(|n| format!(r#""{n}""#)).collect();
-            format!("(flags {})", inner.join(" "))
-        }
-        other => panic!(
-            "wat_type: synth split helper only supports primitive + string + \
-             list + compound (option/result/tuple/record/variant/enum/flags) \
-             types, got {other:?}. For resources, use a dedicated WAT template."
-        ),
     }
 }
 
@@ -163,27 +93,45 @@ fn wat_consumer_primitive_only(
     iface: &InstanceInterface,
     arena: &TypeArena,
 ) -> String {
-    // Named-type refs ($fn_{name}) instead of numeric indices, so
-    // inline compound types like `(list u32)` — which the WAT
-    // parser allocates their own type slots for — don't shift the
-    // numbering and break later references.
+    // Import instance types have a specific rule: any type that is
+    // exported (`(export "X" (type (eq N)))`) creates an ADDITIONAL
+    // type slot at N+1, and later types that reference the exported
+    // type must point at the EXPORT slot, not the raw declaration.
+    // See wasi:http's shape: its variant's `(case "DNS-error" 5)`
+    // references the exported record at slot 5, not the raw record at
+    // slot 4. Non-exported compounds can still be referenced by their
+    // raw declaration slot.
     //
-    // Compound types (record / variant / enum / flags) used as
-    // param or result types would fail the component-model
-    // validator's rule that import instance types can't reference
-    // anonymous compounds. Pre-declare each such type as a named
-    // type, export with `(eq $name)`, and reference by $name from
-    // the function signatures.
+    // This helper tracks an "effective" index per compound:
+    //   - exported compound → its export slot
+    //   - non-exported compound → its raw declaration slot
+    //
+    // Previous implementations (named-type-based, or naive numeric)
+    // didn't distinguish exported from non-exported and so miscalc-
+    // ulated references to exported sub-compounds, producing
+    // `instance not valid to be used as import` validation errors.
+    let mut order: Vec<ValueTypeId> = Vec::new();
+    let mut visited: HashSet<ValueTypeId> = HashSet::new();
 
-    // Pre-declare compound types from type_exports. The adapter
-    // aliases these by NAME from the handler instance, so export
-    // names must match the type_exports keys. Each compound gets
-    // TWO type-space slots: the inline declaration and the (eq N)
-    // export. Resources are skipped — the HTTP handler template
-    // handles those with the special alias-outer preamble.
-    let mut compounds: HashMap<ValueTypeId, u32> = HashMap::new();
-    let mut body = String::new();
-    let mut type_idx: u32 = 0;
+    for sig in iface.functions.values() {
+        for &pid in &sig.params {
+            collect_compound_order(pid, arena, &mut visited, &mut order);
+        }
+        for &rid in &sig.results {
+            collect_compound_order(rid, arena, &mut visited, &mut order);
+        }
+    }
+    for &vid in iface.type_exports.values() {
+        collect_compound_order(vid, arena, &mut visited, &mut order);
+    }
+
+    // Multiple `type_exports` keys can point at the same ValueTypeId
+    // (real WIT allows `type foo = u32; type bar = u32;` as two
+    // exports of the same underlying type — and interning in
+    // `TypeArena` collapses them further). Each name gets its own
+    // export; the first export's slot becomes the compound's
+    // "effective" reference index.
+    let mut exports_by_id: HashMap<ValueTypeId, Vec<String>> = HashMap::new();
     for (export_name, &vid) in &iface.type_exports {
         if matches!(
             arena.lookup_val(vid),
@@ -191,42 +139,57 @@ fn wat_consumer_primitive_only(
         ) {
             continue;
         }
-        let body_str = wat_compound_body(vid, arena, &compounds);
-        body.push_str(&format!("      (type (;{type_idx};) {body_str})\n"));
-        let decl_idx = type_idx;
-        type_idx += 1;
-        body.push_str(&format!(
-            "      (export (;{type_idx};) \"{export_name}\" (type (eq {decl_idx})))\n"
-        ));
-        compounds.insert(vid, type_idx);
-        type_idx += 1;
+        exports_by_id
+            .entry(vid)
+            .or_default()
+            .push(export_name.clone());
+    }
+
+    let mut effective: HashMap<ValueTypeId, u32> = HashMap::new();
+    let mut next_slot: u32 = 0;
+    let mut body = String::new();
+
+    for &id in &order {
+        let decl_body = wat_compound_decl_body(id, arena, &effective);
+        body.push_str(&format!("      (type (;{next_slot};) {decl_body})\n"));
+        let decl_slot = next_slot;
+        next_slot += 1;
+        effective.insert(id, decl_slot);
+
+        if let Some(names) = exports_by_id.get(&id) {
+            for (i, export_name) in names.iter().enumerate() {
+                body.push_str(&format!(
+                    "      (export (;{next_slot};) \"{export_name}\" (type (eq {decl_slot})))\n"
+                ));
+                if i == 0 {
+                    effective.insert(id, next_slot);
+                }
+                next_slot += 1;
+            }
+        }
     }
 
     let mut export_lines = String::new();
-    for (name, sig) in &iface.functions {
+    for (fname, sig) in &iface.functions {
         let params: Vec<String> = sig
             .param_names
             .iter()
             .zip(sig.params.iter())
-            .map(|(pname, &pid)| {
-                format!(
-                    r#"(param "{pname}" {})"#,
-                    wat_type_ctx(pid, arena, &compounds)
-                )
-            })
+            .map(|(pn, &pid)| format!(r#"(param "{pn}" {})"#, wat_ref(pid, arena, &effective)))
             .collect();
         let result = match sig.results.first() {
-            Some(&rid) => format!(" (result {})", wat_type_ctx(rid, arena, &compounds)),
+            Some(&rid) => format!(" (result {})", wat_ref(rid, arena, &effective)),
             None => String::new(),
         };
         let async_kw = if sig.is_async { "async " } else { "" };
-        let func_ty_id = format!("$fn_{}", name.replace('-', "_"));
+        let func_slot = next_slot;
         body.push_str(&format!(
-            "      (type {func_ty_id} (func {async_kw}{}{result}))\n",
+            "      (type (;{func_slot};) (func {async_kw}{}{result}))\n",
             params.join(" "),
         ));
+        next_slot += 1;
         export_lines.push_str(&format!(
-            "      (export \"{name}\" (func (type {func_ty_id})))\n"
+            "      (export \"{fname}\" (func (type {func_slot})))\n"
         ));
     }
     body.push_str(&export_lines);
@@ -236,83 +199,111 @@ fn wat_consumer_primitive_only(
     )
 }
 
-/// Render the body of a compound type (what goes inside
-/// `(type (;N;) ...)`), with inner compound references resolved to
-/// their pre-declared export type indices via `compounds`.
-fn wat_compound_body(
+/// Post-order collection: every compound reachable from `id`, children
+/// before parents. Primitives, resources, and async handles are
+/// skipped — resources flow through a different WAT template.
+fn collect_compound_order(
     id: ValueTypeId,
     arena: &TypeArena,
-    compounds: &HashMap<ValueTypeId, u32>,
-) -> String {
+    visited: &mut HashSet<ValueTypeId>,
+    order: &mut Vec<ValueTypeId>,
+) {
+    if !visited.insert(id) {
+        return;
+    }
     match arena.lookup_val(id) {
+        ValueType::Bool
+        | ValueType::S8
+        | ValueType::U8
+        | ValueType::S16
+        | ValueType::U16
+        | ValueType::S32
+        | ValueType::U32
+        | ValueType::S64
+        | ValueType::U64
+        | ValueType::F32
+        | ValueType::F64
+        | ValueType::Char
+        | ValueType::String
+        | ValueType::ErrorContext
+        | ValueType::Resource(_)
+        | ValueType::AsyncHandle
+        | ValueType::Map(_, _) => return,
+        ValueType::List(inner) | ValueType::Option(inner) | ValueType::FixedSizeList(inner, _) => {
+            collect_compound_order(*inner, arena, visited, order);
+        }
+        ValueType::Result { ok, err } => {
+            if let Some(o) = ok {
+                collect_compound_order(*o, arena, visited, order);
+            }
+            if let Some(e) = err {
+                collect_compound_order(*e, arena, visited, order);
+            }
+        }
+        ValueType::Tuple(ids) => {
+            for cid in ids.clone() {
+                collect_compound_order(cid, arena, visited, order);
+            }
+        }
         ValueType::Record(fields) => {
-            let inner: Vec<String> = fields
-                .iter()
-                .map(|(name, fid)| {
-                    format!(
-                        r#"(field "{name}" {})"#,
-                        wat_type_ctx(*fid, arena, compounds)
-                    )
-                })
-                .collect();
-            format!("(record {})", inner.join(" "))
+            for (_, fid) in fields.clone() {
+                collect_compound_order(fid, arena, visited, order);
+            }
         }
         ValueType::Variant(cases) => {
-            let inner: Vec<String> = cases
-                .iter()
-                .map(|(name, opt)| match opt {
-                    Some(cid) => {
-                        format!(
-                            r#"(case "{name}" {})"#,
-                            wat_type_ctx(*cid, arena, compounds)
-                        )
-                    }
-                    None => format!(r#"(case "{name}")"#),
-                })
-                .collect();
-            format!("(variant {})", inner.join(" "))
+            for (_, opt) in cases.clone() {
+                if let Some(cid) = opt {
+                    collect_compound_order(cid, arena, visited, order);
+                }
+            }
         }
-        ValueType::Enum(tags) => {
-            let items: Vec<String> = tags.iter().map(|t| format!(r#""{t}""#)).collect();
-            format!("(enum {})", items.join(" "))
-        }
-        ValueType::Flags(names) => {
-            let items: Vec<String> = names.iter().map(|n| format!(r#""{n}""#)).collect();
-            format!("(flags {})", items.join(" "))
-        }
-        other => panic!(
-            "wat_compound_body: {other:?} should not be in the compounds pre-declaration list"
-        ),
+        ValueType::Enum(_) | ValueType::Flags(_) => {}
+    }
+    order.push(id);
+}
+
+/// Primitive → WAT spelling; compound → its effective type-space
+/// slot (export slot if exported, raw decl slot otherwise).
+fn wat_ref(id: ValueTypeId, arena: &TypeArena, effective: &HashMap<ValueTypeId, u32>) -> String {
+    match arena.lookup_val(id) {
+        ValueType::Bool => "bool".into(),
+        ValueType::S8 => "s8".into(),
+        ValueType::U8 => "u8".into(),
+        ValueType::S16 => "s16".into(),
+        ValueType::U16 => "u16".into(),
+        ValueType::S32 => "s32".into(),
+        ValueType::U32 => "u32".into(),
+        ValueType::S64 => "s64".into(),
+        ValueType::U64 => "u64".into(),
+        ValueType::F32 => "f32".into(),
+        ValueType::F64 => "f64".into(),
+        ValueType::Char => "char".into(),
+        ValueType::String => "string".into(),
+        _ => effective
+            .get(&id)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| panic!("wat_ref: no effective slot for {id:?}")),
     }
 }
 
-/// Like [`wat_type`] but substitutes a numeric type-index reference
-/// for any ValueTypeId found in `compounds` (pre-declared types)
-/// — the index is the EXPORT's slot (`(eq N)`), not the inline
-/// declaration, because component-model validation rejects
-/// anonymous compounds in import instance types.
-fn wat_type_ctx(
+/// Render the body of a compound type declaration (what goes inside
+/// `(type (;N;) …)`). Sub-compound references go through
+/// [`wat_ref`], which picks the correct effective slot.
+fn wat_compound_decl_body(
     id: ValueTypeId,
     arena: &TypeArena,
-    compounds: &HashMap<ValueTypeId, u32>,
+    effective: &HashMap<ValueTypeId, u32>,
 ) -> String {
-    if let Some(idx) = compounds.get(&id) {
-        return idx.to_string();
-    }
     match arena.lookup_val(id) {
-        // Containers — recurse into inner with context so nested
-        // compound refs also get substituted.
-        ValueType::List(inner) => format!("(list {})", wat_type_ctx(*inner, arena, compounds)),
+        ValueType::List(inner) => format!("(list {})", wat_ref(*inner, arena, effective)),
         ValueType::FixedSizeList(inner, n) => {
-            format!("(list {} {n})", wat_type_ctx(*inner, arena, compounds))
+            format!("(list {} {n})", wat_ref(*inner, arena, effective))
         }
-        ValueType::Option(inner) => {
-            format!("(option {})", wat_type_ctx(*inner, arena, compounds))
-        }
+        ValueType::Option(inner) => format!("(option {})", wat_ref(*inner, arena, effective)),
         ValueType::Result { ok, err } => {
-            let ok_str = ok.map(|id| wat_type_ctx(id, arena, compounds));
-            let err_str = err.map(|id| wat_type_ctx(id, arena, compounds));
-            match (ok_str, err_str) {
+            let ok_s = ok.map(|id| wat_ref(id, arena, effective));
+            let err_s = err.map(|id| wat_ref(id, arena, effective));
+            match (ok_s, err_s) {
                 (Some(o), Some(e)) => format!("(result {o} (error {e}))"),
                 (Some(o), None) => format!("(result {o})"),
                 (None, Some(e)) => format!("(result (error {e}))"),
@@ -322,14 +313,36 @@ fn wat_type_ctx(
         ValueType::Tuple(ids) => {
             let inner: Vec<String> = ids
                 .iter()
-                .map(|id| wat_type_ctx(*id, arena, compounds))
+                .map(|id| wat_ref(*id, arena, effective))
                 .collect();
             format!("(tuple {})", inner.join(" "))
         }
-        // Everything else defers to `wat_type` (primitives +
-        // compound-as-inline fallback, though compounds should have
-        // been caught by the `compounds.get` short-circuit above).
-        _ => wat_type(id, arena),
+        ValueType::Record(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(n, fid)| format!(r#"(field "{n}" {})"#, wat_ref(*fid, arena, effective)))
+                .collect();
+            format!("(record {})", inner.join(" "))
+        }
+        ValueType::Variant(cases) => {
+            let inner: Vec<String> = cases
+                .iter()
+                .map(|(n, opt)| match opt {
+                    Some(cid) => format!(r#"(case "{n}" {})"#, wat_ref(*cid, arena, effective)),
+                    None => format!(r#"(case "{n}")"#),
+                })
+                .collect();
+            format!("(variant {})", inner.join(" "))
+        }
+        ValueType::Enum(tags) => {
+            let items: Vec<String> = tags.iter().map(|t| format!(r#""{t}""#)).collect();
+            format!("(enum {})", items.join(" "))
+        }
+        ValueType::Flags(labels) => {
+            let items: Vec<String> = labels.iter().map(|n| format!(r#""{n}""#)).collect();
+            format!("(flags {})", items.join(" "))
+        }
+        other => panic!("wat_compound_decl_body: {other:?} is not a declarable compound"),
     }
 }
 
@@ -1234,290 +1247,4 @@ fn test_adapter_provider_split_resource_handler() {
         SplitKind::Provider,
     );
     validate_component(&bytes);
-}
-
-// ── Phase 1 structural fuzz harness ──────────────────────────────────
-//
-// Generates random `ValueType` trees (bounded depth), wraps each as a
-// single-result async func, and asserts the adapter generator either
-// produces a valid component or bails with a known-limit error. The
-// point is structural coverage of shapes the hand-written tests above
-// have never seen.
-//
-// Env knobs for replay / tuning:
-//   SPLICER_FUZZ_ITERS — iteration count (default 200)
-//   SPLICER_FUZZ_SEED  — base seed (default time-based)
-
-use arbitrary::{Arbitrary, Unstructured};
-
-/// Emit a primitive `ValueType`. Excludes `Resource` / `AsyncHandle` /
-/// `Map` / `ErrorContext` — the synth-split WAT helper panics on those
-/// and they need their own (more involved) test paths.
-fn fuzz_primitive(u: &mut Unstructured<'_>) -> arbitrary::Result<ValueType> {
-    let ctors: &[fn() -> ValueType] = &[
-        || ValueType::Bool,
-        || ValueType::S8,
-        || ValueType::U8,
-        || ValueType::S16,
-        || ValueType::U16,
-        || ValueType::S32,
-        || ValueType::U32,
-        || ValueType::S64,
-        || ValueType::U64,
-        || ValueType::F32,
-        || ValueType::F64,
-        || ValueType::Char,
-        || ValueType::String,
-    ];
-    Ok(ctors[u.choose_index(ctors.len())?]())
-}
-
-/// Recursively build a random `ValueType` tree. `depth == 0` forces
-/// a primitive leaf. `need_export` collects type ids that must appear
-/// in the interface's `type_exports` for the adapter to reference
-/// them (record / variant / enum / flags — matches the convention of
-/// the hand-written tests).
-fn fuzz_value_type(
-    u: &mut Unstructured<'_>,
-    arena: &mut TypeArena,
-    depth: u32,
-    need_export: &mut Vec<ValueTypeId>,
-) -> arbitrary::Result<ValueTypeId> {
-    if depth == 0 {
-        return Ok(arena.intern_val(fuzz_primitive(u)?));
-    }
-
-    // 11 shape constructors — one is "another primitive" so leaves
-    // keep showing up even at higher depths.
-    match u.choose_index(11)? {
-        0 => Ok(arena.intern_val(fuzz_primitive(u)?)),
-        1 => {
-            let inner = fuzz_value_type(u, arena, depth - 1, need_export)?;
-            Ok(arena.intern_val(ValueType::List(inner)))
-        }
-        2 => {
-            let inner = fuzz_value_type(u, arena, depth - 1, need_export)?;
-            let n = u.int_in_range::<u32>(1..=8)?;
-            Ok(arena.intern_val(ValueType::FixedSizeList(inner, n)))
-        }
-        3 => {
-            let count = u.int_in_range(2..=4)?;
-            let mut ids = Vec::with_capacity(count);
-            for _ in 0..count {
-                ids.push(fuzz_value_type(u, arena, depth - 1, need_export)?);
-            }
-            Ok(arena.intern_val(ValueType::Tuple(ids)))
-        }
-        4 => {
-            let inner = fuzz_value_type(u, arena, depth - 1, need_export)?;
-            Ok(arena.intern_val(ValueType::Option(inner)))
-        }
-        5 => {
-            let ok = if bool::arbitrary(u)? {
-                Some(fuzz_value_type(u, arena, depth - 1, need_export)?)
-            } else {
-                None
-            };
-            let err = if bool::arbitrary(u)? {
-                Some(fuzz_value_type(u, arena, depth - 1, need_export)?)
-            } else {
-                None
-            };
-            Ok(arena.intern_val(ValueType::Result { ok, err }))
-        }
-        6 => {
-            let count = u.int_in_range(1..=4)?;
-            let mut fields = Vec::with_capacity(count);
-            for i in 0..count {
-                let fid = fuzz_value_type(u, arena, depth - 1, need_export)?;
-                fields.push((format!("f{i}"), fid));
-            }
-            let id = arena.intern_val(ValueType::Record(fields));
-            need_export.push(id);
-            Ok(id)
-        }
-        7 => {
-            let count = u.int_in_range(1..=4)?;
-            let mut cases = Vec::with_capacity(count);
-            for i in 0..count {
-                let payload = if bool::arbitrary(u)? {
-                    Some(fuzz_value_type(u, arena, depth - 1, need_export)?)
-                } else {
-                    None
-                };
-                cases.push((format!("c{i}"), payload));
-            }
-            let id = arena.intern_val(ValueType::Variant(cases));
-            need_export.push(id);
-            Ok(id)
-        }
-        8 => {
-            let count = u.int_in_range(1..=4)?;
-            let tags: Vec<String> = (0..count).map(|i| format!("t{i}")).collect();
-            let id = arena.intern_val(ValueType::Enum(tags));
-            need_export.push(id);
-            Ok(id)
-        }
-        9 => {
-            // Component Model caps flags at 32 members.
-            let count = u.int_in_range::<usize>(1..=32)?;
-            let labels: Vec<String> = (0..count).map(|i| format!("fl{i}")).collect();
-            let id = arena.intern_val(ValueType::Flags(labels));
-            need_export.push(id);
-            Ok(id)
-        }
-        _ => Ok(arena.intern_val(fuzz_primitive(u)?)),
-    }
-}
-
-/// Deterministic LCG byte source so a failing iteration is replayable
-/// via `SPLICER_FUZZ_SEED` + `SPLICER_FUZZ_ITERS`. Intentionally
-/// avoids bringing in `rand` just for this harness.
-fn fuzz_seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
-    (0..len)
-        .map(|_| {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (state >> 32) as u8
-        })
-        .collect()
-}
-
-/// An error message matching one of these prefixes is an expected
-/// bail — the adapter correctly refused a shape outside its current
-/// support envelope. Anything else is a real failure.
-fn fuzz_is_expected_bail(msg: &str) -> bool {
-    msg.contains("flat parameter values")
-        || msg.contains("flat representation")
-        || msg.contains("exceeds 16") // "flattens to N core values (exceeds 16..."
-        || msg.contains("results; only 0 or 1 results")
-        || msg.contains("not yet implemented")
-}
-
-/// Structural fuzz over random `ValueType` shapes as async results.
-///
-/// `#[ignore]` because it currently surfaces real adapter bugs on a
-/// double-digit fraction of iterations (`task_return_f0` core-sig
-/// mismatches and "instance not valid to be used as import" for
-/// certain compound shapes). Hunting those down is tracked separately.
-///
-/// Run on demand:
-///     cargo test --lib fuzz_structural_shapes -- --ignored --nocapture
-///
-/// Replay a specific failing seed:
-///     SPLICER_FUZZ_SEED=<iter_seed> SPLICER_FUZZ_ITERS=1 \
-///       cargo test --lib fuzz_structural_shapes -- --ignored --nocapture
-#[test]
-#[ignore]
-fn fuzz_structural_shapes() {
-    let iters: usize = std::env::var("SPLICER_FUZZ_ITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
-    let base_seed: u64 = std::env::var("SPLICER_FUZZ_SEED")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0xDEAD_BEEF)
-        });
-    eprintln!("fuzz: iters={iters} base_seed={base_seed}");
-
-    let mut passed = 0usize;
-    let mut expected_bails = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-
-    for i in 0..iters {
-        let iter_seed = base_seed.wrapping_add(i as u64);
-        let bytes = fuzz_seeded_bytes(iter_seed, 256);
-
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut u = Unstructured::new(&bytes);
-            let mut arena = TypeArena::default();
-            let mut need_export: Vec<ValueTypeId> = Vec::new();
-
-            let result_id = fuzz_value_type(&mut u, &mut arena, 2, &mut need_export)
-                .map_err(|_| "ran out of random bytes".to_string())?;
-
-            let type_exports: BTreeMap<String, ValueTypeId> = need_export
-                .iter()
-                .enumerate()
-                .map(|(idx, id)| (format!("ty{idx}"), *id))
-                .collect();
-            let iface = InterfaceType::Instance(InstanceInterface {
-                functions: BTreeMap::from([(
-                    "get".to_string(),
-                    sig(true, &[], vec![], vec![result_id]),
-                )]),
-                type_exports,
-            });
-
-            let tmp = tempfile::tempdir().unwrap();
-            let hooks = [
-                "splicer:tier1/before".to_string(),
-                "splicer:tier1/after".to_string(),
-            ];
-            let split = synth_split("test:fuzz/iface@1.0.0", &iface, &arena, SplitKind::Consumer);
-            let split_path = split.path().to_str().unwrap();
-
-            let gen = crate::adapter::generate_tier1_adapter(
-                "fuzz-mdl",
-                "test:fuzz/iface@1.0.0",
-                &hooks,
-                Some(&iface),
-                tmp.path().to_str().unwrap(),
-                split_path,
-                &arena,
-            );
-
-            match gen {
-                Ok(path) => {
-                    let bytes = std::fs::read(&path).map_err(|e| format!("read: {e}"))?;
-                    let mut validator =
-                        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
-                    validator
-                        .validate_all(&bytes)
-                        .map_err(|e| format!("invalid component: {e}"))?;
-                    Ok::<String, String>("passed".to_string())
-                }
-                Err(e) => {
-                    let msg = format!("{e:#}");
-                    if fuzz_is_expected_bail(&msg) {
-                        Ok("expected-bail".to_string())
-                    } else {
-                        Err(format!("unexpected bail: {msg}"))
-                    }
-                }
-            }
-        }));
-
-        match outcome {
-            Ok(Ok(tag)) if tag == "passed" => passed += 1,
-            Ok(Ok(_)) => expected_bails += 1,
-            Ok(Err(msg)) => failures.push(format!("iter {i} seed {iter_seed}: {msg}")),
-            Err(_) => failures.push(format!("iter {i} seed {iter_seed}: PANIC")),
-        }
-    }
-
-    eprintln!(
-        "fuzz: passed={passed} expected_bails={expected_bails} failures={}",
-        failures.len()
-    );
-    if !failures.is_empty() {
-        for f in failures.iter().take(20) {
-            eprintln!("  {f}");
-        }
-        if failures.len() > 20 {
-            eprintln!("  ... and {} more", failures.len() - 20);
-        }
-        panic!(
-            "{} structural fuzz iterations failed — replay a single case with \
-             SPLICER_FUZZ_SEED=<iter_seed_from_output> SPLICER_FUZZ_ITERS=1",
-            failures.len()
-        );
-    }
 }
