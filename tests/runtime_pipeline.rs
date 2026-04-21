@@ -7,12 +7,14 @@
 //! invokes the composed component's `run` function, and asserts the
 //! expected control-flow markers appear in stdout.
 //!
-//! The test loops over a list of primitive WIT shapes (`u32`, `s64`,
-//! `bool`, `char`, `string`, etc.) rewriting provider's WIT + Rust per
-//! shape and reusing the cargo workspace so incremental compilation
-//! keeps the per-shape cost down. The consumer's outward signature is
-//! shape-agnostic (`run: func()` with `println!("… {r:?}")`), so only
-//! the provider + its copy of the `my:shape` dep WIT change.
+//! The test loops over a list of WIT shapes — primitives (`u32`,
+//! `string`, …) and a first pass of compounds (`option<T>`,
+//! `list<T>`, `tuple<…>`, `record`) — rewriting the provider's WIT +
+//! Rust per shape and reusing the cargo workspace so incremental
+//! compilation keeps the per-shape cost down. The consumer's outward
+//! signature is shape-agnostic (`run: func()` with
+//! `println!("… {r:?}")`), so only the provider + its copy of the
+//! `my:shape` dep WIT change.
 //!
 //! `#[ignore]`'d because cargo-per-shape still adds up; run on demand:
 //!     cargo test --test runtime_pipeline -- --ignored --nocapture
@@ -27,62 +29,263 @@ use std::process::Command;
 
 // ─── Shape catalog ─────────────────────────────────────────────────
 //
-// A `Shape` describes what varies per test iteration. Compounds
-// (record/variant/option/list/…) are a future commit — the emitter
-// + value-construction work fans out from this struct.
+// A `Shape` describes what varies per test iteration: the WIT type
+// that `foo` returns, the matching Rust type in the provider, a
+// concrete value to return, and what that value renders as in Debug
+// output (used only by the pre-splice sanity check).
+//
+// Compounds recurse: Option/List/Tuple wrap another Shape and Record
+// carries a named field list. This is the hardcoded pass — a
+// follow-up commit swaps `shape_catalog()` for an
+// `arbitrary::Arbitrary` impl so the same enum can be fuzzer-driven.
 
-struct Shape {
-    /// Short label used for logging + env-var filtering.
-    name: &'static str,
-    /// Type spelled in WIT, e.g. `u32`, `string`, `char`.
-    wit_type: &'static str,
-    /// Type spelled in Rust (what wit-bindgen generates for it).
-    rust_ty: &'static str,
-    /// Rust expression producing a concrete value of `rust_ty`.
-    rust_literal: &'static str,
-    /// How `{value:?}` renders the literal — used only by the
-    /// pre-splice sanity check that verifies the unspliced pipeline
-    /// threads the value through correctly.
-    expected_debug: &'static str,
+enum Shape {
+    Primitive {
+        /// Short label used for logging + env-var filtering.
+        name: &'static str,
+        /// Type spelled in WIT, e.g. `u32`, `string`, `char`.
+        wit_type: &'static str,
+        /// Type spelled in Rust (what wit-bindgen generates for it).
+        rust_ty: &'static str,
+        /// Rust expression producing a concrete value of that type.
+        rust_literal: &'static str,
+        /// How `{value:?}` renders the literal.
+        expected_debug: &'static str,
+    },
+    Option(Box<Shape>),
+    List(Box<Shape>),
+    Tuple(Vec<Shape>),
+    Record {
+        /// Record name in WIT. Keep single-word to dodge kebab→snake
+        /// casing rules in wit-bindgen-generated field access.
+        wit_name: &'static str,
+        /// PascalCased wit-bindgen-generated Rust type name.
+        rust_name: &'static str,
+        fields: Vec<(&'static str, Shape)>,
+    },
 }
 
-const PRIMITIVE_SHAPES: &[Shape] = &[
-    Shape {
-        name: "u32",
-        wit_type: "u32",
-        rust_ty: "u32",
-        rust_literal: "42u32",
-        expected_debug: "42",
-    },
-    Shape {
-        name: "s64",
-        wit_type: "s64",
-        rust_ty: "i64",
-        rust_literal: "-42i64",
-        expected_debug: "-42",
-    },
-    Shape {
-        name: "bool",
-        wit_type: "bool",
-        rust_ty: "bool",
-        rust_literal: "true",
-        expected_debug: "true",
-    },
-    Shape {
-        name: "char",
-        wit_type: "char",
-        rust_ty: "char",
-        rust_literal: "'x'",
-        expected_debug: "'x'",
-    },
-    Shape {
-        name: "string",
-        wit_type: "string",
-        rust_ty: "String",
-        rust_literal: r#"String::from("hello")"#,
-        expected_debug: r#""hello""#,
-    },
-];
+impl Shape {
+    fn name(&self) -> String {
+        match self {
+            Shape::Primitive { name, .. } => (*name).to_string(),
+            Shape::Option(inner) => format!("option_{}", inner.name()),
+            Shape::List(inner) => format!("list_{}", inner.name()),
+            Shape::Tuple(parts) => {
+                let mut s = String::from("tuple");
+                for p in parts {
+                    s.push('_');
+                    s.push_str(&p.name());
+                }
+                s
+            }
+            Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
+        }
+    }
+
+    fn wit_type(&self) -> String {
+        match self {
+            Shape::Primitive { wit_type, .. } => (*wit_type).to_string(),
+            Shape::Option(inner) => format!("option<{}>", inner.wit_type()),
+            Shape::List(inner) => format!("list<{}>", inner.wit_type()),
+            Shape::Tuple(parts) => {
+                let inside = parts
+                    .iter()
+                    .map(Shape::wit_type)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("tuple<{inside}>")
+            }
+            Shape::Record { wit_name, .. } => (*wit_name).to_string(),
+        }
+    }
+
+    /// Extra interface-level type declarations (e.g.
+    /// `record point { ... }`). Empty for shapes whose WIT signature
+    /// is fully inline.
+    fn wit_decls(&self) -> String {
+        match self {
+            Shape::Record {
+                wit_name, fields, ..
+            } => {
+                let mut s = format!("record {wit_name} {{\n");
+                for (fname, fshape) in fields {
+                    s.push_str(&format!("    {fname}: {},\n", fshape.wit_type()));
+                }
+                s.push('}');
+                s
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn rust_ty(&self) -> String {
+        match self {
+            Shape::Primitive { rust_ty, .. } => (*rust_ty).to_string(),
+            Shape::Option(inner) => format!("Option<{}>", inner.rust_ty()),
+            Shape::List(inner) => format!("Vec<{}>", inner.rust_ty()),
+            Shape::Tuple(parts) => {
+                let inside = parts
+                    .iter()
+                    .map(Shape::rust_ty)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({inside})")
+            }
+            Shape::Record { rust_name, .. } => {
+                format!("bindings::exports::my::shape::api::{rust_name}")
+            }
+        }
+    }
+
+    fn rust_literal(&self) -> String {
+        match self {
+            Shape::Primitive { rust_literal, .. } => (*rust_literal).to_string(),
+            Shape::Option(inner) => format!("Some({})", inner.rust_literal()),
+            Shape::List(inner) => format!("vec![{}]", inner.rust_literal()),
+            Shape::Tuple(parts) => {
+                let inside = parts
+                    .iter()
+                    .map(Shape::rust_literal)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({inside})")
+            }
+            Shape::Record {
+                rust_name, fields, ..
+            } => {
+                let inits = fields
+                    .iter()
+                    .map(|(fname, fshape)| format!("{fname}: {}", fshape.rust_literal()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("bindings::exports::my::shape::api::{rust_name} {{ {inits} }}")
+            }
+        }
+    }
+
+    fn expected_debug(&self) -> String {
+        match self {
+            Shape::Primitive { expected_debug, .. } => (*expected_debug).to_string(),
+            Shape::Option(inner) => format!("Some({})", inner.expected_debug()),
+            Shape::List(inner) => format!("[{}]", inner.expected_debug()),
+            Shape::Tuple(parts) => {
+                let inside = parts
+                    .iter()
+                    .map(Shape::expected_debug)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({inside})")
+            }
+            Shape::Record {
+                rust_name, fields, ..
+            } => {
+                let inits = fields
+                    .iter()
+                    .map(|(fname, fshape)| format!("{fname}: {}", fshape.expected_debug()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{rust_name} {{ {inits} }}")
+            }
+        }
+    }
+}
+
+fn shape_catalog() -> Vec<Shape> {
+    vec![
+        Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "42u32",
+            expected_debug: "42",
+        },
+        Shape::Primitive {
+            name: "s64",
+            wit_type: "s64",
+            rust_ty: "i64",
+            rust_literal: "-42i64",
+            expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "bool",
+            wit_type: "bool",
+            rust_ty: "bool",
+            rust_literal: "true",
+            expected_debug: "true",
+        },
+        Shape::Primitive {
+            name: "char",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'x'",
+            expected_debug: "'x'",
+        },
+        Shape::Primitive {
+            name: "string",
+            wit_type: "string",
+            rust_ty: "String",
+            rust_literal: r#"String::from("hello")"#,
+            expected_debug: r#""hello""#,
+        },
+        Shape::Option(Box::new(Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "7u32",
+            expected_debug: "7",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "1u32",
+            expected_debug: "1",
+        })),
+        Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            },
+            Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("hi")"#,
+                expected_debug: r#""hi""#,
+            },
+        ]),
+        Shape::Record {
+            wit_name: "point",
+            rust_name: "Point",
+            fields: vec![
+                (
+                    "x",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "3u32",
+                        expected_debug: "3",
+                    },
+                ),
+                (
+                    "y",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "5u32",
+                        expected_debug: "5",
+                    },
+                ),
+            ],
+        },
+    ]
+}
 
 // ─── Fixtures that don't vary per shape ────────────────────────────
 
@@ -230,15 +433,34 @@ fn provider_world_wit(shape: &Shape) -> String {
     format!(
         "package my:shape@1.0.0;\n\
          \n\
-         interface api {{\n    \
-             foo: func() -> {wit};\n\
+         interface api {{\n\
+         {body}\
          }}\n\
          \n\
          world provider {{\n    \
              export api;\n\
          }}\n",
-        wit = shape.wit_type,
+        body = api_interface_body(shape),
     )
+}
+
+/// The body shared between the provider's world WIT and the
+/// consumer's copy of `my:shape` — the record/... decls (if any)
+/// followed by the `foo` signature. Every line is 4-space-indented
+/// so the caller can drop it straight inside `interface api { … }`.
+fn api_interface_body(shape: &Shape) -> String {
+    let mut body = String::new();
+    let decls = shape.wit_decls();
+    if !decls.is_empty() {
+        for line in decls.lines() {
+            body.push_str("    ");
+            body.push_str(line);
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(&format!("    foo: func() -> {};\n", shape.wit_type()));
+    body
 }
 
 /// Provider's `src/lib.rs` — returns a literal of the shape's type
@@ -266,8 +488,8 @@ impl Guest for Provider {{
 
 bindings::export!(Provider with_types_in bindings);
 "#,
-        ty = shape.rust_ty,
-        lit = shape.rust_literal,
+        ty = shape.rust_ty(),
+        lit = shape.rust_literal(),
     )
 }
 
@@ -277,18 +499,18 @@ fn consumer_shape_dep_wit(shape: &Shape) -> String {
     format!(
         "package my:shape@1.0.0;\n\
          \n\
-         interface api {{\n    \
-             foo: func() -> {};\n\
+         interface api {{\n\
+         {body}\
          }}\n",
-        shape.wit_type,
+        body = api_interface_body(shape),
     )
 }
 
 // ─── Test ──────────────────────────────────────────────────────────
 
-/// Loop the whole pipeline over a set of primitive shapes, reusing
-/// the cargo workspace for incremental compilation. Default set is
-/// everything in `PRIMITIVE_SHAPES`; override via
+/// Loop the whole pipeline over the catalog of shapes, reusing the
+/// cargo workspace for incremental compilation. Default set is
+/// everything in `shape_catalog()`; override via
 /// `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
@@ -307,17 +529,18 @@ fn test_runtime_pipeline() {
     assert!(
         !shapes.is_empty(),
         "SPLICER_RUNTIME_SHAPES selected no shapes; known: {}",
-        PRIMITIVE_SHAPES
+        shape_catalog()
             .iter()
-            .map(|s| s.name)
+            .map(Shape::name)
             .collect::<Vec<_>>()
             .join(",")
     );
     let mut failures: Vec<(String, String)> = Vec::new();
-    for shape in shapes {
-        eprintln!("\n=== shape: {} ===", shape.name);
+    for shape in &shapes {
+        let shape_name = shape.name();
+        eprintln!("\n=== shape: {shape_name} ===");
         if let Err(e) = write_per_shape_files(root, shape) {
-            failures.push((shape.name.into(), format!("write_per_shape_files: {e}")));
+            failures.push((shape_name.clone(), format!("write_per_shape_files: {e}")));
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -329,8 +552,11 @@ fn test_runtime_pipeline() {
                 .cloned()
                 .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "<non-string panic>".into());
-            failures.push((shape.name.into(), msg));
-            eprintln!("shape `{}`: FAILED — {}", shape.name, failures.last().unwrap().1);
+            failures.push((shape_name.clone(), msg));
+            eprintln!(
+                "shape `{shape_name}`: FAILED — {}",
+                failures.last().unwrap().1
+            );
         }
     }
     if !failures.is_empty() {
@@ -342,16 +568,17 @@ fn test_runtime_pipeline() {
     }
 }
 
-/// Pick which shapes to run. Without the env var, everything in
-/// `PRIMITIVE_SHAPES`. With it, only the comma-separated names.
-fn select_shapes() -> Vec<&'static Shape> {
+/// Pick which shapes to run. Without the env var, the full
+/// `shape_catalog()`. With it, only shapes whose `name()` matches
+/// one of the comma-separated entries.
+fn select_shapes() -> Vec<Shape> {
+    let all = shape_catalog();
     match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
-        None => PRIMITIVE_SHAPES.iter().collect(),
+        None => all,
         Some(csv) => {
-            let wanted: Vec<&str> = csv.split(',').map(str::trim).collect();
-            PRIMITIVE_SHAPES
-                .iter()
-                .filter(|s| wanted.iter().any(|w| *w == s.name))
+            let wanted: Vec<String> = csv.split(',').map(|s| s.trim().to_string()).collect();
+            all.into_iter()
+                .filter(|s| wanted.iter().any(|w| *w == s.name()))
                 .collect()
         }
     }
@@ -450,12 +677,12 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
     let pre_splice_trace =
         invoke_run(&std::fs::read(&composed_path).unwrap()).expect("invoke composed (pre-splice)");
     eprintln!("runtime_pipeline: pre-splice trace:\n{pre_splice_trace}");
-    let expected_pre = format!("consumer: got {}", shape.expected_debug);
+    let shape_name = shape.name();
+    let expected_pre = format!("consumer: got {}", shape.expected_debug());
     assert!(
         pre_splice_trace.contains(&expected_pre),
-        "even without the splice, consumer didn't see the expected value for shape `{}`.\n\
+        "even without the splice, consumer didn't see the expected value for shape `{shape_name}`.\n\
          --- expected substring ---\n{expected_pre}\n--- pre-splice trace ---\n{pre_splice_trace}",
-        shape.name,
     );
 
     // Run the spliced component. See the known-bug NOTE: the tier-1
@@ -473,13 +700,11 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
     ] {
         assert!(
             captured.contains(marker),
-            "post-splice trace missing marker `{marker}` for shape `{}`\n--- trace ---\n{captured}",
-            shape.name,
+            "post-splice trace missing marker `{marker}` for shape `{shape_name}`\n--- trace ---\n{captured}",
         );
     }
     eprintln!(
-        "runtime_pipeline: all control-flow markers fired for shape `{}`",
-        shape.name
+        "runtime_pipeline: all control-flow markers fired for shape `{shape_name}`",
     );
 }
 
