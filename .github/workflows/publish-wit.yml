@@ -16,7 +16,10 @@ on:
         default: "Splicer middleware WIT definitions"
 
 env:
-  WKG_VERSION: "0.15.0"
+  # Pinned to match consumers. Do not bump without coordinating: newer wkg emits
+  # component-model encodings older wkg can't decode, and wkg 0.14+ has stricter
+  # name validation that rejects `[async]` externs in wasi:http et al.
+  WKG_VERSION: "0.13.0"
 
 jobs:
   publish:
