@@ -1,27 +1,90 @@
-//! Phase 2 commit 1: end-to-end runtime pipeline scaffolding.
+//! Phase 2 commit 3: parameterized runtime pipeline.
 //!
 //! Scaffolds three Rust crates (provider, consumer, middleware) plus
 //! their WIT into a tempdir, runs the full splicer pipeline
 //! (cargo build → wasm-tools component new → wac compose →
-//! splicer splice → wac compose), and validates that the final
-//! composed component parses under `wasmparser::Validator`.
+//! splicer splice → wac compose), loads the result under wasmtime,
+//! invokes the composed component's `run` function, and asserts the
+//! expected control-flow markers appear in stdout.
 //!
-//! What this commit proves: the pipeline machinery (scaffolding,
-//! cargo, wit-bindgen, component adaptation, compose, splice) works
-//! end-to-end for a hardcoded `foo(u32) -> u32` shape.
+//! The test loops over a list of primitive WIT shapes (`u32`, `s64`,
+//! `bool`, `char`, `string`, etc.) rewriting provider's WIT + Rust per
+//! shape and reusing the cargo workspace so incremental compilation
+//! keeps the per-shape cost down. The consumer's outward signature is
+//! shape-agnostic (`run: func()` with `println!("… {r:?}")`), so only
+//! the provider + its copy of the `my:shape` dep WIT change.
 //!
-//! Out of scope for commit 1: running the composed component under
-//! wasmtime (commit 2) and parameterizing the shape (commit 3).
+//! `#[ignore]`'d because cargo-per-shape still adds up; run on demand:
+//!     cargo test --test runtime_pipeline -- --ignored --nocapture
 //!
-//! `#[ignore]`'d because the cargo build chain takes tens of seconds
-//! and we don't want it on every `cargo test`. Run on demand:
-//!     cargo test --lib runtime_pipeline_u32 -- --ignored --nocapture
+//! Override the shape list via env var (comma-separated names):
+//!     SPLICER_RUNTIME_SHAPES=u32,string cargo test --test runtime_pipeline \
+//!         -- --ignored --nocapture
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ─── Fixtures (hardcoded `foo(u32) -> u32` shape) ──────────────────
+// ─── Shape catalog ─────────────────────────────────────────────────
+//
+// A `Shape` describes what varies per test iteration. Compounds
+// (record/variant/option/list/…) are a future commit — the emitter
+// + value-construction work fans out from this struct.
+
+struct Shape {
+    /// Short label used for logging + env-var filtering.
+    name: &'static str,
+    /// Type spelled in WIT, e.g. `u32`, `string`, `char`.
+    wit_type: &'static str,
+    /// Type spelled in Rust (what wit-bindgen generates for it).
+    rust_ty: &'static str,
+    /// Rust expression producing a concrete value of `rust_ty`.
+    rust_literal: &'static str,
+    /// How `{value:?}` renders the literal — used only by the
+    /// pre-splice sanity check that verifies the unspliced pipeline
+    /// threads the value through correctly.
+    expected_debug: &'static str,
+}
+
+const PRIMITIVE_SHAPES: &[Shape] = &[
+    Shape {
+        name: "u32",
+        wit_type: "u32",
+        rust_ty: "u32",
+        rust_literal: "42u32",
+        expected_debug: "42",
+    },
+    Shape {
+        name: "s64",
+        wit_type: "s64",
+        rust_ty: "i64",
+        rust_literal: "-42i64",
+        expected_debug: "-42",
+    },
+    Shape {
+        name: "bool",
+        wit_type: "bool",
+        rust_ty: "bool",
+        rust_literal: "true",
+        expected_debug: "true",
+    },
+    Shape {
+        name: "char",
+        wit_type: "char",
+        rust_ty: "char",
+        rust_literal: "'x'",
+        expected_debug: "'x'",
+    },
+    Shape {
+        name: "string",
+        wit_type: "string",
+        rust_ty: "String",
+        rust_literal: r#"String::from("hello")"#,
+        expected_debug: r#""hello""#,
+    },
+];
+
+// ─── Fixtures that don't vary per shape ────────────────────────────
 
 const WORKSPACE_CARGO_TOML: &str = r#"[workspace]
 resolver = "2"
@@ -43,38 +106,6 @@ crate-type = ["cdylib"]
 wit-bindgen = { workspace = true }
 "#;
 
-const PROVIDER_LIB_RS: &str = r#"mod bindings {
-    wit_bindgen::generate!({
-        world: "provider",
-        generate_all
-    });
-}
-
-use bindings::exports::my::shape::api::Guest;
-
-struct Provider;
-
-impl Guest for Provider {
-    fn foo(x: u32) -> u32 {
-        println!("provider: foo({x})");
-        x.wrapping_add(1)
-    }
-}
-
-bindings::export!(Provider with_types_in bindings);
-"#;
-
-const PROVIDER_WORLD_WIT: &str = r#"package my:shape@1.0.0;
-
-interface api {
-    foo: func(x: u32) -> u32;
-}
-
-world provider {
-    export api;
-}
-"#;
-
 const CONSUMER_CARGO_TOML: &str = r#"[package]
 name = "consumer"
 version = "0.1.0"
@@ -85,6 +116,23 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = { workspace = true }
+"#;
+
+// Consumer is shape-agnostic: it calls `api::foo()`, prints via
+// `{r:?}` Debug formatting (which every primitive + every wit-bindgen-
+// generated compound implements), and returns unit. Swapping shapes
+// therefore only requires rewriting `my-shape` (the imported dep) and
+// the provider crate — the consumer stays fixed.
+const CONSUMER_WORLD_WIT: &str = r#"package my:svc@1.0.0;
+
+interface app {
+    run: func();
+}
+
+world consumer {
+    export app;
+    import my:shape/api@1.0.0;
+}
 "#;
 
 const CONSUMER_LIB_RS: &str = r#"mod bindings {
@@ -100,34 +148,14 @@ use bindings::my::shape::api;
 struct Consumer;
 
 impl Guest for Consumer {
-    fn run() -> u32 {
+    fn run() {
         println!("consumer: calling provider");
-        let r = api::foo(10);
-        println!("consumer: got {r}");
-        r
+        let r = api::foo();
+        println!("consumer: got {r:?}");
     }
 }
 
 bindings::export!(Consumer with_types_in bindings);
-"#;
-
-const CONSUMER_WORLD_WIT: &str = r#"package my:svc@1.0.0;
-
-interface app {
-    run: func() -> u32;
-}
-
-world consumer {
-    export app;
-    import my:shape/api@1.0.0;
-}
-"#;
-
-const CONSUMER_SHAPE_DEP_WIT: &str = r#"package my:shape@1.0.0;
-
-interface api {
-    foo: func(x: u32) -> u32;
-}
 "#;
 
 const MIDDLEWARE_CARGO_TOML: &str = r#"[package]
@@ -194,14 +222,77 @@ rules:
         path: "middleware.comp.wasm"
 "#;
 
+// ─── Per-shape emitters ────────────────────────────────────────────
+
+/// Provider's world WIT — the only file that embeds the shape in its
+/// interface signature.
+fn provider_world_wit(shape: &Shape) -> String {
+    format!(
+        "package my:shape@1.0.0;\n\
+         \n\
+         interface api {{\n    \
+             foo: func() -> {wit};\n\
+         }}\n\
+         \n\
+         world provider {{\n    \
+             export api;\n\
+         }}\n",
+        wit = shape.wit_type,
+    )
+}
+
+/// Provider's `src/lib.rs` — returns a literal of the shape's type
+/// and prints it so the trace proves the provider was invoked.
+fn provider_lib_rs(shape: &Shape) -> String {
+    format!(
+        r#"mod bindings {{
+    wit_bindgen::generate!({{
+        world: "provider",
+        generate_all
+    }});
+}}
+
+use bindings::exports::my::shape::api::Guest;
+
+struct Provider;
+
+impl Guest for Provider {{
+    fn foo() -> {ty} {{
+        let v: {ty} = {lit};
+        println!("provider: returning {{v:?}}");
+        v
+    }}
+}}
+
+bindings::export!(Provider with_types_in bindings);
+"#,
+        ty = shape.rust_ty,
+        lit = shape.rust_literal,
+    )
+}
+
+/// Copy of `my:shape`'s interface, committed into the consumer's
+/// `wit/deps/` so wit-bindgen can resolve the import.
+fn consumer_shape_dep_wit(shape: &Shape) -> String {
+    format!(
+        "package my:shape@1.0.0;\n\
+         \n\
+         interface api {{\n    \
+             foo: func() -> {};\n\
+         }}\n",
+        shape.wit_type,
+    )
+}
+
 // ─── Test ──────────────────────────────────────────────────────────
 
-/// End-to-end pipeline sanity test: scaffold → build → compose →
-/// splice → validate. Hardcoded to `foo(u32) -> u32`; commit 3 will
-/// parameterize on `ValueType`.
+/// Loop the whole pipeline over a set of primitive shapes, reusing
+/// the cargo workspace for incremental compilation. Default set is
+/// everything in `PRIMITIVE_SHAPES`; override via
+/// `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
-fn test_runtime_pipeline_u32() {
+fn test_runtime_pipeline() {
     require_tool("cargo");
     require_tool("wasm-tools");
     require_tool("wac");
@@ -210,8 +301,65 @@ fn test_runtime_pipeline_u32() {
     let root = tmp.path();
     eprintln!("runtime_pipeline: work dir = {}", root.display());
 
-    scaffold_workspace(root).expect("scaffold");
+    scaffold_common(root).expect("scaffold common");
 
+    let shapes = select_shapes();
+    assert!(
+        !shapes.is_empty(),
+        "SPLICER_RUNTIME_SHAPES selected no shapes; known: {}",
+        PRIMITIVE_SHAPES
+            .iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for shape in shapes {
+        eprintln!("\n=== shape: {} ===", shape.name);
+        if let Err(e) = write_per_shape_files(root, shape) {
+            failures.push((shape.name.into(), format!("write_per_shape_files: {e}")));
+            continue;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pipeline_for_shape(root, shape)
+        }));
+        if let Err(panic) = result {
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "<non-string panic>".into());
+            failures.push((shape.name.into(), msg));
+            eprintln!("shape `{}`: FAILED — {}", shape.name, failures.last().unwrap().1);
+        }
+    }
+    if !failures.is_empty() {
+        eprintln!("\n=== failures ===");
+        for (name, msg) in &failures {
+            eprintln!("  {name}: {msg}");
+        }
+        panic!("{} of the shape pipelines failed", failures.len());
+    }
+}
+
+/// Pick which shapes to run. Without the env var, everything in
+/// `PRIMITIVE_SHAPES`. With it, only the comma-separated names.
+fn select_shapes() -> Vec<&'static Shape> {
+    match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
+        None => PRIMITIVE_SHAPES.iter().collect(),
+        Some(csv) => {
+            let wanted: Vec<&str> = csv.split(',').map(str::trim).collect();
+            PRIMITIVE_SHAPES
+                .iter()
+                .filter(|s| wanted.iter().any(|w| *w == s.name))
+                .collect()
+        }
+    }
+}
+
+/// Drive the pipeline end-to-end for a single shape: build, wrap,
+/// compose, splice, validate, invoke, assert on markers.
+fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
     run(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip1", "--workspace"])
@@ -235,8 +383,7 @@ fn test_runtime_pipeline_u32() {
 
     // Stage 1: synthesize a composition of provider + consumer via
     // `splicer compose`, which emits a WAC file + prints the exact
-    // `wac compose` command that assembles the final .wasm. Same
-    // pattern splicer itself will use for splicing in stage 2.
+    // `wac compose` command that assembles the final .wasm.
     let compose_wac = root.join("compose.wac");
     let composed_path = root.join("composed.wasm");
     let wac_cmd = emit_wac_command(
@@ -258,8 +405,7 @@ fn test_runtime_pipeline_u32() {
         "wac compose (provider+consumer)",
     );
 
-    // Stage 2: splice the middleware in. Splicer prints the wac
-    // command needed to reassemble; we run it.
+    // Stage 2: splice the middleware in.
     let splice_yaml_path = root.join("splice.yaml");
     std::fs::write(&splice_yaml_path, SPLICE_YAML).unwrap();
     let spliced_wac = root.join("spliced.wac");
@@ -297,56 +443,52 @@ fn test_runtime_pipeline_u32() {
         .expect("final composed component must validate");
     eprintln!("runtime_pipeline: validated {} bytes", bytes.len());
 
-    // Run: invoke the composed component's `run` function via wasmtime
-    // and compare stdout against the expected trace. Every splice
-    // point emits a marker; if all five lines appear in order, every
-    // stage of the pipeline is observably alive.
-    // Sanity check: invoke the UNSPLICED composition first so we
-    // can tell the difference between "splice dropped the return
-    // value" and "the pipeline was broken all along".
-    let pre_splice_trace = invoke_run(&std::fs::read(&composed_path).unwrap())
-        .expect("invoke composed (pre-splice)");
+    // Sanity check: invoke the UNSPLICED composition first so we can
+    // tell "splice dropped the return value" apart from "the pipeline
+    // was broken all along". Here we CAN assert on the value because
+    // nothing between provider and consumer is manipulating it yet.
+    let pre_splice_trace =
+        invoke_run(&std::fs::read(&composed_path).unwrap()).expect("invoke composed (pre-splice)");
     eprintln!("runtime_pipeline: pre-splice trace:\n{pre_splice_trace}");
+    let expected_pre = format!("consumer: got {}", shape.expected_debug);
     assert!(
-        pre_splice_trace.contains("consumer: got 11"),
-        "even without the splice, consumer didn't see 11; \
-         test setup is wrong, not the adapter.\n--- pre-splice trace ---\n{pre_splice_trace}"
+        pre_splice_trace.contains(&expected_pre),
+        "even without the splice, consumer didn't see the expected value for shape `{}`.\n\
+         --- expected substring ---\n{expected_pre}\n--- pre-splice trace ---\n{pre_splice_trace}",
+        shape.name,
     );
 
-    // Run the spliced component. The pipeline validates + runs end-
-    // to-end; every stage is observably alive as long as all five
-    // marker lines show up in order.
-    //
-    // NOTE: we deliberately don't check `consumer: got 11` here. The
-    // pre-splice sanity check above shows the provider returns 11,
-    // but the spliced path shows `got 0` — the tier-1 adapter drops
-    // sync return values when wrapping a sync function with async
-    // before/after hooks. Tracked as a follow-up adapter bug; see
-    // the Phase 2 commit message. Until that's fixed, this test
-    // asserts on the *control-flow markers* that prove each splice
-    // point fires, and leaves the returned value unchecked.
+    // Run the spliced component. See the known-bug NOTE: the tier-1
+    // adapter drops sync return values when wrapping a sync function
+    // with async before/after hooks, so we only assert on the control-
+    // flow markers, not the returned value.
     let captured = invoke_run(&bytes).expect("invoke run()");
     eprintln!("runtime_pipeline: post-splice trace:\n{captured}");
-
     for marker in [
         "consumer: calling provider",
         "mdl: before foo",
-        "provider: foo(10)",
+        "provider: returning ",
         "mdl: after foo",
-        "consumer: got ", // value intentionally omitted; see NOTE above
+        "consumer: got ", // value intentionally unchecked; see NOTE
     ] {
         assert!(
             captured.contains(marker),
-            "post-splice trace missing marker `{marker}`\n--- trace ---\n{captured}"
+            "post-splice trace missing marker `{marker}` for shape `{}`\n--- trace ---\n{captured}",
+            shape.name,
         );
     }
-    eprintln!("runtime_pipeline: all control-flow markers fired");
+    eprintln!(
+        "runtime_pipeline: all control-flow markers fired for shape `{}`",
+        shape.name
+    );
 }
 
-/// Load the composed component, call `my:svc/app#run`, return
+/// Load the composed component, call `my:svc/app@1.0.0#run`, return
 /// whatever the guest wrote to stdout. The spliced adapter uses
 /// `task.return`, so the `component-model-async` feature + async
-/// wasmtime config are required.
+/// wasmtime config are required. `run` returns unit, so its typed
+/// signature is `TypedFunc<(), ()>` regardless of the shape flowing
+/// through `my:shape/api`.
 fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
     use wasmtime::component::{Component, Linker, ResourceTable, TypedFunc};
     use wasmtime::{Config, Engine, Store};
@@ -392,7 +534,6 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
 
     rt.block_on(async {
         let instance = linker.instantiate_async(&mut store, &component).await?;
-        // Navigate to `my:svc/app@1.0.0` → `run`.
         let app_idx = instance
             .get_export_index(&mut store, None, "my:svc/app@1.0.0")
             .context("component has no `my:svc/app@1.0.0` export")?;
@@ -402,8 +543,8 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
         let run_func = instance
             .get_func(&mut store, run_idx)
             .context("run export is not a func")?;
-        let typed: TypedFunc<(), (u32,)> = run_func.typed(&store)?;
-        let (_ret,) = typed.call_async(&mut store, ()).await?;
+        let typed: TypedFunc<(), ()> = run_func.typed(&store)?;
+        typed.call_async(&mut store, ()).await?;
         typed.post_return_async(&mut store).await?;
         Ok::<_, anyhow::Error>(())
     })?;
@@ -412,7 +553,7 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────
+// ─── Scaffolding helpers ───────────────────────────────────────────
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -440,25 +581,20 @@ fn run(cmd: &mut Command, label: &str) {
     }
 }
 
-fn scaffold_workspace(root: &Path) -> std::io::Result<()> {
+/// One-time setup: workspace + shape-independent crates (consumer +
+/// middleware). Per-shape `write_per_shape_files` then overwrites the
+/// provider crate and the consumer's `deps/my-shape` copy on each
+/// iteration.
+fn scaffold_common(root: &Path) -> std::io::Result<()> {
     std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML)?;
 
-    write_crate(
-        root,
-        "provider",
-        PROVIDER_CARGO_TOML,
-        PROVIDER_LIB_RS,
-        &[("world.wit", PROVIDER_WORLD_WIT)],
-    )?;
+    write_crate(root, "provider", PROVIDER_CARGO_TOML, "// placeholder\n", &[])?;
     write_crate(
         root,
         "consumer",
         CONSUMER_CARGO_TOML,
         CONSUMER_LIB_RS,
-        &[
-            ("world.wit", CONSUMER_WORLD_WIT),
-            ("deps/my-shape-1.0.0/package.wit", CONSUMER_SHAPE_DEP_WIT),
-        ],
+        &[("world.wit", CONSUMER_WORLD_WIT)],
     )?;
     write_crate(
         root,
@@ -473,6 +609,25 @@ fn scaffold_workspace(root: &Path) -> std::io::Result<()> {
             ),
         ],
     )?;
+    Ok(())
+}
+
+/// Per-shape setup: rewrite the provider crate's source + WIT and the
+/// consumer's `deps/my-shape` copy. Everything else (workspace,
+/// middleware, consumer's own world) is stable across shapes.
+fn write_per_shape_files(root: &Path, shape: &Shape) -> std::io::Result<()> {
+    let provider_lib = provider_lib_rs(shape);
+    let provider_world = provider_world_wit(shape);
+    let dep_wit = consumer_shape_dep_wit(shape);
+
+    std::fs::write(root.join("provider/src/lib.rs"), provider_lib)?;
+    let provider_wit_dir = root.join("provider/wit");
+    std::fs::create_dir_all(&provider_wit_dir)?;
+    std::fs::write(provider_wit_dir.join("world.wit"), provider_world)?;
+
+    let dep_dir = root.join("consumer/wit/deps/my-shape-1.0.0");
+    std::fs::create_dir_all(&dep_dir)?;
+    std::fs::write(dep_dir.join("package.wit"), dep_wit)?;
     Ok(())
 }
 
