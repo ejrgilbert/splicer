@@ -55,6 +55,7 @@ struct Provider;
 
 impl Guest for Provider {
     fn foo(x: u32) -> u32 {
+        println!("provider: foo({x})");
         x.wrapping_add(1)
     }
 }
@@ -99,7 +100,10 @@ struct Consumer;
 
 impl Guest for Consumer {
     fn run() -> u32 {
-        api::foo(10)
+        println!("consumer: calling provider");
+        let r = api::foo(10);
+        println!("consumer: got {r}");
+        r
     }
 }
 
@@ -151,11 +155,15 @@ use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
 struct Mdl;
 
 impl BeforeGuest for Mdl {
-    async fn before_call(_name: String) {}
+    async fn before_call(name: String) {
+        println!("mdl: before {name}");
+    }
 }
 
 impl AfterGuest for Mdl {
-    async fn after_call(_name: String) {}
+    async fn after_call(name: String) {
+        println!("mdl: after {name}");
+    }
 }
 
 bindings::export!(Mdl with_types_in bindings);
@@ -169,7 +177,7 @@ world mdl {
 }
 "#;
 
-const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../../../wit/tier1/world.wit");
+const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
 
 const SPLICE_YAML: &str = r#"version: 1
 
@@ -280,13 +288,20 @@ fn test_runtime_pipeline_u32() {
     );
 
     // Validate: parse the final bytes and check the component-model
-    // validator accepts them. No runtime execution this commit.
+    // validator accepts them.
     let bytes = std::fs::read(&final_path).expect("read final.wasm");
     let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
     validator
         .validate_all(&bytes)
         .expect("final composed component must validate");
     eprintln!("runtime_pipeline: validated {} bytes", bytes.len());
+
+    // Run: invoke the composed component's `run` function via wasmtime
+    // and compare stdout against the expected trace. Every splice
+    // point emits a marker; if all five lines appear in order, every
+    // stage of the pipeline is observably alive.
+    // Runtime invocation (wasmtime library API) goes here next — see
+    // commit 2 notes below.
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────
