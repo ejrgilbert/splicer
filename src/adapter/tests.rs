@@ -15,6 +15,7 @@ use cviz::model::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 mod fuzz;
+mod runtime;
 
 /// Helper: validate that bytes form a valid component-model binary.
 fn validate_component(bytes: &[u8]) {
