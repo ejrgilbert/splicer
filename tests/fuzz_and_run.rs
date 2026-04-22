@@ -24,8 +24,14 @@
 //!         -- --ignored --nocapture
 
 use anyhow::Context;
+use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Package name emitted at the top of the generated WAC source. Matches
+/// the CLI's default so our test WAC is identical byte-for-byte to
+/// what `splicer compose`/`splicer splice` write.
+const WAC_PACKAGE_NAME: &str = "example:composition";
 
 // ─── Tunables ──────────────────────────────────────────────────────
 //
@@ -530,7 +536,14 @@ world mdl {
 
 const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
 
-const SPLICE_YAML_BETWEEN: &str = r#"version: 1
+/// Placeholder replaced at call time with the absolute path of the
+/// middleware component. The YAML must reference an absolute path
+/// because `splicer::splice` resolves `inject.path` against the
+/// process cwd — integration tests run from the project root, not
+/// the scaffold tempdir, so a relative path wouldn't resolve.
+const MIDDLEWARE_PATH_PLACEHOLDER: &str = "{MIDDLEWARE_PATH}";
+
+const SPLICE_YAML_BETWEEN_TMPL: &str = r#"version: 1
 
 rules:
   - between:
@@ -541,7 +554,7 @@ rules:
         name: consumer-comp
     inject:
       - name: mdl
-        path: "middleware.comp.wasm"
+        path: "{MIDDLEWARE_PATH}"
 "#;
 
 /// Before-rule variant: insert middleware in front of the provider's
@@ -550,7 +563,7 @@ rules:
 /// Uses `provider.alias: prov` because the auto-derived shim-instance
 /// variable name (`shape-api@1-0-0-shim-instance`) would contain `@`,
 /// which WAC rejects as an identifier.
-const SPLICE_YAML_BEFORE: &str = r#"version: 1
+const SPLICE_YAML_BEFORE_TMPL: &str = r#"version: 1
 
 rules:
   - before:
@@ -559,8 +572,15 @@ rules:
         alias: "prov"
     inject:
       - name: mdl
-        path: "middleware.comp.wasm"
+        path: "{MIDDLEWARE_PATH}"
 "#;
+
+fn splice_yaml(tmpl: &str, middleware_path: &Path) -> String {
+    tmpl.replace(
+        MIDDLEWARE_PATH_PLACEHOLDER,
+        middleware_path.to_str().expect("middleware path utf8"),
+    )
+}
 
 /// Which splicer rule kind the pipeline should exercise.
 #[derive(Clone, Copy)]
@@ -677,7 +697,14 @@ fn test_canned() {
     require_splicer_toolchain();
 
     let tmp = tempfile::tempdir().expect("mktempdir");
-    let root = tmp.path();
+    let root_buf = tmp.path().to_path_buf();
+    // SPLICER_KEEP_TMPDIR=1 disables auto-cleanup so post-mortem
+    // inspection (wasm-tools print, cat *.wac) is possible.
+    if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
+        eprintln!("(keeping tmpdir: {})", root_buf.display());
+        std::mem::forget(tmp);
+    }
+    let root = root_buf.as_path();
     eprintln!("canned: work dir = {}", root.display());
 
     scaffold_common(root).expect("scaffold common");
@@ -745,7 +772,14 @@ fn test_fuzz() {
     eprintln!("fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth}");
 
     let tmp = tempfile::tempdir().expect("mktempdir");
-    let root = tmp.path();
+    let root_buf = tmp.path().to_path_buf();
+    // SPLICER_KEEP_TMPDIR=1 disables auto-cleanup so post-mortem
+    // inspection (wasm-tools print, cat *.wac) is possible.
+    if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
+        eprintln!("(keeping tmpdir: {})", root_buf.display());
+        std::mem::forget(tmp);
+    }
+    let root = root_buf.as_path();
     eprintln!("fuzz: work dir = {}", root.display());
     scaffold_common(root).expect("scaffold common");
 
@@ -841,9 +875,7 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
 
     let provider_comp = wrap_component(root, "provider", &adapter);
     let consumer_comp = wrap_component(root, "consumer", &adapter);
-    // wrap_component writes middleware.comp.wasm at root/; splice YAMLs
-    // reference it by that relative path.
-    let _middleware_comp = wrap_component(root, "middleware", &adapter);
+    let middleware_comp = wrap_component(root, "middleware", &adapter);
 
     // Pre-splice composition of provider+consumer. Used as the
     // baseline we invoke to prove the pipeline threads the value
@@ -870,9 +902,9 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
         eprintln!("pipeline[{kind_tag}]: splicing shape `{shape_name}`");
 
         let final_path = match kind {
-            PipelineKind::Between => splice_between(root, &composed_path),
+            PipelineKind::Between => splice_between(root, &composed_path, &middleware_comp),
             PipelineKind::Before => {
-                splice_before_and_compose(root, &provider_comp, &consumer_comp)
+                splice_before_and_compose(root, &provider_comp, &consumer_comp, &middleware_comp)
             }
         };
 
@@ -904,9 +936,7 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
                 "[{kind_tag}] post-splice trace missing marker `{marker}` for shape `{shape_name}`\n--- trace ---\n{captured}",
             );
         }
-        eprintln!(
-            "pipeline[{kind_tag}]: all control-flow markers fired for shape `{shape_name}`"
-        );
+        eprintln!("pipeline[{kind_tag}]: all control-flow markers fired for shape `{shape_name}`");
     }
 }
 
@@ -917,27 +947,26 @@ const ALL_PIPELINE_KINDS: &[PipelineKind] = &[PipelineKind::Between, PipelineKin
 
 /// Run `splicer compose` + `wac compose` on provider + consumer to
 /// produce the pre-splice composed.wasm.
-fn compose_provider_consumer(
-    root: &Path,
-    provider_comp: &Path,
-    consumer_comp: &Path,
-) -> PathBuf {
+fn compose_provider_consumer(root: &Path, provider_comp: &Path, consumer_comp: &Path) -> PathBuf {
     let compose_wac = root.join("compose.wac");
     let composed_path = root.join("composed.wasm");
-    let wac_cmd = emit_wac_command(
-        Command::new("splicer")
-            .args([
-                "compose",
-                provider_comp.to_str().unwrap(),
-                consumer_comp.to_str().unwrap(),
-                "-o",
-                compose_wac.to_str().unwrap(),
-            ])
-            .current_dir(root),
-        "splicer compose",
-    );
+    let out = compose(ComposeRequest {
+        components: vec![
+            ComponentInput {
+                alias: None,
+                path: provider_comp.to_path_buf(),
+            },
+            ComponentInput {
+                alias: None,
+                path: consumer_comp.to_path_buf(),
+            },
+        ],
+        package_name: WAC_PACKAGE_NAME.to_string(),
+    })
+    .expect("splicer::compose");
+    std::fs::write(&compose_wac, &out.wac).expect("write compose.wac");
     run_wac_command(
-        &wac_cmd,
+        &out.wac_compose_cmd(compose_wac.to_str().unwrap()),
         &composed_path,
         root,
         "wac compose (provider+consumer)",
@@ -947,30 +976,23 @@ fn compose_provider_consumer(
 
 /// Splice middleware into the interface boundary of an already-
 /// composed provider+consumer binary. Returns final.wasm.
-fn splice_between(root: &Path, composed_path: &Path) -> PathBuf {
-    let splice_yaml_path = root.join("between.yaml");
-    std::fs::write(&splice_yaml_path, SPLICE_YAML_BETWEEN).unwrap();
+fn splice_between(root: &Path, composed_path: &Path, middleware_comp: &Path) -> PathBuf {
     let spliced_wac = root.join("spliced.wac");
     let splits_dir = root.join("splits");
     std::fs::create_dir_all(&splits_dir).unwrap();
 
-    let splice_wac_cmd = emit_wac_command(
-        Command::new("splicer")
-            .args([
-                "splice",
-                splice_yaml_path.to_str().unwrap(),
-                composed_path.to_str().unwrap(),
-                "-o",
-                spliced_wac.to_str().unwrap(),
-                "-d",
-                splits_dir.to_str().unwrap(),
-            ])
-            .current_dir(root),
-        "splicer splice (between)",
-    );
+    let out = splice(SpliceRequest {
+        composition_wasm: composed_path.to_path_buf(),
+        rules_yaml: splice_yaml(SPLICE_YAML_BETWEEN_TMPL, middleware_comp),
+        package_name: WAC_PACKAGE_NAME.to_string(),
+        splits_dir: splits_dir.clone(),
+        skip_type_check: false,
+    })
+    .expect("splicer::splice (between)");
+    std::fs::write(&spliced_wac, &out.wac).expect("write spliced.wac");
     let final_path = root.join("final.wasm");
     run_wac_command(
-        &splice_wac_cmd,
+        &out.wac_compose_cmd(spliced_wac.to_str().unwrap()),
         &final_path,
         root,
         "wac compose (post-between-splice)",
@@ -984,53 +1006,50 @@ fn splice_before_and_compose(
     root: &Path,
     provider_comp: &Path,
     consumer_comp: &Path,
+    middleware_comp: &Path,
 ) -> PathBuf {
-    // Step 1: splice against lone provider.
-    let splice_yaml_path = root.join("before.yaml");
-    std::fs::write(&splice_yaml_path, SPLICE_YAML_BEFORE).unwrap();
+    // Step 1: splice against the lone provider.
     let before_wac = root.join("before_splice.wac");
     let splits_dir = root.join("splits_before");
     std::fs::create_dir_all(&splits_dir).unwrap();
 
-    let before_cmd = emit_wac_command(
-        Command::new("splicer")
-            .args([
-                "splice",
-                splice_yaml_path.to_str().unwrap(),
-                provider_comp.to_str().unwrap(),
-                "-o",
-                before_wac.to_str().unwrap(),
-                "-d",
-                splits_dir.to_str().unwrap(),
-            ])
-            .current_dir(root),
-        "splicer splice (before)",
-    );
+    let splice_out = splice(SpliceRequest {
+        composition_wasm: provider_comp.to_path_buf(),
+        rules_yaml: splice_yaml(SPLICE_YAML_BEFORE_TMPL, middleware_comp),
+        package_name: WAC_PACKAGE_NAME.to_string(),
+        splits_dir: splits_dir.clone(),
+        skip_type_check: false,
+    })
+    .expect("splicer::splice (before)");
+    std::fs::write(&before_wac, &splice_out.wac).expect("write before_splice.wac");
     let spliced_provider = root.join("spliced_provider.wasm");
     run_wac_command(
-        &before_cmd,
+        &splice_out.wac_compose_cmd(before_wac.to_str().unwrap()),
         &spliced_provider,
         root,
         "wac compose (before-splice provider)",
     );
 
-    // Step 2: compose spliced provider with the consumer.
+    // Step 2: compose the spliced provider with the consumer.
     let compose_wac = root.join("final_compose.wac");
-    let compose_cmd = emit_wac_command(
-        Command::new("splicer")
-            .args([
-                "compose",
-                spliced_provider.to_str().unwrap(),
-                consumer_comp.to_str().unwrap(),
-                "-o",
-                compose_wac.to_str().unwrap(),
-            ])
-            .current_dir(root),
-        "splicer compose (spliced_provider+consumer)",
-    );
+    let compose_out = compose(ComposeRequest {
+        components: vec![
+            ComponentInput {
+                alias: None,
+                path: spliced_provider.clone(),
+            },
+            ComponentInput {
+                alias: None,
+                path: consumer_comp.to_path_buf(),
+            },
+        ],
+        package_name: WAC_PACKAGE_NAME.to_string(),
+    })
+    .expect("splicer::compose (spliced_provider+consumer)");
+    std::fs::write(&compose_wac, &compose_out.wac).expect("write final_compose.wac");
     let final_path = root.join("final.wasm");
     run_wac_command(
-        &compose_cmd,
+        &compose_out.wac_compose_cmd(compose_wac.to_str().unwrap()),
         &final_path,
         root,
         "wac compose (spliced_provider+consumer)",
@@ -1238,24 +1257,6 @@ fn write_crate(
         std::fs::write(path, contents)?;
     }
     Ok(())
-}
-
-/// Run `splicer compose` / `splicer splice` and return the emitted
-/// `wac compose …` command line (printed on stdout).
-fn emit_wac_command(cmd: &mut Command, label: &str) -> String {
-    let out = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("{label}: spawn failed: {e}"));
-    if !out.status.success() {
-        panic!(
-            "{label}: exit {:?}\nstdout:\n{}\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-    }
-    let s = String::from_utf8(out.stdout).expect("splicer stdout utf8");
-    s.trim().to_string()
 }
 
 /// Run the `wac compose …` shell command splicer emits, appending
