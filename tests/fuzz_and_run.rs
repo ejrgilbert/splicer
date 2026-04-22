@@ -27,7 +27,7 @@ use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ─── Shape catalog ─────────────────────────────────────────────────
+// ─── Shape definitions ────────────────────────────────────────────
 //
 // A `Shape` describes what varies per test iteration: the WIT type
 // that `foo` returns, the matching Rust type in the provider, a
@@ -35,7 +35,7 @@ use std::process::Command;
 // output (used only by the pre-splice sanity check).
 //
 // Compounds recurse: Option/List/Tuple wrap another Shape and Record
-// carries a named field list. `shape_catalog()` is the hardcoded
+// carries a named field list. `canned_shapes()` is the hardcoded
 // deterministic coverage; `gen_shape()` drives the same enum from an
 // `arbitrary::Unstructured` for the fuzz test below.
 
@@ -192,8 +192,8 @@ impl Shape {
     }
 }
 
-/// The primitive shapes that both the hardcoded catalog and the
-/// fuzz generator draw from. Kept as a function (not a const) because
+/// The primitive shapes that both the canned list and the fuzz
+/// generator draw from. Kept as a function (not a const) because
 /// `Shape::Primitive` is not const-constructible with nested lifetimes.
 fn primitive_atoms() -> Vec<Shape> {
     vec![
@@ -235,7 +235,7 @@ fn primitive_atoms() -> Vec<Shape> {
     ]
 }
 
-fn shape_catalog() -> Vec<Shape> {
+fn canned_shapes() -> Vec<Shape> {
     let mut v = primitive_atoms();
     v.extend(vec![
         Shape::Option(Box::new(Shape::Primitive {
@@ -600,9 +600,9 @@ fn consumer_shape_dep_wit(shape: &Shape) -> String {
 
 // ─── Test ──────────────────────────────────────────────────────────
 
-/// Loop the whole pipeline over the catalog of shapes, reusing the
+/// Loop the whole pipeline over the canned shape list, reusing the
 /// cargo workspace for incremental compilation. Default set is
-/// everything in `shape_catalog()`; override via
+/// everything in `canned_shapes()`; override via
 /// `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
@@ -619,7 +619,7 @@ fn test_canned() {
     assert!(
         !shapes.is_empty(),
         "SPLICER_RUNTIME_SHAPES selected no shapes; known: {}",
-        shape_catalog()
+        canned_shapes()
             .iter()
             .map(Shape::name)
             .collect::<Vec<_>>()
@@ -741,10 +741,10 @@ fn test_fuzz() {
 }
 
 /// Pick which shapes to run. Without the env var, the full
-/// `shape_catalog()`. With it, only shapes whose `name()` matches
+/// `canned_shapes()`. With it, only shapes whose `name()` matches
 /// one of the comma-separated entries.
 fn select_shapes() -> Vec<Shape> {
-    let all = shape_catalog();
+    let all = canned_shapes();
     match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
         None => all,
         Some(csv) => {
