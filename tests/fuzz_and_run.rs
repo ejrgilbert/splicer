@@ -918,18 +918,15 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
             .unwrap_or_else(|e| panic!("[{kind_tag}] final component failed validation: {e}"));
         eprintln!("pipeline[{kind_tag}]: validated {} bytes", bytes.len());
 
-        // Invoke the spliced component. See the known-bug NOTE: the
-        // tier-1 adapter drops sync return values when wrapping a
-        // sync function with async before/after hooks, so we only
-        // assert on the control-flow markers, not the returned value.
         let captured = invoke_run(&bytes).expect("invoke run()");
         eprintln!("pipeline[{kind_tag}]: post-splice trace:\n{captured}");
+        let expected_got = format!("consumer: got {}", shape.expected_debug());
         for marker in [
             "consumer: calling provider",
             "mdl: before foo",
             "provider: returning ",
             "mdl: after foo",
-            "consumer: got ", // value intentionally unchecked; see NOTE
+            expected_got.as_str(),
         ] {
             assert!(
                 captured.contains(marker),

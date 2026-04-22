@@ -49,6 +49,12 @@ pub(crate) struct InstTypeCtx {
     /// Maps resource ValueTypeId → local alias index within the instance type.
     /// Populated by the caller after emitting `alias outer` declarations.
     pub alias_locals: HashMap<ValueTypeId, u32>,
+    /// Named compounds to export from the instance type. Nominal
+    /// types (record / variant / enum / flags) must be exported for
+    /// the instance to be valid as an import; when a vid is in this
+    /// map, `encode_cv` appends `(export "<name>" (type (eq N)))` and
+    /// returns the export index instead of the raw type index.
+    pub compound_exports: HashMap<ValueTypeId, String>,
 }
 
 impl InstTypeCtx {
@@ -58,6 +64,7 @@ impl InstTypeCtx {
             resource_exports: Vec::new(),
             outer_resources: HashMap::new(),
             alias_locals: HashMap::new(),
+            compound_exports: HashMap::new(),
         }
     }
 
@@ -67,6 +74,7 @@ impl InstTypeCtx {
             resource_exports: Vec::new(),
             outer_resources: outer,
             alias_locals: HashMap::new(),
+            compound_exports: HashMap::new(),
         }
     }
 
@@ -272,6 +280,18 @@ impl InstTypeCtx {
                 other
             ),
         };
+
+        // Named-compound path: the validator rejects an import
+        // instance that references a nominal type (record / variant /
+        // enum / flags) without an export identity. When `compound_exports`
+        // has a name for this vid, export it and use the export's
+        // index for references.
+        if let Some(name) = self.compound_exports.get(&id).cloned() {
+            let export_idx = inst.type_count();
+            inst.export(&name, ComponentTypeRef::Type(TypeBounds::Eq(local_idx)));
+            self.cache.insert(id, export_idx);
+            return Ok(ComponentValType::Type(export_idx));
+        }
 
         self.cache.insert(id, local_idx);
         Ok(ComponentValType::Type(local_idx))
