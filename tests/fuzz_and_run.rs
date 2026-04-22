@@ -43,10 +43,12 @@ const WAC_PACKAGE_NAME: &str = "example:composition";
 /// Pinned default seed — CI runs produce the same shape sequence
 /// every time. Override with `SPLICER_FUZZ_SEED=<u64>` to explore.
 const DEFAULT_FUZZ_SEED: u64 = 0xDEAD_BEEF;
-/// Default iterations per fuzz run.
-const DEFAULT_FUZZ_ITERS: u32 = 8;
+/// Default iterations per fuzz run. Local runs take ~90s at this
+/// setting; CI overrides via `SPLICER_FUZZ_ITERS` for heavier
+/// coverage.
+const DEFAULT_FUZZ_ITERS: u32 = 30;
 /// Max recursion depth for generated shape trees.
-const DEFAULT_FUZZ_DEPTH: u32 = 3;
+const DEFAULT_FUZZ_DEPTH: u32 = 4;
 /// Random bytes drawn per fuzz iteration. Large enough to sustain a
 /// DEFAULT_FUZZ_DEPTH-deep shape tree without `int_in_range` running
 /// short.
@@ -58,6 +60,12 @@ const MAX_FAILURES_SHOWN: usize = 20;
 const TUPLE_ARITY: std::ops::RangeInclusive<usize> = 2..=3;
 /// WIT field names for generated records.
 const RECORD_FIELD_NAMES: &[&str] = &["a", "b", "c"];
+/// Distinct WIT record names the generator cycles through; length
+/// caps the number of records per shape tree (further records fall
+/// back to a primitive to keep names unique).
+const GEN_RECORD_WIT_NAMES: &[&str] = &["rec0", "rec1", "rec2", "rec3", "rec4", "rec5", "rec6"];
+/// wit-bindgen-generated Rust names for `GEN_RECORD_WIT_NAMES`.
+const GEN_RECORD_RUST_NAMES: &[&str] = &["Rec0", "Rec1", "Rec2", "Rec3", "Rec4", "Rec5", "Rec6"];
 /// In-memory stdout buffer for captured guest output (1 MiB).
 const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 
@@ -362,13 +370,19 @@ fn gen_shape(
     u: &mut arbitrary::Unstructured<'_>,
     max_depth: u32,
     allow_record: bool,
+    record_counter: &mut usize,
 ) -> arbitrary::Result<Shape> {
     let can_recurse = max_depth > 0;
+    // Records get unique names from GEN_RECORD_{WIT,RUST}_NAMES; once
+    // that pool is exhausted we fall back to emitting a primitive to
+    // keep every record in a tree distinct.
+    let records_exhausted = *record_counter >= GEN_RECORD_WIT_NAMES.len();
     // 0=primitive, 1=option, 2=list, 3=tuple, 4=record
-    let max_kind: u8 = match (can_recurse, allow_record) {
-        (false, _) => 0,
-        (true, false) => 3,
-        (true, true) => 4,
+    let max_kind: u8 = match (can_recurse, allow_record, records_exhausted) {
+        (false, _, _) => 0,
+        (true, false, _) => 3,
+        (true, true, false) => 4,
+        (true, true, true) => 3,
     };
     let kind: u8 = u.int_in_range(0..=max_kind)?;
     match kind {
@@ -377,30 +391,34 @@ fn gen_shape(
             u,
             max_depth - 1,
             allow_record,
+            record_counter,
         )?))),
         2 => Ok(Shape::List(Box::new(gen_shape(
             u,
             max_depth - 1,
             allow_record,
+            record_counter,
         )?))),
         3 => {
             let n: usize = u.int_in_range(TUPLE_ARITY)?;
             let parts: arbitrary::Result<Vec<Shape>> = (0..n)
-                .map(|_| gen_shape(u, max_depth - 1, allow_record))
+                .map(|_| gen_shape(u, max_depth - 1, allow_record, record_counter))
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
         4 => {
+            let idx = *record_counter;
+            *record_counter += 1;
             let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
             let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
                 .map(|i| {
-                    let fshape = gen_shape(u, max_depth - 1, false)?;
+                    let fshape = gen_shape(u, max_depth - 1, false, record_counter)?;
                     Ok((RECORD_FIELD_NAMES[i], fshape))
                 })
                 .collect();
             Ok(Shape::Record {
-                wit_name: "rec",
-                rust_name: "Rec",
+                wit_name: GEN_RECORD_WIT_NAMES[idx],
+                rust_name: GEN_RECORD_RUST_NAMES[idx],
                 fields: fields?,
             })
         }
@@ -802,13 +820,15 @@ fn test_fuzz() {
     scaffold_common(root).expect("scaffold common");
 
     let mut failures: Vec<String> = Vec::new();
+    let mut expected_bails = 0usize;
 
     for i in 0..iters {
         let iter_seed = base_seed.wrapping_add(i as u64);
         let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
         let mut u = arbitrary::Unstructured::new(&buf);
 
-        let shape = match gen_shape(&mut u, max_depth, true) {
+        let mut record_counter: usize = 0;
+        let shape = match gen_shape(&mut u, max_depth, true, &mut record_counter) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("iter {i} seed {iter_seed}: gen_shape: {e}"));
@@ -829,15 +849,23 @@ fn test_fuzz() {
         }));
         if let Err(panic) = result {
             let msg = panic_msg(&*panic);
-            failures.push(format!(
-                "iter {i} seed {iter_seed} shape `{shape_name}`: {msg}"
-            ));
+            if is_expected_bail(&msg) {
+                expected_bails += 1;
+                eprintln!(
+                    "iter {i} seed {iter_seed} shape `{shape_name}`: expected-bail ({})",
+                    msg.lines().next().unwrap_or(&msg)
+                );
+            } else {
+                failures.push(format!(
+                    "iter {i} seed {iter_seed} shape `{shape_name}`: {msg}"
+                ));
+            }
         }
     }
 
     eprintln!(
-        "fuzz: passed={} failures={}",
-        iters as usize - failures.len(),
+        "fuzz: passed={} expected_bails={expected_bails} failures={}",
+        iters as usize - failures.len() - expected_bails,
         failures.len()
     );
     if !failures.is_empty() {
@@ -1180,6 +1208,17 @@ fn panic_msg(payload: &(dyn std::any::Any + Send)) -> String {
         .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_else(|| "<non-string panic>".into())
+}
+
+/// Panic messages that indicate splicer correctly refused a shape
+/// outside its declared support envelope. Mirrors the structural
+/// fuzz test's `fuzz_is_expected_bail`.
+fn is_expected_bail(msg: &str) -> bool {
+    msg.contains("flat parameter values")
+        || msg.contains("flat representation")
+        || msg.contains("exceeds 16")
+        || msg.contains("results; only 0 or 1 results")
+        || msg.contains("not yet implemented")
 }
 
 fn run(cmd: &mut Command, label: &str) {
