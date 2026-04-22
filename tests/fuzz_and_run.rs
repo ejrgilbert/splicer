@@ -26,6 +26,7 @@
 use anyhow::Context;
 use arbitrary::Arbitrary;
 use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -577,14 +578,104 @@ impl Shape {
     }
 
     fn expected_debug(&self) -> String {
+        let mut err_enums = HashSet::new();
+        self.collect_error_style_enums(&mut err_enums);
+        self.expected_debug_in(&err_enums)
+    }
+
+    /// Walk the tree and collect rust_names of enums that wit-bindgen
+    /// will render with error-shaped Debug. wit-bindgen emits
+    /// `impl Error for EnumName` (and a matching `Debug`) when the
+    /// enum is used as an error type; it decides per-enum-definition
+    /// at generate time, so any enum reachable below a `result<_, …>`
+    /// err position in this shape tree gets the error-shaped format.
+    fn collect_error_style_enums(&self, out: &mut HashSet<&'static str>) {
+        if let Shape::Result_ {
+            err: Some(e), ok, ..
+        } = self
+        {
+            e.mark_nested_enums(out);
+            if let Some(o) = ok {
+                o.collect_error_style_enums(out);
+            }
+            return;
+        }
+        match self {
+            Shape::Option(inner) | Shape::List(inner) => {
+                inner.collect_error_style_enums(out);
+            }
+            Shape::Tuple(parts) => {
+                for p in parts {
+                    p.collect_error_style_enums(out);
+                }
+            }
+            Shape::Record { fields, .. } => {
+                for (_, f) in fields {
+                    f.collect_error_style_enums(out);
+                }
+            }
+            Shape::Variant { cases, .. } => {
+                for c in cases {
+                    if let Some(p) = &c.payload {
+                        p.collect_error_style_enums(out);
+                    }
+                }
+            }
+            Shape::Result_ { ok, .. } => {
+                // err is None here (matched Some above); still recurse
+                // into ok.
+                if let Some(o) = ok {
+                    o.collect_error_style_enums(out);
+                }
+            }
+            Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => {}
+        }
+    }
+
+    fn mark_nested_enums(&self, out: &mut HashSet<&'static str>) {
+        match self {
+            Shape::Enum { rust_name, .. } => {
+                out.insert(*rust_name);
+            }
+            Shape::Option(inner) | Shape::List(inner) => inner.mark_nested_enums(out),
+            Shape::Tuple(parts) => {
+                for p in parts {
+                    p.mark_nested_enums(out);
+                }
+            }
+            Shape::Record { fields, .. } => {
+                for (_, f) in fields {
+                    f.mark_nested_enums(out);
+                }
+            }
+            Shape::Variant { cases, .. } => {
+                for c in cases {
+                    if let Some(p) = &c.payload {
+                        p.mark_nested_enums(out);
+                    }
+                }
+            }
+            Shape::Result_ { ok, err, .. } => {
+                if let Some(o) = ok {
+                    o.mark_nested_enums(out);
+                }
+                if let Some(e) = err {
+                    e.mark_nested_enums(out);
+                }
+            }
+            Shape::Primitive { .. } | Shape::Flags { .. } => {}
+        }
+    }
+
+    fn expected_debug_in(&self, err_enums: &HashSet<&'static str>) -> String {
         match self {
             Shape::Primitive { expected_debug, .. } => (*expected_debug).to_string(),
-            Shape::Option(inner) => format!("Some({})", inner.expected_debug()),
-            Shape::List(inner) => format!("[{}]", inner.expected_debug()),
+            Shape::Option(inner) => format!("Some({})", inner.expected_debug_in(err_enums)),
+            Shape::List(inner) => format!("[{}]", inner.expected_debug_in(err_enums)),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
-                    .map(Shape::expected_debug)
+                    .map(|p| p.expected_debug_in(err_enums))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({inside})")
@@ -594,7 +685,9 @@ impl Shape {
             } => {
                 let inits = fields
                     .iter()
-                    .map(|(fname, fshape)| format!("{fname}: {}", fshape.expected_debug()))
+                    .map(|(fname, fshape)| {
+                        format!("{fname}: {}", fshape.expected_debug_in(err_enums))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{rust_name} {{ {inits} }}")
@@ -612,7 +705,7 @@ impl Shape {
                 let payload = case
                     .payload
                     .as_ref()
-                    .map(|p| format!("({})", p.expected_debug()))
+                    .map(|p| format!("({})", p.expected_debug_in(err_enums)))
                     .unwrap_or_default();
                 format!("{rust_name}::{}{payload}", case.rust_name)
             }
@@ -622,9 +715,19 @@ impl Shape {
                 selected,
                 ..
             } => {
-                // Same Debug convention as variants.
-                let (_, rust_case) = cases[*selected];
-                format!("{rust_name}::{rust_case}")
+                // Enums used as error types get wit-bindgen's
+                // error-shaped Debug (`TypeName { code, name, message }`);
+                // enums not in an error position keep the standard
+                // `TypeName::Case` Debug.
+                if err_enums.contains(*rust_name) {
+                    let (wit_case, _) = cases[*selected];
+                    format!(
+                        r#"{rust_name} {{ code: {selected}, name: "{wit_case}", message: "" }}"#
+                    )
+                } else {
+                    let (_, rust_case) = cases[*selected];
+                    format!("{rust_name}::{rust_case}")
+                }
             }
             Shape::Flags {
                 rust_name,
@@ -652,12 +755,12 @@ impl Shape {
                 if *is_ok {
                     match ok.as_ref() {
                         None => "Ok(())".into(),
-                        Some(p) => format!("Ok({})", p.expected_debug()),
+                        Some(p) => format!("Ok({})", p.expected_debug_in(err_enums)),
                     }
                 } else {
                     match err.as_ref() {
                         None => "Err(())".into(),
-                        Some(p) => format!("Err({})", p.expected_debug()),
+                        Some(p) => format!("Err({})", p.expected_debug_in(err_enums)),
                     }
                 }
             }
