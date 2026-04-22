@@ -20,6 +20,17 @@
 use super::*;
 use arbitrary::{Arbitrary, Unstructured};
 
+/// Pinned default seed — overrideable with `SPLICER_FUZZ_SEED`.
+const DEFAULT_FUZZ_SEED: u64 = 0xDEAD_BEEF;
+/// Default iteration count for the structural fuzz loop.
+const DEFAULT_FUZZ_ITERS: usize = 200;
+/// Random bytes drawn per fuzz iteration.
+const FUZZ_BYTES_PER_ITER: usize = 256;
+/// Max recursion depth for generated `ValueType` trees.
+const FUZZ_MAX_DEPTH: u32 = 2;
+/// Max failures echoed into the test output before truncating.
+const MAX_FAILURES_SHOWN: usize = 20;
+
 /// Minimal repro for a bug the fuzzer surfaced: `record { f0: list<char> }`
 /// as an async result. Exercises "record with an inline compound field",
 /// a shape none of the pre-fuzz hand-written tests covered. Kept as a
@@ -196,16 +207,11 @@ fn fuzz_structural_shapes() {
     let iters: usize = std::env::var("SPLICER_FUZZ_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
+        .unwrap_or(DEFAULT_FUZZ_ITERS);
     let base_seed: u64 = std::env::var("SPLICER_FUZZ_SEED")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0xDEAD_BEEF)
-        });
+        .unwrap_or(DEFAULT_FUZZ_SEED);
     eprintln!("fuzz: iters={iters} base_seed={base_seed}");
 
     let mut passed = 0usize;
@@ -214,14 +220,14 @@ fn fuzz_structural_shapes() {
 
     for i in 0..iters {
         let iter_seed = base_seed.wrapping_add(i as u64);
-        let bytes = fuzz_seeded_bytes(iter_seed, 256);
+        let bytes = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut u = Unstructured::new(&bytes);
             let mut arena = TypeArena::default();
             let mut need_export: Vec<ValueTypeId> = Vec::new();
 
-            let result_id = fuzz_value_type(&mut u, &mut arena, 2, &mut need_export)
+            let result_id = fuzz_value_type(&mut u, &mut arena, FUZZ_MAX_DEPTH, &mut need_export)
                 .map_err(|_| "ran out of random bytes".to_string())?;
             let shape = arena.canonical_val(result_id);
 
@@ -290,11 +296,11 @@ fn fuzz_structural_shapes() {
         failures.len()
     );
     if !failures.is_empty() {
-        for f in failures.iter().take(20) {
+        for f in failures.iter().take(MAX_FAILURES_SHOWN) {
             eprintln!("  {f}");
         }
-        if failures.len() > 20 {
-            eprintln!("  ... and {} more", failures.len() - 20);
+        if failures.len() > MAX_FAILURES_SHOWN {
+            eprintln!("  ... and {} more", failures.len() - MAX_FAILURES_SHOWN);
         }
         panic!(
             "{} structural fuzz iterations failed — replay a single case with \

@@ -27,6 +27,34 @@ use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// ─── Tunables ──────────────────────────────────────────────────────
+//
+// All defaults and size limits that the fuzz / canned tests read.
+// Keep named so a reader doesn't have to reverse-engineer a naked
+// number. Env vars (SPLICER_FUZZ_SEED / _ITERS / _DEPTH) override
+// the fuzz defaults below.
+
+/// Pinned default seed — CI runs produce the same shape sequence
+/// every time. Override with `SPLICER_FUZZ_SEED=<u64>` to explore.
+const DEFAULT_FUZZ_SEED: u64 = 0xDEAD_BEEF;
+/// Default iterations per fuzz run.
+const DEFAULT_FUZZ_ITERS: u32 = 8;
+/// Max recursion depth for generated shape trees.
+const DEFAULT_FUZZ_DEPTH: u32 = 3;
+/// Random bytes drawn per fuzz iteration. Large enough to sustain a
+/// DEFAULT_FUZZ_DEPTH-deep shape tree without `int_in_range` running
+/// short.
+const FUZZ_BYTES_PER_ITER: usize = 4096;
+/// Max failures echoed into the test output before truncating.
+const MAX_FAILURES_SHOWN: usize = 20;
+
+/// Arity bounds for generated tuples.
+const TUPLE_ARITY: std::ops::RangeInclusive<usize> = 2..=3;
+/// WIT field names for generated records.
+const RECORD_FIELD_NAMES: &[&str] = &["a", "b", "c"];
+/// In-memory stdout buffer for captured guest output (1 MiB).
+const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
+
 // ─── Shape definitions ────────────────────────────────────────────
 //
 // A `Shape` describes what varies per test iteration: the WIT type
@@ -332,19 +360,18 @@ fn gen_shape(
             allow_record,
         )?))),
         3 => {
-            let n: usize = u.int_in_range(2..=3)?;
+            let n: usize = u.int_in_range(TUPLE_ARITY)?;
             let parts: arbitrary::Result<Vec<Shape>> = (0..n)
                 .map(|_| gen_shape(u, max_depth - 1, allow_record))
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
         4 => {
-            const FIELD_NAMES: &[&str] = &["a", "b", "c"];
-            let n: usize = u.int_in_range(1..=3)?;
+            let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
             let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
                 .map(|i| {
                     let fshape = gen_shape(u, max_depth - 1, false)?;
-                    Ok((FIELD_NAMES[i], fshape))
+                    Ok((RECORD_FIELD_NAMES[i], fshape))
                 })
                 .collect();
             Ok(Shape::Record {
@@ -364,9 +391,9 @@ fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shap
 }
 
 /// Deterministic LCG byte source so a failing iteration is replayable
-/// via `SPLICER_FUZZ_SEED` + `SPLICER_FUZZ_ITERS`. Kept byte-for-byte
-/// identical to `src/adapter/tests/fuzz.rs::fuzz_seeded_bytes` so the
-/// two fuzz harnesses stay aligned.
+/// via `SPLICER_FUZZ_SEED` + `SPLICER_FUZZ_ITERS`. Kept identical to
+/// `src/adapter/tests/fuzz.rs::fuzz_seeded_bytes` so the two fuzz
+/// harnesses stay aligned.
 fn fuzz_seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
     (0..len)
@@ -656,10 +683,10 @@ fn test_canned() {
 /// iteration rebuilds the provider crate, so a handful of iters is a
 /// minute of work.
 ///
-/// Env vars:
-///   SPLICER_FUZZ_SEED   — base u64 seed (default: wall-clock nanos)
-///   SPLICER_FUZZ_ITERS  — iterations to run (default: 8)
-///   SPLICER_FUZZ_DEPTH  — max recursion depth per shape (default: 3)
+/// Env vars override the `DEFAULT_FUZZ_*` constants:
+///   SPLICER_FUZZ_SEED   — base u64 seed (default: `DEFAULT_FUZZ_SEED`)
+///   SPLICER_FUZZ_ITERS  — iterations to run
+///   SPLICER_FUZZ_DEPTH  — max recursion depth per shape
 ///
 /// Each iteration uses `base_seed.wrapping_add(iter_idx)` so any
 /// failure can be replayed with `SPLICER_FUZZ_SEED=<iter_seed> \
@@ -671,13 +698,9 @@ fn test_canned() {
 fn test_fuzz() {
     require_splicer_toolchain();
 
-    let default_seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let base_seed: u64 = env_or("SPLICER_FUZZ_SEED", default_seed);
-    let iters: u32 = env_or("SPLICER_FUZZ_ITERS", 8);
-    let max_depth: u32 = env_or("SPLICER_FUZZ_DEPTH", 3);
+    let base_seed: u64 = env_or("SPLICER_FUZZ_SEED", DEFAULT_FUZZ_SEED);
+    let iters: u32 = env_or("SPLICER_FUZZ_ITERS", DEFAULT_FUZZ_ITERS);
+    let max_depth: u32 = env_or("SPLICER_FUZZ_DEPTH", DEFAULT_FUZZ_DEPTH);
 
     eprintln!("fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth}");
 
@@ -690,7 +713,7 @@ fn test_fuzz() {
 
     for i in 0..iters {
         let iter_seed = base_seed.wrapping_add(i as u64);
-        let buf = fuzz_seeded_bytes(iter_seed, 4096);
+        let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
         let mut u = arbitrary::Unstructured::new(&buf);
 
         let shape = match gen_shape(&mut u, max_depth, true) {
@@ -726,11 +749,11 @@ fn test_fuzz() {
         failures.len()
     );
     if !failures.is_empty() {
-        for f in failures.iter().take(20) {
+        for f in failures.iter().take(MAX_FAILURES_SHOWN) {
             eprintln!("  {f}");
         }
-        if failures.len() > 20 {
-            eprintln!("  ... and {} more", failures.len() - 20);
+        if failures.len() > MAX_FAILURES_SHOWN {
+            eprintln!("  ... and {} more", failures.len() - MAX_FAILURES_SHOWN);
         }
         panic!(
             "{} fuzz iterations failed — replay a single case with \
@@ -903,7 +926,7 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
         }
     }
 
-    let stdout_pipe = MemoryOutputPipe::new(1 << 20);
+    let stdout_pipe = MemoryOutputPipe::new(STDOUT_CAPTURE_BYTES);
     let wasi = WasiCtxBuilder::new().stdout(stdout_pipe.clone()).build();
 
     let mut config = Config::new();
