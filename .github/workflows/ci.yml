@@ -97,15 +97,13 @@ jobs:
   # provider/consumer/middleware crates in a tempdir, drives both the
   # canned catalog and the `arbitrary`-generated fuzz cases through the
   # full splicer pipeline (compose + splice for both `between` and
-  # `before` rules), and invokes the output under wasmtime. CI runs at
-  # heavier iter/depth than the local default to catch regressions
-  # before they land. Skipped when the PR only touches docs / CI-
-  # unrelated files (see `changes` job above).
+  # `before` rules), and invokes the output under wasmtime. Runs on
+  # every PR so branch protection can treat it as a required status
+  # check without the skipped-means-failed trap that gating on path
+  # filters would create.
   fuzz_and_run:
    name: Fuzz + Run (thorough)
    runs-on: ubuntu-latest
-   needs: changes
-   if: needs.changes.outputs.fuzz_relevant == 'true'
    steps:
      - uses: actions/checkout@v4
        with:
