@@ -2063,14 +2063,13 @@ fn is_expected_bail(msg: &str) -> bool {
 }
 
 /// Panic messages that indicate a harness limitation, not a splicer
-/// bug. Some sync-mode shapes (deeply-nested `Option<&[...]>` / other
-/// wit-bindgen sync-import borrow shapes) don't have a single
-/// consumer-literal form the harness can construct without per-shape
-/// casework. Classify those as harness-bails so they don't masquerade
-/// as splicer failures, but stay visible enough that a future fix can
-/// eliminate them.
-fn is_harness_bail(msg: &str, mode: AsyncMode) -> bool {
-    matches!(mode, AsyncMode::Sync) && msg.contains("cargo build: exit")
+/// bug. Consumer/provider cargo-build failures always fall here —
+/// splicer runs after the components are built, so any rustc error
+/// is a wit-bindgen/harness codegen mismatch (e.g. the consumer's
+/// `api::foo(&v)` not matching wit-bindgen's per-element borrow
+/// convention for structural containers with nominal elements).
+fn is_harness_bail(msg: &str, _mode: AsyncMode) -> bool {
+    msg.contains("cargo build: exit")
 }
 
 fn run(cmd: &mut Command, label: &str) {
