@@ -260,78 +260,57 @@ pub(crate) fn build_mem_module(with_realloc: bool, bump_start: u32) -> Module {
 // (`wrapper_ty_base + i`, etc.).
 
 /// Emit one wrapper function type per target func, in contiguous
-/// index order. Wrapper type shape depends on the calling convention:
-///
-/// - **async**: `(flat_params…) -> ()` — async canon lift returns
-///   nothing, the wrapper produces its result via `task.return`.
-/// - **sync complex** (multi-value result): `(flat_params…) -> (i32)`
-///   — the wrapper returns a pointer to the flat results in linear
-///   memory for canon lift to read from.
-/// - **sync simple**: `(flat_params…) -> (flat_results…)` — the
-///   straight-through single-value / void case.
+/// index order.
 fn emit_wrapper_types(
     types: &mut TypeSection,
     indices: &mut DispatchIndices,
     funcs: &[AdapterFunc],
+    bridge: &WitBridge,
 ) {
     for func in funcs {
-        if func.is_async {
-            types.ty().function(func.core_params.iter().copied(), []);
-        } else if func.result_is_complex {
-            types
-                .ty()
-                .function(func.core_params.iter().copied(), [ValType::I32]);
-        } else {
-            types.ty().function(
-                func.core_params.iter().copied(),
-                func.core_results.iter().copied(),
-            );
-        }
+        let (params, results) = func.wrapper_export_sig(bridge);
+        types.ty().function(params, results);
         indices.alloc_ty();
     }
 }
 
-/// Emit a retptr-pattern handler import type for each sync func with
-/// a complex (multi-value) result. Canon lower uses
-/// `(core_params…, retptr) -> ()` here, distinct from the wrapper's
-/// `(core_params…) -> (i32)`. Records the assigned type index in
-/// `out[i]` for sync-complex funcs; other entries are left untouched.
+/// Emit a retptr-form handler import type for each sync func with a
+/// multi-value result. Records the assigned type index in `out[i]`;
+/// other entries are left untouched.
 fn emit_sync_complex_handler_types(
     types: &mut TypeSection,
     indices: &mut DispatchIndices,
     funcs: &[AdapterFunc],
+    bridge: &WitBridge,
     out: &mut [Option<u32>],
 ) {
     for (i, func) in funcs.iter().enumerate() {
         if !func.is_async && func.result_is_complex {
             out[i] = Some(indices.alloc_ty());
-            let mut params: Vec<ValType> = func.core_params.clone();
-            params.push(ValType::I32); // retptr
-            types.ty().function(params, []);
+            let (params, results) = func.handler_import_sig(bridge);
+            types.ty().function(params, results);
         }
     }
 }
 
-/// Emit an async-lowered handler call type for each async func:
-/// `(core_params…, result_ptr?) -> (i32)` where `result_ptr` is
-/// appended only when the func has a non-void result and the return
-/// value is a packed subtask handle the wrapper awaits via the
-/// waitable-set machinery. Records the assigned type index in
-/// `out[i]` for async funcs.
+/// Emit an async-lowered handler call type for each async func.
+/// Records the assigned type index in `out[i]`.
 fn emit_async_handler_types(
     types: &mut TypeSection,
     indices: &mut DispatchIndices,
     funcs: &[AdapterFunc],
+    bridge: &WitBridge,
     out: &mut [Option<u32>],
 ) {
     for (i, func) in funcs.iter().enumerate() {
         if func.is_async {
+            // The emitted *type* is correct for pointer-form too, but
+            // the dispatch *body* in `emit_handler_call_phase` still
+            // assumes flat form — both asserts come out together.
+            debug_assert!(!func.uses_async_pointer_params(bridge));
             out[i] = Some(indices.alloc_ty());
-            let mut params: Vec<ValType> = func.core_params.clone();
-            if func.result_type_id.is_some() {
-                params.push(ValType::I32); // result_ptr
-            }
-            types.ty().function(params, [ValType::I32]);
+            let (params, results) = func.handler_import_sig(bridge);
+            types.ty().function(params, results);
         }
     }
 }
@@ -507,6 +486,7 @@ struct DispatchCodeCtx<'a> {
     /// async func `i`, or `None` for sync funcs.
     task_return_fns: &'a [Option<u32>],
     wait: WaitLoopCtx,
+    bridge: &'a WitBridge,
 }
 
 /// Present only when the middleware exports `splicer:tier1/blocking`.
@@ -659,7 +639,9 @@ fn emit_handler_call_phase(
 
     if func.is_async {
         // async: (flat_params...[, result_ptr]) -> subtask, awaited
-        // via the shared wait loop.
+        // via the shared wait loop. Pointer-form would write params
+        // to memory and push one params_ptr instead.
+        debug_assert!(!func.uses_async_pointer_params(ctx.bridge));
         for (pi, _) in func.core_params.iter().enumerate() {
             f.instruction(&Instruction::LocalGet(pi as u32));
         }
@@ -876,16 +858,17 @@ pub(crate) fn build_dispatch_module(
         // in play — async handler types + the shared async builtin
         // types + per-func custom task.return types.
         wrapper_ty_base = indices.ty;
-        emit_wrapper_types(&mut types, &mut indices, funcs);
+        emit_wrapper_types(&mut types, &mut indices, funcs, bridge);
         emit_sync_complex_handler_types(
             &mut types,
             &mut indices,
             funcs,
+            bridge,
             &mut sync_complex_handler_tys,
         );
 
         if has_async_machinery {
-            emit_async_handler_types(&mut types, &mut indices, funcs, &mut async_ds_tys);
+            emit_async_handler_types(&mut types, &mut indices, funcs, bridge, &mut async_ds_tys);
 
             waitable_new_ty = indices.alloc_ty();
             types.ty().function([], [ValType::I32]);
@@ -1128,6 +1111,7 @@ pub(crate) fn build_dispatch_module(
             waitable_drop_fn,
             event_ptr,
         },
+        bridge,
     };
     {
         let mut code_section = CodeSection::new();

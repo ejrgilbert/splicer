@@ -13,8 +13,10 @@
 
 use cviz::model::{FuncSignature, InterfaceType, ValueTypeId};
 use wasm_encoder::ValType;
+use wit_parser::abi::{AbiVariant, WasmSignature};
+use wit_parser::{Docs, Function, FunctionKind, Stability};
 
-use super::abi::WitBridge;
+use super::abi::{wasm_to_val, WitBridge};
 use super::build::MemoryLayoutBuilder;
 
 /// A function in the target interface, fully resolved to both
@@ -107,6 +109,126 @@ impl AdapterFunc {
     /// don't need it.
     pub fn canon_needs_utf8(&self) -> bool {
         self.has_strings
+    }
+
+    /// True when canon-lower-async lowers this func's params via a
+    /// single pointer instead of flat values. Centralized so every
+    /// flat-form-assuming dispatch site can guard with
+    /// `debug_assert!(!func.uses_async_pointer_params(bridge))`.
+    pub fn uses_async_pointer_params(&self, bridge: &WitBridge) -> bool {
+        self.is_async
+            && self
+                .wasm_signature(bridge, AbiVariant::GuestImportAsync)
+                .indirect_params
+    }
+
+    /// Core-Wasm `(params, results)` for the imported handler call
+    /// (canon-lower side), including any retptr/result_ptr appended
+    /// per the canonical ABI.
+    pub fn handler_import_sig(&self, bridge: &WitBridge) -> (Vec<ValType>, Vec<ValType>) {
+        let variant = if self.is_async {
+            AbiVariant::GuestImportAsync
+        } else {
+            AbiVariant::GuestImport
+        };
+        self.core_sig(bridge, variant)
+    }
+
+    /// Core-Wasm `(params, results)` for the adapter's exported
+    /// wrapper (canon-lift side). Splicer uses stackful async
+    /// exports, so async funcs get `GuestExportAsyncStackful`.
+    pub fn wrapper_export_sig(&self, bridge: &WitBridge) -> (Vec<ValType>, Vec<ValType>) {
+        let variant = if self.is_async {
+            AbiVariant::GuestExportAsyncStackful
+        } else {
+            AbiVariant::GuestExport
+        };
+        self.core_sig(bridge, variant)
+    }
+
+    fn core_sig(&self, bridge: &WitBridge, variant: AbiVariant) -> (Vec<ValType>, Vec<ValType>) {
+        let ws = self.wasm_signature(bridge, variant);
+        let params = ws.params.into_iter().map(wasm_to_val).collect();
+        let results = ws.results.into_iter().map(wasm_to_val).collect();
+        (params, results)
+    }
+
+    /// wit-parser's authoritative core-Wasm signature for this func
+    /// under `variant`. Encodes `MAX_FLAT_PARAMS`,
+    /// `MAX_FLAT_ASYNC_PARAMS`, retptr placement, etc., so splicer
+    /// doesn't re-derive those rules.
+    pub fn wasm_signature(&self, bridge: &WitBridge, variant: AbiVariant) -> WasmSignature {
+        let name = &self.name;
+        let is_async = self.is_async;
+        let param_names = self
+            .param_names
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat(String::new()));
+        let params_iter: Vec<(String, ValueTypeId)> = self
+            .param_type_ids
+            .iter()
+            .copied()
+            .zip(param_names)
+            .map(|(id, n)| (n, id))
+            .collect();
+        let func = build_wit_function_from_parts(
+            name,
+            is_async,
+            &params_iter,
+            self.result_type_id,
+            bridge,
+        );
+        bridge.resolve.wasm_signature(variant, &func)
+    }
+}
+
+fn build_wit_function(name: &str, sig: &FuncSignature, bridge: &WitBridge) -> Function {
+    let params: Vec<(String, ValueTypeId)> = sig
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let n = sig
+                .param_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("p{i}"));
+            (n, id)
+        })
+        .collect();
+    build_wit_function_from_parts(
+        name,
+        sig.is_async,
+        &params,
+        sig.results.first().copied(),
+        bridge,
+    )
+}
+
+fn build_wit_function_from_parts(
+    name: &str,
+    is_async: bool,
+    params: &[(String, ValueTypeId)],
+    result_type_id: Option<ValueTypeId>,
+    bridge: &WitBridge,
+) -> Function {
+    let kind = if is_async {
+        FunctionKind::AsyncFreestanding
+    } else {
+        FunctionKind::Freestanding
+    };
+    let wit_params: Vec<(String, wit_parser::Type)> = params
+        .iter()
+        .map(|(pname, id)| (pname.clone(), bridge.get(*id)))
+        .collect();
+    Function {
+        name: name.to_string(),
+        kind,
+        params: wit_params,
+        result: result_type_id.map(|id| bridge.get(id)),
+        docs: Docs::default(),
+        stability: Stability::Unknown,
     }
 }
 
@@ -228,16 +350,6 @@ fn extract_func_sig(
     bridge: &WitBridge,
 ) -> anyhow::Result<ExtractedSig> {
     const MAX_FLAT: usize = 16;
-    // Async `canon lower` caps flat params at 4 — above that,
-    // wit-bindgen / wasmtime switch to pointer-form lowering (params
-    // are written to linear memory and passed as a single `i32` to
-    // the handler). Splicer's dispatch emitter assumes flat form, so
-    // bail here rather than produce an adapter whose declared handler
-    // import type mismatches the caller's canon-lowered signature.
-    // Source: `wasmparser::validator::component_types::ComponentFuncType::lower`,
-    // which sets `sig.params.max = MAX_FLAT_ASYNC_PARAMS` for async
-    // lower.
-    const MAX_FLAT_ASYNC_PARAMS: usize = 4;
 
     let mut param_names = Vec::with_capacity(sig.params.len());
     let mut param_type_ids = Vec::with_capacity(sig.params.len());
@@ -260,11 +372,22 @@ fn extract_func_sig(
             core_params.len()
         );
     }
-    if sig.is_async && core_params.len() > MAX_FLAT_ASYNC_PARAMS {
+    // Grep for `uses_async_pointer_params` to find every dispatch
+    // site that assumes flat form — removing the bail below while
+    // leaving those sites unchanged fires their `debug_assert!`s.
+    let wit_func = build_wit_function(name, sig, bridge);
+    let import_variant = if sig.is_async {
+        AbiVariant::GuestImportAsync
+    } else {
+        AbiVariant::GuestImport
+    };
+    let import_sig = bridge.resolve.wasm_signature(import_variant, &wit_func);
+
+    if sig.is_async && import_sig.indirect_params {
         anyhow::bail!(
-            "Function '{name}' is async with {} flat parameter values \
-             (exceeds the canon-lower-async limit of {MAX_FLAT_ASYNC_PARAMS}). \
-             Pointer-form async param lowering is not yet implemented.",
+            "Function '{name}' is async with a param shape that wit-parser \
+             lowers via pointer form ({} flat values). Pointer-form async \
+             param dispatch is not yet implemented in the adapter body.",
             core_params.len()
         );
     }
@@ -294,7 +417,16 @@ fn extract_func_sig(
                     flat.len()
                 );
             }
-            let is_complex = flat.len() > 1;
+            // For async, `import_sig.retptr` flips on whenever the
+            // func has *any* result (the result_ptr param) — but
+            // `result_is_complex` downstream means "flattens to >1
+            // values" (custom task.return type vs shared void_i32 /
+            // void_i64 slot), so async has to test flatness directly.
+            let is_complex = if sig.is_async {
+                flat.len() > 1
+            } else {
+                import_sig.retptr
+            };
             // Canonical-ABI memory size for the result — accounts for
             // the discriminant-and-padding shape of `result<T, E>`
             // and inter-field natural alignment (`record { i32, i64 }`

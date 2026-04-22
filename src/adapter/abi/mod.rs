@@ -19,4 +19,5 @@ mod bridge;
 mod compat;
 
 pub(super) use bindgen::WasmEncoderBindgen;
+pub(super) use bridge::wasm_to_val;
 pub(super) use bridge::WitBridge;

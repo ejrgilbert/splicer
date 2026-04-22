@@ -1024,6 +1024,48 @@ fn test_adapter_too_many_flat_params_fails_cleanly() {
     );
 }
 
+/// 5 flat async params trip `MAX_FLAT_ASYNC_PARAMS = 4`, forcing
+/// pointer-form lowering. Splicer's dispatch body only emits flat
+/// form, so generation bails. Canary for the day pointer-form
+/// dispatch lands — flipping this test green requires updating the
+/// `uses_async_pointer_params` debug_asserts in tandem.
+#[test]
+fn test_adapter_async_pointer_form_params_bails() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let iface = make_iface(vec![(
+        "many-async",
+        sig(
+            true,
+            &["a", "b", "c", "d", "e"],
+            vec![u32_id; 5],
+            vec![u32_id],
+        ),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let split = synth_split(
+        "test:pkg/many-async@1.0.0",
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    let err = generate_tier1_adapter(
+        "test-mdl",
+        "test:pkg/many-async@1.0.0",
+        &[],
+        Some(&iface),
+        tmp.path().to_str().unwrap(),
+        split.path().to_str().unwrap(),
+        &arena,
+    )
+    .expect_err("5 flat async params should trip the pointer-form bail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pointer form") || msg.contains("Pointer-form"),
+        "bail message should mention pointer-form lowering, got: {msg}"
+    );
+}
+
 /// Build, generate, and validate an async-result adapter whose result
 /// is a `flags` with `n` labels. Shared helper for the width-boundary
 /// tests below.
