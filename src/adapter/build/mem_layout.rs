@@ -95,25 +95,20 @@ impl MemoryLayoutBuilder {
     }
 
     /// Reserve `size` bytes for an async-lowered handler's result
-    /// buffer. The canon-lower-async machinery writes flat result
-    /// values here with natural per-slot alignment (each slot's
-    /// offset driven by the canonical-ABI layout, which
-    /// [`super::bindgen::WasmEncoderBindgen`] honors when emitting
-    /// the `task.return` loads), so the allocator itself doesn't
-    /// re-align between async buffers.
-    pub fn alloc_async_result(&mut self, size: u32) -> u32 {
-        let off = self.post_name_cursor;
-        self.post_name_cursor += size;
-        off
+    /// buffer, aligned to `align`. The canonical ABI requires the
+    /// buffer start at the result type's natural alignment (e.g. 8
+    /// for any type containing an i64/f64); without that, stores
+    /// inside the buffer trap as unaligned.
+    pub fn alloc_async_result(&mut self, size: u32, align: u32) -> u32 {
+        self.alloc_aligned(size, align)
     }
 
-    /// Reserve `size` bytes for a sync-complex retptr buffer. Canon
-    /// lower's retptr pattern requires the buffer to start on an i32
-    /// boundary so the first `(i32.store / f32.store)` inside the
-    /// buffer is naturally aligned; wider stores (i64 / f64) re-align
-    /// internally per the canonical ABI.
-    pub fn alloc_sync_result(&mut self, size: u32) -> u32 {
-        self.alloc_aligned(size, val_type_byte_size(&ValType::I32))
+    /// Reserve `size` bytes for a sync-complex retptr buffer, aligned
+    /// to `align`. Same rule as the async buffer: the caller computes
+    /// `align` as the result type's max alignment, and
+    /// [`alloc_aligned`] rounds the cursor up before reserving.
+    pub fn alloc_sync_result(&mut self, size: u32, align: u32) -> u32 {
+        self.alloc_aligned(size, align)
     }
 
     /// Reserve the event-record slot written by `waitable-set.wait`.

@@ -154,10 +154,14 @@ pub(crate) fn extract_adapter_funcs(
         let name_offset = layout.alloc_name(name_len);
 
         let has_result = extracted.result_type_id.is_some();
+        let result_align = extracted
+            .result_type_id
+            .map(|id| bridge.align_bytes(id))
+            .unwrap_or(1);
         let async_result_mem_offset = (extracted.is_async && has_result)
-            .then(|| layout.alloc_async_result(extracted.result_byte_size));
+            .then(|| layout.alloc_async_result(extracted.result_byte_size, result_align));
         let sync_result_mem_offset = (!extracted.is_async && extracted.result_is_complex)
-            .then(|| layout.alloc_sync_result(extracted.result_byte_size));
+            .then(|| layout.alloc_sync_result(extracted.result_byte_size, result_align));
 
         let param_ids = extracted.param_type_ids.iter().copied();
         let result_id = extracted.result_type_id.into_iter();

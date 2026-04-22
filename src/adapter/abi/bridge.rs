@@ -80,6 +80,11 @@ impl WitBridge {
         self.sizes.size(&self.get(id)).size_wasm32() as u32
     }
 
+    /// Canonical-ABI alignment (in bytes) for a cviz type (wasm32).
+    pub fn align_bytes(&self, id: ValueTypeId) -> u32 {
+        self.sizes.align(&self.get(id)).align_wasm32() as u32
+    }
+
     /// Canonical-ABI flattened core-Wasm types for a cviz type.
     /// Uses [`Resolve::push_flat`] with a fixed-size scratch buffer
     /// (MAX_FLAT_PARAMS = 16 is the canonical cap; 32 accommodates a
