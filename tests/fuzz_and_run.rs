@@ -136,21 +136,39 @@ impl Shape {
     }
 
     /// Extra interface-level type declarations (e.g.
-    /// `record point { ... }`). Empty for shapes whose WIT signature
-    /// is fully inline.
+    /// `record point { ... }`) for every named compound at any depth
+    /// of the shape tree. Empty for shapes made entirely of anonymous
+    /// types.
     fn wit_decls(&self) -> String {
+        let mut decls = String::new();
+        self.collect_wit_decls(&mut decls);
+        decls
+    }
+
+    fn collect_wit_decls(&self, out: &mut String) {
         match self {
+            Shape::Primitive { .. } => {}
+            Shape::Option(inner) | Shape::List(inner) => inner.collect_wit_decls(out),
+            Shape::Tuple(parts) => {
+                for p in parts {
+                    p.collect_wit_decls(out);
+                }
+            }
             Shape::Record {
                 wit_name, fields, ..
             } => {
-                let mut s = format!("record {wit_name} {{\n");
-                for (fname, fshape) in fields {
-                    s.push_str(&format!("    {fname}: {},\n", fshape.wit_type()));
+                for (_, fshape) in fields {
+                    fshape.collect_wit_decls(out);
                 }
-                s.push('}');
-                s
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("record {wit_name} {{\n"));
+                for (fname, fshape) in fields {
+                    out.push_str(&format!("    {fname}: {},\n", fshape.wit_type()));
+                }
+                out.push('}');
             }
-            _ => String::new(),
         }
     }
 
