@@ -1084,40 +1084,104 @@ wit-bindgen = { workspace = true }
 // generated compound implements), and returns unit. Swapping shapes
 // therefore only requires rewriting `my-shape` (the imported dep) and
 // the provider crate — the consumer stays fixed.
-const CONSUMER_WORLD_WIT: &str = r#"package my:svc@1.0.0;
-
-interface app {
-    run: func();
+/// Which async axis the per-iteration Rust + WIT targets. `Sync` keeps
+/// the provider's `foo` and the consumer's `run` as plain WIT funcs;
+/// `Async` marks both with `async` so the adapter exercises its
+/// canon-lower-async handler path and `task.return` loads instead of
+/// the sync retptr pattern.
+#[derive(Clone, Copy)]
+enum AsyncMode {
+    Sync,
+    Async,
 }
 
-world consumer {
-    export app;
-    import my:shape/api@1.0.0;
+impl AsyncMode {
+    fn tag(self) -> &'static str {
+        match self {
+            AsyncMode::Sync => "sync",
+            AsyncMode::Async => "async",
+        }
+    }
+    /// The `async ` marker to insert between `:` and `func` in a WIT
+    /// method declaration (`foo: async func(...)`), or empty for
+    /// sync. Note the placement: `async` comes *after* the colon in
+    /// WIT, not before the method name.
+    fn wit_async_marker(self) -> &'static str {
+        match self {
+            AsyncMode::Sync => "",
+            AsyncMode::Async => "async ",
+        }
+    }
+    /// The `async ` prefix for a Rust `fn` item, or empty for sync.
+    fn rust_prefix(self) -> &'static str {
+        match self {
+            AsyncMode::Sync => "",
+            AsyncMode::Async => "async ",
+        }
+    }
+    /// Extra `generate!` options to enable async codegen; empty in
+    /// sync mode.
+    fn generate_opts(self) -> &'static str {
+        match self {
+            AsyncMode::Sync => "",
+            AsyncMode::Async => "        async: true,\n",
+        }
+    }
+    /// `.await` suffix after the consumer's `api::foo()` call in
+    /// async mode, empty in sync.
+    fn await_suffix(self) -> &'static str {
+        match self {
+            AsyncMode::Sync => "",
+            AsyncMode::Async => ".await",
+        }
+    }
 }
-"#;
 
-const CONSUMER_LIB_RS: &str = r#"mod bindings {
-    wit_bindgen::generate!({
+fn consumer_world_wit(mode: AsyncMode) -> String {
+    format!(
+        "package my:svc@1.0.0;\n\
+         \n\
+         interface app {{\n    \
+             run: {marker}func();\n\
+         }}\n\
+         \n\
+         world consumer {{\n    \
+             export app;\n    \
+             import my:shape/api@1.0.0;\n\
+         }}\n",
+        marker = mode.wit_async_marker(),
+    )
+}
+
+fn consumer_lib_rs(mode: AsyncMode) -> String {
+    format!(
+        r#"mod bindings {{
+    wit_bindgen::generate!({{
         world: "consumer",
-        generate_all
-    });
-}
+{opts}        generate_all
+    }});
+}}
 
 use bindings::exports::my::svc::app::Guest;
 use bindings::my::shape::api;
 
 struct Consumer;
 
-impl Guest for Consumer {
-    fn run() {
+impl Guest for Consumer {{
+    {rust_prefix}fn run() {{
         println!("consumer: calling provider");
-        let r = api::foo();
-        println!("consumer: got {r:?}");
-    }
-}
+        let r = api::foo(){await_suffix};
+        println!("consumer: got {{r:?}}");
+    }}
+}}
 
 bindings::export!(Consumer with_types_in bindings);
-"#;
+"#,
+        opts = mode.generate_opts(),
+        rust_prefix = mode.rust_prefix(),
+        await_suffix = mode.await_suffix(),
+    )
+}
 
 const MIDDLEWARE_CARGO_TOML: &str = r#"[package]
 name = "middleware"
@@ -1241,7 +1305,7 @@ impl PipelineKind {
 
 /// Provider's world WIT — the only file that embeds the shape in its
 /// interface signature.
-fn provider_world_wit(shape: &Shape) -> String {
+fn provider_world_wit(shape: &Shape, mode: AsyncMode) -> String {
     format!(
         "package my:shape@1.0.0;\n\
          \n\
@@ -1252,7 +1316,7 @@ fn provider_world_wit(shape: &Shape) -> String {
          world provider {{\n    \
              export api;\n\
          }}\n",
-        body = api_interface_body(shape),
+        body = api_interface_body(shape, mode),
     )
 }
 
@@ -1260,7 +1324,7 @@ fn provider_world_wit(shape: &Shape) -> String {
 /// consumer's copy of `my:shape` — the record/... decls (if any)
 /// followed by the `foo` signature. Every line is 4-space-indented
 /// so the caller can drop it straight inside `interface api { … }`.
-fn api_interface_body(shape: &Shape) -> String {
+fn api_interface_body(shape: &Shape, mode: AsyncMode) -> String {
     let mut body = String::new();
     let decls = shape.wit_decls();
     if !decls.is_empty() {
@@ -1271,18 +1335,22 @@ fn api_interface_body(shape: &Shape) -> String {
         }
         body.push('\n');
     }
-    body.push_str(&format!("    foo: func() -> {};\n", shape.wit_type()));
+    body.push_str(&format!(
+        "    foo: {}func() -> {};\n",
+        mode.wit_async_marker(),
+        shape.wit_type()
+    ));
     body
 }
 
 /// Provider's `src/lib.rs` — returns a literal of the shape's type
 /// and prints it so the trace proves the provider was invoked.
-fn provider_lib_rs(shape: &Shape) -> String {
+fn provider_lib_rs(shape: &Shape, mode: AsyncMode) -> String {
     format!(
         r#"mod bindings {{
     wit_bindgen::generate!({{
         world: "provider",
-        generate_all
+{opts}        generate_all
     }});
 }}
 
@@ -1291,7 +1359,7 @@ use bindings::exports::my::shape::api::Guest;
 struct Provider;
 
 impl Guest for Provider {{
-    fn foo() -> {ty} {{
+    {rust_prefix}fn foo() -> {ty} {{
         let v: {ty} = {lit};
         println!("provider: returning {{v:?}}");
         v
@@ -1300,6 +1368,8 @@ impl Guest for Provider {{
 
 bindings::export!(Provider with_types_in bindings);
 "#,
+        opts = mode.generate_opts(),
+        rust_prefix = mode.rust_prefix(),
         ty = shape.rust_ty(),
         lit = shape.rust_literal(),
     )
@@ -1307,14 +1377,14 @@ bindings::export!(Provider with_types_in bindings);
 
 /// Copy of `my:shape`'s interface, committed into the consumer's
 /// `wit/deps/` so wit-bindgen can resolve the import.
-fn consumer_shape_dep_wit(shape: &Shape) -> String {
+fn consumer_shape_dep_wit(shape: &Shape, mode: AsyncMode) -> String {
     format!(
         "package my:shape@1.0.0;\n\
          \n\
          interface api {{\n\
          {body}\
          }}\n",
-        body = api_interface_body(shape),
+        body = api_interface_body(shape, mode),
     )
 }
 
@@ -1340,8 +1410,6 @@ fn test_canned() {
     let root = root_buf.as_path();
     eprintln!("canned: work dir = {}", root.display());
 
-    scaffold_common(root).expect("scaffold common");
-
     let shapes = select_shapes();
     assert!(
         !shapes.is_empty(),
@@ -1352,21 +1420,31 @@ fn test_canned() {
             .collect::<Vec<_>>()
             .join(",")
     );
+    // Mode is the outer loop so each mode transition only rebuilds
+    // consumer (+ dep) once, not once per shape. Inside a single mode
+    // the provider is the only crate whose source changes per shape,
+    // which keeps incremental cargo builds cheap.
     let mut failures: Vec<(String, String)> = Vec::new();
-    for shape in &shapes {
-        let shape_name = shape.name();
-        eprintln!("\n=== shape: {shape_name} ===");
-        if let Err(e) = write_per_shape_files(root, shape) {
-            failures.push((shape_name.clone(), format!("write_per_shape_files: {e}")));
-            continue;
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_pipeline_for_shape(root, shape, ALL_PIPELINE_KINDS)
-        }));
-        if let Err(panic) = result {
-            let msg = panic_msg(&*panic);
-            failures.push((shape_name.clone(), msg.clone()));
-            eprintln!("shape `{shape_name}`: FAILED — {msg}");
+    for &mode in ALL_ASYNC_MODES {
+        let mode_tag = mode.tag();
+        eprintln!("\n### mode: {mode_tag} ###");
+        scaffold_common(root, mode).expect("scaffold common");
+        for shape in &shapes {
+            let shape_name = shape.name();
+            let label = format!("{shape_name}/{mode_tag}");
+            eprintln!("\n=== shape: {label} ===");
+            if let Err(e) = write_per_shape_files(root, shape, mode) {
+                failures.push((label.clone(), format!("write_per_shape_files: {e}")));
+                continue;
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_pipeline_for_shape(root, shape, ALL_PIPELINE_KINDS)
+            }));
+            if let Err(panic) = result {
+                let msg = panic_msg(&*panic);
+                failures.push((label.clone(), msg.clone()));
+                eprintln!("shape `{label}`: FAILED — {msg}");
+            }
         }
     }
     if !failures.is_empty() {
@@ -1377,6 +1455,11 @@ fn test_canned() {
         panic!("{} of the shape pipelines failed", failures.len());
     }
 }
+
+/// Async modes every canned shape and every fuzz iteration runs
+/// through. Sync goes first so if async breaks, you've already seen
+/// the sync-mode failure output before async layer piles on top.
+const ALL_ASYNC_MODES: &[AsyncMode] = &[AsyncMode::Sync, AsyncMode::Async];
 
 /// Fuzz twin of `test_canned`: drives the same scaffold
 /// with shapes generated by `gen_shape()`. Also `#[ignore]`'d — each
@@ -1414,55 +1497,68 @@ fn test_fuzz() {
     }
     let root = root_buf.as_path();
     eprintln!("fuzz: work dir = {}", root.display());
-    scaffold_common(root).expect("scaffold common");
 
     let mut failures: Vec<String> = Vec::new();
     let mut expected_bails = 0usize;
+    let mut total_runs: usize = 0;
 
-    for i in 0..iters {
-        let iter_seed = base_seed.wrapping_add(i as u64);
-        let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
-        let mut u = arbitrary::Unstructured::new(&buf);
+    // Mode is the outer loop (see `test_canned` for the rationale).
+    // Each iter's generator state is seeded independently of mode, so
+    // both modes see the same shape sequence — a failure in one mode
+    // but not the other isolates mode as the cause.
+    for &mode in ALL_ASYNC_MODES {
+        let mode_tag = mode.tag();
+        eprintln!("\n### mode: {mode_tag} ###");
+        scaffold_common(root, mode).expect("scaffold common");
 
-        let mut counters = NominalCounters::default();
-        let shape = match gen_shape(&mut u, max_depth, true, &mut counters) {
-            Ok(s) => s,
-            Err(e) => {
-                failures.push(format!("iter {i} seed {iter_seed}: gen_shape: {e}"));
+        for i in 0..iters {
+            total_runs += 1;
+            let iter_seed = base_seed.wrapping_add(i as u64);
+            let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
+            let mut u = arbitrary::Unstructured::new(&buf);
+
+            let mut counters = NominalCounters::default();
+            let shape = match gen_shape(&mut u, max_depth, true, &mut counters) {
+                Ok(s) => s,
+                Err(e) => {
+                    failures.push(format!(
+                        "iter {i} seed {iter_seed} mode {mode_tag}: gen_shape: {e}"
+                    ));
+                    continue;
+                }
+            };
+            let shape_name = shape.name();
+            eprintln!("\n=== iter {i} seed {iter_seed} mode {mode_tag}: {shape_name} ===");
+
+            if let Err(e) = write_per_shape_files(root, &shape, mode) {
+                failures.push(format!(
+                    "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: write_per_shape_files: {e}"
+                ));
                 continue;
             }
-        };
-        let shape_name = shape.name();
-        eprintln!("\n=== iter {i} seed {iter_seed}: {shape_name} ===");
-
-        if let Err(e) = write_per_shape_files(root, &shape) {
-            failures.push(format!(
-                "iter {i} seed {iter_seed} shape `{shape_name}`: write_per_shape_files: {e}"
-            ));
-            continue;
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_pipeline_for_shape(root, &shape, ALL_PIPELINE_KINDS)
-        }));
-        if let Err(panic) = result {
-            let msg = panic_msg(&*panic);
-            if is_expected_bail(&msg) {
-                expected_bails += 1;
-                eprintln!(
-                    "iter {i} seed {iter_seed} shape `{shape_name}`: expected-bail ({})",
-                    msg.lines().next().unwrap_or(&msg)
-                );
-            } else {
-                failures.push(format!(
-                    "iter {i} seed {iter_seed} shape `{shape_name}`: {msg}"
-                ));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_pipeline_for_shape(root, &shape, ALL_PIPELINE_KINDS)
+            }));
+            if let Err(panic) = result {
+                let msg = panic_msg(&*panic);
+                if is_expected_bail(&msg) {
+                    expected_bails += 1;
+                    eprintln!(
+                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: expected-bail ({})",
+                        msg.lines().next().unwrap_or(&msg)
+                    );
+                } else {
+                    failures.push(format!(
+                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: {msg}"
+                    ));
+                }
             }
         }
     }
 
     eprintln!(
         "fuzz: passed={} expected_bails={expected_bails} failures={}",
-        iters as usize - failures.len() - expected_bails,
+        total_runs - failures.len() - expected_bails,
         failures.len()
     );
     if !failures.is_empty() {
@@ -1728,6 +1824,10 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
     let mut config = Config::new();
     config.async_support(true);
     config.wasm_component_model_async(true);
+    // Required for async-lifted exports (e.g. consumer `run: async
+    // func()` in AsyncMode::Async). Harmless when only sync-lifted
+    // exports are in use.
+    config.wasm_component_model_async_stackful(true);
     let engine = Engine::new(&config)?;
 
     let component = Component::from_binary(&engine, bytes)?;
@@ -1832,11 +1932,13 @@ fn run(cmd: &mut Command, label: &str) {
     }
 }
 
-/// One-time setup: workspace + shape-independent crates (consumer +
-/// middleware). Per-shape `write_per_shape_files` then overwrites the
-/// provider crate and the consumer's `deps/my-shape` copy on each
-/// iteration.
-fn scaffold_common(root: &Path) -> std::io::Result<()> {
+/// One-time-per-mode setup: workspace + shape-independent crates
+/// (consumer + middleware). The consumer's world WIT + lib.rs depend
+/// on `AsyncMode` (its `run` export and the `.await` on `api::foo()`
+/// differ), so this needs to be re-run when toggling modes.
+/// `write_per_shape_files` then overwrites the provider crate and
+/// the consumer's `deps/my-shape` copy per shape.
+fn scaffold_common(root: &Path, mode: AsyncMode) -> std::io::Result<()> {
     std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML)?;
 
     write_crate(
@@ -1846,12 +1948,14 @@ fn scaffold_common(root: &Path) -> std::io::Result<()> {
         "// placeholder\n",
         &[],
     )?;
+    let consumer_lib = consumer_lib_rs(mode);
+    let consumer_world = consumer_world_wit(mode);
     write_crate(
         root,
         "consumer",
         CONSUMER_CARGO_TOML,
-        CONSUMER_LIB_RS,
-        &[("world.wit", CONSUMER_WORLD_WIT)],
+        &consumer_lib,
+        &[("world.wit", &consumer_world)],
     )?;
     write_crate(
         root,
@@ -1871,11 +1975,16 @@ fn scaffold_common(root: &Path) -> std::io::Result<()> {
 
 /// Per-shape setup: rewrite the provider crate's source + WIT and the
 /// consumer's `deps/my-shape` copy. Everything else (workspace,
-/// middleware, consumer's own world) is stable across shapes.
-fn write_per_shape_files(root: &Path, shape: &Shape) -> std::io::Result<()> {
-    let provider_lib = provider_lib_rs(shape);
-    let provider_world = provider_world_wit(shape);
-    let dep_wit = consumer_shape_dep_wit(shape);
+/// middleware, consumer's own world) is stable across shapes *within
+/// a single AsyncMode iteration*.
+fn write_per_shape_files(
+    root: &Path,
+    shape: &Shape,
+    mode: AsyncMode,
+) -> std::io::Result<()> {
+    let provider_lib = provider_lib_rs(shape, mode);
+    let provider_world = provider_world_wit(shape, mode);
+    let dep_wit = consumer_shape_dep_wit(shape, mode);
 
     std::fs::write(root.join("provider/src/lib.rs"), provider_lib)?;
     let provider_wit_dir = root.join("provider/wit");
