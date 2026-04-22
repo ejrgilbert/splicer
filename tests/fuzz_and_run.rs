@@ -1842,7 +1842,15 @@ fn select_shapes() -> Vec<Shape> {
 /// wrapping, provider+consumer compose, pre-splice sanity check) runs
 /// once; the splice + post-splice invocation runs per kind.
 fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
-    run(
+    // Harness cargo builds fail whenever the generated consumer /
+    // provider doesn't line up with wit-bindgen's expected borrow /
+    // signature shape for the current Shape — pure harness noise,
+    // not a splicer bug. Suppress the build output entirely; the
+    // panic message is just "cargo build: exit Some(N)" so
+    // `is_harness_bail` still classifies it correctly. To inspect
+    // the real rustc output, rerun with `SPLICER_KEEP_TMPDIR=1`
+    // and run cargo build in the preserved tmpdir.
+    run_quiet(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip1", "--workspace"])
             .current_dir(root),
@@ -2186,6 +2194,20 @@ fn run(cmd: &mut Command, label: &str) {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+    }
+}
+
+/// Like `run`, but drops captured stdout/stderr from the panic
+/// message on failure — used for commands whose failure output is
+/// expected noise (currently just `cargo build` on harness-invalid
+/// shapes). The panic still mentions the label + exit code so
+/// `is_harness_bail` can classify.
+fn run_quiet(cmd: &mut Command, label: &str) {
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{label}: spawn failed: {e}"));
+    if !out.status.success() {
+        panic!("{label}: exit {:?}", out.status.code());
     }
 }
 
