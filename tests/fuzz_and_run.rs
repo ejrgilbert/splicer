@@ -24,6 +24,7 @@
 //!         -- --ignored --nocapture
 
 use anyhow::Context;
+use arbitrary::Arbitrary;
 use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,10 +44,12 @@ const WAC_PACKAGE_NAME: &str = "example:composition";
 /// Pinned default seed — CI runs produce the same shape sequence
 /// every time. Override with `SPLICER_FUZZ_SEED=<u64>` to explore.
 const DEFAULT_FUZZ_SEED: u64 = 0xDEAD_BEEF;
-/// Default iterations per fuzz run.
-const DEFAULT_FUZZ_ITERS: u32 = 8;
+/// Default iterations per fuzz run. Local runs take ~90s at this
+/// setting; CI overrides via `SPLICER_FUZZ_ITERS` for heavier
+/// coverage.
+const DEFAULT_FUZZ_ITERS: u32 = 30;
 /// Max recursion depth for generated shape trees.
-const DEFAULT_FUZZ_DEPTH: u32 = 3;
+const DEFAULT_FUZZ_DEPTH: u32 = 4;
 /// Random bytes drawn per fuzz iteration. Large enough to sustain a
 /// DEFAULT_FUZZ_DEPTH-deep shape tree without `int_in_range` running
 /// short.
@@ -58,6 +61,35 @@ const MAX_FAILURES_SHOWN: usize = 20;
 const TUPLE_ARITY: std::ops::RangeInclusive<usize> = 2..=3;
 /// WIT field names for generated records.
 const RECORD_FIELD_NAMES: &[&str] = &["a", "b", "c"];
+/// Distinct WIT record names the generator cycles through; length
+/// caps the number of records per shape tree (further records fall
+/// back to a primitive to keep names unique).
+const GEN_RECORD_WIT_NAMES: &[&str] = &["rec0", "rec1", "rec2", "rec3", "rec4", "rec5", "rec6"];
+/// wit-bindgen-generated Rust names for `GEN_RECORD_WIT_NAMES`.
+const GEN_RECORD_RUST_NAMES: &[&str] = &["Rec0", "Rec1", "Rec2", "Rec3", "Rec4", "Rec5", "Rec6"];
+/// WIT variant names the generator cycles through; same name-pool
+/// pattern as records.
+const GEN_VARIANT_WIT_NAMES: &[&str] = &["tag0", "tag1", "tag2", "tag3", "tag4"];
+/// wit-bindgen-generated Rust names for `GEN_VARIANT_WIT_NAMES`.
+const GEN_VARIANT_RUST_NAMES: &[&str] = &["Tag0", "Tag1", "Tag2", "Tag3", "Tag4"];
+/// Case names reused across generated variants. Size caps the number
+/// of cases per variant.
+const GEN_VARIANT_CASE_WIT_NAMES: &[&str] = &["ca", "cb", "cc", "cd"];
+const GEN_VARIANT_CASE_RUST_NAMES: &[&str] = &["Ca", "Cb", "Cc", "Cd"];
+/// WIT enum names for the generator.
+const GEN_ENUM_WIT_NAMES: &[&str] = &["enm0", "enm1", "enm2", "enm3"];
+const GEN_ENUM_RUST_NAMES: &[&str] = &["Enm0", "Enm1", "Enm2", "Enm3"];
+/// Case names reused across generated enums.
+const GEN_ENUM_CASE_WIT_NAMES: &[&str] = &["ea", "eb", "ec", "ed"];
+const GEN_ENUM_CASE_RUST_NAMES: &[&str] = &["Ea", "Eb", "Ec", "Ed"];
+/// WIT flags names for the generator.
+const GEN_FLAGS_WIT_NAMES: &[&str] = &["fl0", "fl1", "fl2", "fl3"];
+const GEN_FLAGS_RUST_NAMES: &[&str] = &["Fl0", "Fl1", "Fl2", "Fl3"];
+/// Flag names reused across generated flags. Length caps flag count
+/// per type — kept to 8 to stay within wit-bindgen's single-byte
+/// flat-representation bucket for simplicity.
+const GEN_FLAGS_WIT_FLAG_NAMES: &[&str] = &["fa", "fb", "fc", "fd", "fe", "ff", "fg", "fh"];
+const GEN_FLAGS_RUST_FLAG_NAMES: &[&str] = &["FA", "FB", "FC", "FD", "FE", "FF", "FG", "FH"];
 /// In-memory stdout buffer for captured guest output (1 MiB).
 const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 
@@ -98,6 +130,59 @@ enum Shape {
         rust_name: &'static str,
         fields: Vec<(&'static str, Shape)>,
     },
+    Variant {
+        /// Variant name in WIT.
+        wit_name: &'static str,
+        /// PascalCased wit-bindgen-generated Rust type name.
+        rust_name: &'static str,
+        cases: Vec<VariantCase>,
+        /// Which case (0-indexed) `rust_literal`/`expected_debug`
+        /// materializes. All cases still contribute to the WIT + Rust
+        /// type definitions; only one is instantiated at runtime.
+        selected: usize,
+    },
+    /// Named enum of unit tags — like a `Variant` where every case has
+    /// no payload. Separate kind because the canonical-ABI layout is
+    /// discriminant-only (no joined-flat payloads).
+    Enum {
+        wit_name: &'static str,
+        rust_name: &'static str,
+        /// `(wit_case, rust_case)` pairs.
+        cases: Vec<(&'static str, &'static str)>,
+        /// Which case (0-indexed) to materialize.
+        selected: usize,
+    },
+    /// Named bitfield-set. wit-bindgen generates an opaque struct
+    /// with `const` associated values plus bitor/etc.; the selected
+    /// bitmask names which bits to set in the test value.
+    Flags {
+        wit_name: &'static str,
+        rust_name: &'static str,
+        /// `(wit_flag, rust_flag_const)` pairs — wit-bindgen emits
+        /// each flag as `UPPER_SNAKE_CASE` associated const.
+        flags: Vec<(&'static str, &'static str)>,
+        /// Bitmask over `flags` (bit i set means `flags[i]` is included).
+        selected: u32,
+    },
+    /// `result<ok?, err?>` — structural sum of Ok/Err branches, each
+    /// with an optional payload.
+    Result_ {
+        ok: Option<Box<Shape>>,
+        err: Option<Box<Shape>>,
+        /// Which branch to materialize (`true` = Ok, `false` = Err).
+        is_ok: bool,
+    },
+}
+
+#[derive(Clone)]
+struct VariantCase {
+    /// Case name in WIT (kebab-case-safe, single word).
+    wit_name: &'static str,
+    /// wit-bindgen-generated PascalCase enum-variant ident.
+    rust_name: &'static str,
+    /// Optional payload type. `None` → unit variant; `Some(s)` →
+    /// tuple-struct variant carrying a single `s` value.
+    payload: Option<Shape>,
 }
 
 impl Shape {
@@ -115,6 +200,14 @@ impl Shape {
                 s
             }
             Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
+            Shape::Variant { wit_name, .. } => format!("variant_{}", wit_name),
+            Shape::Enum { wit_name, .. } => format!("enum_{}", wit_name),
+            Shape::Flags { wit_name, .. } => format!("flags_{}", wit_name),
+            Shape::Result_ { ok, err, .. } => {
+                let ok_s = ok.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
+                let err_s = err.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
+                format!("result_{ok_s}_{err_s}")
+            }
         }
     }
 
@@ -132,25 +225,106 @@ impl Shape {
                 format!("tuple<{inside}>")
             }
             Shape::Record { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Variant { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Enum { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Flags { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Result_ { ok, err, .. } => match (ok.as_ref(), err.as_ref()) {
+                (None, None) => "result".into(),
+                (Some(o), None) => format!("result<{}>", o.wit_type()),
+                (None, Some(e)) => format!("result<_, {}>", e.wit_type()),
+                (Some(o), Some(e)) => format!("result<{}, {}>", o.wit_type(), e.wit_type()),
+            },
         }
     }
 
     /// Extra interface-level type declarations (e.g.
-    /// `record point { ... }`). Empty for shapes whose WIT signature
-    /// is fully inline.
+    /// `record point { ... }`) for every named compound at any depth
+    /// of the shape tree. Empty for shapes made entirely of anonymous
+    /// types.
     fn wit_decls(&self) -> String {
+        let mut decls = String::new();
+        self.collect_wit_decls(&mut decls);
+        decls
+    }
+
+    fn collect_wit_decls(&self, out: &mut String) {
         match self {
+            Shape::Primitive { .. } => {}
+            Shape::Option(inner) | Shape::List(inner) => inner.collect_wit_decls(out),
+            Shape::Tuple(parts) => {
+                for p in parts {
+                    p.collect_wit_decls(out);
+                }
+            }
             Shape::Record {
                 wit_name, fields, ..
             } => {
-                let mut s = format!("record {wit_name} {{\n");
-                for (fname, fshape) in fields {
-                    s.push_str(&format!("    {fname}: {},\n", fshape.wit_type()));
+                for (_, fshape) in fields {
+                    fshape.collect_wit_decls(out);
                 }
-                s.push('}');
-                s
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("record {wit_name} {{\n"));
+                for (fname, fshape) in fields {
+                    out.push_str(&format!("    {fname}: {},\n", fshape.wit_type()));
+                }
+                out.push('}');
             }
-            _ => String::new(),
+            Shape::Variant {
+                wit_name, cases, ..
+            } => {
+                for case in cases {
+                    if let Some(p) = &case.payload {
+                        p.collect_wit_decls(out);
+                    }
+                }
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("variant {wit_name} {{\n"));
+                for case in cases {
+                    match &case.payload {
+                        None => out.push_str(&format!("    {},\n", case.wit_name)),
+                        Some(p) => {
+                            out.push_str(&format!("    {}({}),\n", case.wit_name, p.wit_type()))
+                        }
+                    }
+                }
+                out.push('}');
+            }
+            Shape::Enum {
+                wit_name, cases, ..
+            } => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("enum {wit_name} {{\n"));
+                for (wit_case, _) in cases {
+                    out.push_str(&format!("    {wit_case},\n"));
+                }
+                out.push('}');
+            }
+            Shape::Flags {
+                wit_name, flags, ..
+            } => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("flags {wit_name} {{\n"));
+                for (wit_flag, _) in flags {
+                    out.push_str(&format!("    {wit_flag},\n"));
+                }
+                out.push('}');
+            }
+            Shape::Result_ { ok, err, .. } => {
+                if let Some(o) = ok {
+                    o.collect_wit_decls(out);
+                }
+                if let Some(e) = err {
+                    e.collect_wit_decls(out);
+                }
+            }
         }
     }
 
@@ -167,8 +341,22 @@ impl Shape {
                     .join(", ");
                 format!("({inside})")
             }
-            Shape::Record { rust_name, .. } => {
+            Shape::Record { rust_name, .. }
+            | Shape::Variant { rust_name, .. }
+            | Shape::Enum { rust_name, .. }
+            | Shape::Flags { rust_name, .. } => {
                 format!("bindings::exports::my::shape::api::{rust_name}")
+            }
+            Shape::Result_ { ok, err, .. } => {
+                let ok_ty = ok
+                    .as_ref()
+                    .map(|s| s.rust_ty())
+                    .unwrap_or_else(|| "()".into());
+                let err_ty = err
+                    .as_ref()
+                    .map(|s| s.rust_ty())
+                    .unwrap_or_else(|| "()".into());
+                format!("Result<{ok_ty}, {err_ty}>")
             }
         }
     }
@@ -196,6 +384,72 @@ impl Shape {
                     .join(", ");
                 format!("bindings::exports::my::shape::api::{rust_name} {{ {inits} }}")
             }
+            Shape::Variant {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                let case = &cases[*selected];
+                let payload = case
+                    .payload
+                    .as_ref()
+                    .map(|p| format!("({})", p.rust_literal()))
+                    .unwrap_or_default();
+                format!(
+                    "bindings::exports::my::shape::api::{rust_name}::{}{payload}",
+                    case.rust_name
+                )
+            }
+            Shape::Enum {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                let (_, rust_case) = cases[*selected];
+                format!("bindings::exports::my::shape::api::{rust_name}::{rust_case}")
+            }
+            Shape::Flags {
+                rust_name,
+                flags,
+                selected,
+                ..
+            } => {
+                // wit-bindgen emits each flag as a const on the opaque
+                // struct and derives BitOr. An empty bitmask maps to
+                // `Flags::empty()`; otherwise OR together the set bits.
+                if *selected == 0 {
+                    format!("bindings::exports::my::shape::api::{rust_name}::empty()")
+                } else {
+                    let ored = flags
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| selected & (1u32 << i) != 0)
+                        .map(|(_, (_, rust_flag))| {
+                            format!("bindings::exports::my::shape::api::{rust_name}::{rust_flag}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    ored
+                }
+            }
+            Shape::Result_ { ok, err, is_ok } => {
+                // The provider template binds the value to a local of
+                // the full `Result<T, E>` type, so bare `Ok(...)` /
+                // `Err(...)` infer the missing type parameter.
+                if *is_ok {
+                    match ok.as_ref() {
+                        None => "Ok(())".into(),
+                        Some(p) => format!("Ok({})", p.rust_literal()),
+                    }
+                } else {
+                    match err.as_ref() {
+                        None => "Err(())".into(),
+                        Some(p) => format!("Err({})", p.rust_literal()),
+                    }
+                }
+            }
         }
     }
 
@@ -222,6 +476,68 @@ impl Shape {
                     .join(", ");
                 format!("{rust_name} {{ {inits} }}")
             }
+            Shape::Variant {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                // wit-bindgen's derived Debug for variants prints as
+                // `TypeName::CaseName(...)`, not the standard Rust
+                // derive `CaseName(...)`.
+                let case = &cases[*selected];
+                let payload = case
+                    .payload
+                    .as_ref()
+                    .map(|p| format!("({})", p.expected_debug()))
+                    .unwrap_or_default();
+                format!("{rust_name}::{}{payload}", case.rust_name)
+            }
+            Shape::Enum {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                // Same Debug convention as variants.
+                let (_, rust_case) = cases[*selected];
+                format!("{rust_name}::{rust_case}")
+            }
+            Shape::Flags {
+                rust_name,
+                flags,
+                selected,
+                ..
+            } => {
+                // wit-bindgen's Debug prints set flags joined by
+                // ` | ` in decl order, wrapped in `TypeName(...)`.
+                // Empty mask is `TypeName(0x0)`.
+                if *selected == 0 {
+                    format!("{rust_name}(0x0)")
+                } else {
+                    let joined = flags
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| selected & (1u32 << i) != 0)
+                        .map(|(_, (_, rust_flag))| *rust_flag)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    format!("{rust_name}({joined})")
+                }
+            }
+            Shape::Result_ { ok, err, is_ok } => {
+                if *is_ok {
+                    match ok.as_ref() {
+                        None => "Ok(())".into(),
+                        Some(p) => format!("Ok({})", p.expected_debug()),
+                    }
+                } else {
+                    match err.as_ref() {
+                        None => "Err(())".into(),
+                        Some(p) => format!("Err({})", p.expected_debug()),
+                    }
+                }
+            }
         }
     }
 }
@@ -232,6 +548,34 @@ impl Shape {
 fn primitive_atoms() -> Vec<Shape> {
     vec![
         Shape::Primitive {
+            name: "u8",
+            wit_type: "u8",
+            rust_ty: "u8",
+            rust_literal: "7u8",
+            expected_debug: "7",
+        },
+        Shape::Primitive {
+            name: "s8",
+            wit_type: "s8",
+            rust_ty: "i8",
+            rust_literal: "-7i8",
+            expected_debug: "-7",
+        },
+        Shape::Primitive {
+            name: "u16",
+            wit_type: "u16",
+            rust_ty: "u16",
+            rust_literal: "500u16",
+            expected_debug: "500",
+        },
+        Shape::Primitive {
+            name: "s16",
+            wit_type: "s16",
+            rust_ty: "i16",
+            rust_literal: "-500i16",
+            expected_debug: "-500",
+        },
+        Shape::Primitive {
             name: "u32",
             wit_type: "u32",
             rust_ty: "u32",
@@ -239,11 +583,39 @@ fn primitive_atoms() -> Vec<Shape> {
             expected_debug: "42",
         },
         Shape::Primitive {
+            name: "s32",
+            wit_type: "s32",
+            rust_ty: "i32",
+            rust_literal: "-42i32",
+            expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "u64",
+            wit_type: "u64",
+            rust_ty: "u64",
+            rust_literal: "9000u64",
+            expected_debug: "9000",
+        },
+        Shape::Primitive {
             name: "s64",
             wit_type: "s64",
             rust_ty: "i64",
             rust_literal: "-42i64",
             expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "f32",
+            wit_type: "f32",
+            rust_ty: "f32",
+            rust_literal: "1.5f32",
+            expected_debug: "1.5",
+        },
+        Shape::Primitive {
+            name: "f64",
+            wit_type: "f64",
+            rust_ty: "f64",
+            rust_literal: "2.5f64",
+            expected_debug: "2.5",
         },
         Shape::Primitive {
             name: "bool",
@@ -328,6 +700,87 @@ fn canned_shapes() -> Vec<Shape> {
                 ),
             ],
         },
+        // Variant with a mix of unit and payload-carrying cases.
+        // `selected: 1` materializes the payload-carrying `msg` case
+        // so the per-case lift/lower path is exercised end-to-end.
+        Shape::Variant {
+            wit_name: "tag",
+            rust_name: "Tag",
+            cases: vec![
+                VariantCase {
+                    wit_name: "empty",
+                    rust_name: "Empty",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "msg",
+                    rust_name: "Msg",
+                    payload: Some(Shape::Primitive {
+                        name: "string",
+                        wit_type: "string",
+                        rust_ty: "String",
+                        rust_literal: r#"String::from("hi")"#,
+                        expected_debug: r#""hi""#,
+                    }),
+                },
+                VariantCase {
+                    wit_name: "num",
+                    rust_name: "Num",
+                    payload: Some(Shape::Primitive {
+                        name: "s64",
+                        wit_type: "s64",
+                        rust_ty: "i64",
+                        rust_literal: "-1i64",
+                        expected_debug: "-1",
+                    }),
+                },
+            ],
+            selected: 1,
+        },
+        Shape::Enum {
+            wit_name: "color",
+            rust_name: "Color",
+            cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+            selected: 1,
+        },
+        Shape::Flags {
+            wit_name: "perms",
+            rust_name: "Perms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("execute", "EXECUTE")],
+            // READ | EXECUTE — bits 0 and 2 set.
+            selected: 0b101,
+        },
+        // result<u32, string> constructed as the Ok branch.
+        Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "11u32",
+                expected_debug: "11",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("boom")"#,
+                expected_debug: r#""boom""#,
+            })),
+            is_ok: true,
+        },
+        // result<_, string> constructed as the Err branch — exercises
+        // the one-sided payload path.
+        Shape::Result_ {
+            ok: None,
+            err: Some(Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("nope")"#,
+                expected_debug: r#""nope""#,
+            })),
+            is_ok: false,
+        },
     ]);
     v
 }
@@ -340,17 +793,61 @@ fn canned_shapes() -> Vec<Shape> {
 // level decl, which we don't emit. `allow_record=false` is threaded
 // through when recursing into record fields.
 
+/// Per-tree counters for nominal types. Each counter indexes into
+/// the corresponding `GEN_*_NAMES` pool; when a counter hits the
+/// pool length, that nominal kind is considered exhausted and
+/// `gen_nominal` picks another one (or falls back to a primitive).
+#[derive(Default)]
+struct NominalCounters {
+    records: usize,
+    variants: usize,
+    enums: usize,
+    flags: usize,
+}
+
+impl NominalCounters {
+    fn available_nominals(&self) -> Vec<NominalKind> {
+        let mut v = Vec::new();
+        if self.records < GEN_RECORD_WIT_NAMES.len() {
+            v.push(NominalKind::Record);
+        }
+        if self.variants < GEN_VARIANT_WIT_NAMES.len() {
+            v.push(NominalKind::Variant);
+        }
+        if self.enums < GEN_ENUM_WIT_NAMES.len() {
+            v.push(NominalKind::Enum);
+        }
+        if self.flags < GEN_FLAGS_WIT_NAMES.len() {
+            v.push(NominalKind::Flags);
+        }
+        v
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NominalKind {
+    Record,
+    Variant,
+    Enum,
+    Flags,
+}
+
 fn gen_shape(
     u: &mut arbitrary::Unstructured<'_>,
     max_depth: u32,
-    allow_record: bool,
+    allow_nominal: bool,
+    counters: &mut NominalCounters,
 ) -> arbitrary::Result<Shape> {
     let can_recurse = max_depth > 0;
-    // 0=primitive, 1=option, 2=list, 3=tuple, 4=record
-    let max_kind: u8 = match (can_recurse, allow_record) {
-        (false, _) => 0,
-        (true, false) => 3,
-        (true, true) => 4,
+    let any_nominal_left = !counters.available_nominals().is_empty();
+    // 0=primitive, 1=option, 2=list, 3=tuple, 4=result, 5=nominal
+    // (Result is structural — allowed even in nominal-banned contexts —
+    // but its payloads propagate `allow_nominal=false`.)
+    let max_kind: u8 = match (can_recurse, allow_nominal, any_nominal_left) {
+        (false, _, _) => 0,
+        (true, false, _) => 4,
+        (true, true, false) => 4,
+        (true, true, true) => 5,
     };
     let kind: u8 = u.int_in_range(0..=max_kind)?;
     match kind {
@@ -358,36 +855,172 @@ fn gen_shape(
         1 => Ok(Shape::Option(Box::new(gen_shape(
             u,
             max_depth - 1,
-            allow_record,
+            allow_nominal,
+            counters,
         )?))),
         2 => Ok(Shape::List(Box::new(gen_shape(
             u,
             max_depth - 1,
-            allow_record,
+            allow_nominal,
+            counters,
         )?))),
         3 => {
             let n: usize = u.int_in_range(TUPLE_ARITY)?;
             let parts: arbitrary::Result<Vec<Shape>> = (0..n)
-                .map(|_| gen_shape(u, max_depth - 1, allow_record))
+                .map(|_| gen_shape(u, max_depth - 1, allow_nominal, counters))
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
-        4 => {
-            let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
-            let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
-                .map(|i| {
-                    let fshape = gen_shape(u, max_depth - 1, false)?;
-                    Ok((RECORD_FIELD_NAMES[i], fshape))
-                })
-                .collect();
-            Ok(Shape::Record {
-                wit_name: "rec",
-                rust_name: "Rec",
-                fields: fields?,
-            })
-        }
+        4 => gen_result(u, max_depth, allow_nominal, counters),
+        5 => gen_nominal(u, max_depth, counters),
         _ => unreachable!(),
     }
+}
+
+/// Pick a nominal kind uniformly from the ones whose name pool hasn't
+/// been exhausted and delegate. Caller must guarantee at least one is
+/// available (checked via `counters.available_nominals()`).
+fn gen_nominal(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let available = counters.available_nominals();
+    debug_assert!(!available.is_empty());
+    let pick = available[u.int_in_range(0..=available.len() - 1)?];
+    match pick {
+        NominalKind::Record => gen_record(u, max_depth, counters),
+        NominalKind::Variant => gen_variant(u, max_depth, counters),
+        NominalKind::Enum => gen_enum(u, counters),
+        NominalKind::Flags => gen_flags(u, counters),
+    }
+}
+
+fn gen_record(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.records;
+    counters.records += 1;
+    let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
+    let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
+        .map(|i| {
+            let fshape = gen_shape(u, max_depth - 1, false, counters)?;
+            Ok((RECORD_FIELD_NAMES[i], fshape))
+        })
+        .collect();
+    Ok(Shape::Record {
+        wit_name: GEN_RECORD_WIT_NAMES[idx],
+        rust_name: GEN_RECORD_RUST_NAMES[idx],
+        fields: fields?,
+    })
+}
+
+/// Build a variant with 1..=N cases (N capped by the shared case-name
+/// pool). Each case is independently unit or payload-bearing; the
+/// selected case is what `rust_literal` / `expected_debug` will
+/// materialize at runtime.
+fn gen_variant(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.variants;
+    counters.variants += 1;
+    let n: usize = u.int_in_range(1..=GEN_VARIANT_CASE_WIT_NAMES.len())?;
+    let mut cases: Vec<VariantCase> = Vec::with_capacity(n);
+    for i in 0..n {
+        let payload = if bool::arbitrary(u)? {
+            Some(gen_shape(u, max_depth - 1, false, counters)?)
+        } else {
+            None
+        };
+        cases.push(VariantCase {
+            wit_name: GEN_VARIANT_CASE_WIT_NAMES[i],
+            rust_name: GEN_VARIANT_CASE_RUST_NAMES[i],
+            payload,
+        });
+    }
+    let selected: usize = u.int_in_range(0..=cases.len() - 1)?;
+    Ok(Shape::Variant {
+        wit_name: GEN_VARIANT_WIT_NAMES[idx],
+        rust_name: GEN_VARIANT_RUST_NAMES[idx],
+        cases,
+        selected,
+    })
+}
+
+fn gen_enum(
+    u: &mut arbitrary::Unstructured<'_>,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.enums;
+    counters.enums += 1;
+    let n: usize = u.int_in_range(1..=GEN_ENUM_CASE_WIT_NAMES.len())?;
+    let cases: Vec<(&'static str, &'static str)> = (0..n)
+        .map(|i| (GEN_ENUM_CASE_WIT_NAMES[i], GEN_ENUM_CASE_RUST_NAMES[i]))
+        .collect();
+    let selected: usize = u.int_in_range(0..=cases.len() - 1)?;
+    Ok(Shape::Enum {
+        wit_name: GEN_ENUM_WIT_NAMES[idx],
+        rust_name: GEN_ENUM_RUST_NAMES[idx],
+        cases,
+        selected,
+    })
+}
+
+fn gen_flags(
+    u: &mut arbitrary::Unstructured<'_>,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.flags;
+    counters.flags += 1;
+    let n: usize = u.int_in_range(1..=GEN_FLAGS_WIT_FLAG_NAMES.len())?;
+    let flags: Vec<(&'static str, &'static str)> = (0..n)
+        .map(|i| (GEN_FLAGS_WIT_FLAG_NAMES[i], GEN_FLAGS_RUST_FLAG_NAMES[i]))
+        .collect();
+    // Random bitmask over the n flags. u32 comfortably fits up to 32.
+    let full_mask: u32 = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+    let selected = u.int_in_range(0..=full_mask)?;
+    Ok(Shape::Flags {
+        wit_name: GEN_FLAGS_WIT_NAMES[idx],
+        rust_name: GEN_FLAGS_RUST_NAMES[idx],
+        flags,
+        selected,
+    })
+}
+
+fn gen_result(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    allow_nominal: bool,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    // Each side is independently present or absent. If both absent,
+    // that's a bare `result` with no payloads — legal WIT.
+    let ok = if bool::arbitrary(u)? {
+        Some(Box::new(gen_shape(
+            u,
+            max_depth - 1,
+            allow_nominal,
+            counters,
+        )?))
+    } else {
+        None
+    };
+    let err = if bool::arbitrary(u)? {
+        Some(Box::new(gen_shape(
+            u,
+            max_depth - 1,
+            allow_nominal,
+            counters,
+        )?))
+    } else {
+        None
+    };
+    let is_ok = bool::arbitrary(u)?;
+    Ok(Shape::Result_ { ok, err, is_ok })
 }
 
 fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
@@ -784,13 +1417,15 @@ fn test_fuzz() {
     scaffold_common(root).expect("scaffold common");
 
     let mut failures: Vec<String> = Vec::new();
+    let mut expected_bails = 0usize;
 
     for i in 0..iters {
         let iter_seed = base_seed.wrapping_add(i as u64);
         let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
         let mut u = arbitrary::Unstructured::new(&buf);
 
-        let shape = match gen_shape(&mut u, max_depth, true) {
+        let mut counters = NominalCounters::default();
+        let shape = match gen_shape(&mut u, max_depth, true, &mut counters) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("iter {i} seed {iter_seed}: gen_shape: {e}"));
@@ -811,15 +1446,23 @@ fn test_fuzz() {
         }));
         if let Err(panic) = result {
             let msg = panic_msg(&*panic);
-            failures.push(format!(
-                "iter {i} seed {iter_seed} shape `{shape_name}`: {msg}"
-            ));
+            if is_expected_bail(&msg) {
+                expected_bails += 1;
+                eprintln!(
+                    "iter {i} seed {iter_seed} shape `{shape_name}`: expected-bail ({})",
+                    msg.lines().next().unwrap_or(&msg)
+                );
+            } else {
+                failures.push(format!(
+                    "iter {i} seed {iter_seed} shape `{shape_name}`: {msg}"
+                ));
+            }
         }
     }
 
     eprintln!(
-        "fuzz: passed={} failures={}",
-        iters as usize - failures.len(),
+        "fuzz: passed={} expected_bails={expected_bails} failures={}",
+        iters as usize - failures.len() - expected_bails,
         failures.len()
     );
     if !failures.is_empty() {
@@ -918,18 +1561,15 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
             .unwrap_or_else(|e| panic!("[{kind_tag}] final component failed validation: {e}"));
         eprintln!("pipeline[{kind_tag}]: validated {} bytes", bytes.len());
 
-        // Invoke the spliced component. See the known-bug NOTE: the
-        // tier-1 adapter drops sync return values when wrapping a
-        // sync function with async before/after hooks, so we only
-        // assert on the control-flow markers, not the returned value.
         let captured = invoke_run(&bytes).expect("invoke run()");
         eprintln!("pipeline[{kind_tag}]: post-splice trace:\n{captured}");
+        let expected_got = format!("consumer: got {}", shape.expected_debug());
         for marker in [
             "consumer: calling provider",
             "mdl: before foo",
             "provider: returning ",
             "mdl: after foo",
-            "consumer: got ", // value intentionally unchecked; see NOTE
+            expected_got.as_str(),
         ] {
             assert!(
                 captured.contains(marker),
@@ -1165,6 +1805,17 @@ fn panic_msg(payload: &(dyn std::any::Any + Send)) -> String {
         .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_else(|| "<non-string panic>".into())
+}
+
+/// Panic messages that indicate splicer correctly refused a shape
+/// outside its declared support envelope. Mirrors the structural
+/// fuzz test's `fuzz_is_expected_bail`.
+fn is_expected_bail(msg: &str) -> bool {
+    msg.contains("flat parameter values")
+        || msg.contains("flat representation")
+        || msg.contains("exceeds 16")
+        || msg.contains("results; only 0 or 1 results")
+        || msg.contains("not yet implemented")
 }
 
 fn run(cmd: &mut Command, label: &str) {

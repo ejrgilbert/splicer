@@ -477,6 +477,23 @@ fn emit_imports_provider_split(
             ctx.alias_locals.insert(vid, local_idx);
         }
 
+        // For named compounds that the split doesn't pre-alias
+        // (provider declares them fresh), tell the encoder to export
+        // them from the instance type by name. Required for nominal
+        // types (record / variant / enum / flags) to satisfy the
+        // import-instance validator.
+        if let InterfaceType::Instance(inst_iface) = iface_ty {
+            for (name, &vid) in &inst_iface.type_exports {
+                let is_resource = matches!(
+                    arena.lookup_val(vid),
+                    ValueType::Resource(_) | ValueType::AsyncHandle
+                );
+                if !is_resource && !outer_aliased.contains_key(&vid) {
+                    ctx.compound_exports.insert(vid, name.clone());
+                }
+            }
+        }
+
         build_handler_inst_type(&mut ctx, &mut inst, funcs, arena)?;
         handler_inst_ty = indices.alloc_ty();
         inst_ctx = ctx;
@@ -537,20 +554,35 @@ fn emit_imports_provider_split(
         }
     }
 
-    // Compound types (error-code, DNS-error-payload, …) came from
-    // the preamble too; they're not exports on the handler instance,
-    // so reuse those indices for the `comp_aliased_types` map
-    // consumed by section 3c.
+    // Compound types take one of two paths:
+    //
+    // - Preamble-aliased (error-code, DNS-error-payload, …): the
+    //   split's raw sections already aliased them into component
+    //   scope; reuse those indices directly.
+    // - Instance-exported (record/variant/enum/flags declared fresh
+    //   by the provider): the handler instance type exports them by
+    //   name (via `ctx.compound_exports`); alias them into component
+    //   scope off the handler instance so section 3c's
+    //   `encode_comp_cv` reuses them instead of redeclaring.
     let mut comp_aliased_types: HashMap<ValueTypeId, u32> = HashMap::new();
     if let InterfaceType::Instance(inst_iface) = iface_ty {
-        for &vid in inst_iface.type_exports.values() {
-            if !matches!(
+        for (export_name, &vid) in &inst_iface.type_exports {
+            if matches!(
                 arena.lookup_val(vid),
                 ValueType::Resource(_) | ValueType::AsyncHandle
             ) {
-                if let Some(&comp_idx) = outer_aliased.get(&vid) {
-                    comp_aliased_types.insert(vid, comp_idx);
-                }
+                continue;
+            }
+            if let Some(&comp_idx) = outer_aliased.get(&vid) {
+                comp_aliased_types.insert(vid, comp_idx);
+            } else if inst_ctx.compound_exports.contains_key(&vid) {
+                let comp_idx = indices.alloc_ty();
+                aliases.alias(Alias::InstanceExport {
+                    instance: handler_inst,
+                    kind: ComponentExportKind::Type,
+                    name: export_name,
+                });
+                comp_aliased_types.insert(vid, comp_idx);
             }
         }
     }
@@ -1152,7 +1184,6 @@ fn emit_export_phase(
     target_interface: &str,
     funcs: &[AdapterFunc],
     iface_ty: &InterfaceType,
-    split: &FilteredSections,
     inst_ctx: &InstTypeCtx,
     comp_resource_indices: &[u32],
     comp_aliased_types: &HashMap<ValueTypeId, u32>,
@@ -1166,25 +1197,26 @@ fn emit_export_phase(
 
         let mut export_items: Vec<(&str, ComponentExportKind, u32)> = Vec::new();
 
-        // When the handler import came from raw consumer-split sections,
-        // re-export its type exports so the adapter's handler export
-        // matches what consumers expect.
-        let handler_from_split = split.import_names.iter().any(|n| n == target_interface);
-        if handler_from_split {
-            for (i, (_vid, export_name, _res_local, _own_local)) in
-                inst_ctx.resource_exports.iter().enumerate()
-            {
-                export_items.push((
-                    export_name,
-                    ComponentExportKind::Type,
-                    comp_resource_indices[i],
-                ));
-            }
-            if let InterfaceType::Instance(inst) = iface_ty {
-                for (export_name, &vid) in &inst.type_exports {
-                    if let Some(&comp_idx) = comp_aliased_types.get(&vid) {
-                        export_items.push((export_name, ComponentExportKind::Type, comp_idx));
-                    }
+        // Re-export every type the exported funcs reference. An
+        // instance whose functions return a nominal type (record /
+        // variant / …) but doesn't export that type fails the
+        // validator's "instance not valid to be used as export"
+        // check, regardless of whether the handler came from raw
+        // split sections (consumer) or a from-scratch build
+        // (provider).
+        for (i, (_vid, export_name, _res_local, _own_local)) in
+            inst_ctx.resource_exports.iter().enumerate()
+        {
+            export_items.push((
+                export_name,
+                ComponentExportKind::Type,
+                comp_resource_indices[i],
+            ));
+        }
+        if let InterfaceType::Instance(inst) = iface_ty {
+            for (export_name, &vid) in &inst.type_exports {
+                if let Some(&comp_idx) = comp_aliased_types.get(&vid) {
+                    export_items.push((export_name, ComponentExportKind::Type, comp_idx));
                 }
             }
         }
@@ -1478,7 +1510,6 @@ pub(crate) fn build_adapter_bytes(
         target_interface,
         funcs,
         iface_ty,
-        split,
         &inst_ctx,
         &comp_resource_indices,
         &comp_aliased_types,

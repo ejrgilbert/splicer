@@ -10,6 +10,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Figure out whether the PR / push touched code the fuzz harness
+  # depends on. Downstream fuzz jobs depend on this so we don't burn
+  # CI re-fuzzing unchanged code at a pinned seed.
+  changes:
+    name: Detect source changes
+    runs-on: ubuntu-latest
+    outputs:
+      fuzz_relevant: ${{ steps.filter.outputs.fuzz_relevant }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            fuzz_relevant:
+              - 'src/**'
+              - 'wit/**'
+              - 'tests/fuzz_and_run.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
   lint:
     name: Format + Clippy
     runs-on: ubuntu-latest
@@ -70,3 +92,57 @@ jobs:
          cargo install splicer@2.0.0-rc3 cviz@2.0.0-rc3
      - name: Run integration tests
        run: cargo test --test integration -- --ignored
+
+  # End-to-end fuzz + run harness (tests/fuzz_and_run.rs). Scaffolds
+  # provider/consumer/middleware crates in a tempdir, drives both the
+  # canned catalog and the `arbitrary`-generated fuzz cases through the
+  # full splicer pipeline (compose + splice for both `between` and
+  # `before` rules), and invokes the output under wasmtime. Runs on
+  # every PR so branch protection can treat it as a required status
+  # check without the skipped-means-failed trap that gating on path
+  # filters would create.
+  fuzz_and_run:
+   name: Fuzz + Run (thorough)
+   runs-on: ubuntu-latest
+   steps:
+     - uses: actions/checkout@v4
+       with:
+         submodules: recursive
+     - uses: dtolnay/rust-toolchain@stable
+       with:
+         targets: wasm32-wasip1
+     - uses: Swatinem/rust-cache@v2
+     - name: Install tools
+       run: cargo install wac-cli@0.9.0 wasm-tools@1.244.0
+     - name: Canned shape catalog
+       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_canned
+     - name: Fuzz (50 iters, depth 5)
+       env:
+         SPLICER_FUZZ_ITERS: "50"
+         SPLICER_FUZZ_DEPTH: "5"
+       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
+
+  # Heavier fuzz run on every push to main — re-validates the merged
+  # code against deeper shape trees than PR CI exercised. Gated on the
+  # same path filter so a merge that doesn't touch fuzz-relevant paths
+  # doesn't re-run this at the same pinned seed.
+  fuzz_postmerge:
+   name: Fuzz + Run (post-merge, heavy)
+   runs-on: ubuntu-latest
+   needs: changes
+   if: github.event_name == 'push' && needs.changes.outputs.fuzz_relevant == 'true'
+   steps:
+     - uses: actions/checkout@v4
+       with:
+         submodules: recursive
+     - uses: dtolnay/rust-toolchain@stable
+       with:
+         targets: wasm32-wasip1
+     - uses: Swatinem/rust-cache@v2
+     - name: Install tools
+       run: cargo install wac-cli@0.9.0 wasm-tools@1.244.0
+     - name: Fuzz (200 iters, depth 6)
+       env:
+         SPLICER_FUZZ_ITERS: "200"
+         SPLICER_FUZZ_DEPTH: "6"
+       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz

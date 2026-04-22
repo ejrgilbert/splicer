@@ -518,6 +518,7 @@ struct BlockingConfig {
 /// Emit the full wrapper body for func `fi`, including all five
 /// phases (before, blocking, handler call, after, return) and the
 /// final `End` opcode.
+#[allow(clippy::too_many_arguments)]
 fn emit_wrapper_body(
     f: &mut Function,
     fi: usize,
@@ -525,6 +526,7 @@ fn emit_wrapper_body(
     ctx: &DispatchCodeCtx<'_>,
     subtask_local: u32,
     ws_local: u32,
+    sync_result_local: Option<u32>,
     task_return_loads: Option<&[Instruction<'static>]>,
 ) -> anyhow::Result<()> {
     let has_result = func.result_type_id.is_some();
@@ -546,9 +548,9 @@ fn emit_wrapper_body(
 
     emit_before_phase(f, func, ctx, subtask_local, ws_local);
     emit_blocking_phase(f, fi, func, ctx, subtask_local, ws_local)?;
-    let result_local_idx = emit_handler_call_phase(f, fi, func, ctx, subtask_local, ws_local);
+    emit_handler_call_phase(f, fi, func, ctx, subtask_local, ws_local, sync_result_local);
     emit_after_phase(f, func, ctx, subtask_local, ws_local);
-    emit_return_phase(f, fi, func, ctx, result_local_idx, task_return_loads);
+    emit_return_phase(f, fi, func, ctx, sync_result_local, task_return_loads);
 
     f.instruction(&Instruction::End);
     Ok(())
@@ -641,12 +643,9 @@ fn emit_blocking_phase(
 /// - **sync complex** (multi-value result): params + `retptr` → `()`;
 ///   the handler writes flat results at the adapter's pre-reserved
 ///   result buffer, which phase 5 returns.
-/// - **sync simple**: params → flat results; when an after-call hook
-///   will fire before the return, stash the result into a local.
-///
-/// Returns `Some(local_idx)` when phase 5 needs to re-push the stashed
-/// sync-simple result (only when `after_call` is present and the func
-/// has a result), `None` otherwise.
+/// - **sync simple**: params → flat results; when
+///   `sync_result_local` is `Some`, stash the single flat result so
+///   the after-call hook-await path doesn't trash it.
 fn emit_handler_call_phase(
     f: &mut Function,
     fi: usize,
@@ -654,11 +653,13 @@ fn emit_handler_call_phase(
     ctx: &DispatchCodeCtx<'_>,
     subtask_local: u32,
     ws_local: u32,
-) -> Option<u32> {
+    sync_result_local: Option<u32>,
+) {
     let handler_fn = ctx.handler_import_fn_base + fi as u32;
 
     if func.is_async {
-        // async: (flat_params...[, result_ptr]) -> subtask
+        // async: (flat_params...[, result_ptr]) -> subtask, awaited
+        // via the shared wait loop.
         for (pi, _) in func.core_params.iter().enumerate() {
             f.instruction(&Instruction::LocalGet(pi as u32));
         }
@@ -668,7 +669,6 @@ fn emit_handler_call_phase(
         f.instruction(&Instruction::Call(handler_fn));
         f.instruction(&Instruction::LocalSet(subtask_local));
         emit_wait_loop(f, subtask_local, ws_local, &ctx.wait);
-        None
     } else if func.result_is_complex {
         // sync complex: canon lift expects `(core_params) -> (i32)`
         // and canon lower produces `(core_params, retptr: i32) -> ()`.
@@ -682,25 +682,17 @@ fn emit_handler_call_phase(
         }
         f.instruction(&Instruction::I32Const(result_buf as i32));
         f.instruction(&Instruction::Call(handler_fn));
-        None
     } else {
-        // sync simple: call handler, stash result if after-call will
-        // fire before the return (otherwise leave it on the stack).
-        let result_local = if ctx.after_import_fn.is_some() && func.result_type_id.is_some() {
-            Some(func.core_params.len() as u32)
-        } else {
-            None
-        };
-
+        // sync simple: call handler; if a stash local was allocated
+        // (single flat result + after-call hook in play), tuck the
+        // result away so the hook-await path doesn't stomp on it.
         for (pi, _) in func.core_params.iter().enumerate() {
             f.instruction(&Instruction::LocalGet(pi as u32));
         }
         f.instruction(&Instruction::Call(handler_fn));
-
-        if let Some(local_idx) = result_local {
+        if let Some(local_idx) = sync_result_local {
             f.instruction(&Instruction::LocalSet(local_idx));
         }
-        result_local
     }
 }
 
@@ -740,7 +732,7 @@ fn emit_return_phase(
     fi: usize,
     func: &AdapterFunc,
     ctx: &DispatchCodeCtx<'_>,
-    result_local_idx: Option<u32>,
+    sync_result_local: Option<u32>,
     task_return_loads: Option<&[Instruction<'static>]>,
 ) {
     if func.is_async {
@@ -768,7 +760,7 @@ fn emit_return_phase(
             .sync_result_mem_offset
             .expect("sync_result_mem_offset must be set for sync complex");
         f.instruction(&Instruction::I32Const(result_buf as i32));
-    } else if let Some(local_idx) = result_local_idx {
+    } else if let Some(local_idx) = sync_result_local {
         f.instruction(&Instruction::LocalGet(local_idx));
     }
 }
@@ -1148,6 +1140,21 @@ pub(crate) fn build_dispatch_module(
             let subtask_local = indices.alloc_local(ValType::I32);
             let ws_local = indices.alloc_local(ValType::I32);
 
+            // Sync-simple path with a single flat result: when an
+            // after-call hook runs between the handler's return and
+            // the wrapper's return, the hook-await path stomps on the
+            // stack, so the handler result has to be stashed in a
+            // local first. The local must be typed to the handler's
+            // flat result (i32/i64/f32/f64) — reusing `subtask_local`
+            // (i32) mistypes i64/f64 results. Gated on
+            // `core_results.len() == 1` so zero-flat results (empty
+            // records) and multi-value results (handled by the
+            // `result_is_complex` retptr branch) are skipped.
+            let sync_result_local: Option<u32> = (!func.is_async
+                && func.core_results.len() == 1
+                && code_ctx.after_import_fn.is_some())
+            .then(|| indices.alloc_local(func.core_results[0]));
+
             // Pre-build the task.return load sequence for async funcs
             // with a non-void result. `lift_from_memory` allocates
             // additional locals into `indices` as needed (a disc local
@@ -1176,6 +1183,7 @@ pub(crate) fn build_dispatch_module(
                 &code_ctx,
                 subtask_local,
                 ws_local,
+                sync_result_local,
                 task_return_loads.as_deref(),
             )?;
             code_section.function(&f);
