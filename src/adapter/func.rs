@@ -228,6 +228,16 @@ fn extract_func_sig(
     bridge: &WitBridge,
 ) -> anyhow::Result<ExtractedSig> {
     const MAX_FLAT: usize = 16;
+    // Async `canon lower` caps flat params at 4 — above that,
+    // wit-bindgen / wasmtime switch to pointer-form lowering (params
+    // are written to linear memory and passed as a single `i32` to
+    // the handler). Splicer's dispatch emitter assumes flat form, so
+    // bail here rather than produce an adapter whose declared handler
+    // import type mismatches the caller's canon-lowered signature.
+    // Source: `wasmparser::validator::component_types::ComponentFuncType::lower`,
+    // which sets `sig.params.max = MAX_FLAT_ASYNC_PARAMS` for async
+    // lower.
+    const MAX_FLAT_ASYNC_PARAMS: usize = 4;
 
     let mut param_names = Vec::with_capacity(sig.params.len());
     let mut param_type_ids = Vec::with_capacity(sig.params.len());
@@ -247,6 +257,14 @@ fn extract_func_sig(
             "Function '{name}' has {} flat parameter values (exceeds the \
              canonical-ABI limit of {MAX_FLAT}). The pointer-form lowering \
              required for >{MAX_FLAT} flat params is not yet implemented.",
+            core_params.len()
+        );
+    }
+    if sig.is_async && core_params.len() > MAX_FLAT_ASYNC_PARAMS {
+        anyhow::bail!(
+            "Function '{name}' is async with {} flat parameter values \
+             (exceeds the canon-lower-async limit of {MAX_FLAT_ASYNC_PARAMS}). \
+             Pointer-form async param lowering is not yet implemented.",
             core_params.len()
         );
     }
