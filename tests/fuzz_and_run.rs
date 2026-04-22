@@ -24,6 +24,7 @@
 //!         -- --ignored --nocapture
 
 use anyhow::Context;
+use arbitrary::Arbitrary;
 use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,6 +67,15 @@ const RECORD_FIELD_NAMES: &[&str] = &["a", "b", "c"];
 const GEN_RECORD_WIT_NAMES: &[&str] = &["rec0", "rec1", "rec2", "rec3", "rec4", "rec5", "rec6"];
 /// wit-bindgen-generated Rust names for `GEN_RECORD_WIT_NAMES`.
 const GEN_RECORD_RUST_NAMES: &[&str] = &["Rec0", "Rec1", "Rec2", "Rec3", "Rec4", "Rec5", "Rec6"];
+/// WIT variant names the generator cycles through; same name-pool
+/// pattern as records.
+const GEN_VARIANT_WIT_NAMES: &[&str] = &["tag0", "tag1", "tag2", "tag3", "tag4"];
+/// wit-bindgen-generated Rust names for `GEN_VARIANT_WIT_NAMES`.
+const GEN_VARIANT_RUST_NAMES: &[&str] = &["Tag0", "Tag1", "Tag2", "Tag3", "Tag4"];
+/// Case names reused across generated variants. Size caps the number
+/// of cases per variant.
+const GEN_VARIANT_CASE_WIT_NAMES: &[&str] = &["ca", "cb", "cc", "cd"];
+const GEN_VARIANT_CASE_RUST_NAMES: &[&str] = &["Ca", "Cb", "Cc", "Cd"];
 /// In-memory stdout buffer for captured guest output (1 MiB).
 const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 
@@ -106,6 +116,28 @@ enum Shape {
         rust_name: &'static str,
         fields: Vec<(&'static str, Shape)>,
     },
+    Variant {
+        /// Variant name in WIT.
+        wit_name: &'static str,
+        /// PascalCased wit-bindgen-generated Rust type name.
+        rust_name: &'static str,
+        cases: Vec<VariantCase>,
+        /// Which case (0-indexed) `rust_literal`/`expected_debug`
+        /// materializes. All cases still contribute to the WIT + Rust
+        /// type definitions; only one is instantiated at runtime.
+        selected: usize,
+    },
+}
+
+#[derive(Clone)]
+struct VariantCase {
+    /// Case name in WIT (kebab-case-safe, single word).
+    wit_name: &'static str,
+    /// wit-bindgen-generated PascalCase enum-variant ident.
+    rust_name: &'static str,
+    /// Optional payload type. `None` → unit variant; `Some(s)` →
+    /// tuple-struct variant carrying a single `s` value.
+    payload: Option<Shape>,
 }
 
 impl Shape {
@@ -123,6 +155,7 @@ impl Shape {
                 s
             }
             Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
+            Shape::Variant { wit_name, .. } => format!("variant_{}", wit_name),
         }
     }
 
@@ -140,6 +173,7 @@ impl Shape {
                 format!("tuple<{inside}>")
             }
             Shape::Record { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Variant { wit_name, .. } => (*wit_name).to_string(),
         }
     }
 
@@ -177,6 +211,28 @@ impl Shape {
                 }
                 out.push('}');
             }
+            Shape::Variant {
+                wit_name, cases, ..
+            } => {
+                for case in cases {
+                    if let Some(p) = &case.payload {
+                        p.collect_wit_decls(out);
+                    }
+                }
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("variant {wit_name} {{\n"));
+                for case in cases {
+                    match &case.payload {
+                        None => out.push_str(&format!("    {},\n", case.wit_name)),
+                        Some(p) => {
+                            out.push_str(&format!("    {}({}),\n", case.wit_name, p.wit_type()))
+                        }
+                    }
+                }
+                out.push('}');
+            }
         }
     }
 
@@ -193,7 +249,7 @@ impl Shape {
                     .join(", ");
                 format!("({inside})")
             }
-            Shape::Record { rust_name, .. } => {
+            Shape::Record { rust_name, .. } | Shape::Variant { rust_name, .. } => {
                 format!("bindings::exports::my::shape::api::{rust_name}")
             }
         }
@@ -222,6 +278,23 @@ impl Shape {
                     .join(", ");
                 format!("bindings::exports::my::shape::api::{rust_name} {{ {inits} }}")
             }
+            Shape::Variant {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                let case = &cases[*selected];
+                let payload = case
+                    .payload
+                    .as_ref()
+                    .map(|p| format!("({})", p.rust_literal()))
+                    .unwrap_or_default();
+                format!(
+                    "bindings::exports::my::shape::api::{rust_name}::{}{payload}",
+                    case.rust_name
+                )
+            }
         }
     }
 
@@ -248,6 +321,23 @@ impl Shape {
                     .join(", ");
                 format!("{rust_name} {{ {inits} }}")
             }
+            Shape::Variant {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                // wit-bindgen's derived Debug for variants prints as
+                // `TypeName::CaseName(...)`, not the standard Rust
+                // derive `CaseName(...)`.
+                let case = &cases[*selected];
+                let payload = case
+                    .payload
+                    .as_ref()
+                    .map(|p| format!("({})", p.expected_debug()))
+                    .unwrap_or_default();
+                format!("{rust_name}::{}{payload}", case.rust_name)
+            }
         }
     }
 }
@@ -258,6 +348,34 @@ impl Shape {
 fn primitive_atoms() -> Vec<Shape> {
     vec![
         Shape::Primitive {
+            name: "u8",
+            wit_type: "u8",
+            rust_ty: "u8",
+            rust_literal: "7u8",
+            expected_debug: "7",
+        },
+        Shape::Primitive {
+            name: "s8",
+            wit_type: "s8",
+            rust_ty: "i8",
+            rust_literal: "-7i8",
+            expected_debug: "-7",
+        },
+        Shape::Primitive {
+            name: "u16",
+            wit_type: "u16",
+            rust_ty: "u16",
+            rust_literal: "500u16",
+            expected_debug: "500",
+        },
+        Shape::Primitive {
+            name: "s16",
+            wit_type: "s16",
+            rust_ty: "i16",
+            rust_literal: "-500i16",
+            expected_debug: "-500",
+        },
+        Shape::Primitive {
             name: "u32",
             wit_type: "u32",
             rust_ty: "u32",
@@ -265,11 +383,39 @@ fn primitive_atoms() -> Vec<Shape> {
             expected_debug: "42",
         },
         Shape::Primitive {
+            name: "s32",
+            wit_type: "s32",
+            rust_ty: "i32",
+            rust_literal: "-42i32",
+            expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "u64",
+            wit_type: "u64",
+            rust_ty: "u64",
+            rust_literal: "9000u64",
+            expected_debug: "9000",
+        },
+        Shape::Primitive {
             name: "s64",
             wit_type: "s64",
             rust_ty: "i64",
             rust_literal: "-42i64",
             expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "f32",
+            wit_type: "f32",
+            rust_ty: "f32",
+            rust_literal: "1.5f32",
+            expected_debug: "1.5",
+        },
+        Shape::Primitive {
+            name: "f64",
+            wit_type: "f64",
+            rust_ty: "f64",
+            rust_literal: "2.5f64",
+            expected_debug: "2.5",
         },
         Shape::Primitive {
             name: "bool",
@@ -354,6 +500,43 @@ fn canned_shapes() -> Vec<Shape> {
                 ),
             ],
         },
+        // Variant with a mix of unit and payload-carrying cases.
+        // `selected: 1` materializes the payload-carrying `msg` case
+        // so the per-case lift/lower path is exercised end-to-end.
+        Shape::Variant {
+            wit_name: "tag",
+            rust_name: "Tag",
+            cases: vec![
+                VariantCase {
+                    wit_name: "empty",
+                    rust_name: "Empty",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "msg",
+                    rust_name: "Msg",
+                    payload: Some(Shape::Primitive {
+                        name: "string",
+                        wit_type: "string",
+                        rust_ty: "String",
+                        rust_literal: r#"String::from("hi")"#,
+                        expected_debug: r#""hi""#,
+                    }),
+                },
+                VariantCase {
+                    wit_name: "num",
+                    rust_name: "Num",
+                    payload: Some(Shape::Primitive {
+                        name: "s64",
+                        wit_type: "s64",
+                        rust_ty: "i64",
+                        rust_literal: "-1i64",
+                        expected_debug: "-1",
+                    }),
+                },
+            ],
+            selected: 1,
+        },
     ]);
     v
 }
@@ -366,23 +549,32 @@ fn canned_shapes() -> Vec<Shape> {
 // level decl, which we don't emit. `allow_record=false` is threaded
 // through when recursing into record fields.
 
+/// Per-tree counters for nominal types. Each counter indexes into
+/// the corresponding `GEN_*_NAMES` pool; when a counter hits the
+/// pool length, the generator falls back to an anonymous type so
+/// every nominal type in the tree ends up with a unique name.
+#[derive(Default)]
+struct NominalCounters {
+    records: usize,
+    variants: usize,
+}
+
 fn gen_shape(
     u: &mut arbitrary::Unstructured<'_>,
     max_depth: u32,
-    allow_record: bool,
-    record_counter: &mut usize,
+    allow_nominal: bool,
+    counters: &mut NominalCounters,
 ) -> arbitrary::Result<Shape> {
     let can_recurse = max_depth > 0;
-    // Records get unique names from GEN_RECORD_{WIT,RUST}_NAMES; once
-    // that pool is exhausted we fall back to emitting a primitive to
-    // keep every record in a tree distinct.
-    let records_exhausted = *record_counter >= GEN_RECORD_WIT_NAMES.len();
-    // 0=primitive, 1=option, 2=list, 3=tuple, 4=record
-    let max_kind: u8 = match (can_recurse, allow_record, records_exhausted) {
+    let records_exhausted = counters.records >= GEN_RECORD_WIT_NAMES.len();
+    let variants_exhausted = counters.variants >= GEN_VARIANT_WIT_NAMES.len();
+    let any_nominal_left = !records_exhausted || !variants_exhausted;
+    // 0=primitive, 1=option, 2=list, 3=tuple, 4=record, 5=variant
+    let max_kind: u8 = match (can_recurse, allow_nominal, any_nominal_left) {
         (false, _, _) => 0,
         (true, false, _) => 3,
-        (true, true, false) => 4,
-        (true, true, true) => 3,
+        (true, true, false) => 3,
+        (true, true, true) => 5,
     };
     let kind: u8 = u.int_in_range(0..=max_kind)?;
     match kind {
@@ -390,29 +582,33 @@ fn gen_shape(
         1 => Ok(Shape::Option(Box::new(gen_shape(
             u,
             max_depth - 1,
-            allow_record,
-            record_counter,
+            allow_nominal,
+            counters,
         )?))),
         2 => Ok(Shape::List(Box::new(gen_shape(
             u,
             max_depth - 1,
-            allow_record,
-            record_counter,
+            allow_nominal,
+            counters,
         )?))),
         3 => {
             let n: usize = u.int_in_range(TUPLE_ARITY)?;
             let parts: arbitrary::Result<Vec<Shape>> = (0..n)
-                .map(|_| gen_shape(u, max_depth - 1, allow_record, record_counter))
+                .map(|_| gen_shape(u, max_depth - 1, allow_nominal, counters))
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
         4 => {
-            let idx = *record_counter;
-            *record_counter += 1;
+            // Record; fall back to variant if records are exhausted.
+            if records_exhausted {
+                return gen_variant(u, max_depth, counters);
+            }
+            let idx = counters.records;
+            counters.records += 1;
             let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
             let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
                 .map(|i| {
-                    let fshape = gen_shape(u, max_depth - 1, false, record_counter)?;
+                    let fshape = gen_shape(u, max_depth - 1, false, counters)?;
                     Ok((RECORD_FIELD_NAMES[i], fshape))
                 })
                 .collect();
@@ -422,8 +618,65 @@ fn gen_shape(
                 fields: fields?,
             })
         }
+        5 => {
+            // Variant; fall back to record if variants are exhausted.
+            if variants_exhausted {
+                if records_exhausted {
+                    return pick_primitive(u);
+                }
+                let idx = counters.records;
+                counters.records += 1;
+                let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
+                let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
+                    .map(|i| {
+                        let fshape = gen_shape(u, max_depth - 1, false, counters)?;
+                        Ok((RECORD_FIELD_NAMES[i], fshape))
+                    })
+                    .collect();
+                return Ok(Shape::Record {
+                    wit_name: GEN_RECORD_WIT_NAMES[idx],
+                    rust_name: GEN_RECORD_RUST_NAMES[idx],
+                    fields: fields?,
+                });
+            }
+            gen_variant(u, max_depth, counters)
+        }
         _ => unreachable!(),
     }
+}
+
+/// Build a variant with 1..=N cases (N capped by the shared case-name
+/// pool). Each case is independently unit or payload-bearing; the
+/// selected case is what `rust_literal` / `expected_debug` will
+/// materialize at runtime.
+fn gen_variant(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.variants;
+    counters.variants += 1;
+    let n: usize = u.int_in_range(1..=GEN_VARIANT_CASE_WIT_NAMES.len())?;
+    let mut cases: Vec<VariantCase> = Vec::with_capacity(n);
+    for i in 0..n {
+        let payload = if bool::arbitrary(u)? {
+            Some(gen_shape(u, max_depth - 1, false, counters)?)
+        } else {
+            None
+        };
+        cases.push(VariantCase {
+            wit_name: GEN_VARIANT_CASE_WIT_NAMES[i],
+            rust_name: GEN_VARIANT_CASE_RUST_NAMES[i],
+            payload,
+        });
+    }
+    let selected: usize = u.int_in_range(0..=cases.len() - 1)?;
+    Ok(Shape::Variant {
+        wit_name: GEN_VARIANT_WIT_NAMES[idx],
+        rust_name: GEN_VARIANT_RUST_NAMES[idx],
+        cases,
+        selected,
+    })
 }
 
 fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
@@ -827,8 +1080,8 @@ fn test_fuzz() {
         let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
         let mut u = arbitrary::Unstructured::new(&buf);
 
-        let mut record_counter: usize = 0;
-        let shape = match gen_shape(&mut u, max_depth, true, &mut record_counter) {
+        let mut counters = NominalCounters::default();
+        let shape = match gen_shape(&mut u, max_depth, true, &mut counters) {
             Ok(s) => s,
             Err(e) => {
                 failures.push(format!("iter {i} seed {iter_seed}: gen_shape: {e}"));

@@ -923,7 +923,9 @@ dependencies = [
 
 [[package]]
 name = "cviz"
-version = "2.0.0-rc3"
+version = "2.0.0-rc4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5fd020e0061a28431f788992ccc57b18160ad73b511be1929ff5f962d0ba360"
 dependencies = [
  "anyhow",
  "clap",
