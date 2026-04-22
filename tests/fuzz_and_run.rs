@@ -127,6 +127,16 @@ impl BindingsSide {
     }
 }
 
+// TODO: extend Shape with resource types + resource methods/statics/
+// constructors so the fuzzer exercises splicer's canon-lower/lift of
+// `own<T>` / `borrow<T>` handles and the `method:` / `static func:` /
+// `constructor` function kinds. Today Shape covers only value types,
+// which leaves real-world compositions (e.g. `wasi:http/incoming-handler`
+// with `(incoming-request, response-outparam) -> ()`, anything on
+// `wasi:io/streams`, the nebula demo's gateway→service wiring) outside
+// the fuzzer's confidence envelope. Splicer has a couple of hand-
+// written resource tests in `src/adapter/tests.rs` but the fuzz pass
+// doesn't randomize that surface.
 #[derive(Clone)]
 enum Shape {
     Primitive {
@@ -584,21 +594,15 @@ impl Shape {
     }
 
     /// Walk the tree and collect rust_names of enums that wit-bindgen
-    /// will render with error-shaped Debug. wit-bindgen emits
-    /// `impl Error for EnumName` (and a matching `Debug`) when the
-    /// enum is used as an error type; it decides per-enum-definition
-    /// at generate time, so any enum reachable below a `result<_, …>`
-    /// err position in this shape tree gets the error-shaped format.
+    /// will render with error-shaped Debug. wit-bindgen only
+    /// error-styles an enum that appears *directly* as the err arg of
+    /// some `result<_, EnumName>` in the WIT — not when the enum is
+    /// wrapped inside tuple/list/option/etc. at the err position.
     fn collect_error_style_enums(&self, out: &mut HashSet<&'static str>) {
-        if let Shape::Result_ {
-            err: Some(e), ok, ..
-        } = self
-        {
-            e.mark_nested_enums(out);
-            if let Some(o) = ok {
-                o.collect_error_style_enums(out);
+        if let Shape::Result_ { err: Some(e), .. } = self {
+            if let Shape::Enum { rust_name, .. } = e.as_ref() {
+                out.insert(*rust_name);
             }
-            return;
         }
         match self {
             Shape::Option(inner) | Shape::List(inner) => {
@@ -621,49 +625,15 @@ impl Shape {
                     }
                 }
             }
-            Shape::Result_ { ok, .. } => {
-                // err is None here (matched Some above); still recurse
-                // into ok.
+            Shape::Result_ { ok, err, .. } => {
                 if let Some(o) = ok {
                     o.collect_error_style_enums(out);
                 }
+                if let Some(e) = err {
+                    e.collect_error_style_enums(out);
+                }
             }
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => {}
-        }
-    }
-
-    fn mark_nested_enums(&self, out: &mut HashSet<&'static str>) {
-        match self {
-            Shape::Enum { rust_name, .. } => {
-                out.insert(*rust_name);
-            }
-            Shape::Option(inner) | Shape::List(inner) => inner.mark_nested_enums(out),
-            Shape::Tuple(parts) => {
-                for p in parts {
-                    p.mark_nested_enums(out);
-                }
-            }
-            Shape::Record { fields, .. } => {
-                for (_, f) in fields {
-                    f.mark_nested_enums(out);
-                }
-            }
-            Shape::Variant { cases, .. } => {
-                for c in cases {
-                    if let Some(p) = &c.payload {
-                        p.mark_nested_enums(out);
-                    }
-                }
-            }
-            Shape::Result_ { ok, err, .. } => {
-                if let Some(o) = ok {
-                    o.mark_nested_enums(out);
-                }
-                if let Some(e) = err {
-                    e.mark_nested_enums(out);
-                }
-            }
-            Shape::Primitive { .. } | Shape::Flags { .. } => {}
         }
     }
 
