@@ -5,14 +5,33 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
-  schedule:
-    # Nightly at 07:00 UTC — triggers the heavy fuzz job below.
-    - cron: "0 7 * * *"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Figure out whether the PR / push touched code the fuzz harness
+  # depends on. Downstream fuzz jobs depend on this so we don't burn
+  # CI re-fuzzing unchanged code at a pinned seed.
+  changes:
+    name: Detect source changes
+    runs-on: ubuntu-latest
+    outputs:
+      fuzz_relevant: ${{ steps.filter.outputs.fuzz_relevant }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            fuzz_relevant:
+              - 'src/**'
+              - 'wit/**'
+              - 'tests/fuzz_and_run.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+
   lint:
     name: Format + Clippy
     runs-on: ubuntu-latest
@@ -80,10 +99,13 @@ jobs:
   # full splicer pipeline (compose + splice for both `between` and
   # `before` rules), and invokes the output under wasmtime. CI runs at
   # heavier iter/depth than the local default to catch regressions
-  # before they land.
+  # before they land. Skipped when the PR only touches docs / CI-
+  # unrelated files (see `changes` job above).
   fuzz_and_run:
    name: Fuzz + Run (thorough)
    runs-on: ubuntu-latest
+   needs: changes
+   if: needs.changes.outputs.fuzz_relevant == 'true'
    steps:
      - uses: actions/checkout@v4
        with:
@@ -102,14 +124,15 @@ jobs:
          SPLICER_FUZZ_DEPTH: "5"
        run: cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
 
-  # Heavier fuzz run on a schedule — catches bugs that only surface
-  # with more random shapes or deeper nesting than PR CI exercises.
-  # Each iter rebuilds a tempdir workspace, so this job takes longer
-  # than the PR-gated one; acceptable since it runs off-hours.
-  fuzz_nightly:
-   name: Fuzz + Run (nightly, heavy)
+  # Heavier fuzz run on every push to main — re-validates the merged
+  # code against deeper shape trees than PR CI exercised. Gated on the
+  # same path filter so a merge that doesn't touch fuzz-relevant paths
+  # doesn't re-run this at the same pinned seed.
+  fuzz_postmerge:
+   name: Fuzz + Run (post-merge, heavy)
    runs-on: ubuntu-latest
-   if: github.event_name == 'schedule'
+   needs: changes
+   if: github.event_name == 'push' && needs.changes.outputs.fuzz_relevant == 'true'
    steps:
      - uses: actions/checkout@v4
        with:
