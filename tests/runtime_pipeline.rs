@@ -363,33 +363,20 @@ fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shap
     Ok(atoms[idx].clone())
 }
 
-/// Tiny inline SplitMix64: turns a u64 seed into a deterministic byte
-/// stream to feed `Unstructured`. Kept inline so we don't pull `rand`
-/// into dev-deps just for this.
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-        z ^ (z >> 31)
-    }
-    fn fill(&mut self, buf: &mut [u8]) {
-        let mut i = 0;
-        while i < buf.len() {
-            let bytes = self.next_u64().to_le_bytes();
-            let take = (buf.len() - i).min(8);
-            buf[i..i + take].copy_from_slice(&bytes[..take]);
-            i += take;
-        }
-    }
+/// Deterministic LCG byte source so a failing iteration is replayable
+/// via `SPLICER_FUZZ_SEED` + `SPLICER_FUZZ_ITERS`. Kept byte-for-byte
+/// identical to `src/adapter/tests/fuzz.rs::fuzz_seeded_bytes` so the
+/// two fuzz harnesses stay aligned.
+fn fuzz_seeded_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u8
+        })
+        .collect()
 }
 
 // ─── Fixtures that don't vary per shape ────────────────────────────
@@ -684,9 +671,10 @@ fn test_runtime_pipeline() {
 ///   SPLICER_FUZZ_DEPTH  — max recursion depth per shape (default: 3)
 ///
 /// Each iteration uses `base_seed.wrapping_add(iter_idx)` so any
-/// failure can be replayed with `SPLICER_FUZZ_SEED=<that> \
-/// SPLICER_FUZZ_ITERS=1`. The test prints that exact command on
-/// failure.
+/// failure can be replayed with `SPLICER_FUZZ_SEED=<iter_seed> \
+/// SPLICER_FUZZ_ITERS=1`. Failures are printed as
+/// `iter {i} seed {iter_seed} shape `{name}`: {msg}` so the seed to
+/// replay is visible on every failing line.
 #[test]
 #[ignore]
 fn test_runtime_pipeline_fuzz() {
@@ -712,42 +700,33 @@ fn test_runtime_pipeline_fuzz() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
 
-    eprintln!(
-        "runtime_pipeline_fuzz: base seed = {base_seed}, iters = {iters}, max depth = {max_depth}"
-    );
+    eprintln!("runtime_pipeline_fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth}");
 
     let tmp = tempfile::tempdir().expect("mktempdir");
     let root = tmp.path();
     eprintln!("runtime_pipeline_fuzz: work dir = {}", root.display());
     scaffold_common(root).expect("scaffold common");
 
-    // (iter_idx, iter_seed, shape_name, error_msg)
-    let mut failures: Vec<(u32, u64, String, String)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
 
     for i in 0..iters {
         let iter_seed = base_seed.wrapping_add(i as u64);
-        let mut prng = SplitMix64::new(iter_seed);
-        let mut buf = vec![0u8; 4096];
-        prng.fill(&mut buf);
+        let buf = fuzz_seeded_bytes(iter_seed, 4096);
         let mut u = arbitrary::Unstructured::new(&buf);
 
         let shape = match gen_shape(&mut u, max_depth, true) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("\n=== iter {i} (seed={iter_seed}): gen_shape failed: {e} ===");
-                failures.push((i, iter_seed, "<gen>".into(), format!("gen_shape: {e}")));
+                failures.push(format!("iter {i} seed {iter_seed}: gen_shape: {e}"));
                 continue;
             }
         };
         let shape_name = shape.name();
-        eprintln!("\n=== iter {i} (seed={iter_seed}): {shape_name} ===");
+        eprintln!("\n=== iter {i} seed {iter_seed}: {shape_name} ===");
 
         if let Err(e) = write_per_shape_files(root, &shape) {
-            failures.push((
-                i,
-                iter_seed,
-                shape_name,
-                format!("write_per_shape_files: {e}"),
+            failures.push(format!(
+                "iter {i} seed {iter_seed} shape `{shape_name}`: write_per_shape_files: {e}"
             ));
             continue;
         }
@@ -760,23 +739,29 @@ fn test_runtime_pipeline_fuzz() {
                 .cloned()
                 .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "<non-string panic>".into());
-            failures.push((i, iter_seed, shape_name.clone(), msg.clone()));
-            eprintln!("iter {i} (seed={iter_seed}) shape `{shape_name}`: FAILED — {msg}");
+            failures.push(format!(
+                "iter {i} seed {iter_seed} shape `{shape_name}`: {msg}"
+            ));
         }
     }
 
+    eprintln!(
+        "runtime_pipeline_fuzz: passed={} failures={}",
+        iters as usize - failures.len(),
+        failures.len()
+    );
     if !failures.is_empty() {
-        eprintln!("\n=== fuzz failures ===");
-        for (iter, iter_seed, shape_name, msg) in &failures {
-            eprintln!("  iter {iter} (seed={iter_seed}), shape `{shape_name}`:\n    {msg}");
+        for f in failures.iter().take(20) {
+            eprintln!("  {f}");
         }
-        let (first_iter, first_seed, _, _) = &failures[0];
-        eprintln!(
-            "\nTo reproduce iter {first_iter} alone:\n  \
-             SPLICER_FUZZ_SEED={first_seed} SPLICER_FUZZ_ITERS=1 \\\n      \
-             cargo test --test runtime_pipeline -- --ignored --nocapture test_runtime_pipeline_fuzz"
+        if failures.len() > 20 {
+            eprintln!("  ... and {} more", failures.len() - 20);
+        }
+        panic!(
+            "{} runtime fuzz iterations failed — replay a single case with \
+             SPLICER_FUZZ_SEED=<iter_seed_from_output> SPLICER_FUZZ_ITERS=1",
+            failures.len()
         );
-        panic!("{} of {iters} fuzz iterations failed", failures.len());
     }
 }
 
