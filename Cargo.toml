@@ -50,8 +50,9 @@ wirm = "4.0.0-rc3"
 wat = "1"
 tempfile = "3"
 arbitrary = "1"
-# Used by the `wac_compose` example to demonstrate driving the
-# `wac` crates programmatically with splicer's output.
+wasmtime = { version = "41", features = ["component-model", "component-model-async", "async"] }
+wasmtime-wasi = "41"
+tokio = { version = "1", features = ["rt", "macros"] }
 wac-parser = "0.9"
 wac-resolver = "0.9"
 wac-graph = "0.9"
