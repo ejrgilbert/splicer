@@ -127,6 +127,37 @@ enum Shape {
         /// type definitions; only one is instantiated at runtime.
         selected: usize,
     },
+    /// Named enum of unit tags — like a `Variant` where every case has
+    /// no payload. Separate kind because the canonical-ABI layout is
+    /// discriminant-only (no joined-flat payloads).
+    Enum {
+        wit_name: &'static str,
+        rust_name: &'static str,
+        /// `(wit_case, rust_case)` pairs.
+        cases: Vec<(&'static str, &'static str)>,
+        /// Which case (0-indexed) to materialize.
+        selected: usize,
+    },
+    /// Named bitfield-set. wit-bindgen generates an opaque struct
+    /// with `const` associated values plus bitor/etc.; the selected
+    /// bitmask names which bits to set in the test value.
+    Flags {
+        wit_name: &'static str,
+        rust_name: &'static str,
+        /// `(wit_flag, rust_flag_const)` pairs — wit-bindgen emits
+        /// each flag as `UPPER_SNAKE_CASE` associated const.
+        flags: Vec<(&'static str, &'static str)>,
+        /// Bitmask over `flags` (bit i set means `flags[i]` is included).
+        selected: u32,
+    },
+    /// `result<ok?, err?>` — structural sum of Ok/Err branches, each
+    /// with an optional payload.
+    Result_ {
+        ok: Option<Box<Shape>>,
+        err: Option<Box<Shape>>,
+        /// Which branch to materialize (`true` = Ok, `false` = Err).
+        is_ok: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -156,6 +187,13 @@ impl Shape {
             }
             Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
             Shape::Variant { wit_name, .. } => format!("variant_{}", wit_name),
+            Shape::Enum { wit_name, .. } => format!("enum_{}", wit_name),
+            Shape::Flags { wit_name, .. } => format!("flags_{}", wit_name),
+            Shape::Result_ { ok, err, .. } => {
+                let ok_s = ok.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
+                let err_s = err.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
+                format!("result_{ok_s}_{err_s}")
+            }
         }
     }
 
@@ -174,6 +212,14 @@ impl Shape {
             }
             Shape::Record { wit_name, .. } => (*wit_name).to_string(),
             Shape::Variant { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Enum { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Flags { wit_name, .. } => (*wit_name).to_string(),
+            Shape::Result_ { ok, err, .. } => match (ok.as_ref(), err.as_ref()) {
+                (None, None) => "result".into(),
+                (Some(o), None) => format!("result<{}>", o.wit_type()),
+                (None, Some(e)) => format!("result<_, {}>", e.wit_type()),
+                (Some(o), Some(e)) => format!("result<{}, {}>", o.wit_type(), e.wit_type()),
+            },
         }
     }
 
@@ -233,6 +279,38 @@ impl Shape {
                 }
                 out.push('}');
             }
+            Shape::Enum {
+                wit_name, cases, ..
+            } => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("enum {wit_name} {{\n"));
+                for (wit_case, _) in cases {
+                    out.push_str(&format!("    {wit_case},\n"));
+                }
+                out.push('}');
+            }
+            Shape::Flags {
+                wit_name, flags, ..
+            } => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("flags {wit_name} {{\n"));
+                for (wit_flag, _) in flags {
+                    out.push_str(&format!("    {wit_flag},\n"));
+                }
+                out.push('}');
+            }
+            Shape::Result_ { ok, err, .. } => {
+                if let Some(o) = ok {
+                    o.collect_wit_decls(out);
+                }
+                if let Some(e) = err {
+                    e.collect_wit_decls(out);
+                }
+            }
         }
     }
 
@@ -249,8 +327,22 @@ impl Shape {
                     .join(", ");
                 format!("({inside})")
             }
-            Shape::Record { rust_name, .. } | Shape::Variant { rust_name, .. } => {
+            Shape::Record { rust_name, .. }
+            | Shape::Variant { rust_name, .. }
+            | Shape::Enum { rust_name, .. }
+            | Shape::Flags { rust_name, .. } => {
                 format!("bindings::exports::my::shape::api::{rust_name}")
+            }
+            Shape::Result_ { ok, err, .. } => {
+                let ok_ty = ok
+                    .as_ref()
+                    .map(|s| s.rust_ty())
+                    .unwrap_or_else(|| "()".into());
+                let err_ty = err
+                    .as_ref()
+                    .map(|s| s.rust_ty())
+                    .unwrap_or_else(|| "()".into());
+                format!("Result<{ok_ty}, {err_ty}>")
             }
         }
     }
@@ -295,6 +387,55 @@ impl Shape {
                     case.rust_name
                 )
             }
+            Shape::Enum {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                let (_, rust_case) = cases[*selected];
+                format!("bindings::exports::my::shape::api::{rust_name}::{rust_case}")
+            }
+            Shape::Flags {
+                rust_name,
+                flags,
+                selected,
+                ..
+            } => {
+                // wit-bindgen emits each flag as a const on the opaque
+                // struct and derives BitOr. An empty bitmask maps to
+                // `Flags::empty()`; otherwise OR together the set bits.
+                if *selected == 0 {
+                    format!("bindings::exports::my::shape::api::{rust_name}::empty()")
+                } else {
+                    let ored = flags
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| selected & (1u32 << i) != 0)
+                        .map(|(_, (_, rust_flag))| {
+                            format!("bindings::exports::my::shape::api::{rust_name}::{rust_flag}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    ored
+                }
+            }
+            Shape::Result_ { ok, err, is_ok } => {
+                // The provider template binds the value to a local of
+                // the full `Result<T, E>` type, so bare `Ok(...)` /
+                // `Err(...)` infer the missing type parameter.
+                if *is_ok {
+                    match ok.as_ref() {
+                        None => "Ok(())".into(),
+                        Some(p) => format!("Ok({})", p.rust_literal()),
+                    }
+                } else {
+                    match err.as_ref() {
+                        None => "Err(())".into(),
+                        Some(p) => format!("Err({})", p.rust_literal()),
+                    }
+                }
+            }
         }
     }
 
@@ -337,6 +478,51 @@ impl Shape {
                     .map(|p| format!("({})", p.expected_debug()))
                     .unwrap_or_default();
                 format!("{rust_name}::{}{payload}", case.rust_name)
+            }
+            Shape::Enum {
+                rust_name,
+                cases,
+                selected,
+                ..
+            } => {
+                // Same Debug convention as variants.
+                let (_, rust_case) = cases[*selected];
+                format!("{rust_name}::{rust_case}")
+            }
+            Shape::Flags {
+                rust_name,
+                flags,
+                selected,
+                ..
+            } => {
+                // wit-bindgen's Debug prints set flags joined by
+                // ` | ` in decl order, wrapped in `TypeName(...)`.
+                // Empty mask is `TypeName(0x0)`.
+                if *selected == 0 {
+                    format!("{rust_name}(0x0)")
+                } else {
+                    let joined = flags
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| selected & (1u32 << i) != 0)
+                        .map(|(_, (_, rust_flag))| *rust_flag)
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    format!("{rust_name}({joined})")
+                }
+            }
+            Shape::Result_ { ok, err, is_ok } => {
+                if *is_ok {
+                    match ok.as_ref() {
+                        None => "Ok(())".into(),
+                        Some(p) => format!("Ok({})", p.expected_debug()),
+                    }
+                } else {
+                    match err.as_ref() {
+                        None => "Err(())".into(),
+                        Some(p) => format!("Err({})", p.expected_debug()),
+                    }
+                }
             }
         }
     }
@@ -536,6 +722,50 @@ fn canned_shapes() -> Vec<Shape> {
                 },
             ],
             selected: 1,
+        },
+        Shape::Enum {
+            wit_name: "color",
+            rust_name: "Color",
+            cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+            selected: 1,
+        },
+        Shape::Flags {
+            wit_name: "perms",
+            rust_name: "Perms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("execute", "EXECUTE")],
+            // READ | EXECUTE — bits 0 and 2 set.
+            selected: 0b101,
+        },
+        // result<u32, string> constructed as the Ok branch.
+        Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "11u32",
+                expected_debug: "11",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("boom")"#,
+                expected_debug: r#""boom""#,
+            })),
+            is_ok: true,
+        },
+        // result<_, string> constructed as the Err branch — exercises
+        // the one-sided payload path.
+        Shape::Result_ {
+            ok: None,
+            err: Some(Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("nope")"#,
+                expected_debug: r#""nope""#,
+            })),
+            is_ok: false,
         },
     ]);
     v
