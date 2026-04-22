@@ -76,6 +76,20 @@ const GEN_VARIANT_RUST_NAMES: &[&str] = &["Tag0", "Tag1", "Tag2", "Tag3", "Tag4"
 /// of cases per variant.
 const GEN_VARIANT_CASE_WIT_NAMES: &[&str] = &["ca", "cb", "cc", "cd"];
 const GEN_VARIANT_CASE_RUST_NAMES: &[&str] = &["Ca", "Cb", "Cc", "Cd"];
+/// WIT enum names for the generator.
+const GEN_ENUM_WIT_NAMES: &[&str] = &["enm0", "enm1", "enm2", "enm3"];
+const GEN_ENUM_RUST_NAMES: &[&str] = &["Enm0", "Enm1", "Enm2", "Enm3"];
+/// Case names reused across generated enums.
+const GEN_ENUM_CASE_WIT_NAMES: &[&str] = &["ea", "eb", "ec", "ed"];
+const GEN_ENUM_CASE_RUST_NAMES: &[&str] = &["Ea", "Eb", "Ec", "Ed"];
+/// WIT flags names for the generator.
+const GEN_FLAGS_WIT_NAMES: &[&str] = &["fl0", "fl1", "fl2", "fl3"];
+const GEN_FLAGS_RUST_NAMES: &[&str] = &["Fl0", "Fl1", "Fl2", "Fl3"];
+/// Flag names reused across generated flags. Length caps flag count
+/// per type — kept to 8 to stay within wit-bindgen's single-byte
+/// flat-representation bucket for simplicity.
+const GEN_FLAGS_WIT_FLAG_NAMES: &[&str] = &["fa", "fb", "fc", "fd", "fe", "ff", "fg", "fh"];
+const GEN_FLAGS_RUST_FLAG_NAMES: &[&str] = &["FA", "FB", "FC", "FD", "FE", "FF", "FG", "FH"];
 /// In-memory stdout buffer for captured guest output (1 MiB).
 const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 
@@ -781,12 +795,41 @@ fn canned_shapes() -> Vec<Shape> {
 
 /// Per-tree counters for nominal types. Each counter indexes into
 /// the corresponding `GEN_*_NAMES` pool; when a counter hits the
-/// pool length, the generator falls back to an anonymous type so
-/// every nominal type in the tree ends up with a unique name.
+/// pool length, that nominal kind is considered exhausted and
+/// `gen_nominal` picks another one (or falls back to a primitive).
 #[derive(Default)]
 struct NominalCounters {
     records: usize,
     variants: usize,
+    enums: usize,
+    flags: usize,
+}
+
+impl NominalCounters {
+    fn available_nominals(&self) -> Vec<NominalKind> {
+        let mut v = Vec::new();
+        if self.records < GEN_RECORD_WIT_NAMES.len() {
+            v.push(NominalKind::Record);
+        }
+        if self.variants < GEN_VARIANT_WIT_NAMES.len() {
+            v.push(NominalKind::Variant);
+        }
+        if self.enums < GEN_ENUM_WIT_NAMES.len() {
+            v.push(NominalKind::Enum);
+        }
+        if self.flags < GEN_FLAGS_WIT_NAMES.len() {
+            v.push(NominalKind::Flags);
+        }
+        v
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NominalKind {
+    Record,
+    Variant,
+    Enum,
+    Flags,
 }
 
 fn gen_shape(
@@ -796,14 +839,14 @@ fn gen_shape(
     counters: &mut NominalCounters,
 ) -> arbitrary::Result<Shape> {
     let can_recurse = max_depth > 0;
-    let records_exhausted = counters.records >= GEN_RECORD_WIT_NAMES.len();
-    let variants_exhausted = counters.variants >= GEN_VARIANT_WIT_NAMES.len();
-    let any_nominal_left = !records_exhausted || !variants_exhausted;
-    // 0=primitive, 1=option, 2=list, 3=tuple, 4=record, 5=variant
+    let any_nominal_left = !counters.available_nominals().is_empty();
+    // 0=primitive, 1=option, 2=list, 3=tuple, 4=result, 5=nominal
+    // (Result is structural — allowed even in nominal-banned contexts —
+    // but its payloads propagate `allow_nominal=false`.)
     let max_kind: u8 = match (can_recurse, allow_nominal, any_nominal_left) {
         (false, _, _) => 0,
-        (true, false, _) => 3,
-        (true, true, false) => 3,
+        (true, false, _) => 4,
+        (true, true, false) => 4,
         (true, true, true) => 5,
     };
     let kind: u8 = u.int_in_range(0..=max_kind)?;
@@ -828,51 +871,50 @@ fn gen_shape(
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
-        4 => {
-            // Record; fall back to variant if records are exhausted.
-            if records_exhausted {
-                return gen_variant(u, max_depth, counters);
-            }
-            let idx = counters.records;
-            counters.records += 1;
-            let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
-            let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
-                .map(|i| {
-                    let fshape = gen_shape(u, max_depth - 1, false, counters)?;
-                    Ok((RECORD_FIELD_NAMES[i], fshape))
-                })
-                .collect();
-            Ok(Shape::Record {
-                wit_name: GEN_RECORD_WIT_NAMES[idx],
-                rust_name: GEN_RECORD_RUST_NAMES[idx],
-                fields: fields?,
-            })
-        }
-        5 => {
-            // Variant; fall back to record if variants are exhausted.
-            if variants_exhausted {
-                if records_exhausted {
-                    return pick_primitive(u);
-                }
-                let idx = counters.records;
-                counters.records += 1;
-                let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
-                let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
-                    .map(|i| {
-                        let fshape = gen_shape(u, max_depth - 1, false, counters)?;
-                        Ok((RECORD_FIELD_NAMES[i], fshape))
-                    })
-                    .collect();
-                return Ok(Shape::Record {
-                    wit_name: GEN_RECORD_WIT_NAMES[idx],
-                    rust_name: GEN_RECORD_RUST_NAMES[idx],
-                    fields: fields?,
-                });
-            }
-            gen_variant(u, max_depth, counters)
-        }
+        4 => gen_result(u, max_depth, allow_nominal, counters),
+        5 => gen_nominal(u, max_depth, counters),
         _ => unreachable!(),
     }
+}
+
+/// Pick a nominal kind uniformly from the ones whose name pool hasn't
+/// been exhausted and delegate. Caller must guarantee at least one is
+/// available (checked via `counters.available_nominals()`).
+fn gen_nominal(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let available = counters.available_nominals();
+    debug_assert!(!available.is_empty());
+    let pick = available[u.int_in_range(0..=available.len() - 1)?];
+    match pick {
+        NominalKind::Record => gen_record(u, max_depth, counters),
+        NominalKind::Variant => gen_variant(u, max_depth, counters),
+        NominalKind::Enum => gen_enum(u, counters),
+        NominalKind::Flags => gen_flags(u, counters),
+    }
+}
+
+fn gen_record(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.records;
+    counters.records += 1;
+    let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
+    let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
+        .map(|i| {
+            let fshape = gen_shape(u, max_depth - 1, false, counters)?;
+            Ok((RECORD_FIELD_NAMES[i], fshape))
+        })
+        .collect();
+    Ok(Shape::Record {
+        wit_name: GEN_RECORD_WIT_NAMES[idx],
+        rust_name: GEN_RECORD_RUST_NAMES[idx],
+        fields: fields?,
+    })
 }
 
 /// Build a variant with 1..=N cases (N capped by the shared case-name
@@ -907,6 +949,78 @@ fn gen_variant(
         cases,
         selected,
     })
+}
+
+fn gen_enum(
+    u: &mut arbitrary::Unstructured<'_>,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.enums;
+    counters.enums += 1;
+    let n: usize = u.int_in_range(1..=GEN_ENUM_CASE_WIT_NAMES.len())?;
+    let cases: Vec<(&'static str, &'static str)> = (0..n)
+        .map(|i| (GEN_ENUM_CASE_WIT_NAMES[i], GEN_ENUM_CASE_RUST_NAMES[i]))
+        .collect();
+    let selected: usize = u.int_in_range(0..=cases.len() - 1)?;
+    Ok(Shape::Enum {
+        wit_name: GEN_ENUM_WIT_NAMES[idx],
+        rust_name: GEN_ENUM_RUST_NAMES[idx],
+        cases,
+        selected,
+    })
+}
+
+fn gen_flags(
+    u: &mut arbitrary::Unstructured<'_>,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    let idx = counters.flags;
+    counters.flags += 1;
+    let n: usize = u.int_in_range(1..=GEN_FLAGS_WIT_FLAG_NAMES.len())?;
+    let flags: Vec<(&'static str, &'static str)> = (0..n)
+        .map(|i| (GEN_FLAGS_WIT_FLAG_NAMES[i], GEN_FLAGS_RUST_FLAG_NAMES[i]))
+        .collect();
+    // Random bitmask over the n flags. u32 comfortably fits up to 32.
+    let full_mask: u32 = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+    let selected = u.int_in_range(0..=full_mask)?;
+    Ok(Shape::Flags {
+        wit_name: GEN_FLAGS_WIT_NAMES[idx],
+        rust_name: GEN_FLAGS_RUST_NAMES[idx],
+        flags,
+        selected,
+    })
+}
+
+fn gen_result(
+    u: &mut arbitrary::Unstructured<'_>,
+    max_depth: u32,
+    allow_nominal: bool,
+    counters: &mut NominalCounters,
+) -> arbitrary::Result<Shape> {
+    // Each side is independently present or absent. If both absent,
+    // that's a bare `result` with no payloads — legal WIT.
+    let ok = if bool::arbitrary(u)? {
+        Some(Box::new(gen_shape(
+            u,
+            max_depth - 1,
+            allow_nominal,
+            counters,
+        )?))
+    } else {
+        None
+    };
+    let err = if bool::arbitrary(u)? {
+        Some(Box::new(gen_shape(
+            u,
+            max_depth - 1,
+            allow_nominal,
+            counters,
+        )?))
+    } else {
+        None
+    };
+    let is_ok = bool::arbitrary(u)?;
+    Ok(Shape::Result_ { ok, err, is_ok })
 }
 
 fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
