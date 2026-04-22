@@ -530,7 +530,7 @@ world mdl {
 
 const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
 
-const SPLICE_YAML: &str = r#"version: 1
+const SPLICE_YAML_BETWEEN: &str = r#"version: 1
 
 rules:
   - between:
@@ -543,6 +543,46 @@ rules:
       - name: mdl
         path: "middleware.comp.wasm"
 "#;
+
+/// Before-rule variant: insert middleware in front of the provider's
+/// export, BEFORE the provider is composed with the consumer.
+///
+/// Uses `provider.alias: prov` because the auto-derived shim-instance
+/// variable name (`shape-api@1-0-0-shim-instance`) would contain `@`,
+/// which WAC rejects as an identifier.
+const SPLICE_YAML_BEFORE: &str = r#"version: 1
+
+rules:
+  - before:
+      interface: "my:shape/api@1.0.0"
+      provider:
+        alias: "prov"
+    inject:
+      - name: mdl
+        path: "middleware.comp.wasm"
+"#;
+
+/// Which splicer rule kind the pipeline should exercise.
+#[derive(Clone, Copy)]
+enum PipelineKind {
+    /// `between` rule: compose provider+consumer first, then splice
+    /// middleware into the inner/outer interface boundary.
+    Between,
+    /// `before` rule: splice middleware in front of the provider's
+    /// export first, then compose the spliced provider with the
+    /// consumer.
+    Before,
+}
+
+impl PipelineKind {
+    /// Short lowercase label used in log prefixes and error messages.
+    fn tag(self) -> &'static str {
+        match self {
+            PipelineKind::Between => "between",
+            PipelineKind::Before => "before",
+        }
+    }
+}
 
 // ─── Per-shape emitters ────────────────────────────────────────────
 
@@ -661,7 +701,7 @@ fn test_canned() {
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_pipeline_for_shape(root, shape)
+            run_pipeline_for_shape(root, shape, ALL_PIPELINE_KINDS)
         }));
         if let Err(panic) = result {
             let msg = panic_msg(&*panic);
@@ -733,7 +773,7 @@ fn test_fuzz() {
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_pipeline_for_shape(root, &shape)
+            run_pipeline_for_shape(root, &shape, ALL_PIPELINE_KINDS)
         }));
         if let Err(panic) = result {
             let msg = panic_msg(&*panic);
@@ -779,9 +819,11 @@ fn select_shapes() -> Vec<Shape> {
     }
 }
 
-/// Drive the pipeline end-to-end for a single shape: build, wrap,
-/// compose, splice, validate, invoke, assert on markers.
-fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
+/// Drive the pipeline end-to-end for a single shape across every
+/// requested `PipelineKind`. Shared work (cargo build, component
+/// wrapping, provider+consumer compose, pre-splice sanity check) runs
+/// once; the splice + post-splice invocation runs per kind.
+fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
     run(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip1", "--workspace"])
@@ -799,13 +841,87 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
 
     let provider_comp = wrap_component(root, "provider", &adapter);
     let consumer_comp = wrap_component(root, "consumer", &adapter);
-    // wrap_component writes middleware.comp.wasm at root/; splice.yaml
-    // references it by that relative path.
+    // wrap_component writes middleware.comp.wasm at root/; splice YAMLs
+    // reference it by that relative path.
     let _middleware_comp = wrap_component(root, "middleware", &adapter);
 
-    // Stage 1: synthesize a composition of provider + consumer via
-    // `splicer compose`, which emits a WAC file + prints the exact
-    // `wac compose` command that assembles the final .wasm.
+    // Pre-splice composition of provider+consumer. Used as the
+    // baseline we invoke to prove the pipeline threads the value
+    // through without the middleware, and (for `between`) as the
+    // splice input.
+    let composed_path = compose_provider_consumer(root, &provider_comp, &consumer_comp);
+    let shape_name = shape.name();
+
+    // Sanity check: invoke the UNSPLICED composition so we can tell
+    // "splice dropped the return value" apart from "the pipeline was
+    // broken all along". Runs once; shared by every kind.
+    let pre_splice_trace =
+        invoke_run(&std::fs::read(&composed_path).unwrap()).expect("invoke composed (pre-splice)");
+    eprintln!("pipeline: pre-splice trace:\n{pre_splice_trace}");
+    let expected_pre = format!("consumer: got {}", shape.expected_debug());
+    assert!(
+        pre_splice_trace.contains(&expected_pre),
+        "even without the splice, consumer didn't see the expected value for shape `{shape_name}`.\n\
+         --- expected substring ---\n{expected_pre}\n--- pre-splice trace ---\n{pre_splice_trace}",
+    );
+
+    for &kind in kinds {
+        let kind_tag = kind.tag();
+        eprintln!("pipeline[{kind_tag}]: splicing shape `{shape_name}`");
+
+        let final_path = match kind {
+            PipelineKind::Between => splice_between(root, &composed_path),
+            PipelineKind::Before => {
+                splice_before_and_compose(root, &provider_comp, &consumer_comp)
+            }
+        };
+
+        // Validate: parse the final bytes and check the component-
+        // model validator accepts them.
+        let bytes = std::fs::read(&final_path).expect("read final.wasm");
+        let mut validator =
+            wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+        validator
+            .validate_all(&bytes)
+            .unwrap_or_else(|e| panic!("[{kind_tag}] final component failed validation: {e}"));
+        eprintln!("pipeline[{kind_tag}]: validated {} bytes", bytes.len());
+
+        // Invoke the spliced component. See the known-bug NOTE: the
+        // tier-1 adapter drops sync return values when wrapping a
+        // sync function with async before/after hooks, so we only
+        // assert on the control-flow markers, not the returned value.
+        let captured = invoke_run(&bytes).expect("invoke run()");
+        eprintln!("pipeline[{kind_tag}]: post-splice trace:\n{captured}");
+        for marker in [
+            "consumer: calling provider",
+            "mdl: before foo",
+            "provider: returning ",
+            "mdl: after foo",
+            "consumer: got ", // value intentionally unchecked; see NOTE
+        ] {
+            assert!(
+                captured.contains(marker),
+                "[{kind_tag}] post-splice trace missing marker `{marker}` for shape `{shape_name}`\n--- trace ---\n{captured}",
+            );
+        }
+        eprintln!(
+            "pipeline[{kind_tag}]: all control-flow markers fired for shape `{shape_name}`"
+        );
+    }
+}
+
+/// Every kind that `run_pipeline_for_shape` should exercise on each
+/// shape. Callers that want to run one kind in isolation (e.g. to
+/// narrow a reproduction) can pass a shorter slice directly.
+const ALL_PIPELINE_KINDS: &[PipelineKind] = &[PipelineKind::Between, PipelineKind::Before];
+
+/// Run `splicer compose` + `wac compose` on provider + consumer to
+/// produce the pre-splice composed.wasm.
+fn compose_provider_consumer(
+    root: &Path,
+    provider_comp: &Path,
+    consumer_comp: &Path,
+) -> PathBuf {
     let compose_wac = root.join("compose.wac");
     let composed_path = root.join("composed.wasm");
     let wac_cmd = emit_wac_command(
@@ -826,10 +942,14 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
         root,
         "wac compose (provider+consumer)",
     );
+    composed_path
+}
 
-    // Stage 2: splice the middleware in.
-    let splice_yaml_path = root.join("splice.yaml");
-    std::fs::write(&splice_yaml_path, SPLICE_YAML).unwrap();
+/// Splice middleware into the interface boundary of an already-
+/// composed provider+consumer binary. Returns final.wasm.
+fn splice_between(root: &Path, composed_path: &Path) -> PathBuf {
+    let splice_yaml_path = root.join("between.yaml");
+    std::fs::write(&splice_yaml_path, SPLICE_YAML_BETWEEN).unwrap();
     let spliced_wac = root.join("spliced.wac");
     let splits_dir = root.join("splits");
     std::fs::create_dir_all(&splits_dir).unwrap();
@@ -846,59 +966,76 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape) {
                 splits_dir.to_str().unwrap(),
             ])
             .current_dir(root),
-        "splicer splice",
+        "splicer splice (between)",
     );
     let final_path = root.join("final.wasm");
     run_wac_command(
         &splice_wac_cmd,
         &final_path,
         root,
-        "wac compose (post-splice)",
+        "wac compose (post-between-splice)",
+    );
+    final_path
+}
+
+/// Splice middleware in front of a lone provider first, then compose
+/// that spliced-provider with the consumer. Returns final.wasm.
+fn splice_before_and_compose(
+    root: &Path,
+    provider_comp: &Path,
+    consumer_comp: &Path,
+) -> PathBuf {
+    // Step 1: splice against lone provider.
+    let splice_yaml_path = root.join("before.yaml");
+    std::fs::write(&splice_yaml_path, SPLICE_YAML_BEFORE).unwrap();
+    let before_wac = root.join("before_splice.wac");
+    let splits_dir = root.join("splits_before");
+    std::fs::create_dir_all(&splits_dir).unwrap();
+
+    let before_cmd = emit_wac_command(
+        Command::new("splicer")
+            .args([
+                "splice",
+                splice_yaml_path.to_str().unwrap(),
+                provider_comp.to_str().unwrap(),
+                "-o",
+                before_wac.to_str().unwrap(),
+                "-d",
+                splits_dir.to_str().unwrap(),
+            ])
+            .current_dir(root),
+        "splicer splice (before)",
+    );
+    let spliced_provider = root.join("spliced_provider.wasm");
+    run_wac_command(
+        &before_cmd,
+        &spliced_provider,
+        root,
+        "wac compose (before-splice provider)",
     );
 
-    // Validate: parse the final bytes and check the component-model
-    // validator accepts them.
-    let bytes = std::fs::read(&final_path).expect("read final.wasm");
-    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
-    validator
-        .validate_all(&bytes)
-        .expect("final composed component must validate");
-    eprintln!("pipeline: validated {} bytes", bytes.len());
-
-    // Sanity check: invoke the UNSPLICED composition first so we can
-    // tell "splice dropped the return value" apart from "the pipeline
-    // was broken all along". Here we CAN assert on the value because
-    // nothing between provider and consumer is manipulating it yet.
-    let pre_splice_trace =
-        invoke_run(&std::fs::read(&composed_path).unwrap()).expect("invoke composed (pre-splice)");
-    eprintln!("pipeline: pre-splice trace:\n{pre_splice_trace}");
-    let shape_name = shape.name();
-    let expected_pre = format!("consumer: got {}", shape.expected_debug());
-    assert!(
-        pre_splice_trace.contains(&expected_pre),
-        "even without the splice, consumer didn't see the expected value for shape `{shape_name}`.\n\
-         --- expected substring ---\n{expected_pre}\n--- pre-splice trace ---\n{pre_splice_trace}",
+    // Step 2: compose spliced provider with the consumer.
+    let compose_wac = root.join("final_compose.wac");
+    let compose_cmd = emit_wac_command(
+        Command::new("splicer")
+            .args([
+                "compose",
+                spliced_provider.to_str().unwrap(),
+                consumer_comp.to_str().unwrap(),
+                "-o",
+                compose_wac.to_str().unwrap(),
+            ])
+            .current_dir(root),
+        "splicer compose (spliced_provider+consumer)",
     );
-
-    // Run the spliced component. See the known-bug NOTE: the tier-1
-    // adapter drops sync return values when wrapping a sync function
-    // with async before/after hooks, so we only assert on the control-
-    // flow markers, not the returned value.
-    let captured = invoke_run(&bytes).expect("invoke run()");
-    eprintln!("pipeline: post-splice trace:\n{captured}");
-    for marker in [
-        "consumer: calling provider",
-        "mdl: before foo",
-        "provider: returning ",
-        "mdl: after foo",
-        "consumer: got ", // value intentionally unchecked; see NOTE
-    ] {
-        assert!(
-            captured.contains(marker),
-            "post-splice trace missing marker `{marker}` for shape `{shape_name}`\n--- trace ---\n{captured}",
-        );
-    }
-    eprintln!("pipeline: all control-flow markers fired for shape `{shape_name}`",);
+    let final_path = root.join("final.wasm");
+    run_wac_command(
+        &compose_cmd,
+        &final_path,
+        root,
+        "wac compose (spliced_provider+consumer)",
+    );
+    final_path
 }
 
 /// Load the composed component, call `my:svc/app@1.0.0#run`, return
