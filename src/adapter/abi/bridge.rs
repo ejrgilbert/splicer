@@ -316,7 +316,7 @@ impl WitBridge {
 /// Pointer and Length collapse to `I32` (wasm32), `PointerOrI64` to
 /// `I64`. Splicer doesn't need pointer-provenance distinctions — the
 /// emitted wasm just uses i32 / i64 loads.
-fn wasm_to_val(wt: WasmType) -> ValType {
+pub(crate) fn wasm_to_val(wt: WasmType) -> ValType {
     match wt {
         WasmType::I32 | WasmType::Pointer | WasmType::Length => ValType::I32,
         WasmType::I64 | WasmType::PointerOrI64 => ValType::I64,
