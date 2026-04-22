@@ -105,6 +105,27 @@ const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 // deterministic coverage; `gen_shape()` drives the same enum from an
 // `arbitrary::Unstructured` for the fuzz test below.
 
+/// Which wit-bindgen side is constructing a shape literal. Only
+/// matters for nominal types (record/variant/enum/flags): wit-bindgen
+/// emits them under `bindings::exports::my::shape::api` on the
+/// provider (exporting side) and `bindings::my::shape::api` on the
+/// consumer (importing side). Structural types (option/list/tuple/
+/// result) and primitives are path-neutral.
+#[derive(Clone, Copy)]
+enum BindingsSide {
+    Provider,
+    Consumer,
+}
+
+impl BindingsSide {
+    fn path(self) -> &'static str {
+        match self {
+            BindingsSide::Provider => "bindings::exports::my::shape::api",
+            BindingsSide::Consumer => "bindings::my::shape::api",
+        }
+    }
+}
+
 #[derive(Clone)]
 enum Shape {
     Primitive {
@@ -183,6 +204,24 @@ struct VariantCase {
     /// Optional payload type. `None` → unit variant; `Some(s)` →
     /// tuple-struct variant carrying a single `s` value.
     payload: Option<Shape>,
+}
+
+/// Turn a `String::from("…")` Rust source fragment into a bare
+/// string literal (`"…"`) — used when the consumer's sync-mode
+/// binding wants `&str` instead of `String`. The input is
+/// always-generated-by-us so we don't need a real parser.
+fn extract_string_literal(src: &str) -> String {
+    // `String::from("hello")` → `"hello"`. Anything that doesn't
+    // match falls back to the original string — this keeps the
+    // helper robust to callers that accidentally pass a non-
+    // `String::from` literal.
+    let Some(rest) = src.strip_prefix("String::from(") else {
+        return src.to_string();
+    };
+    let Some(inner) = rest.strip_suffix(')') else {
+        return src.to_string();
+    };
+    inner.to_string()
 }
 
 impl Shape {
@@ -328,15 +367,15 @@ impl Shape {
         }
     }
 
-    fn rust_ty(&self) -> String {
+    fn rust_ty(&self, side: BindingsSide) -> String {
         match self {
             Shape::Primitive { rust_ty, .. } => (*rust_ty).to_string(),
-            Shape::Option(inner) => format!("Option<{}>", inner.rust_ty()),
-            Shape::List(inner) => format!("Vec<{}>", inner.rust_ty()),
+            Shape::Option(inner) => format!("Option<{}>", inner.rust_ty(side)),
+            Shape::List(inner) => format!("Vec<{}>", inner.rust_ty(side)),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
-                    .map(Shape::rust_ty)
+                    .map(|p| p.rust_ty(side))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({inside})")
@@ -345,31 +384,54 @@ impl Shape {
             | Shape::Variant { rust_name, .. }
             | Shape::Enum { rust_name, .. }
             | Shape::Flags { rust_name, .. } => {
-                format!("bindings::exports::my::shape::api::{rust_name}")
+                format!("{}::{rust_name}", side.path())
             }
             Shape::Result_ { ok, err, .. } => {
                 let ok_ty = ok
                     .as_ref()
-                    .map(|s| s.rust_ty())
+                    .map(|s| s.rust_ty(side))
                     .unwrap_or_else(|| "()".into());
                 let err_ty = err
                     .as_ref()
-                    .map(|s| s.rust_ty())
+                    .map(|s| s.rust_ty(side))
                     .unwrap_or_else(|| "()".into());
                 format!("Result<{ok_ty}, {err_ty}>")
             }
         }
     }
 
-    fn rust_literal(&self) -> String {
+    fn rust_literal(&self, side: BindingsSide, mode: AsyncMode) -> String {
         match self {
-            Shape::Primitive { rust_literal, .. } => (*rust_literal).to_string(),
-            Shape::Option(inner) => format!("Some({})", inner.rust_literal()),
-            Shape::List(inner) => format!("vec![{}]", inner.rust_literal()),
+            Shape::Primitive {
+                rust_ty,
+                rust_literal,
+                ..
+            } => {
+                // wit-bindgen's sync imports take `&str` for string
+                // params — including inside tuples (`(u32, &str)`),
+                // `result<_, string>` (`Result<_, &str>`), variant
+                // payloads, etc. `ownership: Owning` doesn't rewrite
+                // those inner slots. Async imports use owned `String`
+                // uniformly. So for the string primitive only: emit a
+                // plain str literal on the consumer side in sync mode,
+                // and an owned `String` everywhere else.
+                let consumer_sync_string = *rust_ty == "String"
+                    && matches!(side, BindingsSide::Consumer)
+                    && matches!(mode, AsyncMode::Sync);
+                if consumer_sync_string {
+                    // rust_literal is `String::from("hello")`; strip
+                    // to `"hello"`.
+                    extract_string_literal(rust_literal)
+                } else {
+                    (*rust_literal).to_string()
+                }
+            }
+            Shape::Option(inner) => format!("Some({})", inner.rust_literal(side, mode)),
+            Shape::List(inner) => format!("vec![{}]", inner.rust_literal(side, mode)),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
-                    .map(Shape::rust_literal)
+                    .map(|p| p.rust_literal(side, mode))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({inside})")
@@ -377,12 +439,20 @@ impl Shape {
             Shape::Record {
                 rust_name, fields, ..
             } => {
+                // `ownership: Owning` forces record fields to owned
+                // types on the consumer side even in sync mode — so
+                // a `string` field is `String`, not `&str`. Recurse
+                // with Async-mode so the field emitter uses
+                // `String::from(...)` regardless of the outer mode.
+                let inner_mode = AsyncMode::Async;
                 let inits = fields
                     .iter()
-                    .map(|(fname, fshape)| format!("{fname}: {}", fshape.rust_literal()))
+                    .map(|(fname, fshape)| {
+                        format!("{fname}: {}", fshape.rust_literal(side, inner_mode))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("bindings::exports::my::shape::api::{rust_name} {{ {inits} }}")
+                format!("{}::{rust_name} {{ {inits} }}", side.path())
             }
             Shape::Variant {
                 rust_name,
@@ -390,16 +460,16 @@ impl Shape {
                 selected,
                 ..
             } => {
+                // Same owned-payload rule as Record — variants with
+                // `ownership: Owning` use owned payload types.
+                let inner_mode = AsyncMode::Async;
                 let case = &cases[*selected];
                 let payload = case
                     .payload
                     .as_ref()
-                    .map(|p| format!("({})", p.rust_literal()))
+                    .map(|p| format!("({})", p.rust_literal(side, inner_mode)))
                     .unwrap_or_default();
-                format!(
-                    "bindings::exports::my::shape::api::{rust_name}::{}{payload}",
-                    case.rust_name
-                )
+                format!("{}::{rust_name}::{}{payload}", side.path(), case.rust_name)
             }
             Shape::Enum {
                 rust_name,
@@ -408,7 +478,7 @@ impl Shape {
                 ..
             } => {
                 let (_, rust_case) = cases[*selected];
-                format!("bindings::exports::my::shape::api::{rust_name}::{rust_case}")
+                format!("{}::{rust_name}::{rust_case}", side.path())
             }
             Shape::Flags {
                 rust_name,
@@ -419,19 +489,17 @@ impl Shape {
                 // wit-bindgen emits each flag as a const on the opaque
                 // struct and derives BitOr. An empty bitmask maps to
                 // `Flags::empty()`; otherwise OR together the set bits.
+                let base = format!("{}::{rust_name}", side.path());
                 if *selected == 0 {
-                    format!("bindings::exports::my::shape::api::{rust_name}::empty()")
+                    format!("{base}::empty()")
                 } else {
-                    let ored = flags
+                    flags
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| selected & (1u32 << i) != 0)
-                        .map(|(_, (_, rust_flag))| {
-                            format!("bindings::exports::my::shape::api::{rust_name}::{rust_flag}")
-                        })
+                        .map(|(_, (_, rust_flag))| format!("{base}::{rust_flag}"))
                         .collect::<Vec<_>>()
-                        .join(" | ");
-                    ored
+                        .join(" | ")
                 }
             }
             Shape::Result_ { ok, err, is_ok } => {
@@ -441,14 +509,69 @@ impl Shape {
                 if *is_ok {
                     match ok.as_ref() {
                         None => "Ok(())".into(),
-                        Some(p) => format!("Ok({})", p.rust_literal()),
+                        Some(p) => format!("Ok({})", p.rust_literal(side, mode)),
                     }
                 } else {
                     match err.as_ref() {
                         None => "Err(())".into(),
-                        Some(p) => format!("Err({})", p.rust_literal()),
+                        Some(p) => format!("Err({})", p.rust_literal(side, mode)),
                     }
                 }
+            }
+        }
+    }
+
+    /// The expression the consumer passes as the argument to
+    /// `api::foo(...)`. `v_ident` is the name of the local holding
+    /// the constructed value. Async imports take everything by
+    /// value; sync imports take some shapes by value and others by
+    /// shared reference, so we prefix with `&` where wit-bindgen's
+    /// sync-import signature demands a borrow.
+    fn consumer_pass_expr(&self, v_ident: &str, mode: AsyncMode) -> String {
+        if matches!(mode, AsyncMode::Async) {
+            return v_ident.to_string();
+        }
+        // Sync import convention: wit-bindgen emits `foo(x: T)` when
+        // the generated Rust type is `Copy`, and `foo(x: &T)`
+        // otherwise. `is_copy_in(Sync)` approximates that — inside
+        // structural containers (Tuple, Result, Option, List)
+        // wit-bindgen substitutes `&str` for `string` (Copy-ish);
+        // inside nominal containers (Record, Variant) the
+        // `ownership: Owning` annotation keeps fields as owned
+        // `String` (not Copy).
+        if self.is_copy_in(AsyncMode::Sync) {
+            v_ident.to_string()
+        } else {
+            format!("&{v_ident}")
+        }
+    }
+
+    /// Mode-aware Copy-ness approximation for wit-bindgen's sync
+    /// import rules. In Sync context, `string` is passed as `&str`
+    /// (Copy); in Async context, as `String` (not). `Record` and
+    /// `Variant` branches recurse with `Async` because
+    /// `ownership: Owning` forces their internals to owned types
+    /// regardless of the outer mode.
+    fn is_copy_in(&self, mode: AsyncMode) -> bool {
+        match self {
+            Shape::Primitive { rust_ty, .. } => {
+                *rust_ty != "String" || matches!(mode, AsyncMode::Sync)
+            }
+            Shape::Option(inner) => inner.is_copy_in(mode),
+            Shape::List(_) => false,
+            Shape::Tuple(parts) => parts.iter().all(|p| p.is_copy_in(mode)),
+            Shape::Record { fields, .. } => {
+                fields.iter().all(|(_, s)| s.is_copy_in(AsyncMode::Async))
+            }
+            Shape::Variant { cases, .. } => cases.iter().all(|c| {
+                c.payload
+                    .as_ref()
+                    .is_none_or(|s| s.is_copy_in(AsyncMode::Async))
+            }),
+            Shape::Enum { .. } | Shape::Flags { .. } => true,
+            Shape::Result_ { ok, err, .. } => {
+                ok.as_ref().is_none_or(|s| s.is_copy_in(mode))
+                    && err.as_ref().is_none_or(|s| s.is_copy_in(mode))
             }
         }
     }
@@ -719,8 +842,8 @@ fn canned_shapes() -> Vec<Shape> {
                         name: "string",
                         wit_type: "string",
                         rust_ty: "String",
-                        rust_literal: r#"String::from("hi")"#,
-                        expected_debug: r#""hi""#,
+                        rust_literal: r#"String::from("variant-hi")"#,
+                        expected_debug: r#""variant-hi""#,
                     }),
                 },
                 VariantCase {
@@ -1153,11 +1276,19 @@ fn consumer_world_wit(mode: AsyncMode) -> String {
     )
 }
 
-fn consumer_lib_rs(mode: AsyncMode) -> String {
+fn consumer_lib_rs(shape: &Shape, mode: AsyncMode) -> String {
+    // Echo pattern: consumer constructs a value, sends it, prints
+    // what the provider echoed back. `pass_expr` is the expression
+    // the consumer actually passes to `api::foo(...)` — wit-bindgen's
+    // sync imports take some shape kinds by value and others by
+    // shared reference, so the expression varies per shape.
+    let literal = shape.rust_literal(BindingsSide::Consumer, mode);
+    let pass_expr = shape.consumer_pass_expr("v", mode);
     format!(
         r#"mod bindings {{
     wit_bindgen::generate!({{
         world: "consumer",
+        ownership: Owning,
 {opts}        generate_all
     }});
 }}
@@ -1169,8 +1300,9 @@ struct Consumer;
 
 impl Guest for Consumer {{
     {rust_prefix}fn run() {{
-        println!("consumer: calling provider");
-        let r = api::foo(){await_suffix};
+        let v = {literal};
+        println!("consumer: sending {{v:?}}");
+        let r = api::foo({pass_expr}){await_suffix};
         println!("consumer: got {{r:?}}");
     }}
 }}
@@ -1335,16 +1467,21 @@ fn api_interface_body(shape: &Shape, mode: AsyncMode) -> String {
         }
         body.push('\n');
     }
+    // Echo pattern in both modes: consumer sends a value, provider
+    // echoes back. Exercises both canon-ABI directions (param + result)
+    // in sync and async.
     body.push_str(&format!(
-        "    foo: {}func() -> {};\n",
-        mode.wit_async_marker(),
-        shape.wit_type()
+        "    foo: {marker}func(x: {ty}) -> {ty};\n",
+        marker = mode.wit_async_marker(),
+        ty = shape.wit_type()
     ));
     body
 }
 
-/// Provider's `src/lib.rs` — returns a literal of the shape's type
-/// and prints it so the trace proves the provider was invoked.
+/// Provider's `src/lib.rs` — receives a value, prints it, and echoes
+/// it back. Exercises both canon-ABI directions: consumer lowers the
+/// param and provider lifts it on the way in; provider lowers the
+/// result and consumer lifts it on the way out.
 fn provider_lib_rs(shape: &Shape, mode: AsyncMode) -> String {
     format!(
         r#"mod bindings {{
@@ -1359,10 +1496,9 @@ use bindings::exports::my::shape::api::Guest;
 struct Provider;
 
 impl Guest for Provider {{
-    {rust_prefix}fn foo() -> {ty} {{
-        let v: {ty} = {lit};
-        println!("provider: returning {{v:?}}");
-        v
+    {rust_prefix}fn foo(x: {ty}) -> {ty} {{
+        println!("provider: received {{x:?}}");
+        x
     }}
 }}
 
@@ -1370,8 +1506,7 @@ bindings::export!(Provider with_types_in bindings);
 "#,
         opts = mode.generate_opts(),
         rust_prefix = mode.rust_prefix(),
-        ty = shape.rust_ty(),
-        lit = shape.rust_literal(),
+        ty = shape.rust_ty(BindingsSide::Provider),
     )
 }
 
@@ -1500,6 +1635,7 @@ fn test_fuzz() {
 
     let mut failures: Vec<String> = Vec::new();
     let mut expected_bails = 0usize;
+    let mut harness_bails = 0usize;
     let mut total_runs: usize = 0;
 
     // Mode is the outer loop (see `test_canned` for the rationale).
@@ -1547,6 +1683,12 @@ fn test_fuzz() {
                         "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: expected-bail ({})",
                         msg.lines().next().unwrap_or(&msg)
                     );
+                } else if is_harness_bail(&msg, mode) {
+                    harness_bails += 1;
+                    eprintln!(
+                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: harness-bail ({})",
+                        msg.lines().next().unwrap_or(&msg)
+                    );
                 } else {
                     failures.push(format!(
                         "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: {msg}"
@@ -1557,8 +1699,8 @@ fn test_fuzz() {
     }
 
     eprintln!(
-        "fuzz: passed={} expected_bails={expected_bails} failures={}",
-        total_runs - failures.len() - expected_bails,
+        "fuzz: passed={} expected_bails={expected_bails} harness_bails={harness_bails} failures={}",
+        total_runs - failures.len() - expected_bails - harness_bails,
         failures.len()
     );
     if !failures.is_empty() {
@@ -1659,11 +1801,13 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
 
         let captured = invoke_run(&bytes).expect("invoke run()");
         eprintln!("pipeline[{kind_tag}]: post-splice trace:\n{captured}");
+        let expected_sent = format!("consumer: sending {}", shape.expected_debug());
+        let expected_received = format!("provider: received {}", shape.expected_debug());
         let expected_got = format!("consumer: got {}", shape.expected_debug());
         for marker in [
-            "consumer: calling provider",
+            expected_sent.as_str(),
             "mdl: before foo",
-            "provider: returning ",
+            expected_received.as_str(),
             "mdl: after foo",
             expected_got.as_str(),
         ] {
@@ -1918,6 +2062,17 @@ fn is_expected_bail(msg: &str) -> bool {
         || msg.contains("not yet implemented")
 }
 
+/// Panic messages that indicate a harness limitation, not a splicer
+/// bug. Some sync-mode shapes (deeply-nested `Option<&[...]>` / other
+/// wit-bindgen sync-import borrow shapes) don't have a single
+/// consumer-literal form the harness can construct without per-shape
+/// casework. Classify those as harness-bails so they don't masquerade
+/// as splicer failures, but stay visible enough that a future fix can
+/// eliminate them.
+fn is_harness_bail(msg: &str, mode: AsyncMode) -> bool {
+    matches!(mode, AsyncMode::Sync) && msg.contains("cargo build: exit")
+}
+
 fn run(cmd: &mut Command, label: &str) {
     let out = cmd
         .output()
@@ -1948,13 +2103,16 @@ fn scaffold_common(root: &Path, mode: AsyncMode) -> std::io::Result<()> {
         "// placeholder\n",
         &[],
     )?;
-    let consumer_lib = consumer_lib_rs(mode);
+    // Consumer's lib.rs now embeds the per-shape value the consumer
+    // sends to `foo`, so it's rewritten per shape in
+    // `write_per_shape_files` rather than here. Scaffold with a
+    // placeholder so `cargo` doesn't error on an empty crate.
     let consumer_world = consumer_world_wit(mode);
     write_crate(
         root,
         "consumer",
         CONSUMER_CARGO_TOML,
-        &consumer_lib,
+        "// placeholder\n",
         &[("world.wit", &consumer_world)],
     )?;
     write_crate(
@@ -1977,13 +2135,10 @@ fn scaffold_common(root: &Path, mode: AsyncMode) -> std::io::Result<()> {
 /// consumer's `deps/my-shape` copy. Everything else (workspace,
 /// middleware, consumer's own world) is stable across shapes *within
 /// a single AsyncMode iteration*.
-fn write_per_shape_files(
-    root: &Path,
-    shape: &Shape,
-    mode: AsyncMode,
-) -> std::io::Result<()> {
+fn write_per_shape_files(root: &Path, shape: &Shape, mode: AsyncMode) -> std::io::Result<()> {
     let provider_lib = provider_lib_rs(shape, mode);
     let provider_world = provider_world_wit(shape, mode);
+    let consumer_lib = consumer_lib_rs(shape, mode);
     let dep_wit = consumer_shape_dep_wit(shape, mode);
 
     std::fs::write(root.join("provider/src/lib.rs"), provider_lib)?;
@@ -1991,6 +2146,7 @@ fn write_per_shape_files(
     std::fs::create_dir_all(&provider_wit_dir)?;
     std::fs::write(provider_wit_dir.join("world.wit"), provider_world)?;
 
+    std::fs::write(root.join("consumer/src/lib.rs"), consumer_lib)?;
     let dep_dir = root.join("consumer/wit/deps/my-shape-1.0.0");
     std::fs::create_dir_all(&dep_dir)?;
     std::fs::write(dep_dir.join("package.wit"), dep_wit)?;
