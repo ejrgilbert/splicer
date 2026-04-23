@@ -1,6 +1,6 @@
 [package]
 name = "splicer"
-version = "2.0.0-rc3"
+version = "2.0.0"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
 description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
@@ -30,29 +30,29 @@ path = "examples/wac_compose.rs"
 
 [dependencies]
 colored = "3.1.1"
-cviz = "2.0.0-rc4"
+cviz = "2.0.0"
 #cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"  # or serde_toml if you prefer TOML
+serde_yaml = "0.9"
 anyhow = "1.0.86"
 semver = "1"
 clap = { version = "4.5.58", features = ["derive"] }
-wasmparser = "0.245.1"
-wasm-encoder = { version = "0.245.1", features = ["wasmparser"] }
-wit-parser = "0.244"
-wit-bindgen-core = "0.52"
+wasmparser = "0.247.0"
+wasm-encoder = { version = "0.247.0", features = ["wasmparser"] }
+wit-parser = "0.247"
+wit-bindgen-core = "0.57.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wirm = "4.0.0-rc3"
+wirm = "4.0.1"
 #wirm = { path = "../../research/compilers/wirm" }
 
 [dev-dependencies]
 wat = "1"
 tempfile = "3"
 arbitrary = "1"
-wasmtime = { version = "41", features = ["component-model", "component-model-async", "async"] }
-wasmtime-wasi = "41"
+wasmtime = { version = "44", features = ["component-model", "component-model-async", "async"] }
+wasmtime-wasi = "44"
 tokio = { version = "1", features = ["rt", "macros"] }
-wac-parser = "0.9"
-wac-resolver = "0.9"
-wac-graph = "0.9"
+wac-parser = "0.10"
+wac-resolver = "0.10"
+wac-graph = "0.10"

@@ -26,6 +26,7 @@
 use anyhow::Context;
 use arbitrary::Arbitrary;
 use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -126,6 +127,16 @@ impl BindingsSide {
     }
 }
 
+// TODO: extend Shape with resource types + resource methods/statics/
+// constructors so the fuzzer exercises splicer's canon-lower/lift of
+// `own<T>` / `borrow<T>` handles and the `method:` / `static func:` /
+// `constructor` function kinds. Today Shape covers only value types,
+// which leaves real-world compositions (e.g. `wasi:http/incoming-handler`
+// with `(incoming-request, response-outparam) -> ()`, anything on
+// `wasi:io/streams`, the nebula demo's gateway→service wiring) outside
+// the fuzzer's confidence envelope. Splicer has a couple of hand-
+// written resource tests in `src/adapter/tests.rs` but the fuzz pass
+// doesn't randomize that surface.
 #[derive(Clone)]
 enum Shape {
     Primitive {
@@ -577,14 +588,34 @@ impl Shape {
     }
 
     fn expected_debug(&self) -> String {
+        let mut err_enums = HashSet::new();
+        // wit-bindgen error-styles an enum (implements `Error`, swaps
+        // Debug to `{ code, name, message }`) only when the enum sits
+        // directly at the err arg of a `result<_, EnumName>` that the
+        // function signature returns (or accepts) at the TOP level.
+        // Nested Results — `option<result<_, EnumName>>`,
+        // `result<_, result<_, EnumName>>` — don't count: wit-bindgen
+        // doesn't treat those enums as error types, so Debug stays
+        // `EnumName::Case`. The fuzz harness's foo signature is
+        // `func() -> T` (sync) or `func(x: T) -> T` (async), so T
+        // itself is the top-level shape to inspect.
+        if let Shape::Result_ { err: Some(e), .. } = self {
+            if let Shape::Enum { rust_name, .. } = e.as_ref() {
+                err_enums.insert(*rust_name);
+            }
+        }
+        self.expected_debug_in(&err_enums)
+    }
+
+    fn expected_debug_in(&self, err_enums: &HashSet<&'static str>) -> String {
         match self {
             Shape::Primitive { expected_debug, .. } => (*expected_debug).to_string(),
-            Shape::Option(inner) => format!("Some({})", inner.expected_debug()),
-            Shape::List(inner) => format!("[{}]", inner.expected_debug()),
+            Shape::Option(inner) => format!("Some({})", inner.expected_debug_in(err_enums)),
+            Shape::List(inner) => format!("[{}]", inner.expected_debug_in(err_enums)),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
-                    .map(Shape::expected_debug)
+                    .map(|p| p.expected_debug_in(err_enums))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({inside})")
@@ -594,7 +625,9 @@ impl Shape {
             } => {
                 let inits = fields
                     .iter()
-                    .map(|(fname, fshape)| format!("{fname}: {}", fshape.expected_debug()))
+                    .map(|(fname, fshape)| {
+                        format!("{fname}: {}", fshape.expected_debug_in(err_enums))
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{rust_name} {{ {inits} }}")
@@ -612,7 +645,7 @@ impl Shape {
                 let payload = case
                     .payload
                     .as_ref()
-                    .map(|p| format!("({})", p.expected_debug()))
+                    .map(|p| format!("({})", p.expected_debug_in(err_enums)))
                     .unwrap_or_default();
                 format!("{rust_name}::{}{payload}", case.rust_name)
             }
@@ -622,9 +655,19 @@ impl Shape {
                 selected,
                 ..
             } => {
-                // Same Debug convention as variants.
-                let (_, rust_case) = cases[*selected];
-                format!("{rust_name}::{rust_case}")
+                // Enums used as error types get wit-bindgen's
+                // error-shaped Debug (`TypeName { code, name, message }`);
+                // enums not in an error position keep the standard
+                // `TypeName::Case` Debug.
+                if err_enums.contains(*rust_name) {
+                    let (wit_case, _) = cases[*selected];
+                    format!(
+                        r#"{rust_name} {{ code: {selected}, name: "{wit_case}", message: "" }}"#
+                    )
+                } else {
+                    let (_, rust_case) = cases[*selected];
+                    format!("{rust_name}::{rust_case}")
+                }
             }
             Shape::Flags {
                 rust_name,
@@ -652,12 +695,12 @@ impl Shape {
                 if *is_ok {
                     match ok.as_ref() {
                         None => "Ok(())".into(),
-                        Some(p) => format!("Ok({})", p.expected_debug()),
+                        Some(p) => format!("Ok({})", p.expected_debug_in(err_enums)),
                     }
                 } else {
                     match err.as_ref() {
                         None => "Err(())".into(),
-                        Some(p) => format!("Err({})", p.expected_debug()),
+                        Some(p) => format!("Err({})", p.expected_debug_in(err_enums)),
                     }
                 }
             }
@@ -1739,7 +1782,15 @@ fn select_shapes() -> Vec<Shape> {
 /// wrapping, provider+consumer compose, pre-splice sanity check) runs
 /// once; the splice + post-splice invocation runs per kind.
 fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
-    run(
+    // Harness cargo builds fail whenever the generated consumer /
+    // provider doesn't line up with wit-bindgen's expected borrow /
+    // signature shape for the current Shape — pure harness noise,
+    // not a splicer bug. Suppress the build output entirely; the
+    // panic message is just "cargo build: exit Some(N)" so
+    // `is_harness_bail` still classifies it correctly. To inspect
+    // the real rustc output, rerun with `SPLICER_KEEP_TMPDIR=1`
+    // and run cargo build in the preserved tmpdir.
+    run_quiet(
         Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip1", "--workspace"])
             .current_dir(root),
@@ -1966,7 +2017,6 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
     let wasi = WasiCtxBuilder::new().stdout(stdout_pipe.clone()).build();
 
     let mut config = Config::new();
-    config.async_support(true);
     config.wasm_component_model_async(true);
     // Required for async-lifted exports (e.g. consumer `run: async
     // func()` in AsyncMode::Async). Harmless when only sync-lifted
@@ -2003,7 +2053,6 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
             .context("run export is not a func")?;
         let typed: TypedFunc<(), ()> = run_func.typed(&store)?;
         typed.call_async(&mut store, ()).await?;
-        typed.post_return_async(&mut store).await?;
         Ok::<_, anyhow::Error>(())
     })?;
 
@@ -2083,6 +2132,20 @@ fn run(cmd: &mut Command, label: &str) {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+    }
+}
+
+/// Like `run`, but drops captured stdout/stderr from the panic
+/// message on failure — used for commands whose failure output is
+/// expected noise (currently just `cargo build` on harness-invalid
+/// shapes). The panic still mentions the label + exit code so
+/// `is_harness_bail` can classify.
+fn run_quiet(cmd: &mut Command, label: &str) {
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{label}: spawn failed: {e}"));
+    if !out.status.success() {
+        panic!("{label}: exit {:?}", out.status.code());
     }
 }
 

@@ -755,7 +755,7 @@ impl WasmEncoderBindgen<'_> {
 mod tests {
     use super::*;
     use wit_bindgen_core::abi::lift_from_memory;
-    use wit_parser::{Docs, Field, Record, Stability, TypeDef, TypeDefKind, TypeOwner};
+    use wit_parser::{Docs, Field, Record, Span, Stability, TypeDef, TypeDefKind, TypeOwner};
 
     fn new_sizes(resolve: &Resolve) -> SizeAlign {
         let mut s = SizeAlign::default();
@@ -807,22 +807,26 @@ mod tests {
                         name: "a".to_string(),
                         ty: Type::U32,
                         docs: Docs::default(),
+                        span: Span::default(),
                     },
                     Field {
                         name: "b".to_string(),
                         ty: Type::U64,
                         docs: Docs::default(),
+                        span: Span::default(),
                     },
                     Field {
                         name: "c".to_string(),
                         ty: Type::U8,
                         docs: Docs::default(),
+                        span: Span::default(),
                     },
                 ],
             }),
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
@@ -863,6 +867,7 @@ mod tests {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
@@ -896,6 +901,7 @@ mod tests {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
@@ -924,6 +930,7 @@ mod tests {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
@@ -959,6 +966,7 @@ mod tests {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
@@ -992,10 +1000,11 @@ mod tests {
         let mut resolve = Resolve::default();
         let list_id = resolve.types.alloc(TypeDef {
             name: Some("l".to_string()),
-            kind: TypeDefKind::FixedSizeList(Type::U32, 4),
+            kind: TypeDefKind::FixedLengthList(Type::U32, 4),
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
@@ -1028,6 +1037,7 @@ mod tests {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let result_id = resolve.types.alloc(TypeDef {
             name: Some("r".to_string()),
@@ -1038,6 +1048,7 @@ mod tests {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
         let mut indices = FunctionIndices::new(1);
