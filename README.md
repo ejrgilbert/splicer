@@ -220,6 +220,56 @@ The configuration will fail if:
 
 ---
 
+# Testing
+
+In-process unit tests live under `src/` and exercise the adapter
+generator, WAC emitter, and composition planner directly:
+
+```bash
+cargo test --lib
+```
+
+## End-to-end fuzz + run harness
+
+`tests/fuzz_and_run.rs` scaffolds provider, consumer, and middleware
+crates in a tempdir, drives them through the full splicer pipeline
+(compose + splice for both `between` and `before` rules), and invokes
+the result under `wasmtime` to check the composition actually executes.
+
+Two entry points, both `#[ignore]`'d (they build real crates — slow):
+
+* `test_canned` — a hardcoded catalog of 22 value-type shapes * 2
+  async modes * 2 split-kind pipelines = 88 combos. Same shapes every
+  run. Quick-to-bisect canary for regressions in a known shape.
+
+* `test_fuzz` — `arbitrary`-driven random shapes. Reproducible via
+  `SPLICER_FUZZ_SEED` so any failure can be replayed. Each iter
+  prints `[i/N]` progress (requires `--nocapture`).
+
+```bash
+# Canned catalog — 88 combos, ~2 min
+cargo test --test fuzz_and_run -- --ignored --nocapture test_canned
+
+# Fuzz at PR CI config (25 iters × 2 modes × depth 5, ~2 min)
+SPLICER_FUZZ_ITERS=25 SPLICER_FUZZ_DEPTH=5 \
+  cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
+
+# Replay a single failing iteration
+SPLICER_FUZZ_SEED=<seed_from_output> SPLICER_FUZZ_ITERS=1 \
+  cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
+```
+
+Env knobs:
+
+| var                   | default      | effect                                                  |
+|-----------------------|--------------|---------------------------------------------------------|
+| `SPLICER_FUZZ_SEED`   | `0xDEADBEEF` | base RNG seed; each iter's shape uses `seed + iter_idx` |
+| `SPLICER_FUZZ_ITERS`  | 30           | iterations per async mode (sync + async both run)       |
+| `SPLICER_FUZZ_DEPTH`  | 4            | max recursion depth for compound shapes                 |
+| `SPLICER_KEEP_TMPDIR` | unset        | preserve the tempdir for post-mortem inspection         |
+
+---
+
 # Project Structure
 
 ```
