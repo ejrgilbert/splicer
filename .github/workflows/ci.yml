@@ -89,7 +89,12 @@ jobs:
      - name: Install tools
        run: |
          cargo install wac-cli@0.10.0 wasm-tools@1.247.0
-         cargo install splicer@2.0.0 cviz@2.0.1
+         cargo install cviz@2.0.2
+     - name: Install splicer from the PR-under-test tree
+       # The submodule's run.sh calls whichever `splicer` is on PATH.
+       # Install from the current checkout so the integration tests
+       # exercise THIS PR's splicer, not a stale registry version.
+       run: cargo install --path . --force
      - name: Run integration tests
        run: cargo test --test integration -- --ignored
 
