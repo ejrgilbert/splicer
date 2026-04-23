@@ -835,6 +835,101 @@ mod tests {
         Ok(())
     }
 
+    /// Regression for the nebula-demo bug where splicer emitted the
+    /// same `my:{mdl}-adapter` package name for every rule sharing the
+    /// middleware's `name`, causing `wac_deps` to collide to a single
+    /// adapter wasm and the generated wac to contain two `let {mdl} =
+    /// new my:{mdl}` decls (wac parse error: `{mdl} is already
+    /// defined`). Fix: unique adapter var per interface, emit the
+    /// real-mdl `let` once per mdl.name.
+    #[test]
+    fn tier1_shared_mdl_across_rules_produces_distinct_adapters() -> anyhow::Result<()> {
+        use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
+
+        let comps = vec![
+            mk("provider-a.wasm", WAT_PROVIDER_A),
+            mk("provider-b.wasm", WAT_PROVIDER_B),
+            mk("provider-c.wasm", WAT_PROVIDER_C),
+            mk("consumer.wasm", WAT_CONSUMER_FAN_IN),
+        ];
+        let (graph, node_paths) = build_graph_from_components(&comps)?;
+
+        // Two rules, same mdl.name ("tracing"), different target
+        // interfaces. Fake adapter_path per rule — generate_wac only
+        // records the strings into wac_deps, never reads the file.
+        let mdl_path = "/tmp/tracing.wasm".to_string();
+        let mk_rule = |iface: &str, provider: &str, adapter_path: &str| SpliceRule::Before {
+            interface: iface.to_string(),
+            provider_name: Some(provider.to_string()),
+            provider_alias: None,
+            inject: vec![Injection {
+                name: "tracing".to_string(),
+                path: Some(mdl_path.clone()),
+                adapter_info: Some(AdapterInjectionInfo {
+                    adapter_path: adapter_path.to_string(),
+                    tier1_interfaces: vec![
+                        "splicer:tier1/before".to_string(),
+                        "splicer:tier1/after".to_string(),
+                    ],
+                }),
+            }],
+        };
+        let rules = vec![
+            mk_rule("my:providers/a@0.1.0", "provider-a", "/tmp/adapter-a.wasm"),
+            mk_rule("my:providers/b@0.1.0", "provider-b", "/tmp/adapter-b.wasm"),
+        ];
+
+        let out = crate::wac::generate_wac(
+            HashMap::new(),
+            "",
+            &graph,
+            &rules,
+            Some(&node_paths),
+            "test:pkg",
+        )?;
+        let wac = out.wac;
+
+        // (a) Distinct adapter pkg names per interface — otherwise
+        // wac_deps would collide. `sanitize_wac_id` strips the leading
+        // `my-` before feeding into the adapter var, so the pkg name
+        // is `tracing-adapter-providers-a-0-1-0` (not `…-my-providers-…`).
+        assert!(
+            wac.contains("my:tracing-adapter-providers-a-0-1-0"),
+            "expected per-interface adapter pkg for providers/a:\n{wac}"
+        );
+        assert!(
+            wac.contains("my:tracing-adapter-providers-b-0-1-0"),
+            "expected per-interface adapter pkg for providers/b:\n{wac}"
+        );
+
+        // (b) The real-middleware `let` emits exactly once, even
+        // though two rules inject it.
+        let real_let_count = wac.match_indices("let tracing = new my:tracing").count();
+        assert_eq!(
+            real_let_count, 1,
+            "`let tracing = new my:tracing` should appear exactly once; saw {real_let_count}:\n{wac}"
+        );
+
+        // (c) Both adapter paths + the shared middleware path land
+        // in wac_deps under their distinct pkg names.
+        let path_for = |pkg: &str| {
+            out.wac_deps
+                .get(pkg)
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            path_for("my:tracing-adapter-providers-a-0-1-0").as_deref(),
+            Some("/tmp/adapter-a.wasm"),
+        );
+        assert_eq!(
+            path_for("my:tracing-adapter-providers-b-0-1-0").as_deref(),
+            Some("/tmp/adapter-b.wasm"),
+        );
+        assert_eq!(path_for("my:tracing").as_deref(), Some(mdl_path.as_str()));
+
+        Ok(())
+    }
+
     // ── Error-case tests ──────────────────────────────────────────────────────
 
     #[test]

@@ -30,8 +30,8 @@ path = "examples/wac_compose.rs"
 
 [dependencies]
 colored = "3.1.1"
-cviz = "2.0.0"
-#cviz = { path = "../cviz" }
+#cviz = "2.0.0"
+cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 anyhow = "1.0.86"

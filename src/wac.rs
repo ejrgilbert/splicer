@@ -307,6 +307,11 @@ pub fn generate_wac(
     let mut outer_instances: HashMap<u32, String> = HashMap::new(); // orig_inst_id -> generated_outer_var
     let mut used_comp_nodes: HashMap<u32, String> = HashMap::new(); // inst_id -> used_name
     let mut used_middlewares: Vec<(String, String)> = Vec::new(); // (used_name, path)
+                                                                  // Real-middleware wac vars already emitted via `let mdl = new
+                                                                  // my:mdl { ... };`. Multiple rules can inject the same
+                                                                  // middleware (different target interfaces share the same wrapped
+                                                                  // hooks), so we emit the `let` once and reuse the var.
+    let mut emitted_mdl_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Pre-instantiation pass for fan-in topologies.
     //
@@ -422,6 +427,7 @@ pub fn generate_wac(
                             chain_interface,
                             adapter_info,
                             &mut wac_lines,
+                            &mut emitted_mdl_vars,
                         );
                         last = adapter_var;
                         used_middlewares.extend(extra_args);
@@ -962,14 +968,24 @@ fn create_tier1_mdl(
     interface: &Contract,
     adapter_info: &AdapterInjectionInfo,
     wac_lines: &mut Vec<String>,
+    emitted_mdl_vars: &mut std::collections::HashSet<String>,
 ) -> (String, Vec<(String, String)>) {
     let real_var = mdl.name.clone();
-    let adapter_var = format!("{}-adapter", mdl.name);
+    // The adapter's core-wasm signature is specialized per target
+    // interface, so a single middleware injected on multiple rules
+    // must produce distinct adapter packages — one per interface —
+    // or the generated wac's `deps` map collides under one pkg name
+    // and only the last-generated adapter wasm reaches wac compose.
+    let adapter_var = format!("{}-adapter-{}", mdl.name, sanitize_wac_id(&interface.name));
 
     // Real middleware — only has host imports, so no explicit wiring needed.
-    wac_lines.push(format!(
-        "let {real_var} = new {INST_PREFIX}:{real_var} {{ ... }};"
-    ));
+    // Emit the `let` once per mdl.name; adapters on later rules reuse
+    // the same var.
+    if emitted_mdl_vars.insert(real_var.clone()) {
+        wac_lines.push(format!(
+            "let {real_var} = new {INST_PREFIX}:{real_var} {{ ... }};"
+        ));
+    }
 
     // Proxy — wires the downstream target interface and the tier-1 hook interfaces
     // from the real middleware instance. The adapter's hook imports are versioned,
@@ -1031,7 +1047,7 @@ fn is_shim_split_num(split_num: usize, shim_comps: &HashMap<usize, usize>) -> bo
 /// strip a leading `my-` that would otherwise double the namespace prefix into
 /// `my:my-…` when the raw name already started with `my:`.
 fn sanitize_wac_id(raw: &str) -> String {
-    let sanitized = raw.replace([':', '/', '.', '_'], "-");
+    let sanitized = raw.replace([':', '/', '.', '_', '@'], "-");
     sanitized
         .strip_prefix(&format!("{INST_PREFIX}-"))
         .map(str::to_string)
