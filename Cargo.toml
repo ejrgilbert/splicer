@@ -50,9 +50,9 @@ wirm = "4.0.1"
 wat = "1"
 tempfile = "3"
 arbitrary = "1"
-wasmtime = { version = "41", features = ["component-model", "component-model-async", "async"] }
-wasmtime-wasi = "41"
+wasmtime = { version = "44", features = ["component-model", "component-model-async", "async"] }
+wasmtime-wasi = "44"
 tokio = { version = "1", features = ["rt", "macros"] }
-wac-parser = "0.9"
-wac-resolver = "0.9"
-wac-graph = "0.9"
+wac-parser = "0.10"
+wac-resolver = "0.10"
+wac-graph = "0.10"

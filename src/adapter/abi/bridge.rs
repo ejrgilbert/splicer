@@ -110,7 +110,9 @@ impl WitBridge {
         self.any_type(self.get(id), &|_, kind| {
             matches!(
                 kind,
-                Some(TypeDefKind::List(_) | TypeDefKind::FixedLengthList(..) | TypeDefKind::Map(..))
+                Some(
+                    TypeDefKind::List(_) | TypeDefKind::FixedLengthList(..) | TypeDefKind::Map(..)
+                )
             )
         })
     }

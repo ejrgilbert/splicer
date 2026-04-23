@@ -2017,7 +2017,6 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
     let wasi = WasiCtxBuilder::new().stdout(stdout_pipe.clone()).build();
 
     let mut config = Config::new();
-    config.async_support(true);
     config.wasm_component_model_async(true);
     // Required for async-lifted exports (e.g. consumer `run: async
     // func()` in AsyncMode::Async). Harmless when only sync-lifted
@@ -2054,7 +2053,6 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
             .context("run export is not a func")?;
         let typed: TypedFunc<(), ()> = run_func.typed(&store)?;
         typed.call_async(&mut store, ()).await?;
-        typed.post_return_async(&mut store).await?;
         Ok::<_, anyhow::Error>(())
     })?;
 
