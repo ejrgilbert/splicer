@@ -1043,18 +1043,26 @@ fn is_shim_split_num(split_num: usize, shim_comps: &HashMap<usize, usize>) -> bo
 /// Convert an arbitrary node label into a valid WAC kebab-case identifier.
 ///
 /// Node names in pre-composed binaries often look like `my:service/foo-shim`
-/// (a WIT package path).  WAC identifiers may only contain `[a-z0-9-]`, so we
-/// replace every invalid character with `-`.
-///
-/// Because the caller wraps the result in `new {INST_PREFIX}:{name}`, we also
-/// strip a leading `my-` that would otherwise double the namespace prefix into
-/// `my:my-…` when the raw name already started with `my:`.
+/// (a WIT package path). WAC identifiers are `word ("-" word)*` where each
+/// `word` is `[a-z][a-z0-9]* | [A-Z][A-Z0-9]*` — i.e. each hyphen-separated
+/// segment must start with a letter. We replace every invalid character with
+/// `-`, strip a leading `my-` that would otherwise double the namespace
+/// prefix into `my:my-…`, and prefix any digit-leading segment with `v` so
+/// version numbers like `1.0.0` (which sanitize to `-1-0-0`) don't produce
+/// invalid `1`/`0` word segments.
 fn sanitize_wac_id(raw: &str) -> String {
     let sanitized = raw.replace([':', '/', '.', '_', '@'], "-");
-    sanitized
+    let stripped = sanitized
         .strip_prefix(&format!("{INST_PREFIX}-"))
-        .map(str::to_string)
-        .unwrap_or(sanitized)
+        .unwrap_or(&sanitized);
+    stripped
+        .split('-')
+        .map(|seg| match seg.chars().next() {
+            Some(c) if c.is_ascii_digit() => format!("v{seg}"),
+            _ => seg.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 fn reverse_set(set: &IndexSet<Injection>) -> Vec<Injection> {

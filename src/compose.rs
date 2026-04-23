@@ -894,11 +894,11 @@ mod tests {
         // `my-` before feeding into the adapter var, so the pkg name
         // is `tracing-adapter-providers-a-0-1-0` (not `…-my-providers-…`).
         assert!(
-            wac.contains("my:tracing-adapter-providers-a-0-1-0"),
+            wac.contains("my:tracing-adapter-providers-a-v0-v1-v0"),
             "expected per-interface adapter pkg for providers/a:\n{wac}"
         );
         assert!(
-            wac.contains("my:tracing-adapter-providers-b-0-1-0"),
+            wac.contains("my:tracing-adapter-providers-b-v0-v1-v0"),
             "expected per-interface adapter pkg for providers/b:\n{wac}"
         );
 
@@ -918,11 +918,11 @@ mod tests {
                 .map(|p| p.to_string_lossy().into_owned())
         };
         assert_eq!(
-            path_for("my:tracing-adapter-providers-a-0-1-0").as_deref(),
+            path_for("my:tracing-adapter-providers-a-v0-v1-v0").as_deref(),
             Some("/tmp/adapter-a.wasm"),
         );
         assert_eq!(
-            path_for("my:tracing-adapter-providers-b-0-1-0").as_deref(),
+            path_for("my:tracing-adapter-providers-b-v0-v1-v0").as_deref(),
             Some("/tmp/adapter-b.wasm"),
         );
         assert_eq!(path_for("my:tracing").as_deref(), Some(mdl_path.as_str()));
