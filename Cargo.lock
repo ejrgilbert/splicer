@@ -927,7 +927,9 @@ dependencies = [
 
 [[package]]
 name = "cviz"
-version = "2.0.0"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca6e7126f3ff965d33ea564dcd6f2b42c069c8af6a7d23f36a2085d5078935fb"
 dependencies = [
  "anyhow",
  "clap",
@@ -935,7 +937,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "wirm 4.0.1",
+ "wirm",
 ]
 
 [[package]]
@@ -3778,7 +3780,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
- "wirm 4.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "wirm",
  "wit-bindgen-core 0.57.1",
  "wit-parser 0.247.0",
 ]
@@ -5692,19 +5694,9 @@ dependencies = [
 
 [[package]]
 name = "wirm"
-version = "4.0.1"
-dependencies = [
- "log",
- "paste",
- "wasm-encoder 0.247.0",
- "wasmparser 0.247.0",
-]
-
-[[package]]
-name = "wirm"
-version = "4.0.1"
+version = "4.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6990dbb19ac4f85edd3621474e532c45696fad7dbeb8948694377ad05ea035"
+checksum = "94e5e13e2ebd5ab80dde0abbcc64969eb5fdf57391b2db6c9968d3fd81551340"
 dependencies = [
  "log",
  "paste",

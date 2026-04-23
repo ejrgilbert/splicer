@@ -304,13 +304,16 @@ pub fn generate_wac(
     let mut mdl_override = None;
     let mut last = String::new();
     let mut instance_vars: HashMap<u32, String> = HashMap::new();
-    let mut outer_instances: HashMap<u32, String> = HashMap::new(); // orig_inst_id -> generated_outer_var
-    let mut used_comp_nodes: HashMap<u32, String> = HashMap::new(); // inst_id -> used_name
-    let mut used_middlewares: Vec<(String, String)> = Vec::new(); // (used_name, path)
-                                                                  // Real-middleware wac vars already emitted via `let mdl = new
-                                                                  // my:mdl { ... };`. Multiple rules can inject the same
-                                                                  // middleware (different target interfaces share the same wrapped
-                                                                  // hooks), so we emit the `let` once and reuse the var.
+    // orig_inst_id -> generated_outer_var
+    let mut outer_instances: HashMap<u32, String> = HashMap::new();
+    // inst_id -> used_name
+    let mut used_comp_nodes: HashMap<u32, String> = HashMap::new();
+    // (used_name, path)
+    let mut used_middlewares: Vec<(String, String)> = Vec::new();
+    // Real-middleware wac vars already emitted via `let mdl = new
+    // my:mdl { ... };`. Multiple rules can inject the same
+    // middleware (different target interfaces share the same wrapped
+    // hooks), so we emit the `let` once and reuse the var.
     let mut emitted_mdl_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Pre-instantiation pass for fan-in topologies.
