@@ -12,6 +12,7 @@ use super::*;
 use cviz::model::{
     FuncSignature, InstanceInterface, InterfaceType, TypeArena, ValueType, ValueTypeId,
 };
+use cviz::parse::component::parse_component;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 mod fuzz;
@@ -47,6 +48,13 @@ enum SplitKind {
     /// builds a fresh handler import type on top of the preamble's
     /// aliased types.
     Provider,
+    /// Consumer-style split where the target interface's compound
+    /// types come from a *sibling* types-instance import and are
+    /// referenced inside the target-interface type via `alias outer`
+    /// (the shape real WITs produce for `use other:pkg/types.{X}`).
+    /// Value-type only — mirrors the nebula `orders` composition
+    /// shape that surfaced the cross-interface aliasing bug.
+    ConsumerSiblingTypes,
 }
 
 /// Build a minimal split component for the given `kind`. Written as
@@ -78,6 +86,7 @@ fn synth_split(
         (SplitKind::Consumer, true) => wat_consumer_http_handler_shape(target),
         (SplitKind::Provider, false) => wat_provider_primitive_only(target, iface_inst, arena),
         (SplitKind::Provider, true) => wat_provider_http_handler_shape(target),
+        (SplitKind::ConsumerSiblingTypes, _) => wat_consumer_cross_interface_value_types(target),
     };
 
     let bytes = wat::parse_str(&wat).unwrap_or_else(|e| {
@@ -395,6 +404,57 @@ fn wat_consumer_http_handler_shape(target: &str) -> String {
     (export "handle" (func (type 9)))
   ))
   (import "{target}" (instance (;1;) (type 4)))
+)
+"#
+    )
+}
+
+/// WAT for a consumer split whose target interface references compound
+/// types defined in a sibling types-instance import, rather than
+/// declaring them inline. Mirrors the split shape produced for WIT
+/// that uses `use other:pkg/types.{X}` (e.g. the nebula `orders`
+/// interface pulling `order`/`quote` from `nebula:core/types`).
+///
+/// The handler instance type does NOT re-export these shared types as
+/// direct `(export "name" (type (eq N)))` members — it only
+/// `alias outer`s them from the types instance to reference in its
+/// function signatures. That's what distinguishes this fixture from
+/// the HTTP-handler shape: `error-code` there IS re-exported on the
+/// handler instance, so `Alias::InstanceExport` succeeds downstream.
+/// Here the shared types live only at component scope + inside the
+/// types instance, which exposes the cross-interface aliasing bug.
+///
+/// Hardcoded to the nebula `orders` shape (records + enums + list);
+/// adding more fixtures would be straightforward by parameterizing
+/// the type decls.
+fn wat_consumer_cross_interface_value_types(target: &str) -> String {
+    format!(
+        r#"(component
+  (type (;0;) (instance
+    (type (record (field "sku" string) (field "quantity" u32) (field "unit-price" f64)))
+    (export "item" (type (eq 0)))
+    (type (list 1))
+    (type (enum "BE" "US" "UK" "JP" "CA" "AU"))
+    (export "country" (type (eq 3)))
+    (type (record (field "order-id" string) (field "items" 2) (field "destination" 4)))
+    (export "order" (type (eq 5)))
+    (type (enum "EUR" "USD" "GBP" "JPY" "CAD" "AUD"))
+    (export "currency" (type (eq 7)))
+    (type (record (field "order-id" string) (field "subtotal" f64) (field "tax" f64) (field "total" f64) (field "currency" 8)))
+    (export "quote" (type (eq 9)))
+  ))
+  (import "synth:test/types" (instance (;0;) (type 0)))
+  (alias export 0 "order" (type (;1;)))
+  (alias export 0 "quote" (type (;2;)))
+  (type (;3;) (instance
+    (alias outer 1 1 (type (;0;)))
+    (export "order" (type (eq 0)))
+    (alias outer 1 2 (type (;2;)))
+    (export "quote" (type (eq 2)))
+    (type (;4;) (func (param "order" 0) (result 2)))
+    (export "create-order" (func (type 4)))
+  ))
+  (import "{target}" (instance (;1;) (type 3)))
 )
 "#
     )
@@ -1160,6 +1220,232 @@ fn test_adapter_multi_func() {
         &iface,
         &arena,
         SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+// ── Tier 1: real-world multi-function + named-types shape ──────────
+//
+// Regression fixture for the nebula demo composition
+// (~/git/research/wasm/nebula/demo). That composition's
+// `nebula:service/orders` interface exports three functions — two with
+// record params/results, one void — and all the compound types live
+// in a sibling `nebula:core/types` interface that both sides import.
+// A user reported that splicer's generated adapter dropped two of the
+// three functions and failed component validation with
+// "instance not valid to be used as export". This test pins the
+// shape so a future regression fails loud.
+
+/// Build the nebula `orders`-interface shape: three freestanding
+/// functions plus named type exports for `order`, `quote`, `item`,
+/// `country`, `currency` — the way a real WIT with
+/// `use nebula:core/types.{order, quote}` flows into cviz's
+/// `InstanceInterface`.
+fn build_nebula_orders_iface(arena: &mut TypeArena) -> InterfaceType {
+    let string_id = arena.intern_val(ValueType::String);
+    let u32_id = arena.intern_val(ValueType::U32);
+    let f64_id = arena.intern_val(ValueType::F64);
+
+    let item = arena.intern_val(ValueType::Record(vec![
+        ("sku".into(), string_id),
+        ("quantity".into(), u32_id),
+        ("unit-price".into(), f64_id),
+    ]));
+    let country = arena.intern_val(ValueType::Enum(vec![
+        "BE".into(),
+        "US".into(),
+        "UK".into(),
+        "JP".into(),
+        "CA".into(),
+        "AU".into(),
+    ]));
+    let currency = arena.intern_val(ValueType::Enum(vec![
+        "EUR".into(),
+        "USD".into(),
+        "GBP".into(),
+        "JPY".into(),
+        "CAD".into(),
+        "AUD".into(),
+    ]));
+    let list_item = arena.intern_val(ValueType::List(item));
+    let order = arena.intern_val(ValueType::Record(vec![
+        ("order-id".into(), string_id),
+        ("items".into(), list_item),
+        ("destination".into(), country),
+    ]));
+    let quote = arena.intern_val(ValueType::Record(vec![
+        ("order-id".into(), string_id),
+        ("subtotal".into(), f64_id),
+        ("tax".into(), f64_id),
+        ("total".into(), f64_id),
+        ("currency".into(), currency),
+    ]));
+    let opt_order = arena.intern_val(ValueType::Option(order));
+
+    let create_order = sig(false, &["order"], vec![order], vec![quote]);
+    let read_order = sig(false, &["order-id"], vec![string_id], vec![opt_order]);
+    let delete_order = sig(false, &["order-id"], vec![string_id], vec![]);
+
+    InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([
+            ("create-order".to_string(), create_order),
+            ("read-order".to_string(), read_order),
+            ("delete-order".to_string(), delete_order),
+        ]),
+        type_exports: BTreeMap::from([
+            ("item".to_string(), item),
+            ("country".to_string(), country),
+            ("currency".to_string(), currency),
+            ("order".to_string(), order),
+            ("quote".to_string(), quote),
+        ]),
+    })
+}
+
+#[test]
+fn test_adapter_nebula_orders_shape() {
+    let mut arena = TypeArena::default();
+    let iface = build_nebula_orders_iface(&mut arena);
+    let bytes = gen_adapter(
+        "nebula:service/orders",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+
+    // Pin that the generated component actually re-exports all three
+    // interface functions — the original bug report had the adapter
+    // exporting only `create-order`. Scan the raw bytes for each
+    // name: component exports carry function names as UTF-8 in the
+    // component-level type/export sections.
+    for name in ["create-order", "read-order", "delete-order"] {
+        let needle = name.as_bytes();
+        let found = bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            found,
+            "generated adapter should reference `{name}` but the binary \
+             doesn't contain it — splicer may have dropped interface \
+             functions other than the first one"
+        );
+    }
+}
+
+/// End-to-end regression for the nebula `orders` composition bug.
+/// Parses a nebula-shaped composition WAT via cviz, extracts the
+/// `nebula:service/orders` import's `InterfaceType`, and feeds it
+/// into `generate_tier1_adapter`. The test fails end-to-end if any
+/// layer in the stack regresses:
+///
+/// - wirm's `concretize_from_resolved_to_val` stops following
+///   `Alias::Outer` / `Alias::InstanceExport` chains → cviz returns
+///   empty `type_exports` → splicer redeclares types locally →
+///   `validate_component` trips on
+///   `instance not valid to be used as export`.
+/// - cviz's `concrete_to_interface_type` drops types on the floor.
+/// - splicer's `emit_imports_consumer_split` stops aliasing types
+///   off the handler instance when cviz DOES supply them.
+///
+/// The WAT shape mirrors wit-component's output for a
+/// `use other:pkg/types.{X}` pattern: an inner component imports
+/// both a sibling types instance (`nebula:core/types`) and the
+/// target service (`nebula:service/orders`) whose instance type
+/// `alias outer`s into the types-instance's exports.
+#[test]
+fn test_adapter_cross_interface_value_types() {
+    let wat = r#"(component
+        (component $inner
+            (import "nebula:core/types" (instance $types
+                (type (record (field "sku" string) (field "quantity" u32) (field "unit-price" f64)))
+                (export "item" (type (eq 0)))
+                (type (list 1))
+                (type (enum "BE" "US" "UK" "JP" "CA" "AU"))
+                (export "country" (type (eq 3)))
+                (type (record (field "order-id" string) (field "items" 2) (field "destination" 4)))
+                (export "order" (type (eq 5)))
+                (type (enum "EUR" "USD" "GBP" "JPY" "CAD" "AUD"))
+                (export "currency" (type (eq 7)))
+                (type (record (field "order-id" string) (field "subtotal" f64) (field "tax" f64) (field "total" f64) (field "currency" 8)))
+                (export "quote" (type (eq 9)))
+            ))
+            (alias export $types "order" (type $order))
+            (alias export $types "quote" (type $quote))
+            (import "nebula:service/orders" (instance $svc
+                (alias outer 1 $order (type (;0;)))
+                (export "order" (type (eq 0)))
+                (alias outer 1 $quote (type (;2;)))
+                (export "quote" (type (eq 2)))
+                (type (;4;) (func (param "order" 0) (result 2)))
+                (export "create-order" (func (type 4)))
+            ))
+            (alias export $svc "create-order" (func $f))
+            (instance $out (export "create-order" (func $f)))
+            (export "nebula:service/orders" (instance $out))
+        )
+        (import "nebula:core/types" (instance $host-types
+            (type (record (field "sku" string) (field "quantity" u32) (field "unit-price" f64)))
+            (export "item" (type (eq 0)))
+            (type (list 1))
+            (type (enum "BE" "US" "UK" "JP" "CA" "AU"))
+            (export "country" (type (eq 3)))
+            (type (record (field "order-id" string) (field "items" 2) (field "destination" 4)))
+            (export "order" (type (eq 5)))
+            (type (enum "EUR" "USD" "GBP" "JPY" "CAD" "AUD"))
+            (export "currency" (type (eq 7)))
+            (type (record (field "order-id" string) (field "subtotal" f64) (field "tax" f64) (field "total" f64) (field "currency" 8)))
+            (export "quote" (type (eq 9)))
+        ))
+        (alias export $host-types "order" (type $outer-order))
+        (alias export $host-types "quote" (type $outer-quote))
+        (import "nebula:service/orders" (instance $host-svc
+            (alias outer 1 $outer-order (type (;0;)))
+            (export "order" (type (eq 0)))
+            (alias outer 1 $outer-quote (type (;2;)))
+            (export "quote" (type (eq 2)))
+            (type (;4;) (func (param "order" 0) (result 2)))
+            (export "create-order" (func (type 4)))
+        ))
+        (instance $inst (instantiate $inner
+            (with "nebula:core/types" (instance $host-types))
+            (with "nebula:service/orders" (instance $host-svc))
+        ))
+        (alias export $inst "nebula:service/orders" (instance $out))
+        (export "nebula:service/orders" (instance $out))
+    )"#;
+
+    let comp_bytes = wat::parse_str(wat).expect("composition WAT parses");
+    let graph = parse_component(&comp_bytes).expect("parse_component succeeds");
+    let svc_conn = graph
+        .nodes
+        .values()
+        .flat_map(|n| n.imports.iter())
+        .find(|c| c.interface_name == "nebula:service/orders")
+        .expect("inner component should import nebula:service/orders");
+    let iface = svc_conn
+        .interface_type
+        .as_ref()
+        .expect("interface_type populated")
+        .clone();
+
+    // Sanity: the whole point of the wirm fix is that cviz now
+    // populates these. Assert before running the adapter gen so a
+    // regression in wirm/cviz gives a clearer error than the downstream
+    // `instance not valid to be used as export`.
+    if let InterfaceType::Instance(inst) = &iface {
+        assert!(
+            inst.type_exports.contains_key("order") && inst.type_exports.contains_key("quote"),
+            "cviz should populate order+quote in type_exports; got {:?}",
+            inst.type_exports.keys().collect::<Vec<_>>()
+        );
+    }
+
+    let bytes = gen_adapter(
+        "nebula:service/orders",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &graph.arena,
+        SplitKind::ConsumerSiblingTypes,
     );
     validate_component(&bytes);
 }

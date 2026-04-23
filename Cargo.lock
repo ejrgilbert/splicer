@@ -927,9 +927,9 @@ dependencies = [
 
 [[package]]
 name = "cviz"
-version = "2.0.0"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36744bbbf593d610e9188dab7e1da8f264746380259e87aebb0f3ece89c55fa9"
+checksum = "ca6e7126f3ff965d33ea564dcd6f2b42c069c8af6a7d23f36a2085d5078935fb"
 dependencies = [
  "anyhow",
  "clap",
@@ -5694,9 +5694,9 @@ dependencies = [
 
 [[package]]
 name = "wirm"
-version = "4.0.1"
+version = "4.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6990dbb19ac4f85edd3621474e532c45696fad7dbeb8948694377ad05ea035"
+checksum = "94e5e13e2ebd5ab80dde0abbcc64969eb5fdf57391b2db6c9968d3fd81551340"
 dependencies = [
  "log",
  "paste",

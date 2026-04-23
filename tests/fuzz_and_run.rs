@@ -1603,14 +1603,17 @@ fn test_canned() {
     // the provider is the only crate whose source changes per shape,
     // which keeps incremental cargo builds cheap.
     let mut failures: Vec<(String, String)> = Vec::new();
+    let total_shapes = shapes.len() * ALL_ASYNC_MODES.len();
+    let mut shape_idx = 0usize;
     for &mode in ALL_ASYNC_MODES {
         let mode_tag = mode.tag();
         eprintln!("\n### mode: {mode_tag} ###");
         scaffold_common(root, mode).expect("scaffold common");
         for shape in &shapes {
+            shape_idx += 1;
             let shape_name = shape.name();
             let label = format!("{shape_name}/{mode_tag}");
-            eprintln!("\n=== shape: {label} ===");
+            eprintln!("\n=== [{shape_idx}/{total_shapes}] shape: {label} ===");
             if let Err(e) = write_per_shape_files(root, shape, mode) {
                 failures.push((label.clone(), format!("write_per_shape_files: {e}")));
                 continue;
@@ -1685,6 +1688,8 @@ fn test_fuzz() {
     // Each iter's generator state is seeded independently of mode, so
     // both modes see the same shape sequence — a failure in one mode
     // but not the other isolates mode as the cause.
+    let total_iters_all_modes = (iters as usize) * ALL_ASYNC_MODES.len();
+    let mut run_idx = 0usize;
     for &mode in ALL_ASYNC_MODES {
         let mode_tag = mode.tag();
         eprintln!("\n### mode: {mode_tag} ###");
@@ -1692,6 +1697,7 @@ fn test_fuzz() {
 
         for i in 0..iters {
             total_runs += 1;
+            run_idx += 1;
             let iter_seed = base_seed.wrapping_add(i as u64);
             let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
             let mut u = arbitrary::Unstructured::new(&buf);
@@ -1707,7 +1713,9 @@ fn test_fuzz() {
                 }
             };
             let shape_name = shape.name();
-            eprintln!("\n=== iter {i} seed {iter_seed} mode {mode_tag}: {shape_name} ===");
+            eprintln!(
+                "\n=== [{run_idx}/{total_iters_all_modes}] iter {i} seed {iter_seed} mode {mode_tag}: {shape_name} ==="
+            );
 
             if let Err(e) = write_per_shape_files(root, &shape, mode) {
                 failures.push(format!(

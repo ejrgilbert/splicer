@@ -107,6 +107,10 @@ pub use api::{
     SpliceOutput, SpliceRequest,
 };
 
+/// Re-export so consumers pick up the exact cviz version splicer
+/// links against, avoiding version-skew on shared types.
+pub use ::cviz;
+
 // ── Shared types ──────────────────────────────────────────────────
 
 /// Types that appear on the public API surface and may be useful to
