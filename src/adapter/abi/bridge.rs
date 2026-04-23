@@ -31,7 +31,7 @@ use wasm_encoder::ValType;
 use wit_parser::{
     abi::{FlatTypes, WasmType},
     Case, Docs, Enum, EnumCase, Field, Flag, Flags, Handle, Record, Resolve, Result_, SizeAlign,
-    Stability, Tuple, Type, TypeDef, TypeDefKind, TypeId, TypeOwner, Variant,
+    Span, Stability, Tuple, Type, TypeDef, TypeDefKind, TypeId, TypeOwner, Variant,
 };
 
 /// Owns a [`Resolve`] built from a cviz arena plus a pre-filled
@@ -110,7 +110,7 @@ impl WitBridge {
         self.any_type(self.get(id), &|_, kind| {
             matches!(
                 kind,
-                Some(TypeDefKind::List(_) | TypeDefKind::FixedSizeList(..) | TypeDefKind::Map(..))
+                Some(TypeDefKind::List(_) | TypeDefKind::FixedLengthList(..) | TypeDefKind::Map(..))
             )
         })
     }
@@ -142,7 +142,7 @@ impl WitBridge {
                 r.ok.is_some_and(|t| self.any_type(t, pred))
                     || r.err.is_some_and(|t| self.any_type(t, pred))
             }
-            TypeDefKind::List(t) | TypeDefKind::FixedSizeList(t, _) => self.any_type(*t, pred),
+            TypeDefKind::List(t) | TypeDefKind::FixedLengthList(t, _) => self.any_type(*t, pred),
             TypeDefKind::Map(k, v) => self.any_type(*k, pred) || self.any_type(*v, pred),
             TypeDefKind::Type(t) => self.any_type(*t, pred),
             TypeDefKind::Enum(_)
@@ -192,7 +192,7 @@ impl WitBridge {
             }
             ValueType::FixedSizeList(inner, n) => {
                 let inner = self.translate(*inner, arena);
-                self.alloc(TypeDefKind::FixedSizeList(inner, *n))
+                self.alloc(TypeDefKind::FixedLengthList(inner, *n))
             }
             ValueType::Map(k, v) => {
                 let k = self.translate(*k, arena);
@@ -215,6 +215,7 @@ impl WitBridge {
                         name: name.clone(),
                         ty: self.translate(*fid, arena),
                         docs: Docs::default(),
+                        span: Span::default(),
                     })
                     .collect();
                 self.alloc(TypeDefKind::Record(Record { fields }))
@@ -227,6 +228,7 @@ impl WitBridge {
                         name: name.clone(),
                         ty: payload.map(|p| self.translate(p, arena)),
                         docs: Docs::default(),
+                        span: Span::default(),
                     })
                     .collect();
                 self.alloc(TypeDefKind::Variant(Variant { cases }))
@@ -237,6 +239,7 @@ impl WitBridge {
                     .map(|name| EnumCase {
                         name: name.clone(),
                         docs: Docs::default(),
+                        span: Span::default(),
                     })
                     .collect();
                 self.alloc(TypeDefKind::Enum(Enum { cases }))
@@ -256,6 +259,7 @@ impl WitBridge {
                     .map(|name| Flag {
                         name: name.clone(),
                         docs: Docs::default(),
+                        span: Span::default(),
                     })
                     .collect();
                 self.alloc(TypeDefKind::Flags(Flags { flags }))
@@ -285,6 +289,7 @@ impl WitBridge {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         Type::Id(id)
     }
@@ -306,6 +311,7 @@ impl WitBridge {
             owner: TypeOwner::None,
             docs: Docs::default(),
             stability: Stability::default(),
+            span: Span::default(),
         });
         self.resource_by_name.insert(name.to_string(), id);
         id

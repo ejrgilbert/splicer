@@ -14,7 +14,7 @@
 use cviz::model::{FuncSignature, InterfaceType, ValueTypeId};
 use wasm_encoder::ValType;
 use wit_parser::abi::{AbiVariant, WasmSignature};
-use wit_parser::{Docs, Function, FunctionKind, Stability};
+use wit_parser::{Docs, Function, FunctionKind, Param, Span, Stability};
 
 use super::abi::{wasm_to_val, WitBridge};
 use super::build::MemoryLayoutBuilder;
@@ -218,9 +218,13 @@ fn build_wit_function_from_parts(
     } else {
         FunctionKind::Freestanding
     };
-    let wit_params: Vec<(String, wit_parser::Type)> = params
+    let wit_params: Vec<Param> = params
         .iter()
-        .map(|(pname, id)| (pname.clone(), bridge.get(*id)))
+        .map(|(pname, id)| Param {
+            name: pname.clone(),
+            ty: bridge.get(*id),
+            span: Span::default(),
+        })
         .collect();
     Function {
         name: name.to_string(),
@@ -229,6 +233,7 @@ fn build_wit_function_from_parts(
         result: result_type_id.map(|id| bridge.get(id)),
         docs: Docs::default(),
         stability: Stability::Unknown,
+        span: Span::default(),
     }
 }
 

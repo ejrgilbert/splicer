@@ -589,52 +589,22 @@ impl Shape {
 
     fn expected_debug(&self) -> String {
         let mut err_enums = HashSet::new();
-        self.collect_error_style_enums(&mut err_enums);
-        self.expected_debug_in(&err_enums)
-    }
-
-    /// Walk the tree and collect rust_names of enums that wit-bindgen
-    /// will render with error-shaped Debug. wit-bindgen only
-    /// error-styles an enum that appears *directly* as the err arg of
-    /// some `result<_, EnumName>` in the WIT — not when the enum is
-    /// wrapped inside tuple/list/option/etc. at the err position.
-    fn collect_error_style_enums(&self, out: &mut HashSet<&'static str>) {
+        // wit-bindgen error-styles an enum (implements `Error`, swaps
+        // Debug to `{ code, name, message }`) only when the enum sits
+        // directly at the err arg of a `result<_, EnumName>` that the
+        // function signature returns (or accepts) at the TOP level.
+        // Nested Results — `option<result<_, EnumName>>`,
+        // `result<_, result<_, EnumName>>` — don't count: wit-bindgen
+        // doesn't treat those enums as error types, so Debug stays
+        // `EnumName::Case`. The fuzz harness's foo signature is
+        // `func() -> T` (sync) or `func(x: T) -> T` (async), so T
+        // itself is the top-level shape to inspect.
         if let Shape::Result_ { err: Some(e), .. } = self {
             if let Shape::Enum { rust_name, .. } = e.as_ref() {
-                out.insert(*rust_name);
+                err_enums.insert(*rust_name);
             }
         }
-        match self {
-            Shape::Option(inner) | Shape::List(inner) => {
-                inner.collect_error_style_enums(out);
-            }
-            Shape::Tuple(parts) => {
-                for p in parts {
-                    p.collect_error_style_enums(out);
-                }
-            }
-            Shape::Record { fields, .. } => {
-                for (_, f) in fields {
-                    f.collect_error_style_enums(out);
-                }
-            }
-            Shape::Variant { cases, .. } => {
-                for c in cases {
-                    if let Some(p) = &c.payload {
-                        p.collect_error_style_enums(out);
-                    }
-                }
-            }
-            Shape::Result_ { ok, err, .. } => {
-                if let Some(o) = ok {
-                    o.collect_error_style_enums(out);
-                }
-                if let Some(e) = err {
-                    e.collect_error_style_enums(out);
-                }
-            }
-            Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => {}
-        }
+        self.expected_debug_in(&err_enums)
     }
 
     fn expected_debug_in(&self, err_enums: &HashSet<&'static str>) -> String {
