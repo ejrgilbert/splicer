@@ -1313,7 +1313,7 @@ fn consumer_world_wit(mode: AsyncMode) -> String {
          \n\
          world consumer {{\n    \
              export app;\n    \
-             import my:shape/api@1.0.0;\n\
+             import {TARGET_INTERFACE};\n\
          }}\n",
         marker = mode.wit_async_marker(),
     )
@@ -1414,20 +1414,25 @@ const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
 /// process cwd — integration tests run from the project root, not
 /// the scaffold tempdir, so a relative path wouldn't resolve.
 const MIDDLEWARE_PATH_PLACEHOLDER: &str = "{MIDDLEWARE_PATH}";
+const TARGET_INTERFACE: &str = "my:shape/api@1.0.0";
 
-const SPLICE_YAML_BETWEEN_TMPL: &str = r#"version: 1
+fn splice_yaml_between_tmpl() -> String {
+    format!(
+        r#"version: 1
 
 rules:
   - between:
-      interface: "my:shape/api@1.0.0"
+      interface: "{TARGET_INTERFACE}"
       inner:
         name: provider-comp
       outer:
         name: consumer-comp
     inject:
       - name: mdl
-        path: "{MIDDLEWARE_PATH}"
-"#;
+        path: "{MIDDLEWARE_PATH_PLACEHOLDER}"
+"#
+    )
+}
 
 /// Before-rule variant: insert middleware in front of the provider's
 /// export, BEFORE the provider is composed with the consumer.
@@ -1435,19 +1440,23 @@ rules:
 /// Uses `provider.alias: prov` because the auto-derived shim-instance
 /// variable name (`shape-api@1-0-0-shim-instance`) would contain `@`,
 /// which WAC rejects as an identifier.
-const SPLICE_YAML_BEFORE_TMPL: &str = r#"version: 1
+fn splice_yaml_before_tmpl() -> String {
+    format!(
+        r#"version: 1
 
 rules:
   - before:
-      interface: "my:shape/api@1.0.0"
+      interface: "{TARGET_INTERFACE}"
       provider:
         alias: "prov"
     inject:
       - name: mdl
-        path: "{MIDDLEWARE_PATH}"
-"#;
+        path: "{MIDDLEWARE_PATH_PLACEHOLDER}"
+"#
+    )
+}
 
-fn splice_yaml(tmpl: &str, middleware_path: &Path) -> String {
+fn splice_yaml(tmpl: String, middleware_path: &Path) -> String {
     tmpl.replace(
         MIDDLEWARE_PATH_PLACEHOLDER,
         middleware_path.to_str().expect("middleware path utf8"),
@@ -1863,11 +1872,13 @@ fn run_pipeline_for_shape(root: &Path, shape: &Shape, kinds: &[PipelineKind]) {
         let expected_sent = format!("consumer: sending {}", shape.expected_debug());
         let expected_received = format!("provider: received {}", shape.expected_debug());
         let expected_got = format!("consumer: got {}", shape.expected_debug());
+        let expected_before = format!("mdl: before {TARGET_INTERFACE}#foo");
+        let expected_after = format!("mdl: after {TARGET_INTERFACE}#foo");
         for marker in [
             expected_sent.as_str(),
-            "mdl: before foo",
+            expected_before.as_str(),
             expected_received.as_str(),
-            "mdl: after foo",
+            expected_after.as_str(),
             expected_got.as_str(),
         ] {
             assert!(
@@ -1922,7 +1933,7 @@ fn splice_between(root: &Path, composed_path: &Path, middleware_comp: &Path) -> 
 
     let out = splice(SpliceRequest {
         composition_wasm: composed_path.to_path_buf(),
-        rules_yaml: splice_yaml(SPLICE_YAML_BETWEEN_TMPL, middleware_comp),
+        rules_yaml: splice_yaml(splice_yaml_between_tmpl(), middleware_comp),
         package_name: WAC_PACKAGE_NAME.to_string(),
         splits_dir: splits_dir.clone(),
         skip_type_check: false,
@@ -1954,7 +1965,7 @@ fn splice_before_and_compose(
 
     let splice_out = splice(SpliceRequest {
         composition_wasm: provider_comp.to_path_buf(),
-        rules_yaml: splice_yaml(SPLICE_YAML_BEFORE_TMPL, middleware_comp),
+        rules_yaml: splice_yaml(splice_yaml_before_tmpl(), middleware_comp),
         package_name: WAC_PACKAGE_NAME.to_string(),
         splits_dir: splits_dir.clone(),
         skip_type_check: false,

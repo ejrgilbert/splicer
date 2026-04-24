@@ -755,7 +755,7 @@ fn emit_function_name_data(module: &mut Module, funcs: &[AdapterFunc]) {
     let mut data_section = DataSection::new();
     let all_names: Vec<u8> = funcs
         .iter()
-        .flat_map(|f| f.name.as_bytes().iter().copied())
+        .flat_map(|f| f.hook_name.as_bytes().iter().copied())
         .collect();
     data_section.active(0, &wasm_encoder::ConstExpr::i32_const(0), all_names);
     module.section(&data_section);

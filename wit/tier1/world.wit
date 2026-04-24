@@ -3,7 +3,7 @@
 /// A middleware component exports one or more of these interfaces to
 /// participate in the adapter-generation pipeline. The generated adapter
 /// calls the exported hooks around every invocation of the target
-/// interface's functions, passing only the function name — the
+/// interface's functions, passing "{target_interface}#{fn_name}" — the
 /// middleware never sees the actual parameter or return types/values.
 ///
 /// Any non-empty subset is valid: you can export just `before`, just
