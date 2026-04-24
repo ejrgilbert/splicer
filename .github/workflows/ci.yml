@@ -90,10 +90,6 @@ jobs:
      - uses: actions/checkout@v4
        with:
          submodules: recursive
-     # Pin toolchain to the version run.sh's check_env expects —
-     # otherwise it emits a cargo-version-mismatch WARNING every run.
-     # wasm32-wasip1 target is required because run.sh's `build`
-     # step compiles the component fixtures for that target.
      - uses: dtolnay/rust-toolchain@1.93.0
        with:
          targets: wasm32-wasip1
@@ -105,26 +101,10 @@ jobs:
        # all do), falling back to `cargo install` from source on miss.
        run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }} cviz@${{ env.CVIZ_VERSION }} wkg@${{ env.WKG_VERSION }}
      - name: Install splicer from the PR-under-test tree
-       # The submodule's run.sh calls whichever `splicer` is on PATH.
-       # Install from the current checkout so the integration tests
-       # exercise THIS PR's splicer, not a stale registry version.
        run: cargo install --path . --force
      - name: Run integration tests
-       # `--nocapture` surfaces the component-interposition run.sh
-       # output so failures show up in CI logs instead of exiting
-       # silently with no context.
        run: cargo test --test integration -- --ignored --nocapture
 
-  # End-to-end fuzz + run harness (tests/fuzz_and_run.rs). Scaffolds
-  # provider/consumer/middleware crates in a tempdir, drives both the
-  # canned catalog and the `arbitrary`-generated fuzz cases through the
-  # full splicer pipeline (compose + splice for both `between` and
-  # `before` rules), and invokes the output under wasmtime.
-  #
-  # Split into two parallel jobs so PR wall-clock is min(canned, fuzz)
-  # instead of their sum. Both run on every PR so branch protection
-  # can treat each as a required status check without the
-  # skipped-means-failed trap that gating on path filters would create.
   fuzz_and_run_canned:
    name: Fuzz + Run (canned)
    runs-on: ubuntu-latest
