@@ -94,12 +94,9 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
-     - uses: cargo-bins/cargo-binstall@main
-     - name: Install tools
-       # `cargo binstall` downloads prebuilt release binaries from
-       # GitHub when the crate ships them (wac-cli, wasm-tools, cviz
-       # all do), falling back to `cargo install` from source on miss.
-       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }} cviz@${{ env.CVIZ_VERSION }} wkg@${{ env.WKG_VERSION }}
+     - uses: taiki-e/install-action@v2
+       with:
+         tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }},cviz@${{ env.CVIZ_VERSION }},wkg@${{ env.WKG_VERSION }}
      - name: Install splicer from the PR-under-test tree
        run: cargo install --path . --force
      - name: Run integration tests
@@ -116,9 +113,9 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
-     - uses: cargo-bins/cargo-binstall@main
-     - name: Install tools
-       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+     - uses: taiki-e/install-action@v2
+       with:
+         tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
      - name: Canned shape catalog
        run: cargo test --test fuzz_and_run -- --ignored --nocapture test_canned
 
@@ -133,9 +130,9 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
-     - uses: cargo-bins/cargo-binstall@main
-     - name: Install tools
-       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+     - uses: taiki-e/install-action@v2
+       with:
+         tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
      - name: Fuzz (25 iters, depth 5)
        env:
          SPLICER_FUZZ_ITERS: "25"
@@ -159,9 +156,9 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
-     - uses: cargo-bins/cargo-binstall@main
-     - name: Install tools
-       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+     - uses: taiki-e/install-action@v2
+       with:
+         tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
      - name: Fuzz (200 iters, depth 6)
        env:
          SPLICER_FUZZ_ITERS: "200"
