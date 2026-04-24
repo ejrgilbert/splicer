@@ -8,6 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned tool versions shared across all jobs. Bump here once and
+  # every install step picks it up.
+  WAC_VERSION: "0.10.0"
+  WASM_TOOLS_VERSION: "1.247.0"
+  CVIZ_VERSION: "2.0.2"
+  WKG_VERSION: "0.13.0"
 
 jobs:
   # Figure out whether the PR / push touched code the fuzz harness
@@ -84,14 +90,30 @@ jobs:
      - uses: actions/checkout@v4
        with:
          submodules: recursive
-     - uses: dtolnay/rust-toolchain@stable
+     # Pin toolchain to the version run.sh's check_env expects —
+     # otherwise it emits a cargo-version-mismatch WARNING every run.
+     # wasm32-wasip1 target is required because run.sh's `build`
+     # step compiles the component fixtures for that target.
+     - uses: dtolnay/rust-toolchain@1.93.0
+       with:
+         targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
+     - uses: cargo-bins/cargo-binstall@main
      - name: Install tools
-       run: |
-         cargo install wac-cli@0.9.0 wasm-tools@1.244.0
-         cargo install splicer@2.0.0-rc3 cviz@2.0.0-rc3
+       # `cargo binstall` downloads prebuilt release binaries from
+       # GitHub when the crate ships them (wac-cli, wasm-tools, cviz
+       # all do), falling back to `cargo install` from source on miss.
+       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }} cviz@${{ env.CVIZ_VERSION }} wkg@${{ env.WKG_VERSION }}
+     - name: Install splicer from the PR-under-test tree
+       # The submodule's run.sh calls whichever `splicer` is on PATH.
+       # Install from the current checkout so the integration tests
+       # exercise THIS PR's splicer, not a stale registry version.
+       run: cargo install --path . --force
      - name: Run integration tests
-       run: cargo test --test integration -- --ignored
+       # `--nocapture` surfaces the component-interposition run.sh
+       # output so failures show up in CI logs instead of exiting
+       # silently with no context.
+       run: cargo test --test integration -- --ignored --nocapture
 
   # End-to-end fuzz + run harness (tests/fuzz_and_run.rs). Scaffolds
   # provider/consumer/middleware crates in a tempdir, drives both the
@@ -114,8 +136,9 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
+     - uses: cargo-bins/cargo-binstall@main
      - name: Install tools
-       run: cargo install wac-cli@0.9.0 wasm-tools@1.244.0
+       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }}
      - name: Canned shape catalog
        run: cargo test --test fuzz_and_run -- --ignored --nocapture test_canned
 
@@ -130,8 +153,9 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
+     - uses: cargo-bins/cargo-binstall@main
      - name: Install tools
-       run: cargo install wac-cli@0.9.0 wasm-tools@1.244.0
+       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }}
      - name: Fuzz (25 iters, depth 5)
        env:
          SPLICER_FUZZ_ITERS: "25"
@@ -155,8 +179,9 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
+     - uses: cargo-bins/cargo-binstall@main
      - name: Install tools
-       run: cargo install wac-cli@0.9.0 wasm-tools@1.244.0
+       run: cargo binstall --no-confirm wac-cli@${{ env.WAC_VERSION }} wasm-tools@${{ env.WASM_TOOLS_VERSION }}
      - name: Fuzz (200 iters, depth 6)
        env:
          SPLICER_FUZZ_ITERS: "200"

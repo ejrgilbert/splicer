@@ -1,6 +1,6 @@
 [package]
 name = "splicer"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
 description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
@@ -30,7 +30,7 @@ path = "examples/wac_compose.rs"
 
 [dependencies]
 colored = "3.1.1"
-cviz = "2.0.1"
+cviz = "2.0.2"
 #cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -43,7 +43,7 @@ wit-parser = "0.247"
 wit-bindgen-core = "0.57.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wirm = "4.0.2"
+wirm = "4.0.3"
 #wirm = { path = "../../research/compilers/wirm" }
 
 [dev-dependencies]

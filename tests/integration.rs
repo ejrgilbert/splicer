@@ -1,45 +1,76 @@
 //! Integration tests that run the component-interposition test suite.
 //!
 //! These tests require the `tests/component-interposition` git submodule to be
-//! initialized and its `fixtures/` directory to contain pre-built `.comp.wasm`
-//! files.  They also require `splicer`, `wac`, `cviz-cli`, and `wasm-tools`
-//! to be installed.
+//! initialized, plus `splicer`, `wac`, `cviz-cli`, and `wasm-tools` on PATH.
+//! Fixtures aren't checked in — the first test run invokes `./run.sh build`
+//! once via a sync::Once so subsequent configs reuse the built `.comp.wasm`s
+//! with `--skip-build`.
 //!
 //! Run with:
-//!   cargo test --test integration            # all configs
-//!   cargo test --test integration -- single  # just --single
+//!   cargo test --test integration -- --ignored            # all configs
+//!   cargo test --test integration -- --ignored single     # just --single
 //!
-//! These tests are `#[ignore]` by default so `cargo test` stays fast.
-//! Run ignored tests with:
-//!   cargo test --test integration -- --ignored
+//! `#[ignore]`'d by default so `cargo test` stays fast.
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, Once};
 
 const SUBMODULE_PATH: &str = "tests/component-interposition";
 
 // Configs share intermediate output dirs (compositions/, generated-wac/,
 // splits/) in the submodule, so concurrent invocations race. Serialize them.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+// One-time fixture build per test-session. The `Once` closure must not
+// panic (it'd poison the primitive and cascade "Once poisoned" panics
+// across every test), so we capture success/failure in a separate
+// atomic and let the caller surface a clear message pointing at the
+// failing test's own stdout.
+static FIXTURES_BUILT: Once = Once::new();
+static FIXTURES_BUILD_OK: AtomicBool = AtomicBool::new(false);
 
 fn submodule_ready() -> bool {
     let run_sh = Path::new(SUBMODULE_PATH).join("run.sh");
-    let fixtures = Path::new(SUBMODULE_PATH).join("fixtures");
     if !run_sh.exists() {
         eprintln!("Submodule not initialized. Run:\n  git submodule update --init");
         return false;
     }
-    if !fixtures.exists() || !fixtures.is_dir() {
-        eprintln!(
-            "Fixtures not found at {}/fixtures/.\n\
-             Build components in the submodule first, or check that pre-built\n\
-             fixtures are committed.",
-            SUBMODULE_PATH
-        );
-        return false;
-    }
     true
+}
+
+fn ensure_fixtures_built() {
+    FIXTURES_BUILT.call_once(|| {
+        // NB: this closure must not panic — panicking poisons the
+        // Once and every subsequent test panics with the unhelpful
+        // "Once instance has previously been poisoned" message
+        // instead of pointing at the real build failure. Record the
+        // outcome and let the caller surface a clear message.
+        let status = match Command::new("./run.sh")
+            .arg("build")
+            .current_dir(SUBMODULE_PATH)
+            .status()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ensure_fixtures_built: spawn ./run.sh build: {e}");
+                return;
+            }
+        };
+        if !status.success() {
+            eprintln!(
+                "ensure_fixtures_built: ./run.sh build failed with exit code {:?}",
+                status.code()
+            );
+            return;
+        }
+        FIXTURES_BUILD_OK.store(true, Ordering::Relaxed);
+    });
+    assert!(
+        FIXTURES_BUILD_OK.load(Ordering::Relaxed),
+        "fixture build failed — see the first FAILED integration_* test's \
+         output for the actual `./run.sh build` error"
+    );
 }
 
 fn run_config(opt: &str) {
@@ -48,7 +79,7 @@ fn run_config(opt: &str) {
     if !submodule_ready() {
         panic!("component-interposition submodule not ready");
     }
-    // Fixtures are checked in, so the per-config build isn't needed.
+    ensure_fixtures_built();
     let status = Command::new("./run.sh")
         .arg("all")
         .arg(format!("--{}", opt))

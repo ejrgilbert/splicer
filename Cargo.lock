@@ -927,9 +927,9 @@ dependencies = [
 
 [[package]]
 name = "cviz"
-version = "2.0.1"
+version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca6e7126f3ff965d33ea564dcd6f2b42c069c8af6a7d23f36a2085d5078935fb"
+checksum = "a9c6ac5b16dfb9f3c5bc5ef81990e3dc4fcb8cd2d5e8963bc3eb7d6c703d3626"
 dependencies = [
  "anyhow",
  "clap",
@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "splicer"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -5694,9 +5694,9 @@ dependencies = [
 
 [[package]]
 name = "wirm"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e5e13e2ebd5ab80dde0abbcc64969eb5fdf57391b2db6c9968d3fd81551340"
+checksum = "82cd1a44fea828444d4f1136dff4599c88e46bb423ea7a6534276f80b14154be"
 dependencies = [
  "log",
  "paste",

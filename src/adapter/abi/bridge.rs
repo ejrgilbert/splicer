@@ -297,18 +297,21 @@ impl WitBridge {
     }
 
     /// Look up or allocate the Resource TypeDef for a given name.
-    /// Empty name collapses to a single anonymous resource so
-    /// unnamed cviz resources share layout too.
+    /// Panics on empty input: cviz's `ValueType::Resource(name)` only
+    /// carries a non-empty name now that wirm concretization emits
+    /// only `NamedResource` — an empty name here signals an upstream
+    /// regression we'd rather catch loudly than paper over.
     fn resource_for_name(&mut self, name: &str) -> TypeId {
+        assert!(
+            !name.is_empty(),
+            "resource_for_name: got empty name — upstream (cviz / wirm) \
+             should never produce anonymous resources; please file a bug"
+        );
         if let Some(id) = self.resource_by_name.get(name) {
             return *id;
         }
         let id = self.resolve.types.alloc(TypeDef {
-            name: if name.is_empty() {
-                None
-            } else {
-                Some(name.to_string())
-            },
+            name: Some(name.to_string()),
             kind: TypeDefKind::Resource,
             owner: TypeOwner::None,
             docs: Docs::default(),
