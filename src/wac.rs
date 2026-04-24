@@ -389,6 +389,13 @@ pub fn generate_wac(
     let mut fan_in_iface_vars: HashMap<u32, HashMap<String, String>> = HashMap::new();
     // Aliases for fan-in consumers (first chain that sets them wins).
     let mut fan_in_aliases: HashMap<u32, HashMap<u32, Option<String>>> = HashMap::new();
+    // Top-level export injects on fan-in consumers — drained after
+    // the fan-in instantiation pass.
+    let mut deferred_top_level_injects: Vec<DeferredTopLevelInject> = Vec::new();
+    // (consumer_id, export_name) → var to use in the final
+    // `export <var>["<name>"];` line, when middleware fronts the
+    // consumer's export.
+    let mut export_overrides: HashMap<(u32, String), String> = HashMap::new();
 
     for Chain {
         interface: chain_interface,
@@ -399,6 +406,20 @@ pub fn generate_wac(
     {
         for (i, id) in chain.iter().enumerate() {
             let is_fan_in_last = fan_in_consumers.contains(id) && i == chain.len() - 1;
+
+            // Splicing on a top-level export of a fan-in consumer:
+            // defer to the post-fan-in pass so the consumer var
+            // exists when we wire the middleware.
+            if chain.len() == 1 && is_fan_in_last {
+                if let Some(middlewares) = inject_plan.get(&(i + 1)) {
+                    deferred_top_level_injects.push(DeferredTopLevelInject {
+                        consumer_id: *id,
+                        chain_interface: chain_interface.clone(),
+                        middlewares: middlewares.clone(),
+                    });
+                }
+                continue;
+            }
 
             if !is_fan_in_last {
                 let node = &composition.nodes[id];
@@ -505,6 +526,52 @@ pub fn generate_wac(
         outer_instances.insert(*consumer_id, node_var.clone());
     }
 
+    // Drain deferred top-level-export injects.
+    for deferred in deferred_top_level_injects {
+        let Some(consumer_var) = instance_vars.get(&deferred.consumer_id).cloned() else {
+            anyhow::bail!(
+                "deferred top-level inject for instance {} but no var was created \
+                 (fan-in pass should have instantiated it); please file a bug",
+                deferred.consumer_id
+            );
+        };
+        let mut current_provider = consumer_var;
+        for mdl in reverse_set(&deferred.middlewares).iter() {
+            if let Some(adapter_info) = &mdl.adapter_info {
+                let (adapter_var, extra_args) = create_tier1_mdl(
+                    &current_provider,
+                    mdl,
+                    &deferred.chain_interface,
+                    adapter_info,
+                    &mut wac_lines,
+                    &mut emitted_mdl_vars,
+                );
+                current_provider = adapter_var;
+                used_middlewares.extend(extra_args);
+            } else {
+                current_provider = create_mdl(
+                    &current_provider,
+                    &mdl.name,
+                    &deferred.chain_interface,
+                    &mut wac_lines,
+                );
+                used_middlewares.push((
+                    current_provider.clone(),
+                    mdl.path
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or(PATH_PLACEHOLDER.to_string()),
+                ));
+            }
+        }
+        // Final adapter wraps the consumer for this export — re-route
+        // the export line through it.
+        export_overrides.insert(
+            (deferred.consumer_id, deferred.chain_interface.name),
+            current_provider,
+        );
+    }
+
     // Generate WAC to export the appropriate functions
     for (
         export_name,
@@ -530,7 +597,13 @@ pub fn generate_wac(
             continue;
         }
 
-        let node_var = if let Some(generated_outer) = outer_instances.get(outer_inst_id) {
+        // Per-export override (set by the deferred top-level inject
+        // pass) wins over the consumer's generic outer-instance var.
+        let node_var = if let Some(override_var) =
+            export_overrides.get(&(*outer_inst_id, export_name.clone()))
+        {
+            override_var.clone()
+        } else if let Some(generated_outer) = outer_instances.get(outer_inst_id) {
             generated_outer.clone()
         } else {
             let outer_node = &composition.nodes[outer_inst_id];
@@ -637,6 +710,14 @@ fn warn_about_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
             );
         }
     }
+}
+
+/// Middleware to wire in after the fan-in pass instantiates the
+/// consumer that exports `chain_interface`.
+struct DeferredTopLevelInject {
+    consumer_id: u32,
+    chain_interface: Contract,
+    middlewares: IndexSet<Injection>,
 }
 
 /// Return value from rule application functions.
