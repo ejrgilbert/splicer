@@ -72,7 +72,7 @@ pub fn generate_tier1_adapter(
     })?;
 
     let bridge = WitBridge::from_cviz(arena);
-    let (funcs, layout) = extract_adapter_funcs(iface_ty, &bridge)?;
+    let (funcs, layout) = extract_adapter_funcs(target_interface, iface_ty, &bridge)?;
 
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));

@@ -24,6 +24,10 @@ use super::build::MemoryLayoutBuilder;
 pub(crate) struct AdapterFunc {
     /// The function's name in the interface.
     pub name: String,
+    /// Fully-qualified identifier passed to the middleware hooks
+    /// (`{target-interface}#{name}`). Used only for the dispatch
+    /// module's name data blob.
+    pub hook_name: String,
     /// Whether this function is `async` in the component model.
     pub is_async: bool,
     /// Parameter names, parallel to `param_type_ids`. Falls back to
@@ -70,6 +74,14 @@ pub(crate) struct AdapterFunc {
     /// needs-realloc decision — canon lower allocates memory via
     /// realloc to marshal list contents.
     pub has_lists: bool,
+}
+
+/// Build the identifier passed to the middleware's before/after hooks.
+/// Joins the interface name and function name with `#` — the Component
+/// Model's canonical separator for addressing an item within an instance
+/// (e.g. `wasi:http/incoming-handler@0.2.10#handle`).
+pub(crate) fn build_hook_name(target_interface: &str, fn_name: &str) -> String {
+    format!("{target_interface}#{fn_name}")
 }
 
 impl AdapterFunc {
@@ -259,6 +271,7 @@ fn build_wit_function_from_parts(
 /// - A sync function has a multi-value result (would need retptr
 ///   handling, not yet implemented)
 pub(crate) fn extract_adapter_funcs(
+    target_interface: &str,
     iface_ty: &InterfaceType,
     bridge: &WitBridge,
 ) -> anyhow::Result<(Vec<AdapterFunc>, MemoryLayoutBuilder)> {
@@ -271,13 +284,18 @@ pub(crate) fn extract_adapter_funcs(
         ),
     };
 
-    let total_name_bytes: u32 = inst.functions.keys().map(|n| n.len() as u32).sum();
+    let hook_names: Vec<String> = inst
+        .functions
+        .keys()
+        .map(|n| build_hook_name(target_interface, n))
+        .collect();
+    let total_name_bytes: u32 = hook_names.iter().map(|h| h.len() as u32).sum();
     let mut layout = MemoryLayoutBuilder::new(total_name_bytes);
     let mut funcs = Vec::with_capacity(inst.functions.len());
 
-    for (name, sig) in &inst.functions {
+    for ((name, sig), hook_name) in inst.functions.iter().zip(hook_names) {
         let extracted = extract_func_sig(name, sig, bridge)?;
-        let name_len = name.len() as u32;
+        let name_len = hook_name.len() as u32;
         let name_offset = layout.alloc_name(name_len);
 
         let has_result = extracted.result_type_id.is_some();
@@ -298,6 +316,7 @@ pub(crate) fn extract_adapter_funcs(
 
         funcs.push(AdapterFunc {
             name: name.clone(),
+            hook_name,
             is_async: extracted.is_async,
             param_names: extracted.param_names,
             param_type_ids: extracted.param_type_ids,
