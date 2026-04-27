@@ -14,29 +14,30 @@
 //! primitive / string / list / record / variant / option / tuple
 //! results) goes through here.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection,
-    MemoryType, Module, TypeSection, ValType,
+    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection, MemoryType,
+    Module, TypeSection, ValType,
 };
 use wit_bindgen_core::abi::lift_from_memory;
-use wit_component::{ComponentEncoder, DecodedWasm, StringEncoding, decode, embed_component_metadata};
+use wit_component::{
+    decode, embed_component_metadata, ComponentEncoder, DecodedWasm, StringEncoding,
+};
 use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
 use wit_parser::{
     Function as WitFunction, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
     SizeAlign, Type, WasmExport, WasmExportKind, WasmImport, WorldItem, WorldKey,
 };
 
+use super::abi::WasmEncoderBindgen;
+use super::indices::{DispatchIndices, FunctionIndices};
 use super::mem_layout::MemoryLayoutBuilder;
-use crate::adapter::abi::WasmEncoderBindgen;
-use crate::adapter::indices::{DispatchIndices, FunctionIndices};
 
-/// Generate the adapter component bytes via the WIT-level emit path.
-/// `target_interface` is the fully-qualified interface name
-/// (`<ns>:<pkg>/<iface>[@<ver>]`); `tier1_world_wit` is the contents
-/// of `wit/tier1/world.wit`.
-pub(crate) fn build_adapter_via_wit_component(
+/// Generate the adapter component bytes. `target_interface` is the
+/// fully-qualified interface name (`<ns>:<pkg>/<iface>[@<ver>]`);
+/// `tier1_world_wit` is the contents of `wit/tier1/world.wit`.
+pub(crate) fn build_adapter(
     target_interface: &str,
     has_before: bool,
     has_after: bool,
@@ -101,7 +102,7 @@ fn decode_input_resolve(split_bytes: &[u8]) -> Result<Resolve> {
     match decoded {
         DecodedWasm::Component(resolve, _world) => Ok(resolve),
         DecodedWasm::WitPackage(_, _) => bail!(
-            "wit_component_emit: split bytes decoded to a WIT package; \
+            "split bytes decoded to a WIT package; \
              expected a component"
         ),
     }
@@ -116,7 +117,7 @@ fn find_target_interface(resolve: &Resolve, target_interface: &str) -> Result<In
         .map(|(id, _)| id)
         .ok_or_else(|| {
             anyhow!(
-                "wit_component_emit: interface `{target_interface}` not found in \
+                "interface `{target_interface}` not found in \
                  the decoded WIT; available: {:?}",
                 resolve
                     .interfaces
@@ -138,12 +139,12 @@ fn require_supported_case(
 ) -> Result<()> {
     let iface = &resolve.interfaces[target_iface];
     if iface.functions.is_empty() {
-        bail!("wit_component_emit: interface has no functions");
+        bail!("interface has no functions");
     }
     for (name, func) in &iface.functions {
         if func.kind.resource().is_some() {
             bail!(
-                "wit_component_emit: resource-bound function `{name}` ({:?}) \
+                "resource-bound function `{name}` ({:?}) \
                  not yet handled",
                 func.kind
             );
@@ -303,10 +304,9 @@ struct AsyncRuntimeFuncs {
     event_ptr: i32,
 }
 
-/// Build the dispatch core module — phase orchestrator. `cabi_realloc`
-/// + the bump global are emitted unconditionally (matches
-/// `wit_component::dummy_module`); the ~30-byte cost is cheaper than
-/// a "does any type transitively contain a string/list?" walker.
+/// Build the dispatch core module — phase orchestrator. `cabi_realloc` + the bump global
+/// are emitted unconditionally (matches `wit_component::dummy_module`);
+/// the ~30-byte cost is cheaper than a "does any type transitively contain a string/list?" walker.
 fn build_dispatch_module(
     resolve: &Resolve,
     world_id: wit_parser::WorldId,
@@ -439,7 +439,7 @@ fn compute_func_dispatches(
                 .expect("retptr_needed → func.result is_some()");
             let size = sizes.size(result_ty).size_wasm32() as u32;
             let align = sizes.align(result_ty).align_wasm32() as u32;
-            layout.alloc_sync_result(size, align) as i32
+            layout.alloc_retptr_scratch(size, align) as i32
         });
         let task_return = is_async.then(|| {
             let (module, name, sig) =
@@ -453,7 +453,7 @@ fn compute_func_dispatches(
             is_async,
             export_sig,
             import_sig,
-            result_ty: func.result.clone(),
+            result_ty: func.result,
             task_return,
             name_offset,
             name_len: qualified_name.len() as i32,
@@ -856,13 +856,14 @@ fn emit_code_section(
     per_func: &[FuncDispatch],
     func_idx: &FuncIndices,
 ) {
-    let blocking = func_idx
-        .imp_block
-        .zip(func_idx.block_result_ptr)
-        .map(|(import_fn, result_ptr)| BlockingConfig {
-            import_fn,
-            result_ptr,
-        });
+    let blocking =
+        func_idx
+            .imp_block
+            .zip(func_idx.block_result_ptr)
+            .map(|(import_fn, result_ptr)| BlockingConfig {
+                import_fn,
+                result_ptr,
+            });
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
         if fd.is_async {
@@ -875,9 +876,7 @@ fn emit_code_section(
                 func_idx.imp_before,
                 func_idx.imp_after,
                 blocking.as_ref(),
-                func_idx
-                    .imp_task_return[i]
-                    .expect("async func must have task.return import"),
+                func_idx.imp_task_return[i].expect("async func must have task.return import"),
                 func_idx
                     .async_runtime
                     .as_ref()
@@ -1056,8 +1055,8 @@ fn emit_async_wrapper_body(
 
     // Build the load sequence BEFORE freezing locals — `lift_from_memory`
     // allocates additional scratch (variant disc, joined-payload slots, …).
-    let task_return_loads: Option<Vec<wasm_encoder::Instruction<'static>>> = tr_addr_local
-        .map(|addr_local| {
+    let task_return_loads: Option<Vec<wasm_encoder::Instruction<'static>>> =
+        tr_addr_local.map(|addr_local| {
             let result_ty = fd.result_ty.as_ref().expect("flat loads → result_ty");
             let mut bindgen = WasmEncoderBindgen::new(sizes, addr_local, &mut locals);
             lift_from_memory(resolve, &mut bindgen, (), result_ty);

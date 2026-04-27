@@ -28,11 +28,6 @@ path = "examples/demo.rs"
 name = "wac_compose"
 path = "examples/wac_compose.rs"
 
-[[example]]
-name = "wit_component_spike"
-path = "examples/wit_component_spike.rs"
-required-features = []
-
 [dependencies]
 colored = "3.1.1"
 cviz = "2.0.2"
@@ -64,11 +59,6 @@ tokio = { version = "1", features = ["rt", "macros"] }
 wac-parser = "0.10"
 wac-resolver = "0.10"
 wac-graph = "0.10"
-# Spike-only: enables the `dummy-module` feature for
-# `examples/wit_component_spike.rs`. The base `wit-component` crate is
-# pulled in via `[dependencies]` above; here we just turn on the extra
-# feature the spike needs. Drop this entire entry once the spike is gone.
-wit-component = { version = "0.247", features = ["dummy-module"] }
 
 # wirm 4.0.4 (with the bare-func-types resource map fix from
 # composablesys/wirm#335) hasn't been published yet. Override the

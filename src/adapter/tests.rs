@@ -590,10 +590,8 @@ fn gen_adapter(
         "test-mdl",
         target,
         &hook_strings,
-        Some(iface),
         tmp.path().to_str().unwrap(),
         split_path,
-        arena,
     )
     .expect("adapter generation should succeed");
     std::fs::read(&path).expect("should read generated adapter file")

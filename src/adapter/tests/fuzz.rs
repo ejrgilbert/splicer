@@ -256,10 +256,8 @@ fn fuzz_structural_shapes() {
                 "fuzz-mdl",
                 "test:fuzz/iface@1.0.0",
                 &hooks,
-                Some(&iface),
                 tmp.path().to_str().unwrap(),
                 split_path,
-                &arena,
             );
 
             match gen {

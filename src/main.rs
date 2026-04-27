@@ -119,7 +119,7 @@ fn main() -> Result<()> {
                 skip_type_check,
             })?;
 
-            print_diagnostics(&out.diagnostics, skip_type_check);
+            print_diagnostics(&out.diagnostics);
             write_and_announce(&out.wac, output_wac, |path| out.wac_compose_cmd(path))
         }
 
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
                 package_name: package,
             })?;
 
-            print_diagnostics(&out.diagnostics, false);
+            print_diagnostics(&out.diagnostics);
             write_and_announce(&out.wac, output_wac, |path| out.wac_compose_cmd(path))
         }
     }
@@ -184,7 +184,7 @@ fn write_and_announce(
 /// styling the CLI has always used. Library callers (and
 /// `splicer::splice` / `splicer::compose`) handle their own
 /// diagnostics through the returned `Vec<ContractResult>`.
-fn print_diagnostics(diagnostics: &[ContractResult], skip_type_check: bool) {
+fn print_diagnostics(diagnostics: &[ContractResult]) {
     for diag in diagnostics {
         match diag {
             ContractResult::Ok => {}
@@ -198,17 +198,14 @@ fn print_diagnostics(diagnostics: &[ContractResult], skip_type_check: bool) {
             ContractResult::Warn(msg) => {
                 eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow())
             }
-            ContractResult::Error(msg) => {
-                // splicer::splice would have returned Err already
-                // unless skip_type_check was set, so seeing one here
-                // means the caller asked us to demote it.
-                let _ = skip_type_check;
-                eprintln!(
-                    "{}: type check skipped — {}",
-                    "WARN".yellow().bold(),
-                    msg.yellow()
-                );
-            }
+            // splicer::splice would have returned Err unless
+            // skip_type_check was set; seeing an Error here means the
+            // caller asked us to demote it.
+            ContractResult::Error(msg) => eprintln!(
+                "{}: type check skipped — {}",
+                "WARN".yellow().bold(),
+                msg.yellow()
+            ),
         }
     }
 }

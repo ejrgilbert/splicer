@@ -30,7 +30,20 @@
 
 use wasm_encoder::ValType;
 
-use super::ty::{align_to_val, val_type_byte_size};
+/// Byte size of a core Wasm value type in linear memory.
+fn val_type_byte_size(vt: &ValType) -> u32 {
+    match vt {
+        ValType::I32 | ValType::F32 => 4,
+        ValType::I64 | ValType::F64 => 8,
+        ValType::V128 => 16,
+        ValType::Ref(_) => 4,
+    }
+}
+
+/// Round `offset` up to the nearest multiple of `align`.
+fn align_to_val(offset: u32, align: u32) -> u32 {
+    offset.div_ceil(align) * align
+}
 
 // ─── Slot shapes ───────────────────────────────────────────────────────────
 //
@@ -94,20 +107,11 @@ impl MemoryLayoutBuilder {
         off
     }
 
-    /// Reserve `size` bytes for an async-lowered handler's result
-    /// buffer, aligned to `align`. The canonical ABI requires the
-    /// buffer start at the result type's natural alignment (e.g. 8
-    /// for any type containing an i64/f64); without that, stores
-    /// inside the buffer trap as unaligned.
-    pub fn alloc_async_result(&mut self, size: u32, align: u32) -> u32 {
-        self.alloc_aligned(size, align)
-    }
-
-    /// Reserve `size` bytes for a sync-complex retptr buffer, aligned
-    /// to `align`. Same rule as the async buffer: the caller computes
-    /// `align` as the result type's max alignment, and
-    /// [`alloc_aligned`] rounds the cursor up before reserving.
-    pub fn alloc_sync_result(&mut self, size: u32, align: u32) -> u32 {
+    /// Reserve `size` bytes for a per-func retptr scratch buffer,
+    /// aligned to the result type's natural alignment (sourced from
+    /// `wit_parser::SizeAlign`). Misaligned buffers trap on i64/f64
+    /// stores inside the canonical-ABI lowering.
+    pub fn alloc_retptr_scratch(&mut self, size: u32, align: u32) -> u32 {
         self.alloc_aligned(size, align)
     }
 
