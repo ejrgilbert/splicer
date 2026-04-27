@@ -40,8 +40,8 @@ use wasm_encoder::{
     Alias, CanonicalFunctionSection, CanonicalOption, Component, ComponentAliasSection,
     ComponentExportKind, ComponentExportSection, ComponentImportSection, ComponentInstanceSection,
     ComponentOuterAliasKind, ComponentSectionId, ComponentTypeRef, ComponentTypeSection,
-    ComponentValType, ExportKind, InstanceSection, InstanceType, ModuleSection, PrimitiveValType,
-    RawSection,
+    ComponentValType, ExportKind, InstanceSection, InstanceType, ModuleSection,
+    NestedComponentSection, PrimitiveValType, RawSection, TypeBounds,
 };
 
 use super::dispatch::{build_dispatch_module, build_mem_module};
@@ -1176,9 +1176,61 @@ fn emit_canon_lift_phase(
 /// type exports), then emit a top-level component export pointing the
 /// `target_interface` import name at that instance.
 ///
-/// This is the final phase — no outcome state escapes.
+/// Dispatches to a shim-component path when any function name is a
+/// resource constructor / method / static — the validator rejects the
+/// direct-export approach for those because constructor and method
+/// exports require the resource to be **declared** (as SubResource) in
+/// the instance's type, not merely aliased in. The shim path emits a
+/// nested component that imports the resource as SubResource and the
+/// canon-lifted functions, then re-exports them with explicit type
+/// ascriptions referencing the shim's own SubResource — matching the
+/// pattern wit-component produces from a WIT resource declaration.
 #[allow(clippy::too_many_arguments)]
 fn emit_export_phase(
+    component: &mut Component,
+    indices: &ComponentIndices,
+    target_interface: &str,
+    funcs: &[AdapterFunc],
+    iface_ty: &InterfaceType,
+    inst_ctx: &InstTypeCtx,
+    arena: &TypeArena,
+    comp_resource_indices: &[u32],
+    comp_aliased_types: &HashMap<ValueTypeId, u32>,
+    wrapped_func_base: u32,
+) -> anyhow::Result<()> {
+    let needs_shim = funcs.iter().any(|f| {
+        f.name.starts_with("[constructor]")
+            || f.name.starts_with("[method]")
+            || f.name.starts_with("[static]")
+    });
+    if needs_shim {
+        return emit_export_phase_with_shim(
+            component,
+            indices,
+            target_interface,
+            funcs,
+            inst_ctx,
+            arena,
+            comp_resource_indices,
+            wrapped_func_base,
+        );
+    }
+    emit_export_phase_direct(
+        component,
+        indices,
+        target_interface,
+        funcs,
+        iface_ty,
+        inst_ctx,
+        comp_resource_indices,
+        comp_aliased_types,
+        wrapped_func_base,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_export_phase_direct(
     component: &mut Component,
     indices: &ComponentIndices,
     target_interface: &str,
@@ -1245,6 +1297,298 @@ fn emit_export_phase(
         );
         component.section(&exports);
     }
+}
+
+/// Map a function name to the shim's import name. wit-component-style
+/// conventions: `[constructor]X` → `import-constructor-X`, `[method]X.Y`
+/// → `import-method-X-Y`, `[static]X.Y` → `import-static-X-Y`, anything
+/// else → `import-func-<name>`.
+fn shim_import_name(fn_name: &str) -> String {
+    if let Some(rest) = fn_name.strip_prefix("[constructor]") {
+        format!("import-constructor-{rest}")
+    } else if let Some(rest) = fn_name.strip_prefix("[method]") {
+        format!("import-method-{}", rest.replace('.', "-"))
+    } else if let Some(rest) = fn_name.strip_prefix("[static]") {
+        format!("import-static-{}", rest.replace('.', "-"))
+    } else {
+        format!("import-func-{fn_name}")
+    }
+}
+
+/// Build a `ComponentValType` for a function param/result type, using
+/// only primitives + own/borrow handles. Compound types (variants,
+/// records, options, lists, …) are out of scope for the shim path
+/// today and bail with an explicit error so callers know they need to
+/// extend the shim emitter rather than silently produce a broken
+/// component.
+fn shim_cv(
+    id: ValueTypeId,
+    arena: &TypeArena,
+    own_by_vid: &HashMap<ValueTypeId, u32>,
+    borrow_by_vid: &HashMap<ValueTypeId, u32>,
+) -> anyhow::Result<ComponentValType> {
+    use crate::adapter::build::ty::prim_cv;
+    let vt = arena.lookup_val(id);
+    if let Some(cv) = prim_cv(vt) {
+        return Ok(cv);
+    }
+    match vt {
+        ValueType::Resource(_) => own_by_vid
+            .get(&id)
+            .copied()
+            .map(ComponentValType::Type)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shim emitter: resource {id:?} has no own<> entry — \
+                     handle the borrow case if a borrow param is reaching the shim"
+                )
+            }),
+        // ValueType::AsyncHandle and compound types fall through to the
+        // bail below. If a real workload needs them in a constructor /
+        // method export, extend `shim_cv` (and the cache logic in the
+        // shim builder) to declare them inline.
+        _ => anyhow::bail!(
+            "shim emitter: unsupported type in resource-export function signature: \
+             {vt:?}. Compound types in constructor/method exports aren't yet \
+             handled by the shim path; extend `shim_cv` and the type-emit loop \
+             in `emit_export_phase_with_shim` if you hit this."
+        ),
+    }
+}
+
+/// Helper: detect a borrow param. Borrow shows up as the param's
+/// **inferred** value type (the bridge's WIT model uses `Resource` for
+/// both own and borrow at the value layer; the borrow-vs-own distinction
+/// rides on the function-signature side via the `is_borrow` flag we
+/// carry in `AdapterFunc::param_borrows`). For now we conservatively
+/// treat all resource params as own. If a constructor/method
+/// surfaces with a borrow param, extend this here.
+#[allow(dead_code)]
+fn shim_param_is_borrow(_func: &AdapterFunc, _i: usize) -> bool {
+    false
+}
+
+/// Shim-component path. See [`emit_export_phase`] for the high-level
+/// rationale.
+#[allow(clippy::too_many_arguments)]
+fn emit_export_phase_with_shim(
+    component: &mut Component,
+    indices: &ComponentIndices,
+    target_interface: &str,
+    funcs: &[AdapterFunc],
+    inst_ctx: &InstTypeCtx,
+    arena: &TypeArena,
+    comp_resource_indices: &[u32],
+    wrapped_func_base: u32,
+) -> anyhow::Result<()> {
+    // ── A. Build the shim component ──────────────────────────────────
+    let shim = build_resource_shim(funcs, inst_ctx, arena)?;
+
+    // ── B. Embed the shim as a nested component (idx 0). ─────────────
+    component.section(&NestedComponentSection(&shim));
+    let shim_comp_idx: u32 = 0;
+
+    // ── C. Build instantiation args. The shim's import names are
+    //       deterministic (see `shim_import_name`); the parent provides
+    //       the corresponding resource types and canon-lifted funcs.
+    let mut args: Vec<(String, ComponentExportKind, u32)> = Vec::new();
+    for (i, (_vid, name, _res_local, _own_local)) in
+        inst_ctx.resource_exports.iter().enumerate()
+    {
+        args.push((
+            format!("import-type-{name}"),
+            ComponentExportKind::Type,
+            comp_resource_indices[i],
+        ));
+    }
+    for (i, func) in funcs.iter().enumerate() {
+        args.push((
+            shim_import_name(&func.name),
+            ComponentExportKind::Func,
+            wrapped_func_base + i as u32,
+        ));
+    }
+
+    // ── D. Instantiate the shim. The result is a new instance whose
+    //       inferred type matches the shim's exports — properly
+    //       declaring the resource as SubResource so the constructor /
+    //       method exports validate.
+    let exp_inst_idx = indices.inst;
+    {
+        let mut comp_instances = ComponentInstanceSection::new();
+        comp_instances.instantiate(
+            shim_comp_idx,
+            args.iter().map(|(n, k, i)| (n.as_str(), *k, *i)),
+        );
+        component.section(&comp_instances);
+    }
+
+    // ── E. Export the instantiated instance under the target name. ───
+    {
+        let mut exports = ComponentExportSection::new();
+        exports.export(
+            target_interface,
+            ComponentExportKind::Instance,
+            exp_inst_idx,
+            None,
+        );
+        component.section(&exports);
+    }
+    Ok(())
+}
+
+/// Construct the shim's nested `Component`. Mirrors what wit-component
+/// emits for a WIT interface with a resource constructor: imports the
+/// resource(s) as SubResource and each canon-lifted function, then
+/// re-exports the resources (creating new local aliases) and the
+/// functions with explicit type ascriptions referencing those local
+/// aliases — so the inferred instance type declares the resources
+/// alongside the constructor / method funcs that use them.
+fn build_resource_shim(
+    funcs: &[AdapterFunc],
+    inst_ctx: &InstTypeCtx,
+    arena: &TypeArena,
+) -> anyhow::Result<Component> {
+    let mut shim = Component::new();
+
+    // Type-index allocator local to the shim.
+    let mut next_ty: u32 = 0;
+    let mut next_func: u32 = 0;
+
+    // ── Imports section: resources as SubResource ────────────────────
+    let mut imports = ComponentImportSection::new();
+    let mut imp_resource_idx: HashMap<ValueTypeId, u32> = HashMap::new();
+    for (vid, name, _res_local, _own_local) in &inst_ctx.resource_exports {
+        imports.import(
+            &format!("import-type-{name}"),
+            ComponentTypeRef::Type(TypeBounds::SubResource),
+        );
+        imp_resource_idx.insert(*vid, next_ty);
+        next_ty += 1;
+    }
+    shim.section(&imports);
+
+    // ── Types section: own<imp> + borrow<imp> for each resource, then
+    //    function types using those. Tracked by vid for shim_cv lookups.
+    let mut imp_own_by_vid: HashMap<ValueTypeId, u32> = HashMap::new();
+    let mut imp_borrow_by_vid: HashMap<ValueTypeId, u32> = HashMap::new();
+    let mut imp_types = ComponentTypeSection::new();
+    for (vid, _name, _, _) in &inst_ctx.resource_exports {
+        let imp_idx = *imp_resource_idx.get(vid).expect("imp resource idx");
+        imp_types.defined_type().own(imp_idx);
+        imp_own_by_vid.insert(*vid, next_ty);
+        next_ty += 1;
+        imp_types.defined_type().borrow(imp_idx);
+        imp_borrow_by_vid.insert(*vid, next_ty);
+        next_ty += 1;
+    }
+    // Per-function import-side types.
+    let mut imp_func_type_idx: Vec<u32> = Vec::with_capacity(funcs.len());
+    for func in funcs {
+        let mut params: Vec<(String, ComponentValType)> = Vec::new();
+        for (n, &id) in func.param_names.iter().zip(func.param_type_ids.iter()) {
+            let cv = shim_cv(id, arena, &imp_own_by_vid, &imp_borrow_by_vid)?;
+            params.push((n.clone(), cv));
+        }
+        let result = func
+            .result_type_id
+            .map(|id| shim_cv(id, arena, &imp_own_by_vid, &imp_borrow_by_vid))
+            .transpose()?;
+        let mut fty = imp_types.function();
+        if func.is_async {
+            fty.async_(true);
+        }
+        fty.params(params.iter().map(|(n, cv)| (n.as_str(), *cv)))
+            .result(result);
+        imp_func_type_idx.push(next_ty);
+        next_ty += 1;
+    }
+    shim.section(&imp_types);
+
+    // ── Imports section: functions, using the types declared above. ──
+    let mut func_imports = ComponentImportSection::new();
+    for (i, func) in funcs.iter().enumerate() {
+        func_imports.import(
+            &shim_import_name(&func.name),
+            ComponentTypeRef::Func(imp_func_type_idx[i]),
+        );
+        next_func += 1;
+    }
+    shim.section(&func_imports);
+
+    // ── Exports section #1: re-export each resource. Sectioning this
+    //    BEFORE the export-side types section is what allocates the
+    //    new type aliases at the shim's next-available type indices,
+    //    so the subsequent `own<exp>` / `borrow<exp>` types and
+    //    function-export ascriptions correctly reference the alias —
+    //    not their own slot (the self-reference bug we hit when these
+    //    sections were emitted in the opposite order).
+    let mut res_exports = ComponentExportSection::new();
+    let mut exp_resource_idx: HashMap<ValueTypeId, u32> = HashMap::new();
+    for (vid, name, _, _) in &inst_ctx.resource_exports {
+        let imp_idx = *imp_resource_idx.get(vid).expect("imp resource idx");
+        res_exports.export(name, ComponentExportKind::Type, imp_idx, None);
+        exp_resource_idx.insert(*vid, next_ty);
+        next_ty += 1;
+    }
+    shim.section(&res_exports);
+
+    // ── Types section: own<exp> + borrow<exp> + new function types
+    //    referencing exported resource aliases.
+    let mut exp_own_by_vid: HashMap<ValueTypeId, u32> = HashMap::new();
+    let mut exp_borrow_by_vid: HashMap<ValueTypeId, u32> = HashMap::new();
+    let mut exp_types = ComponentTypeSection::new();
+    for (vid, _, _, _) in &inst_ctx.resource_exports {
+        let exp_idx = *exp_resource_idx.get(vid).expect("exp resource idx");
+        exp_types.defined_type().own(exp_idx);
+        exp_own_by_vid.insert(*vid, next_ty);
+        next_ty += 1;
+        exp_types.defined_type().borrow(exp_idx);
+        exp_borrow_by_vid.insert(*vid, next_ty);
+        next_ty += 1;
+    }
+    let mut exp_func_type_idx: Vec<u32> = Vec::with_capacity(funcs.len());
+    for func in funcs {
+        let mut params: Vec<(String, ComponentValType)> = Vec::new();
+        for (n, &id) in func.param_names.iter().zip(func.param_type_ids.iter()) {
+            let cv = shim_cv(id, arena, &exp_own_by_vid, &exp_borrow_by_vid)?;
+            params.push((n.clone(), cv));
+        }
+        let result = func
+            .result_type_id
+            .map(|id| shim_cv(id, arena, &exp_own_by_vid, &exp_borrow_by_vid))
+            .transpose()?;
+        let mut fty = exp_types.function();
+        if func.is_async {
+            fty.async_(true);
+        }
+        fty.params(params.iter().map(|(n, cv)| (n.as_str(), *cv)))
+            .result(result);
+        exp_func_type_idx.push(next_ty);
+        next_ty += 1;
+    }
+    shim.section(&exp_types);
+
+    // ── Exports section #2: each function with an explicit type
+    //    ascription. The `Some(ComponentTypeRef::Func(N))` encodes the
+    //    `(export "X" (func K) (func (type N)))` form wit-component
+    //    uses — without it, the validator infers the instance type
+    //    from the function's lifted type and rejects constructor /
+    //    method exports whose underlying types reference
+    //    component-scope-aliased resources.
+    let mut func_exports = ComponentExportSection::new();
+    for (i, func) in funcs.iter().enumerate() {
+        func_exports.export(
+            &func.name,
+            ComponentExportKind::Func,
+            i as u32, // shim-local func index, contiguous from 0
+            Some(ComponentTypeRef::Func(exp_func_type_idx[i])),
+        );
+    }
+    shim.section(&func_exports);
+    let _ = next_func;
+
+    Ok(shim)
 }
 
 /// State produced by [`emit_handler_resource_types`] for use by the
@@ -1511,10 +1855,11 @@ pub(crate) fn build_adapter_bytes(
         funcs,
         iface_ty,
         &inst_ctx,
+        arena,
         &comp_resource_indices,
         &comp_aliased_types,
         wrapped_func_base,
-    );
+    )?;
 
     Ok(component.finish())
 }
