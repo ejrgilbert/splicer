@@ -22,14 +22,16 @@ use std::path::PathBuf;
 use wit_component::{ComponentEncoder, StringEncoding, dummy_module, embed_component_metadata};
 use wit_parser::{LiftLowerAbi, ManglingAndAbi, Resolve};
 
-/// Spike WIT — adds a string param + string result on top of the
-/// primitive case so we can read off what cabi_realloc / cabi_post
-/// shape ComponentEncoder demands when strings are present.
+/// Spike WIT — async case to discover the canonical-ABI contract
+/// wit-component expects from an async-export wrapper. Captures the
+/// simplest async signature (one primitive param + primitive result)
+/// so we can read off the callback / task.return shape without
+/// compound-type noise.
 const SPIKE_WIT: &str = r#"
 package spike:demo;
 
 interface api {
-    echo: func(input: string) -> string;
+    foo: async func(x: u32) -> u32;
 }
 
 world adapter {
@@ -88,7 +90,7 @@ fn main() -> Result<()> {
     let mut core_module = dummy_module(
         &resolve,
         world_id,
-        ManglingAndAbi::Legacy(LiftLowerAbi::Sync),
+        ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
     );
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
         .context("embed_component_metadata")?;

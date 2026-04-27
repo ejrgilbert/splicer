@@ -23,23 +23,25 @@
 //! relevant component bytes are extracted as `split_bytes`, adapter
 //! generation runs entirely on `wit-parser` + `wit-component`.
 //!
-//! Today the emitter handles only sync funcs whose result is either
-//! void, a single direct flat value, or retptr-shaped (string / list /
-//! complex compound). Async funcs and resource constructors / methods
-//! / statics fall through to the legacy emit path until those
-//! widenings land.
+//! Today the emitter handles only sync target funcs whose result is
+//! either void, a single direct flat value, or retptr-shaped (string /
+//! list / complex compound). Async target funcs and resource
+//! constructors / methods / statics fall through to the legacy emit
+//! path until those widenings land. The tier-1 hooks themselves are
+//! always async (per `wit/tier1/world.wit`), so the dispatch module
+//! always emits the `[async-lower]` import shape and a wait loop.
 
 use anyhow::{Context, Result, anyhow, bail};
-use std::collections::HashSet;
 use wasm_encoder::{
-    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection, MemoryType,
-    Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection,
+    MemoryType, Module, TypeSection, ValType,
 };
 use wit_component::{ComponentEncoder, DecodedWasm, StringEncoding, decode, embed_component_metadata};
 use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
 use wit_parser::{
-    Function as WitFunction, InterfaceId, Resolve, Type, TypeDefKind, TypeId,
+    Function as WitFunction, InterfaceId, LiftLowerAbi, ManglingAndAbi, Resolve, WasmImport,
+    WorldItem,
 };
 
 use super::mem_layout::MemoryLayoutBuilder;
@@ -80,8 +82,14 @@ pub(crate) fn build_adapter_via_wit_component(
         .select_world(&[world_pkg], Some("adapter"))
         .context("select adapter world")?;
 
-    let mut core_module =
-        build_dispatch_module(&resolve, target_iface, target_interface, has_before, has_after);
+    let mut core_module = build_dispatch_module(
+        &resolve,
+        world_id,
+        target_iface,
+        target_interface,
+        has_before,
+        has_after,
+    );
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
         .context("embed_component_metadata")?;
 
@@ -128,17 +136,14 @@ fn find_target_interface(resolve: &Resolve, target_interface: &str) -> Result<In
 }
 
 /// Bail out of the new path for any case it doesn't yet handle. Each
-/// widening step (async, resource constructors / methods / statics)
-/// removes one of these constraints.
+/// widening step (async target funcs, resource constructors / methods
+/// / statics) removes one of these constraints.
 fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Result<()> {
     let iface = &resolve.interfaces[target_iface];
     if iface.functions.is_empty() {
         bail!("wit_component_emit: interface has no functions");
     }
     for (name, func) in &iface.functions {
-        if func.kind.is_async() {
-            bail!("wit_component_emit: async function `{name}` not yet handled");
-        }
         if func.kind.resource().is_some() {
             // Constructors, methods, and statics use a different
             // dispatch shape (host-side resource rep, special export
@@ -147,6 +152,16 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
                 "wit_component_emit: resource-bound function `{name}` ({:?}) \
                  not yet handled",
                 func.kind
+            );
+        }
+        if func.kind.is_async() {
+            // Async target funcs need [async-lift-stackful] export
+            // names + per-func task.return imports + retptr-form
+            // handler call lifted via `lift_from_memory`. Tracked as
+            // the next widening for this path.
+            bail!(
+                "wit_component_emit: async target function `{name}` not yet \
+                 handled by the new emit path"
             );
         }
     }
@@ -176,61 +191,49 @@ fn synthesize_adapter_world_wit(
 
 // ─── Dispatch core module ──────────────────────────────────────────
 
-/// Per-function dispatch shape, built from a wit-parser [`WasmSignature`]
-/// plus the linear-memory layout. Computed by [`compute_func_dispatches`]
-/// before any sections are emitted, so each section emitter knows the
-/// indices and offsets it needs without re-deriving them.
+/// Per-function dispatch shape: the canonical-ABI signatures from
+/// [`Resolve::wasm_signature`] plus a few derived offsets the section
+/// emitters need. Stored verbatim so the type / import / wrapper-body
+/// phases all read from the same authoritative `WasmSignature`
+/// instances rather than re-categorizing them into a parallel enum.
 struct FuncDispatch {
-    /// Function name — used for the import name, the export-side
-    /// `<iface>#<name>` mangled name, and the hook-call name argument.
+    /// Function name — used for the import field name and the
+    /// `<iface>#<name>` mangled export name.
     name: String,
-    /// Wrapper-export param signature in core wasm types — the
-    /// canonical ABI flat lowering of every WIT param, concatenated.
-    /// Mirrors `WasmSignature::params`.
-    param_flats: Vec<ValType>,
-    /// Result lowering. Drives both wrapper-export and import-handler
-    /// signatures.
-    result: ResultLowering,
-    /// Memory offset of this func's name bytes, for hook calls.
+    /// `wasm_signature(GuestExport, func)` — drives the wrapper export
+    /// type slot and the wrapper body's param-pushing loop.
+    export_sig: WasmSignature,
+    /// `wasm_signature(GuestImport, func)` — drives the handler import
+    /// type slot.
+    import_sig: WasmSignature,
+    /// Memory offset of this func's hook-call name bytes (the
+    /// fully-qualified `<iface>#<name>` string the middleware sees).
     name_offset: i32,
-    /// Length of this func's name in bytes.
+    /// Length of this func's hook-call name in bytes.
     name_len: i32,
-    /// Memory offset of this func's retptr scratch buffer. Set only
-    /// when [`ResultLowering::Retptr`].
+    /// Memory offset of this func's retptr scratch buffer. Set iff
+    /// `export_sig.retptr` (i.e. the result is multi-flat / string /
+    /// list / compound).
     retptr_offset: Option<i32>,
 }
 
-#[derive(Clone)]
-enum ResultLowering {
-    /// Function returns nothing.
-    Void,
-    /// Function returns one flat value directly (e.g. `u32`, `s64`).
-    /// The contained `ValType` IS the wrapper's lowered result type.
-    Direct(ValType),
-    /// Function's result has 2+ flat values (string, list, complex
-    /// compound). The wrapper's lowered result is a single `i32`
-    /// retptr; the import takes an extra `i32` retptr param and writes
-    /// the actual flat values to memory at that address.
-    Retptr,
-}
-
-impl ResultLowering {
-    /// Derive from a wit-parser [`WasmSignature`] + the function's
-    /// declared result type.
-    fn from_signature(func: &WitFunction, sig: &WasmSignature) -> Self {
-        match (func.result.is_some(), sig.retptr) {
-            (false, _) => ResultLowering::Void,
-            (true, true) => ResultLowering::Retptr,
-            (true, false) => {
-                debug_assert_eq!(
-                    sig.results.len(),
-                    1,
-                    "non-retptr result should flatten to exactly one core value"
-                );
-                ResultLowering::Direct(wasm_type_to_val(sig.results[0]))
-            }
+impl FuncDispatch {
+    /// Single flat result type for the Direct case (single non-retptr
+    /// value). `None` for void or retptr-shaped results.
+    fn direct_result(&self) -> Option<ValType> {
+        if !self.export_sig.retptr && self.export_sig.results.len() == 1 {
+            Some(wasm_type_to_val(self.export_sig.results[0]))
+        } else {
+            None
         }
     }
+}
+
+/// Convert a slice of wit-parser [`WasmType`]s to a `Vec<ValType>` for
+/// `wasm-encoder` consumption. Used everywhere a section emitter feeds
+/// a [`WasmSignature`] into a [`TypeSection`] / [`Function`] sig.
+fn val_types(types: &[WasmType]) -> Vec<ValType> {
+    types.iter().copied().map(wasm_type_to_val).collect()
 }
 
 /// Bytes of scratch memory reserved per function that returns a
@@ -255,10 +258,31 @@ struct TypeIndices {
     handler_ty: Vec<u32>,
     /// Per-func exported-wrapper signature.
     wrapper_ty: Vec<u32>,
+    /// Async-lowered hook signature: `(ptr, len) -> packed_status`.
+    /// Used by both `before-call` and `after-call`.
     hook_ty: u32,
     init_ty: u32,
     cabi_post_ty: u32,
     cabi_realloc_ty: u32,
+    /// Type indices for the async-runtime builtins. Populated only
+    /// when at least one tier-1 hook is active.
+    async_runtime: Option<AsyncRuntimeTypes>,
+}
+
+/// Type indices for the canon-async runtime builtins imported from
+/// `$root` (waitable / subtask intrinsics). Reserved as a contiguous
+/// block right after the per-func types so the import section can
+/// reference them in declaration order.
+struct AsyncRuntimeTypes {
+    /// `() -> i32` — `[waitable-set-new]`.
+    waitable_new_ty: u32,
+    /// `(i32, i32) -> ()` — `[waitable-join]`.
+    waitable_join_ty: u32,
+    /// `(i32, i32) -> i32` — `[waitable-set-wait]`.
+    waitable_wait_ty: u32,
+    /// `(i32) -> ()` — shared by `[waitable-set-drop]` and
+    /// `[subtask-drop]`.
+    void_i32_ty: u32,
 }
 
 /// Function-index allocations across the core module's combined
@@ -275,13 +299,36 @@ struct FuncIndices {
     cabi_post: Vec<Option<u32>>,
     /// `Some` iff at least one string/list is in scope.
     cabi_realloc: Option<u32>,
+    /// Async-runtime builtin func indices + the event-record offset
+    /// the wait loop writes into. `Some` iff any hook is active.
+    async_runtime: Option<AsyncRuntimeFuncs>,
+}
+
+/// Function indices and scratch offset for the async-runtime builtins.
+/// Captured once at import time so [`emit_wait_loop`] doesn't need to
+/// re-derive them per wrapper.
+struct AsyncRuntimeFuncs {
+    waitable_new: u32,
+    waitable_join: u32,
+    waitable_wait: u32,
+    waitable_drop: u32,
+    subtask_drop: u32,
+    /// Memory offset of the event-record slot
+    /// `[waitable-set-wait]` writes its completion event into.
+    event_ptr: i32,
 }
 
 /// Build the dispatch core module. Allocations and offsets flow
 /// through [`MemoryLayoutBuilder`], [`DispatchIndices`], and
 /// [`FunctionIndices`]; this function is purely a phase orchestrator.
+///
+/// `cabi_realloc` + the bump global are emitted unconditionally —
+/// `wit_component::dummy_module` does the same, and the per-call cost
+/// (~30 bytes) is far cheaper than maintaining a "does any param /
+/// result transitively contain a string or list?" walker.
 fn build_dispatch_module(
     resolve: &Resolve,
+    world_id: wit_parser::WorldId,
     target_iface: InterfaceId,
     target_interface_name: &str,
     has_before: bool,
@@ -291,32 +338,31 @@ fn build_dispatch_module(
         .functions
         .values()
         .collect();
-    let needs_realloc = funcs
-        .iter()
-        .any(|f| function_uses_caller_alloc(resolve, f));
-    let (per_func, name_blob, bump_start) = compute_func_dispatches(resolve, &funcs);
+    // Tier-1 hooks are always async per `wit/tier1/world.wit`, so any
+    // active hook means we need the canon-async runtime builtins.
+    let needs_async_runtime = has_before || has_after;
+    let (per_func, name_blob, event_ptr, bump_start) = compute_func_dispatches(
+        resolve,
+        target_interface_name,
+        &funcs,
+        needs_async_runtime,
+    );
+    let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after);
     let mut idx = DispatchIndices::new();
 
     let mut module = Module::new();
-    let type_idx = emit_type_section(&mut module, &mut idx, &per_func);
+    let type_idx = emit_type_section(&mut module, &mut idx, &per_func, &hook_imports);
     let func_idx = emit_imports_section(
         &mut module,
         &mut idx,
         target_interface_name,
         &per_func,
         &type_idx,
-        has_before,
-        has_after,
+        &hook_imports,
+        event_ptr,
     );
-    let func_idx = emit_function_section(
-        &mut module,
-        &mut idx,
-        &per_func,
-        &type_idx,
-        func_idx,
-        needs_realloc,
-    );
-    emit_memory_and_globals(&mut module, bump_start, needs_realloc);
+    let func_idx = emit_function_section(&mut module, &mut idx, &per_func, &type_idx, func_idx);
+    emit_memory_and_globals(&mut module, bump_start);
     emit_export_section(&mut module, target_interface_name, &per_func, &func_idx);
     emit_code_section(&mut module, &per_func, &func_idx);
     emit_data_section(&mut module, &name_blob);
@@ -325,40 +371,54 @@ fn build_dispatch_module(
 }
 
 /// Phase 1 — derive per-func dispatch shapes, collect name bytes, and
-/// reserve memory slots for any retptr-shaped result. Each
-/// [`FuncDispatch`] reads its lowering from
-/// [`Resolve::wasm_signature`] in the [`AbiVariant::GuestExport`]
-/// flavor — the wrapper IS the export-side guest function from
-/// wit-component's perspective.
+/// reserve memory slots for any retptr-shaped result + the async-event
+/// record (when hooks are active). Both per-func sigs come from
+/// [`Resolve::wasm_signature`] (no parallel categorization).
+///
+/// The "name" bytes the data segment carries are the fully-qualified
+/// `<iface>#<func>` form. That's the string the middleware sees as
+/// the hook's `name: string` argument; matching the legacy emit
+/// path's contract keeps existing tier-1 middlewares working
+/// unchanged. `event_ptr` is `Some` iff `needs_async_runtime`, so the
+/// caller can pass it straight into [`AsyncRuntimeFuncs::event_ptr`].
 fn compute_func_dispatches(
     resolve: &Resolve,
+    target_interface_name: &str,
     funcs: &[&WitFunction],
-) -> (Vec<FuncDispatch>, Vec<u8>, u32) {
-    let total_name_bytes: u32 = funcs.iter().map(|f| f.name.len() as u32).sum();
+    needs_async_runtime: bool,
+) -> (Vec<FuncDispatch>, Vec<u8>, Option<i32>, u32) {
+    let qualified_names: Vec<String> = funcs
+        .iter()
+        .map(|f| format!("{target_interface_name}#{}", f.name))
+        .collect();
+    let total_name_bytes: u32 = qualified_names.iter().map(|n| n.len() as u32).sum();
     let mut layout = MemoryLayoutBuilder::new(total_name_bytes);
     let mut name_blob: Vec<u8> = Vec::with_capacity(total_name_bytes as usize);
     let mut per_func: Vec<FuncDispatch> = Vec::with_capacity(funcs.len());
 
-    for func in funcs {
-        let sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
-        let name_offset = layout.alloc_name(func.name.len() as u32) as i32;
-        name_blob.extend_from_slice(func.name.as_bytes());
-        let result = ResultLowering::from_signature(func, &sig);
-        let retptr_offset = matches!(result, ResultLowering::Retptr).then(|| {
+    for (func, qualified_name) in funcs.iter().zip(qualified_names.iter()) {
+        let export_sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
+        let import_sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
+        let name_offset = layout.alloc_name(qualified_name.len() as u32) as i32;
+        name_blob.extend_from_slice(qualified_name.as_bytes());
+        let retptr_offset = export_sig.retptr.then(|| {
             layout.alloc_sync_result(RETPTR_SCRATCH_BYTES, RETPTR_SCRATCH_ALIGN) as i32
         });
-        let param_flats: Vec<ValType> = sig.params.iter().copied().map(wasm_type_to_val).collect();
         per_func.push(FuncDispatch {
             name: func.name.clone(),
-            param_flats,
-            result,
+            export_sig,
+            import_sig,
             name_offset,
-            name_len: func.name.len() as i32,
+            name_len: qualified_name.len() as i32,
             retptr_offset,
         });
     }
+    // The event slot must come AFTER per-func name bytes / retptr
+    // buffers in the post-name region — it's the same single-cursor
+    // ordering the legacy path uses.
+    let event_ptr = needs_async_runtime.then(|| layout.alloc_event_slot() as i32);
     let bump_start = layout.finish_as_bump_start();
-    (per_func, name_blob, bump_start)
+    (per_func, name_blob, event_ptr, bump_start)
 }
 
 /// Map wit-parser's [`WasmType`] to wasm-encoder's [`ValType`]. Pointer
@@ -373,92 +433,118 @@ fn wasm_type_to_val(wt: WasmType) -> ValType {
     }
 }
 
-/// Whether any param or result of `func` carries a type whose
-/// canonical-ABI lowering goes through caller-allocated linear memory
-/// (currently `string` and `list<_>`). Drives whether the dispatch
-/// module needs to export `cabi_realloc` + the bump-pointer global.
-fn function_uses_caller_alloc(resolve: &Resolve, func: &WitFunction) -> bool {
-    let mut seen = HashSet::new();
-    for param in &func.params {
-        if type_uses_caller_alloc(resolve, &param.ty, &mut seen) {
-            return true;
-        }
-    }
-    if let Some(ty) = &func.result {
-        if type_uses_caller_alloc(resolve, ty, &mut seen) {
-            return true;
-        }
-    }
-    false
+/// One tier-1 hook import resolved against the [`Resolve`]: the
+/// canonical-ABI `(module, name)` pair from
+/// [`Resolve::wasm_import_name`] and the [`WasmSignature`] from
+/// [`Resolve::wasm_signature`] under [`AbiVariant::GuestImportAsync`].
+/// Captured once at the entry to [`build_dispatch_module`] so the
+/// type / import phases each get the values straight rather than
+/// hardcoding `"[async-lower]before-call"` and `(i32,i32) -> i32`.
+struct HookImport {
+    module: String,
+    name: String,
+    sig: WasmSignature,
 }
 
-/// Recursive helper for [`function_uses_caller_alloc`]. Returns true
-/// when the type at `ty` is itself caller-allocated, OR contains one
-/// (e.g. `record { name: string }`, `list<list<u32>>`).
-fn type_uses_caller_alloc(resolve: &Resolve, ty: &Type, seen: &mut HashSet<TypeId>) -> bool {
-    match ty {
-        Type::String => true,
-        Type::Id(id) => {
-            if !seen.insert(*id) {
-                return false;
+/// Resolved hook imports for the active tier-1 hooks. `before` /
+/// `after` are populated iff the corresponding hook is active.
+struct HookImports {
+    before: Option<HookImport>,
+    after: Option<HookImport>,
+}
+
+impl HookImports {
+    fn any(&self) -> bool {
+        self.before.is_some() || self.after.is_some()
+    }
+}
+
+/// Look up the active tier-1 hook interfaces in `resolve` and produce
+/// the canonical-ABI core import names + signatures via
+/// [`Resolve::wasm_import_name`] / [`Resolve::wasm_signature`].
+///
+/// Why go through wit-parser instead of hardcoding `"[async-lower]<fn>"`:
+/// the `[async-lower]` prefix and the `(i32,i32) -> i32` shape are
+/// wit-component contract — sourcing both from the resolve means a
+/// future contract bump (or a `wit/tier1/world.wit` signature change)
+/// can't silently desync the dispatch module.
+fn collect_hook_imports(
+    resolve: &Resolve,
+    world_id: wit_parser::WorldId,
+    has_before: bool,
+    has_after: bool,
+) -> HookImports {
+    let world = &resolve.worlds[world_id];
+    let resolve_one = |iface_name: &str| -> Option<HookImport> {
+        world.imports.iter().find_map(|(key, item)| {
+            let WorldItem::Interface { id, .. } = item else {
+                return None;
+            };
+            if resolve.id_of(*id).as_deref() != Some(iface_name) {
+                return None;
             }
-            let td = &resolve.types[*id];
-            match &td.kind {
-                TypeDefKind::List(_) | TypeDefKind::FixedLengthList(_, _) => true,
-                TypeDefKind::Type(inner) => type_uses_caller_alloc(resolve, inner, seen),
-                TypeDefKind::Option(inner) => type_uses_caller_alloc(resolve, inner, seen),
-                TypeDefKind::Record(r) => r
-                    .fields
-                    .iter()
-                    .any(|f| type_uses_caller_alloc(resolve, &f.ty, seen)),
-                TypeDefKind::Tuple(t) => t
-                    .types
-                    .iter()
-                    .any(|t| type_uses_caller_alloc(resolve, t, seen)),
-                TypeDefKind::Variant(v) => v.cases.iter().any(|c| {
-                    c.ty.as_ref()
-                        .map(|t| type_uses_caller_alloc(resolve, t, seen))
-                        .unwrap_or(false)
-                }),
-                TypeDefKind::Result(r) => {
-                    r.ok.as_ref()
-                        .map(|t| type_uses_caller_alloc(resolve, t, seen))
-                        .unwrap_or(false)
-                        || r.err
-                            .as_ref()
-                            .map(|t| type_uses_caller_alloc(resolve, t, seen))
-                            .unwrap_or(false)
-                }
-                _ => false,
-            }
-        }
-        _ => false,
+            // Tier-1 interfaces have exactly one function each.
+            let func = resolve.interfaces[*id].functions.values().next()?;
+            let (module, name) = resolve.wasm_import_name(
+                ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
+                WasmImport::Func {
+                    interface: Some(key),
+                    func,
+                },
+            );
+            let sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
+            Some(HookImport { module, name, sig })
+        })
+    };
+    HookImports {
+        before: has_before
+            .then(|| resolve_one("splicer:tier1/before@0.1.0"))
+            .flatten(),
+        after: has_after
+            .then(|| resolve_one("splicer:tier1/after@0.1.0"))
+            .flatten(),
     }
 }
 
 /// Phase 2 — emit the type section. Allocates per-func handler-import
-/// types, per-func wrapper-export types, and the four singletons
-/// (hook, init, cabi_post, cabi_realloc).
+/// types, per-func wrapper-export types, the four singletons (hook,
+/// init, cabi_post, cabi_realloc), and — when async hooks are active
+/// — the canon-async runtime builtin types.
 fn emit_type_section(
     module: &mut Module,
     idx: &mut DispatchIndices,
     per_func: &[FuncDispatch],
+    hook_imports: &HookImports,
 ) -> TypeIndices {
     let mut types = TypeSection::new();
     let mut handler_ty: Vec<u32> = Vec::with_capacity(per_func.len());
     let mut wrapper_ty: Vec<u32> = Vec::with_capacity(per_func.len());
 
     for fd in per_func {
-        let (handler_params, handler_result) = handler_signature(fd);
-        types.ty().function(handler_params, handler_result);
+        types.ty().function(
+            val_types(&fd.import_sig.params),
+            val_types(&fd.import_sig.results),
+        );
         handler_ty.push(idx.alloc_ty());
-
-        let (wrapper_params, wrapper_result) = wrapper_signature(fd);
-        types.ty().function(wrapper_params, wrapper_result);
+        types.ty().function(
+            val_types(&fd.export_sig.params),
+            val_types(&fd.export_sig.results),
+        );
         wrapper_ty.push(idx.alloc_ty());
     }
 
-    types.ty().function([ValType::I32, ValType::I32], []);
+    // Hook signature — sourced from the WIT (both hooks share the
+    // same `async func(name: string)` shape, so the first available
+    // sig wins; `before` first, then `after`). Without a hook
+    // active, nothing references this slot, so it falls back to a
+    // dummy `() -> ()`.
+    let hook_sig = hook_imports
+        .before
+        .as_ref()
+        .or(hook_imports.after.as_ref())
+        .map(|h| (val_types(&h.sig.params), val_types(&h.sig.results)))
+        .unwrap_or_else(|| (vec![], vec![]));
+    types.ty().function(hook_sig.0, hook_sig.1);
     let hook_ty = idx.alloc_ty();
     types.ty().function([], []);
     let init_ty = idx.alloc_ty();
@@ -470,6 +556,25 @@ fn emit_type_section(
     );
     let cabi_realloc_ty = idx.alloc_ty();
 
+    let async_runtime = hook_imports.any().then(|| {
+        types.ty().function([], [ValType::I32]);
+        let waitable_new_ty = idx.alloc_ty();
+        types.ty().function([ValType::I32, ValType::I32], []);
+        let waitable_join_ty = idx.alloc_ty();
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+        let waitable_wait_ty = idx.alloc_ty();
+        types.ty().function([ValType::I32], []);
+        let void_i32_ty = idx.alloc_ty();
+        AsyncRuntimeTypes {
+            waitable_new_ty,
+            waitable_join_ty,
+            waitable_wait_ty,
+            void_i32_ty,
+        }
+    });
+
     module.section(&types);
     TypeIndices {
         handler_ty,
@@ -478,47 +583,30 @@ fn emit_type_section(
         init_ty,
         cabi_post_ty,
         cabi_realloc_ty,
+        async_runtime,
     }
 }
 
-/// Lowered handler-import signature: param flats, plus a retptr `i32`
-/// when the result is retptr-shaped; result is the Direct value or
-/// empty.
-fn handler_signature(fd: &FuncDispatch) -> (Vec<ValType>, Vec<ValType>) {
-    let mut params = fd.param_flats.clone();
-    let result = match &fd.result {
-        ResultLowering::Void => vec![],
-        ResultLowering::Direct(t) => vec![*t],
-        ResultLowering::Retptr => {
-            params.push(ValType::I32);
-            vec![]
-        }
-    };
-    (params, result)
-}
-
-/// Lowered wrapper-export signature: param flats; result is the Direct
-/// value, or `i32` retptr, or empty.
-fn wrapper_signature(fd: &FuncDispatch) -> (Vec<ValType>, Vec<ValType>) {
-    let result = match &fd.result {
-        ResultLowering::Void => vec![],
-        ResultLowering::Direct(t) => vec![*t],
-        ResultLowering::Retptr => vec![ValType::I32],
-    };
-    (fd.param_flats.clone(), result)
-}
-
 /// Phase 3 — emit the import section (per-func handlers + active
-/// hooks). Returns a partially-populated [`FuncIndices`] with the
-/// import indices filled.
+/// hooks + canon-async runtime builtins from `$root`). Returns a
+/// partially-populated [`FuncIndices`] with the import indices filled.
+///
+/// Hook import names come from [`Resolve::wasm_import_name`] under
+/// `Legacy(AsyncCallback)` mangling — that's what produces the
+/// `[async-lower]<fn>` field name wit-component expects for an
+/// async-declared WIT function. The `[waitable-set-*]` /
+/// `[subtask-drop]` builtins are root-level wit-component intrinsics
+/// not exposed via wit-parser; their names mirror
+/// `dummy_module::push_root_async_intrinsics`.
+#[allow(clippy::too_many_arguments)]
 fn emit_imports_section(
     module: &mut Module,
     idx: &mut DispatchIndices,
     target_interface: &str,
     per_func: &[FuncDispatch],
     type_idx: &TypeIndices,
-    has_before: bool,
-    has_after: bool,
+    hook_imports: &HookImports,
+    event_ptr: Option<i32>,
 ) -> FuncIndices {
     let mut imports = ImportSection::new();
     let mut imp_handler: Vec<u32> = Vec::with_capacity(per_func.len());
@@ -530,22 +618,59 @@ fn emit_imports_section(
         );
         imp_handler.push(idx.alloc_func());
     }
-    let imp_before = has_before.then(|| {
+    let mut import_hook = |hook: &HookImport| {
         imports.import(
-            "splicer:tier1/before@0.1.0",
-            "before-call",
+            &hook.module,
+            &hook.name,
             EntityType::Function(type_idx.hook_ty),
         );
         idx.alloc_func()
-    });
-    let imp_after = has_after.then(|| {
+    };
+    let imp_before = hook_imports.before.as_ref().map(&mut import_hook);
+    let imp_after = hook_imports.after.as_ref().map(&mut import_hook);
+
+    let async_runtime = type_idx.async_runtime.as_ref().map(|art| {
+        let event_ptr = event_ptr.expect("event_ptr must be set when async_runtime is");
         imports.import(
-            "splicer:tier1/after@0.1.0",
-            "after-call",
-            EntityType::Function(type_idx.hook_ty),
+            "$root",
+            "[waitable-set-new]",
+            EntityType::Function(art.waitable_new_ty),
         );
-        idx.alloc_func()
+        let waitable_new = idx.alloc_func();
+        imports.import(
+            "$root",
+            "[waitable-join]",
+            EntityType::Function(art.waitable_join_ty),
+        );
+        let waitable_join = idx.alloc_func();
+        imports.import(
+            "$root",
+            "[waitable-set-wait]",
+            EntityType::Function(art.waitable_wait_ty),
+        );
+        let waitable_wait = idx.alloc_func();
+        imports.import(
+            "$root",
+            "[waitable-set-drop]",
+            EntityType::Function(art.void_i32_ty),
+        );
+        let waitable_drop = idx.alloc_func();
+        imports.import(
+            "$root",
+            "[subtask-drop]",
+            EntityType::Function(art.void_i32_ty),
+        );
+        let subtask_drop = idx.alloc_func();
+        AsyncRuntimeFuncs {
+            waitable_new,
+            waitable_join,
+            waitable_wait,
+            waitable_drop,
+            subtask_drop,
+            event_ptr,
+        }
     });
+
     module.section(&imports);
 
     FuncIndices {
@@ -556,17 +681,19 @@ fn emit_imports_section(
         init: 0,
         cabi_post: vec![None; per_func.len()],
         cabi_realloc: None,
+        async_runtime,
     }
 }
 
 /// Phase 4 — emit the function section (defined-function declarations).
+/// `cabi_realloc` is always declared (we always export it; see
+/// [`build_dispatch_module`]'s docstring).
 fn emit_function_section(
     module: &mut Module,
     idx: &mut DispatchIndices,
     per_func: &[FuncDispatch],
     type_idx: &TypeIndices,
     mut func_idx: FuncIndices,
-    needs_realloc: bool,
 ) -> FuncIndices {
     let mut fsec = FunctionSection::new();
 
@@ -583,23 +710,22 @@ fn emit_function_section(
     func_idx.init = idx.alloc_func();
 
     for (i, fd) in per_func.iter().enumerate() {
-        if matches!(fd.result, ResultLowering::Retptr) {
+        if fd.export_sig.retptr {
             fsec.function(type_idx.cabi_post_ty);
             func_idx.cabi_post[i] = Some(idx.alloc_func());
         }
     }
 
-    if needs_realloc {
-        fsec.function(type_idx.cabi_realloc_ty);
-        func_idx.cabi_realloc = Some(idx.alloc_func());
-    }
+    fsec.function(type_idx.cabi_realloc_ty);
+    func_idx.cabi_realloc = Some(idx.alloc_func());
 
     module.section(&fsec);
     func_idx
 }
 
-/// Phase 5 — memory + global sections.
-fn emit_memory_and_globals(module: &mut Module, bump_start: u32, needs_realloc: bool) {
+/// Phase 5 — memory + global sections. The bump pointer is always
+/// emitted (paired with the always-emitted `cabi_realloc`).
+fn emit_memory_and_globals(module: &mut Module, bump_start: u32) {
     let mut memory = MemorySection::new();
     memory.memory(MemoryType {
         minimum: 1,
@@ -610,18 +736,16 @@ fn emit_memory_and_globals(module: &mut Module, bump_start: u32, needs_realloc: 
     });
     module.section(&memory);
 
-    if needs_realloc {
-        let mut globals = GlobalSection::new();
-        globals.global(
-            GlobalType {
-                val_type: ValType::I32,
-                mutable: true,
-                shared: false,
-            },
-            &ConstExpr::i32_const(bump_start as i32),
-        );
-        module.section(&globals);
-    }
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(bump_start as i32),
+    );
+    module.section(&globals);
 }
 
 /// Phase 6 — emit the export section.
@@ -641,9 +765,10 @@ fn emit_export_section(
         }
     }
     exports.export("memory", ExportKind::Memory, 0);
-    if let Some(idx) = func_idx.cabi_realloc {
-        exports.export("cabi_realloc", ExportKind::Func, idx);
-    }
+    let realloc_idx = func_idx
+        .cabi_realloc
+        .expect("cabi_realloc is always emitted");
+    exports.export("cabi_realloc", ExportKind::Func, realloc_idx);
     exports.export("_initialize", ExportKind::Func, func_idx.init);
     module.section(&exports);
 }
@@ -663,17 +788,16 @@ fn emit_code_section(
             func_idx.imp_handler[i],
             func_idx.imp_before,
             func_idx.imp_after,
+            func_idx.async_runtime.as_ref(),
         );
     }
     code.function(&empty_function());
     for fd in per_func {
-        if matches!(fd.result, ResultLowering::Retptr) {
+        if fd.export_sig.retptr {
             code.function(&empty_function());
         }
     }
-    if func_idx.cabi_realloc.is_some() {
-        emit_cabi_realloc(&mut code);
-    }
+    emit_cabi_realloc(&mut code);
     module.section(&code);
 }
 
@@ -688,29 +812,39 @@ fn emit_data_section(module: &mut Module, name_blob: &[u8]) {
     module.section(&data);
 }
 
-/// Emit one wrapper function body.
+/// Emit one wrapper function body. Reads the canon-ABI shape directly
+/// off [`FuncDispatch::export_sig`] — `retptr` distinguishes the
+/// retptr (compound / multi-flat) case; otherwise `results.len() == 1`
+/// is the Direct (single flat) case and `results.is_empty()` is Void.
 fn emit_wrapper_body(
     code: &mut CodeSection,
     fd: &FuncDispatch,
     imp_handler: u32,
     imp_before: Option<u32>,
     imp_after: Option<u32>,
+    async_runtime: Option<&AsyncRuntimeFuncs>,
 ) {
-    let nparams = fd.param_flats.len() as u32;
+    let nparams = fd.export_sig.params.len() as u32;
     let mut locals = FunctionIndices::new(nparams);
-    let result_local = match &fd.result {
-        ResultLowering::Direct(t) => Some(locals.alloc_local(*t)),
-        ResultLowering::Void | ResultLowering::Retptr => None,
-    };
+    let result_local = fd.direct_result().map(|t| locals.alloc_local(t));
+    // The wait loop needs two scratch i32 locals (subtask handle +
+    // waitable-set handle). Allocate them up-front when async hooks
+    // are active so both before- and after-call can reuse the same
+    // slots; harmless when neither hook is present.
+    let wait_locals = async_runtime.map(|_| {
+        let st = locals.alloc_local(ValType::I32);
+        let ws = locals.alloc_local(ValType::I32);
+        (st, ws)
+    });
     let mut f = Function::new_with_locals_types(locals.into_locals());
 
     if let Some(idx) = imp_before {
-        push_hook_call(&mut f, fd, idx);
+        emit_hook_call(&mut f, fd, idx, async_runtime, wait_locals);
     }
     for p in 0..nparams {
         f.instructions().local_get(p);
     }
-    if matches!(fd.result, ResultLowering::Retptr) {
+    if fd.export_sig.retptr {
         f.instructions()
             .i32_const(fd.retptr_offset.expect("retptr_offset set"));
     }
@@ -719,28 +853,74 @@ fn emit_wrapper_body(
         f.instructions().local_set(local);
     }
     if let Some(idx) = imp_after {
-        push_hook_call(&mut f, fd, idx);
+        emit_hook_call(&mut f, fd, idx, async_runtime, wait_locals);
     }
-    match &fd.result {
-        ResultLowering::Void => {}
-        ResultLowering::Direct(_) => {
-            f.instructions()
-                .local_get(result_local.expect("Direct → local_set above"));
-        }
-        ResultLowering::Retptr => {
-            f.instructions()
-                .i32_const(fd.retptr_offset.expect("retptr_offset set"));
-        }
+    if let Some(local) = result_local {
+        f.instructions().local_get(local);
+    } else if fd.export_sig.retptr {
+        f.instructions()
+            .i32_const(fd.retptr_offset.expect("retptr_offset set"));
     }
     f.instructions().end();
     code.function(&f);
 }
 
-/// Push `(name_ptr, name_len, call hook_idx)` into the wrapper body.
-fn push_hook_call(f: &mut Function, fd: &FuncDispatch, hook_idx: u32) {
+/// Call an async-lowered hook with `(name_ptr, name_len)` and await
+/// the returned packed subtask handle via [`emit_wait_loop`]. Both
+/// `async_runtime` and `wait_locals` must be `Some` whenever a hook
+/// is active — `emit_imports_section` and the local-allocation block
+/// in [`emit_wrapper_body`] guarantee that.
+fn emit_hook_call(
+    f: &mut Function,
+    fd: &FuncDispatch,
+    hook_idx: u32,
+    async_runtime: Option<&AsyncRuntimeFuncs>,
+    wait_locals: Option<(u32, u32)>,
+) {
     f.instructions().i32_const(fd.name_offset);
     f.instructions().i32_const(fd.name_len);
     f.instructions().call(hook_idx);
+    let art = async_runtime.expect("async_runtime must be set when a hook is imported");
+    let (st, ws) = wait_locals.expect("wait_locals allocated alongside async_runtime");
+    f.instructions().local_set(st);
+    emit_wait_loop(f, st, ws, art);
+}
+
+/// Await a packed return value from `canon lower async` currently
+/// stored in local `st`. Mirrors the legacy emit path's
+/// `dispatch::emit_wait_loop`, factored to read its function indices
+/// out of [`AsyncRuntimeFuncs`].
+///
+/// `canon lower async` returns a packed i32: low 4 bits are the
+/// Status tag (`Returned=2` means sync-done; `Started=1` means
+/// pending) and the upper 28 bits hold the raw subtask handle (`0`
+/// when sync-done). After this helper:
+///
+/// - Local `st` holds the raw subtask handle (`packed >> 4`).
+/// - If the handle is nonzero, a fresh waitable-set has been
+///   created, the subtask joined into it, the wait completed, and
+///   both the subtask and the waitable-set dropped.
+fn emit_wait_loop(f: &mut Function, st: u32, ws: u32, art: &AsyncRuntimeFuncs) {
+    f.instructions().local_get(st);
+    f.instructions().i32_const(4);
+    f.instructions().i32_shr_u();
+    f.instructions().local_set(st);
+    f.instructions().local_get(st);
+    f.instructions().if_(BlockType::Empty);
+    f.instructions().call(art.waitable_new);
+    f.instructions().local_set(ws);
+    f.instructions().local_get(st);
+    f.instructions().local_get(ws);
+    f.instructions().call(art.waitable_join);
+    f.instructions().local_get(ws);
+    f.instructions().i32_const(art.event_ptr);
+    f.instructions().call(art.waitable_wait);
+    f.instructions().drop();
+    f.instructions().local_get(st);
+    f.instructions().call(art.subtask_drop);
+    f.instructions().local_get(ws);
+    f.instructions().call(art.waitable_drop);
+    f.instructions().end();
 }
 
 /// A function with no locals and an empty body (just `end`). Used for
