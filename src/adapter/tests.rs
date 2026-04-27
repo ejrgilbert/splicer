@@ -640,6 +640,29 @@ fn test_adapter_sync_primitives() {
     validate_component(&bytes);
 }
 
+// Multi-function sync-primitives interface — exercises the new emit
+// path's multi-handler dispatch (separate per-func wrapper + per-func
+// name in the data segment + per-func handler import).
+#[test]
+fn test_adapter_sync_multi_func_primitives() {
+    let mut arena = TypeArena::default();
+    let s32 = arena.intern_val(ValueType::S32);
+    let u32_ = arena.intern_val(ValueType::U32);
+    let iface = make_iface(vec![
+        ("add", sig(false, &["a", "b"], vec![s32, s32], vec![s32])),
+        ("count", sig(false, &[], vec![], vec![u32_])),
+        ("noop", sig(false, &["x"], vec![s32], vec![])),
+    ]);
+    let bytes = gen_adapter(
+        "test:pkg/multi@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
 // ── Tier 1: sync string return (retptr pattern) ─────────────────────
 
 #[test]

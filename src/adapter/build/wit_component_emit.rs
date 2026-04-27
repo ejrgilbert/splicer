@@ -117,27 +117,22 @@ fn require_simple_case(
     iface_ty: &InterfaceType,
     arena: &TypeArena,
 ) -> Result<()> {
-    if funcs.len() != 1 {
-        bail!(
-            "wit_component_emit: only single-function interfaces are \
-             handled today; got {} functions",
-            funcs.len()
-        );
+    if funcs.is_empty() {
+        bail!("wit_component_emit: interface has no functions");
     }
-    let f = &funcs[0];
-    if f.is_async {
-        bail!("wit_component_emit: async functions not yet handled");
-    }
-    if !f.param_type_ids.is_empty() {
+    for f in funcs {
+        if f.is_async {
+            bail!("wit_component_emit: async functions not yet handled");
+        }
         for &id in &f.param_type_ids {
             if !is_primitive(arena, id) {
                 bail!("wit_component_emit: non-primitive param types not yet handled");
             }
         }
-    }
-    if let Some(rid) = f.result_type_id {
-        if !is_primitive(arena, rid) {
-            bail!("wit_component_emit: non-primitive result type not yet handled");
+        if let Some(rid) = f.result_type_id {
+            if !is_primitive(arena, rid) {
+                bail!("wit_component_emit: non-primitive result type not yet handled");
+            }
         }
     }
     if let InterfaceType::Instance(inst) = iface_ty {
@@ -298,52 +293,63 @@ fn synthesize_adapter_world_wit(
     wit
 }
 
-/// Build the dispatch core module for the simplest case: one func with
-/// primitive param + primitive (or unit) result, optional before/after
-/// hooks. Mirrors `examples/wit_component_spike.rs::build_dispatch_core_module`.
+/// Build the dispatch core module for one or more funcs with primitive
+/// params + primitive (or unit) result, optional before/after hooks.
+/// Mirrors `examples/wit_component_spike.rs::build_dispatch_core_module`,
+/// generalized to N funcs.
+///
+/// Layout — types come first (one per func, plus shared hook + init
+/// types), then imports (handlers + hooks), then defined funcs (one
+/// wrapper per handler + `_initialize`), memory, exports (one per
+/// wrapper + memory + `_initialize`), code, data (concatenated func
+/// names with per-func offset/len recorded for the hook calls).
 fn build_simple_dispatch(
     target_interface: &str,
     funcs: &[AdapterFunc],
     has_before: bool,
     has_after: bool,
 ) -> Result<Vec<u8>> {
-    let func = &funcs[0];
     let mut module = Module::new();
 
     // ── Type section ────────────────────────────────────────────────
+    // One type per func (signatures may differ); one shared hook type
+    // `(i32, i32) -> ()`; one `_initialize` type `() -> ()`.
     let mut types = TypeSection::new();
-    // type 0: foo's lowered signature.
-    let core_params: Vec<ValType> = func
-        .param_type_ids
-        .iter()
-        .map(|_| ValType::I32) // primitives mostly fit i32; widen when we cover i64/f32/f64
-        .collect();
-    let core_result: Vec<ValType> = match func.result_type_id {
-        Some(_) => vec![ValType::I32],
-        None => vec![],
-    };
-    types.ty().function(core_params.clone(), core_result.clone());
-    let foo_ty: u32 = 0;
-    // type 1: hooks lowered (i32, i32) -> () for `name: string`.
+    let mut func_ty_idx: Vec<u32> = Vec::with_capacity(funcs.len());
+    for (i, func) in funcs.iter().enumerate() {
+        let core_params: Vec<ValType> = func
+            .param_type_ids
+            .iter()
+            .map(|_| ValType::I32) // primitives mostly fit i32; widen when we cover i64/f32/f64
+            .collect();
+        let core_result: Vec<ValType> = match func.result_type_id {
+            Some(_) => vec![ValType::I32],
+            None => vec![],
+        };
+        types.ty().function(core_params, core_result);
+        func_ty_idx.push(i as u32);
+    }
+    let hook_ty: u32 = funcs.len() as u32;
     types.ty().function([ValType::I32, ValType::I32], []);
-    let hook_ty: u32 = 1;
-    // type 2: _initialize signature (() -> ()).
+    let init_ty: u32 = hook_ty + 1;
     types.ty().function([], []);
-    let init_ty: u32 = 2;
     module.section(&types);
 
     // ── Import section ──────────────────────────────────────────────
     let mut imports = ImportSection::new();
     let mut next_func_idx: u32 = 0;
 
-    let (iface_module_name, iface_func_name) = (target_interface, func.name.as_str());
-    imports.import(
-        iface_module_name,
-        iface_func_name,
-        EntityType::Function(foo_ty),
-    );
-    let imp_handler = next_func_idx;
-    next_func_idx += 1;
+    // Per-func handler imports. Each gets its own type.
+    let mut imp_handler_idx: Vec<u32> = Vec::with_capacity(funcs.len());
+    for (i, func) in funcs.iter().enumerate() {
+        imports.import(
+            target_interface,
+            func.name.as_str(),
+            EntityType::Function(func_ty_idx[i]),
+        );
+        imp_handler_idx.push(next_func_idx);
+        next_func_idx += 1;
+    }
 
     let imp_before = if has_before {
         imports.import(
@@ -372,13 +378,16 @@ fn build_simple_dispatch(
     module.section(&imports);
 
     // ── Function section ────────────────────────────────────────────
-    // Defined funcs: wrapper for foo + _initialize.
+    // One wrapper per func (matching its handler's type) plus
+    // _initialize. Wrappers are contiguous from `wrapper_base`.
     let mut fsec = FunctionSection::new();
-    fsec.function(foo_ty); // wrapper for foo
-    fsec.function(init_ty); // _initialize
+    let wrapper_base = next_func_idx;
+    for (i, _) in funcs.iter().enumerate() {
+        fsec.function(func_ty_idx[i]);
+    }
+    fsec.function(init_ty);
     module.section(&fsec);
-    let wrapper_idx = next_func_idx;
-    let _init_idx = next_func_idx + 1;
+    let init_idx = wrapper_base + funcs.len() as u32;
 
     // ── Memory section ──────────────────────────────────────────────
     let mut memory = MemorySection::new();
@@ -393,72 +402,72 @@ fn build_simple_dispatch(
 
     // ── Export section ──────────────────────────────────────────────
     let mut exports = ExportSection::new();
-    let export_name = format!("{iface_module_name}#{iface_func_name}");
-    exports.export(&export_name, ExportKind::Func, wrapper_idx);
+    for (i, func) in funcs.iter().enumerate() {
+        let export_name = format!("{target_interface}#{}", func.name);
+        exports.export(&export_name, ExportKind::Func, wrapper_base + i as u32);
+    }
     exports.export("memory", ExportKind::Memory, 0);
-    exports.export("_initialize", ExportKind::Func, _init_idx);
+    exports.export("_initialize", ExportKind::Func, init_idx);
     module.section(&exports);
 
-    // ── Code section ────────────────────────────────────────────────
+    // ── Code + Data sections ────────────────────────────────────────
+    // Walk funcs, emitting:
+    //   - one wrapper body per func (with the right per-func name
+    //     offset/len for hook calls)
+    //   - one shared data segment carrying all func name bytes
+    //     concatenated, with per-func (offset, len) recorded.
     let mut code = CodeSection::new();
+    let mut name_blob: Vec<u8> = Vec::new();
+    let mut name_offsets: Vec<(i32, i32)> = Vec::with_capacity(funcs.len());
+    for func in funcs {
+        let off = name_blob.len() as i32;
+        let len = func.name.len() as i32;
+        name_blob.extend_from_slice(func.name.as_bytes());
+        name_offsets.push((off, len));
+    }
 
-    // Stash the function name as bytes at offset 0 in linear memory
-    // so the hook calls can pass `(name_ptr, name_len)`.
-    let name_bytes = func.name.as_bytes();
-    let name_len = name_bytes.len() as i32;
+    for (i, func) in funcs.iter().enumerate() {
+        let has_result = func.result_type_id.is_some();
+        let locals: Vec<(u32, ValType)> = if has_result {
+            vec![(1, ValType::I32)]
+        } else {
+            vec![]
+        };
+        let mut wrapper = Function::new(locals);
+        let result_local: u32 = func.param_type_ids.len() as u32;
+        let (name_off, name_len) = name_offsets[i];
 
-    // Wrapper layout when result is non-void:
-    //   [optional before-call]
-    //   local.get 0..N (handler params)
-    //   call $imp_handler
-    //   local.set $result
-    //   [optional after-call]
-    //   local.get $result
-    //   end
-    //
-    // When result IS void, there's no result local and the
-    // local.set/local.get pair is omitted.
-    let has_result = func.result_type_id.is_some();
-    let locals: Vec<(u32, ValType)> = if has_result {
-        vec![(1, ValType::I32)]
-    } else {
-        vec![]
-    };
-    let mut wrapper = Function::new(locals);
-    let result_local: u32 = func.param_type_ids.len() as u32;
-
-    if let Some(idx) = imp_before {
-        wrapper.instructions().i32_const(0);
-        wrapper.instructions().i32_const(name_len);
-        wrapper.instructions().call(idx);
+        if let Some(idx) = imp_before {
+            wrapper.instructions().i32_const(name_off);
+            wrapper.instructions().i32_const(name_len);
+            wrapper.instructions().call(idx);
+        }
+        for p in 0..(func.param_type_ids.len() as u32) {
+            wrapper.instructions().local_get(p);
+        }
+        wrapper.instructions().call(imp_handler_idx[i]);
+        if has_result {
+            wrapper.instructions().local_set(result_local);
+        }
+        if let Some(idx) = imp_after {
+            wrapper.instructions().i32_const(name_off);
+            wrapper.instructions().i32_const(name_len);
+            wrapper.instructions().call(idx);
+        }
+        if has_result {
+            wrapper.instructions().local_get(result_local);
+        }
+        wrapper.instructions().end();
+        code.function(&wrapper);
     }
-    for i in 0..(func.param_type_ids.len() as u32) {
-        wrapper.instructions().local_get(i);
-    }
-    wrapper.instructions().call(imp_handler);
-    if has_result {
-        wrapper.instructions().local_set(result_local);
-    }
-    if let Some(idx) = imp_after {
-        wrapper.instructions().i32_const(0);
-        wrapper.instructions().i32_const(name_len);
-        wrapper.instructions().call(idx);
-    }
-    if has_result {
-        wrapper.instructions().local_get(result_local);
-    }
-    wrapper.instructions().end();
-    code.function(&wrapper);
 
     let mut init = Function::new(vec![]);
     init.instructions().end();
     code.function(&init);
-
     module.section(&code);
 
-    // ── Data section ────────────────────────────────────────────────
     let mut data = DataSection::new();
-    data.active(0, &ConstExpr::i32_const(0), name_bytes.iter().copied());
+    data.active(0, &ConstExpr::i32_const(0), name_blob.iter().copied());
     module.section(&data);
 
     Ok(module.finish())
