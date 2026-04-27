@@ -136,12 +136,9 @@ pub fn generate_tier1_adapter(
     let bytes = if new_emit_enabled() {
         match build_adapter_via_wit_component(
             target_interface,
-            &funcs,
             has_before,
             has_after,
             has_blocking,
-            arena,
-            iface_ty,
             &split_bytes,
             TIER1_WORLD_WIT,
         ) {
