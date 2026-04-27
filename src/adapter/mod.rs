@@ -34,9 +34,32 @@ mod names;
 mod tests;
 
 use abi::WitBridge;
-use build::build_adapter_bytes;
+use build::{build_adapter_bytes, build_adapter_via_wit_component};
 use filter::{extract_filtered_sections, find_handler_deps};
 use func::extract_adapter_funcs;
+
+/// WIT/world definitions for the splicer:tier1 hook interfaces. The
+/// new emit path embeds this directly into the generated adapter's
+/// WIT so wit-component understands the hook imports.
+const TIER1_WORLD_WIT: &str = include_str!("../../wit/tier1/world.wit");
+
+/// Feature flag: when `SPLICER_NEW_EMIT=1`, route through the WIT-
+/// level emit path (`build_adapter_via_wit_component`) for cases the
+/// new path supports, falling back to the legacy path otherwise. Off
+/// by default during the rewrite so existing tests keep using the
+/// known-good legacy path. Removed once the new path reaches feature
+/// parity and the legacy path is deleted.
+fn new_emit_enabled() -> bool {
+    std::env::var("SPLICER_NEW_EMIT").map_or(false, |v| v == "1")
+}
+
+/// Strict-mode counterpart: when set, an unsupported case in the new
+/// emit path becomes a hard error instead of a silent fallback to
+/// legacy. Useful while developing to make sure the new path is
+/// actually being exercised on the cases we expect.
+fn new_emit_strict() -> bool {
+    std::env::var("SPLICER_NEW_EMIT_STRICT").map_or(false, |v| v == "1")
+}
 
 /// Generate a tier-1 adapter component that wraps `middleware_name` and adapts it to
 /// export `target_interface`.
@@ -100,22 +123,67 @@ pub fn generate_tier1_adapter(
             target_interface
         );
     }
-    let bytes = std::fs::read(split_path)
+    let split_bytes = std::fs::read(split_path)
         .with_context(|| format!("Failed to read split at '{split_path}'"))?;
-    let split = extract_filtered_sections(&bytes, &deps)?;
+    let split = extract_filtered_sections(&split_bytes, &deps)?;
 
-    let bytes = build_adapter_bytes(
-        target_interface,
-        &funcs,
-        has_before,
-        has_after,
-        has_blocking,
-        arena,
-        iface_ty,
-        &split,
-        layout,
-        &bridge,
-    )?;
+    // New emit path: try wit-component if enabled and the case is in
+    // scope. The new path bails for unsupported cases (multi-func,
+    // resources, async, compounds — the guards live in
+    // `build_adapter_via_wit_component`'s `require_simple_case`); when
+    // it bails we transparently fall through to the legacy emitter so
+    // partial coverage doesn't break existing tests.
+    let bytes = if new_emit_enabled() {
+        match build_adapter_via_wit_component(
+            target_interface,
+            &funcs,
+            has_before,
+            has_after,
+            has_blocking,
+            arena,
+            iface_ty,
+            &split_bytes,
+            TIER1_WORLD_WIT,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                if new_emit_strict() {
+                    return Err(e.context(format!(
+                        "new emit path bailed for `{target_interface}` (strict mode on)"
+                    )));
+                }
+                tracing::debug!(
+                    target = "splicer::adapter::new_emit",
+                    "new emit path bailed for `{target_interface}`: {e}; falling back to legacy"
+                );
+                build_adapter_bytes(
+                    target_interface,
+                    &funcs,
+                    has_before,
+                    has_after,
+                    has_blocking,
+                    arena,
+                    iface_ty,
+                    &split,
+                    layout,
+                    &bridge,
+                )?
+            }
+        }
+    } else {
+        build_adapter_bytes(
+            target_interface,
+            &funcs,
+            has_before,
+            has_after,
+            has_blocking,
+            arena,
+            iface_ty,
+            &split,
+            layout,
+            &bridge,
+        )?
+    };
 
     let out_path = format!(
         "{splits_output_path}/splicer_adapter_{}_{}.wasm",

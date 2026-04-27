@@ -24,6 +24,8 @@ mod dispatch;
 mod encoders;
 mod mem_layout;
 mod ty;
+mod wit_component_emit;
 
 pub(super) use component::build_adapter_bytes;
 pub(super) use mem_layout::MemoryLayoutBuilder;
+pub(super) use wit_component_emit::build_adapter_via_wit_component;
