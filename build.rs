@@ -92,49 +92,14 @@ fn main() {
              pub const TIER{upper}_VERSION: &str = \"{pkg_version}\";\n\n"
         ));
 
-        // Per-interface named constants (e.g. TIER1_BEFORE, TIER1_AFTER)
-        // plus the list of function names declared inside each.
-        for ((name, fns), fq) in ifaces.iter().zip(fq_names.iter()) {
+        // Per-interface named constants (e.g. TIER1_BEFORE, TIER1_AFTER).
+        for ((name, _fns), fq) in ifaces.iter().zip(fq_names.iter()) {
             let iface_upper = name.to_uppercase().replace('-', "_");
             let const_name = format!("TIER{upper}_{iface_upper}");
             generated.push_str(&format!(
                 "/// Fully-qualified name of the `{name}` interface in the tier-{tier_num} WIT package.\n\
                  /// Derived from `wit/{dir_name}/world.wit` at build time.\n\
                  pub const {const_name}: &str = \"{fq}\";\n\n"
-            ));
-
-            let fns_const = format!("TIER{upper}_{iface_upper}_FNS");
-            let fns_joined = fns
-                .iter()
-                .map(|f| format!("\"{f}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            generated.push_str(&format!(
-                "/// Function names declared inside the `{name}` interface.\n\
-                 /// Derived from `wit/{dir_name}/world.wit` at build time — the\n\
-                 /// adapter aliases these names out of the imported hook instance.\n\
-                 #[allow(dead_code)]\n\
-                 pub const {fns_const}: &[&str] = &[{fns_joined}];\n\n"
-            ));
-
-            // Mirror of the function names with hyphens replaced by
-            // underscores. Core-wasm identifiers conventionally use
-            // underscores, so when the adapter bridges a hook function
-            // across the component/core boundary (as an env-instance
-            // slot), it uses this underscored form.
-            let env_slots_const = format!("TIER{upper}_{iface_upper}_ENV_SLOTS");
-            let env_slots_joined = fns
-                .iter()
-                .map(|f| format!("\"{}\"", f.replace('-', "_")))
-                .collect::<Vec<_>>()
-                .join(", ");
-            generated.push_str(&format!(
-                "/// Core-wasm env-instance slot names for the `{name}` interface —\n\
-                 /// each {fns_const} entry with hyphens replaced by underscores.\n\
-                 /// Used when the adapter exposes a canon-lowered hook function\n\
-                 /// to its inner dispatch module via the `env` core instance.\n\
-                 #[allow(dead_code)]\n\
-                 pub const {env_slots_const}: &[&str] = &[{env_slots_joined}];\n\n"
             ));
         }
 

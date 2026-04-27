@@ -1,6 +1,6 @@
 [package]
 name = "splicer"
-version = "2.0.3"
+version = "2.1.0"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
 description = "Plan and generate middleware splice operations for WebAssembly component composition graphs."
@@ -41,12 +41,9 @@ wasmparser = "0.247.0"
 wasm-encoder = { version = "0.247.0", features = ["wasmparser"] }
 wit-parser = "0.247"
 wit-bindgen-core = "0.57.1"
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wirm = "4.0.3"
+wirm = "4.0.4"
 #wirm = { path = "../../research/compilers/wirm" }
-# Used by the new WIT-level adapter generator (src/adapter/build/wit_component_emit.rs).
-# Replaces ~all of the manual component-emit logic in src/adapter/build/component.rs.
 wit-component = "0.247"
 
 [dev-dependencies]
@@ -59,11 +56,3 @@ tokio = { version = "1", features = ["rt", "macros"] }
 wac-parser = "0.10"
 wac-resolver = "0.10"
 wac-graph = "0.10"
-
-# wirm 4.0.4 (with the bare-func-types resource map fix from
-# composablesys/wirm#335) hasn't been published yet. Override the
-# crates.io entry — including cviz's transitive dep — to the local
-# checkout so the fix takes effect everywhere splicer pulls wirm in.
-# Revert to a registry version once wirm releases.
-[patch.crates-io]
-wirm = { path = "../../research/compilers/wirm" }
