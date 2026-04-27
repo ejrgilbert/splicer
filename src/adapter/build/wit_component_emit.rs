@@ -83,9 +83,22 @@ pub(crate) fn build_adapter_via_wit_component(
 }
 
 /// Decode the input split's WIT into a [`Resolve`]; bail if the bytes
-/// decode to a WIT package rather than a component.
+/// decode to a WIT package rather than a component. `wit_component::decode`
+/// panics on splits that import + re-export a resource-bearing instance
+/// (https://github.com/bytecodealliance/wasm-tools/issues/2506); catch
+/// it and surface a structured error so the process doesn't die.
 fn decode_input_resolve(split_bytes: &[u8]) -> Result<Resolve> {
-    match decode(split_bytes).context("wit_component::decode split")? {
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(split_bytes)))
+        .map_err(|_| {
+            anyhow!(
+                "wit-parser panic during component decode — likely the import + re-export \
+                 of a resource-bearing instance (upstream issue \
+                 https://github.com/bytecodealliance/wasm-tools/issues/2506). The new emit \
+                 path can't proceed until that's fixed upstream."
+            )
+        })?
+        .context("wit_component::decode split")?;
+    match decoded {
         DecodedWasm::Component(resolve, _world) => Ok(resolve),
         DecodedWasm::WitPackage(_, _) => bail!(
             "wit_component_emit: split bytes decoded to a WIT package; \
@@ -1031,10 +1044,14 @@ fn emit_async_wrapper_body(
     let st = locals.alloc_local(ValType::I32);
     let ws = locals.alloc_local(ValType::I32);
     let wait_locals = Some((st, ws));
-    // Address local for the `lift_from_memory` arg-prep, only needed
-    // when task.return takes flat params.
+    // task.return is `wasm_signature(GuestImport, fake_func_with_result_as_param)`:
+    // small results flatten into params; large results overflow into a
+    // single retptr param (`indirect_params=true`). The `retptr` flag is
+    // only set for actual *results* and is always false for task.return
+    // (whose fake_func has no result), so use `indirect_params` to pick
+    // the path.
     let tr_sig = &fd.task_return.as_ref().expect("async has task_return").sig;
-    let tr_uses_flat_loads = !tr_sig.retptr && fd.result_ty.is_some();
+    let tr_uses_flat_loads = !tr_sig.indirect_params && fd.result_ty.is_some();
     let tr_addr_local = tr_uses_flat_loads.then(|| locals.alloc_local(ValType::I32));
 
     // Build the load sequence BEFORE freezing locals — `lift_from_memory`
@@ -1084,10 +1101,11 @@ fn emit_async_wrapper_body(
     }
 
     // task.return shape: void (no args), retptr (pass the buffer
-    // through), or flat (lift each slot via `lift_from_memory`).
+    // through — large compound result), or flat (lift each slot via
+    // `lift_from_memory`).
     if fd.result_ty.is_none() {
         f.instructions().call(imp_task_return);
-    } else if tr_sig.retptr {
+    } else if tr_sig.indirect_params {
         f.instructions()
             .i32_const(fd.retptr_offset.expect("retptr_offset for async retptr"));
         f.instructions().call(imp_task_return);

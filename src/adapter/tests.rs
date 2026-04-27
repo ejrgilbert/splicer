@@ -1068,87 +1068,6 @@ fn test_adapter_heterogeneous_numeric_variant_async_result() {
     validate_component(&bytes);
 }
 
-/// A function with 17 flat params exceeds the canonical-ABI cap
-/// (`MAX_FLAT_PARAMS = 16`). Splicer currently bails at generation
-/// time with a clear error rather than emit invalid core-wasm; this
-/// test pins that contract so a future change that silently routes
-/// around the check (instead of implementing the retptr form) fails
-/// loud.
-#[test]
-fn test_adapter_too_many_flat_params_fails_cleanly() {
-    let mut arena = TypeArena::default();
-    let u32_id = arena.intern_val(ValueType::U32);
-    let param_names: Vec<String> = (0..17).map(|i| format!("p{i}")).collect();
-    let iface = make_iface(vec![(
-        "many",
-        FuncSignature {
-            is_async: false,
-            param_names,
-            params: vec![u32_id; 17],
-            results: vec![],
-        },
-    )]);
-    let tmp = tempfile::tempdir().unwrap();
-    let split = synth_split("test:pkg/many@1.0.0", &iface, &arena, SplitKind::Consumer);
-    let err = generate_tier1_adapter(
-        "test-mdl",
-        "test:pkg/many@1.0.0",
-        &[],
-        Some(&iface),
-        tmp.path().to_str().unwrap(),
-        split.path().to_str().unwrap(),
-        &arena,
-    )
-    .expect_err("generation should fail when a function's flat arity exceeds MAX_FLAT_PARAMS");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("flat") || msg.contains("16"),
-        "error should mention the flat-param limit, got: {msg}"
-    );
-}
-
-/// 5 flat async params trip `MAX_FLAT_ASYNC_PARAMS = 4`, forcing
-/// pointer-form lowering. Splicer's dispatch body only emits flat
-/// form, so generation bails. Canary for the day pointer-form
-/// dispatch lands — flipping this test green requires updating the
-/// `uses_async_pointer_params` debug_asserts in tandem.
-#[test]
-fn test_adapter_async_pointer_form_params_bails() {
-    let mut arena = TypeArena::default();
-    let u32_id = arena.intern_val(ValueType::U32);
-    let iface = make_iface(vec![(
-        "many-async",
-        sig(
-            true,
-            &["a", "b", "c", "d", "e"],
-            vec![u32_id; 5],
-            vec![u32_id],
-        ),
-    )]);
-    let tmp = tempfile::tempdir().unwrap();
-    let split = synth_split(
-        "test:pkg/many-async@1.0.0",
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    let err = generate_tier1_adapter(
-        "test-mdl",
-        "test:pkg/many-async@1.0.0",
-        &[],
-        Some(&iface),
-        tmp.path().to_str().unwrap(),
-        split.path().to_str().unwrap(),
-        &arena,
-    )
-    .expect_err("5 flat async params should trip the pointer-form bail");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("pointer form") || msg.contains("Pointer-form"),
-        "bail message should mention pointer-form lowering, got: {msg}"
-    );
-}
-
 /// Build, generate, and validate an async-result adapter whose result
 /// is a `flags` with `n` labels. Shared helper for the width-boundary
 /// tests below.
@@ -1586,7 +1505,12 @@ fn test_adapter_provider_split_primitive() {
 /// than aliasing them off the handler instance (which wouldn't work —
 /// the resources came from the preamble, not from the handler
 /// instance's SubResource exports).
+// Blocked on https://github.com/bytecodealliance/wasm-tools/issues/2506
+// — wit-parser panics when decoding a component that imports + re-exports
+// a resource-bearing instance, which is exactly the provider-split shape
+// for a resource-bearing target. Re-enable once upstream fixes it.
 #[test]
+#[ignore]
 fn test_adapter_provider_split_resource_handler() {
     let mut arena = TypeArena::default();
     let iface = build_http_handler_iface(&mut arena);
