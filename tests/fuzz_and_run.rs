@@ -127,16 +127,11 @@ impl BindingsSide {
     }
 }
 
-// TODO: extend Shape with resource types + resource methods/statics/
-// constructors so the fuzzer exercises splicer's canon-lower/lift of
-// `own<T>` / `borrow<T>` handles and the `method:` / `static func:` /
-// `constructor` function kinds. Today Shape covers only value types,
-// which leaves real-world compositions (e.g. `wasi:http/incoming-handler`
-// with `(incoming-request, response-outparam) -> ()`, anything on
-// `wasi:io/streams`, the nebula demo's gateway→service wiring) outside
-// the fuzzer's confidence envelope. Splicer has a couple of hand-
-// written resource tests in `src/adapter/tests.rs` but the fuzz pass
-// doesn't randomize that surface.
+// Shape covers value types plus resource handles (`own<T>` / `borrow<T>`)
+// over a nullary-constructor resource. Resource methods, static funcs,
+// and constructors-with-params are still out of scope — those are
+// function kinds rather than value shapes and belong with tier-2
+// coverage.
 #[derive(Clone)]
 enum Shape {
     Primitive {
@@ -204,6 +199,29 @@ enum Shape {
         /// Which branch to materialize (`true` = Ok, `false` = Err).
         is_ok: bool,
     },
+    // ResourceOwn and ResourceBorrow are wired through every Shape
+    // method but not yet activated in `canned_shapes()` or the fuzz
+    // generator — the consumer/provider scaffolds need resource codegen
+    // first. `allow(dead_code)` until that lands.
+    /// `own<T>` — owning handle to a nullary-constructor resource.
+    /// Round-trips through the canonical ABI as an i32 with ownership
+    /// transfer semantics.
+    #[allow(dead_code)]
+    ResourceOwn {
+        /// Resource name in WIT (kebab-safe single word).
+        wit_name: &'static str,
+        /// PascalCased Rust type wit-bindgen generates.
+        rust_name: &'static str,
+    },
+    /// `borrow<T>` — borrowed handle to the same kind of resource.
+    /// Cannot appear in a function's return position, so the harness's
+    /// echo-`foo(x: T) -> T` signature must specialize when this is the
+    /// top-level shape (handled by the scaffold emitters).
+    #[allow(dead_code)]
+    ResourceBorrow {
+        wit_name: &'static str,
+        rust_name: &'static str,
+    },
 }
 
 #[derive(Clone)]
@@ -258,6 +276,8 @@ impl Shape {
                 let err_s = err.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
                 format!("result_{ok_s}_{err_s}")
             }
+            Shape::ResourceOwn { wit_name, .. } => format!("own_{wit_name}"),
+            Shape::ResourceBorrow { wit_name, .. } => format!("borrow_{wit_name}"),
         }
     }
 
@@ -284,6 +304,8 @@ impl Shape {
                 (None, Some(e)) => format!("result<_, {}>", e.wit_type()),
                 (Some(o), Some(e)) => format!("result<{}, {}>", o.wit_type(), e.wit_type()),
             },
+            Shape::ResourceOwn { wit_name, .. } => format!("own<{wit_name}>"),
+            Shape::ResourceBorrow { wit_name, .. } => format!("borrow<{wit_name}>"),
         }
     }
 
@@ -293,24 +315,27 @@ impl Shape {
     /// types.
     fn wit_decls(&self) -> String {
         let mut decls = String::new();
-        self.collect_wit_decls(&mut decls);
+        let mut seen_resources = HashSet::new();
+        self.collect_wit_decls(&mut decls, &mut seen_resources);
         decls
     }
 
-    fn collect_wit_decls(&self, out: &mut String) {
+    fn collect_wit_decls(&self, out: &mut String, seen_resources: &mut HashSet<&'static str>) {
         match self {
             Shape::Primitive { .. } => {}
-            Shape::Option(inner) | Shape::List(inner) => inner.collect_wit_decls(out),
+            Shape::Option(inner) | Shape::List(inner) => {
+                inner.collect_wit_decls(out, seen_resources)
+            }
             Shape::Tuple(parts) => {
                 for p in parts {
-                    p.collect_wit_decls(out);
+                    p.collect_wit_decls(out, seen_resources);
                 }
             }
             Shape::Record {
                 wit_name, fields, ..
             } => {
                 for (_, fshape) in fields {
-                    fshape.collect_wit_decls(out);
+                    fshape.collect_wit_decls(out, seen_resources);
                 }
                 if !out.is_empty() {
                     out.push_str("\n\n");
@@ -326,7 +351,7 @@ impl Shape {
             } => {
                 for case in cases {
                     if let Some(p) = &case.payload {
-                        p.collect_wit_decls(out);
+                        p.collect_wit_decls(out, seen_resources);
                     }
                 }
                 if !out.is_empty() {
@@ -369,10 +394,24 @@ impl Shape {
             }
             Shape::Result_ { ok, err, .. } => {
                 if let Some(o) = ok {
-                    o.collect_wit_decls(out);
+                    o.collect_wit_decls(out, seen_resources);
                 }
                 if let Some(e) = err {
-                    e.collect_wit_decls(out);
+                    e.collect_wit_decls(out, seen_resources);
+                }
+            }
+            // Both own<X> and borrow<X> share the same `resource X`
+            // declaration. Dedupe via `seen_resources` so a shape that
+            // mixes `own<cat>` and `borrow<cat>` emits one resource decl
+            // rather than two clashing ones.
+            Shape::ResourceOwn { wit_name, .. } | Shape::ResourceBorrow { wit_name, .. } => {
+                if seen_resources.insert(*wit_name) {
+                    if !out.is_empty() {
+                        out.push_str("\n\n");
+                    }
+                    out.push_str(&format!("resource {wit_name} {{\n"));
+                    out.push_str("    constructor();\n");
+                    out.push('}');
                 }
             }
         }
@@ -407,6 +446,14 @@ impl Shape {
                     .map(|s| s.rust_ty(side))
                     .unwrap_or_else(|| "()".into());
                 format!("Result<{ok_ty}, {err_ty}>")
+            }
+            // Both own<X> and borrow<X> spell the type as the
+            // wit-bindgen-generated handle struct on each side. The
+            // own-vs-borrow distinction shows up at the call site
+            // (consumer_pass_expr adds `&` for borrow) and in the
+            // function-signature emitter, not in the type spelling.
+            Shape::ResourceOwn { rust_name, .. } | Shape::ResourceBorrow { rust_name, .. } => {
+                format!("{}::{rust_name}", side.path())
             }
         }
     }
@@ -529,6 +576,16 @@ impl Shape {
                     }
                 }
             }
+            // For both own<X> and borrow<X>, the consumer constructs an
+            // owned handle via the resource's nullary constructor; the
+            // borrow case takes a reference at the call site
+            // (consumer_pass_expr). Provider-side use is symmetric — the
+            // provider's local binding for the function's argument has
+            // the same Rust type, so `Cat::new()` is equally valid as a
+            // placeholder there if the harness ever needs it.
+            Shape::ResourceOwn { rust_name, .. } | Shape::ResourceBorrow { rust_name, .. } => {
+                format!("{}::{rust_name}::new()", side.path())
+            }
         }
     }
 
@@ -539,6 +596,13 @@ impl Shape {
     /// shared reference, so we prefix with `&` where wit-bindgen's
     /// sync-import signature demands a borrow.
     fn consumer_pass_expr(&self, v_ident: &str, mode: AsyncMode) -> String {
+        // `borrow<T>` always passes a reference regardless of mode —
+        // wit-bindgen emits `foo(x: &Cat)` for both sync and async
+        // imports because the canonical-ABI rule (borrow doesn't
+        // transfer ownership) is independent of async lifting.
+        if matches!(self, Shape::ResourceBorrow { .. }) {
+            return format!("&{v_ident}");
+        }
         if matches!(mode, AsyncMode::Async) {
             return v_ident.to_string();
         }
@@ -584,6 +648,9 @@ impl Shape {
                 ok.as_ref().is_none_or(|s| s.is_copy_in(mode))
                     && err.as_ref().is_none_or(|s| s.is_copy_in(mode))
             }
+            // Resource handles are not Copy — wit-bindgen generates a
+            // `Drop` impl that releases the underlying handle.
+            Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => false,
         }
     }
 
@@ -703,6 +770,16 @@ impl Shape {
                         Some(p) => format!("Err({})", p.expected_debug_in(err_enums)),
                     }
                 }
+            }
+            // Resource handle Debug is opaque — wit-bindgen doesn't
+            // expose the internal handle ID stably, so the harness's
+            // value-round-trip assertion can't pin a string. Scaffold
+            // emitters using resource shapes need a different
+            // verification path (e.g. side-effect markers from the
+            // resource's constructor or destructor) rather than
+            // matching this placeholder.
+            Shape::ResourceOwn { rust_name, .. } | Shape::ResourceBorrow { rust_name, .. } => {
+                format!("<{rust_name} handle>")
             }
         }
     }
