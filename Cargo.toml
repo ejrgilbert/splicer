@@ -43,8 +43,11 @@ wit-parser = "0.247"
 wit-bindgen-core = "0.57.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wirm = "4.0.3"
-#wirm = { path = "../../research/compilers/wirm" }
+#wirm = "4.0.3"
+wirm = { path = "../../research/compilers/wirm" }
+
+[patch.crates-io]
+wirm = { path = "../../research/compilers/wirm" }
 
 [dev-dependencies]
 wat = "1"

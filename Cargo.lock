@@ -5695,8 +5695,6 @@ dependencies = [
 [[package]]
 name = "wirm"
 version = "4.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82cd1a44fea828444d4f1136dff4599c88e46bb423ea7a6534276f80b14154be"
 dependencies = [
  "log",
  "paste",
