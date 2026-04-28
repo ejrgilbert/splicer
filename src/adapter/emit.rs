@@ -60,7 +60,7 @@ pub(crate) fn build_adapter(
         )
         .context("parse synthesized adapter world WIT")?;
     let world_id = resolve
-        .select_world(&[world_pkg], Some("adapter"))
+        .select_world(&[world_pkg], Some(ADAPTER_WORLD_NAME))
         .context("select adapter world")?;
 
     let mut core_module = build_dispatch_module(
@@ -187,23 +187,39 @@ fn synthesize_adapter_world_wit(
     has_after: bool,
     has_blocking: bool,
 ) -> String {
-    let mut wit = String::from("package splicer:adapter;\n\nworld adapter {\n");
+    use crate::contract::{
+        versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
+    };
+    let mut wit = format!("package {ADAPTER_WORLD_PACKAGE};\n\nworld {ADAPTER_WORLD_NAME} {{\n");
     wit.push_str(&format!("    import {target_interface};\n"));
     wit.push_str(&format!("    export {target_interface};\n"));
+    let mut import_hook = |iface: &str| {
+        wit.push_str(&format!(
+            "    import {};\n",
+            versioned_interface(iface, TIER1_VERSION)
+        ));
+    };
     if has_before {
-        wit.push_str("    import splicer:tier1/before@0.1.0;\n");
+        import_hook(TIER1_BEFORE);
     }
     if has_after {
-        wit.push_str("    import splicer:tier1/after@0.1.0;\n");
+        import_hook(TIER1_AFTER);
     }
     if has_blocking {
-        wit.push_str("    import splicer:tier1/blocking@0.1.0;\n");
+        import_hook(TIER1_BLOCKING);
     }
     wit.push_str("}\n");
     wit
 }
 
 // ─── Dispatch core module ──────────────────────────────────────────
+
+/// `(module, name, sig)` from [`WitFunction::task_return_import`].
+struct TaskReturnImport {
+    module: String,
+    name: String,
+    sig: WasmSignature,
+}
 
 /// Per-function dispatch shape. All sigs and mangled names come from
 /// [`Resolve::wasm_signature`] / [`Resolve::wasm_import_name`] /
@@ -232,14 +248,6 @@ struct FuncDispatch {
     /// Offset of the retptr scratch buffer; set iff `import_sig.retptr`.
     retptr_offset: Option<i32>,
 }
-
-/// `(module, name, sig)` from [`WitFunction::task_return_import`].
-struct TaskReturnImport {
-    module: String,
-    name: String,
-    sig: WasmSignature,
-}
-
 impl FuncDispatch {
     /// Single flat result for the Direct (non-retptr, non-void) case.
     fn direct_result(&self) -> Option<ValType> {
@@ -258,6 +266,31 @@ fn val_types(types: &[WasmType]) -> Vec<ValType> {
 
 /// The dispatch module has one global — the bump pointer.
 const BUMP_POINTER_GLOBAL: u32 = 0;
+
+/// Synthesized adapter world's package + world name. The contents
+/// don't matter as long as `select_world` and the WIT we push agree
+/// on both.
+const ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter";
+const ADAPTER_WORLD_NAME: &str = "adapter";
+
+/// Module name + intrinsic field names for the canon-async runtime
+/// builtins the dispatch module imports. These are wit-component
+/// contract — not exposed via wit-parser's API; the canonical list
+/// lives in `wit-component::dummy::push_root_async_intrinsics`.
+const ASYNC_INTRINSIC_MODULE: &str = "$root";
+const WAITABLE_SET_NEW: &str = "[waitable-set-new]";
+const WAITABLE_JOIN: &str = "[waitable-join]";
+const WAITABLE_SET_WAIT: &str = "[waitable-set-wait]";
+const WAITABLE_SET_DROP: &str = "[waitable-set-drop]";
+const SUBTASK_DROP: &str = "[subtask-drop]";
+
+/// Standard wasm exports the dispatch module exposes. Sourced as
+/// strings rather than re-derived from `Resolve::wasm_export_name`
+/// because they're invariants of `wit_component::ComponentEncoder`'s
+/// Legacy mangling, not anything that varies per-resolve.
+const EXPORT_MEMORY: &str = "memory";
+const EXPORT_CABI_REALLOC: &str = "cabi_realloc";
+const EXPORT_INITIALIZE: &str = "_initialize";
 
 /// Type-section indices. `task_return_ty[i]` is `Some` iff func `i` is async.
 struct TypeIndices {
@@ -531,6 +564,9 @@ fn collect_hook_imports(
     has_after: bool,
     has_blocking: bool,
 ) -> HookImports {
+    use crate::contract::{
+        versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
+    };
     let world = &resolve.worlds[world_id];
     let resolve_one = |iface_name: &str| -> Option<HookImport> {
         world.imports.iter().find_map(|(key, item)| {
@@ -553,16 +589,16 @@ fn collect_hook_imports(
             Some(HookImport { module, name, sig })
         })
     };
+    let pick = |active: bool, iface: &str| -> Option<HookImport> {
+        if !active {
+            return None;
+        }
+        resolve_one(&versioned_interface(iface, TIER1_VERSION))
+    };
     HookImports {
-        before: has_before
-            .then(|| resolve_one("splicer:tier1/before@0.1.0"))
-            .flatten(),
-        after: has_after
-            .then(|| resolve_one("splicer:tier1/after@0.1.0"))
-            .flatten(),
-        blocking: has_blocking
-            .then(|| resolve_one("splicer:tier1/blocking@0.1.0"))
-            .flatten(),
+        before: pick(has_before, TIER1_BEFORE),
+        after: pick(has_after, TIER1_AFTER),
+        blocking: pick(has_blocking, TIER1_BLOCKING),
     }
 }
 
@@ -712,36 +748,15 @@ fn emit_imports_section(
 
     let async_runtime = type_idx.async_runtime.as_ref().map(|art| {
         let event_ptr = event_ptr.expect("event_ptr must be set when async_runtime is");
-        imports.import(
-            "$root",
-            "[waitable-set-new]",
-            EntityType::Function(art.waitable_new_ty),
-        );
-        let waitable_new = idx.alloc_func();
-        imports.import(
-            "$root",
-            "[waitable-join]",
-            EntityType::Function(art.waitable_join_ty),
-        );
-        let waitable_join = idx.alloc_func();
-        imports.import(
-            "$root",
-            "[waitable-set-wait]",
-            EntityType::Function(art.waitable_wait_ty),
-        );
-        let waitable_wait = idx.alloc_func();
-        imports.import(
-            "$root",
-            "[waitable-set-drop]",
-            EntityType::Function(art.void_i32_ty),
-        );
-        let waitable_drop = idx.alloc_func();
-        imports.import(
-            "$root",
-            "[subtask-drop]",
-            EntityType::Function(art.void_i32_ty),
-        );
-        let subtask_drop = idx.alloc_func();
+        let mut import_intrinsic = |name: &str, ty: u32| {
+            imports.import(ASYNC_INTRINSIC_MODULE, name, EntityType::Function(ty));
+            idx.alloc_func()
+        };
+        let waitable_new = import_intrinsic(WAITABLE_SET_NEW, art.waitable_new_ty);
+        let waitable_join = import_intrinsic(WAITABLE_JOIN, art.waitable_join_ty);
+        let waitable_wait = import_intrinsic(WAITABLE_SET_WAIT, art.waitable_wait_ty);
+        let waitable_drop = import_intrinsic(WAITABLE_SET_DROP, art.void_i32_ty);
+        let subtask_drop = import_intrinsic(SUBTASK_DROP, art.void_i32_ty);
         AsyncRuntimeFuncs {
             waitable_new,
             waitable_join,
@@ -857,12 +872,12 @@ fn emit_export_section(module: &mut Module, per_func: &[FuncDispatch], func_idx:
             exports.export(&post_name, ExportKind::Func, post_idx);
         }
     }
-    exports.export("memory", ExportKind::Memory, 0);
+    exports.export(EXPORT_MEMORY, ExportKind::Memory, 0);
     let realloc_idx = func_idx
         .cabi_realloc
         .expect("cabi_realloc is always emitted");
-    exports.export("cabi_realloc", ExportKind::Func, realloc_idx);
-    exports.export("_initialize", ExportKind::Func, func_idx.init);
+    exports.export(EXPORT_CABI_REALLOC, ExportKind::Func, realloc_idx);
+    exports.export(EXPORT_INITIALIZE, ExportKind::Func, func_idx.init);
     module.section(&exports);
 }
 
