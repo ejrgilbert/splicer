@@ -1,10 +1,7 @@
 use crate::adapter::generate_tier1_adapter;
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
-use cviz::model::{
-    ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection, InterfaceType, InternedId,
-    TypeArena,
-};
+use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -52,7 +49,6 @@ impl Chain {
 struct Contract {
     name: String,
     ty_fingerprint: Option<String>,
-    interface_type: Option<InterfaceType>,
 }
 
 /// One entry in [`WacOutput::generated_adapters`] — a tier-1 adapter
@@ -128,7 +124,7 @@ pub fn generate_wac(
             source_instance,
             is_host_import,
             fingerprint,
-            interface_type: iface_ty,
+            ..
         } in node.imports.iter()
         {
             let mut chain = vec![*outer_node_id];
@@ -160,7 +156,6 @@ pub fn generate_wac(
                     interface: Contract {
                         name: interface_name.to_string(),
                         ty_fingerprint: fingerprint.clone(),
-                        interface_type: iface_ty.clone(),
                     },
                     chain,
                     aliases: HashMap::new(),
@@ -177,27 +172,19 @@ pub fn generate_wac(
         ExportInfo {
             source_instance: source_inst,
             fingerprint,
-            ty: export_ty,
+            ..
         },
     ) in composition.component_exports.iter()
     {
         if handled_interfaces.contains(interface) {
             continue;
         }
-        // Resolve the interface type from the export info if available.
-        let interface_type = export_ty.and_then(|id| match id {
-            InternedId::Interface(iface_id) => {
-                Some(composition.arena.lookup_interface(iface_id).clone())
-            }
-            _ => None,
-        });
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
         chains.push(Chain {
             interface: Contract {
                 name: interface.to_string(),
                 ty_fingerprint: fingerprint.clone(),
-                interface_type,
             },
             chain: vec![*source_inst],
             aliases: HashMap::new(),
@@ -782,10 +769,8 @@ fn apply_rule_between(
                     &mut chain.aliases,
                     &mut chain.inject_plan,
                     &chain.interface.ty_fingerprint,
-                    chain.interface.interface_type.as_ref(),
                     splits_path,
                     consumer_path,
-                    &composition.arena,
                     checked_middlewares,
                     generated_adapters,
                 )?);
@@ -848,10 +833,8 @@ fn apply_rule_before(
                 &mut chain.aliases,
                 &mut chain.inject_plan,
                 &chain.interface.ty_fingerprint,
-                chain.interface.interface_type.as_ref(),
                 splits_path,
                 consumer_path,
-                &composition.arena,
                 checked_middlewares,
                 generated_adapters,
             )?);
@@ -873,10 +856,8 @@ fn add_to_inject_plan(
     aliases: &mut HashMap<u32, Option<String>>,
     inject_plan: &mut InjectPlan,
     contract_fingerprint: &Option<String>,
-    interface_type: Option<&InterfaceType>,
     splits_path: &str,
     consumer_split: Option<String>,
-    arena: &TypeArena,
     checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: &mut Vec<GeneratedAdapter>,
 ) -> anyhow::Result<Vec<ContractResult>> {
@@ -915,10 +896,8 @@ fn add_to_inject_plan(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
-                    interface_type,
                     splits_path,
                     consumer_split_path,
-                    arena,
                 )?;
                 generated_adapters.push(GeneratedAdapter {
                     adapter_path: adapter_path.clone(),

@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "splicer"
-version = "2.0.3"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -3770,7 +3770,6 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "wac-graph",
  "wac-parser",
@@ -3782,6 +3781,7 @@ dependencies = [
  "wat",
  "wirm",
  "wit-bindgen-core 0.57.1",
+ "wit-component 0.247.0",
  "wit-parser 0.247.0",
 ]
 
@@ -5694,9 +5694,9 @@ dependencies = [
 
 [[package]]
 name = "wirm"
-version = "4.0.3"
+version = "4.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82cd1a44fea828444d4f1136dff4599c88e46bb423ea7a6534276f80b14154be"
+checksum = "4b545057c2fa3f2a83aa2d23f9010e372b880aa6973f04c0cb8400a2e813e8f0"
 dependencies = [
  "log",
  "paste",

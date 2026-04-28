@@ -1,80 +1,23 @@
-//! Running index allocators for the wasm namespaces the adapter
-//! emits into. Each struct hands out indices and saves every emitter
-//! from threading `&mut u32` counters around.
+//! Running index allocators for the wasm namespaces the dispatch core
+//! module emits into.
 //!
-//! - [`ComponentIndices`] — component-level type / instance / func
-//!   indices plus the embedded core-module's instance / func indices.
 //! - [`DispatchIndices`] — type and function indices INSIDE the
-//!   dispatch core module. Disjoint from [`ComponentIndices`]; the
-//!   core module only talks to the outer component through named
-//!   env imports.
-//! - [`FunctionIndices`] — local allocator for a single wasm
-//!   function body. `base` is the first free slot above the
-//!   function's parameters; each `alloc_local` returns the next
-//!   index and records the type so the caller can build the
-//!   `Function` from [`FunctionIndices::into_locals`] at the end.
+//!   dispatch core module.
+//! - [`FunctionIndices`] — local allocator for a single wasm function
+//!   body. The first `alloc_local` returns index `param_count`;
+//!   [`FunctionIndices::into_locals`] hands back the typed local list
+//!   for `wasm_encoder::Function::new_with_locals_types`.
 
 use wasm_encoder::ValType;
 
-/// Running index allocators for the outer component's various
-/// core-level namespaces. One instance lives in `build_adapter_bytes`
-/// and is threaded through every phase by `&mut`, so phases no longer
-/// need to carry "where did we leave the type counter?" state in
-/// their outcome structs.
-#[derive(Default)]
-pub(crate) struct ComponentIndices {
-    pub ty: u32,
-    pub inst: u32,
-    pub func: u32,
-    pub core_inst: u32,
-    pub core_func: u32,
-}
-
-impl ComponentIndices {
-    pub fn alloc_ty(&mut self) -> u32 {
-        let idx = self.ty;
-        self.ty += 1;
-        idx
-    }
-    pub fn alloc_inst(&mut self) -> u32 {
-        let idx = self.inst;
-        self.inst += 1;
-        idx
-    }
-    pub fn alloc_func(&mut self) -> u32 {
-        let idx = self.func;
-        self.func += 1;
-        idx
-    }
-    pub fn alloc_core_inst(&mut self) -> u32 {
-        let idx = self.core_inst;
-        self.core_inst += 1;
-        idx
-    }
-    pub fn alloc_core_func(&mut self) -> u32 {
-        let idx = self.core_func;
-        self.core_func += 1;
-        idx
-    }
-}
-
 /// Running index allocators for the dispatch core module's type and
-/// function spaces. Scoped to a single call of `build_dispatch_module`.
-///
-/// These are CORE-MODULE-INTERNAL indices. The dispatch module is a
-/// self-contained core wasm module that only communicates with the
-/// outer component through named env imports (`env/mem`,
-/// `env/handler_f{i}`, …), so its type and function tables have no
-/// relationship to the outer component's indices tracked by
-/// [`ComponentIndices`]. Keeping them in a separate struct makes the
-/// "two different index spaces" explicit and saves every type/import
-/// emitter from threading its own `&mut u32`.
+/// function spaces. Scoped to a single `build_adapter` call.
 pub(crate) struct DispatchIndices {
     /// Next free slot in the core module's `TypeSection`.
     pub ty: u32,
     /// Next free index in the core module's function space. Imports
-    /// come first (contiguous from 0), then the defined wrapper funcs
-    /// in the code section (contiguous after the last import).
+    /// come first (contiguous from 0), then defined wrapper funcs
+    /// after.
     pub func: u32,
 }
 
@@ -83,14 +26,12 @@ impl DispatchIndices {
         Self { ty: 0, func: 0 }
     }
 
-    /// Reserve the next type-section slot and return its index.
     pub fn alloc_ty(&mut self) -> u32 {
         let idx = self.ty;
         self.ty += 1;
         idx
     }
 
-    /// Reserve the next function-index slot and return its index.
     pub fn alloc_func(&mut self) -> u32 {
         let idx = self.func;
         self.func += 1;
@@ -102,10 +43,7 @@ impl DispatchIndices {
 /// free slot above the function's parameters; allocated locals count
 /// up from there.
 pub(crate) struct FunctionIndices {
-    /// First local index — one past the last parameter.
     base: u32,
-    /// Types of locals in allocation order. Fed directly into
-    /// [`wasm_encoder::Function::new_with_locals_types`].
     locals: Vec<ValType>,
 }
 
@@ -154,18 +92,6 @@ mod tests {
         let mut idx = FunctionIndices::new(0);
         assert_eq!(idx.alloc_local(ValType::I32), 0);
         assert_eq!(idx.alloc_local(ValType::F64), 1);
-    }
-
-    #[test]
-    fn component_indices_track_each_namespace_independently() {
-        let mut idx = ComponentIndices::default();
-        assert_eq!(idx.alloc_ty(), 0);
-        assert_eq!(idx.alloc_ty(), 1);
-        assert_eq!(idx.alloc_inst(), 0);
-        assert_eq!(idx.alloc_func(), 0);
-        assert_eq!(idx.alloc_core_inst(), 0);
-        assert_eq!(idx.alloc_core_func(), 0);
-        assert_eq!(idx.alloc_ty(), 2);
     }
 
     #[test]
