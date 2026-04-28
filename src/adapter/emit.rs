@@ -157,6 +157,24 @@ fn require_supported_case(
                  a return value when the call is blocked."
             );
         }
+        // Async funcs whose params overflow `MAX_FLAT_ASYNC_PARAMS = 4`
+        // canon-lower with `indirect_params = true` — the handler takes a
+        // single params-pointer instead of flat values. The wrapper export
+        // (`GuestExportAsyncStackful`, capped at `MAX_FLAT_PARAMS = 16`)
+        // still receives flat, so we'd need to lower-to-memory before the
+        // handler call. Driving `wit_bindgen_core::abi::lower_to_memory`
+        // requires extending `WasmEncoderBindgen` with the store-side
+        // `AbiInst` variants — not yet implemented.
+        if func.kind.is_async() {
+            let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
+            if import_sig.indirect_params {
+                bail!(
+                    "async function `{name}` has params that overflow \
+                     MAX_FLAT_ASYNC_PARAMS (4) and require lower-to-memory; \
+                     not yet implemented"
+                );
+            }
+        }
     }
     Ok(())
 }

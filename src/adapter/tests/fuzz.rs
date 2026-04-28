@@ -31,11 +31,41 @@ const FUZZ_MAX_DEPTH: u32 = 2;
 /// Max failures echoed into the test output before truncating.
 const MAX_FAILURES_SHOWN: usize = 20;
 
-/// Minimal repro for a bug the fuzzer surfaced: `record { f0: list<char> }`
-/// as an async result. Exercises "record with an inline compound field",
-/// a shape none of the pre-fuzz hand-written tests covered. Kept as a
-/// regression test so the fix (effective-slot tracking in the WAT split
-/// helper) doesn't silently regress.
+/// Async function whose params flatten to >`MAX_FLAT_ASYNC_PARAMS` (4)
+/// — canon-lower-async uses `indirect_params=true` (single params-ptr)
+/// but the wrapper export's flat shape doesn't, so we'd need
+/// `lower_to_memory` between them. Not yet implemented; assert we
+/// bail with a clear message rather than emit invalid wasm.
+#[test]
+fn test_adapter_async_indirect_params_bails() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let iface = make_iface(vec![(
+        "many",
+        sig(
+            true,
+            &["a", "b", "c", "d", "e"],
+            vec![u32_id; 5], // 5 > MAX_FLAT_ASYNC_PARAMS=4 → indirect_params
+            vec![u32_id],
+        ),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let split = synth_split("test:pkg/many@1.0.0", &iface, &arena, SplitKind::Consumer);
+    let err = generate_tier1_adapter(
+        "test-mdl",
+        "test:pkg/many@1.0.0",
+        &[],
+        tmp.path().to_str().unwrap(),
+        split.path().to_str().unwrap(),
+    )
+    .expect_err("async indirect-params should bail until lower_to_memory lands");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not yet implemented") && msg.contains("MAX_FLAT_ASYNC_PARAMS"),
+        "bail should mention the limit and not-yet-implemented, got: {msg}"
+    );
+}
+
 #[test]
 fn test_adapter_record_with_list_field_repro() {
     let mut arena = TypeArena::default();
