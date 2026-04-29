@@ -27,9 +27,9 @@ use wit_component::{
 };
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
-    Function as WitFunction, Handle, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi,
-    ResourceIntrinsic, Resolve, SizeAlign, Type, TypeDefKind, TypeId, TypeOwner, WasmExport,
-    WasmExportKind, WasmImport, WorldItem, WorldKey,
+    Function as WitFunction, Handle, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
+    ResourceIntrinsic, SizeAlign, Type, TypeDefKind, TypeId, TypeOwner, WasmExport, WasmExportKind,
+    WasmImport, WorldItem, WorldKey,
 };
 
 use super::abi::WasmEncoderBindgen;

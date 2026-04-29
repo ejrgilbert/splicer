@@ -39,8 +39,7 @@ impl Chain {
         shim_comps: &HashMap<usize, usize>,
     ) -> Option<String> {
         let consumer_id = *self.chain.get(chain_idx)?;
-        composition.nodes.get(&consumer_id)?;
-        let split_to_use = resolve_shim(node_split_num(consumer_id, composition), shim_comps);
+        let split_to_use = resolved_split_num(consumer_id, composition, shim_comps);
         Some(gen_split_path(splits_path, split_to_use))
     }
 }
@@ -684,7 +683,7 @@ fn gen_wac_args(
                 .unwrap_or_else(|| PathBuf::from(PATH_PLACEHOLDER))
         } else {
             // Single-component mode: derive path from the split directory.
-            let split_to_use = resolve_shim(node_split_num(*inst_id, graph), &shim_comps);
+            let split_to_use = resolved_split_num(*inst_id, graph, &shim_comps);
             PathBuf::from(gen_split_path(splits_path, split_to_use))
         };
         deps.insert(format!("{INST_PREFIX}:{name}"), comp_path);
@@ -711,6 +710,16 @@ fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) ->
 /// nodes are offset by -1 in the split keyspace).
 fn node_split_num(node_id: u32, composition: &CompositionGraph) -> usize {
     (composition.nodes[&node_id].component_num + 1) as usize
+}
+
+/// Resolve a graph node id to the split number of its non-shim outer.
+/// Composes [`node_split_num`] + [`resolve_shim`].
+fn resolved_split_num(
+    node_id: u32,
+    composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
+) -> usize {
+    resolve_shim(node_split_num(node_id, composition), shim_comps)
 }
 
 /// Emit one WARN per non-trivial `shim → resolved` mapping in
@@ -1011,7 +1020,7 @@ fn get_or_create_inst(
     // Dedup nodes that resolve to the same split file: separate `new`
     // invocations would create independent runtime instances with
     // diverged resource type identities.
-    let resolved_split = resolve_shim(node_split_num(inst_id, dedup.composition), dedup.shim_comps);
+    let resolved_split = resolved_split_num(inst_id, dedup.composition, dedup.shim_comps);
     if let Some(existing_var) = dedup.split_to_var.get(&resolved_split) {
         state.instance_vars.insert(inst_id, existing_var.clone());
         return existing_var.clone();
@@ -1201,8 +1210,9 @@ fn factored_types_to_wire(
     let providers = |iface: &str| -> std::collections::HashSet<usize> {
         let mut out = std::collections::HashSet::new();
         if let Some(info) = composition.component_exports.get(iface) {
-            out.insert(resolve_shim(
-                node_split_num(info.source_instance, composition),
+            out.insert(resolved_split_num(
+                info.source_instance,
+                composition,
                 shim_comps,
             ));
         }
@@ -1212,7 +1222,7 @@ fn factored_types_to_wire(
                     continue;
                 }
                 if let Some(src) = conn.source_instance {
-                    out.insert(resolve_shim(node_split_num(src, composition), shim_comps));
+                    out.insert(resolved_split_num(src, composition, shim_comps));
                 }
             }
         }
@@ -1293,7 +1303,7 @@ fn resolve_shim_node(
         return inst_id;
     }
     let split_num = node_split_num(inst_id, composition);
-    let resolved = resolve_shim(split_num, shim_comps);
+    let resolved = resolved_split_num(inst_id, composition, shim_comps);
     if resolved == split_num {
         return inst_id;
     }
@@ -1345,10 +1355,7 @@ mod tests {
     /// Build a graph with the given import edges. Each entry is
     /// `(consumer_node_id, interface, source_node_id, is_host_import)`.
     /// `n_nodes` placeholder nodes are created up-front.
-    fn synth_graph(
-        n_nodes: u32,
-        edges: &[(u32, &str, Option<u32>, bool)],
-    ) -> CompositionGraph {
+    fn synth_graph(n_nodes: u32, edges: &[(u32, &str, Option<u32>, bool)]) -> CompositionGraph {
         let mut graph = CompositionGraph::new();
         let mut nodes: HashMap<u32, ComponentNode> = HashMap::new();
         for i in 0..n_nodes {
