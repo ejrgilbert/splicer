@@ -291,6 +291,8 @@ pub fn generate_wac(
     let mut mdl_override = None;
     let mut last = String::new();
     let mut instance_vars: HashMap<u32, String> = HashMap::new();
+    // resolved_split_num -> wac var (dedup across same-file nodes).
+    let mut split_to_var: HashMap<usize, String> = HashMap::new();
     // orig_inst_id -> generated_outer_var
     let mut outer_instances: HashMap<u32, String> = HashMap::new();
     // inst_id -> used_name
@@ -362,11 +364,18 @@ pub fn generate_wac(
             get_or_create_inst(
                 node_id,
                 &pre_pass_aliases,
-                &mut used_comp_nodes,
                 node,
-                &mut instance_vars,
+                &mut WacState {
+                    instance_vars: &mut instance_vars,
+                    used_comp_nodes: &mut used_comp_nodes,
+                    wac_lines: &mut wac_lines,
+                },
+                &mut ShimDedup {
+                    composition,
+                    shim_comps: &shim_comps,
+                    split_to_var: &mut split_to_var,
+                },
                 &None,
-                &mut wac_lines,
             );
         }
     }
@@ -413,11 +422,18 @@ pub fn generate_wac(
                 let node_var = get_or_create_inst(
                     *id,
                     aliases,
-                    &mut used_comp_nodes,
                     node,
-                    &mut instance_vars,
+                    &mut WacState {
+                        instance_vars: &mut instance_vars,
+                        used_comp_nodes: &mut used_comp_nodes,
+                        wac_lines: &mut wac_lines,
+                    },
+                    &mut ShimDedup {
+                        composition,
+                        shim_comps: &shim_comps,
+                        split_to_var: &mut split_to_var,
+                    },
                     &mdl_override,
-                    &mut wac_lines,
                 );
                 // set up what to wire in next
                 last = node_var;
@@ -604,11 +620,18 @@ pub fn generate_wac(
             get_or_create_inst(
                 effective_inst_id,
                 &HashMap::new(),
-                &mut used_comp_nodes,
                 outer_node,
-                &mut instance_vars,
+                &mut WacState {
+                    instance_vars: &mut instance_vars,
+                    used_comp_nodes: &mut used_comp_nodes,
+                    wac_lines: &mut wac_lines,
+                },
+                &mut ShimDedup {
+                    composition,
+                    shim_comps: &shim_comps,
+                    split_to_var: &mut split_to_var,
+                },
                 &None,
-                &mut wac_lines,
             )
         };
 
@@ -955,18 +978,41 @@ fn add_to_inject_plan(
     Ok(final_results)
 }
 
+/// Shim-resolution context (compose graph + shim map + dedup map).
+struct ShimDedup<'a> {
+    composition: &'a CompositionGraph,
+    shim_comps: &'a HashMap<usize, usize>,
+    /// resolved_split_num -> wac instance var.
+    split_to_var: &'a mut HashMap<usize, String>,
+}
+
+/// Mutable wac-builder state shared across instance creation.
+struct WacState<'a> {
+    instance_vars: &'a mut HashMap<u32, String>,
+    used_comp_nodes: &'a mut HashMap<u32, String>,
+    wac_lines: &'a mut Vec<String>,
+}
+
 fn get_or_create_inst(
     inst_id: u32,
     aliases: &HashMap<u32, Option<String>>,
-    used_comp_nodes: &mut HashMap<u32, String>,
     node: &ComponentNode,
-    instance_vars: &mut HashMap<u32, String>,
+    state: &mut WacState,
+    dedup: &mut ShimDedup,
     with_override: &Option<(Contract, String)>,
-    wac_lines: &mut Vec<String>,
 ) -> String {
-    if let Some(var) = instance_vars.get(&inst_id) {
+    if let Some(var) = state.instance_vars.get(&inst_id) {
         return var.clone();
     }
+    // Dedup nodes that resolve to the same split file: separate `new`
+    // invocations would create independent runtime instances with
+    // diverged resource type identities.
+    let resolved_split = resolve_shim(node_split_num(inst_id, dedup.composition), dedup.shim_comps);
+    if let Some(existing_var) = dedup.split_to_var.get(&resolved_split) {
+        state.instance_vars.insert(inst_id, existing_var.clone());
+        return existing_var.clone();
+    }
+
     let alias = aliases.get(&inst_id).cloned();
 
     // it hasn't been instantiated yet! do so here
@@ -975,11 +1021,13 @@ fn get_or_create_inst(
     } else {
         sanitize_wac_id(get_name(node))
     };
-    used_comp_nodes.insert(inst_id, pkg.clone());
-    let node_var = instance_vars
+    state.used_comp_nodes.insert(inst_id, pkg.clone());
+    let node_var = state
+        .instance_vars
         .entry(inst_id)
         .or_insert_with(|| pkg.clone())
         .clone();
+    dedup.split_to_var.insert(resolved_split, node_var.clone());
 
     let mut line = format!("let {node_var} = new {INST_PREFIX}:{pkg} {{");
     for conn in &node.imports {
@@ -995,7 +1043,7 @@ fn get_or_create_inst(
             {
                 let src_var = if conn.interface_name == *override_interface {
                     override_var.clone()
-                } else if let Some(src_var) = instance_vars.get(&src_id.unwrap()) {
+                } else if let Some(src_var) = state.instance_vars.get(&src_id.unwrap()) {
                     // could be an import from the host!
                     // only do this if it's not
                     src_var.clone()
@@ -1011,7 +1059,7 @@ fn get_or_create_inst(
         }
     }
     line.push_str("\n    ...\n};");
-    wac_lines.push(line);
+    state.wac_lines.push(line);
 
     node_var
 }
@@ -1135,12 +1183,10 @@ fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
             continue;
         };
         let iface = &resolve.interfaces[*id];
-        let has_resource = iface.types.values().any(|tid| {
-            matches!(
-                resolve.types[*tid].kind,
-                wit_parser::TypeDefKind::Resource
-            )
-        });
+        let has_resource = iface
+            .types
+            .values()
+            .any(|tid| matches!(resolve.types[*tid].kind, wit_parser::TypeDefKind::Resource));
         if !has_resource {
             continue;
         }

@@ -157,7 +157,7 @@ fn require_supported_case(
         // still receives flat, so we'd need to lower-to-memory before the
         // handler call. Driving `wit_bindgen_core::abi::lower_to_memory`
         // requires extending `WasmEncoderBindgen` with the store-side
-        // `AbiInst` variants — not yet implemented.
+        // `AbiInst` variants. Not yet implemented.
         if func.kind.is_async() {
             let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
             if import_sig.indirect_params {
