@@ -142,13 +142,6 @@ fn require_supported_case(
         bail!("interface has no functions");
     }
     for (name, func) in &iface.functions {
-        if func.kind.resource().is_some() {
-            bail!(
-                "resource-bound function `{name}` ({:?}) \
-                 not yet handled",
-                func.kind
-            );
-        }
         if has_blocking && func.result.is_some() {
             bail!(
                 "Function '{name}' returns a value but the middleware exports \
