@@ -39,8 +39,8 @@ impl Chain {
         shim_comps: &HashMap<usize, usize>,
     ) -> Option<String> {
         let consumer_id = *self.chain.get(chain_idx)?;
-        let component_num = composition.nodes.get(&consumer_id)?.component_num + 1;
-        let split_to_use = resolve_shim(component_num as usize, shim_comps);
+        composition.nodes.get(&consumer_id)?;
+        let split_to_use = resolve_shim(node_split_num(consumer_id, composition), shim_comps);
         Some(gen_split_path(splits_path, split_to_use))
     }
 }
@@ -584,18 +584,25 @@ pub fn generate_wac(
             continue;
         }
 
+        // If the export's source is a shim sub-component, route the
+        // export through its resolved outer instance — otherwise the
+        // export creates a separate shim instance whose resource type
+        // identity diverges from the outer's. (Mirrors the shim
+        // resolution `consumer_split_path` already does for splits.)
+        let effective_inst_id = resolve_shim_node(*outer_inst_id, composition, &shim_comps);
+
         // Per-export override (set by the deferred top-level inject
         // pass) wins over the consumer's generic outer-instance var.
         let node_var = if let Some(override_var) =
-            export_overrides.get(&(*outer_inst_id, export_name.clone()))
+            export_overrides.get(&(effective_inst_id, export_name.clone()))
         {
             override_var.clone()
-        } else if let Some(generated_outer) = outer_instances.get(outer_inst_id) {
+        } else if let Some(generated_outer) = outer_instances.get(&effective_inst_id) {
             generated_outer.clone()
         } else {
-            let outer_node = &composition.nodes[outer_inst_id];
+            let outer_node = &composition.nodes[&effective_inst_id];
             get_or_create_inst(
-                *outer_inst_id,
+                effective_inst_id,
                 &HashMap::new(),
                 &mut used_comp_nodes,
                 outer_node,
@@ -650,9 +657,7 @@ fn gen_wac_args(
                 .unwrap_or_else(|| PathBuf::from(PATH_PLACEHOLDER))
         } else {
             // Single-component mode: derive path from the split directory.
-            // We reserve component 0 for the root component, so add one here.
-            let component_num = graph.nodes[inst_id].component_num + 1;
-            let split_to_use = resolve_shim(component_num as usize, &shim_comps);
+            let split_to_use = resolve_shim(node_split_num(*inst_id, graph), &shim_comps);
             PathBuf::from(gen_split_path(splits_path, split_to_use))
         };
         deps.insert(format!("{INST_PREFIX}:{name}"), comp_path);
@@ -673,6 +678,12 @@ fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) ->
         component_num = shim_comps[&component_num];
     }
     component_num
+}
+
+/// Convert a graph node id to its split number (split0 is the root;
+/// nodes are offset by -1 in the split keyspace).
+fn node_split_num(node_id: u32, composition: &CompositionGraph) -> usize {
+    (composition.nodes[&node_id].component_num + 1) as usize
 }
 
 /// Emit one WARN per non-trivial `shim → resolved` mapping in
@@ -1064,6 +1075,19 @@ fn create_tier1_mdl(
             "\n    \"{versioned}\": {real_var}[\"{versioned}\"],"
         ));
     }
+    // Wire resource-bearing factored-types imports (e.g. `my:shape/types`)
+    // explicitly — `...` doesn't unify resource type identity across
+    // separately-imported instances from a non-host component.
+    if let Ok(adapter_bytes) = std::fs::read(&adapter_info.adapter_path) {
+        for extra in resource_bearing_imports(&adapter_bytes) {
+            if extra == interface.name {
+                continue;
+            }
+            adapter_line.push_str(&format!(
+                "\n    \"{extra}\": {downstream_inst}[\"{extra}\"],"
+            ));
+        }
+    }
     adapter_line.push_str("\n    ...\n};");
     wac_lines.push(adapter_line);
 
@@ -1092,12 +1116,69 @@ fn get_name(node: &ComponentNode) -> &str {
     node.display_label()
 }
 
+/// Qualified names of the component's interface imports whose
+/// instance type contains at least one resource. Best-effort: empty
+/// on decode errors.
+fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
+    let Ok(decoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wit_component::decode(bytes)
+    })) else {
+        return Vec::new();
+    };
+    let Ok(wit_component::DecodedWasm::Component(resolve, world_id)) = decoded else {
+        return Vec::new();
+    };
+    let world = &resolve.worlds[world_id];
+    let mut result = Vec::new();
+    for (_key, item) in &world.imports {
+        let wit_parser::WorldItem::Interface { id, .. } = item else {
+            continue;
+        };
+        let iface = &resolve.interfaces[*id];
+        let has_resource = iface.types.values().any(|tid| {
+            matches!(
+                resolve.types[*tid].kind,
+                wit_parser::TypeDefKind::Resource
+            )
+        });
+        if !has_resource {
+            continue;
+        }
+        if let Some(name) = resolve.id_of(*id) {
+            result.push(name);
+        }
+    }
+    result
+}
+
 /// Returns true if the split-file number `split_num` corresponds to a shim.
 ///
 /// `split_num` is `node.component_num + 1` — the key space used by the
 /// `shim_comps` map produced by `split_out_composition`.
 fn is_shim_split_num(split_num: usize, shim_comps: &HashMap<usize, usize>) -> bool {
     shim_comps.contains_key(&split_num)
+}
+
+/// If `inst_id` is a shim node, return its resolved-outer node id.
+fn resolve_shim_node(
+    inst_id: u32,
+    composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
+) -> u32 {
+    if !composition.nodes.contains_key(&inst_id) {
+        return inst_id;
+    }
+    let split_num = node_split_num(inst_id, composition);
+    let resolved = resolve_shim(split_num, shim_comps);
+    if resolved == split_num {
+        return inst_id;
+    }
+    composition
+        .nodes
+        .iter()
+        .find(|(_, n)| (n.component_num + 1) as usize == resolved)
+        .map(|(id, _)| *id)
+        .unwrap_or(inst_id)
 }
 
 /// Convert an arbitrary node label into a valid WAC kebab-case identifier.
