@@ -454,9 +454,10 @@ pub fn generate_wac(
                             chain_interface,
                             adapter_info,
                             composition,
+                            &shim_comps,
                             &mut wac_lines,
                             &mut emitted_mdl_vars,
-                        );
+                        )?;
                         last = adapter_var;
                         used_middlewares.extend(extra_args);
                     } else {
@@ -548,9 +549,10 @@ pub fn generate_wac(
                     &deferred.chain_interface,
                     adapter_info,
                     composition,
+                    &shim_comps,
                     &mut wac_lines,
                     &mut emitted_mdl_vars,
-                );
+                )?;
                 current_provider = adapter_var;
                 used_middlewares.extend(extra_args);
             } else {
@@ -1093,9 +1095,10 @@ fn create_tier1_mdl(
     interface: &Contract,
     adapter_info: &AdapterInjectionInfo,
     composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
     wac_lines: &mut Vec<String>,
     emitted_mdl_vars: &mut std::collections::HashSet<String>,
-) -> (String, Vec<(String, String)>) {
+) -> anyhow::Result<(String, Vec<(String, String)>)> {
     let real_var = mdl.name.clone();
     // The adapter's core-wasm signature is specialized per target
     // interface, so a single middleware injected on multiple rules
@@ -1129,19 +1132,14 @@ fn create_tier1_mdl(
     }
     // Wire resource-bearing factored-types imports (e.g. `my:shape/types`)
     // explicitly — `...` doesn't unify resource type identity across
-    // separately-imported instances from a non-host component. Only
-    // wire interfaces actually exported by a component in this
-    // composition; host-provided interfaces (e.g. `wasi:http/types`)
-    // are absent from `component_exports` and `...` resolves them
-    // correctly via the runtime.
+    // separately-imported instances from a non-host component.
     if let Ok(adapter_bytes) = std::fs::read(&adapter_info.adapter_path) {
-        for extra in resource_bearing_imports(&adapter_bytes) {
-            if extra == interface.name {
-                continue;
-            }
-            if !composition.component_exports.contains_key(&extra) {
-                continue;
-            }
+        for extra in factored_types_to_wire(
+            &resource_bearing_imports(&adapter_bytes),
+            &interface.name,
+            composition,
+            shim_comps,
+        )? {
             adapter_line.push_str(&format!(
                 "\n    \"{extra}\": {downstream_inst}[\"{extra}\"],"
             ));
@@ -1160,7 +1158,7 @@ fn create_tier1_mdl(
         ),
         (adapter_var.clone(), adapter_info.adapter_path.clone()),
     ];
-    (adapter_var, used)
+    Ok((adapter_var, used))
 }
 
 fn rule_interface(rule: &SpliceRule) -> &str {
@@ -1173,6 +1171,75 @@ fn rule_interface(rule: &SpliceRule) -> &str {
 /// Helper to get the instance name from a node
 fn get_name(node: &ComponentNode) -> &str {
     node.display_label()
+}
+
+/// Decide which adapter imports to wire as factored-types, given the
+/// adapter's resource-bearing imports, the splice target, and the
+/// composition graph. Three cases per import:
+///   1. **Host-provided** (every import edge is `is_host_import`):
+///      skip — `...` resolves it via the runtime's single shared
+///      instance.
+///   2. **Same provider as the target** (every non-host import edge
+///      sources from a node that resolves to the same split as the
+///      target's provider): wire from the downstream.
+///   3. **Different provider than the target**: multi-provider
+///      factored types. Bail — the downstream doesn't actually export
+///      this interface, and wiring from a sibling provider needs
+///      plumbing this code path doesn't yet have.
+fn factored_types_to_wire(
+    resource_imports: &[String],
+    target_iface: &str,
+    composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
+) -> anyhow::Result<Vec<String>> {
+    // Resolved-shim source split numbers that provide `iface`:
+    //   - Top-level component exports (when `iface` is a leaf export
+    //     of the composition, e.g. when splicing a lone provider).
+    //   - Plus every non-host import edge sourcing `iface` (when
+    //     `iface` is consumed internally, e.g. consumer → provider).
+    // Empty set = host-provided.
+    let providers = |iface: &str| -> std::collections::HashSet<usize> {
+        let mut out = std::collections::HashSet::new();
+        if let Some(info) = composition.component_exports.get(iface) {
+            out.insert(resolve_shim(
+                node_split_num(info.source_instance, composition),
+                shim_comps,
+            ));
+        }
+        for node in composition.nodes.values() {
+            for conn in &node.imports {
+                if conn.interface_name != iface || conn.is_host_import {
+                    continue;
+                }
+                if let Some(src) = conn.source_instance {
+                    out.insert(resolve_shim(node_split_num(src, composition), shim_comps));
+                }
+            }
+        }
+        out
+    };
+    let target_providers = providers(target_iface);
+    let mut out = Vec::new();
+    for extra in resource_imports {
+        if extra == target_iface {
+            continue;
+        }
+        let extra_providers = providers(extra);
+        if extra_providers.is_empty() {
+            continue; // host-provided
+        }
+        if extra_providers != target_providers {
+            anyhow::bail!(
+                "splicer can't yet wire factored-types interface `{extra}` for adapter \
+                 on `{target_iface}`: the resource-bearing types interface is exported \
+                 by a different component than the target. Splicer's tier-1 wiring \
+                 currently assumes both interfaces come from the same provider. \
+                 Workaround: have one component export both interfaces."
+            );
+        }
+        out.push(extra.clone());
+    }
+    Ok(out)
 }
 
 /// Qualified names of the component's interface imports whose
@@ -1269,4 +1336,116 @@ fn reverse_set(set: &IndexSet<Injection>) -> Vec<Injection> {
         res.insert(0, item.clone());
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a graph with the given import edges. Each entry is
+    /// `(consumer_node_id, interface, source_node_id, is_host_import)`.
+    /// `n_nodes` placeholder nodes are created up-front.
+    fn synth_graph(
+        n_nodes: u32,
+        edges: &[(u32, &str, Option<u32>, bool)],
+    ) -> CompositionGraph {
+        let mut graph = CompositionGraph::new();
+        let mut nodes: HashMap<u32, ComponentNode> = HashMap::new();
+        for i in 0..n_nodes {
+            nodes.insert(i, ComponentNode::new(format!("$node-{i}"), i, i));
+        }
+        for (consumer, iface, src, is_host) in edges {
+            let n = nodes.get_mut(consumer).expect("node id in range");
+            n.add_import(InterfaceConnection {
+                interface_name: iface.to_string(),
+                source_instance: *src,
+                is_host_import: *is_host,
+                fingerprint: None,
+                interface_type: None,
+            });
+        }
+        for (i, node) in nodes {
+            graph.add_node(i, node);
+        }
+        graph
+    }
+
+    /// Single-provider factored types: a single provider node is the
+    /// non-host source of both api and types. Wire types from
+    /// downstream.
+    #[test]
+    fn factored_types_same_provider_wires() {
+        // node 1 = consumer; node 0 = provider. consumer imports both
+        // api and types from provider (non-host).
+        let graph = synth_graph(
+            2,
+            &[
+                (1, "my:shape/api@1.0.0", Some(0), false),
+                (1, "my:shape/types@1.0.0", Some(0), false),
+            ],
+        );
+        let extras = factored_types_to_wire(
+            &["my:shape/types@1.0.0".to_string()],
+            "my:shape/api@1.0.0",
+            &graph,
+            &HashMap::new(),
+        )
+        .expect("same-provider factored types should wire");
+        assert_eq!(extras, vec!["my:shape/types@1.0.0".to_string()]);
+    }
+
+    /// Host-provided types: every import edge is `is_host_import`. The
+    /// runtime's single shared instance handles it via `...`.
+    #[test]
+    fn factored_types_host_provided_skipped() {
+        // node 0 = srv; imports wasi:http/handler from node 1, and
+        // wasi:http/types from the host.
+        let graph = synth_graph(
+            2,
+            &[
+                (0, "wasi:http/handler@0.3.0", Some(1), false),
+                (0, "wasi:http/types@0.3.0", None, true),
+            ],
+        );
+        let extras = factored_types_to_wire(
+            &["wasi:http/types@0.3.0".to_string()],
+            "wasi:http/handler@0.3.0",
+            &graph,
+            &HashMap::new(),
+        )
+        .expect("host-provided types should be skipped, not error");
+        assert!(extras.is_empty());
+    }
+
+    /// Pathological multi-provider case: api is provided by node 1,
+    /// types is provided by node 0. Adapter on api can't safely wire
+    /// types from its downstream (node 1), so splicer bails.
+    #[test]
+    fn factored_types_multi_provider_bails() {
+        // node 2 = consumer. consumer imports api from node 1
+        // (api-provider), types from node 0 (types-provider).
+        let graph = synth_graph(
+            3,
+            &[
+                (2, "my:shape/api@1.0.0", Some(1), false),
+                (2, "my:shape/types@1.0.0", Some(0), false),
+            ],
+        );
+        let err = factored_types_to_wire(
+            &["my:shape/types@1.0.0".to_string()],
+            "my:shape/api@1.0.0",
+            &graph,
+            &HashMap::new(),
+        )
+        .expect_err("multi-provider factored types should bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my:shape/types@1.0.0"),
+            "error should name the offending interface; got: {msg}"
+        );
+        assert!(
+            msg.contains("different component"),
+            "error should explain the multi-provider problem; got: {msg}"
+        );
+    }
 }
