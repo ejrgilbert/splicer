@@ -453,6 +453,7 @@ pub fn generate_wac(
                             mdl,
                             chain_interface,
                             adapter_info,
+                            composition,
                             &mut wac_lines,
                             &mut emitted_mdl_vars,
                         );
@@ -546,6 +547,7 @@ pub fn generate_wac(
                     mdl,
                     &deferred.chain_interface,
                     adapter_info,
+                    composition,
                     &mut wac_lines,
                     &mut emitted_mdl_vars,
                 );
@@ -1084,11 +1086,13 @@ fn create_mdl(
 ///
 /// Returns `(adapter_var_name, [(pkg_name, path), ...])` where the vec has two
 /// entries: one for the real middleware and one for the adapter component.
+#[allow(clippy::too_many_arguments)]
 fn create_tier1_mdl(
     downstream_inst: &str,
     mdl: &Injection,
     interface: &Contract,
     adapter_info: &AdapterInjectionInfo,
+    composition: &CompositionGraph,
     wac_lines: &mut Vec<String>,
     emitted_mdl_vars: &mut std::collections::HashSet<String>,
 ) -> (String, Vec<(String, String)>) {
@@ -1125,10 +1129,17 @@ fn create_tier1_mdl(
     }
     // Wire resource-bearing factored-types imports (e.g. `my:shape/types`)
     // explicitly — `...` doesn't unify resource type identity across
-    // separately-imported instances from a non-host component.
+    // separately-imported instances from a non-host component. Only
+    // wire interfaces actually exported by a component in this
+    // composition; host-provided interfaces (e.g. `wasi:http/types`)
+    // are absent from `component_exports` and `...` resolves them
+    // correctly via the runtime.
     if let Ok(adapter_bytes) = std::fs::read(&adapter_info.adapter_path) {
         for extra in resource_bearing_imports(&adapter_bytes) {
             if extra == interface.name {
+                continue;
+            }
+            if !composition.component_exports.contains_key(&extra) {
                 continue;
             }
             adapter_line.push_str(&format!(
