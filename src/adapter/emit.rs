@@ -15,6 +15,7 @@
 //! results) goes through here.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashMap;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
     Function, FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection, MemoryType,
@@ -24,10 +25,11 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_component::{
     decode, embed_component_metadata, ComponentEncoder, DecodedWasm, StringEncoding,
 };
-use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
+use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
-    Function as WitFunction, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
-    SizeAlign, Type, WasmExport, WasmExportKind, WasmImport, WorldItem, WorldKey,
+    Function as WitFunction, Handle, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi,
+    ResourceIntrinsic, Resolve, SizeAlign, Type, TypeDefKind, TypeId, TypeOwner, WasmExport,
+    WasmExportKind, WasmImport, WorldItem, WorldKey,
 };
 
 use super::abi::WasmEncoderBindgen;
@@ -240,6 +242,10 @@ struct FuncDispatch {
     name_len: i32,
     /// Offset of the retptr scratch buffer; set iff `import_sig.retptr`.
     retptr_offset: Option<i32>,
+    /// `(flat_param_idx, resource_type_id)` for each top-level
+    /// `borrow<R>` param. The runtime requires us to drop the borrow
+    /// before the wrapper returns; see `emit_wrapper_body`.
+    borrow_drops: Vec<(u32, TypeId)>,
 }
 impl FuncDispatch {
     /// Single flat result for the Direct (non-retptr, non-void) case.
@@ -255,6 +261,40 @@ impl FuncDispatch {
 /// wit-parser [`WasmType`]s → wasm-encoder [`ValType`]s.
 fn val_types(types: &[WasmType]) -> Vec<ValType> {
     types.iter().copied().map(wasm_type_to_val).collect()
+}
+
+/// Top-level `borrow<R>` params, returned as `(flat_idx, resource_id)`.
+/// Top-level only — borrows nested inside compound params aren't yet
+/// dropped (out of scope until the fuzzer surfaces such shapes).
+fn collect_borrow_drops(resolve: &Resolve, func: &WitFunction) -> Vec<(u32, TypeId)> {
+    let mut out = Vec::new();
+    let mut flat_idx: u32 = 0;
+    for param in &func.params {
+        if let Type::Id(tid) = param.ty {
+            if let TypeDefKind::Handle(Handle::Borrow(rid)) = &resolve.types[tid].kind {
+                out.push((flat_idx, resolve_type_alias(resolve, *rid)));
+                flat_idx += 1;
+                continue;
+            }
+        }
+        let mut storage = vec![WasmType::I32; 32];
+        let mut flat = FlatTypes::new(storage.as_mut_slice());
+        if !resolve.push_flat(&param.ty, &mut flat) {
+            return Vec::new();
+        }
+        flat_idx += flat.to_vec().len() as u32;
+    }
+    out
+}
+
+/// Follow `TypeDefKind::Type` aliases to the underlying definition
+/// (e.g. an `api`-side `use types.{cat}` alias → the `types`-side
+/// `resource cat` definition).
+fn resolve_type_alias(resolve: &Resolve, mut tid: TypeId) -> TypeId {
+    while let TypeDefKind::Type(Type::Id(next)) = &resolve.types[tid].kind {
+        tid = *next;
+    }
+    tid
 }
 
 /// The dispatch module has one global — the bump pointer.
@@ -299,6 +339,9 @@ struct TypeIndices {
     cabi_post_ty: u32,
     cabi_realloc_ty: u32,
     async_runtime: Option<AsyncRuntimeTypes>,
+    /// `(func (param i32))` for `[resource-drop]<R>` imports. `Some`
+    /// iff any per_func has borrow params.
+    resource_drop_ty: Option<u32>,
 }
 
 /// Canon-async runtime builtin types (`$root/[waitable-*]`,
@@ -334,6 +377,9 @@ struct FuncIndices {
     /// retptr into. `Some` iff blocking is active.
     block_result_ptr: Option<i32>,
     async_runtime: Option<AsyncRuntimeFuncs>,
+    /// `[resource-drop]<R>` import per resource referenced by a borrow
+    /// param across `per_func`.
+    resource_drop: HashMap<TypeId, u32>,
 }
 
 /// Canon-async runtime builtin indices + the wait-event scratch
@@ -392,6 +438,7 @@ fn build_dispatch_module(
         &hook_imports,
         event_ptr,
         block_result_ptr,
+        resolve,
     );
     let func_idx = emit_function_section(&mut module, &mut idx, &per_func, &type_idx, func_idx);
     emit_memory_and_globals(&mut module, bump_start);
@@ -490,6 +537,7 @@ fn compute_func_dispatches(
                 func.task_return_import(resolve, Some(&target_world_key), Mangling::Legacy);
             TaskReturnImport { module, name, sig }
         });
+        let borrow_drops = collect_borrow_drops(resolve, func);
         per_func.push(FuncDispatch {
             import_module,
             import_field,
@@ -502,6 +550,7 @@ fn compute_func_dispatches(
             name_offset,
             name_len: qualified_name.len() as i32,
             retptr_offset,
+            borrow_drops,
         });
     }
     // [`MemoryLayoutBuilder`] is single-cursor — fixed slots land
@@ -682,6 +731,18 @@ fn emit_type_section(
         }
     });
 
+    // `[resource-drop]<R>`: `(func (param i32))`. Reuse async runtime's
+    // void-i32 slot when available; otherwise allocate fresh.
+    let needs_resource_drop = per_func.iter().any(|f| !f.borrow_drops.is_empty());
+    let resource_drop_ty = needs_resource_drop.then(|| {
+        if let Some(art) = &async_runtime {
+            art.void_i32_ty
+        } else {
+            types.ty().function([ValType::I32], []);
+            idx.alloc_ty()
+        }
+    });
+
     module.section(&types);
     TypeIndices {
         handler_ty,
@@ -693,6 +754,7 @@ fn emit_type_section(
         cabi_post_ty,
         cabi_realloc_ty,
         async_runtime,
+        resource_drop_ty,
     }
 }
 
@@ -710,6 +772,7 @@ fn emit_imports_section(
     hook_imports: &HookImports,
     event_ptr: Option<i32>,
     block_result_ptr: Option<i32>,
+    resolve: &Resolve,
 ) -> FuncIndices {
     let mut imports = ImportSection::new();
     let mut imp_handler: Vec<u32> = Vec::with_capacity(per_func.len());
@@ -720,6 +783,38 @@ fn emit_imports_section(
             EntityType::Function(type_idx.handler_ty[i]),
         );
         imp_handler.push(idx.alloc_func());
+    }
+    // `[resource-drop]<R>` imports for each unique resource referenced
+    // by a borrow param. Imported from the owning interface (factored
+    // types: resource lives in `<pkg>/types`, not the using interface).
+    let mut resource_drop: HashMap<TypeId, u32> = HashMap::new();
+    if let Some(drop_ty) = type_idx.resource_drop_ty {
+        let mut unique: Vec<TypeId> = per_func
+            .iter()
+            .flat_map(|f| f.borrow_drops.iter().map(|(_, rid)| *rid))
+            .collect();
+        unique.sort();
+        unique.dedup();
+        for rid in unique {
+            // Drop is imported from the resource's owning interface
+            // (e.g. `<pkg>/types`), not from the using interface.
+            // `wasm_import_name` then returns the canonical
+            // `<owner-iface>` / `[resource-drop]<R>` pair.
+            let owner_iface = match resolve.types[rid].owner {
+                TypeOwner::Interface(iid) => iid,
+                _ => continue,
+            };
+            let owner_key = WorldKey::Interface(owner_iface);
+            let imp = WasmImport::ResourceIntrinsic {
+                interface: Some(&owner_key),
+                resource: rid,
+                intrinsic: ResourceIntrinsic::ImportedDrop,
+            };
+            let (module_name, field_name) =
+                resolve.wasm_import_name(ManglingAndAbi::Legacy(LiftLowerAbi::Sync), imp);
+            imports.import(&module_name, &field_name, EntityType::Function(drop_ty));
+            resource_drop.insert(rid, idx.alloc_func());
+        }
     }
     let mut import_hook = |hook: &HookImport| {
         imports.import(
@@ -785,6 +880,7 @@ fn emit_imports_section(
         cabi_realloc: None,
         block_result_ptr,
         async_runtime,
+        resource_drop,
     }
 }
 
@@ -907,6 +1003,7 @@ fn emit_code_section(
                     .async_runtime
                     .as_ref()
                     .expect("async runtime imports active when any func is async"),
+                &func_idx.resource_drop,
             );
         } else {
             emit_wrapper_body(
@@ -917,6 +1014,7 @@ fn emit_code_section(
                 func_idx.imp_after,
                 blocking.as_ref(),
                 func_idx.async_runtime.as_ref(),
+                &func_idx.resource_drop,
             );
         }
     }
@@ -960,6 +1058,7 @@ fn emit_wrapper_body(
     imp_after: Option<u32>,
     blocking: Option<&BlockingConfig>,
     async_runtime: Option<&AsyncRuntimeFuncs>,
+    resource_drop: &HashMap<TypeId, u32>,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = FunctionIndices::new(nparams);
@@ -996,6 +1095,13 @@ fn emit_wrapper_body(
     }
     if let Some(idx) = imp_after {
         emit_hook_call(&mut f, fd, idx, async_runtime, wait_locals);
+    }
+    // Drop borrow handles before returning — the runtime requires
+    // every borrow lifted on entry to be dropped before exit.
+    for (flat_idx, rid) in &fd.borrow_drops {
+        let drop_fn = resource_drop[rid];
+        f.instructions().local_get(*flat_idx);
+        f.instructions().call(drop_fn);
     }
     if let Some(local) = result_local {
         f.instructions().local_get(local);
@@ -1062,6 +1168,7 @@ fn emit_async_wrapper_body(
     blocking: Option<&BlockingConfig>,
     imp_task_return: u32,
     async_runtime: &AsyncRuntimeFuncs,
+    resource_drop: &HashMap<TypeId, u32>,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = FunctionIndices::new(nparams);
@@ -1123,6 +1230,13 @@ fn emit_async_wrapper_body(
 
     if let Some(idx) = imp_after {
         emit_hook_call(&mut f, fd, idx, Some(async_runtime), wait_locals);
+    }
+
+    // Drop borrow handles before returning.
+    for (flat_idx, rid) in &fd.borrow_drops {
+        let drop_fn = resource_drop[rid];
+        f.instructions().local_get(*flat_idx);
+        f.instructions().call(drop_fn);
     }
 
     // task.return shape: void (no args), retptr (pass the buffer

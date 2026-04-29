@@ -684,9 +684,7 @@ impl Shape {
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => false,
             Shape::Option(inner) | Shape::List(inner) => inner.contains_resource(),
             Shape::Tuple(parts) => parts.iter().any(Shape::contains_resource),
-            Shape::Record { fields, .. } => {
-                fields.iter().any(|(_, s)| s.contains_resource())
-            }
+            Shape::Record { fields, .. } => fields.iter().any(|(_, s)| s.contains_resource()),
             Shape::Variant { cases, .. } => cases
                 .iter()
                 .any(|c| c.payload.as_ref().is_some_and(Shape::contains_resource)),
@@ -731,8 +729,14 @@ impl Shape {
                     e.collect_resources(out);
                 }
             }
-            Shape::ResourceOwn { wit_name, rust_name }
-            | Shape::ResourceBorrow { wit_name, rust_name } => {
+            Shape::ResourceOwn {
+                wit_name,
+                rust_name,
+            }
+            | Shape::ResourceBorrow {
+                wit_name,
+                rust_name,
+            } => {
                 if !out.iter().any(|(w, _)| w == wit_name) {
                     out.push((*wit_name, *rust_name));
                 }
