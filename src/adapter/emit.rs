@@ -143,6 +143,31 @@ fn require_supported_case(
     if iface.functions.is_empty() {
         bail!("interface has no functions");
     }
+    // Inline-resource interfaces (resources declared in the same
+    // interface that uses them) can't survive splicer's wrapper
+    // pattern: `wit_component::ComponentEncoder` synthesizes a fresh
+    // resource type for the export instance, and runtime handle
+    // identity diverges from the import side. Bail with a clear
+    // error pointing at the factored-types fix.
+    for (ty_name, &tid) in &iface.types {
+        let td = &resolve.types[tid];
+        if matches!(td.kind, TypeDefKind::Resource)
+            && matches!(td.owner, TypeOwner::Interface(owner) if owner == target_iface)
+        {
+            let iface_name = resolve
+                .id_of(target_iface)
+                .unwrap_or_else(|| iface.name.clone().unwrap_or_default());
+            bail!(
+                "interface `{iface_name}` declares resource `{ty_name}` inline. \
+                 Splicer's wrapper-component pattern can't preserve resource \
+                 type identity for inline resources — runtime handle traffic \
+                 between the import side and export side will be rejected. \
+                 Move `{ty_name}` into a sibling `types` interface and \
+                 reference it via `use types.{{{ty_name}}}` (the wasi-style \
+                 factored-types pattern)."
+            );
+        }
+    }
     for (name, func) in &iface.functions {
         if has_blocking && func.result.is_some() {
             bail!(
@@ -1353,4 +1378,93 @@ fn emit_cabi_realloc(code: &mut CodeSection) {
     f.instructions().local_get(scratch);
     f.instructions().end();
     code.function(&f);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse `wit`, find `<pkg_name>/<iface_name>`, return its
+    /// `InterfaceId`. Drives `require_supported_case` directly from a
+    /// WIT source string.
+    fn iface_from_wit(wit: &str, pkg_name: &str, iface_name: &str) -> (Resolve, InterfaceId) {
+        let mut resolve = Resolve::default();
+        resolve.push_str("test.wit", wit).expect("parse test WIT");
+        let target = format!("{pkg_name}/{iface_name}");
+        let iface_id = resolve
+            .interfaces
+            .iter()
+            .find(|(id, _)| resolve.id_of(*id).as_deref() == Some(&target))
+            .map(|(id, _)| id)
+            .expect("target interface present");
+        (resolve, iface_id)
+    }
+
+    /// Inline-resource interface (`resource cat` declared inside the
+    /// same interface that uses it) bails with a clear error pointing
+    /// at the factored-types fix.
+    #[test]
+    fn require_supported_case_bails_on_inline_resource() {
+        let (resolve, iface_id) = iface_from_wit(
+            r#"
+            package my:shape@1.0.0;
+            interface api {
+                resource cat { constructor(); }
+                foo: func(x: cat) -> cat;
+            }
+            "#,
+            "my:shape",
+            "api@1.0.0",
+        );
+        let err = require_supported_case(&resolve, iface_id, false)
+            .expect_err("inline resource should bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("declares resource `cat` inline"),
+            "error should call out the inline declaration; got: {msg}"
+        );
+        assert!(
+            msg.contains("factored-types pattern"),
+            "error should point at the factored-types fix; got: {msg}"
+        );
+    }
+
+    /// Factored-types: resource in a sibling `types` interface,
+    /// referenced via `use types.{{cat}}` in `api`. Accepted.
+    #[test]
+    fn require_supported_case_accepts_factored_types() {
+        let (resolve, iface_id) = iface_from_wit(
+            r#"
+            package my:shape@1.0.0;
+            interface types {
+                resource cat { constructor(); }
+            }
+            interface api {
+                use types.{cat};
+                foo: func(x: cat) -> cat;
+            }
+            "#,
+            "my:shape",
+            "api@1.0.0",
+        );
+        require_supported_case(&resolve, iface_id, false)
+            .expect("factored-types should be accepted");
+    }
+
+    /// Sanity: value-type-only interfaces (no resources at all) pass.
+    #[test]
+    fn require_supported_case_accepts_value_types() {
+        let (resolve, iface_id) = iface_from_wit(
+            r#"
+            package my:shape@1.0.0;
+            interface api {
+                foo: func(x: u32) -> u32;
+            }
+            "#,
+            "my:shape",
+            "api@1.0.0",
+        );
+        require_supported_case(&resolve, iface_id, false)
+            .expect("value-type interfaces should be accepted");
+    }
 }
