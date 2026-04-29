@@ -39,8 +39,7 @@ impl Chain {
         shim_comps: &HashMap<usize, usize>,
     ) -> Option<String> {
         let consumer_id = *self.chain.get(chain_idx)?;
-        let component_num = composition.nodes.get(&consumer_id)?.component_num + 1;
-        let split_to_use = resolve_shim(component_num as usize, shim_comps);
+        let split_to_use = resolved_split_num(consumer_id, composition, shim_comps);
         Some(gen_split_path(splits_path, split_to_use))
     }
 }
@@ -291,6 +290,8 @@ pub fn generate_wac(
     let mut mdl_override = None;
     let mut last = String::new();
     let mut instance_vars: HashMap<u32, String> = HashMap::new();
+    // resolved_split_num -> wac var (dedup across same-file nodes).
+    let mut split_to_var: HashMap<usize, String> = HashMap::new();
     // orig_inst_id -> generated_outer_var
     let mut outer_instances: HashMap<u32, String> = HashMap::new();
     // inst_id -> used_name
@@ -362,11 +363,18 @@ pub fn generate_wac(
             get_or_create_inst(
                 node_id,
                 &pre_pass_aliases,
-                &mut used_comp_nodes,
                 node,
-                &mut instance_vars,
+                &mut WacState {
+                    instance_vars: &mut instance_vars,
+                    used_comp_nodes: &mut used_comp_nodes,
+                    wac_lines: &mut wac_lines,
+                },
+                &mut ShimDedup {
+                    composition,
+                    shim_comps: &shim_comps,
+                    split_to_var: &mut split_to_var,
+                },
                 &None,
-                &mut wac_lines,
             );
         }
     }
@@ -413,11 +421,18 @@ pub fn generate_wac(
                 let node_var = get_or_create_inst(
                     *id,
                     aliases,
-                    &mut used_comp_nodes,
                     node,
-                    &mut instance_vars,
+                    &mut WacState {
+                        instance_vars: &mut instance_vars,
+                        used_comp_nodes: &mut used_comp_nodes,
+                        wac_lines: &mut wac_lines,
+                    },
+                    &mut ShimDedup {
+                        composition,
+                        shim_comps: &shim_comps,
+                        split_to_var: &mut split_to_var,
+                    },
                     &mdl_override,
-                    &mut wac_lines,
                 );
                 // set up what to wire in next
                 last = node_var;
@@ -437,9 +452,11 @@ pub fn generate_wac(
                             mdl,
                             chain_interface,
                             adapter_info,
+                            composition,
+                            &shim_comps,
                             &mut wac_lines,
                             &mut emitted_mdl_vars,
-                        );
+                        )?;
                         last = adapter_var;
                         used_middlewares.extend(extra_args);
                     } else {
@@ -530,9 +547,11 @@ pub fn generate_wac(
                     mdl,
                     &deferred.chain_interface,
                     adapter_info,
+                    composition,
+                    &shim_comps,
                     &mut wac_lines,
                     &mut emitted_mdl_vars,
-                );
+                )?;
                 current_provider = adapter_var;
                 used_middlewares.extend(extra_args);
             } else {
@@ -584,24 +603,38 @@ pub fn generate_wac(
             continue;
         }
 
+        // If the export's source is a shim sub-component, route the
+        // export through its resolved outer instance — otherwise the
+        // export creates a separate shim instance whose resource type
+        // identity diverges from the outer's. (Mirrors the shim
+        // resolution `consumer_split_path` already does for splits.)
+        let effective_inst_id = resolve_shim_node(*outer_inst_id, composition, &shim_comps);
+
         // Per-export override (set by the deferred top-level inject
         // pass) wins over the consumer's generic outer-instance var.
         let node_var = if let Some(override_var) =
-            export_overrides.get(&(*outer_inst_id, export_name.clone()))
+            export_overrides.get(&(effective_inst_id, export_name.clone()))
         {
             override_var.clone()
-        } else if let Some(generated_outer) = outer_instances.get(outer_inst_id) {
+        } else if let Some(generated_outer) = outer_instances.get(&effective_inst_id) {
             generated_outer.clone()
         } else {
-            let outer_node = &composition.nodes[outer_inst_id];
+            let outer_node = &composition.nodes[&effective_inst_id];
             get_or_create_inst(
-                *outer_inst_id,
+                effective_inst_id,
                 &HashMap::new(),
-                &mut used_comp_nodes,
                 outer_node,
-                &mut instance_vars,
+                &mut WacState {
+                    instance_vars: &mut instance_vars,
+                    used_comp_nodes: &mut used_comp_nodes,
+                    wac_lines: &mut wac_lines,
+                },
+                &mut ShimDedup {
+                    composition,
+                    shim_comps: &shim_comps,
+                    split_to_var: &mut split_to_var,
+                },
                 &None,
-                &mut wac_lines,
             )
         };
 
@@ -650,9 +683,7 @@ fn gen_wac_args(
                 .unwrap_or_else(|| PathBuf::from(PATH_PLACEHOLDER))
         } else {
             // Single-component mode: derive path from the split directory.
-            // We reserve component 0 for the root component, so add one here.
-            let component_num = graph.nodes[inst_id].component_num + 1;
-            let split_to_use = resolve_shim(component_num as usize, &shim_comps);
+            let split_to_use = resolved_split_num(*inst_id, graph, &shim_comps);
             PathBuf::from(gen_split_path(splits_path, split_to_use))
         };
         deps.insert(format!("{INST_PREFIX}:{name}"), comp_path);
@@ -673,6 +704,22 @@ fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) ->
         component_num = shim_comps[&component_num];
     }
     component_num
+}
+
+/// Convert a graph node id to its split number (split0 is the root;
+/// nodes are offset by -1 in the split keyspace).
+fn node_split_num(node_id: u32, composition: &CompositionGraph) -> usize {
+    (composition.nodes[&node_id].component_num + 1) as usize
+}
+
+/// Resolve a graph node id to the split number of its non-shim outer.
+/// Composes [`node_split_num`] + [`resolve_shim`].
+fn resolved_split_num(
+    node_id: u32,
+    composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
+) -> usize {
+    resolve_shim(node_split_num(node_id, composition), shim_comps)
 }
 
 /// Emit one WARN per non-trivial `shim → resolved` mapping in
@@ -944,18 +991,41 @@ fn add_to_inject_plan(
     Ok(final_results)
 }
 
+/// Shim-resolution context (compose graph + shim map + dedup map).
+struct ShimDedup<'a> {
+    composition: &'a CompositionGraph,
+    shim_comps: &'a HashMap<usize, usize>,
+    /// resolved_split_num -> wac instance var.
+    split_to_var: &'a mut HashMap<usize, String>,
+}
+
+/// Mutable wac-builder state shared across instance creation.
+struct WacState<'a> {
+    instance_vars: &'a mut HashMap<u32, String>,
+    used_comp_nodes: &'a mut HashMap<u32, String>,
+    wac_lines: &'a mut Vec<String>,
+}
+
 fn get_or_create_inst(
     inst_id: u32,
     aliases: &HashMap<u32, Option<String>>,
-    used_comp_nodes: &mut HashMap<u32, String>,
     node: &ComponentNode,
-    instance_vars: &mut HashMap<u32, String>,
+    state: &mut WacState,
+    dedup: &mut ShimDedup,
     with_override: &Option<(Contract, String)>,
-    wac_lines: &mut Vec<String>,
 ) -> String {
-    if let Some(var) = instance_vars.get(&inst_id) {
+    if let Some(var) = state.instance_vars.get(&inst_id) {
         return var.clone();
     }
+    // Dedup nodes that resolve to the same split file: separate `new`
+    // invocations would create independent runtime instances with
+    // diverged resource type identities.
+    let resolved_split = resolved_split_num(inst_id, dedup.composition, dedup.shim_comps);
+    if let Some(existing_var) = dedup.split_to_var.get(&resolved_split) {
+        state.instance_vars.insert(inst_id, existing_var.clone());
+        return existing_var.clone();
+    }
+
     let alias = aliases.get(&inst_id).cloned();
 
     // it hasn't been instantiated yet! do so here
@@ -964,11 +1034,13 @@ fn get_or_create_inst(
     } else {
         sanitize_wac_id(get_name(node))
     };
-    used_comp_nodes.insert(inst_id, pkg.clone());
-    let node_var = instance_vars
+    state.used_comp_nodes.insert(inst_id, pkg.clone());
+    let node_var = state
+        .instance_vars
         .entry(inst_id)
         .or_insert_with(|| pkg.clone())
         .clone();
+    dedup.split_to_var.insert(resolved_split, node_var.clone());
 
     let mut line = format!("let {node_var} = new {INST_PREFIX}:{pkg} {{");
     for conn in &node.imports {
@@ -984,7 +1056,7 @@ fn get_or_create_inst(
             {
                 let src_var = if conn.interface_name == *override_interface {
                     override_var.clone()
-                } else if let Some(src_var) = instance_vars.get(&src_id.unwrap()) {
+                } else if let Some(src_var) = state.instance_vars.get(&src_id.unwrap()) {
                     // could be an import from the host!
                     // only do this if it's not
                     src_var.clone()
@@ -1000,7 +1072,7 @@ fn get_or_create_inst(
         }
     }
     line.push_str("\n    ...\n};");
-    wac_lines.push(line);
+    state.wac_lines.push(line);
 
     node_var
 }
@@ -1025,14 +1097,17 @@ fn create_mdl(
 ///
 /// Returns `(adapter_var_name, [(pkg_name, path), ...])` where the vec has two
 /// entries: one for the real middleware and one for the adapter component.
+#[allow(clippy::too_many_arguments)]
 fn create_tier1_mdl(
     downstream_inst: &str,
     mdl: &Injection,
     interface: &Contract,
     adapter_info: &AdapterInjectionInfo,
+    composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
     wac_lines: &mut Vec<String>,
     emitted_mdl_vars: &mut std::collections::HashSet<String>,
-) -> (String, Vec<(String, String)>) {
+) -> anyhow::Result<(String, Vec<(String, String)>)> {
     let real_var = mdl.name.clone();
     // The adapter's core-wasm signature is specialized per target
     // interface, so a single middleware injected on multiple rules
@@ -1064,6 +1139,21 @@ fn create_tier1_mdl(
             "\n    \"{versioned}\": {real_var}[\"{versioned}\"],"
         ));
     }
+    // Wire resource-bearing factored-types imports (e.g. `my:shape/types`)
+    // explicitly — `...` doesn't unify resource type identity across
+    // separately-imported instances from a non-host component.
+    if let Ok(adapter_bytes) = std::fs::read(&adapter_info.adapter_path) {
+        for extra in factored_types_to_wire(
+            &resource_bearing_imports(&adapter_bytes),
+            &interface.name,
+            composition,
+            shim_comps,
+        )? {
+            adapter_line.push_str(&format!(
+                "\n    \"{extra}\": {downstream_inst}[\"{extra}\"],"
+            ));
+        }
+    }
     adapter_line.push_str("\n    ...\n};");
     wac_lines.push(adapter_line);
 
@@ -1077,7 +1167,7 @@ fn create_tier1_mdl(
         ),
         (adapter_var.clone(), adapter_info.adapter_path.clone()),
     ];
-    (adapter_var, used)
+    Ok((adapter_var, used))
 }
 
 fn rule_interface(rule: &SpliceRule) -> &str {
@@ -1092,12 +1182,137 @@ fn get_name(node: &ComponentNode) -> &str {
     node.display_label()
 }
 
+/// Decide which adapter imports to wire as factored-types, given the
+/// adapter's resource-bearing imports, the splice target, and the
+/// composition graph. Three cases per import:
+///   1. **Host-provided** (every import edge is `is_host_import`):
+///      skip — `...` resolves it via the runtime's single shared
+///      instance.
+///   2. **Same provider as the target** (every non-host import edge
+///      sources from a node that resolves to the same split as the
+///      target's provider): wire from the downstream.
+///   3. **Different provider than the target**: multi-provider
+///      factored types. Bail — the downstream doesn't actually export
+///      this interface, and wiring from a sibling provider needs
+///      plumbing this code path doesn't yet have.
+fn factored_types_to_wire(
+    resource_imports: &[String],
+    target_iface: &str,
+    composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
+) -> anyhow::Result<Vec<String>> {
+    // Resolved-shim source split numbers that provide `iface`:
+    //   - Top-level component exports (when `iface` is a leaf export
+    //     of the composition, e.g. when splicing a lone provider).
+    //   - Plus every non-host import edge sourcing `iface` (when
+    //     `iface` is consumed internally, e.g. consumer → provider).
+    // Empty set = host-provided.
+    let providers = |iface: &str| -> std::collections::HashSet<usize> {
+        let mut out = std::collections::HashSet::new();
+        if let Some(info) = composition.component_exports.get(iface) {
+            out.insert(resolved_split_num(
+                info.source_instance,
+                composition,
+                shim_comps,
+            ));
+        }
+        for node in composition.nodes.values() {
+            for conn in &node.imports {
+                if conn.interface_name != iface || conn.is_host_import {
+                    continue;
+                }
+                if let Some(src) = conn.source_instance {
+                    out.insert(resolved_split_num(src, composition, shim_comps));
+                }
+            }
+        }
+        out
+    };
+    let target_providers = providers(target_iface);
+    let mut out = Vec::new();
+    for extra in resource_imports {
+        if extra == target_iface {
+            continue;
+        }
+        let extra_providers = providers(extra);
+        if extra_providers.is_empty() {
+            continue; // host-provided
+        }
+        if extra_providers != target_providers {
+            anyhow::bail!(
+                "splicer can't yet wire factored-types interface `{extra}` for adapter \
+                 on `{target_iface}`: the resource-bearing types interface is exported \
+                 by a different component than the target. Splicer's tier-1 wiring \
+                 currently assumes both interfaces come from the same provider. \
+                 Workaround: have one component export both interfaces."
+            );
+        }
+        out.push(extra.clone());
+    }
+    Ok(out)
+}
+
+/// Qualified names of the component's interface imports whose
+/// instance type contains at least one resource. Best-effort: empty
+/// on decode errors.
+fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
+    let Ok(decoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wit_component::decode(bytes)
+    })) else {
+        return Vec::new();
+    };
+    let Ok(wit_component::DecodedWasm::Component(resolve, world_id)) = decoded else {
+        return Vec::new();
+    };
+    let world = &resolve.worlds[world_id];
+    let mut result = Vec::new();
+    for (_key, item) in &world.imports {
+        let wit_parser::WorldItem::Interface { id, .. } = item else {
+            continue;
+        };
+        let iface = &resolve.interfaces[*id];
+        let has_resource = iface
+            .types
+            .values()
+            .any(|tid| matches!(resolve.types[*tid].kind, wit_parser::TypeDefKind::Resource));
+        if !has_resource {
+            continue;
+        }
+        if let Some(name) = resolve.id_of(*id) {
+            result.push(name);
+        }
+    }
+    result
+}
+
 /// Returns true if the split-file number `split_num` corresponds to a shim.
 ///
 /// `split_num` is `node.component_num + 1` — the key space used by the
 /// `shim_comps` map produced by `split_out_composition`.
 fn is_shim_split_num(split_num: usize, shim_comps: &HashMap<usize, usize>) -> bool {
     shim_comps.contains_key(&split_num)
+}
+
+/// If `inst_id` is a shim node, return its resolved-outer node id.
+fn resolve_shim_node(
+    inst_id: u32,
+    composition: &CompositionGraph,
+    shim_comps: &HashMap<usize, usize>,
+) -> u32 {
+    if !composition.nodes.contains_key(&inst_id) {
+        return inst_id;
+    }
+    let split_num = node_split_num(inst_id, composition);
+    let resolved = resolved_split_num(inst_id, composition, shim_comps);
+    if resolved == split_num {
+        return inst_id;
+    }
+    composition
+        .nodes
+        .iter()
+        .find(|(_, n)| (n.component_num + 1) as usize == resolved)
+        .map(|(id, _)| *id)
+        .unwrap_or(inst_id)
 }
 
 /// Convert an arbitrary node label into a valid WAC kebab-case identifier.
@@ -1131,4 +1346,113 @@ fn reverse_set(set: &IndexSet<Injection>) -> Vec<Injection> {
         res.insert(0, item.clone());
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a graph with the given import edges. Each entry is
+    /// `(consumer_node_id, interface, source_node_id, is_host_import)`.
+    /// `n_nodes` placeholder nodes are created up-front.
+    fn synth_graph(n_nodes: u32, edges: &[(u32, &str, Option<u32>, bool)]) -> CompositionGraph {
+        let mut graph = CompositionGraph::new();
+        let mut nodes: HashMap<u32, ComponentNode> = HashMap::new();
+        for i in 0..n_nodes {
+            nodes.insert(i, ComponentNode::new(format!("$node-{i}"), i, i));
+        }
+        for (consumer, iface, src, is_host) in edges {
+            let n = nodes.get_mut(consumer).expect("node id in range");
+            n.add_import(InterfaceConnection {
+                interface_name: iface.to_string(),
+                source_instance: *src,
+                is_host_import: *is_host,
+                fingerprint: None,
+                interface_type: None,
+            });
+        }
+        for (i, node) in nodes {
+            graph.add_node(i, node);
+        }
+        graph
+    }
+
+    /// Single-provider factored types: a single provider node is the
+    /// non-host source of both api and types. Wire types from
+    /// downstream.
+    #[test]
+    fn factored_types_same_provider_wires() {
+        // node 1 = consumer; node 0 = provider. consumer imports both
+        // api and types from provider (non-host).
+        let graph = synth_graph(
+            2,
+            &[
+                (1, "my:shape/api@1.0.0", Some(0), false),
+                (1, "my:shape/types@1.0.0", Some(0), false),
+            ],
+        );
+        let extras = factored_types_to_wire(
+            &["my:shape/types@1.0.0".to_string()],
+            "my:shape/api@1.0.0",
+            &graph,
+            &HashMap::new(),
+        )
+        .expect("same-provider factored types should wire");
+        assert_eq!(extras, vec!["my:shape/types@1.0.0".to_string()]);
+    }
+
+    /// Host-provided types: every import edge is `is_host_import`. The
+    /// runtime's single shared instance handles it via `...`.
+    #[test]
+    fn factored_types_host_provided_skipped() {
+        // node 0 = srv; imports wasi:http/handler from node 1, and
+        // wasi:http/types from the host.
+        let graph = synth_graph(
+            2,
+            &[
+                (0, "wasi:http/handler@0.3.0", Some(1), false),
+                (0, "wasi:http/types@0.3.0", None, true),
+            ],
+        );
+        let extras = factored_types_to_wire(
+            &["wasi:http/types@0.3.0".to_string()],
+            "wasi:http/handler@0.3.0",
+            &graph,
+            &HashMap::new(),
+        )
+        .expect("host-provided types should be skipped, not error");
+        assert!(extras.is_empty());
+    }
+
+    /// Pathological multi-provider case: api is provided by node 1,
+    /// types is provided by node 0. Adapter on api can't safely wire
+    /// types from its downstream (node 1), so splicer bails.
+    #[test]
+    fn factored_types_multi_provider_bails() {
+        // node 2 = consumer. consumer imports api from node 1
+        // (api-provider), types from node 0 (types-provider).
+        let graph = synth_graph(
+            3,
+            &[
+                (2, "my:shape/api@1.0.0", Some(1), false),
+                (2, "my:shape/types@1.0.0", Some(0), false),
+            ],
+        );
+        let err = factored_types_to_wire(
+            &["my:shape/types@1.0.0".to_string()],
+            "my:shape/api@1.0.0",
+            &graph,
+            &HashMap::new(),
+        )
+        .expect_err("multi-provider factored types should bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my:shape/types@1.0.0"),
+            "error should name the offending interface; got: {msg}"
+        );
+        assert!(
+            msg.contains("different component"),
+            "error should explain the multi-provider problem; got: {msg}"
+        );
+    }
 }

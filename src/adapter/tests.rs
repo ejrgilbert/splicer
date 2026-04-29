@@ -1492,32 +1492,3 @@ fn test_adapter_provider_split_primitive() {
     );
     validate_component(&bytes);
 }
-
-/// Exercises the `!handler_in_split` branch with a populated preamble:
-/// the provider split exports an HTTP-handler-shape interface whose
-/// resource types (`request`, `response`) and compound type
-/// (`error-code` variant) are aliased at component scope. The adapter
-/// must route those aliased types through `outer_aliased` into the
-/// fresh handler import type's body via `alias outer`, and reuse the
-/// preamble's component-scope indices for the dispatch phase rather
-/// than aliasing them off the handler instance (which wouldn't work —
-/// the resources came from the preamble, not from the handler
-/// instance's SubResource exports).
-// Blocked on https://github.com/bytecodealliance/wasm-tools/issues/2506
-// — wit-parser panics when decoding a component that imports + re-exports
-// a resource-bearing instance, which is exactly the provider-split shape
-// for a resource-bearing target. Re-enable once upstream fixes it.
-#[test]
-#[ignore]
-fn test_adapter_provider_split_resource_handler() {
-    let mut arena = TypeArena::default();
-    let iface = build_http_handler_iface(&mut arena);
-    let bytes = gen_adapter(
-        "wasi:http/handler@0.3.0-rc-2026-01-06",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Provider,
-    );
-    validate_component(&bytes);
-}
