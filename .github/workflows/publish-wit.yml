@@ -84,10 +84,12 @@ jobs:
 
       - name: Publish to GitHub Container Registry
         id: publish
-        # Pin to commit sha (currently v5). The `wkg` input is now honored
-        # (https://github.com/bytecodealliance/wkg-github-action/pull/12)
-        # so the action installs the same pinned wkg used to build above.
-        uses: bytecodealliance/wkg-github-action@10b3b04b9059ba46208cd7daf7d352af14bded0f
+        # Pinned to the commit that wires `inputs.wkg` through to the
+        # installer (PR #12). The latest tag (v5) predates this, so a
+        # tag pin would silently install latest wkg and reject the
+        # `[async]` externs we emit.
+        # TODO: Pin to a tag once it's available
+        uses: bytecodealliance/wkg-github-action@5b7005d1fc81c8c3380a059e58345033e3a97638
         with:
           wkg: ${{ env.WKG_VERSION }}
           file: splicer-${{ inputs.tier }}.wasm
