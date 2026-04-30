@@ -3,28 +3,32 @@
 /// A middleware component exports one or more of these interfaces to
 /// participate in the adapter-generation pipeline. The generated adapter
 /// calls the exported hooks around every invocation of the target
-/// interface's functions, passing "{target_interface}#{fn_name}" — the
-/// middleware never sees the actual parameter or return types/values.
+/// interface's functions, passing a `call-id` record (target interface
+/// + function name) — the middleware never sees the actual parameter or
+/// return types/values.
 ///
 /// Any non-empty subset is valid: you can export just `before`, just
 /// `after`, just `blocking`, or any combination.
-package splicer:tier1@0.1.0;
+package splicer:tier1@0.2.0;
 
 interface before {
+    use splicer:common/types@0.1.0.{call-id};
     /// Called before every invocation of a target-interface function.
-    before-call: async func(name: string);
+    on-call: async func(call: call-id);
 }
 
 interface after {
+    use splicer:common/types@0.1.0.{call-id};
     /// Called after every invocation of a target-interface function.
-    after-call: async func(name: string);
+    on-return: async func(call: call-id);
 }
 
 interface blocking {
+    use splicer:common/types@0.1.0.{call-id};
     /// Called before the invocation; if it returns `true`, the
     /// downstream call is skipped entirely. Only supported for
     /// void-returning functions today.
-    should-block-call: async func(name: string) -> bool;
+    should-block: async func(call: call-id) -> bool;
 }
 
 world tier1-middleware {

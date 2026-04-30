@@ -10,7 +10,7 @@ include!(concat!(env!("OUT_DIR"), "/tier_interfaces.rs"));
 
 /// Append `@version` to an unversioned interface name, producing the
 /// form used in component import/export names (e.g.
-/// `"splicer:tier1/before"` + `"0.1.0"` → `"splicer:tier1/before@0.1.0"`).
+/// `"splicer:tier1/before"` + `"0.2.0"` → `"splicer:tier1/before@0.2.0"`).
 pub fn versioned_interface(iface: &str, version: &str) -> String {
     format!("{iface}@{version}")
 }
@@ -98,7 +98,7 @@ pub fn validate_contract(
 ///    pass-through middleware that simply failed the fingerprint check.
 ///
 /// Check whether `export_name` (possibly versioned, e.g.
-/// `"splicer:tier1/before@0.1.0"`) matches the unversioned interface
+/// `"splicer:tier1/before@0.2.0"`) matches the unversioned interface
 /// constant `iface` (e.g. `"splicer:tier1/before"`) with semver
 /// compatibility against `expected_version`.
 ///
@@ -145,7 +145,7 @@ fn is_tier1_compatible(
 ) -> Option<Vec<String>> {
     // Match tier-1 interface names with semver-compatible version
     // checking. Export keys may be versioned (e.g.
-    // "splicer:tier1/before@0.1.0") while the constants are
+    // "splicer:tier1/before@0.2.0") while the constants are
     // unversioned ("splicer:tier1/before"). We accept any version
     // that is semver-compatible with the version splicer was built
     // against (TIER1_VERSION, derived from wit/tier1/world.wit).

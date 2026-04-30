@@ -38,13 +38,16 @@ use super::mem_layout::MemoryLayoutBuilder;
 
 /// Generate the adapter component bytes. `target_interface` is the
 /// fully-qualified interface name (`<ns>:<pkg>/<iface>[@<ver>]`);
-/// `tier1_world_wit` is the contents of `wit/tier1/world.wit`.
+/// `common_world_wit` is the contents of `wit/common/world.wit`
+/// (loaded first as a dependency); `tier1_world_wit` is the contents
+/// of `wit/tier1/world.wit` (which references `splicer:common`).
 pub(crate) fn build_adapter(
     target_interface: &str,
     has_before: bool,
     has_after: bool,
     has_blocking: bool,
     split_bytes: &[u8],
+    common_world_wit: &str,
     tier1_world_wit: &str,
 ) -> Result<Vec<u8>> {
     let mut resolve = decode_input_resolve(split_bytes)?;
@@ -52,6 +55,9 @@ pub(crate) fn build_adapter(
 
     require_supported_case(&resolve, target_iface, has_blocking)?;
 
+    resolve
+        .push_str("splicer-common.wit", common_world_wit)
+        .context("parse common WIT")?;
     resolve
         .push_str("splicer-tier1.wit", tier1_world_wit)
         .context("parse tier1 WIT")?;
@@ -172,7 +178,7 @@ fn require_supported_case(
         if has_blocking && func.result.is_some() {
             bail!(
                 "Function '{name}' returns a value but the middleware exports \
-                 `should-block-call`. Tier-1 blocking is only supported for \
+                 `should-block`. Tier-1 blocking is only supported for \
                  void-returning functions because the adapter cannot synthesize \
                  a return value when the call is blocked."
             );
@@ -262,9 +268,17 @@ struct FuncDispatch {
     result_ty: Option<Type>,
     /// `Some` iff async.
     task_return: Option<TaskReturnImport>,
-    /// Offset of the `<iface>#<fn>` string the middleware sees.
-    name_offset: i32,
-    name_len: i32,
+    /// Offset/len of the target interface's fully-qualified name. The
+    /// iface name is allocated once and shared across every
+    /// `FuncDispatch` for the same target interface — duplicated here
+    /// so hook-emission helpers can read it from `fd` without an
+    /// extra parameter.
+    iface_name_offset: i32,
+    iface_name_len: i32,
+    /// Offset/len of this function's name (canonical-ABI form, e.g.
+    /// `"handle"`, `"[method]request.body"`).
+    fn_name_offset: i32,
+    fn_name_len: i32,
     /// Offset of the retptr scratch buffer; set iff `import_sig.retptr`.
     retptr_offset: Option<i32>,
     /// `(flat_param_idx, resource_type_id)` for each top-level
@@ -389,7 +403,7 @@ struct FuncIndices {
     imp_handler: Vec<u32>,
     imp_before: Option<u32>,
     imp_after: Option<u32>,
-    /// `should-block-call` import; `Some` iff blocking is active.
+    /// `should-block` import; `Some` iff blocking is active.
     imp_block: Option<u32>,
     imp_task_return: Vec<Option<u32>>,
     wrapper_base: u32,
@@ -398,7 +412,7 @@ struct FuncIndices {
     cabi_post: Vec<Option<u32>>,
     /// Always `Some` — `cabi_realloc` is unconditionally exported.
     cabi_realloc: Option<u32>,
-    /// Memory offset of the bool slot `should-block-call` writes its
+    /// Memory offset of the bool slot `should-block` writes its
     /// retptr into. `Some` iff blocking is active.
     block_result_ptr: Option<i32>,
     async_runtime: Option<AsyncRuntimeFuncs>,
@@ -476,8 +490,10 @@ fn build_dispatch_module(
 
 /// Phase 1 — derive per-func dispatch shapes, collect name bytes, and
 /// reserve memory slots for retptr scratch + the async-event record.
-/// Hook-call name bytes are the fully-qualified `<iface>#<fn>` form
-/// (the string the middleware receives as `name: string`).
+/// Hooks receive a `call-id { interface-name, function-name }` record:
+/// the interface name is allocated once at the head of memory and
+/// shared by every `FuncDispatch`; each function name is allocated
+/// per-func right after.
 /// `event_ptr` is `Some` iff `needs_async_runtime`.
 #[allow(clippy::too_many_arguments)]
 fn compute_func_dispatches(
@@ -489,18 +505,20 @@ fn compute_func_dispatches(
     needs_async_runtime: bool,
     has_blocking: bool,
 ) -> (Vec<FuncDispatch>, Vec<u8>, Option<i32>, Option<i32>, u32) {
-    let qualified_names: Vec<String> = funcs
-        .iter()
-        .map(|f| format!("{target_interface_name}#{}", f.name))
-        .collect();
-    let total_name_bytes: u32 = qualified_names.iter().map(|n| n.len() as u32).sum();
+    let iface_name_bytes = target_interface_name.len() as u32;
+    let total_fn_name_bytes: u32 = funcs.iter().map(|f| f.name.len() as u32).sum();
+    let total_name_bytes = iface_name_bytes + total_fn_name_bytes;
     let mut layout = MemoryLayoutBuilder::new(total_name_bytes);
     let mut name_blob: Vec<u8> = Vec::with_capacity(total_name_bytes as usize);
     let mut per_func: Vec<FuncDispatch> = Vec::with_capacity(funcs.len());
 
+    // Iface name allocated once and reused across all FuncDispatches.
+    let iface_name_offset = layout.alloc_name(iface_name_bytes) as i32;
+    name_blob.extend_from_slice(target_interface_name.as_bytes());
+
     let target_world_key = WorldKey::Interface(target_iface);
 
-    for (func, qualified_name) in funcs.iter().zip(qualified_names.iter()) {
+    for func in funcs.iter() {
         let is_async = func.kind.is_async();
         let (import_variant, export_variant) = if is_async {
             (
@@ -534,8 +552,8 @@ fn compute_func_dispatches(
         );
         let export_sig = resolve.wasm_signature(export_variant, func);
         let import_sig = resolve.wasm_signature(import_variant, func);
-        let name_offset = layout.alloc_name(qualified_name.len() as u32) as i32;
-        name_blob.extend_from_slice(qualified_name.as_bytes());
+        let fn_name_offset = layout.alloc_name(func.name.len() as u32) as i32;
+        name_blob.extend_from_slice(func.name.as_bytes());
         // Sync: retptr iff the export sig says so. Async: canon-lower-async
         // always retptr's a non-void result.
         let retptr_needed = if is_async {
@@ -572,8 +590,10 @@ fn compute_func_dispatches(
             import_sig,
             result_ty: func.result,
             task_return,
-            name_offset,
-            name_len: qualified_name.len() as i32,
+            iface_name_offset,
+            iface_name_len: iface_name_bytes as i32,
+            fn_name_offset,
+            fn_name_len: func.name.len() as i32,
             retptr_offset,
             borrow_drops,
         });
@@ -723,7 +743,7 @@ fn emit_type_section(
     );
     let cabi_realloc_ty = idx.alloc_ty();
 
-    // Blocking hook sig — sourced from the WIT (`should-block-call:
+    // Blocking hook sig — sourced from the WIT (`should-block:
     // async func(name: string) -> bool` lowered → `(ptr, len, retptr) -> i32`).
     let block_hook_ty = hook_imports.blocking.as_ref().map(|h| {
         types
@@ -1064,7 +1084,7 @@ fn emit_data_section(module: &mut Module, name_blob: &[u8]) {
     module.section(&data);
 }
 
-/// `should-block-call` runtime bundle — the import fn index plus the
+/// `should-block` runtime bundle — the import fn index plus the
 /// memory offset its retptr writes the bool result into.
 struct BlockingConfig {
     import_fn: u32,
@@ -1089,7 +1109,7 @@ fn emit_wrapper_body(
     let mut locals = FunctionIndices::new(nparams);
     let result_local = fd.direct_result().map(|t| locals.alloc_local(t));
     // Wait-loop scratch (subtask + waitable-set handles); shared
-    // across before- / after-call / blocking awaits.
+    // across before- / on-return / blocking awaits.
     let wait_locals = async_runtime.map(|_| {
         let st = locals.alloc_local(ValType::I32);
         let ws = locals.alloc_local(ValType::I32);
@@ -1138,12 +1158,13 @@ fn emit_wrapper_body(
     code.function(&f);
 }
 
-/// Phase 2 (between before-call and the handler call): call
-/// `should-block-call(name, retptr)`, await the subtask, load the
-/// bool, and `return` early if it's true. For async wrappers a
-/// `task.return` import index is supplied and called with no args
-/// before the return (async-stackful must call task.return before
-/// `End`); sync void wrappers just return.
+/// Phase 2 (between on-call and the handler call): call
+/// `should-block(call, retptr)` with the canonical-ABI-lowered
+/// `(iface_ptr, iface_len, fn_ptr, fn_len, retptr)` shape, await the
+/// subtask, load the bool, and `return` early if it's true. For async
+/// wrappers a `task.return` import index is supplied and called with
+/// no args before the return (async-stackful must call task.return
+/// before `End`); sync void wrappers just return.
 ///
 /// Mirrors legacy `dispatch::emit_blocking_phase`.
 /// `require_supported_case` already rejects non-void blocking, so
@@ -1156,8 +1177,10 @@ fn emit_blocking_phase(
     wait_locals: Option<(u32, u32)>,
     task_return_for_async: Option<u32>,
 ) {
-    f.instructions().i32_const(fd.name_offset);
-    f.instructions().i32_const(fd.name_len);
+    f.instructions().i32_const(fd.iface_name_offset);
+    f.instructions().i32_const(fd.iface_name_len);
+    f.instructions().i32_const(fd.fn_name_offset);
+    f.instructions().i32_const(fd.fn_name_len);
     f.instructions().i32_const(blk.result_ptr);
     f.instructions().call(blk.import_fn);
     let art = async_runtime.expect("async_runtime active when blocking is");
@@ -1290,9 +1313,11 @@ fn emit_async_wrapper_body(
     code.function(&f);
 }
 
-/// Call hook with `(name_ptr, name_len)` and await its packed subtask
-/// handle. `async_runtime` + `wait_locals` are `Some` whenever a hook
-/// is active.
+/// Call hook with `(iface_ptr, iface_len, fn_ptr, fn_len)` — the
+/// canonical-ABI lowering of `call: call-id { interface-name: string,
+/// function-name: string }` — and await its packed subtask handle.
+/// `async_runtime` + `wait_locals` are `Some` whenever a hook is
+/// active.
 fn emit_hook_call(
     f: &mut Function,
     fd: &FuncDispatch,
@@ -1300,8 +1325,10 @@ fn emit_hook_call(
     async_runtime: Option<&AsyncRuntimeFuncs>,
     wait_locals: Option<(u32, u32)>,
 ) {
-    f.instructions().i32_const(fd.name_offset);
-    f.instructions().i32_const(fd.name_len);
+    f.instructions().i32_const(fd.iface_name_offset);
+    f.instructions().i32_const(fd.iface_name_len);
+    f.instructions().i32_const(fd.fn_name_offset);
+    f.instructions().i32_const(fd.fn_name_len);
     f.instructions().call(hook_idx);
     let art = async_runtime.expect("async_runtime must be set when a hook is imported");
     let (st, ws) = wait_locals.expect("wait_locals allocated alongside async_runtime");

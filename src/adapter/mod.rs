@@ -30,6 +30,12 @@ use emit::build_adapter;
 /// wit-component understands the hook imports.
 const TIER1_WORLD_WIT: &str = include_str!("../../wit/tier1/world.wit");
 
+/// Shared types referenced by every tier's WIT (currently `call-id`).
+/// Loaded into the resolve before any tier WIT so the
+/// `use splicer:common/types.{call-id};` clauses inside each tier
+/// resolve.
+const COMMON_WORLD_WIT: &str = include_str!("../../wit/common/world.wit");
+
 /// Generate a tier-1 adapter component that wraps `middleware_name`
 /// and adapts it to export `target_interface`.
 ///
@@ -38,9 +44,9 @@ const TIER1_WORLD_WIT: &str = include_str!("../../wit/tier1/world.wit");
 /// - Imports `target_interface` from the handler-providing component.
 /// - Imports the middleware via the tier-1 hook interfaces (the
 ///   subset matched in `middleware_interfaces`).
-/// - For each function in `target_interface`: calls `before-call` →
-///   `should-block-call` (early-return when true; void funcs only) →
-///   the handler → `after-call`.
+/// - For each function in `target_interface`: calls `on-call` →
+///   `should-block` (early-return when true; void funcs only) →
+///   the handler → `on-return`.
 ///
 /// Returns the path to the generated `.wasm`.
 pub fn generate_tier1_adapter(
@@ -64,6 +70,7 @@ pub fn generate_tier1_adapter(
         has_after,
         has_blocking,
         &split_bytes,
+        COMMON_WORLD_WIT,
         TIER1_WORLD_WIT,
     )?;
 
