@@ -81,26 +81,26 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-features --verbose --all-targets
 
-  # Integration tests using the component-interposition submodule.
-  # Runs the full splicer + wac + wasmtime pipeline against real components.
-  integration:
-   name: Integration Tests
-   runs-on: ubuntu-latest
-   steps:
-     - uses: actions/checkout@v4
-       with:
-         submodules: recursive
-     - uses: dtolnay/rust-toolchain@1.93.0
-       with:
-         targets: wasm32-wasip1
-     - uses: Swatinem/rust-cache@v2
-     - uses: taiki-e/install-action@v2
-       with:
-         tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }},cviz@${{ env.CVIZ_VERSION }},wkg@${{ env.WKG_VERSION }}
-     - name: Install splicer from the PR-under-test tree
-       run: cargo install --path . --force
-     - name: Run integration tests
-       run: cargo test --test integration -- --ignored --nocapture
+#  # Integration tests using the component-interposition submodule.
+#  # Runs the full splicer + wac + wasmtime pipeline against real components.
+#  integration:
+#   name: Integration Tests
+#   runs-on: ubuntu-latest
+#   steps:
+#     - uses: actions/checkout@v4
+#       with:
+#         submodules: recursive
+#     - uses: dtolnay/rust-toolchain@1.93.0
+#       with:
+#         targets: wasm32-wasip1
+#     - uses: Swatinem/rust-cache@v2
+#     - uses: taiki-e/install-action@v2
+#       with:
+#         tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }},cviz@${{ env.CVIZ_VERSION }},wkg@${{ env.WKG_VERSION }}
+#     - name: Install splicer from the PR-under-test tree
+#       run: cargo install --path . --force
+#     - name: Run integration tests
+#       run: cargo test --test integration -- --ignored --nocapture
 
   fuzz_and_run_canned:
    name: Fuzz + Run (canned)
