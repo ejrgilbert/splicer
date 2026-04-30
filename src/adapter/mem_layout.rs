@@ -2,7 +2,7 @@
 //!
 //! Every slot the adapter reserves in the dispatch module's memory —
 //! function-name bytes, async and sync-complex result buffers, the
-//! `waitable-set.wait` event record, the `should-block-call` bool
+//! `waitable-set.wait` event record, the `should-block` bool
 //! slot, and the start of the bump allocator — goes through
 //! [`MemoryLayoutBuilder`]. Centralizing the math in one place keeps
 //! the extraction phase (which assigns per-func offsets) and the
@@ -65,7 +65,7 @@ fn align_to_val(offset: u32, align: u32) -> u32 {
 /// `event_ptr + 0` and `event_ptr + 4`.
 const EVENT_RECORD_SHAPE: &[ValType] = &[ValType::I32, ValType::I32];
 
-/// Flat shape of the bool slot `should-block-call` writes. The
+/// Flat shape of the bool slot `should-block` writes. The
 /// canonical ABI stores a bool as an i32; the blocking phase
 /// (see `super::dispatch::emit_blocking_phase`) reads it via
 /// `i32.load` at `block_result_ptr + 0` and branches on zero /

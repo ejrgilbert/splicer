@@ -1,0 +1,17 @@
+/// Shared types used across all splicer middleware tiers.
+///
+/// Tier WIT packages (`splicer:tier1`, `splicer:tier2`, ...) import
+/// types defined here so the call-identity shape stays consistent
+/// across tiers as middleware authors move up.
+package splicer:common@0.1.0;
+
+interface types {
+    /// Identity of the wrapped call: the target interface
+    /// (fully-qualified, e.g. `"wasi:http/handler@0.3.0"`) plus the
+    /// canonical-ABI function name (e.g. `"handle"`,
+    /// `"[method]request.body"`, `"[constructor]request"`).
+    record call-id {
+        interface-name: string,
+        function-name: string,
+    }
+}

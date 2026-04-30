@@ -30,6 +30,18 @@ fn main() {
         return;
     }
 
+    // Watch every world.wit under wit/ (tier dirs + common + any
+    // future siblings) so cargo rebuilds when any WIT changes.
+    for entry in fs::read_dir(wit_dir).unwrap().filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let world_path = entry.path().join("world.wit");
+        if world_path.exists() {
+            println!("cargo::rerun-if-changed={}", world_path.display());
+        }
+    }
+
     let mut tier_dirs: Vec<_> = fs::read_dir(wit_dir)
         .unwrap()
         .filter_map(|e| e.ok())
