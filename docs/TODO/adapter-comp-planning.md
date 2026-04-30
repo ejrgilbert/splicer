@@ -1,10 +1,11 @@
 # Adapter generator — planning and future work
 
 Forward-looking notes for the adapter-component generator. The
-currently-shipped tier-1 path is documented end-to-end in
-[`adapter-components.md`](./adapter-components.md) (user-facing) and
-[`adapter-internals.md`](./adapter-internals.md) (architecture). This
-file focuses on what hasn't been built yet.
+cross-tier framework is documented in
+[`adapter-components.md`](../adapter-components.md), with per-tier deep
+dives under [`tiers/`](../tiers/). The architecture walkthrough lives
+in [`adapter-internals.md`](../adapter-internals.md). This file focuses
+on what hasn't been built yet.
 
 ## Middleware tier roadmap
 
