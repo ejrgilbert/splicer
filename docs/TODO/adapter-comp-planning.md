@@ -53,7 +53,7 @@ pin down:
   synthesized result without calling the downstream)? If yes, that's
   basically a per-call escape hatch into tier-4 behavior — worth
   thinking through whether it's a separate hook or a return-shape
-  signal from `before-call`. (Tier-3 short-circuit would blur the
+  signal from `on-call`. (Tier-3 short-circuit would blur the
   one-tier-per-middleware rule; alternative is to require users to
   ship a separate tier-4 component for that case.)
 

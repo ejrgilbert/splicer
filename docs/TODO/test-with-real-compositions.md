@@ -123,7 +123,7 @@ type system. 0 labels is similarly not a legal WIT flags type.
 - [ ] fanin variants across non-trivial result types
   (current fanin coverage uses primitive/string results)
 - [ ] Mixed sync/async middleware on a single provider
-- [ ] Blocking middleware (`should-block-call`) with a non-void
+- [ ] Blocking middleware (`should-block`) with a non-void
   handler — currently rejected; test the rejection path
 - [ ] Adapter chain >3 deep
 - [ ] Multiple splicer rules on overlapping interface sets

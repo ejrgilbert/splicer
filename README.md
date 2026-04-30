@@ -52,11 +52,12 @@ composition time.
 
 ### Middleware Tiers
 
-| Tier       | Capability                                                                                                                       | WIT                                          | Status        |
-|------------|----------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|---------------|
-| **Tier 1** | Name-only hooks (`before-call`, `after-call`, `should-block-call`): middleware sees function names but not types or data         | [`wit/tier1/world.wit`](wit/tier1/world.wit) | **Supported** |
-| **Tier 2** | Read-only reflection: middleware can inspect the types and serialized data being passed to/from the target, but cannot modify it | `wit/tier2/world.wit` (planned)              | Planned       |
-| **Tier 3** | Read-write interception: middleware can inspect AND modify the data flowing through                                              | `wit/tier3/world.wit` (planned)              | Planned       |
+| Tier       | Capability                                                                                                              | WIT                                          | Status        |
+|------------|-------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|---------------|
+| **Tier 1** | Hook (name only) — `on-call`, `on-return`, `should-block`: middleware sees the call identity but not types or data      | [`wit/tier1/world.wit`](wit/tier1/world.wit) | **Supported** |
+| **Tier 2** | Observe — middleware sees the typed values flowing through (lifted into a structural attribute tree); cannot modify     | `wit/tier2/world.wit` (planned)              | Planned       |
+| **Tier 3** | Transform — middleware sees AND modifies the values; downstream is still called                                         | `wit/tier3/world.wit` (planned)              | Planned       |
+| **Tier 4** | Virtualize — middleware replaces the downstream entirely (mocks, virts, replayers)                                      | `wit/tier4/world.wit` (planned)              | Planned       |
 
 Each tier strictly adds one capability. Middleware written for a lower tier
 works unchanged when higher tiers become available.

@@ -2,9 +2,10 @@
 
 **Status:** currently supported.
 
-The middleware receives the function name as a string and can run logic
-before/after the downstream call, or conditionally block it. It never sees
-the types or values of the function's parameters or return values.
+The middleware receives a **call identity** — the target interface name
+plus the function name — and can run logic before/after the downstream
+call, or conditionally block it. It never sees the types or values of
+the function's parameters or return values.
 
 For the cross-tier framework (one-tier-per-middleware rule, async
 convention, hook-trap propagation, chain composition), see
@@ -17,14 +18,31 @@ interfaces defined in the tier-1 WIT package. The generated adapter only
 wires up the hooks that are actually present, any non-empty subset is
 valid.
 
+## Call-id shape
+
+Every tier-1 hook takes a `call-id` record carrying the target
+interface (fully-qualified) plus the canonical-ABI function name:
+
+```wit
+record call-id {
+    interface-name: string,    // "wasi:http/handler@0.3.0"
+    function-name: string,     // "handle", "[method]request.body", ...
+}
+```
+
+`call-id` is shared across all tiers via the
+[`splicer:common`](../../wit/common/world.wit) package, so middleware
+authors who later move from tier 1 to tier 2 see the same call-identity
+shape — only the payload widens.
+
 ## What "interface" means here (one middleware wraps N functions)
 
 The unit of interposition is a **WIT interface**, not a single function.
 An interface is an instance type that can export any number of functions.
 Splicer's adapter wraps **every** function in the target interface with
 the same middleware — the middleware doesn't get to pick and choose, but
-it can discriminate at runtime via the `name` parameter the hooks
-receive.
+it can discriminate at runtime via the `function-name` field on the
+`call-id` it receives.
 
 Concrete shapes:
 
@@ -35,9 +53,10 @@ Concrete shapes:
 | `my:service/math`      | `add`, `sub`, `mul`, `div` | 4 wrappers        |
 
 All the wrappers share the same hook imports (`splicer:tier1/before`
-etc.). When `add` is called, the adapter calls `before-call("add")`; when
-`div` is called, the adapter calls `before-call("div")`. The middleware
-sees one stream of hook calls with the function name as the
+etc.). When `add` is called, the adapter calls
+`on-call({ interface-name: "my:service/math", function-name: "add" })`;
+when `div` is called, the adapter passes `function-name: "div"`. The
+middleware sees one stream of hook calls with the function name as the
 discriminator — one middleware, N functions.
 
 ### If your middleware only cares about some of the functions
@@ -46,9 +65,9 @@ Because the adapter invokes every hook your middleware exports on every
 wrapped call, **you pay the before/after/block round-trip uniformly**,
 even for the calls your middleware will immediately no-op. For a
 4-function interface where your logging middleware only cares about one,
-`before-call` still fires 4 × per mixed workload and you filter by name
+`on-call` still fires 4 × per mixed workload and you filter by name
 inside the middleware. Typical per-hook cost is an async subtask +
-name-string lower/lift; small in isolation, but it scales linearly with
+two-string lower/lift; small in isolation, but it scales linearly with
 the number of interposed functions the middleware ignores.
 
 There's no config-level way to restrict which functions are wrapped yet
@@ -63,13 +82,13 @@ and real use cases drive the priority.
 
 For each function in the target interface, the adapter:
 
-1. Calls `before-call(fn_name)` if the middleware exports `splicer:tier1/before`
-2. Calls `should-block-call(fn_name)` if the middleware exports
+1. Calls `on-call(call_id)` if the middleware exports `splicer:tier1/before`
+2. Calls `should-block(call_id)` if the middleware exports
    `splicer:tier1/blocking`; skips the downstream invocation when it
    returns `true` (void functions only)
 3. Forwards the call to the handler with all arguments and return values
    passed through unchanged
-4. Calls `after-call(fn_name)` if the middleware exports `splicer:tier1/after`
+4. Calls `on-return(call_id)` if the middleware exports `splicer:tier1/after`
 
 The adapter handles all canonical-ABI lifting/lowering, resource handle
 threading, async machinery, and type plumbing internally. The middleware
@@ -92,28 +111,47 @@ wit_bindgen::generate!({
     generate_all
 });
 
-use crate::bindings::exports::splicer::adapter::before::Guest as BeforeGuest;
-use crate::bindings::exports::splicer::adapter::after::Guest as AfterGuest;
-use crate::bindings::exports::splicer::adapter::blocking::Guest as BlockGuest;
+use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
+use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
+use bindings::exports::splicer::tier1::blocking::Guest as BlockGuest;
+use bindings::splicer::common::types::CallId;
 
 pub struct MyMiddleware;
+
 impl BeforeGuest for MyMiddleware {
-    async fn before_call(name: String) {
-        println!("[middleware] about to call: {name}");
+    async fn on_call(call: CallId) {
+        println!("[middleware] about to call {}#{}",
+                 call.interface_name, call.function_name);
     }
 }
 
 impl AfterGuest for MyMiddleware {
-    async fn after_call(name: String) {
-        println!("[middleware] finished calling: {name}");
+    async fn on_return(call: CallId) {
+        println!("[middleware] finished {}#{}",
+                 call.interface_name, call.function_name);
     }
 }
 
 impl BlockGuest for MyMiddleware {
-    async fn should_block_call(name: String) -> bool {
-        println!("[middleware] blocking call to: {name}");
+    async fn should_block(call: CallId) -> bool {
+        println!("[middleware] blocking {}#{}",
+                 call.interface_name, call.function_name);
         true
     }
+}
+
+bindings::export!(MyMiddleware with_types_in bindings);
+```
+
+The middleware's WIT world declares both packages as exports/deps:
+
+```wit
+package my:middleware@1.0.0;
+
+world type-erased-middleware {
+    export splicer:tier1/before@0.2.0;
+    export splicer:tier1/after@0.2.0;
+    export splicer:tier1/blocking@0.2.0;
 }
 ```
 
