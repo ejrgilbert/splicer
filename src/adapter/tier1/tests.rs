@@ -9,6 +9,7 @@
 //! before-only / after-only / blocking, and no-hooks.
 
 use super::*;
+use crate::adapter::generate_tier1_adapter;
 use cviz::model::{
     FuncSignature, InstanceInterface, InterfaceType, TypeArena, ValueType, ValueTypeId,
 };

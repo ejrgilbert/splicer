@@ -14,7 +14,7 @@
 //! primitive / string / list / record / variant / option / tuple
 //! results) goes through here.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
@@ -22,9 +22,7 @@ use wasm_encoder::{
     Module, TypeSection, ValType,
 };
 use wit_bindgen_core::abi::lift_from_memory;
-use wit_component::{
-    decode, embed_component_metadata, ComponentEncoder, DecodedWasm, StringEncoding,
-};
+use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
     Function as WitFunction, Handle, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
@@ -32,9 +30,10 @@ use wit_parser::{
     WasmImport, WorldItem, WorldKey,
 };
 
-use super::abi::WasmEncoderBindgen;
-use super::indices::{DispatchIndices, FunctionIndices};
-use super::mem_layout::MemoryLayoutBuilder;
+use super::super::abi::WasmEncoderBindgen;
+use super::super::indices::{DispatchIndices, FunctionIndices};
+use super::super::mem_layout::MemoryLayoutBuilder;
+use super::super::shared::{decode_input_resolve, find_target_interface};
 
 /// Generate the adapter component bytes. `target_interface` is the
 /// fully-qualified interface name (`<ns>:<pkg>/<iface>[@<ver>]`);
@@ -89,51 +88,6 @@ pub(crate) fn build_adapter(
         .context("ComponentEncoder::module")?
         .encode()
         .context("ComponentEncoder::encode")
-}
-
-/// Decode the input split's WIT into a [`Resolve`]; bail if the bytes
-/// decode to a WIT package rather than a component. `wit_component::decode`
-/// panics on splits that import + re-export a resource-bearing instance
-/// (https://github.com/bytecodealliance/wasm-tools/issues/2506); catch
-/// it and surface a structured error so the process doesn't die.
-fn decode_input_resolve(split_bytes: &[u8]) -> Result<Resolve> {
-    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode(split_bytes)))
-        .map_err(|_| {
-            anyhow!(
-                "wit-parser panic during component decode — likely the import + re-export \
-                 of a resource-bearing instance (upstream issue \
-                 https://github.com/bytecodealliance/wasm-tools/issues/2506). The new emit \
-                 path can't proceed until that's fixed upstream."
-            )
-        })?
-        .context("wit_component::decode split")?;
-    match decoded {
-        DecodedWasm::Component(resolve, _world) => Ok(resolve),
-        DecodedWasm::WitPackage(_, _) => bail!(
-            "split bytes decoded to a WIT package; \
-             expected a component"
-        ),
-    }
-}
-
-/// Find the target interface by its fully-qualified name.
-fn find_target_interface(resolve: &Resolve, target_interface: &str) -> Result<InterfaceId> {
-    resolve
-        .interfaces
-        .iter()
-        .find(|(id, _)| resolve.id_of(*id).as_deref() == Some(target_interface))
-        .map(|(id, _)| id)
-        .ok_or_else(|| {
-            anyhow!(
-                "interface `{target_interface}` not found in \
-                 the decoded WIT; available: {:?}",
-                resolve
-                    .interfaces
-                    .iter()
-                    .filter_map(|(id, _)| resolve.id_of(id))
-                    .collect::<Vec<_>>()
-            )
-        })
 }
 
 /// Bail on cases the new path doesn't yet handle. Resource-bound

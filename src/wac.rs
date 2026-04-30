@@ -1,4 +1,4 @@
-use crate::adapter::generate_tier1_adapter;
+use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
 use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
@@ -963,18 +963,34 @@ fn add_to_inject_plan(
                 // Tier1Compatible is fully handled here; no diagnostic needed upstream.
             }
             ContractResult::Tier2Compatible(matched_interfaces) => {
-                // Tier-2 detection is wired up but adapter generation
-                // isn't implemented yet. Bail with a clear message
-                // pointing at the tracking issue rather than silently
-                // falling through to the "no adapter" path.
-                anyhow::bail!(
-                    "middleware '{}' is tier-2 compatible (exports {}) but \
-                     tier-2 adapter generation is not yet implemented. \
-                     Track progress at \
-                     https://github.com/ejrgilbert/splicer/issues",
-                    injection.name,
-                    matched_interfaces.join(", "),
-                );
+                let consumer_split_path = consumer_split.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No consumer/provider split available for interface '{interface_name}' \
+                         while generating tier-2 adapter for middleware '{}'.",
+                        injection.name
+                    )
+                })?;
+                let adapter_path = generate_tier2_adapter(
+                    &injection.name,
+                    interface_name,
+                    &matched_interfaces,
+                    splits_path,
+                    consumer_split_path,
+                )?;
+                generated_adapters.push(GeneratedAdapter {
+                    adapter_path: adapter_path.clone(),
+                    middleware_name: injection.name.clone(),
+                    target_interface: interface_name.to_string(),
+                    tier1_interfaces: matched_interfaces.clone(),
+                });
+                resolved.push(Injection {
+                    name: injection.name.clone(),
+                    path: injection.path.clone(),
+                    adapter_info: Some(AdapterInjectionInfo {
+                        adapter_path,
+                        tier1_interfaces: matched_interfaces,
+                    }),
+                });
             }
             other => {
                 resolved.push(injection.clone());

@@ -13,3 +13,6 @@
 //!   per primitive case so far).
 
 pub(super) mod cells;
+pub(super) mod emit;
+
+pub(super) use emit::build_tier2_adapter;
