@@ -1,0 +1,6 @@
+# Maps the `splicer` namespace to ghcr.io so cross-package WIT `use`
+# clauses (e.g. tier1's `use splicer:common/types`) resolve from the
+# registry. CI exports WKG_CONFIG_FILE=<repo>/wkg-registries.toml.
+
+[namespace_registries]
+splicer = { registry = "ghcr.io", metadata = { preferredProtocol = "oci", "oci" = { registry = "ghcr.io", namespacePrefix = "ejrgilbert/" } } }
