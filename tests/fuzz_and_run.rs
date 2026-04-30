@@ -1605,18 +1605,19 @@ const MIDDLEWARE_LIB_RS: &str = r#"mod bindings {
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
+use bindings::splicer::common::types::CallId;
 
 struct Mdl;
 
 impl BeforeGuest for Mdl {
-    async fn before_call(name: String) {
-        println!("mdl: before {name}");
+    async fn on_call(call: CallId) {
+        println!("mdl: before {}.{}", call.interface_name, call.function_name);
     }
 }
 
 impl AfterGuest for Mdl {
-    async fn after_call(name: String) {
-        println!("mdl: after {name}");
+    async fn on_return(call: CallId) {
+        println!("mdl: after {}.{}", call.interface_name, call.function_name);
     }
 }
 
@@ -1626,12 +1627,13 @@ bindings::export!(Mdl with_types_in bindings);
 const MIDDLEWARE_WORLD_WIT: &str = r#"package my:middleware@1.0.0;
 
 world mdl {
-    export splicer:tier1/before@0.1.0;
-    export splicer:tier1/after@0.1.0;
+    export splicer:tier1/before@0.2.0;
+    export splicer:tier1/after@0.2.0;
 }
 "#;
 
 const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
+const MIDDLEWARE_COMMON_DEP_WIT: &str = include_str!("../wit/common/world.wit");
 
 /// Placeholder replaced at call time with the absolute path of the
 /// middleware component. The YAML must reference an absolute path
@@ -2581,8 +2583,12 @@ fn scaffold_common(root: &Path, _mode: AsyncMode) -> std::io::Result<()> {
         &[
             ("world.wit", MIDDLEWARE_WORLD_WIT),
             (
-                "deps/splicer-tier1-0.1.0/package.wit",
+                "deps/splicer-tier1-0.2.0/package.wit",
                 MIDDLEWARE_TIER1_DEP_WIT,
+            ),
+            (
+                "deps/splicer-common-0.1.0/package.wit",
+                MIDDLEWARE_COMMON_DEP_WIT,
             ),
         ],
     )?;
