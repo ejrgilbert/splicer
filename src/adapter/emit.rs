@@ -1109,7 +1109,7 @@ fn emit_wrapper_body(
     let mut locals = FunctionIndices::new(nparams);
     let result_local = fd.direct_result().map(|t| locals.alloc_local(t));
     // Wait-loop scratch (subtask + waitable-set handles); shared
-    // across before- / on-return / blocking awaits.
+    // across on-call / on-return / blocking awaits.
     let wait_locals = async_runtime.map(|_| {
         let st = locals.alloc_local(ValType::I32);
         let ws = locals.alloc_local(ValType::I32);

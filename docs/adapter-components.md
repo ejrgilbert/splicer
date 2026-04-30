@@ -14,8 +14,11 @@ can't be reused on `my:service/adder` without being rewritten.
 match the target interface signature, splicer generates a thin wrapper
 component, the **adapter**, that bridges between a generic middleware
 WIT interface and the specific target interface. The middleware author
-writes against a simple, type-erased WIT contract; splicer handles all
-the type plumbing at composition time.
+writes against a tier-specific WIT contract — fully type-erased at
+tier 1 (the middleware sees only call identity), structural / typed but
+target-agnostic at tiers 2 and up (the adapter lifts canonical-ABI
+values into a uniform field representation). Splicer handles all the
+type plumbing at composition time either way.
 
 This document covers the cross-tier framework: tier taxonomy, the rules
 that apply to every tier, eligibility detection, and chain composition.
