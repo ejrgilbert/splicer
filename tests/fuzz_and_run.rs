@@ -1611,13 +1611,13 @@ struct Mdl;
 
 impl BeforeGuest for Mdl {
     async fn on_call(call: CallId) {
-        println!("mdl: before {}.{}", call.interface_name, call.function_name);
+        println!("mdl: before {}#{}", call.interface_name, call.function_name);
     }
 }
 
 impl AfterGuest for Mdl {
     async fn on_return(call: CallId) {
-        println!("mdl: after {}.{}", call.interface_name, call.function_name);
+        println!("mdl: after {}#{}", call.interface_name, call.function_name);
     }
 }
 
