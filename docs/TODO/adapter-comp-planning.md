@@ -8,62 +8,208 @@ file focuses on what hasn't been built yet.
 
 ## Middleware tier roadmap
 
-Tier 1 is shipped. Tiers 2 and 3 are planned. Middleware capability
-strictly accumulates: a tier-N middleware can do everything an earlier
-tier can, plus one new thing.
+Tier 1 is shipped. Tiers 2, 3, and 4 are planned. The user-facing
+taxonomy and per-tier WIT shapes live in
+[`adapter-components.md`](../adapter-components.md); this section captures
+only the open design questions that aren't settled there.
 
-| Tier | New capability                       | Status      |
-|------|--------------------------------------|-------------|
-| 1    | see function names                   | **shipped** |
-| 2    | see arg / result values (serialized) | planned     |
-| 3    | modify arg / result values           | planned     |
+| Tier | New capability                                       | Status      |
+|------|------------------------------------------------------|-------------|
+| 1    | see function name                                    | **shipped** |
+| 2    | observe typed args / results (no modify)             | planned     |
+| 3    | modify typed args / results, downstream still called | planned     |
+| 4    | replace the downstream entirely (virtualize)         | planned     |
 
-### Tier 2: value-aware middleware (planned)
+### Open design questions for tier 2 / 3 / 4
 
-The middleware gets access to arguments and return values, serialized
-as strings (e.g. WAVE-encoded). The adapter handles canonical-ABI
-lifting/lowering; the middleware works entirely with strings and
-never sees the typed values directly.
+The user-facing doc settles the value representation
+(`field-value` variant covering every WIT ctor, simple type names in
+values, fully-qualified interface ID at call level, async-only hooks,
+arbitrary middleware imports, **one tier per middleware**, and chain
+composition semantics including tier-4-as-terminator). What it doesn't
+pin down:
 
-Proposed WIT interface:
+- **Per-call hook signature for multi-interface attachment.** Tier-2
+  recording works best when one middleware is attached to *several*
+  interfaces at once (e.g. `wasi:http/handler` plus `wasi:http/types`)
+  so it sees the whole span of nested calls. The hook needs to carry
+  enough identity for the middleware to disambiguate which interface
+  each call belongs to. Sketch:
+  ```wit
+  record call-id {
+      interface: string,   // "wasi:http/types@0.3.0"
+      function: string,    // "request.body"
+  }
+  on-call: async func(call: call-id, args: list<field>);
+  on-return: async func(call: call-id, results: list<field>);
+  ```
+  Open: should `call-id` also carry a per-invocation correlation token
+  so nested calls can be associated with their enclosing top-level
+  call? (See "Span-based recording" below.)
+
+- **Tier-3 short-circuit.** Tier 3 mutates in-flight values but still
+  forwards to the downstream. Should it have a way to bail (return a
+  synthesized result without calling the downstream)? If yes, that's
+  basically a per-call escape hatch into tier-4 behavior — worth
+  thinking through whether it's a separate hook or a return-shape
+  signal from `before-call`. (Tier-3 short-circuit would blur the
+  one-tier-per-middleware rule; alternative is to require users to
+  ship a separate tier-4 component for that case.)
+
+### Tier 4 absorbs the "one-per-signature" cases
+
+The original "one-per-signature" section below described middleware
+that has to *fabricate* structurally valid values from scratch
+(fuzzers, mocks, property harnesses). With tier 4 in the picture,
+those use cases land naturally: a tier-4 middleware exports the
+target interface's tier-4 world and synthesizes the return value
+itself. The Rust-codegen path is still useful for built-ins that want
+`arbitrary`-style auto-generation, but it's now an implementation
+strategy *for tier 4*, not a separate fourth category.
+
+## Span-based recording and record/replay
+
+Tier 2 (record) + tier 4 (replay) is the canonical capture-and-relive
+pair, but several design pieces aren't worked out yet.
+
+### The span / correlation problem
+
+Recording is interesting only when applied to **multiple WIT
+boundaries at once**. A trace of just `wasi:http/handler::handle`
+captures the request and response, but everything that happened
+*inside* that handler — header reads, body chunk pulls, kv lookups,
+filesystem writes — is invisible. To record those, the same tier-2
+middleware has to also be attached to `wasi:http/types`,
+`wasi:keyvalue/store`, `wasi:filesystem/preopens`, etc.
+
+That makes the recorder see a **stream** of calls from many
+interfaces. To reconstruct what happened during one top-level
+invocation, it has to group those calls into a span. The grouping
+identity needs to come from the adapter, not from the middleware
+guessing — middleware guessing breaks under concurrency (two
+in-flight `handle` calls would see their inner `request.body` reads
+intermixed in the hook stream with no way to disambiguate).
+
+Sketch of what the call hook would carry:
 
 ```wit
-interface value-aware-middleware {
-    // return some(wave-encoded-result) to short-circuit and skip downstream
-    before-call: async func(name: string, args: string) -> option<string>;
-    // return some(wave-encoded-result) to replace the downstream result
-    after-call: async func(name: string, result: string) -> option<string>;
+record call-id {
+    interface: string,                  // "wasi:http/types@0.3.0"
+    function: string,                   // "request.body"
+    span: u64,                          // top-level call's correlation token
+    parent: option<u64>,                // immediate-caller span (nested case)
 }
 ```
 
-Generated proxy shape:
+Open questions:
 
-```
-export handle(req: request) -> response:
-    wave_args = wave_encode(req)
-    cached = middleware.before-call("handle", wave_args)
-    if cached is some:
-        return wave_decode(cached)
-    result = downstream.handle(req)
-    wave_result = wave_encode(result)
-    override = middleware.after-call("handle", wave_result)
-    return wave_decode(override) if override is some else result
-```
+- **How does the adapter learn the span token?** A natural answer:
+  the adapter at the **outermost** instrumented boundary mints a
+  fresh `u64` per top-level call and threads it through async-context
+  state (or task-local storage) so inner adapters at lower boundaries
+  can read it. Needs a concrete mechanism; the component model's
+  `task` API may or may not give enough plumbing here.
+- **What about non-tree fan-in?** If two top-level calls share a
+  resource handle (e.g. a long-lived `wasi:keyvalue::bucket`), inner
+  calls on that resource may legitimately span both top-level spans.
+  Probably modelled as `parent: list<u64>` or a separate "resources
+  alive across spans" view; design is open.
+- **Does the recorder export the span tokens, or are they internal
+  bookkeeping?** Replayers care about call ordering within a span,
+  not the token itself. Trace format probably stores ordered call
+  groups keyed by span-internal index, not by `u64`.
 
-**Suitable for**: memoizers, result caching, circuit breakers with
-response replay, content-based routing, mutation-based fuzzers.
+### Replayer as tier-4
 
-### Tier 3: read-write middleware (planned)
+A replayer is a tier-4 component that exports the target interface
+and consumes a recorded trace as state (data segment, imported
+`wasi:filesystem` read, etc.). On each call it looks up the next
+recorded call for that interface/function in its span, returns the
+recorded result, and advances the cursor.
 
-Tier 2 but with modification authority over both inbound args and
-outbound results. Same serialized-string contract; the difference is
-that splicer decodes the middleware's returned string back into the
-canonical-ABI typed form before the call continues.
+Open questions:
 
-**Suitable for**: request enrichment (injecting headers / context),
-response transformation, content filtering, A/B testing (routing
-request variants to the same downstream), mutation-testing
-frameworks.
+- **Trace format identity.** Trace metadata header records
+  `(interface-id, schema-hash)` for each instrumented interface. The
+  replayer refuses to load a trace whose schema-hash doesn't match
+  the WIT it was generated against — protects against
+  silently-broken replay when the WIT evolves.
+- **Span replay determinism.** If the recorded trace contains
+  concurrent calls within one span, what order does the replayer
+  serve them in? Probably "in recorded order, regardless of
+  caller-side concurrency"; means the replayer needs to gate calls
+  until the predecessor in trace order has been served.
+- **Resource handle correlation across record→replay.** The
+  recording sees `resource-handle("request", 42)`. The replay needs
+  to mint a fresh handle for the same role. Probably: replayer
+  rewrites recorded `u64` IDs through a per-span identity map as it
+  serves calls. Needs care for resources that escape the span (rare
+  but possible in `wasi:keyvalue`).
+
+### Recorder as tier-2
+
+A recorder is a tier-2 component that observes the lifted
+`list<field>` for each call in its span and writes them out (data
+segment, `wasi:io` stream, custom sink interface). Mostly
+straightforward once the span / correlation question is answered;
+trace format design is the main open question.
+
+## Multi-middleware chain diagnostics
+
+The chain composition rules themselves are settled in the user-facing
+doc — tiers 1-3 compose freely, tier 4 is a chain terminator, ordering
+of tier-3s matters but is well-defined. What's still open is **how
+loud splicer should be about questionable configurations**.
+
+Concrete diagnostics worth adding:
+
+- **Reject (hard error): middleware after a tier-4 entry.** Anything
+  past a tier-4 in `inject: [...]` is unreachable. The current plan
+  is a warning at splice time; promoting to a hard error costs
+  nothing and prevents silent dead-code.
+- **Warn: tier-3 chain whose ordering looks accidental.** E.g. two
+  tier-3 transformers where one is `redact-pii` and the other is
+  `compress` — putting `compress` outside `redact-pii` means the
+  PII gets compressed before redaction, which is almost certainly
+  unintended. Hard to detect generically (we don't know what the
+  middleware does); could surface as a `splicer doctor`-style
+  command that lints config patterns the user opts into.
+- **Info: chain summary output.** When `splicer splice` runs, print
+  a one-line per-rule chain visualization showing tier per entry —
+  helps users see what they configured.
+
+No code changes needed for the chain mechanism itself; this is
+purely a UX / diagnostics question.
+
+## Per-tier performance characterization
+
+Every tier above 1 lifts canonical-ABI values into `field-value`
+trees on every call, then (for tier 3) lowers them back. That cost
+scales with payload size, not just call count.
+
+Worth measuring before locking in the design:
+
+- **Tier 1 baseline.** Sub-microsecond per hook call on a mid-size
+  multi-function interface. Already in the perf doc.
+- **Tier 2 per-call lifting.** How does it scale with payload size?
+  A 1MB HTTP body should hit the `bytes` fast path (no per-element
+  variant boxing); a 10k-element `list<u32>` won't. Need numbers for
+  representative shapes.
+- **Tier 2 multi-boundary recording overhead.** When a single
+  `wasi:http::handle` invocation triggers 50 inner calls on
+  `wasi:http/types` + `wasi:keyvalue` + `wasi:filesystem`, the
+  recorder pays the lift cost on every one. Aggregate cost matters
+  more than per-call.
+- **Tier 3 round-trip cost.** Lifting + middleware processing +
+  lowering back. Probably 2× tier 2 plus the middleware's own work.
+- **Tier 4 vs direct call.** A tier-4 middleware replaces the
+  downstream, so the relevant comparison isn't "wrapping overhead"
+  but "would the same logic written as a normal component be
+  faster?" The answer should be "no, modulo the lift overhead on the
+  way in," but worth confirming.
+
+Action: add benchmarks to `bench/` once tier 2 lands. Don't design
+tier 3 / 4 around a perf model that hasn't been measured.
 
 ## The "one-per-signature" case
 
