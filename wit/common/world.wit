@@ -1,8 +1,8 @@
 /// Shared types used across all splicer middleware tiers.
 ///
 /// Tier WIT packages (`splicer:tier1`, `splicer:tier2`, ...) import
-/// types defined here so the call-identity shape stays consistent
-/// across tiers as middleware authors move up.
+/// types defined here so the call-identity and lifted-value shapes
+/// stay consistent across tiers as middleware authors move up.
 package splicer:common@0.1.0;
 
 interface types {
@@ -13,5 +13,103 @@ interface types {
     record call-id {
         interface-name: string,
         function-name: string,
+    }
+
+    // ── Lifted-value representation ───────────────────────────────
+    //
+    // Each canonical-ABI value gets lifted into a `field-tree`: a
+    // flat array of cells plus an index identifying the root.
+    // Compound cells reference children by `u32` index into the same
+    // array (not by direct self-reference). A helper library walks
+    // the indices to present a tree-shaped API; middleware authors
+    // who don't have a helper can iterate the cells directly.
+    //
+    // Why index-based recursion instead of a self-referential
+    // variant? WIT does not yet support recursive types — see
+    // https://github.com/WebAssembly/component-model/issues/56.
+    // Until that lands, "compile" the recursion out into an
+    // index-keyed array layout.
+
+    /// `record { ... }` payload — type name + named fields.
+    record record-info {
+        type-name: string,
+        /// `(field-name, cell-index)` per declared field, in WIT order.
+        fields: list<tuple<string, u32>>,
+    }
+
+    /// `flags { ... }` payload — type name + names of set bits.
+    record flags-info {
+        type-name: string,
+        set-flags: list<string>,
+    }
+
+    /// `enum { ... }` payload — type name + the case-name in this value.
+    record enum-info {
+        type-name: string,
+        case-name: string,
+    }
+
+    /// `variant { ... }` payload — type name, case name, optional payload index.
+    record variant-info {
+        type-name: string,
+        case-name: string,
+        /// Index of the payload cell, or `none` for payload-less cases.
+        payload: option<u32>,
+    }
+
+    /// `own<R>` / `borrow<R>` / `stream<T>` / `future<T>` payload —
+    /// resource (or element) type name + opaque correlation id. The
+    /// id is **not** a usable handle; the adapter still owns
+    /// canonical-ABI ownership semantics. Useful for correlating
+    /// the same handle's appearances across multiple calls.
+    record handle-info {
+        type-name: string,
+        id: u64,
+    }
+
+    /// One node in a lifted value tree. Compound cases hold `u32`
+    /// indices into the cell list rather than direct child cells —
+    /// WIT disallows recursive variants, so the recursion is
+    /// "compiled out" into an index-based array layout.
+    variant cell {
+        // ── primitives ────────────────────────────────────────────
+        %bool(bool),
+        integer(s64),                          // s8/s16/s32/s64/u8/u16/u32/u64
+        floating(f64),                         // f32/f64 (widened)
+        text(string),                          // string and char
+        bytes(list<u8>),                       // list<u8> fast-path
+
+        // ── structural / anonymous types ──────────────────────────
+        list-of(list<u32>),                    // child indices, in order
+        tuple-of(list<u32>),                   // child indices, in order
+        option-some(u32),                      // index of inner value
+        option-none,
+        result-ok(option<u32>),                // index, or none for unit ok
+        result-err(option<u32>),               // index, or none for unit err
+
+        // ── nominal types — name carried alongside the value ──────
+        record-of(record-info),
+        flags-set(flags-info),
+        enum-case(enum-info),
+        variant-case(variant-info),
+
+        // ── opaque correlation handles — adapter owns lifecycle ───
+        resource-handle(handle-info),
+        stream-handle(handle-info),
+        future-handle(handle-info),
+    }
+
+    /// A lifted value tree: a flat array of cells plus the root
+    /// index. Walk by reading `cells[root]` and following child
+    /// indices for compound cases.
+    record field-tree {
+        cells: list<cell>,
+        root: u32,
+    }
+
+    /// Named slot in a function's argument list.
+    record field {
+        name: string,
+        tree: field-tree,
     }
 }

@@ -962,6 +962,20 @@ fn add_to_inject_plan(
                 });
                 // Tier1Compatible is fully handled here; no diagnostic needed upstream.
             }
+            ContractResult::Tier2Compatible(matched_interfaces) => {
+                // Tier-2 detection is wired up but adapter generation
+                // isn't implemented yet. Bail with a clear message
+                // pointing at the tracking issue rather than silently
+                // falling through to the "no adapter" path.
+                anyhow::bail!(
+                    "middleware '{}' is tier-2 compatible (exports {}) but \
+                     tier-2 adapter generation is not yet implemented. \
+                     Track progress at \
+                     https://github.com/ejrgilbert/splicer/issues",
+                    injection.name,
+                    matched_interfaces.join(", "),
+                );
+            }
             other => {
                 resolved.push(injection.clone());
                 final_results.push(other);

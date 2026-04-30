@@ -405,12 +405,15 @@ fn print_diagnostics(diagnostics: &[ContractResult]) {
     for diag in diagnostics {
         match diag {
             ContractResult::Ok => {}
-            // Tier1Compatible is consumed inside `splicer::splice` /
-            // `splicer::compose` (the adapter is generated and the
-            // injection path is substituted), so it should never reach
-            // a user-facing diagnostic list.
+            // Tier{1,2}Compatible are consumed inside `splicer::splice`
+            // / `splicer::compose` — tier-1 dispatches to adapter
+            // generation; tier-2 currently bails before reaching this
+            // diagnostics path. Neither should surface here.
             ContractResult::Tier1Compatible(_) => unreachable!(
                 "Tier1Compatible should not surface in the diagnostics list returned by splicer::splice"
+            ),
+            ContractResult::Tier2Compatible(_) => unreachable!(
+                "Tier2Compatible should not surface in the diagnostics list returned by splicer::splice"
             ),
             ContractResult::Warn(msg) => {
                 eprintln!("{}: {}", "WARN".yellow().bold(), msg.yellow())

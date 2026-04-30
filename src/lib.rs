@@ -97,7 +97,8 @@ pub use ::cviz;
 pub mod types {
     pub use crate::contract::{
         ContractResult, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_INTERFACES, TIER1_PACKAGE,
-        TIER1_VERSION,
+        TIER1_VERSION, TIER2_AFTER, TIER2_BEFORE, TIER2_INTERFACES, TIER2_PACKAGE, TIER2_TRAP,
+        TIER2_VERSION,
     };
     pub use crate::parse::config::{Injection, SpliceRule};
     pub use crate::wac::GeneratedAdapter;
