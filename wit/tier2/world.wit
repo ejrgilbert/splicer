@@ -1,0 +1,42 @@
+/// Tier-2 middleware: typed observation hooks.
+///
+/// A middleware component exports one or more of these interfaces to
+/// participate in the adapter-generation pipeline. The generated
+/// adapter lifts canonical-ABI values into a structural cell-array
+/// representation and passes them to the hooks; the middleware can
+/// observe the lifted values but cannot modify them.
+///
+/// Any non-empty subset is valid: you can export just `before`, just
+/// `after`, just `trap`, or any combination.
+package splicer:tier2@0.1.0;
+
+interface before {
+    use splicer:common/types@0.1.0.{call-id, field};
+    /// Called before every invocation of a target-interface function,
+    /// with the function's parameters lifted into a `list<field>`.
+    on-call: async func(call: call-id, args: list<field>);
+}
+
+interface after {
+    use splicer:common/types@0.1.0.{call-id, field-tree};
+    /// Called after every invocation of a target-interface function,
+    /// with the result lifted into a `field-tree`. `none` for void
+    /// functions; `some(tree)` otherwise. Results are unnamed in WIT,
+    /// so unlike `args` there's no `field` wrapper.
+    on-return: async func(call: call-id, result: option<field-tree>);
+}
+
+interface trap {
+    use splicer:common/types@0.1.0.{call-id};
+    /// Called when the wrapped function traps (errored async subtask
+    /// terminal state). Sync downstream traps propagate without
+    /// firing this hook — see `docs/tiers/tier-2.md` for the
+    /// limitation.
+    on-trap: async func(call: call-id, reason: string);
+}
+
+world tier2-middleware {
+    export before;
+    export after;
+    export trap;
+}

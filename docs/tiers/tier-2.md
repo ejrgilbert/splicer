@@ -11,29 +11,40 @@ For the cross-tier framework (one-tier-per-middleware rule, async
 convention, hook-trap propagation, chain composition), see
 [`adapter-components.md`](../adapter-components.md).
 
-## Value representation: flattened cells
+## Value representation: flattened cells with side tables
 
 The adapter lifts canonical-ABI values into a **flat array of cells**.
 Compound cells reference children by `u32` index into the same array
-rather than by direct self-reference. A helper library (or hand-rolled
+rather than by direct self-reference. Nominal-typed metadata
+(record-of, variant-case, etc.) lives in **per-kind side tables** that
+cells reference by `u32` index. A helper library (or hand-rolled
 walker) presents this as a tree; the wire format itself is a single
-linear `list<cell>` plus a root index.
+linear `list<cell>` plus a small set of side lists plus a root index.
 
-This shape is dictated by a WIT-spec constraint: WIT does not yet
-support recursive types ([component-model
-issue #56](https://github.com/WebAssembly/component-model/issues/56)),
-so the recursion is "compiled out" into an index-keyed array layout.
+Two design constraints shape this layout:
+
+1. **WIT does not yet support recursive types**
+   ([component-model
+   issue #56](https://github.com/WebAssembly/component-model/issues/56)),
+   so the tree's recursion is "compiled out" into an index-keyed array.
+2. **Canonical-ABI lays out a `list<variant>` as fixed-stride memory**,
+   where the stride equals the variant's max payload size padded to
+   alignment. Keeping nominal metadata inline in cell variant cases
+   would force every cell — including a `cell::bool(true)` — to pay
+   24+ bytes of padding. Pulling the metadata into side tables caps
+   every cell payload at 8 bytes (`s64`), so the cell stride lands at
+   16 bytes regardless of which case is present.
 
 ```wit
 variant cell {
-    // ── primitives ────────────────────────────────────────────────
+    // ── primitives — payload fits in 8 bytes ──────────────────────
     %bool(bool),
     integer(s64),                          // s8/s16/s32/s64/u8/u16/u32/u64
     floating(f64),                         // f32/f64 (widened)
     text(string),                          // string and char
     bytes(list<u8>),                       // list<u8> fast-path
 
-    // ── structural / anonymous types ──────────────────────────────
+    // ── structural / anonymous — index into cells ─────────────────
     list-of(list<u32>),                    // child indices
     tuple-of(list<u32>),                   // child indices
     option-some(u32),                      // index of inner value
@@ -41,33 +52,38 @@ variant cell {
     result-ok(option<u32>),                // index, or none for unit ok
     result-err(option<u32>),               // index, or none for unit err
 
-    // ── nominal types — name carried alongside the value ──────────
-    record-of(record-info),
-    flags-set(flags-info),
-    enum-case(enum-info),
-    variant-case(variant-info),
+    // ── nominal — index into the corresponding side table ─────────
+    record-of(u32),                        // → record-infos[idx]
+    flags-set(u32),                        // → flags-infos[idx]
+    enum-case(u32),                        // → enum-infos[idx]
+    variant-case(u32),                     // → variant-infos[idx]
 
-    // ── opaque correlation handles — adapter owns lifecycle ───────
-    resource-handle(handle-info),
-    stream-handle(handle-info),
-    future-handle(handle-info),
+    // ── opaque handles — index into handle-infos ──────────────────
+    resource-handle(u32),                  // → handle-infos[idx]
+    stream-handle(u32),
+    future-handle(u32),
 }
 
 record record-info {
     type-name: string,
-    fields: list<tuple<string, u32>>,      // (field-name, child-index)
+    fields: list<tuple<string, u32>>,      // (field-name, cell-index)
 }
 record flags-info  { type-name: string, set-flags: list<string>, }
 record enum-info   { type-name: string, case-name: string, }
 record variant-info {
     type-name: string,
     case-name: string,
-    payload: option<u32>,                  // index of payload, or none
+    payload: option<u32>,                  // cell-index, or none
 }
 record handle-info { type-name: string, id: u64, }
 
 record field-tree {
-    cells: list<cell>,
+    cells:         list<cell>,
+    record-infos:  list<record-info>,
+    flags-infos:   list<flags-info>,
+    enum-infos:    list<enum-info>,
+    variant-infos: list<variant-info>,
+    handle-infos:  list<handle-info>,
     root: u32,
 }
 
@@ -86,6 +102,28 @@ Every WIT type constructor maps to a distinct `cell` variant case, so
 the lifted value is self-describing — middleware code can pattern-match
 exhaustively without consulting the schema, and a generic trace
 consumer can render a value correctly even without the WIT.
+
+### Memory savings from the side-table split
+
+Cell stride drops from **32 bytes** (with metadata inline) to **16 bytes**
+(metadata in side tables). For typical lifted-value trees:
+
+| Tree shape                                  | Inline-metadata (32 B/cell) | Side-table (16 B/cell + side) | Savings |
+|---------------------------------------------|---------------------------:|----------------------------:|--------:|
+| 100 primitive cells (e.g., a flat tuple)    |                      3200 B|                       1600 B|     50% |
+| 1 record + 50 primitive children            |                      1632 B|                        846 B|     48% |
+| 50 records + 50 primitives                  |                      3200 B|                       3100 B|      3% |
+| HTTP body lifted as `bytes` (1 cell + body) |             32 B + body    |             16 B + body     | negligible |
+
+Primitive-dominated trees (the realistic shape — record leaves are
+mostly primitives) win the most. Record-heavy trees roughly break
+even because each nominal cell trades 16 B of cell padding for ~24 B
+of side-table entry. Never meaningfully worse, often dramatically
+better.
+
+The cost is one extra `tree.<kind>_infos[idx]` lookup in middleware
+code per nominal cell. Helper libraries hide this; without one, the
+indirection is mechanical.
 
 Type names inside cells use **simple** names (`"color"`, not
 `"my:pkg/types@1.0.0.color"`). The fully-qualified interface identity

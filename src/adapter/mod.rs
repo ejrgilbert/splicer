@@ -22,6 +22,7 @@ mod indices;
 mod mem_layout;
 #[cfg(test)]
 mod tests;
+mod tier2;
 
 use emit::build_adapter;
 
