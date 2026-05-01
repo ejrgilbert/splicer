@@ -38,7 +38,7 @@ use super::super::abi::emit::{
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
-use super::blob::{write_le_i32, BlobSlice, RecordWriter};
+use super::blob::{BlobSlice, RecordWriter, Reloc, Segment, SymRef, SymbolId};
 use super::cells::CellLayout;
 use super::emit::{
     FuncClassified, FuncDispatch, SchemaLayouts, RECORD_FIELD_TUPLE_IDX,
@@ -737,9 +737,10 @@ fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo
 //      item-names) into the shared name_blob.
 //   2. Lay out one entry record per item in declaration order, into
 //      one contiguous side-table data segment.
-//   3. Hand back per-(fn, param) and per-(fn, result) `BlobSlice`
-//      pointers (relative to the segment start; caller translates
-//      to absolute via `BlobSlice::translate`).
+//   3. Hand back per-(fn, param) and per-(fn, result) [`SymRef`]
+//      pointers tagged with the segment's [`SymbolId`]; the layout
+//      phase resolves them to absolute [`BlobSlice`]s after every
+//      segment has a base.
 //
 // The kind-specific bits (where to find the info on `SideTableInfo`,
 // which `RecordLayout` to use, what the item-name field is called)
@@ -767,29 +768,14 @@ pub(super) struct NamedListStrings {
     items: Vec<BlobSlice>, // per item, in declaration order
 }
 
-/// Output of [`build_side_table_blob`]: the entry-record bytes plus
-/// per-(fn, param) and per-(fn, result) slice pointers (relative to
-/// the segment start).
+/// Output of [`build_side_table_blob`]: the entry-record [`Segment`]
+/// plus per-(fn, param) and per-(fn, result) [`SymRef`]s into it.
+/// Resolution to absolute [`BlobSlice`]s happens once the segment's
+/// base is known.
 pub(super) struct SideTableBlob {
-    pub bytes: Vec<u8>,
-    pub per_param: Vec<Vec<BlobSlice>>,
-    pub per_result: Vec<BlobSlice>,
-}
-
-impl SideTableBlob {
-    /// Translate every per-param / per-result slice from
-    /// segment-relative to absolute. Called by the layout phase
-    /// once the segment's data offset is known.
-    pub(super) fn translate_to(&mut self, base: u32) {
-        for params in self.per_param.iter_mut() {
-            for slice in params.iter_mut() {
-                slice.translate(base);
-            }
-        }
-        for slice in self.per_result.iter_mut() {
-            slice.translate(base);
-        }
-    }
+    pub segment: Segment,
+    pub per_param: Vec<Vec<SymRef>>,
+    pub per_result: Vec<SymRef>,
 }
 
 /// Walk every param / result; for each lift that surfaces a
@@ -864,12 +850,13 @@ pub(super) fn build_side_table_blob(
     per_func: &[FuncClassified],
     strings: &StringTable,
     spec: &SideTableSpec<'_>,
+    segment_id: SymbolId,
     from_plan: impl Fn(&LiftPlan) -> Option<&NamedListInfo>,
     from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
 ) -> SideTableBlob {
     let mut bytes: Vec<u8> = Vec::new();
-    let mut per_param: Vec<Vec<BlobSlice>> = Vec::with_capacity(per_func.len());
-    let mut per_result: Vec<BlobSlice> = Vec::with_capacity(per_func.len());
+    let mut per_param: Vec<Vec<SymRef>> = Vec::with_capacity(per_func.len());
+    let mut per_result: Vec<SymRef> = Vec::with_capacity(per_func.len());
     for fd in per_func {
         let mut params = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
@@ -877,6 +864,7 @@ pub(super) fn build_side_table_blob(
                 &mut bytes,
                 strings,
                 spec,
+                segment_id,
                 from_plan(&p.plan),
             ));
         }
@@ -885,10 +873,21 @@ pub(super) fn build_side_table_blob(
             .result_lift
             .as_ref()
             .and_then(|r| from_result(&r.side_table));
-        per_result.push(append_entries(&mut bytes, strings, spec, result_info));
+        per_result.push(append_entries(
+            &mut bytes,
+            strings,
+            spec,
+            segment_id,
+            result_info,
+        ));
     }
     SideTableBlob {
-        bytes,
+        segment: Segment {
+            id: segment_id,
+            align: spec.entry_layout.align,
+            bytes,
+            relocs: Vec::new(),
+        },
         per_param,
         per_result,
     }
@@ -898,10 +897,11 @@ fn append_entries(
     blob: &mut Vec<u8>,
     strings: &StringTable,
     spec: &SideTableSpec<'_>,
+    segment_id: SymbolId,
     info: Option<&NamedListInfo>,
-) -> BlobSlice {
+) -> SymRef {
     let Some(info) = info else {
-        return BlobSlice::EMPTY;
+        return SymRef::EMPTY;
     };
     let s = strings
         .get(&info.type_name)
@@ -913,7 +913,11 @@ fn append_entries(
         entry.write_slice(blob, INFO_TYPE_NAME, s.type_name);
         entry.write_slice(blob, spec.item_name_field, s.items[item_idx]);
     }
-    BlobSlice { off: blob_off, len }
+    SymRef {
+        target: segment_id,
+        off: blob_off,
+        len,
+    }
 }
 
 // ─── Convenience facades for emit.rs (one per side-table kind) ────
@@ -947,6 +951,7 @@ pub(super) fn build_enum_info_blob(
     per_func: &[FuncClassified],
     strings: &StringTable,
     schema: &SchemaLayouts,
+    segment_id: SymbolId,
 ) -> SideTableBlob {
     build_side_table_blob(
         per_func,
@@ -955,6 +960,7 @@ pub(super) fn build_enum_info_blob(
             entry_layout: &schema.enum_info_layout,
             item_name_field: ENUM_INFO_CASE_NAME,
         },
+        segment_id,
         |plan| plan.enum_infos().next(),
         |st| st.enum_info.as_ref(),
     )
@@ -1023,69 +1029,35 @@ pub(super) fn register_record_strings(
     table
 }
 
-/// Output of [`build_record_info_blob`]. Two contiguous data
-/// segments + per-(fn, param) pointers. Both segments use
-/// segment-relative offsets internally; absolute resolution happens
-/// in [`RecordInfoBlobs::patch_fields_ptr`] (after the tuples
-/// segment is placed) and [`RecordInfoBlobs::translate_to`] (after
-/// the entries segment is placed).
+/// Output of [`build_record_info_blob`]. Two [`Segment`]s — the
+/// `entries` segment carries one [`Reloc`] per record-cell, pointing
+/// each entry's `fields.ptr` at the matching range inside the
+/// `tuples` segment. Per-(fn, param) range pointers are [`SymRef`]s
+/// into `entries`; the layout phase resolves both layers in one
+/// reloc-pass once each segment has a base.
 pub(super) struct RecordInfoBlobs {
-    /// Bytes of the `record-info` entries blob (one entry per
-    /// `CellOp::RecordOf` across all plans, laid out per-(fn, param)
-    /// in plan order).
-    pub entries: Vec<u8>,
-    /// Bytes of the `(name, cell-idx)` tuples arena (referenced from
-    /// each entry's `fields: list<tuple<string, u32>>`).
-    pub tuples: Vec<u8>,
-    /// Byte offsets within `entries` of each entry's `fields.ptr`
-    /// slot, recorded so [`Self::patch_fields_ptr`] can add the
-    /// tuples-segment base when it's known.
-    fields_ptr_patch_sites: Vec<u32>,
-    /// Per (fn, param): the param's contiguous record-info range
-    /// pointer (segment-relative; absolute after `translate_to`).
-    pub per_param_range: Vec<Vec<BlobSlice>>,
+    /// `record-info` entries: one entry per `CellOp::RecordOf` across
+    /// all plans, laid out per-(fn, param) in plan order. Carries
+    /// relocs for each entry's `fields.ptr` → tuples segment.
+    pub entries: Segment,
+    /// `(name, cell-idx)` tuples arena, referenced from each entry's
+    /// `fields: list<tuple<string, u32>>`.
+    pub tuples: Segment,
+    /// Per (fn, param): the param's contiguous record-info range,
+    /// targeting the entries segment.
+    pub per_param_range: Vec<Vec<SymRef>>,
     /// Per (fn, param): for each plan cell, its assigned record-info
     /// side-table index (None for non-`RecordOf` cells). The lift
     /// codegen reads this when emitting `cell::record-of(idx)`.
     pub per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>>,
-    /// Per (fn): result-side range. `EMPTY` for void / non-Compound
-    /// results; populated for `Compound` results so the result tree's
-    /// `record-infos` slot can patch in.
-    pub per_result_range: Vec<BlobSlice>,
+    /// Per (fn): result-side range. `SymRef::EMPTY` for void /
+    /// non-Compound results; populated for `Compound` results so the
+    /// result tree's `record-infos` slot can patch in.
+    pub per_result_range: Vec<SymRef>,
     /// Per (fn): for each cell of the result's plan, its assigned
     /// record-info side-table index (None for non-`RecordOf` cells).
     /// Empty Vec for non-Compound results.
     pub per_result_cell_idx: Vec<Vec<Option<u32>>>,
-}
-
-impl RecordInfoBlobs {
-    /// After the tuples segment is placed at `tuples_base`, walk
-    /// every entry's `fields.ptr` slot and add the base. The slots
-    /// initially store segment-relative offsets.
-    pub(super) fn patch_fields_ptr(&mut self, tuples_base: u32) {
-        for &site in &self.fields_ptr_patch_sites {
-            let cur = i32::from_le_bytes([
-                self.entries[site as usize],
-                self.entries[site as usize + 1],
-                self.entries[site as usize + 2],
-                self.entries[site as usize + 3],
-            ]);
-            write_le_i32(&mut self.entries, site as usize, cur + tuples_base as i32);
-        }
-    }
-
-    /// Translate per-(fn, param) range pointers to absolute. Mirrors
-    /// [`SideTableBlob::translate_to`] for the simpler enum case.
-    pub(super) fn translate_to(&mut self, entries_base: u32) {
-        for params in self.per_param_range.iter_mut() {
-            for slice in params.iter_mut() {
-                slice.translate(entries_base);
-            }
-        }
-        for slice in self.per_result_range.iter_mut() {
-            slice.translate(entries_base);
-        }
-    }
 }
 
 /// Lay out the per-(fn, param) and per-(fn, compound-result) record-
@@ -1096,29 +1068,35 @@ pub(super) fn build_record_info_blob(
     per_func: &[FuncClassified],
     strings: &RecordStringTable,
     schema: &SchemaLayouts,
+    entries_id: SymbolId,
+    tuples_id: SymbolId,
 ) -> RecordInfoBlobs {
     let entry_layout = &schema.record_info_layout;
     let tuple_layout = &schema.record_field_tuple_layout;
 
     let mut entries: Vec<u8> = Vec::new();
     let mut tuples: Vec<u8> = Vec::new();
-    let mut fields_ptr_patch_sites: Vec<u32> = Vec::new();
-    let mut per_param_range: Vec<Vec<BlobSlice>> = Vec::with_capacity(per_func.len());
+    let mut entry_relocs: Vec<Reloc> = Vec::new();
+    let mut per_param_range: Vec<Vec<SymRef>> = Vec::with_capacity(per_func.len());
     let mut per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>> = Vec::with_capacity(per_func.len());
-    let mut per_result_range: Vec<BlobSlice> = Vec::with_capacity(per_func.len());
+    let mut per_result_range: Vec<SymRef> = Vec::with_capacity(per_func.len());
     let mut per_result_cell_idx: Vec<Vec<Option<u32>>> = Vec::with_capacity(per_func.len());
 
     /// Append entries for one plan's `CellOp::RecordOf` cells; returns
-    /// the contiguous range pointer + per-cell side-table index map.
+    /// the contiguous range [`SymRef`] (into the entries segment) +
+    /// the per-cell side-table index map. Each entry's `fields.ptr`
+    /// slot gets a [`Reloc`] into the tuples segment.
     fn append_plan(
         plan: &LiftPlan,
         strings: &RecordStringTable,
         entries: &mut Vec<u8>,
         tuples: &mut Vec<u8>,
-        fields_ptr_patch_sites: &mut Vec<u32>,
+        entry_relocs: &mut Vec<Reloc>,
         entry_layout: &RecordLayout,
         tuple_layout: &RecordLayout,
-    ) -> (BlobSlice, Vec<Option<u32>>) {
+        entries_id: SymbolId,
+        tuples_id: SymbolId,
+    ) -> (SymRef, Vec<Option<u32>>) {
         let range_start = entries.len() as u32;
         let mut count: u32 = 0;
         let mut cell_idx_map: Vec<Option<u32>> = vec![None; plan.cells.len()];
@@ -1143,15 +1121,20 @@ pub(super) fn build_record_info_blob(
 
             let entry = RecordWriter::extend_zero(entries, entry_layout);
             entry.write_slice(entries, INFO_TYPE_NAME, s.type_name);
-            let fields_field_off = entry.field_offset(RECORD_INFO_FIELDS);
-            let fields_ptr_off = (fields_field_off + SLICE_PTR_OFFSET as usize) as u32;
-            let fields_len_off = (fields_field_off + SLICE_LEN_OFFSET as usize) as u32;
-            write_le_i32(entries, fields_ptr_off as usize, tuples_off as i32);
-            write_le_i32(entries, fields_len_off as usize, tuples_len as i32);
-            fields_ptr_patch_sites.push(fields_ptr_off);
+            entry.write_slice_reloc(
+                entries,
+                entry_relocs,
+                RECORD_INFO_FIELDS,
+                SymRef {
+                    target: tuples_id,
+                    off: tuples_off,
+                    len: tuples_len,
+                },
+            );
         }
         (
-            BlobSlice {
+            SymRef {
+                target: entries_id,
                 off: range_start,
                 len: count,
             },
@@ -1168,9 +1151,11 @@ pub(super) fn build_record_info_blob(
                 strings,
                 &mut entries,
                 &mut tuples,
-                &mut fields_ptr_patch_sites,
+                &mut entry_relocs,
                 entry_layout,
                 tuple_layout,
+                entries_id,
+                tuples_id,
             );
             params_ranges.push(range);
             params_cell_idx.push(cell_idx_map);
@@ -1185,20 +1170,31 @@ pub(super) fn build_record_info_blob(
                     strings,
                     &mut entries,
                     &mut tuples,
-                    &mut fields_ptr_patch_sites,
+                    &mut entry_relocs,
                     entry_layout,
                     tuple_layout,
+                    entries_id,
+                    tuples_id,
                 ),
-                None => (BlobSlice::EMPTY, Vec::new()),
+                None => (SymRef::EMPTY, Vec::new()),
             };
         per_result_range.push(result_range);
         per_result_cell_idx.push(result_cell_idx_map);
     }
 
     RecordInfoBlobs {
-        entries,
-        tuples,
-        fields_ptr_patch_sites,
+        entries: Segment {
+            id: entries_id,
+            align: entry_layout.align,
+            bytes: entries,
+            relocs: entry_relocs,
+        },
+        tuples: Segment {
+            id: tuples_id,
+            align: tuple_layout.align,
+            bytes: tuples,
+            relocs: Vec::new(),
+        },
         per_param_range,
         per_param_cell_idx,
         per_result_range,

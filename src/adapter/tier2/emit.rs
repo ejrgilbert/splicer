@@ -41,13 +41,13 @@ use super::super::mem_layout::StaticLayout;
 use super::super::resolve::{
     decode_input_resolve, dispatch_mangling, find_target_interface, hook_callback_mangling,
 };
-use super::blob::{BlobSlice, RecordWriter};
+use super::blob::{BlobSlice, RecordWriter, RelocPlan, SymbolBases};
 use super::cells::CellLayout;
 use super::lift::{
     alloc_wrapper_locals, build_enum_info_blob, build_record_info_blob, classify_func_params,
     classify_result_lift, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    register_enum_strings, register_record_strings, ParamLayout, ParamLift, ResultEmitPlan,
-    ResultLayout, ResultLift, ResultSourceLayout, WrapperLocals,
+    register_enum_strings, register_record_strings, ParamLayout, ParamLift, RecordInfoBlobs,
+    ResultEmitPlan, ResultLayout, ResultLift, ResultSourceLayout, SideTableBlob, WrapperLocals,
 };
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
@@ -564,6 +564,8 @@ fn lay_out_static_memory(
     let record_strings = register_record_strings(&per_func, name_blob);
 
     let mut layout = StaticLayout::new();
+    let mut symbols = SymbolBases::new();
+    let mut relocs = RelocPlan::new();
 
     layout.place_data(1, name_blob);
 
@@ -602,32 +604,78 @@ fn lay_out_static_memory(
         vec![None; n_funcs]
     };
 
-    // Place the per-(fn, field) enum-info side tables. `per_param` /
-    // `per_result` come back relative to the blob's start; we
-    // translate to absolute by adding the placed blob's data offset.
-    let mut enum_info = build_enum_info_blob(&per_func, &enum_strings, schema);
-    let enum_info_base = layout.place_data(schema.enum_info_layout.align, &enum_info.bytes);
-    enum_info.translate_to(enum_info_base);
+    // Build the per-(fn, field) enum-info and record-info side
+    // tables. Each builder produces [`Segment`]s carrying their bytes
+    // + any in-segment relocs (record-info's `entries` references
+    // `tuples`); placement order below is now commutative because
+    // every cross-segment ptr is a queued reloc, not a write that
+    // gets patched after the fact.
+    let enum_info_id = symbols.alloc();
+    let record_entries_id = symbols.alloc();
+    let record_tuples_id = symbols.alloc();
+    let enum_info = build_enum_info_blob(&per_func, &enum_strings, schema, enum_info_id);
+    let SideTableBlob {
+        segment: enum_segment,
+        per_param: enum_per_param_sym,
+        per_result: enum_per_result_sym,
+    } = enum_info;
+    let RecordInfoBlobs {
+        entries: record_entries_seg,
+        tuples: record_tuples_seg,
+        per_param_range: record_per_param_range_sym,
+        per_param_cell_idx,
+        per_result_range: record_per_result_range_sym,
+        per_result_cell_idx,
+    } = build_record_info_blob(
+        &per_func,
+        &record_strings,
+        schema,
+        record_entries_id,
+        record_tuples_id,
+    );
 
-    // Place the record-info side table. Two segments — the
-    // `record-info` entries blob references the `(name, cell-idx)`
-    // tuples blob, so we place tuples first, patch the entries' fields
-    // pointers, then place entries and translate per-param ranges to
-    // absolute.
-    let mut record_info = build_record_info_blob(&per_func, &record_strings, schema);
-    let record_tuples_base =
-        layout.place_data(schema.record_field_tuple_layout.align, &record_info.tuples);
-    record_info.patch_fields_ptr(record_tuples_base);
-    let record_info_base = layout.place_data(schema.record_info_layout.align, &record_info.entries);
-    record_info.translate_to(record_info_base);
+    // Order doesn't matter for correctness — each placement assigns
+    // a base, relocs land later. Tuples-then-entries-then-enums is
+    // just a convenient order to coalesce same-alignment segments
+    // back-to-back.
+    let record_tuples_base = layout.place_data(record_tuples_seg.align, &record_tuples_seg.bytes);
+    symbols.set(record_tuples_seg.id, record_tuples_base);
+    relocs.record_segment(record_tuples_base, record_tuples_seg.relocs);
+
+    let record_entries_base =
+        layout.place_data(record_entries_seg.align, &record_entries_seg.bytes);
+    symbols.set(record_entries_seg.id, record_entries_base);
+    relocs.record_segment(record_entries_base, record_entries_seg.relocs);
+
+    let enum_info_base = layout.place_data(enum_segment.align, &enum_segment.bytes);
+    symbols.set(enum_segment.id, enum_info_base);
+    relocs.record_segment(enum_info_base, enum_segment.relocs);
+
+    // Resolve per-(fn, param) and per-(fn, result) [`SymRef`]s to
+    // absolute [`BlobSlice`]s now that all three segments have bases.
+    let enum_per_param: Vec<Vec<BlobSlice>> = enum_per_param_sym
+        .into_iter()
+        .map(|v| v.into_iter().map(|s| s.resolve(&symbols)).collect())
+        .collect();
+    let enum_per_result: Vec<BlobSlice> = enum_per_result_sym
+        .into_iter()
+        .map(|s| s.resolve(&symbols))
+        .collect();
+    let record_per_param_range: Vec<Vec<BlobSlice>> = record_per_param_range_sym
+        .into_iter()
+        .map(|v| v.into_iter().map(|s| s.resolve(&symbols)).collect())
+        .collect();
+    let record_per_result_range: Vec<BlobSlice> = record_per_result_range_sym
+        .into_iter()
+        .map(|s| s.resolve(&symbols))
+        .collect();
 
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
     // blob writers don't grow another arg per kind.
-    let param_side_tables: Vec<Vec<FieldSideTables>> = enum_info
-        .per_param
+    let param_side_tables: Vec<Vec<FieldSideTables>> = enum_per_param
         .iter()
-        .zip(record_info.per_param_range.iter())
+        .zip(record_per_param_range.iter())
         .map(|(enums, records)| {
             enums
                 .iter()
@@ -639,10 +687,9 @@ fn lay_out_static_memory(
                 .collect()
         })
         .collect();
-    let result_side_tables: Vec<FieldSideTables> = enum_info
-        .per_result
+    let result_side_tables: Vec<FieldSideTables> = enum_per_result
         .iter()
-        .zip(record_info.per_result_range.iter())
+        .zip(record_per_result_range.iter())
         .map(|(&enum_infos, &record_infos)| FieldSideTables {
             enum_infos,
             record_infos,
@@ -719,7 +766,11 @@ fn lay_out_static_memory(
     // placed; today that's `cell` (8) but pulling from `cell_layout`
     // keeps it tied to the schema instead of a literal.
     let bump_start = layout.end().next_multiple_of(schema.cell_layout.align);
-    let data_segments = layout.into_segments();
+    let mut data_segments = layout.into_segments();
+    // Resolve every queued cross-segment pointer in one pass. Has to
+    // happen after `into_segments` so the segments aren't being
+    // mutated through the layout's coalescing path.
+    relocs.resolve(&symbols, &mut data_segments);
 
     // Assemble FuncDispatch from each FuncClassified + its offsets.
     // Owns the move from classify-time → post-layout types — every
@@ -729,7 +780,7 @@ fn lay_out_static_memory(
         .enumerate()
         .map(|(i, fc)| {
             let fn_cells_offsets = &cells_offsets[i];
-            let fn_param_record_idxs = &record_info.per_param_cell_idx[i];
+            let fn_param_record_idxs = &per_param_cell_idx[i];
             let params: Vec<ParamLayout> = fc
                 .params
                 .into_iter()
@@ -757,7 +808,7 @@ fn lay_out_static_memory(
                             compound,
                             retptr_offset: retptr_offset
                                 .expect("Compound → retptr scratch reserved"),
-                            record_info_cell_idx: record_info.per_result_cell_idx[i].clone(),
+                            record_info_cell_idx: per_result_cell_idx[i].clone(),
                         }
                     }
                 };
