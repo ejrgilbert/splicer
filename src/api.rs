@@ -359,8 +359,11 @@ rules:
         let path = inj.path.as_deref().expect("path stamped");
         let bytes = std::fs::read(path).expect("file written");
         assert!(bytes.starts_with(b"\0asm"), "embedded bytes are wasm");
+        // `Path::ends_with` is component-aware, so this works on both
+        // unix (`builtins/hello-tier1.wasm`) and windows
+        // (`builtins\hello-tier1.wasm`).
         assert!(
-            path.ends_with("builtins/hello-tier1.wasm"),
+            std::path::Path::new(path).ends_with("builtins/hello-tier1.wasm"),
             "path lives under splits_dir/builtins/: {path}"
         );
     }
@@ -410,11 +413,8 @@ rules:
 
         let inject = &rules[0].inject();
         assert_eq!(inject[0].path.as_deref(), Some("./tracing.wasm"));
-        assert!(inject[1]
-            .path
-            .as_ref()
-            .unwrap()
-            .ends_with("builtins/hello-tier1.wasm"));
+        let materialized = inject[1].path.as_deref().unwrap();
+        assert!(std::path::Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
     }
 
     /// The long-form `builtin: { name: ..., alias: ... }` should land
@@ -439,11 +439,8 @@ rules:
         let inj = &rules[0].inject()[0];
         assert_eq!(inj.name, "greeter");
         assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
-        assert!(inj
-            .path
-            .as_ref()
-            .unwrap()
-            .ends_with("builtins/hello-tier1.wasm"));
+        let materialized = inj.path.as_deref().unwrap();
+        assert!(std::path::Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
     }
 
     /// Naming a builtin that doesn't exist surfaces a clear error
