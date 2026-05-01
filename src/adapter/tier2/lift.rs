@@ -39,8 +39,8 @@ use super::super::indices::FunctionIndices;
 use super::blob::{write_le_i32, BlobSlice, RecordWriter};
 use super::cells::CellLayout;
 use super::emit::{
-    FuncDispatch, SchemaLayouts, RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME,
-    RECORD_INFO_FIELDS,
+    FuncClassified, FuncDispatch, SchemaLayouts, RECORD_FIELD_TUPLE_IDX,
+    RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS,
 };
 
 // ─── WIT names referenced by lift codegen ─────────────────────────
@@ -222,12 +222,12 @@ pub(super) enum CellOp {
 /// [`LocalRef::resolve`] at emit time.
 ///
 /// `Param(n)` is **plan-local**: indexed from 0 within the
-/// [`LiftPlan`] that owns it. The plan's owner ([`ParamLift`] for
-/// params, [`ResultLift`] for compound results) stores a `local_base`
+/// [`LiftPlan`] that owns it. The plan's owner stores a `local_base`
 /// — an absolute wasm-local index — that gets added to `n` at resolve
-/// time. This way the same plan-builder allocates plan-local indices
-/// for both param-flat-slots (base = cumulative param-slot cursor)
-/// and result-synthetic locals (base = first `WrapperLocals.result_locals`).
+/// time. For params, the base lives on [`ParamLift::local_base`]
+/// (cumulative param-slot cursor). For compound results, the base is
+/// the first synthetic local allocated in
+/// [`WrapperLocals::result_lift_locals`].
 ///
 /// `PtrScratch` / `LenScratch` / `Result` are wrapper-allocated
 /// scratch locals; they don't shift with the plan's base.
@@ -425,26 +425,32 @@ impl LiftPlanBuilder {
     }
 }
 
-// ─── Result-lift descriptors ──────────────────────────────────────
+// ─── Result-lift descriptors (classify-time, immutable) ───────────
 //
 // Three shapes:
 //
 // - `Direct(kind)` — primitive that fits in one flat slot, captured
 //   into `lcl.result` after the handler call.
-// - `RetptrPair { kind, retptr_offset }` — `(ptr, len)` for string /
-//   `list<u8>` returns; the wrapper loads the pair from retptr scratch
-//   into `lcl.ptr_scratch` / `lcl.len_scratch` before lifting.
+// - `RetptrPair(kind)` — `(ptr, len)` for string / `list<u8>` returns;
+//   the wrapper loads the pair from retptr scratch into
+//   `lcl.ptr_scratch` / `lcl.len_scratch` before lifting.
 // - `Compound(CompoundResult)` — record / tuple / etc. that lives in
 //   memory at retptr scratch. Driven by a [`LiftPlan`] symmetric with
 //   the per-param plans; `wit_bindgen_core::abi::lift_from_memory`
 //   pushes flat values onto the wasm stack from retptr_offset, and
 //   the wrapper `local.set`s those into per-result synthetic locals
 //   (in reverse, since the stack is LIFO) for the plan walker.
+//
+// All offsets (retptr_offset for RetptrPair / Compound, cells_offset
+// + record_info_cell_idx for Compound) live on the post-layout
+// [`ResultLayout`] / [`ResultSourceLayout`]; this classify-time type
+// has no offsets and never gets mutated.
 
-/// How to extract the function's return value when lifting it for
-/// on-return. `side_table` populates the result tree's side-tables
-/// at adapter-build time. Compound results carry their side-table
-/// contributions inline on the plan's `CellOp`s instead.
+/// Classify-time descriptor for the function's return value. The
+/// layout phase wraps it into a [`ResultLayout`] with the offsets
+/// once those are known. `side_table` populates the result tree's
+/// side tables at adapter-build time. Compound results carry their
+/// side-table contributions inline on the plan's `CellOp`s instead.
 pub(super) struct ResultLift {
     pub source: ResultSource,
     pub side_table: SideTableInfo,
@@ -454,18 +460,17 @@ pub(super) enum ResultSource {
     /// Direct primitive (no retptr): source is `lcl.result`.
     Direct(LiftKind),
     /// `(ptr, len)` pair in retptr scratch (string / `list<u8>`).
-    RetptrPair { kind: LiftKind, retptr_offset: i32 },
+    RetptrPair(LiftKind),
     /// Compound result: walk a [`LiftPlan`] over flat slots loaded
     /// from retptr scratch via `lift_from_memory`.
     Compound(CompoundResult),
 }
 
-/// Per-fn compound-result recipe: which WIT type to lift, where its
-/// canonical-ABI bytes live (retptr scratch), and the cell-tree
-/// plan that consumes the flat slots. `local_base` is back-filled
-/// by the wrapper-body emitter once it allocates the synthetic
-/// flat-slot locals; `cells_offset` is back-filled by the layout
-/// phase (parallel to `ParamLift::cells_offset`).
+/// Per-fn compound-result classify output: which WIT type to lift
+/// plus the cell-tree plan that consumes the flat slots. The
+/// retptr scratch byte offset, the cells-slab byte offset, and the
+/// per-cell record-info side-table indices are all layout-phase
+/// outputs — they live on [`ResultSourceLayout::Compound`], not here.
 pub(super) struct CompoundResult {
     /// WIT type of the result value — kept around so the wrapper
     /// body can drive `lift_from_memory` through `WasmEncoderBindgen`.
@@ -474,28 +479,9 @@ pub(super) struct CompoundResult {
     /// param's plan; `LocalRef::Param(n)` resolves to
     /// `local_base + n` at emit time.
     pub plan: LiftPlan,
-    /// Byte offset of the retptr scratch buffer (back-filled by
-    /// layout via [`ResultLift::set_retptr_offset`]).
-    pub retptr_offset: i32,
-    /// Per-cell record-info side-table indices; back-filled by the
-    /// layout phase (parallel to `ParamLift::record_info_cell_idx`).
-    pub record_info_cell_idx: Vec<Option<u32>>,
-    /// Byte offset of the result's contiguous cells slab in static
-    /// memory; back-filled by the layout phase.
-    pub cells_offset: u32,
 }
 
 impl ResultLift {
-    /// Re-anchor the retptr scratch offset back-filled by the layout
-    /// phase. No-op for `Direct` results.
-    pub(super) fn set_retptr_offset(&mut self, off: i32) {
-        match &mut self.source {
-            ResultSource::Direct(_) => {}
-            ResultSource::RetptrPair { retptr_offset, .. } => *retptr_offset = off,
-            ResultSource::Compound(c) => c.retptr_offset = off,
-        }
-    }
-
     /// Returns `Some(&CompoundResult)` for compound result lifts;
     /// `None` otherwise.
     pub(super) fn compound(&self) -> Option<&CompoundResult> {
@@ -504,33 +490,84 @@ impl ResultLift {
             _ => None,
         }
     }
-
-    /// Mutable accessor for the layout phase to back-fill
-    /// `cells_offset` / `record_info_cell_idx`.
-    pub(super) fn compound_mut(&mut self) -> Option<&mut CompoundResult> {
-        match &mut self.source {
-            ResultSource::Compound(c) => Some(c),
-            _ => None,
-        }
-    }
 }
 
-/// Per-parameter lift recipe. `cells_offset` is the byte offset of
-/// this param's contiguous cells slab within the static data segment;
-/// the slab holds `plan.cell_count()` cells, each `cell_layout.size`
-/// bytes. `record_info_cell_idx[i]` is the side-table index for the
-/// `i`th cell when it's a `CellOp::RecordOf` (else `None`). `local_base`
-/// is the absolute wasm-local index that `LocalRef::Param(0)` of the
-/// param's plan corresponds to — for params, this is the cumulative
-/// flat-slot count of preceding params. Both are filled in at
-/// classify / layout time.
+/// Classify-time per-parameter lift recipe. `local_base` is the
+/// absolute wasm-local index that `LocalRef::Param(0)` of the
+/// param's plan corresponds to — the cumulative flat-slot count of
+/// preceding params. Cells-slab offset + per-cell record-info
+/// indices live on the post-layout [`ParamLayout`].
 pub(super) struct ParamLift {
     pub name: BlobSlice,
     pub plan: LiftPlan,
-    pub cells_offset: u32,
-    pub record_info_cell_idx: Vec<Option<u32>>,
     /// Absolute wasm-local index of `LocalRef::Param(0)` for this plan.
     pub local_base: u32,
+}
+
+// ─── Layout-phase outputs (immutable, includes offsets) ───────────
+//
+// The layout phase wraps each classify-time `ParamLift` /
+// `ResultLift` with the offsets it computes. These types are what
+// the emit phase reads — they're constructed once at the end of
+// layout and never mutated. The "all `: 0  // back-filled later`
+// placeholders" failure mode in the audit follow-up doc is
+// structurally impossible with this split.
+
+/// Post-layout per-parameter lift descriptor: the classify-time
+/// data plus its cells-slab offset + per-cell record-info indices.
+pub(super) struct ParamLayout {
+    pub lift: ParamLift,
+    /// Byte offset of this param's contiguous cells slab within
+    /// the static data segment; the slab holds `lift.plan.cell_count()`
+    /// cells, each `cell_layout.size` bytes.
+    pub cells_offset: u32,
+    /// Per cell of `lift.plan.cells`: the side-table index for
+    /// `CellOp::RecordOf` cells, `None` for other cell kinds.
+    pub record_info_cell_idx: Vec<Option<u32>>,
+}
+
+/// Post-layout per-result lift descriptor: a sum-type `source`
+/// carrying both the lift kind and any layout-derived offsets
+/// per-variant. The classify-time `side_table` info isn't carried
+/// here — it's consumed by the side-table builders during the
+/// layout phase (which see [`FuncClassified::result_lift`]'s
+/// pre-layout `side_table` directly).
+pub(super) struct ResultLayout {
+    pub source: ResultSourceLayout,
+}
+
+pub(super) enum ResultSourceLayout {
+    /// Direct primitive (no retptr): source is `lcl.result`.
+    Direct(LiftKind),
+    /// `(ptr, len)` pair at the function's retptr scratch.
+    RetptrPair { kind: LiftKind, retptr_offset: i32 },
+    /// Compound result: classify-time recipe plus layout offsets
+    /// (retptr scratch + per-cell record-info side-table indices for
+    /// `CellOp::RecordOf` cells). The cells-slab base is _not_
+    /// duplicated here; the wrapper body reads it off
+    /// [`AfterSetup::result_cells_offset`] (the canonical source —
+    /// today's compound lifts only fire from the after-hook path).
+    Compound {
+        compound: CompoundResult,
+        retptr_offset: i32,
+        /// One entry per cell of `compound.plan.cells`, in plan
+        /// order. `Some(idx)` for `CellOp::RecordOf` cells, `None`
+        /// for other kinds. Built unconditionally (it's a property
+        /// of the cell plan, not of the after-hook wiring).
+        record_info_cell_idx: Vec<Option<u32>>,
+    },
+}
+
+impl ResultLayout {
+    /// Returns the underlying classify-time [`CompoundResult`] for
+    /// compound result lifts (the wrapper-body emitter reads `ty` /
+    /// `plan` off it). `None` for direct / retptr-pair results.
+    pub(super) fn compound(&self) -> Option<&CompoundResult> {
+        match &self.source {
+            ResultSourceLayout::Compound { compound, .. } => Some(compound),
+            _ => None,
+        }
+    }
 }
 
 /// Result-side-table info, populated when a result is lift-able.
@@ -576,13 +613,10 @@ pub(super) fn classify_func_params(
         let mut builder = LiftPlanBuilder::new();
         builder.push(&param.ty, resolve);
         let plan = builder.into_plan();
-        let record_info_cell_idx = vec![None; plan.cells.len()];
         let consumed = plan.flat_slot_count;
         params_lift.push(ParamLift {
             name,
             plan,
-            cells_offset: 0,      // back-filled by lay_out_static_memory
-            record_info_cell_idx, // back-filled by lay_out_static_memory
             local_base: slot_cursor,
         });
         slot_cursor += consumed;
@@ -628,15 +662,8 @@ pub(super) fn classify_result_lift(
         let mut builder = LiftPlanBuilder::new();
         builder.push(ty, resolve);
         let plan = builder.into_plan();
-        let record_info_cell_idx = vec![None; plan.cells.len()];
         return Some(ResultLift {
-            source: ResultSource::Compound(CompoundResult {
-                ty: *ty,
-                plan,
-                retptr_offset: 0, // back-filled by the layout phase.
-                record_info_cell_idx,
-                cells_offset: 0, // back-filled by the layout phase.
-            }),
+            source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
             side_table: SideTableInfo::default(),
         });
     }
@@ -654,10 +681,7 @@ pub(super) fn classify_result_lift(
         export_sig.retptr
     };
     let source = if result_at_retptr {
-        ResultSource::RetptrPair {
-            kind,
-            retptr_offset: 0, // back-filled by the layout phase.
-        }
+        ResultSource::RetptrPair(kind)
     } else {
         ResultSource::Direct(kind)
     };
@@ -789,7 +813,7 @@ impl SideTableBlob {
 /// info off the result's [`SideTableInfo`] (single info, since
 /// results today are single-cell).
 pub(super) fn register_side_table_strings(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     name_blob: &mut Vec<u8>,
     from_plan: impl Fn(&LiftPlan) -> Vec<&NamedListInfo>,
     from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
@@ -846,7 +870,7 @@ fn append_string(name_blob: &mut Vec<u8>, s: &str) -> BlobSlice {
 /// land, this may yield multiple infos per plan — the builder
 /// handles that by appending one contiguous range per plan-cell.)
 pub(super) fn build_side_table_blob(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     strings: &StringTable,
     spec: &SideTableSpec<'_>,
     from_plan: impl Fn(&LiftPlan) -> Option<&NamedListInfo>,
@@ -907,7 +931,7 @@ fn append_entries(
 /// funcs. Thin wrapper over [`register_side_table_strings`] tied to
 /// `CellOp::EnumCase`.
 pub(super) fn register_enum_strings(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     name_blob: &mut Vec<u8>,
 ) -> StringTable {
     register_side_table_strings(
@@ -929,7 +953,7 @@ pub(super) fn register_enum_strings(
 /// plan, with the side-table builder appending contiguous ranges
 /// per plan-cell.
 pub(super) fn build_enum_info_blob(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     strings: &StringTable,
     schema: &SchemaLayouts,
 ) -> SideTableBlob {
@@ -975,7 +999,7 @@ pub(super) type RecordStringTable = HashMap<String, RecordTypeStrings>;
 /// `field-name` into `name_blob` (deduped per type-name). Result keyed
 /// by record type-name.
 pub(super) fn register_record_strings(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     name_blob: &mut Vec<u8>,
 ) -> RecordStringTable {
     let mut table = RecordStringTable::new();
@@ -1078,7 +1102,7 @@ impl RecordInfoBlobs {
 /// `CellOp::RecordOf` in a plan contributes one entry; the entry's
 /// side-table index is its position in that plan's contiguous range.
 pub(super) fn build_record_info_blob(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     strings: &RecordStringTable,
     schema: &SchemaLayouts,
 ) -> RecordInfoBlobs {
@@ -1472,17 +1496,17 @@ fn emit_lift_kind(
 pub(super) fn emit_lift_result(
     f: &mut Function,
     cell_layout: &CellLayout,
-    source: &ResultSource,
+    source: &ResultSourceLayout,
     lcl: &WrapperLocals,
 ) {
     match source {
-        ResultSource::Direct(kind) => {
+        ResultSourceLayout::Direct(kind) => {
             let local = lcl
                 .result
-                .expect("ResultSource::Direct → result local must be allocated");
+                .expect("ResultSourceLayout::Direct → result local must be allocated");
             emit_lift_kind(f, cell_layout, *kind, local, local, lcl);
         }
-        ResultSource::RetptrPair {
+        ResultSourceLayout::RetptrPair {
             kind,
             retptr_offset,
         } => {
@@ -1502,15 +1526,15 @@ pub(super) fn emit_lift_result(
             f.instructions().local_set(lcl.len_scratch);
             emit_lift_kind(f, cell_layout, *kind, lcl.ptr_scratch, lcl.len_scratch, lcl);
         }
-        ResultSource::Compound(_) => unreachable!(
-            "compound results are emitted directly via emit_lift_compound_result + \
+        ResultSourceLayout::Compound { .. } => unreachable!(
+            "compound results are emitted directly via emit_lift_compound_prefix + \
              emit_lift_plan; emit_lift_result handles only single-cell sources"
         ),
     }
 }
 
 /// Emit the wasm prefix for a compound result: load the result's
-/// canonical-ABI bytes from `compound.retptr_offset` via the pre-built
+/// canonical-ABI bytes from `retptr_offset` via the pre-built
 /// `lift_from_memory` instruction sequence, then capture each flat
 /// value into a synthetic local in REVERSE order (the wasm stack is
 /// LIFO — the last-pushed value is the highest-indexed flat slot).
@@ -1522,6 +1546,7 @@ pub(super) fn emit_lift_result(
 pub(super) fn emit_lift_compound_prefix(
     f: &mut Function,
     compound: &CompoundResult,
+    retptr_offset: i32,
     lift_from_memory_loads: &[wasm_encoder::Instruction<'static>],
     result_lift_addr: u32,
     result_lift_locals: &[u32],
@@ -1533,7 +1558,7 @@ pub(super) fn emit_lift_compound_prefix(
     );
     // Stage retptr_offset into the addr local that the pre-built
     // bindgen loads read from.
-    f.instructions().i32_const(compound.retptr_offset);
+    f.instructions().i32_const(retptr_offset);
     f.instructions().local_set(result_lift_addr);
     // Push canonical-ABI flat values onto the wasm value stack.
     for inst in lift_from_memory_loads {

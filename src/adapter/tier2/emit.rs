@@ -46,7 +46,8 @@ use super::cells::CellLayout;
 use super::lift::{
     alloc_wrapper_locals, build_enum_info_blob, build_record_info_blob, classify_func_params,
     classify_result_lift, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    register_enum_strings, register_record_strings, ParamLift, ResultLift, WrapperLocals,
+    register_enum_strings, register_record_strings, ParamLayout, ParamLift, ResultLayout,
+    ResultLift, ResultSourceLayout, WrapperLocals,
 };
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
@@ -190,6 +191,38 @@ pub(super) struct AfterSetup {
     pub result_cells_offset: Option<u32>,
 }
 
+/// Classify-phase per-function output. Holds everything the layout
+/// phase needs to compute static-memory offsets, but no offsets
+/// itself. The layout phase consumes a `Vec<FuncClassified>` by
+/// value and returns a `Vec<FuncDispatch>` whose offsets are filled
+/// in once and immutable thereafter. This split is what makes
+/// "back-fill across phase boundaries" structurally impossible:
+/// there's nowhere on `FuncClassified` to write a layout offset to.
+pub(super) struct FuncClassified {
+    pub shape: FuncShape,
+    /// WIT result type, kept around so async wrappers can drive
+    /// `lift_from_memory` to flat-load the result for `task.return`.
+    pub result_ty: Option<Type>,
+    pub import_module: String,
+    pub import_field: String,
+    pub export_name: String,
+    /// Wrapper export sig (`AbiVariant::GuestExport`).
+    pub export_sig: WasmSignature,
+    /// Handler import sig (`AbiVariant::GuestImport`).
+    pub import_sig: WasmSignature,
+    pub needs_cabi_post: bool,
+    /// Byte offset of the function name within the data segment.
+    pub fn_name_offset: i32,
+    pub fn_name_len: i32,
+    /// Per-param classify-time lift recipe (no offsets).
+    pub params: Vec<ParamLift>,
+    /// Classify-time return-value lift recipe (no offsets).
+    pub result_lift: Option<ResultLift>,
+}
+
+/// Layout-phase per-function output: the classify data plus every
+/// static-memory offset the emit phase needs. Constructed once at
+/// the end of `lay_out_static_memory`; read-only thereafter.
 pub(super) struct FuncDispatch {
     pub shape: FuncShape,
     /// WIT result type, kept around so async wrappers can drive
@@ -211,16 +244,16 @@ pub(super) struct FuncDispatch {
     /// Byte offset of the function name within the data segment.
     pub fn_name_offset: i32,
     pub fn_name_len: i32,
-    /// Per-param lift recipe + wasm flat-slot indexing. Empty for
-    /// zero-arg functions. Each param's [`ParamLift::cells_offset`]
-    /// holds the offset of its own cells slab — there's no longer a
-    /// shared per-fn slab base, since record params consume more than
-    /// one cell.
-    pub params: Vec<ParamLift>,
+    /// Per-param post-layout lift recipe (classify data + offsets).
+    /// Empty for zero-arg functions. Each `ParamLayout::cells_offset`
+    /// holds the offset of its own cells slab — there's no shared
+    /// per-fn slab base, since record params consume more than one
+    /// cell.
+    pub params: Vec<ParamLayout>,
     /// Byte offset of this function's pre-built `field` records in
     /// the data segment. Holds `params.len()` consecutive `field`
-    /// records, each [`FIELD_SIZE_BYTES`] bytes. Pointed at by the
-    /// `args.list.ptr` field passed to `on-call`.
+    /// records, each [`SchemaLayouts::field_layout`]`.size` bytes.
+    /// Pointed at by the `args.list.ptr` field passed to `on-call`.
     pub fields_buf_offset: u32,
     /// Byte offset of the retptr scratch buffer; `Some` iff the
     /// import sig wants a caller-allocates retptr but the export sig
@@ -231,7 +264,7 @@ pub(super) struct FuncDispatch {
     /// How to lift the function's return value into a `cell` for the
     /// on-return hook. `None` for void or compound returns we don't
     /// yet lift (Phase 2-2b territory).
-    pub result_lift: Option<ResultLift>,
+    pub result_lift: Option<ResultLayout>,
     /// On-return-hook scaffolding; `Some` iff after-hook is wired.
     pub after: Option<AfterSetup>,
 }
@@ -411,12 +444,14 @@ fn write_field_record(
 }
 
 /// Build the contiguous fields blob: one `field` record per
-/// (fn, param). `param_side_tables[fn_idx][param_idx]` carries the
-/// param's per-kind side-table pointers (or `EMPTY` slots for kinds
-/// the param doesn't carry).
+/// (fn, param). `cells_offsets[fn_idx][param_idx]` is the byte
+/// offset of the param's contiguous cells slab; `param_side_tables`
+/// is parallel and carries the param's per-kind side-table pointers
+/// (or `EMPTY` slots for kinds the param doesn't carry).
 fn build_fields_blob(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     schema: &SchemaLayouts,
+    cells_offsets: &[Vec<u32>],
     param_side_tables: &[Vec<FieldSideTables>],
 ) -> Vec<u8> {
     let mut blob: Vec<u8> = Vec::new();
@@ -430,7 +465,7 @@ fn build_fields_blob(
                 &mut blob,
                 schema,
                 BlobSlice {
-                    off: p.cells_offset,
+                    off: cells_offsets[fn_idx][i],
                     len: p.plan.cell_count(),
                 },
                 p.name,
@@ -444,10 +479,14 @@ fn build_fields_blob(
 /// Build the contiguous on-return params blob: one record per fn,
 /// with `result: option::some(field-tree)` pre-wired for funcs that
 /// have a result lift, `option::none` for the rest.
+/// `result_cells_offsets[fn_idx]` is the byte offset of that fn's
+/// 1-cell (Direct/RetptrPair) or N-cell (Compound) result slab;
+/// `None` when the after-hook isn't relevant for this fn.
 fn build_after_params_blob(
-    per_func: &[FuncDispatch],
+    per_func: &[FuncClassified],
     schema: &SchemaLayouts,
     iface_name: BlobSlice,
+    result_cells_offsets: &[Option<u32>],
     result_side_tables: &[FieldSideTables],
 ) -> Vec<u8> {
     let Some(after_layout) = schema.on_return_params_layout.as_ref() else {
@@ -466,7 +505,7 @@ fn build_after_params_blob(
                 len: fd.fn_name_len as u32,
             },
         );
-        match fd.after.as_ref().and_then(|a| a.result_cells_offset) {
+        match result_cells_offsets[fn_idx] {
             Some(cells_off) => {
                 entry.write_option_some(&mut blob, ON_RET_RESULT);
                 let tree_base =
@@ -498,22 +537,31 @@ fn build_after_params_blob(
 }
 
 /// Reserve scratch + place data segments for everything the wrapper
-/// body references at runtime: cells slabs, fields blob, on-return
-/// params blob, event slot, hook-params buffer, retptr scratch. Each
-/// allocation goes through `StaticLayout` so alignment is enforced.
-/// Mutates `per_func` to fill in the buffer-offset fields.
+/// body references at runtime, then assemble immutable
+/// [`FuncDispatch`] records combining each [`FuncClassified`] with
+/// its computed offsets. Each allocation goes through `StaticLayout`
+/// so alignment is enforced.
+///
+/// Phase boundary: this fn takes ownership of the classify output
+/// and returns a fully-built dispatch list. There's no halfway state
+/// where some FuncDispatch fields are placeholders waiting for a
+/// later phase to back-fill them. Reordering the steps inside this
+/// fn can still produce wrong offsets, but it can't leave the type
+/// system holding a `: 0  // back-filled later` lie.
 fn lay_out_static_memory(
-    per_func: &mut [FuncDispatch],
+    per_func: Vec<FuncClassified>,
     funcs: &[&WitFunction],
     schema: &SchemaLayouts,
     name_blob: &mut Vec<u8>,
     iface_name: BlobSlice,
-) -> StaticDataPlan {
+) -> (Vec<FuncDispatch>, StaticDataPlan) {
+    let n_funcs = per_func.len();
+
     // Side-table strings get appended to name_blob BEFORE we place
     // it — every side-table-info entry references these string
     // offsets, so they have to land in the data segment first.
-    let enum_strings = register_enum_strings(per_func, name_blob);
-    let record_strings = register_record_strings(per_func, name_blob);
+    let enum_strings = register_enum_strings(&per_func, name_blob);
+    let record_strings = register_record_strings(&per_func, name_blob);
 
     let mut layout = StaticLayout::new();
 
@@ -523,18 +571,22 @@ fn lay_out_static_memory(
     // Each param contributes `plan.cell_count() * cell_size` bytes;
     // record params produce >1 cell, so per-param offsets get
     // recorded individually.
-    for fd in per_func.iter_mut() {
-        for p in fd.params.iter_mut() {
-            let slab_size = p.plan.cell_count() * schema.cell_layout.size;
-            p.cells_offset = layout.reserve_scratch(schema.cell_layout.align, slab_size);
-        }
-    }
+    let cells_offsets: Vec<Vec<u32>> = per_func
+        .iter()
+        .map(|fd| {
+            fd.params
+                .iter()
+                .map(|p| {
+                    let slab_size = p.plan.cell_count() * schema.cell_layout.size;
+                    layout.reserve_scratch(schema.cell_layout.align, slab_size)
+                })
+                .collect()
+        })
+        .collect();
     // Per-fn result-cell scratch, when after-hook is wired and the
     // function has a result to lift. Compound results need
     // `plan.cell_count() * cell_size` bytes; primitive single-cell
-    // results need just one cell. Captured in a parallel Vec so we
-    // can fold it into `fd.after` alongside `params_offset` once both
-    // are known.
+    // results need just one cell.
     let result_cells_offsets: Vec<Option<u32>> = if schema.after_hook.is_some() {
         per_func
             .iter()
@@ -547,13 +599,13 @@ fn lay_out_static_memory(
             })
             .collect()
     } else {
-        vec![None; per_func.len()]
+        vec![None; n_funcs]
     };
 
     // Place the per-(fn, field) enum-info side tables. `per_param` /
     // `per_result` come back relative to the blob's start; we
     // translate to absolute by adding the placed blob's data offset.
-    let mut enum_info = build_enum_info_blob(per_func, &enum_strings, schema);
+    let mut enum_info = build_enum_info_blob(&per_func, &enum_strings, schema);
     let enum_info_base = layout.place_data(schema.enum_info_layout.align, &enum_info.bytes);
     enum_info.translate_to(enum_info_base);
 
@@ -562,7 +614,7 @@ fn lay_out_static_memory(
     // tuples blob, so we place tuples first, patch the entries' fields
     // pointers, then place entries and translate per-param ranges to
     // absolute.
-    let mut record_info = build_record_info_blob(per_func, &record_strings, schema);
+    let mut record_info = build_record_info_blob(&per_func, &record_strings, schema);
     let record_tuples_base =
         layout.place_data(schema.record_field_tuple_layout.align, &record_info.tuples);
     record_info.patch_fields_ptr(record_tuples_base);
@@ -596,70 +648,46 @@ fn lay_out_static_memory(
             record_infos,
         })
         .collect();
-    // Hand the per-(fn, param) per-cell record-info indices to each
-    // ParamLift, so the wrapper-body emitter can read them inline.
-    for (fd, fn_indices) in per_func.iter_mut().zip(record_info.per_param_cell_idx) {
-        for (p, p_indices) in fd.params.iter_mut().zip(fn_indices) {
-            p.record_info_cell_idx = p_indices;
-        }
-    }
-    // Same for compound results: stash the result plan's per-cell
-    // record-info indices on the CompoundResult so the after-hook
-    // emitter can hand them to `emit_lift_plan`.
-    for (fd, r_indices) in per_func.iter_mut().zip(record_info.per_result_cell_idx) {
-        if let Some(c) = fd
-            .result_lift
-            .as_mut()
-            .and_then(|rl| rl.compound_mut())
-        {
-            c.record_info_cell_idx = r_indices;
-        }
-    }
 
     // Fields blob (data) — pre-filled with cells.ptr pointing at
     // each param's reserved slab slot, plus per-kind side-table
     // pointers patched per-param.
-    let fields_blob = build_fields_blob(per_func, schema, &param_side_tables);
+    let fields_blob = build_fields_blob(&per_func, schema, &cells_offsets, &param_side_tables);
     let fields_base = layout.place_data(schema.field_layout.align, &fields_blob);
-    let mut cursor = fields_base;
-    for fd in per_func.iter_mut() {
-        fd.fields_buf_offset = cursor;
-        cursor += fd.params.len() as u32 * schema.field_layout.size;
-    }
+    let fields_buf_offsets: Vec<u32> = {
+        let mut cursor = fields_base;
+        per_func
+            .iter()
+            .map(|fd| {
+                let here = cursor;
+                cursor += fd.params.len() as u32 * schema.field_layout.size;
+                here
+            })
+            .collect()
+    };
 
     // On-return params blob (data), only when after-hook is wired.
-    // First seed `fd.after.result_cells_offset` so the blob builder
-    // sees the per-fn result-cells scratch; the params_offset is
-    // back-filled below once we know the placed base.
-    if schema.after_hook.is_some() {
-        for (fd, &result_cells_offset) in per_func.iter_mut().zip(result_cells_offsets.iter()) {
-            fd.after = Some(AfterSetup {
-                params_offset: 0, // back-filled below
-                result_cells_offset,
-            });
-            // Mirror the slab base onto the CompoundResult so the
-            // wrapper-body emitter can read it via the result_lift
-            // accessor (parallel to `ParamLift::cells_offset`).
-            if let (Some(off), Some(c)) = (
-                result_cells_offset,
-                fd.result_lift.as_mut().and_then(|rl| rl.compound_mut()),
-            ) {
-                c.cells_offset = off;
-            }
+    let after_blob = build_after_params_blob(
+        &per_func,
+        schema,
+        iface_name,
+        &result_cells_offsets,
+        &result_side_tables,
+    );
+    let after_params_offsets: Vec<Option<i32>> = match schema.on_return_params_layout.as_ref() {
+        Some(al) => {
+            let after_base = layout.place_data(al.align, &after_blob);
+            let mut cursor = after_base;
+            (0..n_funcs)
+                .map(|_| {
+                    let here = cursor as i32;
+                    cursor += al.size;
+                    Some(here)
+                })
+                .collect()
         }
-    }
-    let after_blob = build_after_params_blob(per_func, schema, iface_name, &result_side_tables);
-    if let Some(al) = schema.on_return_params_layout.as_ref() {
-        let after_base = layout.place_data(al.align, &after_blob);
-        let mut cursor = after_base;
-        for fd in per_func.iter_mut() {
-            fd.after
-                .as_mut()
-                .expect("has_after → fd.after seeded")
-                .params_offset = cursor as i32;
-            cursor += al.size;
-        }
-    }
+        None => vec![None; n_funcs],
+    };
 
     // Scratch slots: event record + on-call indirect-params buffer.
     let event_ptr = layout.reserve_scratch(EVENT_SLOT_ALIGN, EVENT_SLOT_SIZE) as i32;
@@ -669,51 +697,126 @@ fn lay_out_static_memory(
     };
 
     // Per-fn retptr scratch — only for funcs whose canonical-ABI
-    // shape uses one. Back-fills RetptrPair so the wrapper body knows
-    // the load address.
-    for (fd, func) in per_func.iter_mut().zip(funcs.iter()) {
-        if !(fd.export_sig.retptr || fd.import_sig.retptr) {
-            continue;
-        }
-        let result_ty = func
-            .result
-            .as_ref()
-            .expect("retptr → func.result is_some()");
-        let size = schema.size_align.size(result_ty).size_wasm32() as u32;
-        let align = schema.size_align.align(result_ty).align_wasm32() as u32;
-        let off = layout.reserve_scratch(align, size) as i32;
-        fd.retptr_offset = Some(off);
-        if let Some(rl) = &mut fd.result_lift {
-            rl.set_retptr_offset(off);
-        }
-    }
+    // shape uses one.
+    let retptr_offsets: Vec<Option<i32>> = per_func
+        .iter()
+        .zip(funcs.iter())
+        .map(|(fd, func)| {
+            if !(fd.export_sig.retptr || fd.import_sig.retptr) {
+                return None;
+            }
+            let result_ty = func
+                .result
+                .as_ref()
+                .expect("retptr → func.result is_some()");
+            let size = schema.size_align.size(result_ty).size_wasm32() as u32;
+            let align = schema.size_align.align(result_ty).align_wasm32() as u32;
+            Some(layout.reserve_scratch(align, size) as i32)
+        })
+        .collect();
 
     // Align the bump-allocator start past the largest alignment we
     // placed; today that's `cell` (8) but pulling from `cell_layout`
     // keeps it tied to the schema instead of a literal.
     let bump_start = layout.end().next_multiple_of(schema.cell_layout.align);
     let data_segments = layout.into_segments();
-    StaticDataPlan {
-        bump_start,
-        event_ptr,
-        hook_params_ptr,
-        data_segments,
-    }
+
+    // Assemble FuncDispatch from each FuncClassified + its offsets.
+    // Owns the move from classify-time → post-layout types — every
+    // offset is known here, nothing is "0 // back-filled later".
+    let dispatches: Vec<FuncDispatch> = per_func
+        .into_iter()
+        .enumerate()
+        .map(|(i, fc)| {
+            let fn_cells_offsets = &cells_offsets[i];
+            let fn_param_record_idxs = &record_info.per_param_cell_idx[i];
+            let params: Vec<ParamLayout> = fc
+                .params
+                .into_iter()
+                .enumerate()
+                .map(|(p_idx, lift)| ParamLayout {
+                    lift,
+                    cells_offset: fn_cells_offsets[p_idx],
+                    record_info_cell_idx: fn_param_record_idxs[p_idx].clone(),
+                })
+                .collect();
+
+            let retptr_offset = retptr_offsets[i];
+            let result_cells_offset = result_cells_offsets[i];
+            let result_lift = fc.result_lift.map(|rl| {
+                let ResultLift { source, .. } = rl;
+                let layout_source = match source {
+                    super::lift::ResultSource::Direct(kind) => ResultSourceLayout::Direct(kind),
+                    super::lift::ResultSource::RetptrPair(kind) => ResultSourceLayout::RetptrPair {
+                        kind,
+                        retptr_offset: retptr_offset
+                            .expect("RetptrPair → retptr scratch reserved"),
+                    },
+                    super::lift::ResultSource::Compound(compound) => {
+                        ResultSourceLayout::Compound {
+                            compound,
+                            retptr_offset: retptr_offset
+                                .expect("Compound → retptr scratch reserved"),
+                            record_info_cell_idx: record_info.per_result_cell_idx[i].clone(),
+                        }
+                    }
+                };
+                ResultLayout {
+                    source: layout_source,
+                }
+            });
+
+            let after = after_params_offsets[i].map(|params_offset| AfterSetup {
+                params_offset,
+                result_cells_offset,
+            });
+
+            FuncDispatch {
+                shape: fc.shape,
+                result_ty: fc.result_ty,
+                import_module: fc.import_module,
+                import_field: fc.import_field,
+                export_name: fc.export_name,
+                export_sig: fc.export_sig,
+                import_sig: fc.import_sig,
+                needs_cabi_post: fc.needs_cabi_post,
+                fn_name_offset: fc.fn_name_offset,
+                fn_name_len: fc.fn_name_len,
+                params,
+                fields_buf_offset: fields_buf_offsets[i],
+                retptr_offset,
+                result_lift,
+                after,
+            }
+        })
+        .collect();
+
+    (
+        dispatches,
+        StaticDataPlan {
+            bump_start,
+            event_ptr,
+            hook_params_ptr,
+            data_segments,
+        },
+    )
 }
 
-/// Build the per-target-function dispatch records: classify each
+/// Build the per-target-function classify records: classify each
 /// param, populate the WIT-derived sigs and mangled names, classify
-/// the result for on-return lift. Buffer offsets are left as
-/// placeholders; the static-memory layout phase fills them in.
-/// Appends fn names + param names to `name_blob` as it goes.
-fn build_per_func_dispatches(
+/// the result for on-return lift. Output has no static-memory
+/// offsets — those are computed by [`lay_out_static_memory`], which
+/// consumes the `Vec<FuncClassified>` and returns a parallel
+/// `Vec<FuncDispatch>` with the offsets filled in. Appends fn names
+/// + param names to `name_blob` as it goes.
+fn build_per_func_classified(
     resolve: &Resolve,
     target_iface: InterfaceId,
     funcs: &[&WitFunction],
     name_blob: &mut Vec<u8>,
-) -> Result<Vec<FuncDispatch>> {
+) -> Result<Vec<FuncClassified>> {
     let target_world_key = WorldKey::Interface(target_iface);
-    let mut per_func: Vec<FuncDispatch> = Vec::with_capacity(funcs.len());
+    let mut per_func: Vec<FuncClassified> = Vec::with_capacity(funcs.len());
 
     for func in funcs {
         let fn_name_offset = name_blob.len() as i32;
@@ -761,7 +864,7 @@ fn build_per_func_dispatches(
             FuncShape::Sync
         };
 
-        per_func.push(FuncDispatch {
+        per_func.push(FuncClassified {
             shape,
             result_ty: func.result,
             import_module,
@@ -773,10 +876,7 @@ fn build_per_func_dispatches(
             fn_name_offset,
             fn_name_len,
             params: params_lift,
-            fields_buf_offset: 0,
-            retptr_offset: None,
             result_lift,
-            after: None,
         });
     }
     Ok(per_func)
@@ -867,9 +967,10 @@ fn build_dispatch_module(
         len: target_interface_name.len() as u32,
     };
     let mut name_blob: Vec<u8> = target_interface_name.as_bytes().to_vec();
-    let mut per_func = build_per_func_dispatches(resolve, target_iface, &funcs, &mut name_blob)?;
+    let classified = build_per_func_classified(resolve, target_iface, &funcs, &mut name_blob)?;
 
-    let plan = lay_out_static_memory(&mut per_func, &funcs, &schema, &mut name_blob, iface_name);
+    let (per_func, plan) =
+        lay_out_static_memory(classified, &funcs, &schema, &mut name_blob, iface_name);
 
     let mut module = Module::new();
     let type_idx = emit_type_section(
@@ -1341,9 +1442,9 @@ fn emit_wrapper_function(
                 &mut f,
                 &schema.cell_layout,
                 p.cells_offset,
-                &p.plan,
+                &p.lift.plan,
                 &p.record_info_cell_idx,
-                p.local_base,
+                p.lift.local_base,
                 &lcl,
             );
         }
@@ -1390,8 +1491,12 @@ fn emit_wrapper_function(
     // ── Phase 3: on-return (only if after-hook wired) ──
     if let (Some(after_idx), Some(after)) = (func_idx.after_hook_idx, fd.after.as_ref()) {
         if let (Some(rl), Some(cells_off)) = (fd.result_lift.as_ref(), after.result_cells_offset) {
-            match rl.compound() {
-                Some(compound) => {
+            match &rl.source {
+                ResultSourceLayout::Compound {
+                    compound,
+                    retptr_offset,
+                    record_info_cell_idx,
+                } => {
                     // Memory → flat-on-stack → synthetic locals → walk plan.
                     let loads = result_lift_loads
                         .as_deref()
@@ -1402,6 +1507,7 @@ fn emit_wrapper_function(
                     emit_lift_compound_prefix(
                         &mut f,
                         compound,
+                        *retptr_offset,
                         loads,
                         addr_local,
                         &lcl.result_lift_locals,
@@ -1411,12 +1517,12 @@ fn emit_wrapper_function(
                         &schema.cell_layout,
                         cells_off,
                         &compound.plan,
-                        &compound.record_info_cell_idx,
+                        record_info_cell_idx,
                         lcl.result_local_base(),
                         &lcl,
                     );
                 }
-                None => {
+                ResultSourceLayout::Direct(_) | ResultSourceLayout::RetptrPair { .. } => {
                     f.instructions().i32_const(cells_off as i32);
                     f.instructions().local_set(lcl.addr);
                     emit_lift_result(&mut f, &schema.cell_layout, &rl.source, &lcl);
