@@ -66,7 +66,6 @@ pub(crate) mod cell_disc {
 }
 
 /// Canonical-ABI byte size of one `cell` value. See module docs.
-#[allow(dead_code)]
 pub(crate) const CELL_SIZE: u32 = 16;
 
 /// Byte offset where a cell's payload starts (after disc + padding).
@@ -96,7 +95,6 @@ const PAYLOAD_OFFSET: u64 = 8;
 /// exactly one `wasm-encoder` store instruction; `natural_align`
 /// returns the log2 alignment that store implicitly requires.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // some variants (F64) only used by helpers landing later in 2-2a.
 enum StoreKind {
     /// `i32.store8` — 1 byte.
     I8,
@@ -129,7 +127,6 @@ impl StoreKind {
     /// Returns `None` for variants whose payload has multiple flat
     /// slots (`text`, `bytes`) or whose payload is a side-table
     /// index — those cases construct their own `PayloadPart` slices.
-    #[allow(dead_code)]
     fn for_primitive_disc(disc: u8) -> Option<StoreKind> {
         match disc {
             cell_disc::BOOL => Some(StoreKind::I8),
@@ -147,7 +144,6 @@ impl StoreKind {
 /// the payload area (i.e. the actual store happens at
 /// `addr + PAYLOAD_OFFSET + offset`).
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 struct PayloadPart {
     /// Local holding the value to store (must already be of the type
     /// `kind` expects — caller is responsible for any narrowing /
@@ -161,7 +157,6 @@ struct PayloadPart {
 /// Emit wasm that writes one cell at `addr_local`: a 1-byte
 /// discriminant at offset 0 followed by each `parts[i]` written into
 /// the payload area at its declared sub-offset.
-#[allow(dead_code)]
 fn emit_cell(f: &mut Function, addr_local: u32, disc: u8, parts: &[PayloadPart]) {
     // Discriminant byte at offset 0.
     f.instructions().local_get(addr_local);
@@ -194,7 +189,6 @@ fn emit_cell(f: &mut Function, addr_local: u32, disc: u8, parts: &[PayloadPart])
 /// differ. Both are derived from `disc` via
 /// [`StoreKind::for_primitive_disc`]; callers go through the typed
 /// public helpers below for self-documentation at the call site.
-#[allow(dead_code)]
 fn emit_single_payload_cell(
     f: &mut Function,
     addr_local: u32,
@@ -215,7 +209,6 @@ fn emit_single_payload_cell(
 /// Emit wasm that writes a `cell::bool(bool)`. `payload_local` is
 /// an `i32` carrying 0 (false) or 1 (true) — the canonical-ABI
 /// flat form of `bool`.
-#[allow(dead_code)]
 pub(crate) fn emit_bool_cell(f: &mut Function, addr_local: u32, payload_local: u32) {
     emit_single_payload_cell(f, addr_local, cell_disc::BOOL, payload_local);
 }
@@ -223,7 +216,6 @@ pub(crate) fn emit_bool_cell(f: &mut Function, addr_local: u32, payload_local: u
 /// Emit wasm that writes a `cell::integer(s64)`. `payload_local` is
 /// an `i64` already widened from any narrower integer type
 /// (s8/u8/.../u32 → `i64.extend_i32_{s,u}`; s64/u64 passes through).
-#[allow(dead_code)]
 pub(crate) fn emit_integer_cell(f: &mut Function, addr_local: u32, payload_local: u32) {
     emit_single_payload_cell(f, addr_local, cell_disc::INTEGER, payload_local);
 }
@@ -231,7 +223,6 @@ pub(crate) fn emit_integer_cell(f: &mut Function, addr_local: u32, payload_local
 /// Emit wasm that writes a `cell::floating(f64)`. `payload_local`
 /// is an `f64` already widened from `f32` if the source was 32-bit
 /// (`f64.promote_f32`).
-#[allow(dead_code)]
 pub(crate) fn emit_floating_cell(f: &mut Function, addr_local: u32, payload_local: u32) {
     emit_single_payload_cell(f, addr_local, cell_disc::FLOATING, payload_local);
 }
@@ -239,7 +230,6 @@ pub(crate) fn emit_floating_cell(f: &mut Function, addr_local: u32, payload_loca
 /// Emit wasm that writes a `cell::text(string)`. `string` lowers as
 /// `(ptr: i32, len: i32)` — both i32 locals must already point at a
 /// valid utf-8 buffer in the same memory.
-#[allow(dead_code)]
 pub(crate) fn emit_text_cell(f: &mut Function, addr_local: u32, ptr_local: u32, len_local: u32) {
     emit_cell(f, addr_local, cell_disc::TEXT, &ptr_len_parts(ptr_local, len_local));
 }
@@ -247,7 +237,6 @@ pub(crate) fn emit_text_cell(f: &mut Function, addr_local: u32, ptr_local: u32, 
 /// Emit wasm that writes a `cell::bytes(list<u8>)`. Same flat shape
 /// as text: `(ptr: i32, len: i32)`. Used for the `list<u8>` fast-
 /// path when the WIT element type is `u8`.
-#[allow(dead_code)]
 pub(crate) fn emit_bytes_cell(f: &mut Function, addr_local: u32, ptr_local: u32, len_local: u32) {
     emit_cell(f, addr_local, cell_disc::BYTES, &ptr_len_parts(ptr_local, len_local));
 }

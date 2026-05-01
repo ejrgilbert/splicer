@@ -1638,10 +1638,10 @@ const MIDDLEWARE_COMMON_DEP_WIT: &str = include_str!("../wit/common/world.wit");
 // ─── Tier-2 middleware fixture (used by `test_tier2_smoke`) ───────
 //
 // Same crate skeleton as the tier-1 middleware above, but exports
-// `splicer:tier2/before` and prints from `on-call(call, args)`. The
-// `args` slice is empty until the cells lift codegen wires in
-// (Phase 2-2b); for now we just confirm `on-call` fires with the
-// right call identity.
+// `splicer:tier2/before`. The middleware dumps each `Field` it
+// observes — name + the cell at its tree root, formatted in a
+// stable shape (e.g. `x: integer(42)`) so the test can pin both
+// dispatch and lift correctness with a substring match.
 
 const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
     wit_bindgen::generate!({
@@ -1652,17 +1652,40 @@ const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
 }
 
 use bindings::exports::splicer::tier2::before::Guest as BeforeGuest;
-use bindings::splicer::common::types::{CallId, Field};
+use bindings::splicer::common::types::{CallId, Cell, Field};
 
 struct Mdl;
 
+fn fmt_cell(c: &Cell) -> String {
+    match c {
+        Cell::Bool(v) => format!("bool({v})"),
+        Cell::Integer(v) => format!("integer({v})"),
+        Cell::Floating(v) => format!("floating({v})"),
+        Cell::Text(s) => format!("text({s:?})"),
+        Cell::Bytes(b) => format!("bytes(len={})", b.len()),
+        other => format!("other({other:?})"),
+    }
+}
+
+fn fmt_field(f: &Field) -> String {
+    let root = f.tree.root as usize;
+    let cell = f
+        .tree
+        .cells
+        .get(root)
+        .map(fmt_cell)
+        .unwrap_or_else(|| String::from("<missing>"));
+    format!("{}: {cell}", f.name)
+}
+
 impl BeforeGuest for Mdl {
     async fn on_call(call: CallId, args: Vec<Field>) {
+        let rendered: Vec<String> = args.iter().map(fmt_field).collect();
         println!(
-            "mdl: tier2-on-call {}#{} (args={})",
+            "mdl: tier2-on-call {}#{} args=[{}]",
             call.interface_name,
             call.function_name,
-            args.len()
+            rendered.join(", "),
         );
     }
 }
@@ -2067,13 +2090,11 @@ fn test_canned() {
 /// detects tier-2 and routes through `build_tier2_adapter`.
 ///
 /// Asserts the trace contains the `mdl: tier2-on-call …` line
-/// printed from the middleware's `on_call` impl, proving the hook
-/// fires under wasmtime with the right call identity. Runs the
-/// `Before` pipeline kind only — one kind is enough to prove
-/// dispatch end-to-end.
-///
-/// Args are the empty `list<field>` for now (cells lift wires in at
-/// Phase 2-2b); the assertion checks `(args=0)` accordingly.
+/// printed from the middleware's `on_call` impl, proving both the
+/// hook dispatch + the per-param cell lift work under wasmtime.
+/// Runs the `Before` pipeline kind only — one kind is enough to
+/// prove dispatch end-to-end. The args render shows the lifted cell
+/// for the single u32 param so a regression in either path fires.
 #[test]
 #[ignore]
 fn test_tier2_smoke() {
@@ -2157,7 +2178,9 @@ fn test_tier2_smoke() {
     let captured = invoke_run(&bytes).expect("invoke run()");
     eprintln!("tier2-smoke: trace:\n{captured}");
 
-    let expected_marker = format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo (args=0)");
+    let expected_marker = format!(
+        "mdl: tier2-on-call {TARGET_INTERFACE}#foo args=[x: integer(42)]"
+    );
     assert!(
         captured.contains(&expected_marker),
         "tier-2 on-call did not fire — trace missing `{expected_marker}`\n--- trace ---\n{captured}",
