@@ -29,6 +29,7 @@ use wit_parser::{
     WasmImport, WorldItem, WorldKey,
 };
 
+use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
     empty_function, emit_cabi_realloc, emit_memory_and_globals, val_types, wasm_type_to_val,
     EXPORT_CABI_REALLOC, EXPORT_INITIALIZE, EXPORT_MEMORY,
@@ -294,17 +295,6 @@ fn resolve_type_alias(resolve: &Resolve, mut tid: TypeId) -> TypeId {
 const ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter";
 const ADAPTER_WORLD_NAME: &str = "adapter";
 
-/// Module name + intrinsic field names for the canon-async runtime
-/// builtins the dispatch module imports. These are wit-component
-/// contract — not exposed via wit-parser's API; the canonical list
-/// lives in `wit-component::dummy::push_root_async_intrinsics`.
-const ASYNC_INTRINSIC_MODULE: &str = "$root";
-const WAITABLE_SET_NEW: &str = "[waitable-set-new]";
-const WAITABLE_JOIN: &str = "[waitable-join]";
-const WAITABLE_SET_WAIT: &str = "[waitable-set-wait]";
-const WAITABLE_SET_DROP: &str = "[waitable-set-drop]";
-const SUBTASK_DROP: &str = "[subtask-drop]";
-
 /// Type-section indices. `task_return_ty[i]` is `Some` iff func `i` is async.
 struct TypeIndices {
     handler_ty: Vec<u32>,
@@ -318,23 +308,10 @@ struct TypeIndices {
     init_ty: u32,
     cabi_post_ty: u32,
     cabi_realloc_ty: u32,
-    async_runtime: Option<AsyncRuntimeTypes>,
+    async_runtime: Option<AsyncTypes>,
     /// `(func (param i32))` for `[resource-drop]<R>` imports. `Some`
     /// iff any per_func has borrow params.
     resource_drop_ty: Option<u32>,
-}
-
-/// Canon-async runtime builtin types (`$root/[waitable-*]`,
-/// `[subtask-drop]`).
-struct AsyncRuntimeTypes {
-    /// `() -> i32`.
-    waitable_new_ty: u32,
-    /// `(i32, i32) -> ()`.
-    waitable_join_ty: u32,
-    /// `(i32, i32) -> i32`.
-    waitable_wait_ty: u32,
-    /// `(i32) -> ()` — shared by `[waitable-set-drop]` + `[subtask-drop]`.
-    void_i32_ty: u32,
 }
 
 /// Imports come first (handlers, hooks, async-runtime, task.return),
@@ -356,22 +333,10 @@ struct FuncIndices {
     /// Memory offset of the bool slot `should-block` writes its
     /// retptr into. `Some` iff blocking is active.
     block_result_ptr: Option<i32>,
-    async_runtime: Option<AsyncRuntimeFuncs>,
+    async_runtime: Option<AsyncFuncs>,
     /// `[resource-drop]<R>` import per resource referenced by a borrow
     /// param across `per_func`.
     resource_drop: HashMap<TypeId, u32>,
-}
-
-/// Canon-async runtime builtin indices + the wait-event scratch
-/// offset. Populated whenever any hook is active or any target func
-/// is async.
-struct AsyncRuntimeFuncs {
-    waitable_new: u32,
-    waitable_join: u32,
-    waitable_wait: u32,
-    waitable_drop: u32,
-    subtask_drop: u32,
-    event_ptr: i32,
 }
 
 /// Build the dispatch core module — phase orchestrator. `cabi_realloc` + the bump global
@@ -687,24 +652,8 @@ fn emit_type_section(
     // body. Gating only on hooks would leave a hook-less async-target
     // module unable to await its handler subtask.
     let needs_async_runtime = hook_imports.any() || per_func.iter().any(|f| f.is_async);
-    let async_runtime = needs_async_runtime.then(|| {
-        types.ty().function([], [ValType::I32]);
-        let waitable_new_ty = idx.alloc_ty();
-        types.ty().function([ValType::I32, ValType::I32], []);
-        let waitable_join_ty = idx.alloc_ty();
-        types
-            .ty()
-            .function([ValType::I32, ValType::I32], [ValType::I32]);
-        let waitable_wait_ty = idx.alloc_ty();
-        types.ty().function([ValType::I32], []);
-        let void_i32_ty = idx.alloc_ty();
-        AsyncRuntimeTypes {
-            waitable_new_ty,
-            waitable_join_ty,
-            waitable_wait_ty,
-            void_i32_ty,
-        }
-    });
+    let async_runtime =
+        needs_async_runtime.then(|| canon_async::emit_types(&mut types, || idx.alloc_ty()));
 
     // `[resource-drop]<R>`: `(func (param i32))`. Reuse async runtime's
     // void-i32 slot when available; otherwise allocate fresh.
@@ -811,23 +760,7 @@ fn emit_imports_section(
 
     let async_runtime = type_idx.async_runtime.as_ref().map(|art| {
         let event_ptr = event_ptr.expect("event_ptr must be set when async_runtime is");
-        let mut import_intrinsic = |name: &str, ty: u32| {
-            imports.import(ASYNC_INTRINSIC_MODULE, name, EntityType::Function(ty));
-            idx.alloc_func()
-        };
-        let waitable_new = import_intrinsic(WAITABLE_SET_NEW, art.waitable_new_ty);
-        let waitable_join = import_intrinsic(WAITABLE_JOIN, art.waitable_join_ty);
-        let waitable_wait = import_intrinsic(WAITABLE_SET_WAIT, art.waitable_wait_ty);
-        let waitable_drop = import_intrinsic(WAITABLE_SET_DROP, art.void_i32_ty);
-        let subtask_drop = import_intrinsic(SUBTASK_DROP, art.void_i32_ty);
-        AsyncRuntimeFuncs {
-            waitable_new,
-            waitable_join,
-            waitable_wait,
-            waitable_drop,
-            subtask_drop,
-            event_ptr,
-        }
+        canon_async::import_intrinsics(&mut imports, art, event_ptr, || idx.alloc_func())
     });
 
     // task.return: `[export]<iface>` / `[task-return]<fn>` per
@@ -1008,7 +941,7 @@ fn emit_wrapper_body(
     imp_before: Option<u32>,
     imp_after: Option<u32>,
     blocking: Option<&BlockingConfig>,
-    async_runtime: Option<&AsyncRuntimeFuncs>,
+    async_runtime: Option<&AsyncFuncs>,
     resource_drop: &HashMap<TypeId, u32>,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
@@ -1079,7 +1012,7 @@ fn emit_blocking_phase(
     f: &mut Function,
     fd: &FuncDispatch,
     blk: &BlockingConfig,
-    async_runtime: Option<&AsyncRuntimeFuncs>,
+    async_runtime: Option<&AsyncFuncs>,
     wait_locals: Option<(u32, u32)>,
     task_return_for_async: Option<u32>,
 ) {
@@ -1092,7 +1025,7 @@ fn emit_blocking_phase(
     let art = async_runtime.expect("async_runtime active when blocking is");
     let (st, ws) = wait_locals.expect("wait_locals allocated alongside async_runtime");
     f.instructions().local_set(st);
-    emit_wait_loop(f, st, ws, art);
+    canon_async::emit_wait_loop(f, st, ws, art);
     f.instructions().i32_const(blk.result_ptr);
     f.instructions().i32_load(wasm_encoder::MemArg {
         offset: 0,
@@ -1121,7 +1054,7 @@ fn emit_async_wrapper_body(
     imp_after: Option<u32>,
     blocking: Option<&BlockingConfig>,
     imp_task_return: u32,
-    async_runtime: &AsyncRuntimeFuncs,
+    async_runtime: &AsyncFuncs,
     resource_drop: &HashMap<TypeId, u32>,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
@@ -1180,7 +1113,7 @@ fn emit_async_wrapper_body(
     }
     f.instructions().call(imp_handler);
     f.instructions().local_set(st);
-    emit_wait_loop(&mut f, st, ws, async_runtime);
+    canon_async::emit_wait_loop(&mut f, st, ws, async_runtime);
 
     if let Some(idx) = imp_after {
         emit_hook_call(&mut f, fd, idx, Some(async_runtime), wait_locals);
@@ -1228,7 +1161,7 @@ fn emit_hook_call(
     f: &mut Function,
     fd: &FuncDispatch,
     hook_idx: u32,
-    async_runtime: Option<&AsyncRuntimeFuncs>,
+    async_runtime: Option<&AsyncFuncs>,
     wait_locals: Option<(u32, u32)>,
 ) {
     f.instructions().i32_const(fd.iface_name_offset);
@@ -1239,35 +1172,7 @@ fn emit_hook_call(
     let art = async_runtime.expect("async_runtime must be set when a hook is imported");
     let (st, ws) = wait_locals.expect("wait_locals allocated alongside async_runtime");
     f.instructions().local_set(st);
-    emit_wait_loop(f, st, ws, art);
-}
-
-/// Await a packed `canon lower async` status in local `st`. The packed
-/// i32 is `(handle << 4) | status_tag` (tag: 1=Started, 2=Returned);
-/// after this helper `st` holds the raw handle, and if it was nonzero
-/// the subtask has been joined into a fresh waitable-set, waited on,
-/// and both handles dropped.
-fn emit_wait_loop(f: &mut Function, st: u32, ws: u32, art: &AsyncRuntimeFuncs) {
-    f.instructions().local_get(st);
-    f.instructions().i32_const(4);
-    f.instructions().i32_shr_u();
-    f.instructions().local_set(st);
-    f.instructions().local_get(st);
-    f.instructions().if_(BlockType::Empty);
-    f.instructions().call(art.waitable_new);
-    f.instructions().local_set(ws);
-    f.instructions().local_get(st);
-    f.instructions().local_get(ws);
-    f.instructions().call(art.waitable_join);
-    f.instructions().local_get(ws);
-    f.instructions().i32_const(art.event_ptr);
-    f.instructions().call(art.waitable_wait);
-    f.instructions().drop();
-    f.instructions().local_get(st);
-    f.instructions().call(art.subtask_drop);
-    f.instructions().local_get(ws);
-    f.instructions().call(art.waitable_drop);
-    f.instructions().end();
+    canon_async::emit_wait_loop(f, st, ws, art);
 }
 
 #[cfg(test)]
