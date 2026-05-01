@@ -381,9 +381,19 @@ impl CellLayout {
     }
 
     /// `cell::enum-case(u32)` — index into `field-tree.enum-infos`.
+    /// Caller passes a local holding the side-table index; we write
+    /// disc 13 at offset 0 and the i32 index at the payload offset.
     pub(crate) fn emit_enum_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
-        let _ = (f, addr_local, side_table_idx);
-        todo!("Phase 2-2b: cell::enum-case — disc 13 + i32 enum-info side-table index");
+        self.emit_cell(
+            f,
+            addr_local,
+            cell_disc::ENUM_CASE,
+            &[PayloadPart {
+                local: side_table_idx,
+                kind: StoreKind::I32,
+                offset: 0,
+            }],
+        );
     }
 
     /// `cell::variant-case(u32)` — index into `field-tree.variant-infos`.

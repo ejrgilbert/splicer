@@ -11,8 +11,14 @@
 //! - [`cells`] — emit helpers for constructing individual `cell`
 //!   variant cases in the canonical-ABI memory layout (one helper
 //!   per primitive case so far).
+//! - [`lift`] — lift classification (`LiftKind`), per-(param|result)
+//!   lift descriptors, side-table population, and the wasm-encoder
+//!   codegen that writes one cell per lifted value.
+//! - [`emit`] — dispatch-module orchestration: schema layouts,
+//!   wrapper-body emission, section emitters.
 
 pub(super) mod cells;
 pub(super) mod emit;
+pub(super) mod lift;
 
 pub(super) use emit::build_tier2_adapter;

@@ -1652,30 +1652,31 @@ const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
 }
 
 use bindings::exports::splicer::tier2::before::Guest as BeforeGuest;
-use bindings::splicer::common::types::{CallId, Cell, Field};
+use bindings::splicer::common::types::{CallId, Cell, Field, FieldTree};
 
 struct Mdl;
 
-fn fmt_cell(c: &Cell) -> String {
-    match c {
+fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
+    let cell = tree.cells.get(idx as usize).expect("cell idx in range");
+    match cell {
         Cell::Bool(v) => format!("bool({v})"),
         Cell::Integer(v) => format!("integer({v})"),
         Cell::Floating(v) => format!("floating({v})"),
         Cell::Text(s) => format!("text({s:?})"),
         Cell::Bytes(b) => format!("bytes(len={})", b.len()),
+        Cell::EnumCase(side_idx) => {
+            let info = tree
+                .enum_infos
+                .get(*side_idx as usize)
+                .expect("enum_infos idx in range");
+            format!("enum({}::{})", info.type_name, info.case_name)
+        }
         other => format!("other({other:?})"),
     }
 }
 
 fn fmt_field(f: &Field) -> String {
-    let root = f.tree.root as usize;
-    let cell = f
-        .tree
-        .cells
-        .get(root)
-        .map(fmt_cell)
-        .unwrap_or_else(|| String::from("<missing>"));
-    format!("{}: {cell}", f.name)
+    format!("{}: {}", f.name, fmt_cell(&f.tree, f.tree.root))
 }
 
 impl BeforeGuest for Mdl {
@@ -2103,7 +2104,11 @@ fn test_tier2_canned_primitives() {
     // Same shape set as tier-1's `primitive_atoms`, minus the
     // unsupported entries. Listed by `Shape::name` for env-var
     // selection compatibility.
-    let supported = primitive_atoms()
+    // Walk the full canned shape set; `predict_tier2_args_marker`
+    // gates each shape on whether tier-2's lift codegen handles it
+    // today. Compound shapes light up here as Phase 2-2b lands their
+    // `cells.rs` impls.
+    let supported = canned_shapes()
         .into_iter()
         .filter(|s| predict_tier2_args_marker(s).is_some())
         .collect::<Vec<_>>();
@@ -2293,8 +2298,18 @@ fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
             "char" => None,
             _ => None,
         },
-        // Compound shapes (lists, options, records, …) need
-        // multi-cell lifting, which is part of Phase 2-2b.
+        Shape::Enum {
+            wit_name,
+            cases,
+            selected,
+            ..
+        } => {
+            let case = cases.get(*selected).map(|(c, _)| *c)?;
+            Some(format!("x: enum({wit_name}::{case})"))
+        }
+        // Other compound shapes (lists, options, records, variants,
+        // tuples, results, flags) light up here as their lift
+        // codegen lands.
         _ => None,
     }
 }
