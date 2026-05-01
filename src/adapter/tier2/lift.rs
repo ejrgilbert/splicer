@@ -31,13 +31,16 @@ use super::super::abi::emit::{
     direct_return_type, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
 use super::super::indices::FunctionIndices;
+use super::blob::{BlobSlice, RecordWriter};
 use super::cells::CellLayout;
 use super::emit::{FuncDispatch, SchemaLayouts};
 
 // ─── WIT names referenced by lift codegen ─────────────────────────
-
-/// Field names within `record enum-info`.
-const ENUM_INFO_TYPE_NAME: &str = "type-name";
+//
+// Side-table-info records in `splicer:common/types` share the same
+// shape: `record { type-name: string, <item>-name: string }`. Field
+// names below are passed to [`SideTableSpec`] per kind.
+const INFO_TYPE_NAME: &str = "type-name";
 const ENUM_INFO_CASE_NAME: &str = "case-name";
 
 // ─── Classification + lift descriptors ────────────────────────────
@@ -234,23 +237,39 @@ pub(super) struct ParamLift {
 }
 
 /// Schema-level info needed to populate one field-tree's side
-/// tables (enum-infos, flags-infos, record-infos, …). Per
-/// (param | result), built at classify time and consumed by the
+/// tables (enum-infos, flags-infos, record-infos, variant-infos, …).
+/// Per (param | result), built at classify time and consumed by the
 /// layout phase to emit the side-table data segments + patch the
 /// field-tree blobs.
+///
+/// Every kind we care about today (enum / flags / variant / record)
+/// shares the same shape: a type-name + an ordered list of item
+/// names (case / flag / field). New kinds are wired by adding a
+/// field below + classifying into [`NamedListInfo`] at lift time.
 #[derive(Default, Clone)]
 pub(super) struct SideTableInfo {
     /// `Some` for enum-typed lifts: carries the enum's type-name
     /// plus its case names in disc order.
-    pub enum_info: Option<EnumLiftInfo>,
+    pub enum_info: Option<NamedListInfo>,
+    // Phase 2-2b additions land here:
+    //   pub flags_info: Option<NamedListInfo>,
+    //   pub variant_info: Option<NamedListInfo>,
+    //   pub record_info: Option<NamedListInfo>,
+    // — the side-table builder ([`build_side_table_blob`]) is
+    // already generic over a per-kind extractor closure.
 }
 
+/// A type-name plus an ordered list of item names. Carries
+/// enough info to populate any of the `*-info` side-table records
+/// in `splicer:common/types`, which all share the
+/// `{ type-name, <item>-name }` shape.
 #[derive(Clone)]
-pub(super) struct EnumLiftInfo {
+pub(super) struct NamedListInfo {
     pub type_name: String,
-    /// Case names in WIT declaration order — the i'th entry is the
-    /// name of the case with disc value `i`.
-    pub case_names: Vec<String>,
+    /// Item names in WIT declaration order — the i'th entry's WIT
+    /// declaration index equals `i` (matching the disc / bit-position
+    /// / field-index used at runtime).
+    pub item_names: Vec<String>,
 }
 
 // ─── Classifiers ──────────────────────────────────────────────────
@@ -332,7 +351,7 @@ fn side_table_info_for(ty: &Type, kind: LiftKind, resolve: &Resolve) -> SideTabl
 /// Returns `None` if the type isn't an enum or lacks a name (the
 /// canonical-ABI lower has the disc but the cell can't render
 /// without case-names).
-fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<EnumLiftInfo> {
+fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo> {
     let Type::Id(id) = ty else {
         return None;
     };
@@ -341,183 +360,212 @@ fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<EnumLiftInfo>
         return None;
     };
     let type_name = typedef.name.as_ref()?.clone();
-    let case_names: Vec<String> = e.cases.iter().map(|c| c.name.clone()).collect();
-    Some(EnumLiftInfo {
+    let item_names: Vec<String> = e.cases.iter().map(|c| c.name.clone()).collect();
+    Some(NamedListInfo {
         type_name,
-        case_names,
+        item_names,
     })
 }
 
 // ─── Side-table population ────────────────────────────────────────
+//
+// All side-table kinds (enum / flags / variant / record) share the
+// same shape and lifecycle:
+//   1. Walk every (fn, param | result); for each lift carrying an
+//      info of this kind, dedup-register the strings (type-name +
+//      item-names) into the shared name_blob.
+//   2. Lay out one entry record per item in declaration order, into
+//      one contiguous side-table data segment.
+//   3. Hand back per-(fn, param) and per-(fn, result) `BlobSlice`
+//      pointers (relative to the segment start; caller translates
+//      to absolute via `BlobSlice::translate`).
+//
+// The kind-specific bits (where to find the info on `SideTableInfo`,
+// which `RecordLayout` to use, what the item-name field is called)
+// are passed in via [`SideTableSpec`] + an extractor closure.
 
-/// Where each enum type's strings live in the name blob, after
-/// `register_enum_strings`. Keyed by enum type-name to dedupe across
-/// multiple uses of the same enum across params/results/fns.
-pub(super) type EnumStringTable = HashMap<String, EnumStringOffsets>;
-
-pub(super) struct EnumStringOffsets {
-    type_name: (u32, u32),  // (offset, len) in name_blob
-    cases: Vec<(u32, u32)>, // per case, in disc order
+/// Per-side-table-kind configuration. Plug-in points for adding a
+/// new kind: provide the `RecordLayout` for one entry record + the
+/// item-name field name, and pass an extractor closure that pulls
+/// this kind's info off `SideTableInfo`.
+pub(super) struct SideTableSpec<'a> {
+    /// Layout of one entry record (e.g. `splicer:common/types.enum-info`).
+    pub entry_layout: &'a RecordLayout,
+    /// Field name on the entry record for the per-item identifier
+    /// (e.g. `"case-name"` for enum-info, `"flag-name"` for flags-info).
+    pub item_name_field: &'static str,
 }
 
-/// Walk every param / result; for each enum-typed lift, append its
-/// type-name + case-names to `name_blob` (deduped per enum type).
-/// Returns the per-enum-type string offsets so the side-table builder
-/// can stitch entries together without re-scanning name_blob.
-pub(super) fn register_enum_strings(
+/// Where each registered type's strings live in the name blob.
+/// Keyed by type-name to dedupe across multiple uses of the same
+/// type across params / results / functions.
+pub(super) type StringTable = HashMap<String, NamedListStrings>;
+
+pub(super) struct NamedListStrings {
+    type_name: BlobSlice,
+    items: Vec<BlobSlice>, // per item, in declaration order
+}
+
+/// Output of [`build_side_table_blob`]: the entry-record bytes plus
+/// per-(fn, param) and per-(fn, result) slice pointers (relative to
+/// the segment start).
+pub(super) struct SideTableBlob {
+    pub bytes: Vec<u8>,
+    pub per_param: Vec<Vec<BlobSlice>>,
+    pub per_result: Vec<BlobSlice>,
+}
+
+impl SideTableBlob {
+    /// Translate every per-param / per-result slice from
+    /// segment-relative to absolute. Called by the layout phase
+    /// once the segment's data offset is known.
+    pub(super) fn translate_to(&mut self, base: u32) {
+        for params in self.per_param.iter_mut() {
+            for slice in params.iter_mut() {
+                slice.translate(base);
+            }
+        }
+        for slice in self.per_result.iter_mut() {
+            slice.translate(base);
+        }
+    }
+}
+
+/// Walk every param / result; for each lift that the extractor
+/// surfaces a [`NamedListInfo`] for, append its strings to
+/// `name_blob` (deduped per type-name). Returns the per-type string
+/// offsets so the side-table builder can stitch entries together
+/// without re-scanning name_blob.
+pub(super) fn register_side_table_strings(
     per_func: &[FuncDispatch],
     name_blob: &mut Vec<u8>,
-) -> EnumStringTable {
-    let mut table = EnumStringTable::new();
+    extract: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
+) -> StringTable {
+    let mut table = StringTable::new();
     for fd in per_func {
         for p in &fd.params {
-            if let Some(ei) = &p.side_table.enum_info {
-                ensure_enum_registered(&mut table, name_blob, ei);
+            if let Some(info) = extract(&p.side_table) {
+                ensure_registered(&mut table, name_blob, info);
             }
         }
         if let Some(rl) = &fd.result_lift {
-            if let Some(ei) = &rl.side_table.enum_info {
-                ensure_enum_registered(&mut table, name_blob, ei);
+            if let Some(info) = extract(&rl.side_table) {
+                ensure_registered(&mut table, name_blob, info);
             }
         }
     }
     table
 }
 
-fn ensure_enum_registered(
-    table: &mut EnumStringTable,
-    name_blob: &mut Vec<u8>,
-    ei: &EnumLiftInfo,
-) {
-    if table.contains_key(&ei.type_name) {
+fn ensure_registered(table: &mut StringTable, name_blob: &mut Vec<u8>, info: &NamedListInfo) {
+    if table.contains_key(&info.type_name) {
         return;
     }
-    let type_name_off = name_blob.len() as u32;
-    name_blob.extend_from_slice(ei.type_name.as_bytes());
-    let type_name = (type_name_off, ei.type_name.len() as u32);
-    let cases = ei
-        .case_names
+    let type_name = append_string(name_blob, &info.type_name);
+    let items = info
+        .item_names
         .iter()
-        .map(|n| {
-            let off = name_blob.len() as u32;
-            name_blob.extend_from_slice(n.as_bytes());
-            (off, n.len() as u32)
-        })
+        .map(|n| append_string(name_blob, n))
         .collect();
     table.insert(
-        ei.type_name.clone(),
-        EnumStringOffsets { type_name, cases },
+        info.type_name.clone(),
+        NamedListStrings { type_name, items },
     );
 }
 
-/// `(blob_offset, count)` per (fn, param) and (fn, result), with
-/// `blob_offset` initially relative to the enum-info data segment's
-/// start; the caller translates to absolute after `place_data`.
-pub(super) struct EnumInfoBlob {
-    pub bytes: Vec<u8>,
-    pub per_param: Vec<Vec<(u32, u32)>>,
-    pub per_result: Vec<(u32, u32)>,
+fn append_string(name_blob: &mut Vec<u8>, s: &str) -> BlobSlice {
+    let off = name_blob.len() as u32;
+    name_blob.extend_from_slice(s.as_bytes());
+    BlobSlice {
+        off,
+        len: s.len() as u32,
+    }
 }
 
-/// Lay out the per-(field-tree) enum-info entries: one
-/// `enum-info` record per case of the enum a field carries. The
-/// cell at runtime stores the disc as the side-table index, so the
-/// disc directly indexes into this blob's contiguous case range.
-pub(super) fn build_enum_info_blob(
+/// Lay out one side-table-kind's entry records: one entry per item
+/// of each registered info, contiguous so the cell-at-runtime can
+/// disc-index directly into the per-tree slice.
+pub(super) fn build_side_table_blob(
     per_func: &[FuncDispatch],
-    strings: &EnumStringTable,
-    schema: &SchemaLayouts,
-) -> EnumInfoBlob {
-    let entry_size = schema.enum_info_layout.size as usize;
-    let type_name_off = schema.enum_info_layout.offset_of(ENUM_INFO_TYPE_NAME) as usize;
-    let case_name_off = schema.enum_info_layout.offset_of(ENUM_INFO_CASE_NAME) as usize;
-
+    strings: &StringTable,
+    spec: &SideTableSpec<'_>,
+    extract: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
+) -> SideTableBlob {
     let mut bytes: Vec<u8> = Vec::new();
-    let mut per_param: Vec<Vec<(u32, u32)>> = Vec::with_capacity(per_func.len());
-    let mut per_result: Vec<(u32, u32)> = Vec::with_capacity(per_func.len());
+    let mut per_param: Vec<Vec<BlobSlice>> = Vec::with_capacity(per_func.len());
+    let mut per_result: Vec<BlobSlice> = Vec::with_capacity(per_func.len());
     for fd in per_func {
-        let mut params_off = Vec::with_capacity(fd.params.len());
+        let mut params = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
-            params_off.push(append_enum_entries(
+            params.push(append_entries(
                 &mut bytes,
                 strings,
-                p.side_table.enum_info.as_ref(),
-                entry_size,
-                type_name_off,
-                case_name_off,
+                spec,
+                extract(&p.side_table),
             ));
         }
-        per_param.push(params_off);
-        let result_ei = fd
-            .result_lift
-            .as_ref()
-            .and_then(|r| r.side_table.enum_info.as_ref());
-        per_result.push(append_enum_entries(
-            &mut bytes,
-            strings,
-            result_ei,
-            entry_size,
-            type_name_off,
-            case_name_off,
-        ));
+        per_param.push(params);
+        let result_info = fd.result_lift.as_ref().and_then(|r| extract(&r.side_table));
+        per_result.push(append_entries(&mut bytes, strings, spec, result_info));
     }
-    EnumInfoBlob {
+    SideTableBlob {
         bytes,
         per_param,
         per_result,
     }
 }
 
-fn append_enum_entries(
+fn append_entries(
     blob: &mut Vec<u8>,
-    strings: &EnumStringTable,
-    ei: Option<&EnumLiftInfo>,
-    entry_size: usize,
-    type_name_off: usize,
-    case_name_off: usize,
-) -> (u32, u32) {
-    let Some(ei) = ei else {
-        return (0, 0);
+    strings: &StringTable,
+    spec: &SideTableSpec<'_>,
+    info: Option<&NamedListInfo>,
+) -> BlobSlice {
+    let Some(info) = info else {
+        return BlobSlice::EMPTY;
     };
     let s = strings
-        .get(&ei.type_name)
-        .expect("register_enum_strings ran for every enum_info");
+        .get(&info.type_name)
+        .expect("register_side_table_strings ran for every info");
     let blob_off = blob.len() as u32;
-    let count = ei.case_names.len() as u32;
-    for case_idx in 0..ei.case_names.len() {
-        let entry_start = blob.len();
-        blob.extend(std::iter::repeat_n(0u8, entry_size));
-        let (tn_off, tn_len) = s.type_name;
-        let (cn_off, cn_len) = s.cases[case_idx];
-        write_le_i32(
-            blob,
-            entry_start + type_name_off + SLICE_PTR_OFFSET as usize,
-            tn_off as i32,
-        );
-        write_le_i32(
-            blob,
-            entry_start + type_name_off + SLICE_LEN_OFFSET as usize,
-            tn_len as i32,
-        );
-        write_le_i32(
-            blob,
-            entry_start + case_name_off + SLICE_PTR_OFFSET as usize,
-            cn_off as i32,
-        );
-        write_le_i32(
-            blob,
-            entry_start + case_name_off + SLICE_LEN_OFFSET as usize,
-            cn_len as i32,
-        );
+    let len = info.item_names.len() as u32;
+    for item_idx in 0..info.item_names.len() {
+        let entry = RecordWriter::extend_zero(blob, spec.entry_layout);
+        entry.write_slice(blob, INFO_TYPE_NAME, s.type_name);
+        entry.write_slice(blob, spec.item_name_field, s.items[item_idx]);
     }
-    (blob_off, count)
+    BlobSlice { off: blob_off, len }
 }
 
-/// Side-table-segment-local helper. Mirrors the one in `emit.rs`;
-/// duplicated to avoid widening that module's public surface for
-/// what's a 3-line write helper.
-fn write_le_i32(buf: &mut [u8], offset: usize, value: i32) {
-    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+// ─── Convenience facades for emit.rs (one per side-table kind) ────
+
+/// Register enum-info strings for every enum-typed lift across all
+/// funcs. Thin wrapper over [`register_side_table_strings`] tied to
+/// the `enum_info` field on [`SideTableInfo`].
+pub(super) fn register_enum_strings(
+    per_func: &[FuncDispatch],
+    name_blob: &mut Vec<u8>,
+) -> StringTable {
+    register_side_table_strings(per_func, name_blob, |st| st.enum_info.as_ref())
+}
+
+/// Build the enum-info side-table blob. Thin wrapper over
+/// [`build_side_table_blob`] tied to the `enum-info` record + the
+/// `enum_info` field on [`SideTableInfo`].
+pub(super) fn build_enum_info_blob(
+    per_func: &[FuncDispatch],
+    strings: &StringTable,
+    schema: &SchemaLayouts,
+) -> SideTableBlob {
+    build_side_table_blob(
+        per_func,
+        strings,
+        &SideTableSpec {
+            entry_layout: &schema.enum_info_layout,
+            item_name_field: ENUM_INFO_CASE_NAME,
+        },
+        |st| st.enum_info.as_ref(),
+    )
 }
 
 // ─── Wrapper-body locals + lift codegen ───────────────────────────
@@ -565,8 +613,8 @@ pub(super) fn alloc_wrapper_locals(
     // i32 addr local so `lift_from_memory` can flat-load result
     // values out of the retptr scratch.
     let tr_uses_flat_loads = fd
-        .task_return
-        .as_ref()
+        .shape
+        .task_return()
         .is_some_and(|tr| !tr.sig.indirect_params && fd.result_ty.is_some());
     let tr_addr = tr_uses_flat_loads.then(|| locals.alloc_local(ValType::I32));
     WrapperLocals {
@@ -589,7 +637,14 @@ pub(super) fn emit_lift_param(
     p: &ParamLift,
     lcl: &WrapperLocals,
 ) {
-    emit_lift_kind(f, cell_layout, p.kind, p.first_local, p.first_local + 1, lcl);
+    emit_lift_kind(
+        f,
+        cell_layout,
+        p.kind,
+        p.first_local,
+        p.first_local + 1,
+        lcl,
+    );
 }
 
 /// Shared lift body for params and direct-return results. `slot0` /
@@ -709,10 +764,3 @@ pub(super) fn emit_lift_result(
         }
     }
 }
-
-/// `RecordLayout` is re-exported here so callers can keep `lift::*`
-/// imports tight without dragging in `abi::emit::*`. It's the type
-/// `SchemaLayouts::enum_info_layout` exposes; `build_enum_info_blob`
-/// reads its `offset_of(...)`.
-#[allow(dead_code)]
-pub(super) type EnumInfoLayout = RecordLayout;

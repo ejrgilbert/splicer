@@ -8,6 +8,8 @@
 //! correlation in Phase 2-4.
 //!
 //! Submodules:
+//! - [`blob`] — typed data-segment packing helpers (`BlobSlice`,
+//!   `RecordWriter`); the data-side analogue of [`cells::CellLayout`].
 //! - [`cells`] — emit helpers for constructing individual `cell`
 //!   variant cases in the canonical-ABI memory layout (one helper
 //!   per primitive case so far).
@@ -17,6 +19,7 @@
 //! - [`emit`] — dispatch-module orchestration: schema layouts,
 //!   wrapper-body emission, section emitters.
 
+pub(super) mod blob;
 pub(super) mod cells;
 pub(super) mod emit;
 pub(super) mod lift;
