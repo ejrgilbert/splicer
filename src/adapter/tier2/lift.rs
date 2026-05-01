@@ -221,16 +221,21 @@ pub(super) enum CellOp {
 /// lifts; resolved to a concrete wasm local index via
 /// [`LocalRef::resolve`] at emit time.
 ///
-/// `PtrScratch` / `LenScratch` / `Result` aren't constructed by
-/// today's plan-builder (params source from `Param(n)` only and
-/// result lifts stay on the legacy `LiftKind`+`ResultSource` path
-/// — see the result-lift block below). They land in this enum
-/// ahead of records-as-result, where retptr-memory-loaded fields
-/// will use them.
+/// `Param(n)` is **plan-local**: indexed from 0 within the
+/// [`LiftPlan`] that owns it. The plan's owner ([`ParamLift`] for
+/// params, [`ResultLift`] for compound results) stores a `local_base`
+/// — an absolute wasm-local index — that gets added to `n` at resolve
+/// time. This way the same plan-builder allocates plan-local indices
+/// for both param-flat-slots (base = cumulative param-slot cursor)
+/// and result-synthetic locals (base = first `WrapperLocals.result_locals`).
+///
+/// `PtrScratch` / `LenScratch` / `Result` are wrapper-allocated
+/// scratch locals; they don't shift with the plan's base.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub(super) enum LocalRef {
-    /// nth flat-slot wasm local of the function's params.
+    /// Plan-local flat-slot index. Resolved to absolute via
+    /// `local_base + n` at emit time — see [`LocalRef::resolve`].
     Param(u32),
     /// `lcl.ptr_scratch` — set up before the lift for retptr-loaded results.
     PtrScratch,
@@ -241,12 +246,16 @@ pub(super) enum LocalRef {
 }
 
 impl LocalRef {
-    /// Resolve to a concrete wasm local index. Panics for unset
+    /// Resolve to a concrete wasm local index. `local_base` is the
+    /// absolute index that `Param(0)` of the owning plan corresponds
+    /// to — for params, the cumulative param-slot cursor when this
+    /// param's plan started; for compound results, the first
+    /// synthetic local allocated for the result. Panics for unset
     /// scratch locals (which only happens if the plan-builder picked
     /// an inappropriate `LocalRef` for the lift's source).
-    pub(super) fn resolve(&self, lcl: &WrapperLocals) -> u32 {
+    pub(super) fn resolve(&self, lcl: &WrapperLocals, local_base: u32) -> u32 {
         match self {
-            LocalRef::Param(i) => *i,
+            LocalRef::Param(i) => local_base + *i,
             LocalRef::PtrScratch => lcl.ptr_scratch,
             LocalRef::LenScratch => lcl.len_scratch,
             LocalRef::Result => lcl
@@ -263,6 +272,11 @@ impl LocalRef {
 /// pull out per-kind side-table contributions.
 pub(super) struct LiftPlan {
     pub cells: Vec<CellOp>,
+    /// Total flat-slot locals consumed by the plan (i.e.
+    /// `LocalRef::Param(0..flat_slot_count)` cover every flat slot).
+    /// Owners pair this with `local_base` to know how many absolute
+    /// wasm locals to allocate / reserve after their base.
+    pub flat_slot_count: u32,
 }
 
 impl LiftPlan {
@@ -296,17 +310,23 @@ impl LiftPlan {
 /// makes child cell indices observable from the parent's side-table
 /// info (a child's index is just `cells.len()` after its sub-call
 /// has appended).
+///
+/// Plan-local: `next_local` always starts at 0. The plan's owner
+/// records the count `next_local` ends at (= total flat slots
+/// consumed) and pairs it with an absolute `local_base` so
+/// [`LocalRef::resolve`] can compute absolute wasm-local indices at
+/// emit time.
 struct LiftPlanBuilder {
     cells: Vec<CellOp>,
-    /// Next available wasm flat-slot local (for `LocalRef::Param`).
+    /// Next available plan-local flat-slot index (for `LocalRef::Param`).
     next_local: u32,
 }
 
 impl LiftPlanBuilder {
-    fn new(first_local: u32) -> Self {
+    fn new() -> Self {
         Self {
             cells: Vec::new(),
-            next_local: first_local,
+            next_local: 0,
         }
     }
 
@@ -398,41 +418,99 @@ impl LiftPlanBuilder {
     }
 
     fn into_plan(self) -> LiftPlan {
-        LiftPlan { cells: self.cells }
+        LiftPlan {
+            cells: self.cells,
+            flat_slot_count: self.next_local,
+        }
     }
 }
 
-// ─── Result-lift descriptors (legacy LiftKind+ResultSource path) ──
+// ─── Result-lift descriptors ──────────────────────────────────────
 //
-// Result lifts stay on the (LiftKind, ResultSource, SideTableInfo)
-// triple until compound result lifts land — they need a
-// memory-load prefix before the cell write (canonical-ABI returns
-// records via retptr, not flat locals), which doesn't fit the
-// flat-LocalRef LiftPlan model. Migrate when records-as-result is
-// in scope.
+// Three shapes:
+//
+// - `Direct(kind)` — primitive that fits in one flat slot, captured
+//   into `lcl.result` after the handler call.
+// - `RetptrPair { kind, retptr_offset }` — `(ptr, len)` for string /
+//   `list<u8>` returns; the wrapper loads the pair from retptr scratch
+//   into `lcl.ptr_scratch` / `lcl.len_scratch` before lifting.
+// - `Compound(CompoundResult)` — record / tuple / etc. that lives in
+//   memory at retptr scratch. Driven by a [`LiftPlan`] symmetric with
+//   the per-param plans; `wit_bindgen_core::abi::lift_from_memory`
+//   pushes flat values onto the wasm stack from retptr_offset, and
+//   the wrapper `local.set`s those into per-result synthetic locals
+//   (in reverse, since the stack is LIFO) for the plan walker.
 
 /// How to extract the function's return value when lifting it for
 /// on-return. `side_table` populates the result tree's side-tables
-/// at adapter-build time.
+/// at adapter-build time. Compound results carry their side-table
+/// contributions inline on the plan's `CellOp`s instead.
 pub(super) struct ResultLift {
     pub source: ResultSource,
     pub side_table: SideTableInfo,
 }
 
-#[derive(Clone, Copy)]
 pub(super) enum ResultSource {
     /// Direct primitive (no retptr): source is `lcl.result`.
     Direct(LiftKind),
     /// `(ptr, len)` pair in retptr scratch (string / `list<u8>`).
     RetptrPair { kind: LiftKind, retptr_offset: i32 },
+    /// Compound result: walk a [`LiftPlan`] over flat slots loaded
+    /// from retptr scratch via `lift_from_memory`.
+    Compound(CompoundResult),
+}
+
+/// Per-fn compound-result recipe: which WIT type to lift, where its
+/// canonical-ABI bytes live (retptr scratch), and the cell-tree
+/// plan that consumes the flat slots. `local_base` is back-filled
+/// by the wrapper-body emitter once it allocates the synthetic
+/// flat-slot locals; `cells_offset` is back-filled by the layout
+/// phase (parallel to `ParamLift::cells_offset`).
+pub(super) struct CompoundResult {
+    /// WIT type of the result value — kept around so the wrapper
+    /// body can drive `lift_from_memory` through `WasmEncoderBindgen`.
+    pub ty: Type,
+    /// Cell-array plan walked by `emit_lift_plan`. Same shape as a
+    /// param's plan; `LocalRef::Param(n)` resolves to
+    /// `local_base + n` at emit time.
+    pub plan: LiftPlan,
+    /// Byte offset of the retptr scratch buffer (back-filled by
+    /// layout via [`ResultLift::set_retptr_offset`]).
+    pub retptr_offset: i32,
+    /// Per-cell record-info side-table indices; back-filled by the
+    /// layout phase (parallel to `ParamLift::record_info_cell_idx`).
+    pub record_info_cell_idx: Vec<Option<u32>>,
+    /// Byte offset of the result's contiguous cells slab in static
+    /// memory; back-filled by the layout phase.
+    pub cells_offset: u32,
 }
 
 impl ResultLift {
     /// Re-anchor the retptr scratch offset back-filled by the layout
     /// phase. No-op for `Direct` results.
     pub(super) fn set_retptr_offset(&mut self, off: i32) {
-        if let ResultSource::RetptrPair { retptr_offset, .. } = &mut self.source {
-            *retptr_offset = off;
+        match &mut self.source {
+            ResultSource::Direct(_) => {}
+            ResultSource::RetptrPair { retptr_offset, .. } => *retptr_offset = off,
+            ResultSource::Compound(c) => c.retptr_offset = off,
+        }
+    }
+
+    /// Returns `Some(&CompoundResult)` for compound result lifts;
+    /// `None` otherwise.
+    pub(super) fn compound(&self) -> Option<&CompoundResult> {
+        match &self.source {
+            ResultSource::Compound(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable accessor for the layout phase to back-fill
+    /// `cells_offset` / `record_info_cell_idx`.
+    pub(super) fn compound_mut(&mut self) -> Option<&mut CompoundResult> {
+        match &mut self.source {
+            ResultSource::Compound(c) => Some(c),
+            _ => None,
         }
     }
 }
@@ -441,13 +519,18 @@ impl ResultLift {
 /// this param's contiguous cells slab within the static data segment;
 /// the slab holds `plan.cell_count()` cells, each `cell_layout.size`
 /// bytes. `record_info_cell_idx[i]` is the side-table index for the
-/// `i`th cell when it's a `CellOp::RecordOf` (else `None`). Both are
-/// filled in by the layout phase.
+/// `i`th cell when it's a `CellOp::RecordOf` (else `None`). `local_base`
+/// is the absolute wasm-local index that `LocalRef::Param(0)` of the
+/// param's plan corresponds to — for params, this is the cumulative
+/// flat-slot count of preceding params. Both are filled in at
+/// classify / layout time.
 pub(super) struct ParamLift {
     pub name: BlobSlice,
     pub plan: LiftPlan,
     pub cells_offset: u32,
     pub record_info_cell_idx: Vec<Option<u32>>,
+    /// Absolute wasm-local index of `LocalRef::Param(0)` for this plan.
+    pub local_base: u32,
 }
 
 /// Result-side-table info, populated when a result is lift-able.
@@ -478,8 +561,8 @@ pub(super) struct NamedListInfo {
 // ─── Classifiers ──────────────────────────────────────────────────
 
 /// Build a [`LiftPlan`] for every WIT param of `func`. `slot_cursor`
-/// threads across params so each param's plan starts at the next
-/// flat-slot local.
+/// threads across params, recording each param's absolute `local_base`
+/// (the function-flat-slot index its `LocalRef::Param(0)` resolves to).
 pub(super) fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
@@ -490,17 +573,19 @@ pub(super) fn classify_func_params(
     for param in &func.params {
         let pname = &param.name;
         let name = append_param_name(name_blob, pname);
-        let mut builder = LiftPlanBuilder::new(slot_cursor);
+        let mut builder = LiftPlanBuilder::new();
         builder.push(&param.ty, resolve);
-        slot_cursor = builder.next_local;
         let plan = builder.into_plan();
         let record_info_cell_idx = vec![None; plan.cells.len()];
+        let consumed = plan.flat_slot_count;
         params_lift.push(ParamLift {
             name,
             plan,
             cells_offset: 0,      // back-filled by lay_out_static_memory
             record_info_cell_idx, // back-filled by lay_out_static_memory
+            local_base: slot_cursor,
         });
+        slot_cursor += consumed;
     }
     params_lift
 }
@@ -533,10 +618,33 @@ pub(super) fn classify_result_lift(
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
     let kind = LiftKind::classify(ty, resolve);
+
+    // Compound kinds (currently just Record) drive a LiftPlan over
+    // retptr-loaded flat slots. The plan-builder walks the WIT type
+    // exactly like it does for params; the difference is the source
+    // of `LocalRef::Param(n)` — synthetic locals populated from
+    // `lift_from_memory` instead of function-flat-slot params.
+    if matches!(kind, LiftKind::Record) {
+        let mut builder = LiftPlanBuilder::new();
+        builder.push(ty, resolve);
+        let plan = builder.into_plan();
+        let record_info_cell_idx = vec![None; plan.cells.len()];
+        return Some(ResultLift {
+            source: ResultSource::Compound(CompoundResult {
+                ty: *ty,
+                plan,
+                retptr_offset: 0, // back-filled by the layout phase.
+                record_info_cell_idx,
+                cells_offset: 0, // back-filled by the layout phase.
+            }),
+            side_table: SideTableInfo::default(),
+        });
+    }
+
     if !result_kind_supported(kind) {
-        // Records/variants/etc as result types: defer until result
-        // lifts learn about retptr-memory-load prefixes. The wrapper
-        // still calls after-hook with option::none for `result`.
+        // Variants / option / list / etc. as result types: defer
+        // until those land. The wrapper still calls after-hook with
+        // option::none for `result`.
         return None;
     }
     let side_table = side_table_info_for(ty, kind, resolve);
@@ -556,9 +664,9 @@ pub(super) fn classify_result_lift(
     Some(ResultLift { source, side_table })
 }
 
-/// Whether the result lift codegen (`emit_lift_result`) can handle
-/// this kind today. Compound kinds need a memory-load-prefix variant
-/// that doesn't exist yet.
+/// Whether the (non-compound) result lift codegen can handle this
+/// kind today. Compound kinds use the `Compound` arm and don't go
+/// through this check.
 fn result_kind_supported(kind: LiftKind) -> bool {
     matches!(
         kind,
@@ -862,34 +970,40 @@ pub(super) struct RecordTypeStrings {
 
 pub(super) type RecordStringTable = HashMap<String, RecordTypeStrings>;
 
-/// Walk every plan's [`CellOp::RecordOf`]; for each record type seen,
-/// register its `type-name` + each `field-name` into `name_blob`
-/// (deduped per type-name). Result keyed by record type-name.
+/// Walk every plan's [`CellOp::RecordOf`] (params + compound results);
+/// for each record type seen, register its `type-name` + each
+/// `field-name` into `name_blob` (deduped per type-name). Result keyed
+/// by record type-name.
 pub(super) fn register_record_strings(
     per_func: &[FuncDispatch],
     name_blob: &mut Vec<u8>,
 ) -> RecordStringTable {
     let mut table = RecordStringTable::new();
-    for fd in per_func {
-        for p in &fd.params {
-            for (type_name, fields) in p.plan.record_ofs() {
-                if !table.contains_key(type_name) {
-                    let tn = append_string(name_blob, type_name);
-                    let fns = fields
-                        .iter()
-                        .map(|(name, _)| append_string(name_blob, name))
-                        .collect();
-                    table.insert(
-                        type_name.to_string(),
-                        RecordTypeStrings {
-                            type_name: tn,
-                            field_names: fns,
-                        },
-                    );
-                }
+    let register_plan = |plan: &LiftPlan, name_blob: &mut Vec<u8>, table: &mut RecordStringTable| {
+        for (type_name, fields) in plan.record_ofs() {
+            if !table.contains_key(type_name) {
+                let tn = append_string(name_blob, type_name);
+                let fns = fields
+                    .iter()
+                    .map(|(name, _)| append_string(name_blob, name))
+                    .collect();
+                table.insert(
+                    type_name.to_string(),
+                    RecordTypeStrings {
+                        type_name: tn,
+                        field_names: fns,
+                    },
+                );
             }
         }
-        // Records-as-result not yet supported: no result-side walk.
+    };
+    for fd in per_func {
+        for p in &fd.params {
+            register_plan(&p.plan, name_blob, &mut table);
+        }
+        if let Some(c) = fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
+            register_plan(&c.plan, name_blob, &mut table);
+        }
     }
     table
 }
@@ -919,10 +1033,14 @@ pub(super) struct RecordInfoBlobs {
     /// side-table index (None for non-`RecordOf` cells). The lift
     /// codegen reads this when emitting `cell::record-of(idx)`.
     pub per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>>,
-    /// Per (fn): result-side range. Empty for now (records-as-result
-    /// not supported); kept symmetric for easy folding into
-    /// `FieldSideTables`.
+    /// Per (fn): result-side range. `EMPTY` for void / non-Compound
+    /// results; populated for `Compound` results so the result tree's
+    /// `record-infos` slot can patch in.
     pub per_result_range: Vec<BlobSlice>,
+    /// Per (fn): for each cell of the result's plan, its assigned
+    /// record-info side-table index (None for non-`RecordOf` cells).
+    /// Empty Vec for non-Compound results.
+    pub per_result_cell_idx: Vec<Vec<Option<u32>>>,
 }
 
 impl RecordInfoBlobs {
@@ -955,10 +1073,10 @@ impl RecordInfoBlobs {
     }
 }
 
-/// Lay out the per-(fn, param) record-info entries + their
-/// (name, cell-idx) tuples arena. Each `CellOp::RecordOf` in a
-/// param's plan contributes one entry (with side-table index =
-/// position in the param's contiguous range).
+/// Lay out the per-(fn, param) and per-(fn, compound-result) record-
+/// info entries + their (name, cell-idx) tuples arena. Each
+/// `CellOp::RecordOf` in a plan contributes one entry; the entry's
+/// side-table index is its position in that plan's contiguous range.
 pub(super) fn build_record_info_blob(
     per_func: &[FuncDispatch],
     strings: &RecordStringTable,
@@ -972,59 +1090,95 @@ pub(super) fn build_record_info_blob(
     let mut fields_ptr_patch_sites: Vec<u32> = Vec::new();
     let mut per_param_range: Vec<Vec<BlobSlice>> = Vec::with_capacity(per_func.len());
     let mut per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>> = Vec::with_capacity(per_func.len());
+    let mut per_result_range: Vec<BlobSlice> = Vec::with_capacity(per_func.len());
+    let mut per_result_cell_idx: Vec<Vec<Option<u32>>> = Vec::with_capacity(per_func.len());
+
+    /// Append entries for one plan's `CellOp::RecordOf` cells; returns
+    /// the contiguous range pointer + per-cell side-table index map.
+    fn append_plan(
+        plan: &LiftPlan,
+        strings: &RecordStringTable,
+        entries: &mut Vec<u8>,
+        tuples: &mut Vec<u8>,
+        fields_ptr_patch_sites: &mut Vec<u32>,
+        entry_layout: &RecordLayout,
+        tuple_layout: &RecordLayout,
+    ) -> (BlobSlice, Vec<Option<u32>>) {
+        let range_start = entries.len() as u32;
+        let mut count: u32 = 0;
+        let mut cell_idx_map: Vec<Option<u32>> = vec![None; plan.cells.len()];
+        for (cell_pos, op) in plan.cells.iter().enumerate() {
+            let CellOp::RecordOf { type_name, fields } = op else {
+                continue;
+            };
+            let s = strings
+                .get(type_name.as_str())
+                .expect("register_record_strings registered every record type");
+            let side_idx = count;
+            cell_idx_map[cell_pos] = Some(side_idx);
+            count += 1;
+
+            let tuples_off = tuples.len() as u32;
+            let tuples_len = fields.len() as u32;
+            for (i, (_, child_cell_idx)) in fields.iter().enumerate() {
+                let tuple = RecordWriter::extend_zero(tuples, tuple_layout);
+                tuple.write_slice(tuples, RECORD_FIELD_TUPLE_NAME, s.field_names[i]);
+                tuple.write_i32(tuples, RECORD_FIELD_TUPLE_IDX, *child_cell_idx as i32);
+            }
+
+            let entry = RecordWriter::extend_zero(entries, entry_layout);
+            entry.write_slice(entries, INFO_TYPE_NAME, s.type_name);
+            let fields_field_off = entry.field_offset(RECORD_INFO_FIELDS);
+            let fields_ptr_off = (fields_field_off + SLICE_PTR_OFFSET as usize) as u32;
+            let fields_len_off = (fields_field_off + SLICE_LEN_OFFSET as usize) as u32;
+            write_le_i32(entries, fields_ptr_off as usize, tuples_off as i32);
+            write_le_i32(entries, fields_len_off as usize, tuples_len as i32);
+            fields_ptr_patch_sites.push(fields_ptr_off);
+        }
+        (
+            BlobSlice {
+                off: range_start,
+                len: count,
+            },
+            cell_idx_map,
+        )
+    }
 
     for fd in per_func {
         let mut params_ranges = Vec::with_capacity(fd.params.len());
         let mut params_cell_idx = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
-            let range_start = entries.len() as u32;
-            let mut count: u32 = 0;
-            let mut cell_idx_map: Vec<Option<u32>> = vec![None; p.plan.cells.len()];
-            for (cell_pos, op) in p.plan.cells.iter().enumerate() {
-                let CellOp::RecordOf { type_name, fields } = op else {
-                    continue;
-                };
-                let s = strings
-                    .get(type_name.as_str())
-                    .expect("register_record_strings registered every record type");
-                let side_idx = count;
-                cell_idx_map[cell_pos] = Some(side_idx);
-                count += 1;
-
-                // Serialize this record's `(field-name, cell-idx)` tuples
-                // into the tuples arena. Capture the segment-relative
-                // start so the entry can point at it.
-                let tuples_off = tuples.len() as u32;
-                let tuples_len = fields.len() as u32;
-                for (i, (_, child_cell_idx)) in fields.iter().enumerate() {
-                    let tuple = RecordWriter::extend_zero(&mut tuples, tuple_layout);
-                    tuple.write_slice(&mut tuples, RECORD_FIELD_TUPLE_NAME, s.field_names[i]);
-                    tuple.write_i32(&mut tuples, RECORD_FIELD_TUPLE_IDX, *child_cell_idx as i32);
-                }
-
-                // Serialize the record-info entry. `fields.ptr` is
-                // segment-relative for now; patched in
-                // `patch_fields_ptr` after the tuples segment is placed.
-                let entry = RecordWriter::extend_zero(&mut entries, entry_layout);
-                entry.write_slice(&mut entries, INFO_TYPE_NAME, s.type_name);
-                let fields_field_off = entry.field_offset(RECORD_INFO_FIELDS);
-                let fields_ptr_off = (fields_field_off + SLICE_PTR_OFFSET as usize) as u32;
-                let fields_len_off = (fields_field_off + SLICE_LEN_OFFSET as usize) as u32;
-                write_le_i32(&mut entries, fields_ptr_off as usize, tuples_off as i32);
-                write_le_i32(&mut entries, fields_len_off as usize, tuples_len as i32);
-                fields_ptr_patch_sites.push(fields_ptr_off);
-            }
-            params_ranges.push(BlobSlice {
-                off: range_start,
-                len: count,
-            });
+            let (range, cell_idx_map) = append_plan(
+                &p.plan,
+                strings,
+                &mut entries,
+                &mut tuples,
+                &mut fields_ptr_patch_sites,
+                entry_layout,
+                tuple_layout,
+            );
+            params_ranges.push(range);
             params_cell_idx.push(cell_idx_map);
         }
         per_param_range.push(params_ranges);
         per_param_cell_idx.push(params_cell_idx);
-    }
 
-    let per_result_range = vec![BlobSlice::EMPTY; per_func.len()];
+        let (result_range, result_cell_idx_map) =
+            match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
+                Some(c) => append_plan(
+                    &c.plan,
+                    strings,
+                    &mut entries,
+                    &mut tuples,
+                    &mut fields_ptr_patch_sites,
+                    entry_layout,
+                    tuple_layout,
+                ),
+                None => (BlobSlice::EMPTY, Vec::new()),
+            };
+        per_result_range.push(result_range);
+        per_result_cell_idx.push(result_cell_idx_map);
+    }
 
     RecordInfoBlobs {
         entries,
@@ -1033,6 +1187,7 @@ pub(super) fn build_record_info_blob(
         per_param_range,
         per_param_cell_idx,
         per_result_range,
+        per_result_cell_idx,
     }
 }
 
@@ -1063,9 +1218,35 @@ pub(super) struct WrapperLocals {
     /// `task.return` flat loads. `None` for sync, void async, and
     /// async with retptr-passthrough task.return.
     pub tr_addr: Option<u32>,
+    /// Address local that drives `lift_from_memory` for the result-
+    /// side cell-tree lift on `Compound` results. Distinct from
+    /// `tr_addr`: a single function may use both (async + compound
+    /// result), and they fire at different points in the wrapper body.
+    /// `None` when the result lift isn't `Compound`.
+    pub result_lift_addr: Option<u32>,
+    /// Synthetic flat-slot locals capturing the result's canonical-ABI
+    /// flat values on `Compound` lifts. Indexed by the plan's
+    /// `LocalRef::Param(n)` (n is plan-local; absolute index is
+    /// `result_lift_locals[n]`). `local_base` for the result plan is
+    /// `result_lift_locals[0]` when non-empty. Empty for non-Compound
+    /// results.
+    pub result_lift_locals: Vec<u32>,
+}
+
+impl WrapperLocals {
+    /// `local_base` for the result-side plan: the absolute wasm-local
+    /// index that the result plan's `LocalRef::Param(0)` resolves to.
+    /// Panics if no Compound result locals were allocated.
+    pub(super) fn result_local_base(&self) -> u32 {
+        *self
+            .result_lift_locals
+            .first()
+            .expect("result_local_base requires Compound-allocated locals")
+    }
 }
 
 pub(super) fn alloc_wrapper_locals(
+    resolve: &Resolve,
     locals: &mut FunctionIndices,
     fd: &FuncDispatch,
 ) -> WrapperLocals {
@@ -1085,6 +1266,33 @@ pub(super) fn alloc_wrapper_locals(
         .task_return()
         .is_some_and(|tr| !tr.sig.indirect_params && fd.result_ty.is_some());
     let tr_addr = tr_uses_flat_loads.then(|| locals.alloc_local(ValType::I32));
+
+    // Compound result lifts need: an addr local for the bindgen-driven
+    // `lift_from_memory` loads, plus one synthetic local per
+    // canonical-ABI flat slot to capture the loaded values for the
+    // plan walker. Allocate in canonical-ABI flat-type order so the
+    // `local.set`-in-reverse capture lines up with the wasm stack.
+    let (result_lift_addr, result_lift_locals) =
+        match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
+            Some(c) => {
+                let addr_local = locals.alloc_local(ValType::I32);
+                let flat = super::super::abi::flat_types(resolve, &c.ty, None).expect(
+                    "Compound result must flatten within MAX_FLAT_PARAMS — \
+                     classify_result_lift only returns Compound for kinds that do",
+                );
+                debug_assert_eq!(
+                    flat.len(),
+                    c.plan.flat_slot_count as usize,
+                    "canonical-ABI flat count must match plan flat_slot_count"
+                );
+                let synth: Vec<u32> = flat
+                    .into_iter()
+                    .map(|wt| locals.alloc_local(wasm_type_to_val(wt)))
+                    .collect();
+                (Some(addr_local), synth)
+            }
+            None => (None, Vec::new()),
+        };
     WrapperLocals {
         addr,
         st,
@@ -1095,19 +1303,37 @@ pub(super) fn alloc_wrapper_locals(
         ext_f64,
         result,
         tr_addr,
+        result_lift_addr,
+        result_lift_locals,
     }
 }
 
-/// Emit the wasm that lifts one param into its cells slab. Walks
-/// `param.plan.cells` in allocation order and, for each cell, sets
+/// Map a wit-bindgen-core `WasmType` to a wasm-encoder `ValType`.
+/// Splicer targets wasm32, so Pointer/Length collapse to i32 and
+/// PointerOrI64 collapses to i64.
+fn wasm_type_to_val(wt: wit_parser::abi::WasmType) -> ValType {
+    use wit_parser::abi::WasmType::*;
+    match wt {
+        I32 | Pointer | Length => ValType::I32,
+        I64 | PointerOrI64 => ValType::I64,
+        F32 => ValType::F32,
+        F64 => ValType::F64,
+    }
+}
+
+/// Emit the wasm that lifts one plan into its cells slab. Walks
+/// `plan.cells` in allocation order and, for each cell, sets
 /// `lcl.addr` to that cell's absolute address (`cells_offset + i *
-/// cell_size`) and dispatches on the cell's variant.
-pub(super) fn emit_lift_param(
+/// cell_size`) and dispatches on the cell's variant. `local_base` is
+/// the absolute wasm-local index that the plan's `LocalRef::Param(0)`
+/// resolves to.
+pub(super) fn emit_lift_plan(
     f: &mut Function,
     cell_layout: &CellLayout,
     cells_offset: u32,
     plan: &LiftPlan,
     record_info_indices: &[Option<u32>],
+    local_base: u32,
     lcl: &WrapperLocals,
 ) {
     debug_assert_eq!(record_info_indices.len(), plan.cells.len());
@@ -1115,7 +1341,7 @@ pub(super) fn emit_lift_param(
         let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
         f.instructions().i32_const(cell_addr as i32);
         f.instructions().local_set(lcl.addr);
-        emit_cell_op(f, cell_layout, op, record_info_indices[cell_idx], lcl);
+        emit_cell_op(f, cell_layout, op, record_info_indices[cell_idx], local_base, lcl);
     }
 }
 
@@ -1130,39 +1356,54 @@ fn emit_cell_op(
     cell_layout: &CellLayout,
     op: &CellOp,
     record_info_idx: Option<u32>,
+    local_base: u32,
     lcl: &WrapperLocals,
 ) {
     let addr = lcl.addr;
     match op {
-        CellOp::Bool { local } => cell_layout.emit_bool(f, addr, local.resolve(lcl)),
+        CellOp::Bool { local } => cell_layout.emit_bool(f, addr, local.resolve(lcl, local_base)),
         CellOp::IntegerSignExt { local } => {
-            f.instructions().local_get(local.resolve(lcl));
+            f.instructions().local_get(local.resolve(lcl, local_base));
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
         CellOp::IntegerZeroExt { local } => {
-            f.instructions().local_get(local.resolve(lcl));
+            f.instructions().local_get(local.resolve(lcl, local_base));
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        CellOp::Integer64 { local } => cell_layout.emit_integer(f, addr, local.resolve(lcl)),
+        CellOp::Integer64 { local } => {
+            cell_layout.emit_integer(f, addr, local.resolve(lcl, local_base))
+        }
         CellOp::FloatingF32 { local } => {
-            f.instructions().local_get(local.resolve(lcl));
+            f.instructions().local_get(local.resolve(lcl, local_base));
             f.instructions().f64_promote_f32();
             f.instructions().local_set(lcl.ext_f64);
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
-        CellOp::FloatingF64 { local } => cell_layout.emit_floating(f, addr, local.resolve(lcl)),
+        CellOp::FloatingF64 { local } => {
+            cell_layout.emit_floating(f, addr, local.resolve(lcl, local_base))
+        }
         CellOp::Text { ptr, len } => {
-            cell_layout.emit_text(f, addr, ptr.resolve(lcl), len.resolve(lcl));
+            cell_layout.emit_text(
+                f,
+                addr,
+                ptr.resolve(lcl, local_base),
+                len.resolve(lcl, local_base),
+            );
         }
         CellOp::Bytes { ptr, len } => {
-            cell_layout.emit_bytes(f, addr, ptr.resolve(lcl), len.resolve(lcl));
+            cell_layout.emit_bytes(
+                f,
+                addr,
+                ptr.resolve(lcl, local_base),
+                len.resolve(lcl, local_base),
+            );
         }
         CellOp::EnumCase { local, .. } => {
-            cell_layout.emit_enum_case(f, addr, local.resolve(lcl));
+            cell_layout.emit_enum_case(f, addr, local.resolve(lcl, local_base));
         }
         CellOp::RecordOf { .. } => {
             let idx = record_info_idx
@@ -1219,14 +1460,19 @@ fn emit_lift_kind(
     }
 }
 
-/// Emit the wasm to lift one return value into the cell at `addr_local`.
-/// Direct primitive returns read from `result_local`; Text/Bytes
-/// returns load `(ptr, len)` from the retptr scratch into `ptr_scratch`
-/// / `len_scratch` and lift those.
+/// Emit the wasm to lift a single-cell result value into the cell at
+/// `lcl.addr`. Direct primitive returns read from `lcl.result`;
+/// Text/Bytes returns load `(ptr, len)` from retptr scratch into
+/// `ptr_scratch` / `len_scratch` and lift those.
+///
+/// Compound results don't go through here — their cells aren't a
+/// single one-shot write, so the wrapper-body emitter walks them via
+/// [`emit_lift_plan`] after capturing the retptr-loaded flat slots
+/// into synthetic locals.
 pub(super) fn emit_lift_result(
     f: &mut Function,
     cell_layout: &CellLayout,
-    source: ResultSource,
+    source: &ResultSource,
     lcl: &WrapperLocals,
 ) {
     match source {
@@ -1234,27 +1480,68 @@ pub(super) fn emit_lift_result(
             let local = lcl
                 .result
                 .expect("ResultSource::Direct → result local must be allocated");
-            emit_lift_kind(f, cell_layout, kind, local, local, lcl);
+            emit_lift_kind(f, cell_layout, *kind, local, local, lcl);
         }
         ResultSource::RetptrPair {
             kind,
             retptr_offset,
         } => {
-            f.instructions().i32_const(retptr_offset);
+            f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
                 offset: SLICE_PTR_OFFSET as u64,
                 align: 2,
                 memory_index: 0,
             });
             f.instructions().local_set(lcl.ptr_scratch);
-            f.instructions().i32_const(retptr_offset);
+            f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
                 offset: SLICE_LEN_OFFSET as u64,
                 align: 2,
                 memory_index: 0,
             });
             f.instructions().local_set(lcl.len_scratch);
-            emit_lift_kind(f, cell_layout, kind, lcl.ptr_scratch, lcl.len_scratch, lcl);
+            emit_lift_kind(f, cell_layout, *kind, lcl.ptr_scratch, lcl.len_scratch, lcl);
         }
+        ResultSource::Compound(_) => unreachable!(
+            "compound results are emitted directly via emit_lift_compound_result + \
+             emit_lift_plan; emit_lift_result handles only single-cell sources"
+        ),
+    }
+}
+
+/// Emit the wasm prefix for a compound result: load the result's
+/// canonical-ABI bytes from `compound.retptr_offset` via the pre-built
+/// `lift_from_memory` instruction sequence, then capture each flat
+/// value into a synthetic local in REVERSE order (the wasm stack is
+/// LIFO — the last-pushed value is the highest-indexed flat slot).
+///
+/// After this returns, the synthetic locals at `result_local_base ..
+/// result_local_base + plan.flat_slot_count` hold the result's flat
+/// values in canonical-ABI order, ready for [`emit_lift_plan`] to
+/// walk the cell plan.
+pub(super) fn emit_lift_compound_prefix(
+    f: &mut Function,
+    compound: &CompoundResult,
+    lift_from_memory_loads: &[wasm_encoder::Instruction<'static>],
+    result_lift_addr: u32,
+    result_lift_locals: &[u32],
+) {
+    debug_assert_eq!(
+        result_lift_locals.len(),
+        compound.plan.flat_slot_count as usize,
+        "synthetic-local count must match plan flat slot count"
+    );
+    // Stage retptr_offset into the addr local that the pre-built
+    // bindgen loads read from.
+    f.instructions().i32_const(compound.retptr_offset);
+    f.instructions().local_set(result_lift_addr);
+    // Push canonical-ABI flat values onto the wasm value stack.
+    for inst in lift_from_memory_loads {
+        f.instruction(inst);
+    }
+    // local.set in reverse order: top-of-stack is the LAST pushed (=
+    // highest plan-local index). Working back to slot 0.
+    for &local in result_lift_locals.iter().rev() {
+        f.instructions().local_set(local);
     }
 }

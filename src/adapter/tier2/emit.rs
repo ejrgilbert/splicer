@@ -45,8 +45,8 @@ use super::blob::{BlobSlice, RecordWriter};
 use super::cells::CellLayout;
 use super::lift::{
     alloc_wrapper_locals, build_enum_info_blob, build_record_info_blob, classify_func_params,
-    classify_result_lift, emit_lift_param, emit_lift_result, register_enum_strings,
-    register_record_strings, ParamLift, ResultLift, WrapperLocals,
+    classify_result_lift, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
+    register_enum_strings, register_record_strings, ParamLift, ResultLift, WrapperLocals,
 };
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
@@ -472,12 +472,20 @@ fn build_after_params_blob(
                 let tree_base =
                     entry.field_offset(ON_RET_RESULT) + schema.option_payload_off as usize;
                 let tree = RecordWriter::at(&schema.tree_layout, tree_base);
+                // Compound result: cells.len = plan.cell_count (slab
+                // holds the full cell tree); single-cell result
+                // (Direct / RetptrPair): len = 1.
+                let cells_len = fd
+                    .result_lift
+                    .as_ref()
+                    .and_then(|rl| rl.compound())
+                    .map_or(1, |c| c.plan.cell_count());
                 tree.write_slice(
                     &mut blob,
                     TREE_CELLS,
                     BlobSlice {
                         off: cells_off,
-                        len: 1,
+                        len: cells_len,
                     },
                 );
                 result_side_tables[fn_idx].write_to_tree(&mut blob, &tree);
@@ -522,15 +530,19 @@ fn lay_out_static_memory(
         }
     }
     // Per-fn result-cell scratch, when after-hook is wired and the
-    // function has a result to lift. Captured in a parallel Vec so
-    // we can fold it into `fd.after` alongside `params_offset` once
-    // both are known.
+    // function has a result to lift. Compound results need
+    // `plan.cell_count() * cell_size` bytes; primitive single-cell
+    // results need just one cell. Captured in a parallel Vec so we
+    // can fold it into `fd.after` alongside `params_offset` once both
+    // are known.
     let result_cells_offsets: Vec<Option<u32>> = if schema.after_hook.is_some() {
         per_func
             .iter()
             .map(|fd| {
-                fd.result_lift.is_some().then(|| {
-                    layout.reserve_scratch(schema.cell_layout.align, schema.cell_layout.size)
+                fd.result_lift.as_ref().map(|rl| {
+                    let cells = rl.compound().map_or(1, |c| c.plan.cell_count());
+                    layout
+                        .reserve_scratch(schema.cell_layout.align, cells * schema.cell_layout.size)
                 })
             })
             .collect()
@@ -591,6 +603,18 @@ fn lay_out_static_memory(
             p.record_info_cell_idx = p_indices;
         }
     }
+    // Same for compound results: stash the result plan's per-cell
+    // record-info indices on the CompoundResult so the after-hook
+    // emitter can hand them to `emit_lift_plan`.
+    for (fd, r_indices) in per_func.iter_mut().zip(record_info.per_result_cell_idx) {
+        if let Some(c) = fd
+            .result_lift
+            .as_mut()
+            .and_then(|rl| rl.compound_mut())
+        {
+            c.record_info_cell_idx = r_indices;
+        }
+    }
 
     // Fields blob (data) — pre-filled with cells.ptr pointing at
     // each param's reserved slab slot, plus per-kind side-table
@@ -613,6 +637,15 @@ fn lay_out_static_memory(
                 params_offset: 0, // back-filled below
                 result_cells_offset,
             });
+            // Mirror the slab base onto the CompoundResult so the
+            // wrapper-body emitter can read it via the result_lift
+            // accessor (parallel to `ParamLift::cells_offset`).
+            if let (Some(off), Some(c)) = (
+                result_cells_offset,
+                fd.result_lift.as_mut().and_then(|rl| rl.compound_mut()),
+            ) {
+                c.cells_offset = off;
+            }
         }
     }
     let after_blob = build_after_params_blob(per_func, schema, iface_name, &result_side_tables);
@@ -1270,7 +1303,7 @@ fn emit_wrapper_function(
     let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = FunctionIndices::new(nparams);
-    let lcl = alloc_wrapper_locals(&mut locals, fd);
+    let lcl = alloc_wrapper_locals(ctx.resolve, &mut locals, fd);
 
     // For async funcs whose `task.return` takes flat-form params,
     // pre-build the load sequence — `lift_from_memory` may allocate
@@ -1284,17 +1317,33 @@ fn emit_wrapper_function(
             bindgen.into_instructions()
         });
 
+    // Compound result lifts also pre-run the bindgen — same constraint
+    // about bindgen-allocated scratch locals having to land before the
+    // locals list is frozen. Sequence runs at after-hook emit time
+    // (Phase 3 below).
+    let result_lift_loads: Option<Vec<wasm_encoder::Instruction<'static>>> =
+        match (lcl.result_lift_addr, fd.result_lift.as_ref().and_then(|rl| rl.compound())) {
+            (Some(addr_local), Some(c)) => {
+                let mut bindgen =
+                    WasmEncoderBindgen::new(&schema.size_align, addr_local, &mut locals);
+                lift_from_memory(ctx.resolve, &mut bindgen, (), &c.ty);
+                Some(bindgen.into_instructions())
+            }
+            _ => None,
+        };
+
     let mut f = Function::new_with_locals_types(locals.into_locals());
 
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before_idx) = func_idx.before_hook_idx {
         for p in fd.params.iter() {
-            emit_lift_param(
+            emit_lift_plan(
                 &mut f,
                 &schema.cell_layout,
                 p.cells_offset,
                 &p.plan,
                 &p.record_info_cell_idx,
+                p.local_base,
                 &lcl,
             );
         }
@@ -1341,9 +1390,38 @@ fn emit_wrapper_function(
     // ── Phase 3: on-return (only if after-hook wired) ──
     if let (Some(after_idx), Some(after)) = (func_idx.after_hook_idx, fd.after.as_ref()) {
         if let (Some(rl), Some(cells_off)) = (fd.result_lift.as_ref(), after.result_cells_offset) {
-            f.instructions().i32_const(cells_off as i32);
-            f.instructions().local_set(lcl.addr);
-            emit_lift_result(&mut f, &schema.cell_layout, rl.source, &lcl);
+            match rl.compound() {
+                Some(compound) => {
+                    // Memory → flat-on-stack → synthetic locals → walk plan.
+                    let loads = result_lift_loads
+                        .as_deref()
+                        .expect("Compound result → bindgen loads pre-built");
+                    let addr_local = lcl
+                        .result_lift_addr
+                        .expect("Compound result → result_lift_addr allocated");
+                    emit_lift_compound_prefix(
+                        &mut f,
+                        compound,
+                        loads,
+                        addr_local,
+                        &lcl.result_lift_locals,
+                    );
+                    emit_lift_plan(
+                        &mut f,
+                        &schema.cell_layout,
+                        cells_off,
+                        &compound.plan,
+                        &compound.record_info_cell_idx,
+                        lcl.result_local_base(),
+                        &lcl,
+                    );
+                }
+                None => {
+                    f.instructions().i32_const(cells_off as i32);
+                    f.instructions().local_set(lcl.addr);
+                    emit_lift_result(&mut f, &schema.cell_layout, &rl.source, &lcl);
+                }
+            }
         }
         f.instructions().i32_const(after.params_offset);
         canon_async::emit_call_and_wait(&mut f, after_idx, lcl.st, lcl.ws, async_funcs);

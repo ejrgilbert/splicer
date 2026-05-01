@@ -1651,6 +1651,7 @@ const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
     });
 }
 
+use bindings::exports::splicer::tier2::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier2::before::Guest as BeforeGuest;
 use bindings::splicer::common::types::{CallId, Cell, Field, FieldTree};
 
@@ -1691,6 +1692,13 @@ fn fmt_field(f: &Field) -> String {
     format!("{}: {}", f.name, fmt_cell(&f.tree, f.tree.root))
 }
 
+fn fmt_result(result: &Option<FieldTree>) -> String {
+    match result {
+        None => "none".to_string(),
+        Some(tree) => fmt_cell(tree, tree.root),
+    }
+}
+
 impl BeforeGuest for Mdl {
     async fn on_call(call: CallId, args: Vec<Field>) {
         let rendered: Vec<String> = args.iter().map(fmt_field).collect();
@@ -1703,6 +1711,17 @@ impl BeforeGuest for Mdl {
     }
 }
 
+impl AfterGuest for Mdl {
+    async fn on_return(call: CallId, result: Option<FieldTree>) {
+        println!(
+            "mdl: tier2-on-return {}#{} result={}",
+            call.interface_name,
+            call.function_name,
+            fmt_result(&result),
+        );
+    }
+}
+
 bindings::export!(Mdl with_types_in bindings);
 "#;
 
@@ -1710,6 +1729,7 @@ const MIDDLEWARE_TIER2_WORLD_WIT: &str = r#"package my:middleware-tier2@1.0.0;
 
 world tier2-mdl {
     export splicer:tier2/before@0.1.0;
+    export splicer:tier2/after@0.1.0;
 }
 "#;
 
@@ -2160,6 +2180,22 @@ fn test_tier2_canned_primitives() {
                 "tier-2 on-call rendered the wrong cell for `{shape_name}` — \
                  expected substring `{expected_marker}`\n--- trace ---\n{captured}",
             );
+            // On-return marker — pinned for shapes whose result lift
+            // is wired (same predicate as the args side, since `foo`
+            // echoes the value back). For shapes whose result is
+            // not yet lifted, the after-hook still fires with
+            // `result=none`.
+            let expected_result_inner = predict_tier2_result_marker(shape)
+                .map(|s| format!("result={s}"))
+                .unwrap_or_else(|| "result=none".to_string());
+            let expected_return_marker = format!(
+                "mdl: tier2-on-return {TARGET_INTERFACE}#foo {expected_result_inner}"
+            );
+            assert!(
+                captured.contains(&expected_return_marker),
+                "tier-2 on-return rendered the wrong cell for `{shape_name}` — \
+                 expected substring `{expected_return_marker}`\n--- trace ---\n{captured}",
+            );
             // Sanity: the wrapped call still threads through.
             let expected_got = format!("consumer: got {}", shape.expected_debug());
             assert!(
@@ -2293,6 +2329,16 @@ fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> St
 fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
     let inner = predict_tier2_arg_inner(shape)?;
     Some(format!("x: {inner}"))
+}
+
+/// Compute the expected `result=…` substring for one shape's
+/// on-return marker. Returns `None` for shapes whose result lift
+/// isn't yet wired (compound kinds beyond record). Callers should
+/// only assert it when `predict_tier2_args_marker` (which gates the
+/// param side) and this both return `Some` — both directions must
+/// be lift-able for the test to pin both markers.
+fn predict_tier2_result_marker(shape: &Shape) -> Option<String> {
+    predict_tier2_arg_inner(shape)
 }
 
 /// Predict the substring `fmt_cell` produces for a single shape.
