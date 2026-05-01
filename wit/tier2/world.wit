@@ -7,7 +7,7 @@
 /// observe the lifted values but cannot modify them.
 ///
 /// Any non-empty subset is valid: you can export just `before`, just
-/// `after`, just `trap`, or any combination.
+/// `after`, or both.
 package splicer:tier2@0.1.0;
 
 interface before {
@@ -26,17 +26,7 @@ interface after {
     on-return: async func(call: call-id, %result: option<field-tree>);
 }
 
-interface trap {
-    use splicer:common/types@0.1.0.{call-id};
-    /// Called when the wrapped function traps (errored async subtask
-    /// terminal state). Sync downstream traps propagate without
-    /// firing this hook — see `docs/tiers/tier-2.md` for the
-    /// limitation.
-    on-trap: async func(call: call-id, reason: string);
-}
-
 world tier2-middleware {
     export before;
     export after;
-    export trap;
 }

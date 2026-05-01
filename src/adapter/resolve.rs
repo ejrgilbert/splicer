@@ -27,7 +27,7 @@ pub(crate) fn dispatch_mangling(is_async: bool) -> ManglingAndAbi {
 }
 
 /// Mangling for canon-async hook imports (tier-1 before/after/blocking,
-/// tier-2 on-call/on-return/on-trap). Always `AsyncCallback`.
+/// tier-2 on-call/on-return). Always `AsyncCallback`.
 pub(crate) fn hook_callback_mangling() -> ManglingAndAbi {
     ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback)
 }

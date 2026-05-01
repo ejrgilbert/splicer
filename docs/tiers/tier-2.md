@@ -211,11 +211,6 @@ interface after {
     use splicer:common/types@0.1.0.{call-id, field-tree};
     on-return: async func(call: call-id, result: option<field-tree>);
 }
-
-interface trap {
-    use splicer:common/types@0.1.0.{call-id};
-    on-trap: async func(call: call-id, reason: string);
-}
 ```
 
 **Receiver convention.** For resource methods (`request.body()`, etc.),
@@ -234,7 +229,6 @@ A middleware can export any non-empty subset:
 - `before` only — pre-call observation (e.g. throttler that counts inbound shapes)
 - `after` only — post-call observation (e.g. response logger)
 - `before` + `after` — full lifecycle (e.g. tracer, recorder, metrics)
-- `trap` (optional) — fires when the wrapped function traps
 
 The adapter only fires hooks the middleware actually exports, so a
 `before`-only middleware never pays the lift cost on the result.
@@ -244,16 +238,26 @@ results are unnamed, so `on-return` carries `option<field-tree>`
 directly (`none` for void functions, `some(tree)` otherwise) rather
 than wrapping in a `field` with a synthetic name.
 
-**Trap observability.** `on-trap` fires when an **async** downstream
-function traps — the component model's async subtask state machine
-exposes the trap-vs-return distinction, and the adapter inspects it
-before re-propagating. For **sync** downstream functions, traps
-propagate without firing `on-trap`: core wasm has no exception-handling
-primitive that lets the adapter intercept synchronously. If you need
-trap visibility on sync targets, file an issue; opt-in async wrapping
-(at a per-call latency cost) is plausible future work.
-
 **WIT definition:** [`wit/tier2/world.wit`](../../wit/tier2/world.wit)
+
+### Future hook: `on-trap`
+
+A trap-observability hook (`on-trap(call, reason)`) was scoped but
+intentionally not shipped. The motivating use case is real:
+instrumenting a target interface and seeing when a downstream call
+fails. The blocker is at the runtime layer rather than our codegen:
+canon-async (wasmtime 41.0.1) propagates child-task traps as wasm
+traps that unwind the parent's stack — the parent guest never gets
+a chance to observe the trap before unwinding alongside it. There's
+no `Status::Failed` or `Event::TaskFailed` for the parent's
+wait-loop to dispatch on, neither for guest-implemented nor
+host-implemented targets.
+
+Wiring `on-trap` would require either (1) canon-async growing a
+guest-visible terminal-error event the parent can poll for, or (2)
+the adapter wrapping every async call in an exception-catching
+shell — neither is in scope today. We'll add the WIT + dispatch
+when upstream lands the event semantics.
 
 **Good for:** request/response logging with payload inspection, metrics
 extraction from request fields, content-based routing decisions,

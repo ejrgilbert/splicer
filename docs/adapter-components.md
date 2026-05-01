@@ -96,30 +96,19 @@ separate sync code path.
 ### Adapter behavior when a middleware hook traps
 
 If a middleware's hook (any tier's `on-call`, `on-return`,
-`should-block`, `on-trap`, etc.) itself traps — e.g. the middleware
-panics, dereferences out-of-bounds memory, or otherwise hits an
-unrecoverable error — the adapter **propagates the trap** rather than
-swallowing it.
+`should-block`, etc.) itself traps — e.g. the middleware panics,
+dereferences out-of-bounds memory, or otherwise hits an unrecoverable
+error — the trap propagates as a wasm trap through the adapter and
+on up to the host. The adapter does nothing special; the runtime's
+backtrace points at the adapter's dispatch wrapper at the hook-call
+site, so an operator can tell from the backtrace alone that the trap
+originated in the middleware hook (not in the wrapped target
+function).
 
-Concretely: hooks run as async subtasks, so the adapter awaits the
-subtask and inspects its terminal state. If the subtask is in `errored`
-state, the adapter traps too. The runtime's backtrace points at the
-adapter's dispatch wrapper at the hook-call site, so an operator can
-tell from the backtrace alone that the trap originated in the
-middleware hook (not in the wrapped target function).
-
-The adapter does **not** attach a custom string reason to the
-re-propagated trap (core wasm has no parameterized-trap primitive), and
-it does **not** import a logging interface to write a more readable
-error before trapping. Both are deliberate: keep the adapter
-zero-imports beyond what its target requires, and rely on the runtime's
-backtrace to identify the fault site.
-
-The adapter does **not** silently swallow middleware traps and proceed
-with the downstream call. A middleware whose code is broken should fail
-loudly so the operator notices. A configurable
-`on-middleware-trap: propagate | log | swallow` policy is plausible
-future work if a concrete use case justifies it.
+A middleware whose code is broken fails loudly so the operator
+notices. A configurable `on-middleware-trap: propagate | log |
+swallow` policy is plausible future work if a concrete use case
+justifies it.
 
 ### One tier per middleware
 

@@ -1,22 +1,16 @@
 //! Tier-2 adapter generator: builds an adapter component that lifts
-//! a target function's canonical-ABI parameters into the cell-array
-//! representation and forwards them to the middleware's tier-2
-//! `on-call` hook before dispatching to the handler.
+//! a target function's canonical-ABI parameters and result into the
+//! cell-array representation and forwards them to the middleware's
+//! tier-2 `on-call` / `on-return` hooks around the handler call.
 //!
-//! Status (Phase 2-3, slice 2): on-call invocation is wired in. For
-//! each target function the wrapper builds the `call-id` strings,
-//! calls `on-call(call_id, empty-list)` via canon-lower-async,
-//! awaits via the canon-async runtime intrinsics, then forwards the
-//! original args to the handler.
+//! Sync and async target functions are both supported; the wrapper
+//! body emits `task.return` for async dispatches.
 //!
-//! `args` is currently always an empty `list<field>` — the
-//! cell-construction path that fills it lives in
-//! [`super::cells`] but isn't wired into the orchestrator yet (next
-//! slice). End-to-end, this means a tier-2 middleware's `on-call`
-//! fires with the right call identity but observes no payload data.
-//!
-//! Async target functions, `on-return`, and `on-trap` remain
-//! out-of-scope for this slice.
+//! Compound type lift (`record`, `variant`, `option`, `result`,
+//! `list<T>` for `T != u8`, `tuple`, `enum`, `flags`, `char`) is
+//! classified end-to-end through `LiftKind` but `todo!()`s at the
+//! codegen layer (`super::cells`) — the gap is visible in code at
+//! the lowest level, not hidden behind a fallback.
 //!
 //! Design conventions intentionally mirror the tier-1 emit path
 //! (`super::super::tier1::emit`).
