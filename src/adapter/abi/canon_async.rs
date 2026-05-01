@@ -97,6 +97,23 @@ pub(crate) fn import_intrinsics(
     }
 }
 
+/// Issue an already-set-up `canon lower async` call (params already
+/// on the wasm stack) and await its completion: `call hook_idx;
+/// local.set st; emit_wait_loop`. The shared tail every tier uses
+/// once params are pushed (whether direct flat params or a single
+/// indirect-params pointer).
+pub(crate) fn emit_call_and_wait(
+    f: &mut Function,
+    hook_idx: u32,
+    st: u32,
+    ws: u32,
+    art: &AsyncFuncs,
+) {
+    f.instructions().call(hook_idx);
+    f.instructions().local_set(st);
+    emit_wait_loop(f, st, ws, art);
+}
+
 /// Await a packed `canon lower async` status sitting in local `st`.
 /// The packed `i32` is `(handle << 4) | status_tag` (tag 1=Started,
 /// 2=Returned). After this helper:

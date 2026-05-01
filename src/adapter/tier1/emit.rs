@@ -1153,11 +1153,9 @@ fn emit_hook_call(
     f.instructions().i32_const(fd.iface_name_len);
     f.instructions().i32_const(fd.fn_name_offset);
     f.instructions().i32_const(fd.fn_name_len);
-    f.instructions().call(hook_idx);
     let art = async_runtime.expect("async_runtime must be set when a hook is imported");
     let (st, ws) = wait_locals.expect("wait_locals allocated alongside async_runtime");
-    f.instructions().local_set(st);
-    canon_async::emit_wait_loop(f, st, ws, art);
+    canon_async::emit_call_and_wait(f, hook_idx, st, ws, art);
 }
 
 #[cfg(test)]

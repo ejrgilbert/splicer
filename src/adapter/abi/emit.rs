@@ -8,6 +8,7 @@ use wasm_encoder::{
     Module, ValType,
 };
 use wit_parser::abi::{WasmSignature, WasmType};
+use wit_parser::{Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId};
 
 use super::super::indices::FunctionIndices;
 
@@ -167,3 +168,90 @@ pub(crate) fn emit_wrapper_return(
         f.instructions().i32_const(off);
     }
 }
+
+// ─── Schema-driven layout helpers ─────────────────────────────────
+// Tier-2 codegen builds static data segments whose shapes mirror
+// canonical-ABI lowerings of WIT records (e.g. `field`, the on-call
+// indirect-params record). Rather than hand-roll the byte offsets,
+// these helpers ask `wit-parser::SizeAlign` to compute them — so a
+// later change to `wit/common/world.wit` flows through without code
+// edits.
+
+/// Size + alignment + per-field byte offset (keyed by WIT field
+/// name) of a record-shaped canonical-ABI value, on wasm32.
+pub(crate) struct RecordLayout {
+    pub size: u32,
+    pub align: u32,
+    pub field_offsets: std::collections::HashMap<String, u32>,
+}
+
+impl RecordLayout {
+    /// Layout for an arbitrary list of named typed fields. Used for
+    /// function-param records (e.g. on-call's
+    /// `record { call: call-id, args: list<field> }`).
+    pub(crate) fn for_named_fields(
+        sizes: &SizeAlign,
+        fields: &[(String, Type)],
+    ) -> Self {
+        let types: Vec<Type> = fields.iter().map(|(_, t)| *t).collect();
+        let info = sizes.record(&types);
+        let offs = sizes.field_offsets(&types);
+        Self {
+            size: info.size.size_wasm32() as u32,
+            align: info.align.align_wasm32() as u32,
+            field_offsets: fields
+                .iter()
+                .zip(offs)
+                .map(|((name, _), (off, _))| (name.clone(), off.size_wasm32() as u32))
+                .collect(),
+        }
+    }
+
+    /// Layout for a `record { … }` typedef (e.g. `field`,
+    /// `field-tree`). Panics if `id` doesn't refer to a record.
+    pub(crate) fn for_record_typedef(
+        sizes: &SizeAlign,
+        resolve: &Resolve,
+        id: TypeId,
+    ) -> Self {
+        let typedef = &resolve.types[id];
+        let TypeDefKind::Record(r) = &typedef.kind else {
+            panic!(
+                "RecordLayout::for_record_typedef called with non-record typedef `{:?}`",
+                typedef.name
+            );
+        };
+        let fields: Vec<(String, Type)> = r
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.ty))
+            .collect();
+        Self::for_named_fields(sizes, &fields)
+    }
+
+    /// Byte offset of the named field. Panics with a descriptive
+    /// message if the field doesn't exist — i.e. the WIT was renamed
+    /// without updating codegen.
+    pub(crate) fn offset_of(&self, name: &str) -> u32 {
+        *self.field_offsets.get(name).unwrap_or_else(|| {
+            let mut keys: Vec<&str> = self.field_offsets.keys().map(|s| s.as_str()).collect();
+            keys.sort();
+            panic!("RecordLayout: no field named `{name}` (record has: {keys:?})")
+        })
+    }
+}
+
+/// Byte offset of an `option<T>`'s payload area (i.e. the byte right
+/// after the 1-byte disc, padded up to `align(T)`).
+pub(crate) fn option_payload_offset(sizes: &SizeAlign, payload_ty: &Type) -> u32 {
+    sizes
+        .payload_offset(Int::U8, [Some(payload_ty)])
+        .size_wasm32() as u32
+}
+
+/// Canonical-ABI byte offsets of `string`/`list<T>`'s flat (ptr, len)
+/// pair. Both are i32-aligned — true regardless of which `T` the
+/// list carries — so these are kept as named constants instead of
+/// being looked up via `SizeAlign`.
+pub(crate) const SLICE_PTR_OFFSET: u32 = 0;
+pub(crate) const SLICE_LEN_OFFSET: u32 = 4;

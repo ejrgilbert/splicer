@@ -36,15 +36,12 @@ use wit_parser::{
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
     direct_return_type, emit_cabi_realloc, emit_handler_call, emit_memory_and_globals,
-    emit_wrapper_return, empty_function, val_types, EXPORT_CABI_REALLOC, EXPORT_INITIALIZE,
-    EXPORT_MEMORY,
+    emit_wrapper_return, empty_function, option_payload_offset, val_types, RecordLayout,
+    EXPORT_CABI_REALLOC, EXPORT_INITIALIZE, EXPORT_MEMORY, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
 use super::super::mem_layout::StaticLayout;
 use super::super::resolve::{decode_input_resolve, find_target_interface};
-use super::cells::{
-    emit_bool_cell, emit_bytes_cell, emit_floating_cell, emit_integer_cell, emit_text_cell,
-    CELL_SIZE,
-};
+use super::cells::CellLayout;
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
 const TIER2_ADAPTER_WORLD_NAME: &str = "adapter";
@@ -53,15 +50,16 @@ const TIER2_ADAPTER_WORLD_NAME: &str = "adapter";
 pub(crate) fn build_tier2_adapter(
     target_interface: &str,
     has_before: bool,
+    has_after: bool,
     split_bytes: &[u8],
     common_wit: &str,
     tier2_wit: &str,
 ) -> Result<Vec<u8>> {
-    if !has_before {
+    if !has_before && !has_after {
         bail!(
-            "tier-2 adapter generation currently requires the middleware to export \
-             `splicer:tier2/before` — `after`-only and `trap`-only middleware are \
-             planned for a follow-up slice."
+            "tier-2 adapter generation requires the middleware to export at least \
+             one of `splicer:tier2/before` or `splicer:tier2/after` — `trap`-only \
+             middleware is planned for a follow-up slice."
         );
     }
 
@@ -78,15 +76,21 @@ pub(crate) fn build_tier2_adapter(
     let world_pkg = resolve
         .push_str(
             "splicer-adapter-tier2.wit",
-            &synthesize_adapter_world_wit(target_interface),
+            &synthesize_adapter_world_wit(target_interface, has_before, has_after),
         )
         .context("parse synthesized tier-2 adapter world WIT")?;
     let world_id = resolve
         .select_world(&[world_pkg], Some(TIER2_ADAPTER_WORLD_NAME))
         .context("select tier-2 adapter world")?;
 
-    let mut core_module =
-        build_dispatch_module(&resolve, world_id, target_iface, target_interface)?;
+    let mut core_module = build_dispatch_module(
+        &resolve,
+        world_id,
+        target_iface,
+        target_interface,
+        has_before,
+        has_after,
+    )?;
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
         .context("embed_component_metadata")?;
 
@@ -116,17 +120,29 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
 }
 
 /// Synthesize the tier-2 adapter world.
-fn synthesize_adapter_world_wit(target_interface: &str) -> String {
-    use crate::contract::{versioned_interface, TIER2_BEFORE, TIER2_VERSION};
+fn synthesize_adapter_world_wit(
+    target_interface: &str,
+    has_before: bool,
+    has_after: bool,
+) -> String {
+    use crate::contract::{versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_VERSION};
     let mut wit = format!(
         "package {TIER2_ADAPTER_WORLD_PACKAGE};\n\nworld {TIER2_ADAPTER_WORLD_NAME} {{\n"
     );
     wit.push_str(&format!("    import {target_interface};\n"));
     wit.push_str(&format!("    export {target_interface};\n"));
-    wit.push_str(&format!(
-        "    import {};\n",
-        versioned_interface(TIER2_BEFORE, TIER2_VERSION)
-    ));
+    if has_before {
+        wit.push_str(&format!(
+            "    import {};\n",
+            versioned_interface(TIER2_BEFORE, TIER2_VERSION)
+        ));
+    }
+    if has_after {
+        wit.push_str(&format!(
+            "    import {};\n",
+            versioned_interface(TIER2_AFTER, TIER2_VERSION)
+        ));
+    }
     wit.push_str("}\n");
     wit
 }
@@ -173,6 +189,29 @@ struct FuncDispatch {
     /// extra trailing arg when calling the import, then loads from it
     /// to produce its own return value.
     retptr_offset: Option<i32>,
+    /// How to lift the function's return value into a `cell` at
+    /// `result_cells_buf_offset`. `None` for void or compound returns
+    /// we don't yet lift (Phase 2-2b territory).
+    result_lift: Option<ResultLift>,
+    /// Byte offset of the 1-cell result scratch slab. `Some` iff
+    /// `result_lift` is `Some` — the wrapper writes the lifted result
+    /// here per-call before invoking on-return.
+    result_cells_buf_offset: Option<u32>,
+    /// Byte offset of the pre-built on-return indirect-params buffer.
+    /// `Some` iff the middleware exported `splicer:tier2/after` and
+    /// this function has a wired on-return hook.
+    after_params_offset: Option<i32>,
+}
+
+/// How to extract the function's return value when lifting it for
+/// on-return.
+#[derive(Clone, Copy)]
+enum ResultLift {
+    /// Direct primitive (no retptr): source is the captured
+    /// result_local — emit_code_section resolves the actual local idx.
+    Direct(LiftKind),
+    /// `(ptr, len)` pair in retptr scratch (string / `list<u8>`).
+    RetptrPair { kind: LiftKind, retptr_offset: i32 },
 }
 
 /// Per-parameter lift recipe. `first_local` is the wasm local index
@@ -243,71 +282,63 @@ impl LiftKind {
     }
 }
 
-/// Canonical-ABI byte size of one `field` record (`name: string,
-/// tree: field-tree`) on wasm32. Verified at build time against
-/// `wit-parser::SizeAlign`. Hard-coded here because `emit_data_section`
-/// pre-builds the records' bytes; if the WIT layout drifts, the
-/// assertion in [`build_dispatch_module`] fires.
-const FIELD_SIZE_BYTES: u32 = 60;
+// ─── WIT names referenced by codegen ──────────────────────────────
+//
+// Schema dependencies, named once here so a WIT rename surfaces as
+// one or two diffs in this file rather than scattered string
+// literals.
 
-/// Sub-offsets within one `field` record. Match the canonical-ABI
-/// lower of `record { name: string, tree: field-tree }` — strings
-/// and lists each lower to `(ptr: i32, len: i32)`, all i32-aligned.
-mod field_offset {
-    pub(super) const NAME_PTR: u32 = 0;
-    pub(super) const NAME_LEN: u32 = 4;
-    pub(super) const CELLS_PTR: u32 = 8;
-    pub(super) const CELLS_LEN: u32 = 12;
-    // Bytes 16..56 hold the five empty side-table list pairs and
-    // are zero-initialized; they never get patched at runtime.
-    pub(super) const ROOT: u32 = 56;
-}
+// Typedef names in `splicer:common/types`.
+const TYPEDEF_FIELD: &str = "field";
+const TYPEDEF_FIELD_TREE: &str = "field-tree";
+const TYPEDEF_CALL_ID: &str = "call-id";
+const TYPEDEF_CELL: &str = "cell";
 
-/// Alignment of one `field` record in linear memory. All fields are
-/// i32-pointer-aligned (string + lists + u32 root → 4 bytes).
-const FIELD_ALIGN_BYTES: u32 = 4;
+// Field names within those records.
+const FIELD_NAME: &str = "name";
+const FIELD_TREE: &str = "tree";
+const TREE_CELLS: &str = "cells";
+const TREE_ROOT: &str = "root";
+const CALLID_IFACE: &str = "interface-name";
+const CALLID_FN: &str = "function-name";
 
-/// Alignment for one cell. `cell::integer` / `cell::floating` use
-/// 8-byte stores at the payload offset (cell_addr + 8), so the
-/// slab base must be 8-aligned and CELL_SIZE must be a multiple of 8.
-const CELL_SLAB_ALIGN: u32 = 8;
+// Field names within the on-call / on-return func-params records.
+const ON_CALL_CALL: &str = "call";
+const ON_CALL_ARGS: &str = "args";
+const ON_RET_CALL: &str = "call";
+const ON_RET_RESULT: &str = "result";
+
+// ─── ABI-anchored constants (not WIT-schema-derivable) ────────────
 
 /// Size + alignment of the `waitable-set.wait` event record slot.
+/// This is wit-component runtime ABI, not anything from our WIT.
 const EVENT_SLOT_SIZE: u32 = 8;
 const EVENT_SLOT_ALIGN: u32 = 4;
 
-/// Alignment for the on-call indirect-params buffer. All fields are
-/// i32, so 4-byte alignment suffices.
-const HOOK_PARAMS_ALIGN: u32 = 4;
+/// Variant disc values for `option<T>` — canonical-ABI invariants.
+const OPTION_NONE: u8 = 0;
+const OPTION_SOME: u8 = 1;
 
-/// Byte size of the on-call hook's indirect-params buffer. Matches
-/// the canonical-ABI lower of `record { call-id, list<field> }`:
-/// two strings (8 B each) + a list pointer/len pair (8 B) = 24 B,
-/// 4-aligned. Reserved as a static slot in the adapter's memory
-/// layout; populated per-call by [`emit_populate_hook_params`].
-///
-/// `on-call`'s 6 flat i32s exceed canon-lower-async's
-/// MAX_FLAT_ASYNC_PARAMS = 4, so the canonical ABI lowers them into
-/// a memory record and hands canon-lower-async a single pointer.
-const HOOK_PARAMS_SIZE: u32 = 24;
+/// Sub-offsets within the on-call indirect-params buffer, derived
+/// from the canonical-ABI layouts of the on-call func-params record
+/// + nested `call-id` record. Built once per dispatch module so the
+/// hook-params populator stays schema-driven.
+struct OnCallParamOffsets {
+    iface_ptr: u32,
+    iface_len: u32,
+    fn_ptr: u32,
+    fn_len: u32,
+    args_ptr: u32,
+    args_len: u32,
+}
 
 /// Emit wasm that writes the call-id (interface + function name
 /// pointers/lengths) and the per-call `list<field>` args pointer/
-/// length into the indirect-params buffer at `base_ptr`. Field
-/// offsets match the canonical-ABI lower of the on-call params
-/// record:
-///
-/// ```text
-/// offset  0: interface-name.ptr
-/// offset  4: interface-name.len
-/// offset  8: function-name.ptr
-/// offset 12: function-name.len
-/// offset 16: args.list.ptr
-/// offset 20: args.list.len
-/// ```
+/// length into the indirect-params buffer at `base_ptr`.
 fn emit_populate_hook_params(
     f: &mut Function,
     base_ptr: i32,
+    offs: &OnCallParamOffsets,
     iface_name_offset: i32,
     iface_name_len: i32,
     fn_name_offset: i32,
@@ -324,87 +355,281 @@ fn emit_populate_hook_params(
             memory_index: 0,
         });
     };
-    store_i32(0, iface_name_offset);
-    store_i32(4, iface_name_len);
-    store_i32(8, fn_name_offset);
-    store_i32(12, fn_name_len);
-    store_i32(16, args_ptr);
-    store_i32(20, args_len);
+    store_i32(offs.iface_ptr as u64, iface_name_offset);
+    store_i32(offs.iface_len as u64, iface_name_len);
+    store_i32(offs.fn_ptr as u64, fn_name_offset);
+    store_i32(offs.fn_len as u64, fn_name_len);
+    store_i32(offs.args_ptr as u64, args_ptr);
+    store_i32(offs.args_len as u64, args_len);
 }
 
-fn build_dispatch_module(
-    resolve: &Resolve,
-    world_id: WorldId,
-    target_iface: InterfaceId,
-    target_interface_name: &str,
-) -> Result<Vec<u8>> {
-    let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
-        .functions
-        .values()
-        .collect();
+/// Schema-driven layouts + hook descriptors gathered up front so
+/// later phases see one bundle instead of a dozen locals.
+struct SchemaLayouts {
+    size_align: SizeAlign,
+    field_layout: RecordLayout,
+    tree_layout: RecordLayout,
+    cell_layout: CellLayout,
+    callid_layout: RecordLayout,
+    before_hook: Option<HookImport>,
+    after_hook: Option<HookImport>,
+    on_call_params_layout: Option<RecordLayout>,
+    on_return_params_layout: Option<RecordLayout>,
+    /// Byte offset of the `option<field-tree>` payload inside the
+    /// option variant.
+    option_payload_off: u32,
+}
 
-    // Sanity-check the FIELD_SIZE_BYTES constant against the live
-    // WIT — fires if the `field` / `field-tree` record gains a
-    // member without bumping the constant.
-    let mut size_align = SizeAlign::default();
-    size_align.fill(resolve);
-    let field_ty_id = find_field_typeid(resolve)?;
-    let computed_field_size = size_align.size(&Type::Id(field_ty_id)).size_wasm32() as u32;
-    if computed_field_size != FIELD_SIZE_BYTES {
-        bail!(
-            "FIELD_SIZE_BYTES ({FIELD_SIZE_BYTES}) is out of date; \
-             wit-parser computes {computed_field_size} bytes for `splicer:common/types`.field — \
-             update FIELD_SIZE_BYTES + field_offset::* to match"
+/// Output of the static-memory layout phase: the addresses the
+/// emit-code phase needs to reference, plus the data segments
+/// ready to feed `emit_data_section`.
+struct StaticDataPlan {
+    bump_start: u32,
+    event_ptr: i32,
+    hook_params_ptr: u32,
+    on_call_offs: Option<OnCallParamOffsets>,
+    data_segments: Vec<(u32, Vec<u8>)>,
+}
+
+/// Single-pass build of a `field` record + its embedded
+/// `field-tree` for one (function, param) pair, with cells.ptr
+/// pointing at the param's pre-allocated cell.
+fn write_field_record(
+    blob: &mut Vec<u8>,
+    schema: &SchemaLayouts,
+    cell_addr: i32,
+    name_offset: i32,
+    name_len: i32,
+) {
+    let field_start = blob.len();
+    blob.extend(std::iter::repeat(0u8).take(schema.field_layout.size as usize));
+    let name_base = field_start + schema.field_layout.offset_of(FIELD_NAME) as usize;
+    let tree_base = field_start + schema.field_layout.offset_of(FIELD_TREE) as usize;
+    let cells_base = tree_base + schema.tree_layout.offset_of(TREE_CELLS) as usize;
+    let root_base = tree_base + schema.tree_layout.offset_of(TREE_ROOT) as usize;
+    write_le_i32(blob, name_base + SLICE_PTR_OFFSET as usize, name_offset);
+    write_le_i32(blob, name_base + SLICE_LEN_OFFSET as usize, name_len);
+    write_le_i32(blob, cells_base + SLICE_PTR_OFFSET as usize, cell_addr);
+    write_le_i32(blob, cells_base + SLICE_LEN_OFFSET as usize, 1);
+    // Side-table list pairs and `root` stay zero — empty side-tables,
+    // root cell at index 0.
+    write_le_i32(blob, root_base, 0);
+}
+
+/// Build the contiguous fields blob: one `field` record per (fn, param).
+fn build_fields_blob(per_func: &[FuncDispatch], schema: &SchemaLayouts) -> Vec<u8> {
+    let mut blob: Vec<u8> = Vec::new();
+    for fd in per_func {
+        for (i, p) in fd.params.iter().enumerate() {
+            let cell_addr =
+                (fd.cells_buf_offset + i as u32 * schema.cell_layout.size) as i32;
+            write_field_record(&mut blob, schema, cell_addr, p.name_offset, p.name_len);
+        }
+    }
+    blob
+}
+
+/// Build the contiguous on-return params blob: one record per fn,
+/// with `result: option::some(field-tree)` pre-wired for funcs that
+/// have a result lift, `option::none` for the rest.
+fn build_after_params_blob(
+    per_func: &[FuncDispatch],
+    schema: &SchemaLayouts,
+    iface_name_offset: i32,
+    iface_name_len: i32,
+) -> Vec<u8> {
+    let Some(after_layout) = schema.on_return_params_layout.as_ref() else {
+        return Vec::new();
+    };
+    let call_off = after_layout.offset_of(ON_RET_CALL);
+    let result_off = after_layout.offset_of(ON_RET_RESULT);
+    let iface_off = call_off + schema.callid_layout.offset_of(CALLID_IFACE);
+    let fn_off = call_off + schema.callid_layout.offset_of(CALLID_FN);
+    // result: option<field-tree>. Disc at result_off; tree payload
+    // at result_off + option_payload_off.
+    let result_disc_off = result_off as usize;
+    let tree_base = result_off + schema.option_payload_off;
+    let tree_cells_base =
+        (tree_base + schema.tree_layout.offset_of(TREE_CELLS)) as usize;
+    let tree_root_off_in_after =
+        (tree_base + schema.tree_layout.offset_of(TREE_ROOT)) as usize;
+
+    let mut blob: Vec<u8> = Vec::new();
+    for fd in per_func {
+        let entry_start = blob.len();
+        blob.extend(std::iter::repeat(0u8).take(after_layout.size as usize));
+        write_le_i32(
+            &mut blob,
+            entry_start + iface_off as usize + SLICE_PTR_OFFSET as usize,
+            iface_name_offset,
         );
+        write_le_i32(
+            &mut blob,
+            entry_start + iface_off as usize + SLICE_LEN_OFFSET as usize,
+            iface_name_len,
+        );
+        write_le_i32(
+            &mut blob,
+            entry_start + fn_off as usize + SLICE_PTR_OFFSET as usize,
+            fd.fn_name_offset,
+        );
+        write_le_i32(
+            &mut blob,
+            entry_start + fn_off as usize + SLICE_LEN_OFFSET as usize,
+            fd.fn_name_len,
+        );
+        if let Some(cells_off) = fd.result_cells_buf_offset {
+            blob[entry_start + result_disc_off] = OPTION_SOME;
+            write_le_i32(
+                &mut blob,
+                entry_start + tree_cells_base + SLICE_PTR_OFFSET as usize,
+                cells_off as i32,
+            );
+            write_le_i32(
+                &mut blob,
+                entry_start + tree_cells_base + SLICE_LEN_OFFSET as usize,
+                1,
+            );
+            write_le_i32(&mut blob, entry_start + tree_root_off_in_after, 0);
+        } else {
+            blob[entry_start + result_disc_off] = OPTION_NONE;
+        }
+    }
+    blob
+}
+
+/// Resolve the (call.iface, call.fn, args.list) sub-offsets of the
+/// on-call indirect-params buffer from the schema. Used by the
+/// wrapper body to populate the buffer per-call.
+fn compute_on_call_offsets(schema: &SchemaLayouts) -> Option<OnCallParamOffsets> {
+    let l = schema.on_call_params_layout.as_ref()?;
+    let call_off = l.offset_of(ON_CALL_CALL);
+    let args_off = l.offset_of(ON_CALL_ARGS);
+    let iface_base = call_off + schema.callid_layout.offset_of(CALLID_IFACE);
+    let fn_base = call_off + schema.callid_layout.offset_of(CALLID_FN);
+    Some(OnCallParamOffsets {
+        iface_ptr: iface_base + SLICE_PTR_OFFSET,
+        iface_len: iface_base + SLICE_LEN_OFFSET,
+        fn_ptr: fn_base + SLICE_PTR_OFFSET,
+        fn_len: fn_base + SLICE_LEN_OFFSET,
+        args_ptr: args_off + SLICE_PTR_OFFSET,
+        args_len: args_off + SLICE_LEN_OFFSET,
+    })
+}
+
+/// Reserve scratch + place data segments for everything the wrapper
+/// body references at runtime: cells slabs, fields blob, on-return
+/// params blob, event slot, hook-params buffer, retptr scratch. Each
+/// allocation goes through `StaticLayout` so alignment is enforced.
+/// Mutates `per_func` to fill in the buffer-offset fields.
+fn lay_out_static_memory(
+    per_func: &mut [FuncDispatch],
+    funcs: &[&WitFunction],
+    schema: &SchemaLayouts,
+    name_blob: &[u8],
+    iface_name_offset: i32,
+    iface_name_len: i32,
+) -> StaticDataPlan {
+    let mut layout = StaticLayout::new();
+
+    layout.place_data(1, name_blob);
+
+    // Cells slabs first — fields records embed pointers to these.
+    for fd in per_func.iter_mut() {
+        let slab_size = fd.params.len() as u32 * schema.cell_layout.size;
+        fd.cells_buf_offset = layout.reserve_scratch(schema.cell_layout.align, slab_size);
+    }
+    if schema.after_hook.is_some() {
+        for fd in per_func.iter_mut() {
+            if fd.result_lift.is_some() {
+                fd.result_cells_buf_offset = Some(
+                    layout.reserve_scratch(schema.cell_layout.align, schema.cell_layout.size),
+                );
+            }
+        }
     }
 
-    // ── Name blob layout ─────────────────────────────────────────
-    // [interface_name][fn_name_0][param0_name][param1_name]...
-    //                 [fn_name_1][...]
-    // The interface name is shared across all funcs; each function
-    // and each of its params get their own slots. Param names feed
-    // the pre-built `field` records' `name: string` fields.
+    // Fields blob (data) — pre-filled with cells.ptr pointing at
+    // each param's reserved slab slot.
+    let fields_blob = build_fields_blob(per_func, schema);
+    let fields_base = layout.place_data(schema.field_layout.align, &fields_blob);
+    let mut cursor = fields_base;
+    for fd in per_func.iter_mut() {
+        fd.fields_buf_offset = cursor;
+        cursor += fd.params.len() as u32 * schema.field_layout.size;
+    }
 
-    let iface_name_offset: i32 = 0;
-    let iface_name_len = target_interface_name.len() as i32;
+    // On-return params blob (data), only when after-hook is wired.
+    let after_blob =
+        build_after_params_blob(per_func, schema, iface_name_offset, iface_name_len);
+    if let Some(al) = schema.on_return_params_layout.as_ref() {
+        let after_base = layout.place_data(al.align, &after_blob);
+        let mut cursor = after_base;
+        for fd in per_func.iter_mut() {
+            fd.after_params_offset = Some(cursor as i32);
+            cursor += al.size;
+        }
+    }
 
+    // Scratch slots: event record + on-call indirect-params buffer.
+    let event_ptr = layout.reserve_scratch(EVENT_SLOT_ALIGN, EVENT_SLOT_SIZE) as i32;
+    let (hook_params_ptr, on_call_offs) = match schema.on_call_params_layout.as_ref() {
+        Some(l) => (
+            layout.reserve_scratch(l.align, l.size),
+            compute_on_call_offsets(schema),
+        ),
+        None => (0, None),
+    };
+
+    // Per-fn retptr scratch — only for funcs whose canonical-ABI
+    // shape uses one. Back-fills RetptrPair so the wrapper body knows
+    // the load address.
+    for (fd, func) in per_func.iter_mut().zip(funcs.iter()) {
+        if !(fd.export_sig.retptr || fd.import_sig.retptr) {
+            continue;
+        }
+        let result_ty = func.result.as_ref().expect("retptr → func.result is_some()");
+        let size = schema.size_align.size(result_ty).size_wasm32() as u32;
+        let align = schema.size_align.align(result_ty).align_wasm32() as u32;
+        let off = layout.reserve_scratch(align, size) as i32;
+        fd.retptr_offset = Some(off);
+        if let Some(ResultLift::RetptrPair { retptr_offset, .. }) = &mut fd.result_lift {
+            *retptr_offset = off;
+        }
+    }
+
+    let bump_start = align_up(layout.end(), 8);
+    let data_segments = layout.into_segments();
+    StaticDataPlan {
+        bump_start,
+        event_ptr,
+        hook_params_ptr,
+        on_call_offs,
+        data_segments,
+    }
+}
+
+/// Build the per-target-function dispatch records: classify each
+/// param, populate the WIT-derived sigs and mangled names, classify
+/// the result for on-return lift. Buffer offsets are left as
+/// placeholders; the static-memory layout phase fills them in.
+/// Appends fn names + param names to `name_blob` as it goes.
+fn build_per_func_dispatches(
+    resolve: &Resolve,
+    target_iface: InterfaceId,
+    funcs: &[&WitFunction],
+    name_blob: &mut Vec<u8>,
+) -> Result<Vec<FuncDispatch>> {
     let target_world_key = WorldKey::Interface(target_iface);
     let sync_mangling = ManglingAndAbi::Legacy(LiftLowerAbi::Sync);
-
-    let mut name_blob: Vec<u8> = target_interface_name.as_bytes().to_vec();
     let mut per_func: Vec<FuncDispatch> = Vec::with_capacity(funcs.len());
 
-    for func in &funcs {
+    for func in funcs {
         let fn_name_offset = name_blob.len() as i32;
         let fn_name_len = func.name.len() as i32;
         name_blob.extend_from_slice(func.name.as_bytes());
 
-        // Walk params: classify each, append name to the blob, track
-        // the first wasm flat-slot index. `slot_count()` advances the
-        // cursor for multi-slot params (string, list<u8>).
-        let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
-        let mut slot_cursor: u32 = 0;
-        for param in &func.params {
-            let pname = &param.name;
-            let ptype = &param.ty;
-            let kind = LiftKind::classify(ptype, resolve).ok_or_else(|| {
-                anyhow!(
-                    "tier-2 lift codegen does not yet support param `{pname}` of `{}` \
-                     (type {ptype:?}) — only primitives + string + list<u8> are wired today",
-                    func.name
-                )
-            })?;
-            let name_offset = name_blob.len() as i32;
-            let name_len = pname.len() as i32;
-            name_blob.extend_from_slice(pname.as_bytes());
-            params_lift.push(ParamLift {
-                name_offset,
-                name_len,
-                kind,
-                first_local: slot_cursor,
-            });
-            slot_cursor += kind.slot_count();
-        }
+        let params_lift = classify_func_params(resolve, func, name_blob)?;
 
         let (import_module, import_field) = resolve.wasm_import_name(
             sync_mangling,
@@ -424,6 +649,7 @@ fn build_dispatch_module(
         let export_sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
         let import_sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
         let needs_cabi_post = export_sig.retptr;
+        let result_lift = classify_result_lift(resolve, func, &export_sig);
 
         per_func.push(FuncDispatch {
             import_module,
@@ -435,97 +661,160 @@ fn build_dispatch_module(
             fn_name_offset,
             fn_name_len,
             params: params_lift,
-            // Buffer offsets get filled in once the layout is
-            // resolved; placeholder zeros below.
             cells_buf_offset: 0,
             fields_buf_offset: 0,
             retptr_offset: None,
+            result_lift,
+            result_cells_buf_offset: None,
+            after_params_offset: None,
         });
     }
+    Ok(per_func)
+}
 
-    // ── Memory layout (built via `StaticLayout` for alignment safety) ──
-    //
-    // Sections are placed in this order; the builder pads between
-    // them according to each section's declared alignment so a
-    // future allocation can't accidentally land on a misaligned
-    // boundary. Per-fn cells slabs require 8-byte alignment because
-    // `cell::integer` and `cell::floating` use 8-byte stores at
-    // `cell_addr + 8`; misaligned cells trap inside canon-lower-async.
-    //
-    //   name_blob (data, align 1)
-    //   per-fn cells slabs (scratch, align 8) — placed BEFORE fields
-    //                                            so fields can embed
-    //                                            their addresses
-    //   fields_blob (data, align 4)
-    //   event_slot (scratch, align 4, size 8)
-    //   hook_params (scratch, align 4, size HOOK_PARAMS_SIZE)
-    //   bump_start = layout.end() padded to 8
-    let mut layout = StaticLayout::new();
-
-    layout.place_data(1, &name_blob);
-
-    // Reserve cells slabs first — fields records embed pointers to
-    // these slabs, so the layout must know their offsets before
-    // building the fields blob. Slabs are scratch (zero-init by the
-    // wasm runtime); the wrapper body overwrites them per-call.
-    for fd in per_func.iter_mut() {
-        let slab_size = fd.params.len() as u32 * CELL_SIZE;
-        fd.cells_buf_offset = layout.reserve_scratch(CELL_SLAB_ALIGN, slab_size);
+fn classify_func_params(
+    resolve: &Resolve,
+    func: &WitFunction,
+    name_blob: &mut Vec<u8>,
+) -> Result<Vec<ParamLift>> {
+    let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
+    let mut slot_cursor: u32 = 0;
+    for param in &func.params {
+        let pname = &param.name;
+        let ptype = &param.ty;
+        let kind = LiftKind::classify(ptype, resolve).ok_or_else(|| {
+            anyhow!(
+                "tier-2 lift codegen does not yet support param `{pname}` of `{}` \
+                 (type {ptype:?}) — only primitives + string + list<u8> are wired today",
+                func.name
+            )
+        })?;
+        let name_offset = name_blob.len() as i32;
+        let name_len = pname.len() as i32;
+        name_blob.extend_from_slice(pname.as_bytes());
+        params_lift.push(ParamLift {
+            name_offset,
+            name_len,
+            kind,
+            first_local: slot_cursor,
+        });
+        slot_cursor += kind.slot_count();
     }
+    Ok(params_lift)
+}
 
-    // Build the fields blob with all pointers already correct.
-    let mut fields_blob: Vec<u8> = Vec::new();
-    for fd in per_func.iter_mut() {
-        fd.fields_buf_offset = u32::MAX; // sentinel; first param sets real value.
-        for (i, p) in fd.params.iter().enumerate() {
-            let field_start = fields_blob.len();
-            fields_blob.extend(std::iter::repeat(0u8).take(FIELD_SIZE_BYTES as usize));
-            let cell_addr = (fd.cells_buf_offset + i as u32 * CELL_SIZE) as i32;
-            write_le_i32(&mut fields_blob, field_start + field_offset::NAME_PTR as usize, p.name_offset);
-            write_le_i32(&mut fields_blob, field_start + field_offset::NAME_LEN as usize, p.name_len);
-            write_le_i32(&mut fields_blob, field_start + field_offset::CELLS_PTR as usize, cell_addr);
-            write_le_i32(&mut fields_blob, field_start + field_offset::CELLS_LEN as usize, 1);
-            // Side-table lists (offsets 16..56) stay zero — empty
-            // ptr/len pairs. `root` (offset 56) stays 0 — the single
-            // primitive cell.
-            write_le_i32(&mut fields_blob, field_start + field_offset::ROOT as usize, 0);
-        }
+/// Classify the function's return value for on-return lift. Direct
+/// primitive returns capture into `result_local`; string / `list<u8>`
+/// returns ride retptr. Compound returns we don't yet lift get
+/// `None` → `option::none` at runtime.
+fn classify_result_lift(
+    resolve: &Resolve,
+    func: &WitFunction,
+    export_sig: &WasmSignature,
+) -> Option<ResultLift> {
+    let kind = LiftKind::classify(func.result.as_ref()?, resolve)?;
+    if export_sig.retptr {
+        Some(ResultLift::RetptrPair {
+            kind,
+            retptr_offset: 0, // back-filled by the layout phase.
+        })
+    } else {
+        Some(ResultLift::Direct(kind))
     }
-    let fields_base = layout.place_data(FIELD_ALIGN_BYTES, &fields_blob);
-    // Now back-fill each fn's fields_buf_offset.
-    let mut fields_cursor = fields_base;
-    for fd in per_func.iter_mut() {
-        fd.fields_buf_offset = fields_cursor;
-        fields_cursor += fd.params.len() as u32 * FIELD_SIZE_BYTES;
-    }
+}
 
-    let event_ptr = layout.reserve_scratch(EVENT_SLOT_ALIGN, EVENT_SLOT_SIZE) as i32;
-    let hook_params_ptr = layout.reserve_scratch(HOOK_PARAMS_ALIGN, HOOK_PARAMS_SIZE);
+fn compute_schema(
+    resolve: &Resolve,
+    world_id: WorldId,
+    has_before: bool,
+    has_after: bool,
+) -> Result<SchemaLayouts> {
+    let mut size_align = SizeAlign::default();
+    size_align.fill(resolve);
 
-    // Per-fn retptr scratch — only reserved for funcs whose canonical-ABI
-    // shape uses one. Sized + aligned by the result type.
-    for (fd, func) in per_func.iter_mut().zip(funcs.iter()) {
-        if !(fd.export_sig.retptr || fd.import_sig.retptr) {
-            continue;
-        }
-        let result_ty = func.result.as_ref().expect("retptr → func.result is_some()");
-        let size = size_align.size(result_ty).size_wasm32() as u32;
-        let align = size_align.align(result_ty).align_wasm32() as u32;
-        fd.retptr_offset = Some(layout.reserve_scratch(align, size) as i32);
-    }
+    let field_ty_id = find_common_typeid(resolve, TYPEDEF_FIELD)?;
+    let field_tree_ty_id = find_common_typeid(resolve, TYPEDEF_FIELD_TREE)?;
+    let cell_ty_id = find_common_typeid(resolve, TYPEDEF_CELL)?;
+    let call_id_ty = find_common_typeid(resolve, TYPEDEF_CALL_ID)?;
 
-    let bump_start = align_up(layout.end(), 8);
-    let data_segments = layout.into_segments();
+    let field_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_ty_id);
+    let tree_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_tree_ty_id);
+    let cell_layout = CellLayout::from_resolve(&size_align, resolve, cell_ty_id);
+    let callid_layout = RecordLayout::for_record_typedef(&size_align, resolve, call_id_ty);
 
-    // Find the on-call hook function (its WasmImport name + sig come
-    // from `Resolve::wasm_import_name` / `wasm_signature` with the
-    // async-callback mangling, same as tier-1's hooks).
-    let hook = find_on_call_hook(resolve, world_id)?;
+    let before_hook = has_before
+        .then(|| find_on_call_hook(resolve, world_id))
+        .transpose()?;
+    let after_hook = has_after
+        .then(|| find_on_return_hook(resolve, world_id))
+        .transpose()?;
+
+    let on_call_params_layout = before_hook
+        .as_ref()
+        .map(|h| RecordLayout::for_named_fields(&size_align, &h.params));
+    let on_return_params_layout = after_hook
+        .as_ref()
+        .map(|h| RecordLayout::for_named_fields(&size_align, &h.params));
+    let option_payload_off = option_payload_offset(&size_align, &Type::Id(field_tree_ty_id));
+
+    Ok(SchemaLayouts {
+        size_align,
+        field_layout,
+        tree_layout,
+        cell_layout,
+        callid_layout,
+        before_hook,
+        after_hook,
+        on_call_params_layout,
+        on_return_params_layout,
+        option_payload_off,
+    })
+}
+
+fn build_dispatch_module(
+    resolve: &Resolve,
+    world_id: WorldId,
+    target_iface: InterfaceId,
+    target_interface_name: &str,
+    has_before: bool,
+    has_after: bool,
+) -> Result<Vec<u8>> {
+    let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
+        .functions
+        .values()
+        .collect();
+    let schema = compute_schema(resolve, world_id, has_before, has_after)?;
+
+    let iface_name_offset: i32 = 0;
+    let iface_name_len = target_interface_name.len() as i32;
+    let mut name_blob: Vec<u8> = target_interface_name.as_bytes().to_vec();
+    let mut per_func = build_per_func_dispatches(resolve, target_iface, &funcs, &mut name_blob)?;
+
+    let plan = lay_out_static_memory(
+        &mut per_func,
+        &funcs,
+        &schema,
+        &name_blob,
+        iface_name_offset,
+        iface_name_len,
+    );
 
     let mut module = Module::new();
-    let type_idx = emit_type_section(&mut module, &per_func, &hook.sig);
-    let func_idx = emit_imports_and_funcs(&mut module, &per_func, &type_idx, &hook, event_ptr);
-    emit_memory_and_globals(&mut module, bump_start);
+    let type_idx = emit_type_section(
+        &mut module,
+        &per_func,
+        schema.before_hook.as_ref().map(|h| &h.sig),
+        schema.after_hook.as_ref().map(|h| &h.sig),
+    );
+    let func_idx = emit_imports_and_funcs(
+        &mut module,
+        &per_func,
+        &type_idx,
+        schema.before_hook.as_ref(),
+        schema.after_hook.as_ref(),
+        plan.event_ptr,
+    );
+    emit_memory_and_globals(&mut module, plan.bump_start);
     emit_export_section(
         &mut module,
         &per_func,
@@ -539,33 +828,35 @@ fn build_dispatch_module(
         &func_idx,
         iface_name_offset,
         iface_name_len,
-        hook_params_ptr as i32,
+        plan.hook_params_ptr as i32,
+        &schema.cell_layout,
+        plan.on_call_offs.as_ref(),
     );
-    emit_data_section(&mut module, &data_segments);
+    emit_data_section(&mut module, &plan.data_segments);
     Ok(module.finish())
 }
 
 /// Locate the `splicer:common/types`.field typedef in the resolved
 /// `Resolve`. Returns the typedef id ready for `SizeAlign::size`.
-fn find_field_typeid(resolve: &Resolve) -> Result<TypeId> {
-    // Iterate interfaces and match by `id_of` against
-    // `"splicer:common/types[@<version>]"`. The tier WITs and the
-    // common WIT travel together in this repo, so whichever version
-    // got loaded is the canonical one.
+/// Look up a typedef in `splicer:common/types` by name (e.g.
+/// `"field"`, `"field-tree"`, `"call-id"`). The tier WITs and the
+/// common WIT travel together in this repo, so whichever version
+/// got loaded is the canonical one — version is ignored.
+fn find_common_typeid(resolve: &Resolve, type_name: &str) -> Result<TypeId> {
     for (id, _) in resolve.interfaces.iter() {
         let qname = match resolve.id_of(id) {
             Some(s) => s,
             None => continue,
         };
-        // Match `splicer:common/types[@version]` regardless of version
-        // — the resolve just loaded common WIT, so there's only one.
         let unversioned = qname.split('@').next().unwrap_or(&qname);
         if unversioned == "splicer:common/types" {
             return resolve.interfaces[id]
                 .types
-                .get("field")
+                .get(type_name)
                 .copied()
-                .ok_or_else(|| anyhow!("`splicer:common/types` is missing typedef `field`"));
+                .ok_or_else(|| {
+                    anyhow!("`splicer:common/types` is missing typedef `{type_name}`")
+                });
         }
     }
     bail!("resolve has no `splicer:common/types` interface — was the common WIT loaded?")
@@ -586,22 +877,33 @@ struct HookImport {
     module: String,
     name: String,
     sig: WasmSignature,
+    /// `(name, type)` per WIT param. Used to derive the
+    /// indirect-params buffer's [`RecordLayout`] from the schema.
+    params: Vec<(String, Type)>,
 }
 
 fn find_on_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
     use crate::contract::{TIER2_BEFORE, TIER2_VERSION};
-    let target_iface = format!("{TIER2_BEFORE}@{TIER2_VERSION}");
+    find_tier2_hook(resolve, world_id, &format!("{TIER2_BEFORE}@{TIER2_VERSION}"))
+}
+
+fn find_on_return_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
+    use crate::contract::{TIER2_AFTER, TIER2_VERSION};
+    find_tier2_hook(resolve, world_id, &format!("{TIER2_AFTER}@{TIER2_VERSION}"))
+}
+
+fn find_tier2_hook(resolve: &Resolve, world_id: WorldId, target_iface: &str) -> Result<HookImport> {
     let world = &resolve.worlds[world_id];
     for (key, item) in &world.imports {
         if let WorldItem::Interface { id, .. } = item {
-            if resolve.id_of(*id).as_deref() != Some(&target_iface) {
+            if resolve.id_of(*id).as_deref() != Some(target_iface) {
                 continue;
             }
             let func = resolve.interfaces[*id]
                 .functions
                 .values()
                 .next()
-                .ok_or_else(|| anyhow!("splicer:tier2/before has no functions"))?;
+                .ok_or_else(|| anyhow!("`{target_iface}` has no functions"))?;
             let (module, name) = resolve.wasm_import_name(
                 ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
                 WasmImport::Func {
@@ -610,10 +912,20 @@ fn find_on_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport>
                 },
             );
             let sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
-            return Ok(HookImport { module, name, sig });
+            let params = func
+                .params
+                .iter()
+                .map(|p| (p.name.clone(), p.ty))
+                .collect();
+            return Ok(HookImport {
+                module,
+                name,
+                sig,
+                params,
+            });
         }
     }
-    bail!("synthesized adapter world is missing import of {target_iface}");
+    bail!("synthesized adapter world is missing import of `{target_iface}`")
 }
 
 // ─── Section emission ─────────────────────────────────────────────
@@ -621,7 +933,8 @@ fn find_on_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport>
 struct TypeIndices {
     handler_ty: Vec<u32>,
     wrapper_ty: Vec<u32>,
-    hook_ty: u32,
+    before_hook_ty: Option<u32>,
+    after_hook_ty: Option<u32>,
     init_ty: u32,
     cabi_post_ty: u32,
     cabi_realloc_ty: u32,
@@ -631,7 +944,8 @@ struct TypeIndices {
 fn emit_type_section(
     module: &mut Module,
     per_func: &[FuncDispatch],
-    hook_sig: &WasmSignature,
+    before_hook_sig: Option<&WasmSignature>,
+    after_hook_sig: Option<&WasmSignature>,
 ) -> TypeIndices {
     let mut types = TypeSection::new();
     let mut next_ty: u32 = 0;
@@ -666,11 +980,10 @@ fn emit_type_section(
         })
         .collect();
 
-    let hook_ty = alloc_one(
-        &mut types,
-        val_types(&hook_sig.params),
-        val_types(&hook_sig.results),
-    );
+    let before_hook_ty = before_hook_sig
+        .map(|sig| alloc_one(&mut types, val_types(&sig.params), val_types(&sig.results)));
+    let after_hook_ty = after_hook_sig
+        .map(|sig| alloc_one(&mut types, val_types(&sig.params), val_types(&sig.results)));
     let init_ty = alloc_one(&mut types, vec![], vec![]);
     let cabi_post_ty = alloc_one(&mut types, vec![ValType::I32], vec![]);
     let cabi_realloc_ty = alloc_one(
@@ -689,7 +1002,8 @@ fn emit_type_section(
     TypeIndices {
         handler_ty,
         wrapper_ty,
-        hook_ty,
+        before_hook_ty,
+        after_hook_ty,
         init_ty,
         cabi_post_ty,
         cabi_realloc_ty,
@@ -699,7 +1013,8 @@ fn emit_type_section(
 
 struct FuncIndices {
     handler_imp_base: u32,
-    hook_idx: u32,
+    before_hook_idx: Option<u32>,
+    after_hook_idx: Option<u32>,
     async_funcs: canon_async::AsyncFuncs,
     wrapper_base: u32,
     init_idx: u32,
@@ -710,7 +1025,8 @@ fn emit_imports_and_funcs(
     module: &mut Module,
     per_func: &[FuncDispatch],
     ty: &TypeIndices,
-    hook: &HookImport,
+    before_hook: Option<&HookImport>,
+    after_hook: Option<&HookImport>,
     event_ptr: i32,
 ) -> FuncIndices {
     let mut imports = ImportSection::new();
@@ -722,9 +1038,18 @@ fn emit_imports_and_funcs(
         next_imp += 1;
     }
 
-    imports.import(&hook.module, &hook.name, EntityType::Function(ty.hook_ty));
-    let hook_idx = next_imp;
-    next_imp += 1;
+    let before_hook_idx = before_hook.map(|h| {
+        imports.import(&h.module, &h.name, EntityType::Function(ty.before_hook_ty.unwrap()));
+        let idx = next_imp;
+        next_imp += 1;
+        idx
+    });
+    let after_hook_idx = after_hook.map(|h| {
+        imports.import(&h.module, &h.name, EntityType::Function(ty.after_hook_ty.unwrap()));
+        let idx = next_imp;
+        next_imp += 1;
+        idx
+    });
 
     let async_funcs = canon_async::import_intrinsics(&mut imports, &ty.async_types, event_ptr, || {
         let i = next_imp;
@@ -755,7 +1080,8 @@ fn emit_imports_and_funcs(
 
     FuncIndices {
         handler_imp_base,
-        hook_idx,
+        before_hook_idx,
+        after_hook_idx,
         async_funcs,
         wrapper_base,
         init_idx,
@@ -831,26 +1157,32 @@ fn emit_code_section(
     iface_name_offset: i32,
     iface_name_len: i32,
     hook_params_ptr: i32,
+    cell_layout: &CellLayout,
+    on_call_offs: Option<&OnCallParamOffsets>,
 ) {
     let async_funcs = &func_idx.async_funcs;
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
         // Locals beyond the wasm sig params:
-        //   $addr     i32 — scratch for the cell write address
-        //   $st       i32 — packed status from on-call
-        //   $ws       i32 — waitable-set handle for the wait loop
-        //   $ext64    i64 — widened source for IntegerSignExt/ZeroExt
-        //   $ext_f64  f64 — promoted source for FloatingF32
-        //   $result   (typed) — direct-return value, when present
+        //   $addr        i32 — scratch for the cell write address
+        //   $st          i32 — packed status from canon-async hook
+        //   $ws          i32 — waitable-set handle for the wait loop
+        //   $ptr_scratch i32 — retptr-loaded ptr for Text/Bytes lift
+        //   $len_scratch i32 — retptr-loaded len for Text/Bytes lift
+        //   $ext64       i64 — widened source for IntegerSignExt/ZeroExt
+        //   $ext_f64     f64 — promoted source for FloatingF32
+        //   $result      (typed) — direct-return value, when present
         let nparams = fd.export_sig.params.len() as u32;
         let addr = nparams;
         let st = nparams + 1;
         let ws = nparams + 2;
-        let ext64 = nparams + 3;
-        let ext_f64 = nparams + 4;
-        let result_local = direct_return_type(&fd.export_sig).map(|_| nparams + 5);
+        let ptr_scratch = nparams + 3;
+        let len_scratch = nparams + 4;
+        let ext64 = nparams + 5;
+        let ext_f64 = nparams + 6;
+        let result_local = direct_return_type(&fd.export_sig).map(|_| nparams + 7);
         let mut local_groups: Vec<(u32, ValType)> = vec![
-            (3, ValType::I32),
+            (5, ValType::I32),
             (1, ValType::I64),
             (1, ValType::F64),
         ];
@@ -859,45 +1191,39 @@ fn emit_code_section(
         }
         let mut f = Function::new(local_groups);
 
-        // Lift each param into its cells_buf slot. After this loop
-        // the static fields_blob's cells.ptr already points at the
-        // freshly-written cells; the host reads them when it lowers
-        // the on-call args list.
-        for (p_idx, p) in fd.params.iter().enumerate() {
-            let cell_addr = fd.cells_buf_offset as i32 + p_idx as i32 * CELL_SIZE as i32;
-            f.instructions().i32_const(cell_addr);
-            f.instructions().local_set(addr);
-            emit_lift_param(&mut f, p, addr, ext64, ext_f64);
+        // ── Phase 1: on-call (only if before-hook wired) ──
+        if let Some(before_idx) = func_idx.before_hook_idx {
+            for (p_idx, p) in fd.params.iter().enumerate() {
+                let cell_addr =
+                    fd.cells_buf_offset as i32 + p_idx as i32 * cell_layout.size as i32;
+                f.instructions().i32_const(cell_addr);
+                f.instructions().local_set(addr);
+                emit_lift_param(&mut f, cell_layout, p, addr, ext64, ext_f64);
+            }
+            let nargs = fd.params.len() as i32;
+            let args_ptr = if nargs == 0 {
+                0
+            } else {
+                fd.fields_buf_offset as i32
+            };
+            emit_populate_hook_params(
+                &mut f,
+                hook_params_ptr,
+                on_call_offs.expect("before-hook wired → on-call layout computed"),
+                iface_name_offset,
+                iface_name_len,
+                fd.fn_name_offset,
+                fd.fn_name_len,
+                args_ptr,
+                nargs,
+            );
+            f.instructions().i32_const(hook_params_ptr);
+            canon_async::emit_call_and_wait(&mut f, before_idx, st, ws, async_funcs);
         }
 
-        // Populate the indirect-params buffer + call on-call (the
-        // canon-lower-async signature is `(params_ptr) -> i32 packed
-        // status` because `on-call`'s 6 flat params overflow
-        // MAX_FLAT_ASYNC_PARAMS = 4).
-        let nargs = fd.params.len() as i32;
-        let args_ptr = if nargs == 0 {
-            0
-        } else {
-            fd.fields_buf_offset as i32
-        };
-        emit_populate_hook_params(
-            &mut f,
-            hook_params_ptr,
-            iface_name_offset,
-            iface_name_len,
-            fd.fn_name_offset,
-            fd.fn_name_len,
-            args_ptr,
-            nargs,
-        );
-        f.instructions().i32_const(hook_params_ptr);
-        f.instructions().call(func_idx.hook_idx);
-        f.instructions().local_set(st);
-
-        canon_async::emit_wait_loop(&mut f, st, ws, async_funcs);
-
-        // Forward to handler. Bridges callee-returns ↔ caller-allocates
-        // for compound results via the shared abi/emit helpers.
+        // ── Phase 2: forward to handler. Bridges callee-returns ↔
+        // caller-allocates for compound results via the shared
+        // abi/emit helpers.
         emit_handler_call(
             &mut f,
             nparams,
@@ -908,6 +1234,36 @@ fn emit_code_section(
         if let Some(local) = result_local {
             f.instructions().local_set(local);
         }
+
+        // ── Phase 3: on-return (only if after-hook wired) ──
+        if let Some(after_idx) = func_idx.after_hook_idx {
+            // Lift the result into result_cells_buf[0] when we have
+            // one. Void / unsupported compound returns leave the
+            // pre-built `option::none` disc in place; nothing to do.
+            if let (Some(rl), Some(cells_off)) =
+                (fd.result_lift, fd.result_cells_buf_offset)
+            {
+                f.instructions().i32_const(cells_off as i32);
+                f.instructions().local_set(addr);
+                emit_lift_result(
+                    &mut f,
+                    cell_layout,
+                    rl,
+                    addr,
+                    ext64,
+                    ext_f64,
+                    ptr_scratch,
+                    len_scratch,
+                    result_local,
+                );
+            }
+            f.instructions().i32_const(
+                fd.after_params_offset
+                    .expect("has_after → after_params_offset set"),
+            );
+            canon_async::emit_call_and_wait(&mut f, after_idx, st, ws, async_funcs);
+        }
+
         emit_wrapper_return(
             &mut f,
             result_local,
@@ -931,44 +1287,113 @@ fn emit_code_section(
 /// `ext64` / `ext_f64` are scratch widening locals (i64 / f64).
 fn emit_lift_param(
     f: &mut Function,
+    cell_layout: &CellLayout,
     p: &ParamLift,
     addr_local: u32,
     ext64: u32,
     ext_f64: u32,
 ) {
-    match p.kind {
-        LiftKind::Bool => {
-            emit_bool_cell(f, addr_local, p.first_local);
-        }
+    emit_lift_kind(
+        f,
+        cell_layout,
+        p.kind,
+        p.first_local,
+        p.first_local + 1,
+        addr_local,
+        ext64,
+        ext_f64,
+    );
+}
+
+/// Shared lift body for params and direct-return results. `slot0` /
+/// `slot1` are wasm locals carrying the source value(s); for single-
+/// slot kinds only `slot0` is used. Multi-slot kinds (Text/Bytes)
+/// expect `(ptr, len)` in (slot0, slot1).
+fn emit_lift_kind(
+    f: &mut Function,
+    cell_layout: &CellLayout,
+    kind: LiftKind,
+    slot0: u32,
+    slot1: u32,
+    addr_local: u32,
+    ext64: u32,
+    ext_f64: u32,
+) {
+    match kind {
+        LiftKind::Bool => cell_layout.emit_bool(f, addr_local, slot0),
         LiftKind::IntegerSignExt => {
-            f.instructions().local_get(p.first_local);
+            f.instructions().local_get(slot0);
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(ext64);
-            emit_integer_cell(f, addr_local, ext64);
+            cell_layout.emit_integer(f, addr_local, ext64);
         }
         LiftKind::IntegerZeroExt => {
-            f.instructions().local_get(p.first_local);
+            f.instructions().local_get(slot0);
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(ext64);
-            emit_integer_cell(f, addr_local, ext64);
+            cell_layout.emit_integer(f, addr_local, ext64);
         }
-        LiftKind::Integer64 => {
-            emit_integer_cell(f, addr_local, p.first_local);
-        }
+        LiftKind::Integer64 => cell_layout.emit_integer(f, addr_local, slot0),
         LiftKind::FloatingF32 => {
-            f.instructions().local_get(p.first_local);
+            f.instructions().local_get(slot0);
             f.instructions().f64_promote_f32();
             f.instructions().local_set(ext_f64);
-            emit_floating_cell(f, addr_local, ext_f64);
+            cell_layout.emit_floating(f, addr_local, ext_f64);
         }
-        LiftKind::FloatingF64 => {
-            emit_floating_cell(f, addr_local, p.first_local);
+        LiftKind::FloatingF64 => cell_layout.emit_floating(f, addr_local, slot0),
+        LiftKind::Text => cell_layout.emit_text(f, addr_local, slot0, slot1),
+        LiftKind::Bytes => cell_layout.emit_bytes(f, addr_local, slot0, slot1),
+    }
+}
+
+/// Emit the wasm to lift one return value into the cell at `addr_local`.
+/// Direct primitive returns read from `result_local`; Text/Bytes
+/// returns load `(ptr, len)` from the retptr scratch into `ptr_scratch`
+/// / `len_scratch` and lift those.
+fn emit_lift_result(
+    f: &mut Function,
+    cell_layout: &CellLayout,
+    result_lift: ResultLift,
+    addr_local: u32,
+    ext64: u32,
+    ext_f64: u32,
+    ptr_scratch: u32,
+    len_scratch: u32,
+    result_local: Option<u32>,
+) {
+    match result_lift {
+        ResultLift::Direct(kind) => {
+            let local = result_local.expect("ResultLift::Direct → result_local must be set");
+            emit_lift_kind(f, cell_layout, kind, local, local, addr_local, ext64, ext_f64);
         }
-        LiftKind::Text => {
-            emit_text_cell(f, addr_local, p.first_local, p.first_local + 1);
-        }
-        LiftKind::Bytes => {
-            emit_bytes_cell(f, addr_local, p.first_local, p.first_local + 1);
+        ResultLift::RetptrPair {
+            kind,
+            retptr_offset,
+        } => {
+            f.instructions().i32_const(retptr_offset);
+            f.instructions().i32_load(MemArg {
+                offset: SLICE_PTR_OFFSET as u64,
+                align: 2,
+                memory_index: 0,
+            });
+            f.instructions().local_set(ptr_scratch);
+            f.instructions().i32_const(retptr_offset);
+            f.instructions().i32_load(MemArg {
+                offset: SLICE_LEN_OFFSET as u64,
+                align: 2,
+                memory_index: 0,
+            });
+            f.instructions().local_set(len_scratch);
+            emit_lift_kind(
+                f,
+                cell_layout,
+                kind,
+                ptr_scratch,
+                len_scratch,
+                addr_local,
+                ext64,
+                ext_f64,
+            );
         }
     }
 }
@@ -1022,6 +1447,7 @@ mod tests {
 
         let bytes = build_tier2_adapter(
             "my:math/api@1.0.0",
+            true,
             true,
             &split_bytes,
             common_wit,

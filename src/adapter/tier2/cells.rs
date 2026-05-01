@@ -38,6 +38,7 @@
 //! show it matters.
 
 use wasm_encoder::{Function, MemArg};
+use wit_parser::{Resolve, SizeAlign, Type, TypeId};
 
 /// Discriminants for the `cell` variant, in declaration order from
 /// `wit/common/world.wit`. Kept as `pub(crate)` constants rather than
@@ -65,11 +66,42 @@ pub(crate) mod cell_disc {
     pub(crate) const FUTURE_HANDLE: u8 = 17;
 }
 
-/// Canonical-ABI byte size of one `cell` value. See module docs.
-pub(crate) const CELL_SIZE: u32 = 16;
+/// Schema-derived layout of the `cell` variant: total size,
+/// alignment, and the byte offset where each case's payload starts
+/// (variants put all payloads at the same offset). All emit helpers
+/// hang off this struct so the canonical-ABI numbers are read from
+/// the live WIT once and never duplicated.
+pub(crate) struct CellLayout {
+    pub size: u32,
+    pub align: u32,
+    payload_offset: u64,
+}
 
-/// Byte offset where a cell's payload starts (after disc + padding).
-const PAYLOAD_OFFSET: u64 = 8;
+impl CellLayout {
+    /// Compute the layout from `splicer:common/types.cell`. `cell_id`
+    /// must point at the variant typedef.
+    pub(crate) fn from_resolve(
+        sizes: &SizeAlign,
+        resolve: &Resolve,
+        cell_id: TypeId,
+    ) -> Self {
+        use wit_parser::TypeDefKind;
+        let typedef = &resolve.types[cell_id];
+        let TypeDefKind::Variant(v) = &typedef.kind else {
+            panic!("CellLayout::from_resolve: `cell` typedef is not a variant");
+        };
+        let size = sizes.size(&Type::Id(cell_id)).size_wasm32() as u32;
+        let align = sizes.align(&Type::Id(cell_id)).align_wasm32() as u32;
+        let payload_offset = sizes
+            .payload_offset(v.tag(), v.cases.iter().map(|c| c.ty.as_ref()))
+            .size_wasm32() as u64;
+        Self {
+            size,
+            align,
+            payload_offset,
+        }
+    }
+}
 
 // ─── Primitive cell-emit helpers ──────────────────────────────────
 //
@@ -154,91 +186,90 @@ struct PayloadPart {
     offset: u32,
 }
 
-/// Emit wasm that writes one cell at `addr_local`: a 1-byte
-/// discriminant at offset 0 followed by each `parts[i]` written into
-/// the payload area at its declared sub-offset.
-fn emit_cell(f: &mut Function, addr_local: u32, disc: u8, parts: &[PayloadPart]) {
-    // Discriminant byte at offset 0.
-    f.instructions().local_get(addr_local);
-    f.instructions().i32_const(disc as i32);
-    f.instructions().i32_store8(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    });
-    // Payload parts.
-    for part in parts {
+impl CellLayout {
+    /// Emit wasm that writes one cell at `addr_local`: a 1-byte
+    /// discriminant at offset 0 followed by each `parts[i]` written
+    /// into the payload area at its declared sub-offset.
+    fn emit_cell(&self, f: &mut Function, addr_local: u32, disc: u8, parts: &[PayloadPart]) {
+        // Discriminant byte at offset 0.
         f.instructions().local_get(addr_local);
-        f.instructions().local_get(part.local);
-        let mem = MemArg {
-            offset: PAYLOAD_OFFSET + part.offset as u64,
-            align: part.kind.natural_align(),
+        f.instructions().i32_const(disc as i32);
+        f.instructions().i32_store8(MemArg {
+            offset: 0,
+            align: 0,
             memory_index: 0,
-        };
-        match part.kind {
-            StoreKind::I8 => f.instructions().i32_store8(mem),
-            StoreKind::I32 => f.instructions().i32_store(mem),
-            StoreKind::I64 => f.instructions().i64_store(mem),
-            StoreKind::F64 => f.instructions().f64_store(mem),
-        };
+        });
+        // Payload parts.
+        for part in parts {
+            f.instructions().local_get(addr_local);
+            f.instructions().local_get(part.local);
+            let mem = MemArg {
+                offset: self.payload_offset + part.offset as u64,
+                align: part.kind.natural_align(),
+                memory_index: 0,
+            };
+            match part.kind {
+                StoreKind::I8 => f.instructions().i32_store8(mem),
+                StoreKind::I32 => f.instructions().i32_store(mem),
+                StoreKind::I64 => f.instructions().i64_store(mem),
+                StoreKind::F64 => f.instructions().f64_store(mem),
+            };
+        }
     }
-}
 
-/// Emit a single-payload primitive cell — body is identical across
-/// `bool` / `integer` / `floating`, only the disc and store width
-/// differ. Both are derived from `disc` via
-/// [`StoreKind::for_primitive_disc`]; callers go through the typed
-/// public helpers below for self-documentation at the call site.
-fn emit_single_payload_cell(
-    f: &mut Function,
-    addr_local: u32,
-    disc: u8,
-    payload_local: u32,
-) {
-    let kind = StoreKind::for_primitive_disc(disc).unwrap_or_else(|| {
-        panic!("emit_single_payload_cell: disc {disc} is not a single-payload primitive")
-    });
-    emit_cell(
-        f,
-        addr_local,
-        disc,
-        &[PayloadPart { local: payload_local, kind, offset: 0 }],
-    );
-}
+    /// Emit a single-payload primitive cell — body is identical
+    /// across `bool` / `integer` / `floating`, only the disc and
+    /// store width differ.
+    fn emit_single_payload(&self, f: &mut Function, addr_local: u32, disc: u8, payload_local: u32) {
+        let kind = StoreKind::for_primitive_disc(disc).unwrap_or_else(|| {
+            panic!("emit_single_payload: disc {disc} is not a single-payload primitive")
+        });
+        self.emit_cell(
+            f,
+            addr_local,
+            disc,
+            &[PayloadPart { local: payload_local, kind, offset: 0 }],
+        );
+    }
 
-/// Emit wasm that writes a `cell::bool(bool)`. `payload_local` is
-/// an `i32` carrying 0 (false) or 1 (true) — the canonical-ABI
-/// flat form of `bool`.
-pub(crate) fn emit_bool_cell(f: &mut Function, addr_local: u32, payload_local: u32) {
-    emit_single_payload_cell(f, addr_local, cell_disc::BOOL, payload_local);
-}
+    /// `cell::bool(bool)` — `payload_local` is the i32 flat form (0 or 1).
+    pub(crate) fn emit_bool(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
+        self.emit_single_payload(f, addr_local, cell_disc::BOOL, payload_local);
+    }
 
-/// Emit wasm that writes a `cell::integer(s64)`. `payload_local` is
-/// an `i64` already widened from any narrower integer type
-/// (s8/u8/.../u32 → `i64.extend_i32_{s,u}`; s64/u64 passes through).
-pub(crate) fn emit_integer_cell(f: &mut Function, addr_local: u32, payload_local: u32) {
-    emit_single_payload_cell(f, addr_local, cell_disc::INTEGER, payload_local);
-}
+    /// `cell::integer(s64)` — `payload_local` is i64, already widened
+    /// from any narrower integer.
+    pub(crate) fn emit_integer(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
+        self.emit_single_payload(f, addr_local, cell_disc::INTEGER, payload_local);
+    }
 
-/// Emit wasm that writes a `cell::floating(f64)`. `payload_local`
-/// is an `f64` already widened from `f32` if the source was 32-bit
-/// (`f64.promote_f32`).
-pub(crate) fn emit_floating_cell(f: &mut Function, addr_local: u32, payload_local: u32) {
-    emit_single_payload_cell(f, addr_local, cell_disc::FLOATING, payload_local);
-}
+    /// `cell::floating(f64)` — `payload_local` is f64, already
+    /// promoted from f32 if necessary.
+    pub(crate) fn emit_floating(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
+        self.emit_single_payload(f, addr_local, cell_disc::FLOATING, payload_local);
+    }
 
-/// Emit wasm that writes a `cell::text(string)`. `string` lowers as
-/// `(ptr: i32, len: i32)` — both i32 locals must already point at a
-/// valid utf-8 buffer in the same memory.
-pub(crate) fn emit_text_cell(f: &mut Function, addr_local: u32, ptr_local: u32, len_local: u32) {
-    emit_cell(f, addr_local, cell_disc::TEXT, &ptr_len_parts(ptr_local, len_local));
-}
+    /// `cell::text(string)` — `(ptr, len)` pair pointing at utf-8.
+    pub(crate) fn emit_text(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        ptr_local: u32,
+        len_local: u32,
+    ) {
+        self.emit_cell(f, addr_local, cell_disc::TEXT, &ptr_len_parts(ptr_local, len_local));
+    }
 
-/// Emit wasm that writes a `cell::bytes(list<u8>)`. Same flat shape
-/// as text: `(ptr: i32, len: i32)`. Used for the `list<u8>` fast-
-/// path when the WIT element type is `u8`.
-pub(crate) fn emit_bytes_cell(f: &mut Function, addr_local: u32, ptr_local: u32, len_local: u32) {
-    emit_cell(f, addr_local, cell_disc::BYTES, &ptr_len_parts(ptr_local, len_local));
+    /// `cell::bytes(list<u8>)` — same flat shape as text.
+    pub(crate) fn emit_bytes(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        ptr_local: u32,
+        len_local: u32,
+    ) {
+        self.emit_cell(f, addr_local, cell_disc::BYTES, &ptr_len_parts(ptr_local, len_local));
+    }
 }
 
 /// Shared `(ptr, len)` payload layout used by `text` and `bytes`
@@ -308,39 +339,56 @@ mod tests {
             .expect("emitted module should validate");
     }
 
+    /// Synthetic `CellLayout` matching today's `cell` variant
+    /// (size=16, align=8, payload_offset=8). The structural fuzz
+    /// tests don't have a `Resolve` to derive from, so they pin the
+    /// expected canonical-ABI numbers here. End-to-end "did the
+    /// right value land in memory" coverage runs against the live
+    /// schema-derived layout via `test_tier2_canned_primitives`.
+    fn synth_cell_layout() -> CellLayout {
+        CellLayout {
+            size: 16,
+            align: 8,
+            payload_offset: 8,
+        }
+    }
+
     #[test]
     fn bool_cell_emits_valid_wasm() {
         // params: (addr_local: i32, payload_local: i32)
-        build_and_validate(&[ValType::I32, ValType::I32], |f| emit_bool_cell(f, 0, 1));
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32, ValType::I32], |f| cl.emit_bool(f, 0, 1));
     }
 
     #[test]
     fn integer_cell_emits_valid_wasm() {
         // params: (addr_local: i32, payload_local: i64)
-        build_and_validate(&[ValType::I32, ValType::I64], |f| emit_integer_cell(f, 0, 1));
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32, ValType::I64], |f| cl.emit_integer(f, 0, 1));
     }
 
     #[test]
     fn floating_cell_emits_valid_wasm() {
         // params: (addr_local: i32, payload_local: f64)
-        build_and_validate(&[ValType::I32, ValType::F64], |f| {
-            emit_floating_cell(f, 0, 1)
-        });
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32, ValType::F64], |f| cl.emit_floating(f, 0, 1));
     }
 
     #[test]
     fn text_cell_emits_valid_wasm() {
         // params: (addr_local: i32, ptr_local: i32, len_local: i32)
+        let cl = synth_cell_layout();
         build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
-            emit_text_cell(f, 0, 1, 2)
+            cl.emit_text(f, 0, 1, 2)
         });
     }
 
     #[test]
     fn bytes_cell_emits_valid_wasm() {
         // params: (addr_local: i32, ptr_local: i32, len_local: i32)
+        let cl = synth_cell_layout();
         build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
-            emit_bytes_cell(f, 0, 1, 2)
+            cl.emit_bytes(f, 0, 1, 2)
         });
     }
 
@@ -365,24 +413,15 @@ mod tests {
 
         // 5 primitive kinds × 100 iterations of random alignment of
         // helper choice. Cheap (each iter builds a tiny module).
+        let cl = synth_cell_layout();
         for iter in 0..100u64 {
             let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(iter);
             match mixed % 5 {
-                0 => build_and_validate(&[ValType::I32, ValType::I32], |f| {
-                    emit_bool_cell(f, 0, 1)
-                }),
-                1 => build_and_validate(&[ValType::I32, ValType::I64], |f| {
-                    emit_integer_cell(f, 0, 1)
-                }),
-                2 => build_and_validate(&[ValType::I32, ValType::F64], |f| {
-                    emit_floating_cell(f, 0, 1)
-                }),
-                3 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
-                    emit_text_cell(f, 0, 1, 2)
-                }),
-                4 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
-                    emit_bytes_cell(f, 0, 1, 2)
-                }),
+                0 => build_and_validate(&[ValType::I32, ValType::I32], |f| cl.emit_bool(f, 0, 1)),
+                1 => build_and_validate(&[ValType::I32, ValType::I64], |f| cl.emit_integer(f, 0, 1)),
+                2 => build_and_validate(&[ValType::I32, ValType::F64], |f| cl.emit_floating(f, 0, 1)),
+                3 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| cl.emit_text(f, 0, 1, 2)),
+                4 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| cl.emit_bytes(f, 0, 1, 2)),
                 _ => unreachable!(),
             }
         }

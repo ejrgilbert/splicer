@@ -103,6 +103,7 @@ pub fn generate_tier2_adapter(
     split_path: &str,
 ) -> anyhow::Result<String> {
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
+    let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
 
     write_adapter(
         middleware_name,
@@ -114,6 +115,7 @@ pub fn generate_tier2_adapter(
             build_tier2_adapter(
                 target_interface,
                 has_before,
+                has_after,
                 split_bytes,
                 COMMON_WORLD_WIT,
                 TIER2_WORLD_WIT,

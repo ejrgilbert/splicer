@@ -2271,17 +2271,10 @@ fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
             "s64" => Some(String::from("x: integer(-42)")),
             "f32" => Some(String::from("x: floating(1.5)")),
             "f64" => Some(String::from("x: floating(2.5)")),
-            // `string` lift IS implemented (`emit_text_cell`), but the
-            // canned harness's `foo: func(x: T) -> T` puts a string
-            // in result position too — and tier-2's wrapper doesn't
-            // wire up the caller-allocates retptr conversion yet
-            // (that's the `on-return` slice). Re-enable when result-
-            // side machinery lands; the lift path itself is exercised
-            // by `dispatch_module_roundtrips_through_component_encoder`.
-            //
+            "string" => Some(String::from("x: text(\"hello\")")),
             // `char` lift requires utf-8 encoding at the wrapper
             // level; deferred to a follow-up slice.
-            "string" | "char" => None,
+            "char" => None,
             _ => None,
         },
         // Compound shapes (lists, options, records, …) need
