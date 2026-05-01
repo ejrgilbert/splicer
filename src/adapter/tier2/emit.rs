@@ -35,8 +35,9 @@ use wit_parser::{
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    empty_function, emit_cabi_realloc, emit_memory_and_globals, val_types, EXPORT_CABI_REALLOC,
-    EXPORT_INITIALIZE, EXPORT_MEMORY,
+    direct_return_type, emit_cabi_realloc, emit_handler_call, emit_memory_and_globals,
+    emit_wrapper_return, empty_function, val_types, EXPORT_CABI_REALLOC, EXPORT_INITIALIZE,
+    EXPORT_MEMORY,
 };
 use super::super::mem_layout::StaticLayout;
 use super::super::resolve::{decode_input_resolve, find_target_interface};
@@ -140,7 +141,15 @@ struct FuncDispatch {
     import_module: String,
     import_field: String,
     export_name: String,
-    sig: WasmSignature,
+    /// Wrapper export sig (`AbiVariant::GuestExport`) — the shape
+    /// `wit-component`'s validator expects for our exported wrapper.
+    export_sig: WasmSignature,
+    /// Handler import sig (`AbiVariant::GuestImport`) — the shape
+    /// `wit-component`'s validator expects for our import declaration.
+    /// May differ from `export_sig` for compound-result functions
+    /// (caller-allocates retptr on the import side vs. callee-returns
+    /// pointer on the export side).
+    import_sig: WasmSignature,
     needs_cabi_post: bool,
     /// Byte offset of the function name within the data segment.
     fn_name_offset: i32,
@@ -158,6 +167,12 @@ struct FuncDispatch {
     /// records, each [`FIELD_SIZE_BYTES`] bytes. Pointed at by the
     /// `args.list.ptr` field passed to `on-call`.
     fields_buf_offset: u32,
+    /// Byte offset of the retptr scratch buffer; `Some` iff the
+    /// import sig wants a caller-allocates retptr but the export sig
+    /// returns the pointer directly. The wrapper passes this as the
+    /// extra trailing arg when calling the import, then loads from it
+    /// to produce its own return value.
+    retptr_offset: Option<i32>,
 }
 
 /// Per-parameter lift recipe. `first_local` is the wasm local index
@@ -406,14 +421,16 @@ fn build_dispatch_module(
                 kind: WasmExportKind::Normal,
             },
         );
-        let sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
-        let needs_cabi_post = sig.retptr;
+        let export_sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
+        let import_sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
+        let needs_cabi_post = export_sig.retptr;
 
         per_func.push(FuncDispatch {
             import_module,
             import_field,
             export_name,
-            sig,
+            export_sig,
+            import_sig,
             needs_cabi_post,
             fn_name_offset,
             fn_name_len,
@@ -422,6 +439,7 @@ fn build_dispatch_module(
             // resolved; placeholder zeros below.
             cells_buf_offset: 0,
             fields_buf_offset: 0,
+            retptr_offset: None,
         });
     }
 
@@ -483,6 +501,18 @@ fn build_dispatch_module(
 
     let event_ptr = layout.reserve_scratch(EVENT_SLOT_ALIGN, EVENT_SLOT_SIZE) as i32;
     let hook_params_ptr = layout.reserve_scratch(HOOK_PARAMS_ALIGN, HOOK_PARAMS_SIZE);
+
+    // Per-fn retptr scratch — only reserved for funcs whose canonical-ABI
+    // shape uses one. Sized + aligned by the result type.
+    for (fd, func) in per_func.iter_mut().zip(funcs.iter()) {
+        if !(fd.export_sig.retptr || fd.import_sig.retptr) {
+            continue;
+        }
+        let result_ty = func.result.as_ref().expect("retptr → func.result is_some()");
+        let size = size_align.size(result_ty).size_wasm32() as u32;
+        let align = size_align.align(result_ty).align_wasm32() as u32;
+        fd.retptr_offset = Some(layout.reserve_scratch(align, size) as i32);
+    }
 
     let bump_start = align_up(layout.end(), 8);
     let data_segments = layout.into_segments();
@@ -620,8 +650,8 @@ fn emit_type_section(
         .map(|fd| {
             alloc_one(
                 &mut types,
-                val_types(&fd.sig.params),
-                val_types(&fd.sig.results),
+                val_types(&fd.import_sig.params),
+                val_types(&fd.import_sig.results),
             )
         })
         .collect();
@@ -630,8 +660,8 @@ fn emit_type_section(
         .map(|fd| {
             alloc_one(
                 &mut types,
-                val_types(&fd.sig.params),
-                val_types(&fd.sig.results),
+                val_types(&fd.export_sig.params),
+                val_types(&fd.export_sig.results),
             )
         })
         .collect();
@@ -811,17 +841,23 @@ fn emit_code_section(
         //   $ws       i32 — waitable-set handle for the wait loop
         //   $ext64    i64 — widened source for IntegerSignExt/ZeroExt
         //   $ext_f64  f64 — promoted source for FloatingF32
-        let nparams = fd.sig.params.len() as u32;
+        //   $result   (typed) — direct-return value, when present
+        let nparams = fd.export_sig.params.len() as u32;
         let addr = nparams;
         let st = nparams + 1;
         let ws = nparams + 2;
         let ext64 = nparams + 3;
         let ext_f64 = nparams + 4;
-        let mut f = Function::new([
+        let result_local = direct_return_type(&fd.export_sig).map(|_| nparams + 5);
+        let mut local_groups: Vec<(u32, ValType)> = vec![
             (3, ValType::I32),
             (1, ValType::I64),
             (1, ValType::F64),
-        ]);
+        ];
+        if let Some(t) = direct_return_type(&fd.export_sig) {
+            local_groups.push((1, t));
+        }
+        let mut f = Function::new(local_groups);
 
         // Lift each param into its cells_buf slot. After this loop
         // the static fields_blob's cells.ptr already points at the
@@ -860,11 +896,24 @@ fn emit_code_section(
 
         canon_async::emit_wait_loop(&mut f, st, ws, async_funcs);
 
-        // Pass-through to handler with original args.
-        for j in 0..nparams {
-            f.instructions().local_get(j);
+        // Forward to handler. Bridges callee-returns ↔ caller-allocates
+        // for compound results via the shared abi/emit helpers.
+        emit_handler_call(
+            &mut f,
+            nparams,
+            fd.import_sig.retptr,
+            fd.retptr_offset,
+            func_idx.handler_imp_base + i as u32,
+        );
+        if let Some(local) = result_local {
+            f.instructions().local_set(local);
         }
-        f.instructions().call(func_idx.handler_imp_base + i as u32);
+        emit_wrapper_return(
+            &mut f,
+            result_local,
+            fd.export_sig.retptr,
+            fd.retptr_offset,
+        );
         f.instructions().end();
         code.function(&f);
     }

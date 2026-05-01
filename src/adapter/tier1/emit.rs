@@ -31,8 +31,9 @@ use wit_parser::{
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
-    empty_function, emit_cabi_realloc, emit_memory_and_globals, val_types, wasm_type_to_val,
-    EXPORT_CABI_REALLOC, EXPORT_INITIALIZE, EXPORT_MEMORY,
+    direct_return_type, emit_cabi_realloc, emit_handler_call, emit_memory_and_globals,
+    emit_wrapper_return, empty_function, val_types, EXPORT_CABI_REALLOC, EXPORT_INITIALIZE,
+    EXPORT_MEMORY,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, FunctionIndices};
@@ -243,16 +244,6 @@ struct FuncDispatch {
     /// `borrow<R>` param. The runtime requires us to drop the borrow
     /// before the wrapper returns; see `emit_wrapper_body`.
     borrow_drops: Vec<(u32, TypeId)>,
-}
-impl FuncDispatch {
-    /// Single flat result for the Direct (non-retptr, non-void) case.
-    fn direct_result(&self) -> Option<ValType> {
-        if !self.export_sig.retptr && self.export_sig.results.len() == 1 {
-            Some(wasm_type_to_val(self.export_sig.results[0]))
-        } else {
-            None
-        }
-    }
 }
 
 /// Top-level `borrow<R>` params, returned as `(flat_idx, resource_id)`.
@@ -946,7 +937,7 @@ fn emit_wrapper_body(
 ) {
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = FunctionIndices::new(nparams);
-    let result_local = fd.direct_result().map(|t| locals.alloc_local(t));
+    let result_local = direct_return_type(&fd.export_sig).map(|t| locals.alloc_local(t));
     // Wait-loop scratch (subtask + waitable-set handles); shared
     // across on-call / on-return / blocking awaits.
     let wait_locals = async_runtime.map(|_| {
@@ -966,14 +957,13 @@ fn emit_wrapper_body(
         // local-restoration song-and-dance here.
         emit_blocking_phase(&mut f, fd, blk, async_runtime, wait_locals, None);
     }
-    for p in 0..nparams {
-        f.instructions().local_get(p);
-    }
-    if fd.export_sig.retptr {
-        f.instructions()
-            .i32_const(fd.retptr_offset.expect("retptr_offset set"));
-    }
-    f.instructions().call(imp_handler);
+    emit_handler_call(
+        &mut f,
+        nparams,
+        fd.export_sig.retptr,
+        fd.retptr_offset,
+        imp_handler,
+    );
     if let Some(local) = result_local {
         f.instructions().local_set(local);
     }
@@ -987,12 +977,7 @@ fn emit_wrapper_body(
         f.instructions().local_get(*flat_idx);
         f.instructions().call(drop_fn);
     }
-    if let Some(local) = result_local {
-        f.instructions().local_get(local);
-    } else if fd.export_sig.retptr {
-        f.instructions()
-            .i32_const(fd.retptr_offset.expect("retptr_offset set"));
-    }
+    emit_wrapper_return(&mut f, result_local, fd.export_sig.retptr, fd.retptr_offset);
     f.instructions().end();
     code.function(&f);
 }

@@ -7,7 +7,7 @@ use wasm_encoder::{
     CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemorySection, MemoryType,
     Module, ValType,
 };
-use wit_parser::abi::WasmType;
+use wit_parser::abi::{WasmSignature, WasmType};
 
 use super::super::indices::FunctionIndices;
 
@@ -115,5 +115,55 @@ pub(crate) fn wasm_type_to_val(wt: WasmType) -> ValType {
         WasmType::I64 | WasmType::PointerOrI64 => ValType::I64,
         WasmType::F32 => ValType::F32,
         WasmType::F64 => ValType::F64,
+    }
+}
+
+// ─── Wrapper-body passthrough helpers ─────────────────────────────
+// Bridge between callee-returns export sigs (`[] -> [I32]`) and
+// caller-allocates import sigs (`[I32] -> []`) for sync compound
+// returns. Shared across tiers.
+
+/// `ValType` of a single-value direct (non-retptr) return, or `None`
+/// for void / retptr-bound results.
+pub(crate) fn direct_return_type(export_sig: &WasmSignature) -> Option<ValType> {
+    if !export_sig.retptr && export_sig.results.len() == 1 {
+        Some(wasm_type_to_val(export_sig.results[0]))
+    } else {
+        None
+    }
+}
+
+/// Push the wrapper's `nparams` flat params (and an extra static
+/// `retptr_offset` if the import wants caller-allocates), then call.
+pub(crate) fn emit_handler_call(
+    f: &mut Function,
+    nparams: u32,
+    import_retptr: bool,
+    retptr_offset: Option<i32>,
+    handler_idx: u32,
+) {
+    for p in 0..nparams {
+        f.instructions().local_get(p);
+    }
+    if import_retptr {
+        let off = retptr_offset.expect("import_retptr → retptr_offset must be Some");
+        f.instructions().i32_const(off);
+    }
+    f.instructions().call(handler_idx);
+}
+
+/// Push either the direct-return local, or the static retptr (when
+/// the export sig is callee-returns). No-op for void.
+pub(crate) fn emit_wrapper_return(
+    f: &mut Function,
+    result_local: Option<u32>,
+    export_retptr: bool,
+    retptr_offset: Option<i32>,
+) {
+    if let Some(local) = result_local {
+        f.instructions().local_get(local);
+    } else if export_retptr {
+        let off = retptr_offset.expect("export_retptr → retptr_offset must be Some");
+        f.instructions().i32_const(off);
     }
 }
