@@ -44,8 +44,9 @@ use super::super::resolve::{
 use super::blob::{BlobSlice, RecordWriter};
 use super::cells::CellLayout;
 use super::lift::{
-    alloc_wrapper_locals, build_enum_info_blob, classify_func_params, classify_result_lift,
-    emit_lift_param, emit_lift_result, register_enum_strings, ParamLift, ResultLift, WrapperLocals,
+    alloc_wrapper_locals, build_enum_info_blob, build_record_info_blob, classify_func_params,
+    classify_result_lift, emit_lift_param, emit_lift_result, register_enum_strings,
+    register_record_strings, ParamLift, ResultLift, WrapperLocals,
 };
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
@@ -247,15 +248,26 @@ const TYPEDEF_FIELD_TREE: &str = "field-tree";
 const TYPEDEF_CALL_ID: &str = "call-id";
 const TYPEDEF_CELL: &str = "cell";
 const TYPEDEF_ENUM_INFO: &str = "enum-info";
+const TYPEDEF_RECORD_INFO: &str = "record-info";
 
 // Field names within those records.
 const FIELD_NAME: &str = "name";
 const FIELD_TREE: &str = "tree";
 const TREE_CELLS: &str = "cells";
 const TREE_ENUM_INFOS: &str = "enum-infos";
+const TREE_RECORD_INFOS: &str = "record-infos";
 const TREE_ROOT: &str = "root";
 const CALLID_IFACE: &str = "interface-name";
 const CALLID_FN: &str = "function-name";
+/// Field name on `record record-info { … }` for the (name, cell-idx)
+/// tuple list.
+pub(super) const RECORD_INFO_FIELDS: &str = "fields";
+/// Synthetic field names for the anonymous `tuple<string, u32>` that
+/// holds one record's `(field-name, child-cell-idx)` pair. Tuples
+/// are positional — these names are only used to look up offsets in
+/// the [`RecordLayout`] we synthesize via `for_named_fields`.
+pub(super) const RECORD_FIELD_TUPLE_NAME: &str = "name";
+pub(super) const RECORD_FIELD_TUPLE_IDX: &str = "idx";
 
 // Field names within the on-call / on-return func-params records.
 const ON_CALL_CALL: &str = "call";
@@ -328,6 +340,13 @@ pub(super) struct SchemaLayouts {
     pub cell_layout: CellLayout,
     pub callid_layout: RecordLayout,
     pub enum_info_layout: RecordLayout,
+    /// Layout of `record record-info { type-name, fields }` (the
+    /// per-record-cell side-table entry).
+    pub record_info_layout: RecordLayout,
+    /// Layout of one element of `record-info.fields`, an anonymous
+    /// `tuple<string, u32>`. Field names are synthetic (see
+    /// [`RECORD_FIELD_TUPLE_NAME`] / [`RECORD_FIELD_TUPLE_IDX`]).
+    pub record_field_tuple_layout: RecordLayout,
     before_hook: Option<HookImport>,
     after_hook: Option<HookImport>,
     on_call_params_layout: Option<RecordLayout>,
@@ -355,8 +374,8 @@ struct StaticDataPlan {
 #[derive(Clone, Copy, Default)]
 struct FieldSideTables {
     enum_infos: BlobSlice,
+    record_infos: BlobSlice,
     // flags_infos: BlobSlice,
-    // record_infos: BlobSlice,
     // variant_infos: BlobSlice,
     // handle_infos: BlobSlice,
 }
@@ -364,6 +383,7 @@ struct FieldSideTables {
 impl FieldSideTables {
     fn write_to_tree(&self, blob: &mut [u8], tree: &RecordWriter) {
         tree.write_slice(blob, TREE_ENUM_INFOS, self.enum_infos);
+        tree.write_slice(blob, TREE_RECORD_INFOS, self.record_infos);
         // tree.write_slice(blob, TREE_FLAGS_INFOS, self.flags_infos);
         // ...
     }
@@ -482,8 +502,10 @@ fn lay_out_static_memory(
     iface_name: BlobSlice,
 ) -> StaticDataPlan {
     // Side-table strings get appended to name_blob BEFORE we place
-    // it — the enum-info entries reference these string offsets.
+    // it — every side-table-info entry references these string
+    // offsets, so they have to land in the data segment first.
     let enum_strings = register_enum_strings(per_func, name_blob);
+    let record_strings = register_record_strings(per_func, name_blob);
 
     let mut layout = StaticLayout::new();
 
@@ -523,24 +545,52 @@ fn lay_out_static_memory(
     let enum_info_base = layout.place_data(schema.enum_info_layout.align, &enum_info.bytes);
     enum_info.translate_to(enum_info_base);
 
+    // Place the record-info side table. Two segments — the
+    // `record-info` entries blob references the `(name, cell-idx)`
+    // tuples blob, so we place tuples first, patch the entries' fields
+    // pointers, then place entries and translate per-param ranges to
+    // absolute.
+    let mut record_info = build_record_info_blob(per_func, &record_strings, schema);
+    let record_tuples_base =
+        layout.place_data(schema.record_field_tuple_layout.align, &record_info.tuples);
+    record_info.patch_fields_ptr(record_tuples_base);
+    let record_info_base = layout.place_data(schema.record_info_layout.align, &record_info.entries);
+    record_info.translate_to(record_info_base);
+
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
     // blob writers don't grow another arg per kind.
     let param_side_tables: Vec<Vec<FieldSideTables>> = enum_info
         .per_param
         .iter()
-        .map(|params| {
-            params
+        .zip(record_info.per_param_range.iter())
+        .map(|(enums, records)| {
+            enums
                 .iter()
-                .map(|&enum_infos| FieldSideTables { enum_infos })
+                .zip(records.iter())
+                .map(|(&enum_infos, &record_infos)| FieldSideTables {
+                    enum_infos,
+                    record_infos,
+                })
                 .collect()
         })
         .collect();
     let result_side_tables: Vec<FieldSideTables> = enum_info
         .per_result
         .iter()
-        .map(|&enum_infos| FieldSideTables { enum_infos })
+        .zip(record_info.per_result_range.iter())
+        .map(|(&enum_infos, &record_infos)| FieldSideTables {
+            enum_infos,
+            record_infos,
+        })
         .collect();
+    // Hand the per-(fn, param) per-cell record-info indices to each
+    // ParamLift, so the wrapper-body emitter can read them inline.
+    for (fd, fn_indices) in per_func.iter_mut().zip(record_info.per_param_cell_idx) {
+        for (p, p_indices) in fd.params.iter_mut().zip(fn_indices) {
+            p.record_info_cell_idx = p_indices;
+        }
+    }
 
     // Fields blob (data) — pre-filled with cells.ptr pointing at
     // each param's reserved slab slot, plus per-kind side-table
@@ -713,12 +763,25 @@ fn compute_schema(
     let cell_ty_id = find_common_typeid(resolve, TYPEDEF_CELL)?;
     let call_id_ty = find_common_typeid(resolve, TYPEDEF_CALL_ID)?;
     let enum_info_ty = find_common_typeid(resolve, TYPEDEF_ENUM_INFO)?;
+    let record_info_ty = find_common_typeid(resolve, TYPEDEF_RECORD_INFO)?;
 
     let field_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_ty_id);
     let tree_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_tree_ty_id);
     let cell_layout = CellLayout::from_resolve(&size_align, resolve, cell_ty_id);
     let callid_layout = RecordLayout::for_record_typedef(&size_align, resolve, call_id_ty);
     let enum_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, enum_info_ty);
+    let record_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, record_info_ty);
+    // The anonymous `tuple<string, u32>` element of `record-info.fields`
+    // — synthesize a RecordLayout for it with positional names so the
+    // record-info builder can do `offset_of(RECORD_FIELD_TUPLE_NAME)` /
+    // `offset_of(RECORD_FIELD_TUPLE_IDX)`.
+    let record_field_tuple_layout = RecordLayout::for_named_fields(
+        &size_align,
+        &[
+            (RECORD_FIELD_TUPLE_NAME.to_string(), Type::String),
+            (RECORD_FIELD_TUPLE_IDX.to_string(), Type::U32),
+        ],
+    );
 
     let before_hook = has_before
         .then(|| find_on_call_hook(resolve, world_id))
@@ -742,6 +805,8 @@ fn compute_schema(
         cell_layout,
         callid_layout,
         enum_info_layout,
+        record_info_layout,
+        record_field_tuple_layout,
         before_hook,
         after_hook,
         on_call_params_layout,
@@ -1224,17 +1289,12 @@ fn emit_wrapper_function(
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before_idx) = func_idx.before_hook_idx {
         for p in fd.params.iter() {
-            // Side-table indices for `RecordOf` cells get filled in by
-            // the layout phase; primitives + enum produce all-None
-            // indices (their side-table info is dynamic — sourced from
-            // a wasm local — not from a static index).
-            let record_info_indices: Vec<Option<u32>> = vec![None; p.plan.cells.len()];
             emit_lift_param(
                 &mut f,
                 &schema.cell_layout,
                 p.cells_offset,
                 &p.plan,
-                &record_info_indices,
+                &p.record_info_cell_idx,
                 &lcl,
             );
         }

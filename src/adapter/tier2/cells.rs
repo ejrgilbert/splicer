@@ -313,6 +313,7 @@ impl CellLayout {
     /// `cell::char` — char's utf-8 encoding. char isn't a cell variant
     /// of its own; we encode the i32 code point as utf-8 bytes (1–4 of
     /// them) and emit the result as `cell::text`.
+    #[allow(dead_code)] // Phase 2-2b stub.
     pub(crate) fn emit_char(&self, f: &mut Function, addr_local: u32, code_point_local: u32) {
         let _ = (f, addr_local, code_point_local);
         todo!(
@@ -405,6 +406,7 @@ impl CellLayout {
     }
 
     /// `cell::flags-set(u32)` — index into `field-tree.flags-infos`.
+    #[allow(dead_code)] // Phase 2-2b stub.
     pub(crate) fn emit_flags_set(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
         let _ = (f, addr_local, side_table_idx);
         todo!("Phase 2-2b: cell::flags-set — disc 12 + i32 flags-info side-table index");
@@ -436,6 +438,7 @@ impl CellLayout {
     }
 
     /// `cell::resource-handle(u32)` — index into `field-tree.handle-infos`.
+    #[allow(dead_code)] // Phase 2-4 stub.
     pub(crate) fn emit_resource_handle(
         &self,
         f: &mut Function,
@@ -447,6 +450,7 @@ impl CellLayout {
     }
 
     /// `cell::stream-handle(u32)` — index into `field-tree.handle-infos`.
+    #[allow(dead_code)] // Phase 2-4 stub.
     pub(crate) fn emit_stream_handle(
         &self,
         f: &mut Function,
@@ -458,6 +462,7 @@ impl CellLayout {
     }
 
     /// `cell::future-handle(u32)` — index into `field-tree.handle-infos`.
+    #[allow(dead_code)] // Phase 2-4 stub.
     pub(crate) fn emit_future_handle(
         &self,
         f: &mut Function,

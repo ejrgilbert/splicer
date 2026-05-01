@@ -36,9 +36,12 @@ use super::super::abi::emit::{
     direct_return_type, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
 use super::super::indices::FunctionIndices;
-use super::blob::{BlobSlice, RecordWriter};
+use super::blob::{write_le_i32, BlobSlice, RecordWriter};
 use super::cells::CellLayout;
-use super::emit::{FuncDispatch, SchemaLayouts};
+use super::emit::{
+    FuncDispatch, SchemaLayouts, RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME,
+    RECORD_INFO_FIELDS,
+};
 
 // ─── WIT names referenced by lift codegen ─────────────────────────
 //
@@ -109,53 +112,6 @@ pub(super) enum LiftKind {
 }
 
 impl LiftKind {
-    /// Number of flat wasm slots this param consumes. Hard-coded
-    /// for wired primitive kinds; `todo!()` for compound kinds
-    /// because their flat-slot count depends on the inner type's
-    /// canonical-ABI lowering — driving that off `wit-parser`'s flat
-    /// representation lands alongside the actual lift codegen.
-    pub(super) fn slot_count(self) -> u32 {
-        match self {
-            LiftKind::Bool
-            | LiftKind::IntegerSignExt
-            | LiftKind::IntegerZeroExt
-            | LiftKind::Integer64
-            | LiftKind::FloatingF32
-            | LiftKind::FloatingF64 => 1,
-            LiftKind::Text | LiftKind::Bytes => 2,
-            LiftKind::Char => todo!("Phase 2-2b: char param slot_count = 1 (i32 code point)"),
-            LiftKind::ListOf => todo!("Phase 2-2b: list<T> param slot_count = 2 (ptr, len)"),
-            LiftKind::TupleOf => {
-                todo!("Phase 2-2b: tuple param slot_count = sum of element flat-slot counts")
-            }
-            LiftKind::Option => {
-                todo!("Phase 2-2b: option<T> param slot_count = 1 (disc) + flat(T)")
-            }
-            LiftKind::Result => {
-                todo!(
-                    "Phase 2-2b: result<T,E> param slot_count = 1 (disc) + max(flat(T), flat(E)) joined"
-                )
-            }
-            LiftKind::Record => {
-                todo!("Phase 2-2b: record param slot_count = sum of field flat-slot counts")
-            }
-            LiftKind::Flags => {
-                todo!("Phase 2-2b: flags param slot_count = 1 (i32 unless > 32 flags, then more)")
-            }
-            // Enum lowers to a single i32 disc.
-            LiftKind::Enum => 1,
-            LiftKind::Variant => {
-                todo!(
-                    "Phase 2-2b: variant param slot_count = 1 (disc) + max-payload flat-slot count joined"
-                )
-            }
-            LiftKind::Handle => todo!("Phase 2-4: handle param slot_count = 1 (i32 handle index)"),
-            LiftKind::Future => todo!("Phase 2-4: future param slot_count = 1 (i32 future handle)"),
-            LiftKind::Stream => todo!("Phase 2-4: stream param slot_count = 1 (i32 stream handle)"),
-            LiftKind::ErrorContext => todo!("error-context param slot_count = 1 (i32)"),
-        }
-    }
-
     /// Classify a WIT param type. Infallible: every `Type` maps to a
     /// `LiftKind`. Codegen for un-wired variants `todo!()`s in
     /// `cells.rs` / `slot_count` when actually reached.
@@ -222,14 +178,32 @@ impl LiftKind {
 /// locals (via [`LocalRef`]), and any side-table info this cell
 /// contributes (e.g., enum-info / record-info entries).
 pub(super) enum CellOp {
-    Bool { local: LocalRef },
-    IntegerSignExt { local: LocalRef },
-    IntegerZeroExt { local: LocalRef },
-    Integer64 { local: LocalRef },
-    FloatingF32 { local: LocalRef },
-    FloatingF64 { local: LocalRef },
-    Text { ptr: LocalRef, len: LocalRef },
-    Bytes { ptr: LocalRef, len: LocalRef },
+    Bool {
+        local: LocalRef,
+    },
+    IntegerSignExt {
+        local: LocalRef,
+    },
+    IntegerZeroExt {
+        local: LocalRef,
+    },
+    Integer64 {
+        local: LocalRef,
+    },
+    FloatingF32 {
+        local: LocalRef,
+    },
+    FloatingF64 {
+        local: LocalRef,
+    },
+    Text {
+        ptr: LocalRef,
+        len: LocalRef,
+    },
+    Bytes {
+        ptr: LocalRef,
+        len: LocalRef,
+    },
     EnumCase {
         local: LocalRef,
         info: NamedListInfo,
@@ -246,7 +220,15 @@ pub(super) enum CellOp {
 /// classify time so the plan is reusable across param vs. result
 /// lifts; resolved to a concrete wasm local index via
 /// [`LocalRef::resolve`] at emit time.
+///
+/// `PtrScratch` / `LenScratch` / `Result` aren't constructed by
+/// today's plan-builder (params source from `Param(n)` only and
+/// result lifts stay on the legacy `LiftKind`+`ResultSource` path
+/// — see the result-lift block below). They land in this enum
+/// ahead of records-as-result, where retptr-memory-loaded fields
+/// will use them.
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 pub(super) enum LocalRef {
     /// nth flat-slot wasm local of the function's params.
     Param(u32),
@@ -293,6 +275,15 @@ impl LiftPlan {
     pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
         self.cells.iter().filter_map(|op| match op {
             CellOp::EnumCase { info, .. } => Some(info),
+            _ => None,
+        })
+    }
+
+    /// Iterator over every `CellOp::RecordOf` in the plan. Used by
+    /// the record-info side-table builder.
+    pub(super) fn record_ofs(&self) -> impl Iterator<Item = (&str, &[(String, u32)])> {
+        self.cells.iter().filter_map(|op| match op {
+            CellOp::RecordOf { type_name, fields } => Some((type_name.as_str(), fields.as_slice())),
             _ => None,
         })
     }
@@ -449,11 +440,14 @@ impl ResultLift {
 /// Per-parameter lift recipe. `cells_offset` is the byte offset of
 /// this param's contiguous cells slab within the static data segment;
 /// the slab holds `plan.cell_count()` cells, each `cell_layout.size`
-/// bytes. Filled in by the layout phase.
+/// bytes. `record_info_cell_idx[i]` is the side-table index for the
+/// `i`th cell when it's a `CellOp::RecordOf` (else `None`). Both are
+/// filled in by the layout phase.
 pub(super) struct ParamLift {
     pub name: BlobSlice,
     pub plan: LiftPlan,
     pub cells_offset: u32,
+    pub record_info_cell_idx: Vec<Option<u32>>,
 }
 
 /// Result-side-table info, populated when a result is lift-able.
@@ -499,10 +493,13 @@ pub(super) fn classify_func_params(
         let mut builder = LiftPlanBuilder::new(slot_cursor);
         builder.push(&param.ty, resolve);
         slot_cursor = builder.next_local;
+        let plan = builder.into_plan();
+        let record_info_cell_idx = vec![None; plan.cells.len()];
         params_lift.push(ParamLift {
             name,
-            plan: builder.into_plan(),
-            cells_offset: 0, // back-filled by lay_out_static_memory
+            plan,
+            cells_offset: 0,      // back-filled by lay_out_static_memory
+            record_info_cell_idx, // back-filled by lay_out_static_memory
         });
     }
     params_lift
@@ -753,10 +750,18 @@ pub(super) fn build_side_table_blob(
     for fd in per_func {
         let mut params = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
-            params.push(append_entries(&mut bytes, strings, spec, from_plan(&p.plan)));
+            params.push(append_entries(
+                &mut bytes,
+                strings,
+                spec,
+                from_plan(&p.plan),
+            ));
         }
         per_param.push(params);
-        let result_info = fd.result_lift.as_ref().and_then(|r| from_result(&r.side_table));
+        let result_info = fd
+            .result_lift
+            .as_ref()
+            .and_then(|r| from_result(&r.side_table));
         per_result.push(append_entries(&mut bytes, strings, spec, result_info));
     }
     SideTableBlob {
@@ -830,6 +835,205 @@ pub(super) fn build_enum_info_blob(
         |plan| plan.enum_infos().next(),
         |st| st.enum_info.as_ref(),
     )
+}
+
+// ─── Record-info side table ───────────────────────────────────────
+//
+// Different shape from enum-info: enum-info's side table has one
+// entry per case (laid out per-type, indexed by runtime disc).
+// record-info's side table has one entry per *record cell instance*
+// (laid out per-(fn, param), indexed by an adapter-build-time-known
+// constant). Each entry's `fields: list<tuple<string, u32>>` lives
+// in a separate tuples blob; the record-info entry stores a slice
+// pointer into it. Two segments to place, two layers of pointer
+// patching.
+
+/// Per-record-type strings registered in the shared `name_blob`.
+/// Field-name strings dedupe per record type — two params of the
+/// same record type reuse the strings. Cross-type collisions (e.g.
+/// `"name"` appearing in `person` and `pet`) currently get
+/// registered twice; promote to global string-dedup if it shows up
+/// in profiling.
+pub(super) struct RecordTypeStrings {
+    pub type_name: BlobSlice,
+    /// Per field, in WIT declaration order.
+    pub field_names: Vec<BlobSlice>,
+}
+
+pub(super) type RecordStringTable = HashMap<String, RecordTypeStrings>;
+
+/// Walk every plan's [`CellOp::RecordOf`]; for each record type seen,
+/// register its `type-name` + each `field-name` into `name_blob`
+/// (deduped per type-name). Result keyed by record type-name.
+pub(super) fn register_record_strings(
+    per_func: &[FuncDispatch],
+    name_blob: &mut Vec<u8>,
+) -> RecordStringTable {
+    let mut table = RecordStringTable::new();
+    for fd in per_func {
+        for p in &fd.params {
+            for (type_name, fields) in p.plan.record_ofs() {
+                if !table.contains_key(type_name) {
+                    let tn = append_string(name_blob, type_name);
+                    let fns = fields
+                        .iter()
+                        .map(|(name, _)| append_string(name_blob, name))
+                        .collect();
+                    table.insert(
+                        type_name.to_string(),
+                        RecordTypeStrings {
+                            type_name: tn,
+                            field_names: fns,
+                        },
+                    );
+                }
+            }
+        }
+        // Records-as-result not yet supported: no result-side walk.
+    }
+    table
+}
+
+/// Output of [`build_record_info_blob`]. Two contiguous data
+/// segments + per-(fn, param) pointers. Both segments use
+/// segment-relative offsets internally; absolute resolution happens
+/// in [`RecordInfoBlobs::patch_fields_ptr`] (after the tuples
+/// segment is placed) and [`RecordInfoBlobs::translate_to`] (after
+/// the entries segment is placed).
+pub(super) struct RecordInfoBlobs {
+    /// Bytes of the `record-info` entries blob (one entry per
+    /// `CellOp::RecordOf` across all plans, laid out per-(fn, param)
+    /// in plan order).
+    pub entries: Vec<u8>,
+    /// Bytes of the `(name, cell-idx)` tuples arena (referenced from
+    /// each entry's `fields: list<tuple<string, u32>>`).
+    pub tuples: Vec<u8>,
+    /// Byte offsets within `entries` of each entry's `fields.ptr`
+    /// slot, recorded so [`Self::patch_fields_ptr`] can add the
+    /// tuples-segment base when it's known.
+    fields_ptr_patch_sites: Vec<u32>,
+    /// Per (fn, param): the param's contiguous record-info range
+    /// pointer (segment-relative; absolute after `translate_to`).
+    pub per_param_range: Vec<Vec<BlobSlice>>,
+    /// Per (fn, param): for each plan cell, its assigned record-info
+    /// side-table index (None for non-`RecordOf` cells). The lift
+    /// codegen reads this when emitting `cell::record-of(idx)`.
+    pub per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>>,
+    /// Per (fn): result-side range. Empty for now (records-as-result
+    /// not supported); kept symmetric for easy folding into
+    /// `FieldSideTables`.
+    pub per_result_range: Vec<BlobSlice>,
+}
+
+impl RecordInfoBlobs {
+    /// After the tuples segment is placed at `tuples_base`, walk
+    /// every entry's `fields.ptr` slot and add the base. The slots
+    /// initially store segment-relative offsets.
+    pub(super) fn patch_fields_ptr(&mut self, tuples_base: u32) {
+        for &site in &self.fields_ptr_patch_sites {
+            let cur = i32::from_le_bytes([
+                self.entries[site as usize],
+                self.entries[site as usize + 1],
+                self.entries[site as usize + 2],
+                self.entries[site as usize + 3],
+            ]);
+            write_le_i32(&mut self.entries, site as usize, cur + tuples_base as i32);
+        }
+    }
+
+    /// Translate per-(fn, param) range pointers to absolute. Mirrors
+    /// [`SideTableBlob::translate_to`] for the simpler enum case.
+    pub(super) fn translate_to(&mut self, entries_base: u32) {
+        for params in self.per_param_range.iter_mut() {
+            for slice in params.iter_mut() {
+                slice.translate(entries_base);
+            }
+        }
+        for slice in self.per_result_range.iter_mut() {
+            slice.translate(entries_base);
+        }
+    }
+}
+
+/// Lay out the per-(fn, param) record-info entries + their
+/// (name, cell-idx) tuples arena. Each `CellOp::RecordOf` in a
+/// param's plan contributes one entry (with side-table index =
+/// position in the param's contiguous range).
+pub(super) fn build_record_info_blob(
+    per_func: &[FuncDispatch],
+    strings: &RecordStringTable,
+    schema: &SchemaLayouts,
+) -> RecordInfoBlobs {
+    let entry_layout = &schema.record_info_layout;
+    let tuple_layout = &schema.record_field_tuple_layout;
+
+    let mut entries: Vec<u8> = Vec::new();
+    let mut tuples: Vec<u8> = Vec::new();
+    let mut fields_ptr_patch_sites: Vec<u32> = Vec::new();
+    let mut per_param_range: Vec<Vec<BlobSlice>> = Vec::with_capacity(per_func.len());
+    let mut per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>> = Vec::with_capacity(per_func.len());
+
+    for fd in per_func {
+        let mut params_ranges = Vec::with_capacity(fd.params.len());
+        let mut params_cell_idx = Vec::with_capacity(fd.params.len());
+        for p in &fd.params {
+            let range_start = entries.len() as u32;
+            let mut count: u32 = 0;
+            let mut cell_idx_map: Vec<Option<u32>> = vec![None; p.plan.cells.len()];
+            for (cell_pos, op) in p.plan.cells.iter().enumerate() {
+                let CellOp::RecordOf { type_name, fields } = op else {
+                    continue;
+                };
+                let s = strings
+                    .get(type_name.as_str())
+                    .expect("register_record_strings registered every record type");
+                let side_idx = count;
+                cell_idx_map[cell_pos] = Some(side_idx);
+                count += 1;
+
+                // Serialize this record's `(field-name, cell-idx)` tuples
+                // into the tuples arena. Capture the segment-relative
+                // start so the entry can point at it.
+                let tuples_off = tuples.len() as u32;
+                let tuples_len = fields.len() as u32;
+                for (i, (_, child_cell_idx)) in fields.iter().enumerate() {
+                    let tuple = RecordWriter::extend_zero(&mut tuples, tuple_layout);
+                    tuple.write_slice(&mut tuples, RECORD_FIELD_TUPLE_NAME, s.field_names[i]);
+                    tuple.write_i32(&mut tuples, RECORD_FIELD_TUPLE_IDX, *child_cell_idx as i32);
+                }
+
+                // Serialize the record-info entry. `fields.ptr` is
+                // segment-relative for now; patched in
+                // `patch_fields_ptr` after the tuples segment is placed.
+                let entry = RecordWriter::extend_zero(&mut entries, entry_layout);
+                entry.write_slice(&mut entries, INFO_TYPE_NAME, s.type_name);
+                let fields_field_off = entry.field_offset(RECORD_INFO_FIELDS);
+                let fields_ptr_off = (fields_field_off + SLICE_PTR_OFFSET as usize) as u32;
+                let fields_len_off = (fields_field_off + SLICE_LEN_OFFSET as usize) as u32;
+                write_le_i32(&mut entries, fields_ptr_off as usize, tuples_off as i32);
+                write_le_i32(&mut entries, fields_len_off as usize, tuples_len as i32);
+                fields_ptr_patch_sites.push(fields_ptr_off);
+            }
+            params_ranges.push(BlobSlice {
+                off: range_start,
+                len: count,
+            });
+            params_cell_idx.push(cell_idx_map);
+        }
+        per_param_range.push(params_ranges);
+        per_param_cell_idx.push(params_cell_idx);
+    }
+
+    let per_result_range = vec![BlobSlice::EMPTY; per_func.len()];
+
+    RecordInfoBlobs {
+        entries,
+        tuples,
+        fields_ptr_patch_sites,
+        per_param_range,
+        per_param_cell_idx,
+        per_result_range,
+    }
 }
 
 // ─── Wrapper-body locals + lift codegen ───────────────────────────

@@ -1671,6 +1671,18 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
                 .expect("enum_infos idx in range");
             format!("enum({}::{})", info.type_name, info.case_name)
         }
+        Cell::RecordOf(side_idx) => {
+            let info = tree
+                .record_infos
+                .get(*side_idx as usize)
+                .expect("record_infos idx in range");
+            let rendered: Vec<String> = info
+                .fields
+                .iter()
+                .map(|(name, child_idx)| format!("{name}: {}", fmt_cell(tree, *child_idx)))
+                .collect();
+            format!("record({} {{ {} }})", info.type_name, rendered.join(", "))
+        }
         other => format!("other({other:?})"),
     }
 }
@@ -2279,20 +2291,30 @@ fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> St
 /// Returns `None` for shapes the lift codegen doesn't yet handle
 /// (e.g. `char`, compound shapes); callers filter those out.
 fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
+    let inner = predict_tier2_arg_inner(shape)?;
+    Some(format!("x: {inner}"))
+}
+
+/// Predict the substring `fmt_cell` produces for a single shape.
+/// Works recursively so record-field shapes (and, eventually, list
+/// elements / option payloads / variant cases) reuse the same
+/// per-shape mapping. Each primitive's value is derived from the
+/// shape's `expected_debug` so per-instance literal differences
+/// (e.g., a top-level `u32 = 42` vs. a record-field `u32 = 3`)
+/// don't fork the predictor.
+fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
     match shape {
-        Shape::Primitive { name, .. } => match *name {
-            "bool" => Some(String::from("x: bool(true)")),
-            "u8" => Some(String::from("x: integer(7)")),
-            "s8" => Some(String::from("x: integer(-7)")),
-            "u16" => Some(String::from("x: integer(500)")),
-            "s16" => Some(String::from("x: integer(-500)")),
-            "u32" => Some(String::from("x: integer(42)")),
-            "s32" => Some(String::from("x: integer(-42)")),
-            "u64" => Some(String::from("x: integer(9000)")),
-            "s64" => Some(String::from("x: integer(-42)")),
-            "f32" => Some(String::from("x: floating(1.5)")),
-            "f64" => Some(String::from("x: floating(2.5)")),
-            "string" => Some(String::from("x: text(\"hello\")")),
+        Shape::Primitive {
+            name,
+            expected_debug,
+            ..
+        } => match *name {
+            "bool" => Some(format!("bool({expected_debug})")),
+            "u8" | "s8" | "u16" | "s16" | "u32" | "s32" | "u64" | "s64" => {
+                Some(format!("integer({expected_debug})"))
+            }
+            "f32" | "f64" => Some(format!("floating({expected_debug})")),
+            "string" => Some(format!("text({expected_debug})")),
             // `char` lift requires utf-8 encoding at the wrapper
             // level; deferred to a follow-up slice.
             "char" => None,
@@ -2305,11 +2327,22 @@ fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
             ..
         } => {
             let case = cases.get(*selected).map(|(c, _)| *c)?;
-            Some(format!("x: enum({wit_name}::{case})"))
+            Some(format!("enum({wit_name}::{case})"))
         }
-        // Other compound shapes (lists, options, records, variants,
-        // tuples, results, flags) light up here as their lift
-        // codegen lands.
+        Shape::Record {
+            wit_name, fields, ..
+        } => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(fname, fshape)| {
+                    let inner = predict_tier2_arg_inner(fshape)?;
+                    Some(format!("{fname}: {inner}"))
+                })
+                .collect::<Option<_>>()?;
+            Some(format!("record({wit_name} {{ {} }})", parts.join(", ")))
+        }
+        // Other compound shapes (lists, options, variants, tuples,
+        // results, flags) light up here as their lift codegen lands.
         _ => None,
     }
 }
