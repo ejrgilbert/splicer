@@ -4,8 +4,8 @@
 //! to provide regardless of which tier of adapter it backs.
 
 use wasm_encoder::{
-    CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemorySection, MemoryType,
-    Module, ValType,
+    CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemorySection, MemoryType, Module,
+    ValType,
 };
 use wit_parser::abi::{WasmSignature, WasmType};
 use wit_parser::{Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId};
@@ -189,10 +189,7 @@ impl RecordLayout {
     /// Layout for an arbitrary list of named typed fields. Used for
     /// function-param records (e.g. on-call's
     /// `record { call: call-id, args: list<field> }`).
-    pub(crate) fn for_named_fields(
-        sizes: &SizeAlign,
-        fields: &[(String, Type)],
-    ) -> Self {
+    pub(crate) fn for_named_fields(sizes: &SizeAlign, fields: &[(String, Type)]) -> Self {
         let types: Vec<Type> = fields.iter().map(|(_, t)| *t).collect();
         let info = sizes.record(&types);
         let offs = sizes.field_offsets(&types);
@@ -209,11 +206,7 @@ impl RecordLayout {
 
     /// Layout for a `record { … }` typedef (e.g. `field`,
     /// `field-tree`). Panics if `id` doesn't refer to a record.
-    pub(crate) fn for_record_typedef(
-        sizes: &SizeAlign,
-        resolve: &Resolve,
-        id: TypeId,
-    ) -> Self {
+    pub(crate) fn for_record_typedef(sizes: &SizeAlign, resolve: &Resolve, id: TypeId) -> Self {
         let typedef = &resolve.types[id];
         let TypeDefKind::Record(r) = &typedef.kind else {
             panic!(
@@ -221,11 +214,7 @@ impl RecordLayout {
                 typedef.name
             );
         };
-        let fields: Vec<(String, Type)> = r
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), f.ty))
-            .collect();
+        let fields: Vec<(String, Type)> = r.fields.iter().map(|f| (f.name.clone(), f.ty)).collect();
         Self::for_named_fields(sizes, &fields)
     }
 

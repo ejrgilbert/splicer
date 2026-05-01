@@ -460,10 +460,7 @@ mod tests {
     #[test]
     fn match_tier_interfaces_picks_up_versioned_exports() {
         // Versioned export key + unversioned constant → semver-compatible match.
-        let exports = exports_for(&[
-            "splicer:tier2/before@0.1.0",
-            "splicer:tier2/after@0.1.7",
-        ]);
+        let exports = exports_for(&["splicer:tier2/before@0.1.0", "splicer:tier2/after@0.1.7"]);
         let matched = match_tier_interfaces(&exports, TIER2_INTERFACES, TIER2_VERSION);
         assert_eq!(matched.len(), 2);
         assert!(matched.iter().any(|i| i == "splicer:tier2/before"));
@@ -485,10 +482,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(
             "mw".to_string(),
-            exports_for(&[
-                "splicer:tier1/before@0.2.0",
-                "splicer:tier2/after@0.1.0",
-            ]),
+            exports_for(&["splicer:tier1/before@0.2.0", "splicer:tier2/after@0.1.0"]),
         );
         let results = validate_contract(
             &[injection("mw")],

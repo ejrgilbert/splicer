@@ -60,8 +60,8 @@ use wasm_encoder::{BlockType, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::{Bindgen, Bitcast, Instruction as AbiInst, WasmType};
 use wit_parser::{Alignment, ArchitectureSize, Resolve, SizeAlign, Type};
 
-use super::compat::{cast, flat_types};
 use super::super::indices::FunctionIndices;
+use super::compat::{cast, flat_types};
 
 /// Bindgen that accumulates `wasm_encoder::Instruction`s into buffers,
 /// ready to be flushed into a `Function` by [`WasmEncoderBindgen::drain_into`].

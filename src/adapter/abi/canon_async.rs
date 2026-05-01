@@ -11,9 +11,7 @@
 //!   `canon lower async` status (the `(handle << 4) | status_tag`
 //!   value every async-lowered import returns).
 
-use wasm_encoder::{
-    BlockType, EntityType, Function, ImportSection, TypeSection, ValType,
-};
+use wasm_encoder::{BlockType, EntityType, Function, ImportSection, TypeSection, ValType};
 
 /// wit-component routes async runtime intrinsics through this
 /// module name; not configurable.

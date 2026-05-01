@@ -80,11 +80,7 @@ pub(crate) struct CellLayout {
 impl CellLayout {
     /// Compute the layout from `splicer:common/types.cell`. `cell_id`
     /// must point at the variant typedef.
-    pub(crate) fn from_resolve(
-        sizes: &SizeAlign,
-        resolve: &Resolve,
-        cell_id: TypeId,
-    ) -> Self {
+    pub(crate) fn from_resolve(sizes: &SizeAlign, resolve: &Resolve, cell_id: TypeId) -> Self {
         use wit_parser::TypeDefKind;
         let typedef = &resolve.types[cell_id];
         let TypeDefKind::Variant(v) = &typedef.kind else {
@@ -228,7 +224,11 @@ impl CellLayout {
             f,
             addr_local,
             disc,
-            &[PayloadPart { local: payload_local, kind, offset: 0 }],
+            &[PayloadPart {
+                local: payload_local,
+                kind,
+                offset: 0,
+            }],
         );
     }
 
@@ -257,7 +257,12 @@ impl CellLayout {
         ptr_local: u32,
         len_local: u32,
     ) {
-        self.emit_cell(f, addr_local, cell_disc::TEXT, &ptr_len_parts(ptr_local, len_local));
+        self.emit_cell(
+            f,
+            addr_local,
+            cell_disc::TEXT,
+            &ptr_len_parts(ptr_local, len_local),
+        );
     }
 
     /// `cell::bytes(list<u8>)` — same flat shape as text.
@@ -268,7 +273,157 @@ impl CellLayout {
         ptr_local: u32,
         len_local: u32,
     ) {
-        self.emit_cell(f, addr_local, cell_disc::BYTES, &ptr_len_parts(ptr_local, len_local));
+        self.emit_cell(
+            f,
+            addr_local,
+            cell_disc::BYTES,
+            &ptr_len_parts(ptr_local, len_local),
+        );
+    }
+
+    // ─── Phase 2-2b stubs — codegen lives here once compound lift lands ──
+    //
+    // Each stub names the cell variant + payload shape it'll produce
+    // when implemented. They're unreachable until `LiftKind` for the
+    // matching compound type maps to them in `tier2/emit::emit_lift_kind`.
+    // Keeping the stubs in cells.rs documents the lowest-level contract:
+    // "to lift a record, you need `cell_layout.emit_record_of(addr,
+    // side_table_idx)` to write disc 11 + i32 at payload+0".
+
+    /// `cell::char` — char's utf-8 encoding. char isn't a cell variant
+    /// of its own; we encode the i32 code point as utf-8 bytes (1–4 of
+    /// them) and emit the result as `cell::text`.
+    pub(crate) fn emit_char(&self, f: &mut Function, addr_local: u32, code_point_local: u32) {
+        let _ = (f, addr_local, code_point_local);
+        todo!(
+            "Phase 2-2b: utf-8-encode the i32 code point into a cabi_realloc'd \
+             buffer, then emit_text(ptr, len)"
+        );
+    }
+
+    /// `cell::list-of(list<u32>)` — payload is `(ptr, len)` of a
+    /// child-cell-index array allocated upstream.
+    #[allow(dead_code)] // Phase 2-2b stub; orchestration in `emit_lift_kind` reaches it.
+    pub(crate) fn emit_list_of(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        idx_array_ptr: u32,
+        idx_array_len: u32,
+    ) {
+        let _ = (f, addr_local, idx_array_ptr, idx_array_len);
+        todo!("Phase 2-2b: cell::list-of — disc 5 + (ptr, len) at payload");
+    }
+
+    /// `cell::tuple-of(list<u32>)` — same flat shape as list-of.
+    #[allow(dead_code)] // Phase 2-2b stub.
+    pub(crate) fn emit_tuple_of(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        idx_array_ptr: u32,
+        idx_array_len: u32,
+    ) {
+        let _ = (f, addr_local, idx_array_ptr, idx_array_len);
+        todo!("Phase 2-2b: cell::tuple-of — disc 6 + (ptr, len) at payload");
+    }
+
+    /// `cell::option-some(u32)` — single inner cell index.
+    #[allow(dead_code)] // Phase 2-2b stub.
+    pub(crate) fn emit_option_some(&self, f: &mut Function, addr_local: u32, inner_idx: u32) {
+        let _ = (f, addr_local, inner_idx);
+        todo!("Phase 2-2b: cell::option-some — disc 7 + i32 inner cell index at payload+0");
+    }
+
+    /// `cell::option-none` — no payload, just the discriminant.
+    #[allow(dead_code)] // Phase 2-2b stub.
+    pub(crate) fn emit_option_none(&self, f: &mut Function, addr_local: u32) {
+        let _ = (f, addr_local);
+        todo!("Phase 2-2b: cell::option-none — disc 8, no payload");
+    }
+
+    /// `cell::result-ok(option<u32>)` — disc 9 + option<inner>.
+    #[allow(dead_code)] // Phase 2-2b stub.
+    pub(crate) fn emit_result_ok(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        has_payload: bool,
+        inner_idx: u32,
+    ) {
+        let _ = (f, addr_local, has_payload, inner_idx);
+        todo!("Phase 2-2b: cell::result-ok(option<u32>) — disc 9 + option<u32> payload");
+    }
+
+    /// `cell::result-err(option<u32>)` — disc 10 + option<inner>.
+    #[allow(dead_code)] // Phase 2-2b stub.
+    pub(crate) fn emit_result_err(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        has_payload: bool,
+        inner_idx: u32,
+    ) {
+        let _ = (f, addr_local, has_payload, inner_idx);
+        todo!("Phase 2-2b: cell::result-err(option<u32>) — disc 10 + option<u32> payload");
+    }
+
+    /// `cell::record-of(u32)` — index into `field-tree.record-infos`.
+    pub(crate) fn emit_record_of(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
+        let _ = (f, addr_local, side_table_idx);
+        todo!("Phase 2-2b: cell::record-of — disc 11 + i32 record-info side-table index");
+    }
+
+    /// `cell::flags-set(u32)` — index into `field-tree.flags-infos`.
+    pub(crate) fn emit_flags_set(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
+        let _ = (f, addr_local, side_table_idx);
+        todo!("Phase 2-2b: cell::flags-set — disc 12 + i32 flags-info side-table index");
+    }
+
+    /// `cell::enum-case(u32)` — index into `field-tree.enum-infos`.
+    pub(crate) fn emit_enum_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
+        let _ = (f, addr_local, side_table_idx);
+        todo!("Phase 2-2b: cell::enum-case — disc 13 + i32 enum-info side-table index");
+    }
+
+    /// `cell::variant-case(u32)` — index into `field-tree.variant-infos`.
+    #[allow(dead_code)] // Phase 2-2b stub.
+    pub(crate) fn emit_variant_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
+        let _ = (f, addr_local, side_table_idx);
+        todo!("Phase 2-2b: cell::variant-case — disc 14 + i32 variant-info side-table index");
+    }
+
+    /// `cell::resource-handle(u32)` — index into `field-tree.handle-infos`.
+    pub(crate) fn emit_resource_handle(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        handle_info_idx: u32,
+    ) {
+        let _ = (f, addr_local, handle_info_idx);
+        todo!("Phase 2-4: cell::resource-handle — disc 15 + i32 handle-info index");
+    }
+
+    /// `cell::stream-handle(u32)` — index into `field-tree.handle-infos`.
+    pub(crate) fn emit_stream_handle(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        handle_info_idx: u32,
+    ) {
+        let _ = (f, addr_local, handle_info_idx);
+        todo!("Phase 2-4: cell::stream-handle — disc 16 + i32 handle-info index");
+    }
+
+    /// `cell::future-handle(u32)` — index into `field-tree.handle-infos`.
+    pub(crate) fn emit_future_handle(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        handle_info_idx: u32,
+    ) {
+        let _ = (f, addr_local, handle_info_idx);
+        todo!("Phase 2-4: cell::future-handle — disc 17 + i32 handle-info index");
     }
 }
 
@@ -276,8 +431,16 @@ impl CellLayout {
 /// (and, later, by any cell carrying a flat `list<T>` reference).
 fn ptr_len_parts(ptr_local: u32, len_local: u32) -> [PayloadPart; 2] {
     [
-        PayloadPart { local: ptr_local, kind: StoreKind::I32, offset: 0 },
-        PayloadPart { local: len_local, kind: StoreKind::I32, offset: 4 },
+        PayloadPart {
+            local: ptr_local,
+            kind: StoreKind::I32,
+            offset: 0,
+        },
+        PayloadPart {
+            local: len_local,
+            kind: StoreKind::I32,
+            offset: 4,
+        },
     ]
 }
 
@@ -418,10 +581,18 @@ mod tests {
             let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(iter);
             match mixed % 5 {
                 0 => build_and_validate(&[ValType::I32, ValType::I32], |f| cl.emit_bool(f, 0, 1)),
-                1 => build_and_validate(&[ValType::I32, ValType::I64], |f| cl.emit_integer(f, 0, 1)),
-                2 => build_and_validate(&[ValType::I32, ValType::F64], |f| cl.emit_floating(f, 0, 1)),
-                3 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| cl.emit_text(f, 0, 1, 2)),
-                4 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| cl.emit_bytes(f, 0, 1, 2)),
+                1 => {
+                    build_and_validate(&[ValType::I32, ValType::I64], |f| cl.emit_integer(f, 0, 1))
+                }
+                2 => {
+                    build_and_validate(&[ValType::I32, ValType::F64], |f| cl.emit_floating(f, 0, 1))
+                }
+                3 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
+                    cl.emit_text(f, 0, 1, 2)
+                }),
+                4 => build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
+                    cl.emit_bytes(f, 0, 1, 2)
+                }),
                 _ => unreachable!(),
             }
         }

@@ -2111,8 +2111,7 @@ fn test_tier2_canned_primitives() {
     let shapes = match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
         None => supported,
         Some(csv) => {
-            let wanted: Vec<String> =
-                csv.split(',').map(|s| s.trim().to_string()).collect();
+            let wanted: Vec<String> = csv.split(',').map(|s| s.trim().to_string()).collect();
             supported
                 .into_iter()
                 .filter(|s| wanted.iter().any(|w| *w == s.name()))
@@ -2127,11 +2126,16 @@ fn test_tier2_canned_primitives() {
     let mut failures: Vec<(String, String)> = Vec::new();
     for (i, shape) in shapes.iter().enumerate() {
         let shape_name = shape.name();
-        eprintln!("\n=== [tier2 {}/{}] shape: {} ===", i + 1, shapes.len(), shape_name);
+        eprintln!(
+            "\n=== [tier2 {}/{}] shape: {} ===",
+            i + 1,
+            shapes.len(),
+            shape_name
+        );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let captured = run_tier2_pipeline_for_shape(&workspace, shape);
-            let expected_args = predict_tier2_args_marker(shape)
-                .expect("filtered to supported shapes above");
+            let expected_args =
+                predict_tier2_args_marker(shape).expect("filtered to supported shapes above");
             let expected_marker =
                 format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo args=[{expected_args}]");
             assert!(
@@ -2182,10 +2186,22 @@ fn scaffold_tier2_workspace() -> Tier2Workspace {
     eprintln!("tier2: work dir = {}", root.display());
 
     std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML).expect("workspace toml");
-    write_crate(root, "provider", PROVIDER_CARGO_TOML, "// placeholder\n", &[])
-        .expect("provider scaffold");
-    write_crate(root, "consumer", CONSUMER_CARGO_TOML, "// placeholder\n", &[])
-        .expect("consumer scaffold");
+    write_crate(
+        root,
+        "provider",
+        PROVIDER_CARGO_TOML,
+        "// placeholder\n",
+        &[],
+    )
+    .expect("provider scaffold");
+    write_crate(
+        root,
+        "consumer",
+        CONSUMER_CARGO_TOML,
+        "// placeholder\n",
+        &[],
+    )
+    .expect("consumer scaffold");
     write_crate(
         root,
         "middleware",

@@ -124,9 +124,8 @@ fn synthesize_adapter_world_wit(
     has_after: bool,
 ) -> String {
     use crate::contract::{versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_VERSION};
-    let mut wit = format!(
-        "package {TIER2_ADAPTER_WORLD_PACKAGE};\n\nworld {TIER2_ADAPTER_WORLD_NAME} {{\n"
-    );
+    let mut wit =
+        format!("package {TIER2_ADAPTER_WORLD_PACKAGE};\n\nworld {TIER2_ADAPTER_WORLD_NAME} {{\n");
     wit.push_str(&format!("    import {target_interface};\n"));
     wit.push_str(&format!("    export {target_interface};\n"));
     if has_before {
@@ -238,10 +237,14 @@ struct ParamLift {
     first_local: u32,
 }
 
-/// How to widen a param's flat-form value(s) into the matching
-/// `cell` variant payload. One slot per kind unless noted.
+/// How a WIT type maps to a `cell` variant. Wired variants are
+/// implemented end-to-end (lift codegen produces real cells);
+/// un-wired variants (Phase 2-2b / 2-4) classify here without panic
+/// but `todo!()` at the codegen layer (`cells.rs`) when actually
+/// reached at adapter-build time.
 #[derive(Clone, Copy)]
 enum LiftKind {
+    // ── Phase 2-2a (wired) ────────────────────────────────────────
     /// `bool` — 1 i32 slot (0/1) → `cell::bool`.
     Bool,
     /// `s8`/`s16`/`s32` — 1 i32 slot, sign-extend → `cell::integer`.
@@ -258,39 +261,123 @@ enum LiftKind {
     Text,
     /// `list<u8>` — 2 i32 slots (ptr, len) → `cell::bytes`.
     Bytes,
+
+    // ── Phase 2-2b (todo!() in cells.rs) ─────────────────────────
+    /// `char` → `cell::text` (utf-8 encode the i32 code point).
+    Char,
+    /// `list<T>` (non-u8 element) → `cell::list-of`.
+    ListOf,
+    /// `tuple<...>` → `cell::tuple-of`.
+    TupleOf,
+    /// `option<T>` → `cell::option-some(u32)` or `cell::option-none`.
+    Option,
+    /// `result<T, E>` → `cell::result-ok(option<u32>)` or `cell::result-err(option<u32>)`.
+    Result,
+    /// `record { ... }` → `cell::record-of(u32)` (side-table index).
+    Record,
+    /// `flags { ... }` → `cell::flags-set(u32)`.
+    Flags,
+    /// `enum { ... }` → `cell::enum-case(u32)`.
+    Enum,
+    /// `variant { ... }` → `cell::variant-case(u32)`.
+    Variant,
+
+    // ── Phase 2-4 (todo!() in cells.rs) ──────────────────────────
+    /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`.
+    Handle,
+    /// `future<T>` → `cell::future-handle(u32)`.
+    Future,
+    /// `stream<T>` → `cell::stream-handle(u32)`.
+    Stream,
+
+    // ── Future work ──────────────────────────────────────────────
+    /// `error-context` — no cell variant yet; design TBD.
+    ErrorContext,
 }
 
 impl LiftKind {
-    /// Number of flat wasm slots this param consumes.
+    /// Number of flat wasm slots this param consumes. Hard-coded
+    /// for wired primitive kinds; `todo!()` for compound kinds
+    /// because their flat-slot count depends on the inner type's
+    /// canonical-ABI lowering — driving that off `wit-parser`'s flat
+    /// representation lands alongside the actual lift codegen.
     fn slot_count(self) -> u32 {
         match self {
+            LiftKind::Bool
+            | LiftKind::IntegerSignExt
+            | LiftKind::IntegerZeroExt
+            | LiftKind::Integer64
+            | LiftKind::FloatingF32
+            | LiftKind::FloatingF64 => 1,
             LiftKind::Text | LiftKind::Bytes => 2,
-            _ => 1,
+            LiftKind::Char => todo!("Phase 2-2b: char param slot_count = 1 (i32 code point)"),
+            LiftKind::ListOf => todo!("Phase 2-2b: list<T> param slot_count = 2 (ptr, len)"),
+            LiftKind::TupleOf => {
+                todo!("Phase 2-2b: tuple param slot_count = sum of element flat-slot counts")
+            }
+            LiftKind::Option => {
+                todo!("Phase 2-2b: option<T> param slot_count = 1 (disc) + flat(T)")
+            }
+            LiftKind::Result => {
+                todo!("Phase 2-2b: result<T,E> param slot_count = 1 (disc) + max(flat(T), flat(E)) joined")
+            }
+            LiftKind::Record => {
+                todo!("Phase 2-2b: record param slot_count = sum of field flat-slot counts")
+            }
+            LiftKind::Flags => {
+                todo!("Phase 2-2b: flags param slot_count = 1 (i32 unless > 32 flags, then more)")
+            }
+            LiftKind::Enum => todo!("Phase 2-2b: enum param slot_count = 1 (disc i32)"),
+            LiftKind::Variant => {
+                todo!("Phase 2-2b: variant param slot_count = 1 (disc) + max-payload flat-slot count joined")
+            }
+            LiftKind::Handle => todo!("Phase 2-4: handle param slot_count = 1 (i32 handle index)"),
+            LiftKind::Future => todo!("Phase 2-4: future param slot_count = 1 (i32 future handle)"),
+            LiftKind::Stream => todo!("Phase 2-4: stream param slot_count = 1 (i32 stream handle)"),
+            LiftKind::ErrorContext => todo!("error-context param slot_count = 1 (i32)"),
         }
     }
 
-    /// Classify a WIT param type. Returns `None` for types not yet
-    /// supported by Phase 2-2a primitives (compound types, char,
-    /// resources, etc.) — caller bails with a clear error.
-    fn classify(ty: &Type, resolve: &Resolve) -> Option<LiftKind> {
+    /// Classify a WIT param type. Infallible: every `Type` maps to a
+    /// `LiftKind`. Codegen for un-wired variants `todo!()`s in
+    /// `cells.rs` / `slot_count` when actually reached.
+    fn classify(ty: &Type, resolve: &Resolve) -> LiftKind {
         match ty {
-            Type::Bool => Some(LiftKind::Bool),
-            Type::S8 | Type::S16 | Type::S32 => Some(LiftKind::IntegerSignExt),
-            Type::U8 | Type::U16 | Type::U32 => Some(LiftKind::IntegerZeroExt),
-            Type::S64 | Type::U64 => Some(LiftKind::Integer64),
-            Type::F32 => Some(LiftKind::FloatingF32),
-            Type::F64 => Some(LiftKind::FloatingF64),
-            Type::String => Some(LiftKind::Text),
-            // `list<u8>` fast-path: peek through TypeDefKind::List for u8.
+            Type::Bool => LiftKind::Bool,
+            Type::S8 | Type::S16 | Type::S32 => LiftKind::IntegerSignExt,
+            Type::U8 | Type::U16 | Type::U32 => LiftKind::IntegerZeroExt,
+            Type::S64 | Type::U64 => LiftKind::Integer64,
+            Type::F32 => LiftKind::FloatingF32,
+            Type::F64 => LiftKind::FloatingF64,
+            Type::String => LiftKind::Text,
+            Type::Char => LiftKind::Char,
+            Type::ErrorContext => LiftKind::ErrorContext,
             Type::Id(id) => match &resolve.types[*id].kind {
-                wit_parser::TypeDefKind::List(elem) if matches!(elem, Type::U8) => {
-                    Some(LiftKind::Bytes)
+                wit_parser::TypeDefKind::List(Type::U8) => LiftKind::Bytes,
+                wit_parser::TypeDefKind::List(_) => LiftKind::ListOf,
+                wit_parser::TypeDefKind::Tuple(_) => LiftKind::TupleOf,
+                wit_parser::TypeDefKind::Record(_) => LiftKind::Record,
+                wit_parser::TypeDefKind::Variant(_) => LiftKind::Variant,
+                wit_parser::TypeDefKind::Enum(_) => LiftKind::Enum,
+                wit_parser::TypeDefKind::Flags(_) => LiftKind::Flags,
+                wit_parser::TypeDefKind::Option(_) => LiftKind::Option,
+                wit_parser::TypeDefKind::Result(_) => LiftKind::Result,
+                wit_parser::TypeDefKind::Handle(_) => LiftKind::Handle,
+                wit_parser::TypeDefKind::Future(_) => LiftKind::Future,
+                wit_parser::TypeDefKind::Stream(_) => LiftKind::Stream,
+                // Type aliases peel through and reclassify the
+                // underlying type.
+                wit_parser::TypeDefKind::Type(t) => LiftKind::classify(t, resolve),
+                wit_parser::TypeDefKind::FixedLengthList(_, _)
+                | wit_parser::TypeDefKind::Map(_, _)
+                | wit_parser::TypeDefKind::Resource
+                | wit_parser::TypeDefKind::Unknown => {
+                    todo!(
+                        "tier-2 lift: unsupported TypeDefKind {:?}",
+                        &resolve.types[*id].kind
+                    )
                 }
-                _ => None,
             },
-            // Char (utf-8 encoding required at lift time) and
-            // ErrorContext are deferred to follow-up slices.
-            Type::Char | Type::ErrorContext => None,
         }
     }
 }
@@ -334,8 +421,8 @@ const OPTION_SOME: u8 = 1;
 
 /// Sub-offsets within the on-call indirect-params buffer, derived
 /// from the canonical-ABI layouts of the on-call func-params record
-/// + nested `call-id` record. Built once per dispatch module so the
-/// hook-params populator stays schema-driven.
+/// plus the nested `call-id` record. Built once per dispatch module
+/// so the hook-params populator stays schema-driven.
 struct OnCallParamOffsets {
     iface_ptr: u32,
     iface_len: u32,
@@ -345,6 +432,18 @@ struct OnCallParamOffsets {
     args_len: u32,
 }
 
+/// Per-call values written into the on-call indirect-params buffer.
+/// Bundled so [`emit_populate_hook_params`] takes a single grouping
+/// of values rather than six positional `i32`s.
+struct OnCallCallSite {
+    iface_name_offset: i32,
+    iface_name_len: i32,
+    fn_name_offset: i32,
+    fn_name_len: i32,
+    args_ptr: i32,
+    args_len: i32,
+}
+
 /// Emit wasm that writes the call-id (interface + function name
 /// pointers/lengths) and the per-call `list<field>` args pointer/
 /// length into the indirect-params buffer at `base_ptr`.
@@ -352,12 +451,7 @@ fn emit_populate_hook_params(
     f: &mut Function,
     base_ptr: i32,
     offs: &OnCallParamOffsets,
-    iface_name_offset: i32,
-    iface_name_len: i32,
-    fn_name_offset: i32,
-    fn_name_len: i32,
-    args_ptr: i32,
-    args_len: i32,
+    site: &OnCallCallSite,
 ) {
     let mut store_i32 = |field_offset: u64, value: i32| {
         f.instructions().i32_const(base_ptr);
@@ -368,12 +462,12 @@ fn emit_populate_hook_params(
             memory_index: 0,
         });
     };
-    store_i32(offs.iface_ptr as u64, iface_name_offset);
-    store_i32(offs.iface_len as u64, iface_name_len);
-    store_i32(offs.fn_ptr as u64, fn_name_offset);
-    store_i32(offs.fn_len as u64, fn_name_len);
-    store_i32(offs.args_ptr as u64, args_ptr);
-    store_i32(offs.args_len as u64, args_len);
+    store_i32(offs.iface_ptr as u64, site.iface_name_offset);
+    store_i32(offs.iface_len as u64, site.iface_name_len);
+    store_i32(offs.fn_ptr as u64, site.fn_name_offset);
+    store_i32(offs.fn_len as u64, site.fn_name_len);
+    store_i32(offs.args_ptr as u64, site.args_ptr);
+    store_i32(offs.args_len as u64, site.args_len);
 }
 
 /// Schema-driven layouts + hook descriptors gathered up front so
@@ -415,7 +509,7 @@ fn write_field_record(
     name_len: i32,
 ) {
     let field_start = blob.len();
-    blob.extend(std::iter::repeat(0u8).take(schema.field_layout.size as usize));
+    blob.extend(std::iter::repeat_n(0u8, schema.field_layout.size as usize));
     let name_base = field_start + schema.field_layout.offset_of(FIELD_NAME) as usize;
     let tree_base = field_start + schema.field_layout.offset_of(FIELD_TREE) as usize;
     let cells_base = tree_base + schema.tree_layout.offset_of(TREE_CELLS) as usize;
@@ -434,8 +528,7 @@ fn build_fields_blob(per_func: &[FuncDispatch], schema: &SchemaLayouts) -> Vec<u
     let mut blob: Vec<u8> = Vec::new();
     for fd in per_func {
         for (i, p) in fd.params.iter().enumerate() {
-            let cell_addr =
-                (fd.cells_buf_offset + i as u32 * schema.cell_layout.size) as i32;
+            let cell_addr = (fd.cells_buf_offset + i as u32 * schema.cell_layout.size) as i32;
             write_field_record(&mut blob, schema, cell_addr, p.name_offset, p.name_len);
         }
     }
@@ -462,15 +555,13 @@ fn build_after_params_blob(
     // at result_off + option_payload_off.
     let result_disc_off = result_off as usize;
     let tree_base = result_off + schema.option_payload_off;
-    let tree_cells_base =
-        (tree_base + schema.tree_layout.offset_of(TREE_CELLS)) as usize;
-    let tree_root_off_in_after =
-        (tree_base + schema.tree_layout.offset_of(TREE_ROOT)) as usize;
+    let tree_cells_base = (tree_base + schema.tree_layout.offset_of(TREE_CELLS)) as usize;
+    let tree_root_off_in_after = (tree_base + schema.tree_layout.offset_of(TREE_ROOT)) as usize;
 
     let mut blob: Vec<u8> = Vec::new();
     for fd in per_func {
         let entry_start = blob.len();
-        blob.extend(std::iter::repeat(0u8).take(after_layout.size as usize));
+        blob.extend(std::iter::repeat_n(0u8, after_layout.size as usize));
         write_le_i32(
             &mut blob,
             entry_start + iface_off as usize + SLICE_PTR_OFFSET as usize,
@@ -555,9 +646,8 @@ fn lay_out_static_memory(
     if schema.after_hook.is_some() {
         for fd in per_func.iter_mut() {
             if fd.result_lift.is_some() {
-                fd.result_cells_buf_offset = Some(
-                    layout.reserve_scratch(schema.cell_layout.align, schema.cell_layout.size),
-                );
+                fd.result_cells_buf_offset =
+                    Some(layout.reserve_scratch(schema.cell_layout.align, schema.cell_layout.size));
             }
         }
     }
@@ -573,8 +663,7 @@ fn lay_out_static_memory(
     }
 
     // On-return params blob (data), only when after-hook is wired.
-    let after_blob =
-        build_after_params_blob(per_func, schema, iface_name_offset, iface_name_len);
+    let after_blob = build_after_params_blob(per_func, schema, iface_name_offset, iface_name_len);
     if let Some(al) = schema.on_return_params_layout.as_ref() {
         let after_base = layout.place_data(al.align, &after_blob);
         let mut cursor = after_base;
@@ -601,7 +690,10 @@ fn lay_out_static_memory(
         if !(fd.export_sig.retptr || fd.import_sig.retptr) {
             continue;
         }
-        let result_ty = func.result.as_ref().expect("retptr → func.result is_some()");
+        let result_ty = func
+            .result
+            .as_ref()
+            .expect("retptr → func.result is_some()");
         let size = schema.size_align.size(result_ty).size_wasm32() as u32;
         let align = schema.size_align.align(result_ty).align_wasm32() as u32;
         let off = layout.reserve_scratch(align, size) as i32;
@@ -641,7 +733,7 @@ fn build_per_func_dispatches(
         let fn_name_len = func.name.len() as i32;
         name_blob.extend_from_slice(func.name.as_bytes());
 
-        let params_lift = classify_func_params(resolve, func, name_blob)?;
+        let params_lift = classify_func_params(resolve, func, name_blob);
         let is_async = func.kind.is_async();
         let (import_variant, export_variant) = if is_async {
             (
@@ -708,19 +800,12 @@ fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
     name_blob: &mut Vec<u8>,
-) -> Result<Vec<ParamLift>> {
+) -> Vec<ParamLift> {
     let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
     let mut slot_cursor: u32 = 0;
     for param in &func.params {
         let pname = &param.name;
-        let ptype = &param.ty;
-        let kind = LiftKind::classify(ptype, resolve).ok_or_else(|| {
-            anyhow!(
-                "tier-2 lift codegen does not yet support param `{pname}` of `{}` \
-                 (type {ptype:?}) — only primitives + string + list<u8> are wired today",
-                func.name
-            )
-        })?;
+        let kind = LiftKind::classify(&param.ty, resolve);
         let name_offset = name_blob.len() as i32;
         let name_len = pname.len() as i32;
         name_blob.extend_from_slice(pname.as_bytes());
@@ -732,16 +817,19 @@ fn classify_func_params(
         });
         slot_cursor += kind.slot_count();
     }
-    Ok(params_lift)
+    params_lift
 }
 
 /// Classify the function's return value for on-return lift. Direct
 /// primitive returns capture into `result_local`; string / `list<u8>`
-/// returns ride retptr. Compound returns we don't yet lift get
-/// `None` → `option::none` at runtime.
+/// returns ride retptr. Compound returns route through `LiftKind`
+/// variants whose codegen `todo!()`s in `cells.rs` — building an
+/// adapter for a record-returning interface panics with a precise
+/// message at adapter-build time.
 ///
 /// For async funcs canon-lower-async always retptr's a non-void
 /// result, so even primitive results live at the retptr scratch.
+/// Returns `None` only for void functions.
 fn classify_result_lift(
     resolve: &Resolve,
     func: &WitFunction,
@@ -749,7 +837,7 @@ fn classify_result_lift(
     import_sig: &WasmSignature,
     is_async: bool,
 ) -> Option<ResultLift> {
-    let kind = LiftKind::classify(func.result.as_ref()?, resolve)?;
+    let kind = LiftKind::classify(func.result.as_ref()?, resolve);
     let result_at_retptr = if is_async {
         import_sig.retptr
     } else {
@@ -864,17 +952,15 @@ fn build_dispatch_module(
         func_idx.init_idx,
         func_idx.cabi_realloc_idx,
     );
-    emit_code_section(
-        &mut module,
-        &per_func,
-        &func_idx,
-        &schema,
+    let wrapper_ctx = WrapperCtx {
+        schema: &schema,
         resolve,
         iface_name_offset,
         iface_name_len,
-        plan.hook_params_ptr as i32,
-        plan.on_call_offs.as_ref(),
-    );
+        hook_params_ptr: plan.hook_params_ptr as i32,
+        on_call_offs: plan.on_call_offs.as_ref(),
+    };
+    emit_code_section(&mut module, &per_func, &func_idx, &wrapper_ctx);
     emit_data_section(&mut module, &plan.data_segments);
     Ok(module.finish())
 }
@@ -897,9 +983,7 @@ fn find_common_typeid(resolve: &Resolve, type_name: &str) -> Result<TypeId> {
                 .types
                 .get(type_name)
                 .copied()
-                .ok_or_else(|| {
-                    anyhow!("`splicer:common/types` is missing typedef `{type_name}`")
-                });
+                .ok_or_else(|| anyhow!("`splicer:common/types` is missing typedef `{type_name}`"));
         }
     }
     bail!("resolve has no `splicer:common/types` interface — was the common WIT loaded?")
@@ -927,7 +1011,11 @@ struct HookImport {
 
 fn find_on_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
     use crate::contract::{TIER2_BEFORE, TIER2_VERSION};
-    find_tier2_hook(resolve, world_id, &format!("{TIER2_BEFORE}@{TIER2_VERSION}"))
+    find_tier2_hook(
+        resolve,
+        world_id,
+        &format!("{TIER2_BEFORE}@{TIER2_VERSION}"),
+    )
 }
 
 fn find_on_return_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
@@ -955,11 +1043,7 @@ fn find_tier2_hook(resolve: &Resolve, world_id: WorldId, target_iface: &str) -> 
                 },
             );
             let sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
-            let params = func
-                .params
-                .iter()
-                .map(|p| (p.name.clone(), p.ty))
-                .collect();
+            let params = func.params.iter().map(|p| (p.name.clone(), p.ty)).collect();
             return Ok(HookImport {
                 module,
                 name,
@@ -994,15 +1078,13 @@ fn emit_type_section(
 ) -> TypeIndices {
     let mut types = TypeSection::new();
     let mut next_ty: u32 = 0;
-    let mut alloc_one = |ty_section: &mut TypeSection,
-                         params: Vec<ValType>,
-                         results: Vec<ValType>|
-     -> u32 {
-        ty_section.ty().function(params, results);
-        let idx = next_ty;
-        next_ty += 1;
-        idx
-    };
+    let mut alloc_one =
+        |ty_section: &mut TypeSection, params: Vec<ValType>, results: Vec<ValType>| -> u32 {
+            ty_section.ty().function(params, results);
+            let idx = next_ty;
+            next_ty += 1;
+            idx
+        };
 
     let handler_ty: Vec<u32> = per_func
         .iter()
@@ -1046,7 +1128,11 @@ fn emit_type_section(
         .iter()
         .map(|fd| {
             fd.task_return.as_ref().map(|tr| {
-                alloc_one(&mut types, val_types(&tr.sig.params), val_types(&tr.sig.results))
+                alloc_one(
+                    &mut types,
+                    val_types(&tr.sig.params),
+                    val_types(&tr.sig.results),
+                )
             })
         })
         .collect();
@@ -1096,28 +1182,41 @@ fn emit_imports_and_funcs(
 
     let handler_imp_base = next_imp;
     for (fd, &fty) in per_func.iter().zip(&ty.handler_ty) {
-        imports.import(&fd.import_module, &fd.import_field, EntityType::Function(fty));
+        imports.import(
+            &fd.import_module,
+            &fd.import_field,
+            EntityType::Function(fty),
+        );
         next_imp += 1;
     }
 
     let before_hook_idx = before_hook.map(|h| {
-        imports.import(&h.module, &h.name, EntityType::Function(ty.before_hook_ty.unwrap()));
+        imports.import(
+            &h.module,
+            &h.name,
+            EntityType::Function(ty.before_hook_ty.unwrap()),
+        );
         let idx = next_imp;
         next_imp += 1;
         idx
     });
     let after_hook_idx = after_hook.map(|h| {
-        imports.import(&h.module, &h.name, EntityType::Function(ty.after_hook_ty.unwrap()));
+        imports.import(
+            &h.module,
+            &h.name,
+            EntityType::Function(ty.after_hook_ty.unwrap()),
+        );
         let idx = next_imp;
         next_imp += 1;
         idx
     });
 
-    let async_funcs = canon_async::import_intrinsics(&mut imports, &ty.async_types, event_ptr, || {
-        let i = next_imp;
-        next_imp += 1;
-        i
-    });
+    let async_funcs =
+        canon_async::import_intrinsics(&mut imports, &ty.async_types, event_ptr, || {
+            let i = next_imp;
+            next_imp += 1;
+            i
+        });
 
     // Per-async-fn `task.return` imports. Mirrors tier-1's order:
     // imports come AFTER the canon-async runtime intrinsics. `Some`
@@ -1231,32 +1330,27 @@ fn emit_export_section(
 /// local.get $param_0 ; ... ; local.get $param_N
 /// call $handler
 /// ```
+/// Static context the wrapper-body emitter needs to read per-call
+/// from the layout phase. Bundles the schema + memory-layout
+/// addresses so the body emitter doesn't take eight positional args.
+struct WrapperCtx<'a> {
+    schema: &'a SchemaLayouts,
+    resolve: &'a Resolve,
+    iface_name_offset: i32,
+    iface_name_len: i32,
+    hook_params_ptr: i32,
+    on_call_offs: Option<&'a OnCallParamOffsets>,
+}
+
 fn emit_code_section(
     module: &mut Module,
     per_func: &[FuncDispatch],
     func_idx: &FuncIndices,
-    schema: &SchemaLayouts,
-    resolve: &Resolve,
-    iface_name_offset: i32,
-    iface_name_len: i32,
-    hook_params_ptr: i32,
-    on_call_offs: Option<&OnCallParamOffsets>,
+    ctx: &WrapperCtx<'_>,
 ) {
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
-        emit_wrapper_function(
-            &mut code,
-            per_func,
-            func_idx,
-            schema,
-            resolve,
-            iface_name_offset,
-            iface_name_len,
-            hook_params_ptr,
-            on_call_offs,
-            i,
-            fd,
-        );
+        emit_wrapper_function(&mut code, func_idx, ctx, i, fd);
     }
     code.function(&empty_function());
     for fd in per_func {
@@ -1325,21 +1419,15 @@ fn alloc_wrapper_locals(locals: &mut FunctionIndices, fd: &FuncDispatch) -> Wrap
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_wrapper_function(
     code: &mut CodeSection,
-    per_func: &[FuncDispatch],
     func_idx: &FuncIndices,
-    schema: &SchemaLayouts,
-    resolve: &Resolve,
-    iface_name_offset: i32,
-    iface_name_len: i32,
-    hook_params_ptr: i32,
-    on_call_offs: Option<&OnCallParamOffsets>,
+    ctx: &WrapperCtx<'_>,
     i: usize,
     fd: &FuncDispatch,
 ) {
     let async_funcs = &func_idx.async_funcs;
+    let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = FunctionIndices::new(nparams);
     let lcl = alloc_wrapper_locals(&mut locals, fd);
@@ -1351,9 +1439,8 @@ fn emit_wrapper_function(
     let task_return_loads: Option<Vec<wasm_encoder::Instruction<'static>>> =
         lcl.tr_addr.map(|addr_local| {
             let result_ty = fd.result_ty.as_ref().expect("flat loads → result_ty");
-            let mut bindgen =
-                WasmEncoderBindgen::new(&schema.size_align, addr_local, &mut locals);
-            lift_from_memory(resolve, &mut bindgen, (), result_ty);
+            let mut bindgen = WasmEncoderBindgen::new(&schema.size_align, addr_local, &mut locals);
+            lift_from_memory(ctx.resolve, &mut bindgen, (), result_ty);
             bindgen.into_instructions()
         });
 
@@ -1366,7 +1453,7 @@ fn emit_wrapper_function(
                 fd.cells_buf_offset as i32 + p_idx as i32 * schema.cell_layout.size as i32;
             f.instructions().i32_const(cell_addr);
             f.instructions().local_set(lcl.addr);
-            emit_lift_param(&mut f, &schema.cell_layout, p, lcl.addr, lcl.ext64, lcl.ext_f64);
+            emit_lift_param(&mut f, &schema.cell_layout, p, &lcl);
         }
         let nargs = fd.params.len() as i32;
         let args_ptr = if nargs == 0 {
@@ -1376,16 +1463,19 @@ fn emit_wrapper_function(
         };
         emit_populate_hook_params(
             &mut f,
-            hook_params_ptr,
-            on_call_offs.expect("before-hook wired → on-call layout computed"),
-            iface_name_offset,
-            iface_name_len,
-            fd.fn_name_offset,
-            fd.fn_name_len,
-            args_ptr,
-            nargs,
+            ctx.hook_params_ptr,
+            ctx.on_call_offs
+                .expect("before-hook wired → on-call layout computed"),
+            &OnCallCallSite {
+                iface_name_offset: ctx.iface_name_offset,
+                iface_name_len: ctx.iface_name_len,
+                fn_name_offset: fd.fn_name_offset,
+                fn_name_len: fd.fn_name_len,
+                args_ptr,
+                args_len: nargs,
+            },
         );
-        f.instructions().i32_const(hook_params_ptr);
+        f.instructions().i32_const(ctx.hook_params_ptr);
         canon_async::emit_call_and_wait(&mut f, before_idx, lcl.st, lcl.ws, async_funcs);
     }
 
@@ -1409,22 +1499,10 @@ fn emit_wrapper_function(
 
     // ── Phase 3: on-return (only if after-hook wired) ──
     if let Some(after_idx) = func_idx.after_hook_idx {
-        if let (Some(rl), Some(cells_off)) =
-            (fd.result_lift, fd.result_cells_buf_offset)
-        {
+        if let (Some(rl), Some(cells_off)) = (fd.result_lift, fd.result_cells_buf_offset) {
             f.instructions().i32_const(cells_off as i32);
             f.instructions().local_set(lcl.addr);
-            emit_lift_result(
-                &mut f,
-                &schema.cell_layout,
-                rl,
-                lcl.addr,
-                lcl.ext64,
-                lcl.ext_f64,
-                lcl.ptr_scratch,
-                lcl.len_scratch,
-                lcl.result,
-            );
+            emit_lift_result(&mut f, &schema.cell_layout, rl, &lcl);
         }
         f.instructions().i32_const(
             fd.after_params_offset
@@ -1438,16 +1516,10 @@ fn emit_wrapper_function(
     if fd.is_async {
         emit_task_return(&mut f, fd, func_idx, i, &lcl, task_return_loads.as_deref());
     } else {
-        emit_wrapper_return(
-            &mut f,
-            lcl.result,
-            fd.export_sig.retptr,
-            fd.retptr_offset,
-        );
+        emit_wrapper_return(&mut f, lcl.result, fd.export_sig.retptr, fd.retptr_offset);
     }
     f.instructions().end();
     code.function(&f);
-    let _ = per_func; // (unused for now; kept on the signature for symmetry)
 }
 
 /// Emit the async tail: call `task.return` with the appropriate
@@ -1464,8 +1536,8 @@ fn emit_task_return(
     lcl: &WrapperLocals,
     task_return_loads: Option<&[wasm_encoder::Instruction<'static>]>,
 ) {
-    let imp_task_return = func_idx.task_return_idx[i]
-        .expect("async func must have task.return import");
+    let imp_task_return =
+        func_idx.task_return_idx[i].expect("async func must have task.return import");
     let tr = fd
         .task_return
         .as_ref()
@@ -1492,26 +1564,14 @@ fn emit_task_return(
     }
 }
 
-/// Emit the wasm to lift one param into the cell at `addr_local`.
-/// `ext64` / `ext_f64` are scratch widening locals (i64 / f64).
+/// Emit the wasm to lift one param into the cell at `lcl.addr`.
 fn emit_lift_param(
     f: &mut Function,
     cell_layout: &CellLayout,
     p: &ParamLift,
-    addr_local: u32,
-    ext64: u32,
-    ext_f64: u32,
+    lcl: &WrapperLocals,
 ) {
-    emit_lift_kind(
-        f,
-        cell_layout,
-        p.kind,
-        p.first_local,
-        p.first_local + 1,
-        addr_local,
-        ext64,
-        ext_f64,
-    );
+    emit_lift_kind(f, cell_layout, p.kind, p.first_local, p.first_local + 1, lcl);
 }
 
 /// Shared lift body for params and direct-return results. `slot0` /
@@ -1524,34 +1584,71 @@ fn emit_lift_kind(
     kind: LiftKind,
     slot0: u32,
     slot1: u32,
-    addr_local: u32,
-    ext64: u32,
-    ext_f64: u32,
+    lcl: &WrapperLocals,
 ) {
+    let addr = lcl.addr;
     match kind {
-        LiftKind::Bool => cell_layout.emit_bool(f, addr_local, slot0),
+        // ── Wired primitives ─────────────────────────────────────
+        LiftKind::Bool => cell_layout.emit_bool(f, addr, slot0),
         LiftKind::IntegerSignExt => {
             f.instructions().local_get(slot0);
             f.instructions().i64_extend_i32_s();
-            f.instructions().local_set(ext64);
-            cell_layout.emit_integer(f, addr_local, ext64);
+            f.instructions().local_set(lcl.ext64);
+            cell_layout.emit_integer(f, addr, lcl.ext64);
         }
         LiftKind::IntegerZeroExt => {
             f.instructions().local_get(slot0);
             f.instructions().i64_extend_i32_u();
-            f.instructions().local_set(ext64);
-            cell_layout.emit_integer(f, addr_local, ext64);
+            f.instructions().local_set(lcl.ext64);
+            cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        LiftKind::Integer64 => cell_layout.emit_integer(f, addr_local, slot0),
+        LiftKind::Integer64 => cell_layout.emit_integer(f, addr, slot0),
         LiftKind::FloatingF32 => {
             f.instructions().local_get(slot0);
             f.instructions().f64_promote_f32();
-            f.instructions().local_set(ext_f64);
-            cell_layout.emit_floating(f, addr_local, ext_f64);
+            f.instructions().local_set(lcl.ext_f64);
+            cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
-        LiftKind::FloatingF64 => cell_layout.emit_floating(f, addr_local, slot0),
-        LiftKind::Text => cell_layout.emit_text(f, addr_local, slot0, slot1),
-        LiftKind::Bytes => cell_layout.emit_bytes(f, addr_local, slot0, slot1),
+        LiftKind::FloatingF64 => cell_layout.emit_floating(f, addr, slot0),
+        LiftKind::Text => cell_layout.emit_text(f, addr, slot0, slot1),
+        LiftKind::Bytes => cell_layout.emit_bytes(f, addr, slot0, slot1),
+
+        // ── Direct one-shot dispatch (single cells.rs call) ──
+        LiftKind::Char => cell_layout.emit_char(f, addr, slot0),
+        LiftKind::Record => cell_layout.emit_record_of(f, addr, slot0),
+        LiftKind::Flags => cell_layout.emit_flags_set(f, addr, slot0),
+        LiftKind::Enum => cell_layout.emit_enum_case(f, addr, slot0),
+        LiftKind::Handle => cell_layout.emit_resource_handle(f, addr, slot0),
+        LiftKind::Future => cell_layout.emit_future_handle(f, addr, slot0),
+        LiftKind::Stream => cell_layout.emit_stream_handle(f, addr, slot0),
+
+        // ── Multi-cell or runtime-disc dispatch — orchestration
+        // belongs HERE, not at the cells.rs level. Each todo!()
+        // names what the implementer needs to wire.
+        LiftKind::ListOf => {
+            let _ = (slot0, slot1);
+            todo!(
+                "Phase 2-2b: list<T> lift — recurse on element type, allocate a u32-index \
+                 array, populate with child cell indices, then `cell_layout.emit_list_of(...)`"
+            )
+        }
+        LiftKind::TupleOf => todo!(
+            "Phase 2-2b: tuple lift — same shape as list, but child indices come from \
+             per-element classification + lift, no element recursion"
+        ),
+        LiftKind::Option => todo!(
+            "Phase 2-2b: option<T> lift — read disc; if some, recurse on inner + \
+             `emit_option_some`; if none, `emit_option_none`"
+        ),
+        LiftKind::Result => todo!(
+            "Phase 2-2b: result<T,E> lift — read disc; for ok/err, recurse on payload + \
+             `emit_result_ok` / `emit_result_err`"
+        ),
+        LiftKind::Variant => todo!(
+            "Phase 2-2b: variant lift — read disc; per-case payload classify + lift; \
+             populate variant-info side table; `emit_variant_case(side_table_idx)`"
+        ),
+        LiftKind::ErrorContext => todo!("error-context lift — design TBD"),
     }
 }
 
@@ -1563,17 +1660,14 @@ fn emit_lift_result(
     f: &mut Function,
     cell_layout: &CellLayout,
     result_lift: ResultLift,
-    addr_local: u32,
-    ext64: u32,
-    ext_f64: u32,
-    ptr_scratch: u32,
-    len_scratch: u32,
-    result_local: Option<u32>,
+    lcl: &WrapperLocals,
 ) {
     match result_lift {
         ResultLift::Direct(kind) => {
-            let local = result_local.expect("ResultLift::Direct → result_local must be set");
-            emit_lift_kind(f, cell_layout, kind, local, local, addr_local, ext64, ext_f64);
+            let local = lcl
+                .result
+                .expect("ResultLift::Direct → result local must be allocated");
+            emit_lift_kind(f, cell_layout, kind, local, local, lcl);
         }
         ResultLift::RetptrPair {
             kind,
@@ -1585,23 +1679,21 @@ fn emit_lift_result(
                 align: 2,
                 memory_index: 0,
             });
-            f.instructions().local_set(ptr_scratch);
+            f.instructions().local_set(lcl.ptr_scratch);
             f.instructions().i32_const(retptr_offset);
             f.instructions().i32_load(MemArg {
                 offset: SLICE_LEN_OFFSET as u64,
                 align: 2,
                 memory_index: 0,
             });
-            f.instructions().local_set(len_scratch);
+            f.instructions().local_set(lcl.len_scratch);
             emit_lift_kind(
                 f,
                 cell_layout,
                 kind,
-                ptr_scratch,
-                len_scratch,
-                addr_local,
-                ext64,
-                ext_f64,
+                lcl.ptr_scratch,
+                lcl.len_scratch,
+                lcl,
             );
         }
     }
@@ -1613,7 +1705,11 @@ fn emit_data_section(module: &mut Module, segments: &[(u32, Vec<u8>)]) {
     }
     let mut data = DataSection::new();
     for (offset, bytes) in segments {
-        data.active(0, &ConstExpr::i32_const(*offset as i32), bytes.iter().copied());
+        data.active(
+            0,
+            &ConstExpr::i32_const(*offset as i32),
+            bytes.iter().copied(),
+        );
     }
     module.section(&data);
 }

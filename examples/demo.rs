@@ -289,6 +289,9 @@ fn show_contract_result(result: &ContractResult) {
         ContractResult::Tier1Compatible(ifaces) => {
             println!("  ↪  Tier1Compatible — middleware is type-erased; adapter component will be generated (hooks: {ifaces:?})")
         }
+        ContractResult::Tier2Compatible(ifaces) => {
+            println!("  ↪  Tier2Compatible — middleware observes lifted values; adapter component will be generated (hooks: {ifaces:?})")
+        }
     }
 }
 
