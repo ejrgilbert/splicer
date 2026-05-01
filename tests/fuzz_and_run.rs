@@ -2188,9 +2188,8 @@ fn test_tier2_canned_primitives() {
             let expected_result_inner = predict_tier2_result_marker(shape)
                 .map(|s| format!("result={s}"))
                 .unwrap_or_else(|| "result=none".to_string());
-            let expected_return_marker = format!(
-                "mdl: tier2-on-return {TARGET_INTERFACE}#foo {expected_result_inner}"
-            );
+            let expected_return_marker =
+                format!("mdl: tier2-on-return {TARGET_INTERFACE}#foo {expected_result_inner}");
             assert!(
                 captured.contains(&expected_return_marker),
                 "tier-2 on-return rendered the wrong cell for `{shape_name}` — \

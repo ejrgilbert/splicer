@@ -800,17 +800,13 @@ fn lay_out_static_memory(
                     super::lift::ResultSource::Direct(kind) => ResultSourceLayout::Direct(kind),
                     super::lift::ResultSource::RetptrPair(kind) => ResultSourceLayout::RetptrPair {
                         kind,
-                        retptr_offset: retptr_offset
-                            .expect("RetptrPair → retptr scratch reserved"),
+                        retptr_offset: retptr_offset.expect("RetptrPair → retptr scratch reserved"),
                     },
-                    super::lift::ResultSource::Compound(compound) => {
-                        ResultSourceLayout::Compound {
-                            compound,
-                            retptr_offset: retptr_offset
-                                .expect("Compound → retptr scratch reserved"),
-                            record_info_cell_idx: per_result_cell_idx[i].clone(),
-                        }
-                    }
+                    super::lift::ResultSource::Compound(compound) => ResultSourceLayout::Compound {
+                        compound,
+                        retptr_offset: retptr_offset.expect("Compound → retptr scratch reserved"),
+                        record_info_cell_idx: per_result_cell_idx[i].clone(),
+                    },
                 };
                 ResultLayout {
                     source: layout_source,
@@ -1458,8 +1454,7 @@ fn emit_wrapper_function(
     // `alloc_wrapper_locals` also drives the `lift_from_memory`
     // bindgen for compound result lifts (it may allocate further
     // scratch locals — must happen before the locals list freezes).
-    let (lcl, result_emit) =
-        alloc_wrapper_locals(ctx.resolve, &schema.size_align, &mut locals, fd);
+    let (lcl, result_emit) = alloc_wrapper_locals(ctx.resolve, &schema.size_align, &mut locals, fd);
 
     // For async funcs whose `task.return` takes flat-form params,
     // pre-build the load sequence — `lift_from_memory` may allocate

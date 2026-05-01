@@ -399,7 +399,11 @@ fn extract_typedef_body(src: &str, kind: &str, name: &str) -> Option<String> {
         body.push_str(trimmed);
         body.push('\n');
     }
-    if found { Some(body) } else { None }
+    if found {
+        Some(body)
+    } else {
+        None
+    }
 }
 
 /// True iff the typedef body has a line whose first ident-token is

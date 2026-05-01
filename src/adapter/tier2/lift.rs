@@ -41,8 +41,8 @@ use super::super::indices::FunctionIndices;
 use super::blob::{BlobSlice, RecordWriter, Reloc, Segment, SymRef, SymbolId};
 use super::cells::CellLayout;
 use super::emit::{
-    FuncClassified, FuncDispatch, SchemaLayouts, RECORD_FIELD_TUPLE_IDX,
-    RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS,
+    FuncClassified, FuncDispatch, SchemaLayouts, RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME,
+    RECORD_INFO_FIELDS,
 };
 
 // ─── WIT names referenced by lift codegen ─────────────────────────
@@ -1000,24 +1000,25 @@ pub(super) fn register_record_strings(
     name_blob: &mut Vec<u8>,
 ) -> RecordStringTable {
     let mut table = RecordStringTable::new();
-    let register_plan = |plan: &LiftPlan, name_blob: &mut Vec<u8>, table: &mut RecordStringTable| {
-        for (type_name, fields) in plan.record_ofs() {
-            if !table.contains_key(type_name) {
-                let tn = append_string(name_blob, type_name);
-                let fns = fields
-                    .iter()
-                    .map(|(name, _)| append_string(name_blob, name))
-                    .collect();
-                table.insert(
-                    type_name.to_string(),
-                    RecordTypeStrings {
-                        type_name: tn,
-                        field_names: fns,
-                    },
-                );
+    let register_plan =
+        |plan: &LiftPlan, name_blob: &mut Vec<u8>, table: &mut RecordStringTable| {
+            for (type_name, fields) in plan.record_ofs() {
+                if !table.contains_key(type_name) {
+                    let tn = append_string(name_blob, type_name);
+                    let fns = fields
+                        .iter()
+                        .map(|(name, _)| append_string(name_blob, name))
+                        .collect();
+                    table.insert(
+                        type_name.to_string(),
+                        RecordTypeStrings {
+                            type_name: tn,
+                            field_names: fns,
+                        },
+                    );
+                }
             }
-        }
-    };
+        };
     for fd in per_func {
         for p in &fd.params {
             register_plan(&p.plan, name_blob, &mut table);
@@ -1250,10 +1251,7 @@ pub(super) enum ResultEmitPlan<'a> {
     /// Direct primitive return — source value already in
     /// `source_local` (captured from the handler's flat return after
     /// the call).
-    Direct {
-        kind: LiftKind,
-        source_local: u32,
-    },
+    Direct { kind: LiftKind, source_local: u32 },
     /// `(ptr, len)` pair lives at `retptr_offset` in static scratch.
     /// The wrapper loads the pair into `ptr_local` / `len_local`
     /// before lifting (today these are always `lcl.ptr_scratch` /
@@ -1412,7 +1410,14 @@ pub(super) fn emit_lift_plan(
         let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
         f.instructions().i32_const(cell_addr as i32);
         f.instructions().local_set(lcl.addr);
-        emit_cell_op(f, cell_layout, op, record_info_indices[cell_idx], local_base, lcl);
+        emit_cell_op(
+            f,
+            cell_layout,
+            op,
+            record_info_indices[cell_idx],
+            local_base,
+            lcl,
+        );
     }
 }
 

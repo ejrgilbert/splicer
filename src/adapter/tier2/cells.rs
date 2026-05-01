@@ -135,9 +135,10 @@ impl CellLayout {
     /// `from_resolve` validates the WIT against `EXPECTED_CELL_CASES`,
     /// so reaching the panic implies an emit-side typo.
     fn disc_of(&self, name: &str) -> u8 {
-        *self.discs.get(name).unwrap_or_else(|| {
-            panic!("CellLayout::disc_of: no `cell` case named `{name}`")
-        })
+        *self
+            .discs
+            .get(name)
+            .unwrap_or_else(|| panic!("CellLayout::disc_of: no `cell` case named `{name}`"))
     }
 }
 
