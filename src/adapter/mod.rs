@@ -6,21 +6,20 @@
 //! Submodules:
 //! - [`tier1`] — name-only-hooks adapter (currently shipped).
 //! - [`tier2`] — observation-hooks adapter (in progress, Phase 2-3).
-//! - [`shared`] — helpers reused by both tiers (split decode,
-//!   target-interface lookup).
-//! - [`abi`] — canonical-ABI infrastructure (the `wit-bindgen-core`
-//!   `Bindgen` impl + verbatim helpers).
+//! - [`abi`] — canonical-ABI infrastructure (Bindgen impl, verbatim
+//!   wit-bindgen-core helpers, wasm-encoder emit helpers).
+//! - [`resolve`] — split decode + target-interface lookup.
 //! - [`indices`] — index trackers for dispatch-module type / function
-//!   / local namespaces. Used by both tiers.
+//!   / local namespaces.
 //! - [`mem_layout`] — byte-offset allocator for the dispatch module's
-//!   scratch memory. Used by both tiers.
+//!   scratch memory.
 
 use anyhow::Context;
 
 mod abi;
 mod indices;
 mod mem_layout;
-mod shared;
+mod resolve;
 mod tier1;
 mod tier2;
 

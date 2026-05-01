@@ -23,7 +23,7 @@ interface after {
     /// with the result lifted into a `field-tree`. `none` for void
     /// functions; `some(tree)` otherwise. Results are unnamed in WIT,
     /// so unlike `args` there's no `field` wrapper.
-    on-return: async func(call: call-id, result: option<field-tree>);
+    on-return: async func(call: call-id, %result: option<field-tree>);
 }
 
 interface trap {

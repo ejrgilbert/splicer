@@ -1,7 +1,7 @@
-//! Helpers used by both tier-1 (`super::emit`) and tier-2
-//! (`super::tier2::emit`) adapter generators. Anything that's pure
-//! WIT-parser plumbing or split-bytes ↔ Resolve handling lives here
-//! to avoid two near-identical copies drifting out of sync.
+//! WIT-resolve plumbing shared between tier-1 and tier-2 adapter
+//! generators: decoding the input split's WIT into a [`Resolve`] and
+//! locating a target interface within it. Both tiers' `build_*_adapter`
+//! entry points open with the same two calls.
 
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::{decode, DecodedWasm};

@@ -18,8 +18,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, MemorySection, MemoryType,
-    Module, TypeSection, ValType,
+    Function, FunctionSection, ImportSection, Module, TypeSection, ValType,
 };
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
@@ -30,10 +29,14 @@ use wit_parser::{
     WasmImport, WorldItem, WorldKey,
 };
 
+use super::super::abi::emit::{
+    empty_function, emit_cabi_realloc, emit_memory_and_globals, val_types, wasm_type_to_val,
+    EXPORT_CABI_REALLOC, EXPORT_INITIALIZE, EXPORT_MEMORY,
+};
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, FunctionIndices};
 use super::super::mem_layout::MemoryLayoutBuilder;
-use super::super::shared::{decode_input_resolve, find_target_interface};
+use super::super::resolve::{decode_input_resolve, find_target_interface};
 
 /// Generate the adapter component bytes. `target_interface` is the
 /// fully-qualified interface name (`<ns>:<pkg>/<iface>[@<ver>]`);
@@ -251,11 +254,6 @@ impl FuncDispatch {
     }
 }
 
-/// wit-parser [`WasmType`]s → wasm-encoder [`ValType`]s.
-fn val_types(types: &[WasmType]) -> Vec<ValType> {
-    types.iter().copied().map(wasm_type_to_val).collect()
-}
-
 /// Top-level `borrow<R>` params, returned as `(flat_idx, resource_id)`.
 /// Top-level only — borrows nested inside compound params aren't yet
 /// dropped (out of scope until the fuzzer surfaces such shapes).
@@ -290,9 +288,6 @@ fn resolve_type_alias(resolve: &Resolve, mut tid: TypeId) -> TypeId {
     tid
 }
 
-/// The dispatch module has one global — the bump pointer.
-const BUMP_POINTER_GLOBAL: u32 = 0;
-
 /// Synthesized adapter world's package + world name. The contents
 /// don't matter as long as `select_world` and the WIT we push agree
 /// on both.
@@ -309,14 +304,6 @@ const WAITABLE_JOIN: &str = "[waitable-join]";
 const WAITABLE_SET_WAIT: &str = "[waitable-set-wait]";
 const WAITABLE_SET_DROP: &str = "[waitable-set-drop]";
 const SUBTASK_DROP: &str = "[subtask-drop]";
-
-/// Standard wasm exports the dispatch module exposes. Sourced as
-/// strings rather than re-derived from `Resolve::wasm_export_name`
-/// because they're invariants of `wit_component::ComponentEncoder`'s
-/// Legacy mangling, not anything that varies per-resolve.
-const EXPORT_MEMORY: &str = "memory";
-const EXPORT_CABI_REALLOC: &str = "cabi_realloc";
-const EXPORT_INITIALIZE: &str = "_initialize";
 
 /// Type-section indices. `task_return_ty[i]` is `Some` iff func `i` is async.
 struct TypeIndices {
@@ -559,17 +546,6 @@ fn compute_func_dispatches(
     let block_result_ptr = has_blocking.then(|| layout.alloc_block_result() as i32);
     let bump_start = layout.finish_as_bump_start();
     (per_func, name_blob, event_ptr, block_result_ptr, bump_start)
-}
-
-/// wit-parser [`WasmType`] → wasm-encoder [`ValType`] (wasm32:
-/// `Pointer`/`Length` → i32, `PointerOrI64` → i64).
-fn wasm_type_to_val(wt: WasmType) -> ValType {
-    match wt {
-        WasmType::I32 | WasmType::Pointer | WasmType::Length => ValType::I32,
-        WasmType::I64 | WasmType::PointerOrI64 => ValType::I64,
-        WasmType::F32 => ValType::F32,
-        WasmType::F64 => ValType::F64,
-    }
 }
 
 /// One tier-1 hook import — `(module, name)` from
@@ -919,30 +895,6 @@ fn emit_function_section(
 
     module.section(&fsec);
     func_idx
-}
-
-/// Phase 5 — memory + bump-pointer global (paired with `cabi_realloc`).
-fn emit_memory_and_globals(module: &mut Module, bump_start: u32) {
-    let mut memory = MemorySection::new();
-    memory.memory(MemoryType {
-        minimum: 1,
-        maximum: None,
-        memory64: false,
-        shared: false,
-        page_size_log2: None,
-    });
-    module.section(&memory);
-
-    let mut globals = GlobalSection::new();
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(bump_start as i32),
-    );
-    module.section(&globals);
 }
 
 /// Phase 6 — export section. Wrapper names come from
@@ -1316,49 +1268,6 @@ fn emit_wait_loop(f: &mut Function, st: u32, ws: u32, art: &AsyncRuntimeFuncs) {
     f.instructions().local_get(ws);
     f.instructions().call(art.waitable_drop);
     f.instructions().end();
-}
-
-/// No-op function body — used for `_initialize` and `cabi_post_*`.
-fn empty_function() -> Function {
-    let mut f = Function::new_with_locals_types([]);
-    f.instructions().end();
-    f
-}
-
-/// Bump-allocator `cabi_realloc(old_ptr, old_size, align, new_size)`.
-/// Every call is a fresh alloc — `old_ptr`/`old_size` are ignored.
-fn emit_cabi_realloc(code: &mut CodeSection) {
-    const PARAM_COUNT: u32 = 4;
-    const ALIGN_LOCAL: u32 = 2;
-    const NEW_SIZE_LOCAL: u32 = 3;
-    let mut locals = FunctionIndices::new(PARAM_COUNT);
-    let scratch = locals.alloc_local(ValType::I32);
-    let mut f = Function::new_with_locals_types(locals.into_locals());
-
-    // scratch = (global.bump + (align - 1)) & ~(align - 1)
-    f.instructions().global_get(BUMP_POINTER_GLOBAL);
-    f.instructions().local_get(ALIGN_LOCAL);
-    f.instructions().i32_const(1);
-    f.instructions().i32_sub();
-    f.instructions().i32_add();
-    f.instructions().local_get(ALIGN_LOCAL);
-    f.instructions().i32_const(1);
-    f.instructions().i32_sub();
-    f.instructions().i32_const(-1);
-    f.instructions().i32_xor();
-    f.instructions().i32_and();
-    f.instructions().local_set(scratch);
-
-    // global.bump = scratch + new_size
-    f.instructions().local_get(scratch);
-    f.instructions().local_get(NEW_SIZE_LOCAL);
-    f.instructions().i32_add();
-    f.instructions().global_set(BUMP_POINTER_GLOBAL);
-
-    // return scratch
-    f.instructions().local_get(scratch);
-    f.instructions().end();
-    code.function(&f);
 }
 
 #[cfg(test)]
