@@ -211,13 +211,11 @@ pub(super) struct FuncDispatch {
     pub fn_name_offset: i32,
     pub fn_name_len: i32,
     /// Per-param lift recipe + wasm flat-slot indexing. Empty for
-    /// zero-arg functions.
+    /// zero-arg functions. Each param's [`ParamLift::cells_offset`]
+    /// holds the offset of its own cells slab — there's no longer a
+    /// shared per-fn slab base, since record params consume more than
+    /// one cell.
     pub params: Vec<ParamLift>,
-    /// Byte offset of this function's cells scratch slab. The slab
-    /// holds `params.len()` consecutive cells, each [`CELL_SIZE`]
-    /// bytes. Cleared (zeroed by the runtime) at module instantiation;
-    /// rewritten per-call in the wrapper body.
-    pub cells_buf_offset: u32,
     /// Byte offset of this function's pre-built `field` records in
     /// the data segment. Holds `params.len()` consecutive `field`
     /// records, each [`FIELD_SIZE_BYTES`] bytes. Pointed at by the
@@ -372,29 +370,23 @@ impl FieldSideTables {
 }
 
 /// Single-pass build of a `field` record + its embedded
-/// `field-tree` for one (function, param) pair, with `cells.ptr`
-/// pointing at the param's pre-allocated cell. `side_tables` patches
-/// the field-tree's per-kind-infos lists for any kinds the param
-/// carries.
+/// `field-tree` for one (function, param) pair. `cells` points at
+/// the param's contiguous cells slab (`(slab-offset, cell-count)`).
+/// `side_tables` patches the field-tree's per-kind-infos lists for
+/// any kinds the param's plan carries.
 fn write_field_record(
     blob: &mut Vec<u8>,
     schema: &SchemaLayouts,
-    cell_addr: i32,
+    cells: BlobSlice,
     name: BlobSlice,
     side_tables: FieldSideTables,
 ) {
     let field = RecordWriter::extend_zero(blob, &schema.field_layout);
     field.write_slice(blob, FIELD_NAME, name);
     let tree = field.nested(FIELD_TREE, &schema.tree_layout);
-    tree.write_slice(
-        blob,
-        TREE_CELLS,
-        BlobSlice {
-            off: cell_addr as u32,
-            len: 1,
-        },
-    );
+    tree.write_slice(blob, TREE_CELLS, cells);
     side_tables.write_to_tree(blob, &tree);
+    // Root cell is always `cells[0]` for the plan-builder.
     tree.write_i32(blob, TREE_ROOT, 0);
 }
 
@@ -410,15 +402,18 @@ fn build_fields_blob(
     let mut blob: Vec<u8> = Vec::new();
     for (fn_idx, fd) in per_func.iter().enumerate() {
         for (i, p) in fd.params.iter().enumerate() {
-            let cell_addr = (fd.cells_buf_offset + i as u32 * schema.cell_layout.size) as i32;
+            // The field-tree's `cells.ptr` points at the param's
+            // slab; `cells.len = plan.cell_count()`. `root` is always
+            // 0 because the plan-builder allocates the root cell
+            // first into each plan.
             write_field_record(
                 &mut blob,
                 schema,
-                cell_addr,
                 BlobSlice {
-                    off: p.name_offset as u32,
-                    len: p.name_len as u32,
+                    off: p.cells_offset,
+                    len: p.plan.cell_count(),
                 },
+                p.name,
                 param_side_tables[fn_idx][i],
             );
         }
@@ -495,9 +490,14 @@ fn lay_out_static_memory(
     layout.place_data(1, name_blob);
 
     // Cells slabs first — fields records embed pointers to these.
+    // Each param contributes `plan.cell_count() * cell_size` bytes;
+    // record params produce >1 cell, so per-param offsets get
+    // recorded individually.
     for fd in per_func.iter_mut() {
-        let slab_size = fd.params.len() as u32 * schema.cell_layout.size;
-        fd.cells_buf_offset = layout.reserve_scratch(schema.cell_layout.align, slab_size);
+        for p in fd.params.iter_mut() {
+            let slab_size = p.plan.cell_count() * schema.cell_layout.size;
+            p.cells_offset = layout.reserve_scratch(schema.cell_layout.align, slab_size);
+        }
     }
     // Per-fn result-cell scratch, when after-hook is wired and the
     // function has a result to lift. Captured in a parallel Vec so
@@ -690,7 +690,6 @@ fn build_per_func_dispatches(
             fn_name_offset,
             fn_name_len,
             params: params_lift,
-            cells_buf_offset: 0,
             fields_buf_offset: 0,
             retptr_offset: None,
             result_lift,
@@ -1224,12 +1223,20 @@ fn emit_wrapper_function(
 
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before_idx) = func_idx.before_hook_idx {
-        for (p_idx, p) in fd.params.iter().enumerate() {
-            let cell_addr =
-                fd.cells_buf_offset as i32 + p_idx as i32 * schema.cell_layout.size as i32;
-            f.instructions().i32_const(cell_addr);
-            f.instructions().local_set(lcl.addr);
-            emit_lift_param(&mut f, &schema.cell_layout, p, &lcl);
+        for p in fd.params.iter() {
+            // Side-table indices for `RecordOf` cells get filled in by
+            // the layout phase; primitives + enum produce all-None
+            // indices (their side-table info is dynamic — sourced from
+            // a wasm local — not from a static index).
+            let record_info_indices: Vec<Option<u32>> = vec![None; p.plan.cells.len()];
+            emit_lift_param(
+                &mut f,
+                &schema.cell_layout,
+                p.cells_offset,
+                &p.plan,
+                &record_info_indices,
+                &lcl,
+            );
         }
         let nargs = fd.params.len() as u32;
         let args_off = if nargs == 0 { 0 } else { fd.fields_buf_offset };

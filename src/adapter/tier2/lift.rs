@@ -1,25 +1,30 @@
 //! Tier-2 lift codegen: classifying WIT types into cell variants,
 //! emitting the wasm that writes one cell per (param | result),
-//! and laying out the per-field-tree side tables (`enum-infos` for
-//! now; `flags-infos` / `record-infos` / `variant-infos` /
-//! `handle-infos` join as their lift codegen lands).
+//! and laying out the per-field-tree side tables (`enum-infos`,
+//! `record-infos`; `flags-infos` / `variant-infos` / `handle-infos`
+//! join as their lift codegen lands).
 //!
 //! Split from `emit.rs` so the dispatch-orchestration code there
 //! doesn't pull in every cell-variant detail.
 //!
+//! See [`docs/tiers/lift-codegen.md`](../../../docs/tiers/lift-codegen.md)
+//! for the cross-tier design (data flow, invariants, why the plan
+//! data structure exists).
+//!
 //! Three layers:
-//! - **Classify.** [`LiftKind::classify`] maps a `Type` to a single
-//!   `cell` variant; [`classify_func_params`] / [`classify_result_lift`]
-//!   walk a function's params + result and produce [`ParamLift`] /
-//!   [`ResultLift`] descriptors plus any [`SideTableInfo`] the lift
-//!   needs.
-//! - **Side-table population.** [`register_enum_strings`] +
-//!   [`build_enum_info_blob`] precompute the per-field-tree side
-//!   tables at adapter-build time (cells store side-table indices
-//!   that index directly into these blobs at runtime).
-//! - **Codegen.** [`emit_lift_param`] / [`emit_lift_kind`] /
-//!   [`emit_lift_result`] emit the wasm that writes one cell, given
-//!   the wrapper's [`WrapperLocals`] for scratch.
+//! - **Classify.** [`LiftPlanBuilder`] walks a WIT type and emits a
+//!   flat [`LiftPlan`] of [`CellOp`]s in allocation order — `cells[0]`
+//!   is the root, child cells follow their parents. The plan owns
+//!   the cell-index space; side-table contributions reference cells
+//!   by `Vec`-position into the same plan.
+//! - **Side-table population.** [`register_side_table_strings`] +
+//!   [`build_side_table_blob`] (and per-kind facades) precompute the
+//!   per-field-tree side tables at adapter-build time. Walks the
+//!   per-param plans for nominal `CellOp` cases.
+//! - **Codegen.** [`emit_lift_param`] walks `plan.cells` and emits
+//!   one wasm cell per `CellOp`. [`emit_lift_result`] handles result
+//!   lifts (kept on the legacy `LiftKind`+`ResultSource` path until
+//!   compound result lifts land).
 
 use std::collections::HashMap;
 
@@ -50,7 +55,7 @@ const ENUM_INFO_CASE_NAME: &str = "case-name";
 /// un-wired variants (Phase 2-2b / 2-4) classify here without panic
 /// but `todo!()` at the codegen layer (`cells.rs`) when actually
 /// reached at adapter-build time.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum LiftKind {
     // ── Phase 2-2a (wired) ────────────────────────────────────────
     /// `bool` — 1 i32 slot (0/1) → `cell::bool`.
@@ -195,9 +200,229 @@ impl LiftKind {
     }
 }
 
+// ─── Lift plan: structural single-source-of-truth ─────────────────
+//
+// A LiftPlan describes one (param | result) lift end-to-end:
+// every cell that needs to be written, in allocation order, with
+// each cell bound to its source wasm locals (via `LocalRef`) and
+// any nominal-cell side-table info it carries. `cells[0]` is the
+// root that the field-tree's `root` field points at.
+//
+// Why a flat Vec instead of a nested IR: cell indices in
+// nominal-cell side-table entries (e.g., a record's `fields`
+// list) are just `Vec`-positions in `cells`. The same vector that
+// drives codegen also drives side-table emission; child indices
+// can't desync because they're a property of allocation order.
+// `cells.len()` is the slab size; total flat-slot consumption is
+// known by counting `LocalRef::Param(_)`s allocated. See
+// [`docs/tiers/lift-codegen.md`](../../../docs/tiers/lift-codegen.md).
+
+/// One cell to write at a known cell-array index. Each variant
+/// captures the cell's runtime-disc semantics, its source wasm
+/// locals (via [`LocalRef`]), and any side-table info this cell
+/// contributes (e.g., enum-info / record-info entries).
+pub(super) enum CellOp {
+    Bool { local: LocalRef },
+    IntegerSignExt { local: LocalRef },
+    IntegerZeroExt { local: LocalRef },
+    Integer64 { local: LocalRef },
+    FloatingF32 { local: LocalRef },
+    FloatingF64 { local: LocalRef },
+    Text { ptr: LocalRef, len: LocalRef },
+    Bytes { ptr: LocalRef, len: LocalRef },
+    EnumCase {
+        local: LocalRef,
+        info: NamedListInfo,
+    },
+    RecordOf {
+        type_name: String,
+        /// `(field-name, child-cell-idx)` per field, in WIT order.
+        /// `child-cell-idx` indexes into the same `LiftPlan::cells`.
+        fields: Vec<(String, u32)>,
+    },
+}
+
+/// Where a payload value comes from at emit time. Kept abstract at
+/// classify time so the plan is reusable across param vs. result
+/// lifts; resolved to a concrete wasm local index via
+/// [`LocalRef::resolve`] at emit time.
+#[derive(Clone, Copy)]
+pub(super) enum LocalRef {
+    /// nth flat-slot wasm local of the function's params.
+    Param(u32),
+    /// `lcl.ptr_scratch` — set up before the lift for retptr-loaded results.
+    PtrScratch,
+    /// `lcl.len_scratch` — paired with `PtrScratch`.
+    LenScratch,
+    /// `lcl.result` — direct primitive return captured into a local.
+    Result,
+}
+
+impl LocalRef {
+    /// Resolve to a concrete wasm local index. Panics for unset
+    /// scratch locals (which only happens if the plan-builder picked
+    /// an inappropriate `LocalRef` for the lift's source).
+    pub(super) fn resolve(&self, lcl: &WrapperLocals) -> u32 {
+        match self {
+            LocalRef::Param(i) => *i,
+            LocalRef::PtrScratch => lcl.ptr_scratch,
+            LocalRef::LenScratch => lcl.len_scratch,
+            LocalRef::Result => lcl
+                .result
+                .expect("LocalRef::Result requires a direct-return local"),
+        }
+    }
+}
+
+/// Plan for lifting one (param | result) into a cell tree. Cells
+/// are listed in allocation order; `cells[0]` is the root that the
+/// field-tree's `root` field points at. Walked top-to-bottom by the
+/// emit-code phase; the side-table builder also walks `cells` to
+/// pull out per-kind side-table contributions.
+pub(super) struct LiftPlan {
+    pub cells: Vec<CellOp>,
+}
+
+impl LiftPlan {
+    pub(super) fn cell_count(&self) -> u32 {
+        self.cells.len() as u32
+    }
+
+    /// Iterator over every `CellOp::EnumCase` in the plan. Used by
+    /// the side-table builder to register enum strings.
+    pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
+        self.cells.iter().filter_map(|op| match op {
+            CellOp::EnumCase { info, .. } => Some(info),
+            _ => None,
+        })
+    }
+}
+
+// ─── Lift plan builder ────────────────────────────────────────────
+
+/// Allocates cells + flat-slot locals while walking a WIT type.
+/// The "parent before children" recursion in [`Self::push`] is what
+/// makes child cell indices observable from the parent's side-table
+/// info (a child's index is just `cells.len()` after its sub-call
+/// has appended).
+struct LiftPlanBuilder {
+    cells: Vec<CellOp>,
+    /// Next available wasm flat-slot local (for `LocalRef::Param`).
+    next_local: u32,
+}
+
+impl LiftPlanBuilder {
+    fn new(first_local: u32) -> Self {
+        Self {
+            cells: Vec::new(),
+            next_local: first_local,
+        }
+    }
+
+    /// Push cells for one lift; returns the root cell's index.
+    fn push(&mut self, ty: &Type, resolve: &Resolve) -> u32 {
+        let root_idx = self.cells.len() as u32;
+        match LiftKind::classify(ty, resolve) {
+            LiftKind::Bool => {
+                let local = self.bump_local();
+                self.cells.push(CellOp::Bool { local });
+            }
+            LiftKind::IntegerSignExt => {
+                let local = self.bump_local();
+                self.cells.push(CellOp::IntegerSignExt { local });
+            }
+            LiftKind::IntegerZeroExt => {
+                let local = self.bump_local();
+                self.cells.push(CellOp::IntegerZeroExt { local });
+            }
+            LiftKind::Integer64 => {
+                let local = self.bump_local();
+                self.cells.push(CellOp::Integer64 { local });
+            }
+            LiftKind::FloatingF32 => {
+                let local = self.bump_local();
+                self.cells.push(CellOp::FloatingF32 { local });
+            }
+            LiftKind::FloatingF64 => {
+                let local = self.bump_local();
+                self.cells.push(CellOp::FloatingF64 { local });
+            }
+            LiftKind::Text => {
+                let ptr = self.bump_local();
+                let len = self.bump_local();
+                self.cells.push(CellOp::Text { ptr, len });
+            }
+            LiftKind::Bytes => {
+                let ptr = self.bump_local();
+                let len = self.bump_local();
+                self.cells.push(CellOp::Bytes { ptr, len });
+            }
+            LiftKind::Enum => {
+                let info = enum_lift_info_for_type(ty, resolve)
+                    .expect("LiftKind::Enum classify implies enum-info available");
+                let local = self.bump_local();
+                self.cells.push(CellOp::EnumCase { local, info });
+            }
+            LiftKind::Record => self.push_record(ty, resolve, root_idx),
+            other => todo!("Phase 2-2b/2-4 plan-builder for {other:?}"),
+        }
+        root_idx
+    }
+
+    fn bump_local(&mut self) -> LocalRef {
+        let r = LocalRef::Param(self.next_local);
+        self.next_local += 1;
+        r
+    }
+
+    /// Records: push the parent first, recurse on each field
+    /// (children get appended to `cells` AFTER the parent, so their
+    /// returned root indices are the indices the parent's `fields`
+    /// list needs), then backfill the parent's `fields`.
+    fn push_record(&mut self, ty: &Type, resolve: &Resolve, root_idx: u32) {
+        let Type::Id(id) = ty else {
+            unreachable!("LiftKind::Record came from non-Id type")
+        };
+        let typedef = &resolve.types[*id];
+        let wit_parser::TypeDefKind::Record(r) = &typedef.kind else {
+            unreachable!("LiftKind::Record came from non-Record kind")
+        };
+        let type_name = typedef.name.clone().unwrap_or_default();
+        // Reserve the parent slot at root_idx.
+        self.cells.push(CellOp::RecordOf {
+            type_name,
+            fields: Vec::new(),
+        });
+        // Recurse on each field; children get appended after parent.
+        let mut fields = Vec::with_capacity(r.fields.len());
+        for field in &r.fields {
+            let child_idx = self.push(&field.ty, resolve);
+            fields.push((field.name.clone(), child_idx));
+        }
+        // Backfill the parent's `fields` with the now-known child indices.
+        match &mut self.cells[root_idx as usize] {
+            CellOp::RecordOf { fields: f, .. } => *f = fields,
+            _ => unreachable!("just pushed RecordOf at root_idx"),
+        }
+    }
+
+    fn into_plan(self) -> LiftPlan {
+        LiftPlan { cells: self.cells }
+    }
+}
+
+// ─── Result-lift descriptors (legacy LiftKind+ResultSource path) ──
+//
+// Result lifts stay on the (LiftKind, ResultSource, SideTableInfo)
+// triple until compound result lifts land — they need a
+// memory-load prefix before the cell write (canonical-ABI returns
+// records via retptr, not flat locals), which doesn't fit the
+// flat-LocalRef LiftPlan model. Migrate when records-as-result is
+// in scope.
+
 /// How to extract the function's return value when lifting it for
 /// on-return. `side_table` populates the result tree's side-tables
-/// (enum-infos, flags-infos, …) at adapter-build time.
+/// at adapter-build time.
 pub(super) struct ResultLift {
     pub source: ResultSource,
     pub side_table: SideTableInfo,
@@ -205,8 +430,7 @@ pub(super) struct ResultLift {
 
 #[derive(Clone, Copy)]
 pub(super) enum ResultSource {
-    /// Direct primitive (no retptr): source is the captured
-    /// result_local — emit_code_section resolves the actual local idx.
+    /// Direct primitive (no retptr): source is `lcl.result`.
     Direct(LiftKind),
     /// `(ptr, len)` pair in retptr scratch (string / `list<u8>`).
     RetptrPair { kind: LiftKind, retptr_offset: i32 },
@@ -222,47 +446,32 @@ impl ResultLift {
     }
 }
 
-/// Per-parameter lift recipe. `first_local` is the wasm local index
-/// of the first flat slot for this param (subsequent slots for
-/// multi-slot params live at +1, +2, ...). `name_offset` /
-/// `name_len` reference the param name in the shared name blob.
+/// Per-parameter lift recipe. `cells_offset` is the byte offset of
+/// this param's contiguous cells slab within the static data segment;
+/// the slab holds `plan.cell_count()` cells, each `cell_layout.size`
+/// bytes. Filled in by the layout phase.
 pub(super) struct ParamLift {
-    pub name_offset: i32,
-    pub name_len: i32,
-    pub kind: LiftKind,
-    pub first_local: u32,
-    /// Schema-level side-table contributions populated at classify
-    /// time. Empty (`Default::default()`) for primitive params.
-    pub side_table: SideTableInfo,
+    pub name: BlobSlice,
+    pub plan: LiftPlan,
+    pub cells_offset: u32,
 }
 
-/// Schema-level info needed to populate one field-tree's side
-/// tables (enum-infos, flags-infos, record-infos, variant-infos, …).
-/// Per (param | result), built at classify time and consumed by the
-/// layout phase to emit the side-table data segments + patch the
-/// field-tree blobs.
-///
-/// Every kind we care about today (enum / flags / variant / record)
-/// shares the same shape: a type-name + an ordered list of item
-/// names (case / flag / field). New kinds are wired by adding a
-/// field below + classifying into [`NamedListInfo`] at lift time.
+/// Result-side-table info, populated when a result is lift-able.
+/// Mirrors the per-kind options on `SideTableInfo` but only for
+/// results (params now carry their info inline in their LiftPlan
+/// `CellOp`s).
 #[derive(Default, Clone)]
 pub(super) struct SideTableInfo {
-    /// `Some` for enum-typed lifts: carries the enum's type-name
+    /// `Some` for enum-typed result lifts: carries the enum's type-name
     /// plus its case names in disc order.
     pub enum_info: Option<NamedListInfo>,
-    // Phase 2-2b additions land here:
-    //   pub flags_info: Option<NamedListInfo>,
-    //   pub variant_info: Option<NamedListInfo>,
-    //   pub record_info: Option<NamedListInfo>,
-    // — the side-table builder ([`build_side_table_blob`]) is
-    // already generic over a per-kind extractor closure.
 }
 
 /// A type-name plus an ordered list of item names. Carries
 /// enough info to populate any of the `*-info` side-table records
-/// in `splicer:common/types`, which all share the
-/// `{ type-name, <item>-name }` shape.
+/// in `splicer:common/types` that share the
+/// `{ type-name, <item>-name }` shape (enum-info, eventually flags-info
+/// + variant-info).
 #[derive(Clone)]
 pub(super) struct NamedListInfo {
     pub type_name: String,
@@ -274,6 +483,9 @@ pub(super) struct NamedListInfo {
 
 // ─── Classifiers ──────────────────────────────────────────────────
 
+/// Build a [`LiftPlan`] for every WIT param of `func`. `slot_cursor`
+/// threads across params so each param's plan starts at the next
+/// flat-slot local.
 pub(super) fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
@@ -283,33 +495,38 @@ pub(super) fn classify_func_params(
     let mut slot_cursor: u32 = 0;
     for param in &func.params {
         let pname = &param.name;
-        let kind = LiftKind::classify(&param.ty, resolve);
-        let side_table = side_table_info_for(&param.ty, kind, resolve);
-        let name_offset = name_blob.len() as i32;
-        let name_len = pname.len() as i32;
-        name_blob.extend_from_slice(pname.as_bytes());
+        let name = append_param_name(name_blob, pname);
+        let mut builder = LiftPlanBuilder::new(slot_cursor);
+        builder.push(&param.ty, resolve);
+        slot_cursor = builder.next_local;
         params_lift.push(ParamLift {
-            name_offset,
-            name_len,
-            kind,
-            first_local: slot_cursor,
-            side_table,
+            name,
+            plan: builder.into_plan(),
+            cells_offset: 0, // back-filled by lay_out_static_memory
         });
-        slot_cursor += kind.slot_count();
     }
     params_lift
 }
 
+fn append_param_name(name_blob: &mut Vec<u8>, name: &str) -> BlobSlice {
+    let off = name_blob.len() as u32;
+    name_blob.extend_from_slice(name.as_bytes());
+    BlobSlice {
+        off,
+        len: name.len() as u32,
+    }
+}
+
 /// Classify the function's return value for on-return lift. Direct
-/// primitive returns capture into `result_local`; string / `list<u8>`
-/// returns ride retptr. Compound returns route through `LiftKind`
-/// variants whose codegen `todo!()`s in `cells.rs` — building an
-/// adapter for a record-returning interface panics with a precise
-/// message at adapter-build time.
+/// primitive returns capture into `lcl.result`; string / `list<u8>`
+/// returns ride retptr. Compound returns we don't yet lift bail out
+/// with `None` (the wrapper still calls the after-hook with
+/// `result: option::none`).
 ///
 /// For async funcs canon-lower-async always retptr's a non-void
 /// result, so even primitive results live at the retptr scratch.
-/// Returns `None` only for void functions.
+/// Returns `None` only for void functions or unsupported result
+/// kinds.
 pub(super) fn classify_result_lift(
     resolve: &Resolve,
     func: &WitFunction,
@@ -319,6 +536,12 @@ pub(super) fn classify_result_lift(
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
     let kind = LiftKind::classify(ty, resolve);
+    if !result_kind_supported(kind) {
+        // Records/variants/etc as result types: defer until result
+        // lifts learn about retptr-memory-load prefixes. The wrapper
+        // still calls after-hook with option::none for `result`.
+        return None;
+    }
     let side_table = side_table_info_for(ty, kind, resolve);
     let result_at_retptr = if is_async {
         import_sig.retptr
@@ -334,6 +557,24 @@ pub(super) fn classify_result_lift(
         ResultSource::Direct(kind)
     };
     Some(ResultLift { source, side_table })
+}
+
+/// Whether the result lift codegen (`emit_lift_result`) can handle
+/// this kind today. Compound kinds need a memory-load-prefix variant
+/// that doesn't exist yet.
+fn result_kind_supported(kind: LiftKind) -> bool {
+    matches!(
+        kind,
+        LiftKind::Bool
+            | LiftKind::IntegerSignExt
+            | LiftKind::IntegerZeroExt
+            | LiftKind::Integer64
+            | LiftKind::FloatingF32
+            | LiftKind::FloatingF64
+            | LiftKind::Text
+            | LiftKind::Bytes
+            | LiftKind::Enum
+    )
 }
 
 /// Build the `SideTableInfo` for a (type, kind) pair. Empty for
@@ -431,25 +672,32 @@ impl SideTableBlob {
     }
 }
 
-/// Walk every param / result; for each lift that the extractor
-/// surfaces a [`NamedListInfo`] for, append its strings to
-/// `name_blob` (deduped per type-name). Returns the per-type string
-/// offsets so the side-table builder can stitch entries together
-/// without re-scanning name_blob.
+/// Walk every param / result; for each lift that surfaces a
+/// [`NamedListInfo`] of this kind, append its strings to `name_blob`
+/// (deduped per type-name). Returns the per-type string offsets so
+/// the side-table builder can stitch entries together without
+/// re-scanning `name_blob`.
+///
+/// `from_plan` extracts the kind's infos from a per-param
+/// [`LiftPlan`] (multiple infos possible if the plan has multiple
+/// nominal cells of this kind). `from_result` reads the kind's
+/// info off the result's [`SideTableInfo`] (single info, since
+/// results today are single-cell).
 pub(super) fn register_side_table_strings(
     per_func: &[FuncDispatch],
     name_blob: &mut Vec<u8>,
-    extract: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
+    from_plan: impl Fn(&LiftPlan) -> Vec<&NamedListInfo>,
+    from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
 ) -> StringTable {
     let mut table = StringTable::new();
     for fd in per_func {
         for p in &fd.params {
-            if let Some(info) = extract(&p.side_table) {
+            for info in from_plan(&p.plan) {
                 ensure_registered(&mut table, name_blob, info);
             }
         }
         if let Some(rl) = &fd.result_lift {
-            if let Some(info) = extract(&rl.side_table) {
+            if let Some(info) = from_result(&rl.side_table) {
                 ensure_registered(&mut table, name_blob, info);
             }
         }
@@ -482,14 +730,22 @@ fn append_string(name_blob: &mut Vec<u8>, s: &str) -> BlobSlice {
     }
 }
 
-/// Lay out one side-table-kind's entry records: one entry per item
-/// of each registered info, contiguous so the cell-at-runtime can
-/// disc-index directly into the per-tree slice.
+/// Lay out one per-case-kind side table. For per-case kinds (enum,
+/// variant) the side-table index is the runtime disc, so entries
+/// are laid out one-per-case in WIT declaration order. The cell at
+/// runtime points at the contiguous per-(param|result) range via
+/// `(blob_off, len)`.
+///
+/// `from_plan` returns the (at most one for enum) info for a param's
+/// plan that contributes to this side table. (When records of enums
+/// land, this may yield multiple infos per plan — the builder
+/// handles that by appending one contiguous range per plan-cell.)
 pub(super) fn build_side_table_blob(
     per_func: &[FuncDispatch],
     strings: &StringTable,
     spec: &SideTableSpec<'_>,
-    extract: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
+    from_plan: impl Fn(&LiftPlan) -> Option<&NamedListInfo>,
+    from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
 ) -> SideTableBlob {
     let mut bytes: Vec<u8> = Vec::new();
     let mut per_param: Vec<Vec<BlobSlice>> = Vec::with_capacity(per_func.len());
@@ -497,15 +753,10 @@ pub(super) fn build_side_table_blob(
     for fd in per_func {
         let mut params = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
-            params.push(append_entries(
-                &mut bytes,
-                strings,
-                spec,
-                extract(&p.side_table),
-            ));
+            params.push(append_entries(&mut bytes, strings, spec, from_plan(&p.plan)));
         }
         per_param.push(params);
-        let result_info = fd.result_lift.as_ref().and_then(|r| extract(&r.side_table));
+        let result_info = fd.result_lift.as_ref().and_then(|r| from_result(&r.side_table));
         per_result.push(append_entries(&mut bytes, strings, spec, result_info));
     }
     SideTableBlob {
@@ -541,17 +792,29 @@ fn append_entries(
 
 /// Register enum-info strings for every enum-typed lift across all
 /// funcs. Thin wrapper over [`register_side_table_strings`] tied to
-/// the `enum_info` field on [`SideTableInfo`].
+/// `CellOp::EnumCase`.
 pub(super) fn register_enum_strings(
     per_func: &[FuncDispatch],
     name_blob: &mut Vec<u8>,
 ) -> StringTable {
-    register_side_table_strings(per_func, name_blob, |st| st.enum_info.as_ref())
+    register_side_table_strings(
+        per_func,
+        name_blob,
+        |plan| plan.enum_infos().collect(),
+        |st| st.enum_info.as_ref(),
+    )
 }
 
 /// Build the enum-info side-table blob. Thin wrapper over
 /// [`build_side_table_blob`] tied to the `enum-info` record + the
 /// `enum_info` field on [`SideTableInfo`].
+///
+/// Today's plans have at most one `EnumCase` per param (enum is a
+/// primitive at the param level — only nested-in-record enums could
+/// produce multiple, and that's not yet supported). When that lands,
+/// the per-plan extractor will need to surface multiple infos per
+/// plan, with the side-table builder appending contiguous ranges
+/// per plan-cell.
 pub(super) fn build_enum_info_blob(
     per_func: &[FuncDispatch],
     strings: &StringTable,
@@ -564,6 +827,7 @@ pub(super) fn build_enum_info_blob(
             entry_layout: &schema.enum_info_layout,
             item_name_field: ENUM_INFO_CASE_NAME,
         },
+        |plan| plan.enum_infos().next(),
         |st| st.enum_info.as_ref(),
     )
 }
@@ -630,24 +894,81 @@ pub(super) fn alloc_wrapper_locals(
     }
 }
 
-/// Emit the wasm to lift one param into the cell at `lcl.addr`.
+/// Emit the wasm that lifts one param into its cells slab. Walks
+/// `param.plan.cells` in allocation order and, for each cell, sets
+/// `lcl.addr` to that cell's absolute address (`cells_offset + i *
+/// cell_size`) and dispatches on the cell's variant.
 pub(super) fn emit_lift_param(
     f: &mut Function,
     cell_layout: &CellLayout,
-    p: &ParamLift,
+    cells_offset: u32,
+    plan: &LiftPlan,
+    record_info_indices: &[Option<u32>],
     lcl: &WrapperLocals,
 ) {
-    emit_lift_kind(
-        f,
-        cell_layout,
-        p.kind,
-        p.first_local,
-        p.first_local + 1,
-        lcl,
-    );
+    debug_assert_eq!(record_info_indices.len(), plan.cells.len());
+    for (cell_idx, op) in plan.cells.iter().enumerate() {
+        let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
+        f.instructions().i32_const(cell_addr as i32);
+        f.instructions().local_set(lcl.addr);
+        emit_cell_op(f, cell_layout, op, record_info_indices[cell_idx], lcl);
+    }
 }
 
-/// Shared lift body for params and direct-return results. `slot0` /
+/// Emit one cell's worth of wasm at the address held in `lcl.addr`.
+///
+/// `record_info_idx` is the side-table index for `CellOp::RecordOf`
+/// cells (set by the layout phase via the static record-info builder
+/// — adapter-build-time-known, emitted as `i32.const`). Other cells
+/// don't read it.
+fn emit_cell_op(
+    f: &mut Function,
+    cell_layout: &CellLayout,
+    op: &CellOp,
+    record_info_idx: Option<u32>,
+    lcl: &WrapperLocals,
+) {
+    let addr = lcl.addr;
+    match op {
+        CellOp::Bool { local } => cell_layout.emit_bool(f, addr, local.resolve(lcl)),
+        CellOp::IntegerSignExt { local } => {
+            f.instructions().local_get(local.resolve(lcl));
+            f.instructions().i64_extend_i32_s();
+            f.instructions().local_set(lcl.ext64);
+            cell_layout.emit_integer(f, addr, lcl.ext64);
+        }
+        CellOp::IntegerZeroExt { local } => {
+            f.instructions().local_get(local.resolve(lcl));
+            f.instructions().i64_extend_i32_u();
+            f.instructions().local_set(lcl.ext64);
+            cell_layout.emit_integer(f, addr, lcl.ext64);
+        }
+        CellOp::Integer64 { local } => cell_layout.emit_integer(f, addr, local.resolve(lcl)),
+        CellOp::FloatingF32 { local } => {
+            f.instructions().local_get(local.resolve(lcl));
+            f.instructions().f64_promote_f32();
+            f.instructions().local_set(lcl.ext_f64);
+            cell_layout.emit_floating(f, addr, lcl.ext_f64);
+        }
+        CellOp::FloatingF64 { local } => cell_layout.emit_floating(f, addr, local.resolve(lcl)),
+        CellOp::Text { ptr, len } => {
+            cell_layout.emit_text(f, addr, ptr.resolve(lcl), len.resolve(lcl));
+        }
+        CellOp::Bytes { ptr, len } => {
+            cell_layout.emit_bytes(f, addr, ptr.resolve(lcl), len.resolve(lcl));
+        }
+        CellOp::EnumCase { local, .. } => {
+            cell_layout.emit_enum_case(f, addr, local.resolve(lcl));
+        }
+        CellOp::RecordOf { .. } => {
+            let idx = record_info_idx
+                .expect("record-info index missing — layout phase didn't backfill RecordOf cell");
+            cell_layout.emit_record_of(f, addr, idx);
+        }
+    }
+}
+
+/// Shared lift body for direct-return result values. `slot0` /
 /// `slot1` are wasm locals carrying the source value(s); for single-
 /// slot kinds only `slot0` is used. Multi-slot kinds (Text/Bytes)
 /// expect `(ptr, len)` in (slot0, slot1).
@@ -661,7 +982,6 @@ fn emit_lift_kind(
 ) {
     let addr = lcl.addr;
     match kind {
-        // ── Wired primitives ─────────────────────────────────────
         LiftKind::Bool => cell_layout.emit_bool(f, addr, slot0),
         LiftKind::IntegerSignExt => {
             f.instructions().local_get(slot0);
@@ -685,43 +1005,13 @@ fn emit_lift_kind(
         LiftKind::FloatingF64 => cell_layout.emit_floating(f, addr, slot0),
         LiftKind::Text => cell_layout.emit_text(f, addr, slot0, slot1),
         LiftKind::Bytes => cell_layout.emit_bytes(f, addr, slot0, slot1),
-
-        // ── Direct one-shot dispatch (single cells.rs call) ──
-        LiftKind::Char => cell_layout.emit_char(f, addr, slot0),
-        LiftKind::Record => cell_layout.emit_record_of(f, addr, slot0),
-        LiftKind::Flags => cell_layout.emit_flags_set(f, addr, slot0),
         LiftKind::Enum => cell_layout.emit_enum_case(f, addr, slot0),
-        LiftKind::Handle => cell_layout.emit_resource_handle(f, addr, slot0),
-        LiftKind::Future => cell_layout.emit_future_handle(f, addr, slot0),
-        LiftKind::Stream => cell_layout.emit_stream_handle(f, addr, slot0),
-
-        // ── Multi-cell or runtime-disc dispatch — orchestration
-        // belongs HERE, not at the cells.rs level. Each todo!()
-        // names what the implementer needs to wire.
-        LiftKind::ListOf => {
-            let _ = (slot0, slot1);
-            todo!(
-                "Phase 2-2b: list<T> lift — recurse on element type, allocate a u32-index \
-                 array, populate with child cell indices, then `cell_layout.emit_list_of(...)`"
-            )
-        }
-        LiftKind::TupleOf => todo!(
-            "Phase 2-2b: tuple lift — same shape as list, but child indices come from \
-             per-element classification + lift, no element recursion"
+        // Compound result lifts aren't yet supported; classify_result_lift
+        // returns None for these so we never reach here at emit time.
+        kind => unreachable!(
+            "emit_lift_kind reached unsupported result kind {kind:?} — \
+             classify_result_lift should have filtered it"
         ),
-        LiftKind::Option => todo!(
-            "Phase 2-2b: option<T> lift — read disc; if some, recurse on inner + \
-             `emit_option_some`; if none, `emit_option_none`"
-        ),
-        LiftKind::Result => todo!(
-            "Phase 2-2b: result<T,E> lift — read disc; for ok/err, recurse on payload + \
-             `emit_result_ok` / `emit_result_err`"
-        ),
-        LiftKind::Variant => todo!(
-            "Phase 2-2b: variant lift — read disc; per-case payload classify + lift; \
-             populate variant-info side table; `emit_variant_case(side_table_idx)`"
-        ),
-        LiftKind::ErrorContext => todo!("error-context lift — design TBD"),
     }
 }
 

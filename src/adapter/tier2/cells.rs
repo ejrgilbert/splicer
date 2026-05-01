@@ -165,6 +165,19 @@ impl StoreKind {
     }
 }
 
+/// Where one payload word's value comes from.
+///
+/// Most cells source from a wasm local holding the runtime-lifted
+/// value (`Local`). A few cells — notably `record-of`, where the
+/// side-table index is computed at adapter-build time — source from
+/// an `i32.const` (`ConstI32`); pre-materializing the constant into
+/// a wasm local first would just be wasted instructions.
+#[derive(Clone, Copy)]
+enum PayloadSource {
+    Local(u32),
+    ConstI32(i32),
+}
+
 /// One value to write into a cell's payload area.
 ///
 /// Callers describe each cell as a list of these — the loop in
@@ -173,10 +186,10 @@ impl StoreKind {
 /// `addr + PAYLOAD_OFFSET + offset`).
 #[derive(Clone, Copy)]
 struct PayloadPart {
-    /// Local holding the value to store (must already be of the type
-    /// `kind` expects — caller is responsible for any narrowing /
-    /// extension before reaching here).
-    local: u32,
+    /// Source for the value being stored. Must already match the
+    /// type `kind` expects — caller is responsible for any narrowing
+    /// or extension before reaching here.
+    source: PayloadSource,
     kind: StoreKind,
     /// Byte offset within the payload area.
     offset: u32,
@@ -198,7 +211,14 @@ impl CellLayout {
         // Payload parts.
         for part in parts {
             f.instructions().local_get(addr_local);
-            f.instructions().local_get(part.local);
+            match part.source {
+                PayloadSource::Local(l) => {
+                    f.instructions().local_get(l);
+                }
+                PayloadSource::ConstI32(c) => {
+                    f.instructions().i32_const(c);
+                }
+            }
             let mem = MemArg {
                 offset: self.payload_offset + part.offset as u64,
                 align: part.kind.natural_align(),
@@ -225,7 +245,7 @@ impl CellLayout {
             addr_local,
             disc,
             &[PayloadPart {
-                local: payload_local,
+                source: PayloadSource::Local(payload_local),
                 kind,
                 offset: 0,
             }],
@@ -369,9 +389,19 @@ impl CellLayout {
     }
 
     /// `cell::record-of(u32)` — index into `field-tree.record-infos`.
+    /// The side-table index is adapter-build-time-known, so we emit it
+    /// as an `i32.const` rather than a local-load.
     pub(crate) fn emit_record_of(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
-        let _ = (f, addr_local, side_table_idx);
-        todo!("Phase 2-2b: cell::record-of — disc 11 + i32 record-info side-table index");
+        self.emit_cell(
+            f,
+            addr_local,
+            cell_disc::RECORD_OF,
+            &[PayloadPart {
+                source: PayloadSource::ConstI32(side_table_idx as i32),
+                kind: StoreKind::I32,
+                offset: 0,
+            }],
+        );
     }
 
     /// `cell::flags-set(u32)` — index into `field-tree.flags-infos`.
@@ -381,15 +411,17 @@ impl CellLayout {
     }
 
     /// `cell::enum-case(u32)` — index into `field-tree.enum-infos`.
-    /// Caller passes a local holding the side-table index; we write
-    /// disc 13 at offset 0 and the i32 index at the payload offset.
+    /// Caller passes a local holding the side-table index (the runtime
+    /// disc value, since enum-info entries are laid out per-case in
+    /// disc order); we write disc 13 at offset 0 and the i32 index at
+    /// the payload offset.
     pub(crate) fn emit_enum_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
         self.emit_cell(
             f,
             addr_local,
             cell_disc::ENUM_CASE,
             &[PayloadPart {
-                local: side_table_idx,
+                source: PayloadSource::Local(side_table_idx),
                 kind: StoreKind::I32,
                 offset: 0,
             }],
@@ -442,12 +474,12 @@ impl CellLayout {
 fn ptr_len_parts(ptr_local: u32, len_local: u32) -> [PayloadPart; 2] {
     [
         PayloadPart {
-            local: ptr_local,
+            source: PayloadSource::Local(ptr_local),
             kind: StoreKind::I32,
             offset: 0,
         },
         PayloadPart {
-            local: len_local,
+            source: PayloadSource::Local(len_local),
             kind: StoreKind::I32,
             offset: 4,
         },
