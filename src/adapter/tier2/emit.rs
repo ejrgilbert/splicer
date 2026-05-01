@@ -29,9 +29,11 @@ use wasm_encoder::{
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
 use wit_parser::abi::{AbiVariant, WasmSignature};
 use wit_parser::{
-    Function as WitFunction, InterfaceId, LiftLowerAbi, ManglingAndAbi, Resolve, SizeAlign, Type,
-    TypeId, WasmExport, WasmExportKind, WasmImport, WorldId, WorldItem, WorldKey,
+    Function as WitFunction, InterfaceId, Mangling, Resolve, SizeAlign, Type, TypeId, WasmExport,
+    WasmExportKind, WasmImport, WorldId, WorldItem, WorldKey,
 };
+
+use wit_bindgen_core::abi::lift_from_memory;
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
@@ -39,8 +41,12 @@ use super::super::abi::emit::{
     emit_wrapper_return, empty_function, option_payload_offset, val_types, RecordLayout,
     EXPORT_CABI_REALLOC, EXPORT_INITIALIZE, EXPORT_MEMORY, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
+use super::super::abi::WasmEncoderBindgen;
+use super::super::indices::FunctionIndices;
 use super::super::mem_layout::StaticLayout;
-use super::super::resolve::{decode_input_resolve, find_target_interface};
+use super::super::resolve::{
+    decode_input_resolve, dispatch_mangling, find_target_interface, hook_callback_mangling,
+};
 use super::cells::CellLayout;
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
@@ -108,14 +114,6 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
     if iface.functions.is_empty() {
         bail!("interface has no functions");
     }
-    for (name, func) in &iface.functions {
-        if func.kind.is_async() {
-            bail!(
-                "tier-2 first slice doesn't yet support async target functions; \
-                 `{name}` is async"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -153,7 +151,22 @@ fn synthesize_adapter_world_wit(
 /// `(iface, fn)` strings shared from the same name blob — the
 /// interface name is allocated once and reused; each function's name
 /// gets its own slot.
+/// `task.return` import for one async target function. The wrapper
+/// body calls this at the end of an async dispatch to publish the
+/// result.
+struct TaskReturnImport {
+    module: String,
+    name: String,
+    sig: WasmSignature,
+}
+
 struct FuncDispatch {
+    is_async: bool,
+    /// `task.return` import; `Some` iff `is_async`.
+    task_return: Option<TaskReturnImport>,
+    /// WIT result type, kept around so async wrappers can drive
+    /// `lift_from_memory` to flat-load the result for `task.return`.
+    result_ty: Option<Type>,
     import_module: String,
     import_field: String,
     export_name: String,
@@ -621,7 +634,6 @@ fn build_per_func_dispatches(
     name_blob: &mut Vec<u8>,
 ) -> Result<Vec<FuncDispatch>> {
     let target_world_key = WorldKey::Interface(target_iface);
-    let sync_mangling = ManglingAndAbi::Legacy(LiftLowerAbi::Sync);
     let mut per_func: Vec<FuncDispatch> = Vec::with_capacity(funcs.len());
 
     for func in funcs {
@@ -630,28 +642,48 @@ fn build_per_func_dispatches(
         name_blob.extend_from_slice(func.name.as_bytes());
 
         let params_lift = classify_func_params(resolve, func, name_blob)?;
+        let is_async = func.kind.is_async();
+        let (import_variant, export_variant) = if is_async {
+            (
+                AbiVariant::GuestImportAsync,
+                AbiVariant::GuestExportAsyncStackful,
+            )
+        } else {
+            (AbiVariant::GuestImport, AbiVariant::GuestExport)
+        };
+        let mangling = dispatch_mangling(is_async);
 
         let (import_module, import_field) = resolve.wasm_import_name(
-            sync_mangling,
+            mangling,
             WasmImport::Func {
                 interface: Some(&target_world_key),
                 func,
             },
         );
         let export_name = resolve.wasm_export_name(
-            sync_mangling,
+            mangling,
             WasmExport::Func {
                 interface: Some(&target_world_key),
                 func,
                 kind: WasmExportKind::Normal,
             },
         );
-        let export_sig = resolve.wasm_signature(AbiVariant::GuestExport, func);
-        let import_sig = resolve.wasm_signature(AbiVariant::GuestImport, func);
-        let needs_cabi_post = export_sig.retptr;
-        let result_lift = classify_result_lift(resolve, func, &export_sig);
+        let export_sig = resolve.wasm_signature(export_variant, func);
+        let import_sig = resolve.wasm_signature(import_variant, func);
+        // Async exports never need cabi_post (results land via
+        // task.return, not a callee-allocated buffer).
+        let needs_cabi_post = !is_async && export_sig.retptr;
+        let result_lift = classify_result_lift(resolve, func, &export_sig, &import_sig, is_async);
+        let task_return = is_async.then(|| {
+            let (module, name, sig) =
+                func.task_return_import(resolve, Some(&target_world_key), Mangling::Legacy);
+            TaskReturnImport { module, name, sig }
+        });
 
         per_func.push(FuncDispatch {
+            is_async,
+            task_return,
+            result_ty: func.result,
             import_module,
             import_field,
             export_name,
@@ -707,13 +739,23 @@ fn classify_func_params(
 /// primitive returns capture into `result_local`; string / `list<u8>`
 /// returns ride retptr. Compound returns we don't yet lift get
 /// `None` → `option::none` at runtime.
+///
+/// For async funcs canon-lower-async always retptr's a non-void
+/// result, so even primitive results live at the retptr scratch.
 fn classify_result_lift(
     resolve: &Resolve,
     func: &WitFunction,
     export_sig: &WasmSignature,
+    import_sig: &WasmSignature,
+    is_async: bool,
 ) -> Option<ResultLift> {
     let kind = LiftKind::classify(func.result.as_ref()?, resolve)?;
-    if export_sig.retptr {
+    let result_at_retptr = if is_async {
+        import_sig.retptr
+    } else {
+        export_sig.retptr
+    };
+    if result_at_retptr {
         Some(ResultLift::RetptrPair {
             kind,
             retptr_offset: 0, // back-filled by the layout phase.
@@ -826,10 +868,11 @@ fn build_dispatch_module(
         &mut module,
         &per_func,
         &func_idx,
+        &schema,
+        resolve,
         iface_name_offset,
         iface_name_len,
         plan.hook_params_ptr as i32,
-        &schema.cell_layout,
         plan.on_call_offs.as_ref(),
     );
     emit_data_section(&mut module, &plan.data_segments);
@@ -905,7 +948,7 @@ fn find_tier2_hook(resolve: &Resolve, world_id: WorldId, target_iface: &str) -> 
                 .next()
                 .ok_or_else(|| anyhow!("`{target_iface}` has no functions"))?;
             let (module, name) = resolve.wasm_import_name(
-                ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
+                hook_callback_mangling(),
                 WasmImport::Func {
                     interface: Some(key),
                     func,
@@ -939,6 +982,8 @@ struct TypeIndices {
     cabi_post_ty: u32,
     cabi_realloc_ty: u32,
     async_types: canon_async::AsyncTypes,
+    /// Per-async-func `task.return` type; `Some(idx)` iff `is_async`.
+    task_return_ty: Vec<Option<u32>>,
 }
 
 fn emit_type_section(
@@ -992,6 +1037,20 @@ fn emit_type_section(
         vec![ValType::I32],
     );
 
+    // Per-async-fn `task.return` types. Allocated BEFORE the canon-
+    // async runtime types so `alloc_one` (which captures `next_ty`)
+    // is still the sole borrower; the runtime-types closure also
+    // captures `next_ty` and the borrow checker rejects two
+    // simultaneous mutable captures.
+    let task_return_ty: Vec<Option<u32>> = per_func
+        .iter()
+        .map(|fd| {
+            fd.task_return.as_ref().map(|tr| {
+                alloc_one(&mut types, val_types(&tr.sig.params), val_types(&tr.sig.results))
+            })
+        })
+        .collect();
+
     let async_types = canon_async::emit_types(&mut types, || {
         let i = next_ty;
         next_ty += 1;
@@ -1008,6 +1067,7 @@ fn emit_type_section(
         cabi_post_ty,
         cabi_realloc_ty,
         async_types,
+        task_return_ty,
     }
 }
 
@@ -1016,6 +1076,8 @@ struct FuncIndices {
     before_hook_idx: Option<u32>,
     after_hook_idx: Option<u32>,
     async_funcs: canon_async::AsyncFuncs,
+    /// Per-async-func `task.return` import index.
+    task_return_idx: Vec<Option<u32>>,
     wrapper_base: u32,
     init_idx: u32,
     cabi_realloc_idx: u32,
@@ -1057,6 +1119,24 @@ fn emit_imports_and_funcs(
         i
     });
 
+    // Per-async-fn `task.return` imports. Mirrors tier-1's order:
+    // imports come AFTER the canon-async runtime intrinsics. `Some`
+    // iff the func is async.
+    let mut task_return_idx: Vec<Option<u32>> = vec![None; per_func.len()];
+    for (i, fd) in per_func.iter().enumerate() {
+        if let Some(tr) = &fd.task_return {
+            let ty_idx = ty
+                .task_return_ty
+                .get(i)
+                .copied()
+                .flatten()
+                .expect("async func must have task.return type allocated");
+            imports.import(&tr.module, &tr.name, EntityType::Function(ty_idx));
+            task_return_idx[i] = Some(next_imp);
+            next_imp += 1;
+        }
+    }
+
     module.section(&imports);
 
     let wrapper_base = next_imp;
@@ -1083,6 +1163,7 @@ fn emit_imports_and_funcs(
         before_hook_idx,
         after_hook_idx,
         async_funcs,
+        task_return_idx,
         wrapper_base,
         init_idx,
         cabi_realloc_idx,
@@ -1154,124 +1235,28 @@ fn emit_code_section(
     module: &mut Module,
     per_func: &[FuncDispatch],
     func_idx: &FuncIndices,
+    schema: &SchemaLayouts,
+    resolve: &Resolve,
     iface_name_offset: i32,
     iface_name_len: i32,
     hook_params_ptr: i32,
-    cell_layout: &CellLayout,
     on_call_offs: Option<&OnCallParamOffsets>,
 ) {
-    let async_funcs = &func_idx.async_funcs;
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
-        // Locals beyond the wasm sig params:
-        //   $addr        i32 — scratch for the cell write address
-        //   $st          i32 — packed status from canon-async hook
-        //   $ws          i32 — waitable-set handle for the wait loop
-        //   $ptr_scratch i32 — retptr-loaded ptr for Text/Bytes lift
-        //   $len_scratch i32 — retptr-loaded len for Text/Bytes lift
-        //   $ext64       i64 — widened source for IntegerSignExt/ZeroExt
-        //   $ext_f64     f64 — promoted source for FloatingF32
-        //   $result      (typed) — direct-return value, when present
-        let nparams = fd.export_sig.params.len() as u32;
-        let addr = nparams;
-        let st = nparams + 1;
-        let ws = nparams + 2;
-        let ptr_scratch = nparams + 3;
-        let len_scratch = nparams + 4;
-        let ext64 = nparams + 5;
-        let ext_f64 = nparams + 6;
-        let result_local = direct_return_type(&fd.export_sig).map(|_| nparams + 7);
-        let mut local_groups: Vec<(u32, ValType)> = vec![
-            (5, ValType::I32),
-            (1, ValType::I64),
-            (1, ValType::F64),
-        ];
-        if let Some(t) = direct_return_type(&fd.export_sig) {
-            local_groups.push((1, t));
-        }
-        let mut f = Function::new(local_groups);
-
-        // ── Phase 1: on-call (only if before-hook wired) ──
-        if let Some(before_idx) = func_idx.before_hook_idx {
-            for (p_idx, p) in fd.params.iter().enumerate() {
-                let cell_addr =
-                    fd.cells_buf_offset as i32 + p_idx as i32 * cell_layout.size as i32;
-                f.instructions().i32_const(cell_addr);
-                f.instructions().local_set(addr);
-                emit_lift_param(&mut f, cell_layout, p, addr, ext64, ext_f64);
-            }
-            let nargs = fd.params.len() as i32;
-            let args_ptr = if nargs == 0 {
-                0
-            } else {
-                fd.fields_buf_offset as i32
-            };
-            emit_populate_hook_params(
-                &mut f,
-                hook_params_ptr,
-                on_call_offs.expect("before-hook wired → on-call layout computed"),
-                iface_name_offset,
-                iface_name_len,
-                fd.fn_name_offset,
-                fd.fn_name_len,
-                args_ptr,
-                nargs,
-            );
-            f.instructions().i32_const(hook_params_ptr);
-            canon_async::emit_call_and_wait(&mut f, before_idx, st, ws, async_funcs);
-        }
-
-        // ── Phase 2: forward to handler. Bridges callee-returns ↔
-        // caller-allocates for compound results via the shared
-        // abi/emit helpers.
-        emit_handler_call(
-            &mut f,
-            nparams,
-            fd.import_sig.retptr,
-            fd.retptr_offset,
-            func_idx.handler_imp_base + i as u32,
+        emit_wrapper_function(
+            &mut code,
+            per_func,
+            func_idx,
+            schema,
+            resolve,
+            iface_name_offset,
+            iface_name_len,
+            hook_params_ptr,
+            on_call_offs,
+            i,
+            fd,
         );
-        if let Some(local) = result_local {
-            f.instructions().local_set(local);
-        }
-
-        // ── Phase 3: on-return (only if after-hook wired) ──
-        if let Some(after_idx) = func_idx.after_hook_idx {
-            // Lift the result into result_cells_buf[0] when we have
-            // one. Void / unsupported compound returns leave the
-            // pre-built `option::none` disc in place; nothing to do.
-            if let (Some(rl), Some(cells_off)) =
-                (fd.result_lift, fd.result_cells_buf_offset)
-            {
-                f.instructions().i32_const(cells_off as i32);
-                f.instructions().local_set(addr);
-                emit_lift_result(
-                    &mut f,
-                    cell_layout,
-                    rl,
-                    addr,
-                    ext64,
-                    ext_f64,
-                    ptr_scratch,
-                    len_scratch,
-                    result_local,
-                );
-            }
-            f.instructions().i32_const(
-                fd.after_params_offset
-                    .expect("has_after → after_params_offset set"),
-            );
-            canon_async::emit_call_and_wait(&mut f, after_idx, st, ws, async_funcs);
-        }
-
-        emit_wrapper_return(
-            &mut f,
-            result_local,
-            fd.export_sig.retptr,
-            fd.retptr_offset,
-        );
-        f.instructions().end();
-        code.function(&f);
     }
     code.function(&empty_function());
     for fd in per_func {
@@ -1281,6 +1266,230 @@ fn emit_code_section(
     }
     emit_cabi_realloc(&mut code);
     module.section(&code);
+}
+
+/// Locals used by the wrapper body. Allocated once up front so all
+/// downstream emit phases (param lift, hook calls, result lift, async
+/// task.return load) reference the same indices.
+struct WrapperLocals {
+    /// Scratch for the cell write address.
+    addr: u32,
+    /// Packed status from canon-async hook calls.
+    st: u32,
+    /// Waitable-set handle for the wait loop.
+    ws: u32,
+    /// Retptr-loaded ptr for Text/Bytes result lift.
+    ptr_scratch: u32,
+    /// Retptr-loaded len for Text/Bytes result lift.
+    len_scratch: u32,
+    /// i64 widening source for IntegerSignExt/ZeroExt.
+    ext64: u32,
+    /// f64 promoted source for FloatingF32.
+    ext_f64: u32,
+    /// Direct-return value when the export sig has a single flat
+    /// result; `None` otherwise.
+    result: Option<u32>,
+    /// Address local that drives `lift_from_memory` for async
+    /// `task.return` flat loads. `None` for sync, void async, and
+    /// async with retptr-passthrough task.return.
+    tr_addr: Option<u32>,
+}
+
+fn alloc_wrapper_locals(locals: &mut FunctionIndices, fd: &FuncDispatch) -> WrapperLocals {
+    let addr = locals.alloc_local(ValType::I32);
+    let st = locals.alloc_local(ValType::I32);
+    let ws = locals.alloc_local(ValType::I32);
+    let ptr_scratch = locals.alloc_local(ValType::I32);
+    let len_scratch = locals.alloc_local(ValType::I32);
+    let ext64 = locals.alloc_local(ValType::I64);
+    let ext_f64 = locals.alloc_local(ValType::F64);
+    let result = direct_return_type(&fd.export_sig).map(|t| locals.alloc_local(t));
+    // Async with a non-retptr-passthrough task.return needs an
+    // i32 addr local so `lift_from_memory` can flat-load result
+    // values out of the retptr scratch.
+    let tr_uses_flat_loads = fd
+        .task_return
+        .as_ref()
+        .is_some_and(|tr| !tr.sig.indirect_params && fd.result_ty.is_some());
+    let tr_addr = tr_uses_flat_loads.then(|| locals.alloc_local(ValType::I32));
+    WrapperLocals {
+        addr,
+        st,
+        ws,
+        ptr_scratch,
+        len_scratch,
+        ext64,
+        ext_f64,
+        result,
+        tr_addr,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_wrapper_function(
+    code: &mut CodeSection,
+    per_func: &[FuncDispatch],
+    func_idx: &FuncIndices,
+    schema: &SchemaLayouts,
+    resolve: &Resolve,
+    iface_name_offset: i32,
+    iface_name_len: i32,
+    hook_params_ptr: i32,
+    on_call_offs: Option<&OnCallParamOffsets>,
+    i: usize,
+    fd: &FuncDispatch,
+) {
+    let async_funcs = &func_idx.async_funcs;
+    let nparams = fd.export_sig.params.len() as u32;
+    let mut locals = FunctionIndices::new(nparams);
+    let lcl = alloc_wrapper_locals(&mut locals, fd);
+
+    // For async funcs whose `task.return` takes flat-form params,
+    // pre-build the load sequence — `lift_from_memory` may allocate
+    // additional bindgen scratch locals, which must happen before
+    // the locals list is frozen below.
+    let task_return_loads: Option<Vec<wasm_encoder::Instruction<'static>>> =
+        lcl.tr_addr.map(|addr_local| {
+            let result_ty = fd.result_ty.as_ref().expect("flat loads → result_ty");
+            let mut bindgen =
+                WasmEncoderBindgen::new(&schema.size_align, addr_local, &mut locals);
+            lift_from_memory(resolve, &mut bindgen, (), result_ty);
+            bindgen.into_instructions()
+        });
+
+    let mut f = Function::new_with_locals_types(locals.into_locals());
+
+    // ── Phase 1: on-call (only if before-hook wired) ──
+    if let Some(before_idx) = func_idx.before_hook_idx {
+        for (p_idx, p) in fd.params.iter().enumerate() {
+            let cell_addr =
+                fd.cells_buf_offset as i32 + p_idx as i32 * schema.cell_layout.size as i32;
+            f.instructions().i32_const(cell_addr);
+            f.instructions().local_set(lcl.addr);
+            emit_lift_param(&mut f, &schema.cell_layout, p, lcl.addr, lcl.ext64, lcl.ext_f64);
+        }
+        let nargs = fd.params.len() as i32;
+        let args_ptr = if nargs == 0 {
+            0
+        } else {
+            fd.fields_buf_offset as i32
+        };
+        emit_populate_hook_params(
+            &mut f,
+            hook_params_ptr,
+            on_call_offs.expect("before-hook wired → on-call layout computed"),
+            iface_name_offset,
+            iface_name_len,
+            fd.fn_name_offset,
+            fd.fn_name_len,
+            args_ptr,
+            nargs,
+        );
+        f.instructions().i32_const(hook_params_ptr);
+        canon_async::emit_call_and_wait(&mut f, before_idx, lcl.st, lcl.ws, async_funcs);
+    }
+
+    // ── Phase 2: forward to handler. Bridges callee-returns ↔
+    // caller-allocates for compound results via the shared
+    // abi/emit helpers. For async, the import returns a packed
+    // canon-lower-async status that we wait on.
+    emit_handler_call(
+        &mut f,
+        nparams,
+        fd.import_sig.retptr,
+        fd.retptr_offset,
+        func_idx.handler_imp_base + i as u32,
+    );
+    if fd.is_async {
+        f.instructions().local_set(lcl.st);
+        canon_async::emit_wait_loop(&mut f, lcl.st, lcl.ws, async_funcs);
+    } else if let Some(local) = lcl.result {
+        f.instructions().local_set(local);
+    }
+
+    // ── Phase 3: on-return (only if after-hook wired) ──
+    if let Some(after_idx) = func_idx.after_hook_idx {
+        if let (Some(rl), Some(cells_off)) =
+            (fd.result_lift, fd.result_cells_buf_offset)
+        {
+            f.instructions().i32_const(cells_off as i32);
+            f.instructions().local_set(lcl.addr);
+            emit_lift_result(
+                &mut f,
+                &schema.cell_layout,
+                rl,
+                lcl.addr,
+                lcl.ext64,
+                lcl.ext_f64,
+                lcl.ptr_scratch,
+                lcl.len_scratch,
+                lcl.result,
+            );
+        }
+        f.instructions().i32_const(
+            fd.after_params_offset
+                .expect("has_after → after_params_offset set"),
+        );
+        canon_async::emit_call_and_wait(&mut f, after_idx, lcl.st, lcl.ws, async_funcs);
+    }
+
+    // ── Phase 4: tail. Async fns publish the result via task.return;
+    // sync fns return the direct value (or static retptr).
+    if fd.is_async {
+        emit_task_return(&mut f, fd, func_idx, i, &lcl, task_return_loads.as_deref());
+    } else {
+        emit_wrapper_return(
+            &mut f,
+            lcl.result,
+            fd.export_sig.retptr,
+            fd.retptr_offset,
+        );
+    }
+    f.instructions().end();
+    code.function(&f);
+    let _ = per_func; // (unused for now; kept on the signature for symmetry)
+}
+
+/// Emit the async tail: call `task.return` with the appropriate
+/// args. Three shapes:
+/// - void result → no args.
+/// - `tr_sig.indirect_params` (compound result) → push retptr scratch.
+/// - flat result → load each value from retptr via the pre-built
+///   `lift_from_memory` instruction sequence.
+fn emit_task_return(
+    f: &mut Function,
+    fd: &FuncDispatch,
+    func_idx: &FuncIndices,
+    i: usize,
+    lcl: &WrapperLocals,
+    task_return_loads: Option<&[wasm_encoder::Instruction<'static>]>,
+) {
+    let imp_task_return = func_idx.task_return_idx[i]
+        .expect("async func must have task.return import");
+    let tr = fd
+        .task_return
+        .as_ref()
+        .expect("async func must have task_return descriptor");
+    if fd.result_ty.is_none() {
+        f.instructions().call(imp_task_return);
+    } else if tr.sig.indirect_params {
+        f.instructions().i32_const(
+            fd.retptr_offset
+                .expect("async non-void result → retptr_offset"),
+        );
+        f.instructions().call(imp_task_return);
+    } else {
+        let addr_local = lcl.tr_addr.expect("flat loads → tr_addr local");
+        f.instructions().i32_const(
+            fd.retptr_offset
+                .expect("async non-void result → retptr_offset"),
+        );
+        f.instructions().local_set(addr_local);
+        for inst in task_return_loads.expect("flat loads → instruction sequence") {
+            f.instruction(inst);
+        }
+        f.instructions().call(imp_task_return);
+    }
 }
 
 /// Emit the wasm to lift one param into the cell at `addr_local`.

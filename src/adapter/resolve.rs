@@ -5,7 +5,38 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::{decode, DecodedWasm};
-use wit_parser::{InterfaceId, Resolve};
+use wit_parser::{InterfaceId, LiftLowerAbi, ManglingAndAbi, Resolve};
+
+// ─── Name-mangling helpers ────────────────────────────────────────
+//
+// `ManglingAndAbi::Legacy` is the only mangling currently supported
+// for the async ABI in wit-parser; `Standard32` exists but is
+// sync-only as of v0.247. Until upstream tools migrate (wit-component,
+// wit-bindgen, wac all emit Legacy-mangled names today), we have to
+// match. These helpers centralize that choice — when the migration
+// happens, every callsite flips at once from one place.
+
+/// Mangling for a target dispatch function: `AsyncStackful` mangling
+/// when the WIT function is `async`, else `Sync`.
+pub(crate) fn dispatch_mangling(is_async: bool) -> ManglingAndAbi {
+    ManglingAndAbi::Legacy(if is_async {
+        LiftLowerAbi::AsyncStackful
+    } else {
+        LiftLowerAbi::Sync
+    })
+}
+
+/// Mangling for canon-async hook imports (tier-1 before/after/blocking,
+/// tier-2 on-call/on-return/on-trap). Always `AsyncCallback`.
+pub(crate) fn hook_callback_mangling() -> ManglingAndAbi {
+    ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback)
+}
+
+/// Mangling for plain sync imports — used by tier-1's resource-drop
+/// import lookup.
+pub(crate) fn sync_mangling() -> ManglingAndAbi {
+    ManglingAndAbi::Legacy(LiftLowerAbi::Sync)
+}
 
 /// Decode the input split's WIT into a [`Resolve`]; bail if the bytes
 /// decode to a WIT package rather than a component. `wit_component::decode`

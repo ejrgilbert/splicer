@@ -24,9 +24,9 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
-    Function as WitFunction, Handle, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
-    ResourceIntrinsic, SizeAlign, Type, TypeDefKind, TypeId, TypeOwner, WasmExport, WasmExportKind,
-    WasmImport, WorldItem, WorldKey,
+    Function as WitFunction, Handle, InterfaceId, Mangling, Resolve, ResourceIntrinsic, SizeAlign,
+    Type, TypeDefKind, TypeId, TypeOwner, WasmExport, WasmExportKind, WasmImport, WorldItem,
+    WorldKey,
 };
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
@@ -38,7 +38,10 @@ use super::super::abi::emit::{
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, FunctionIndices};
 use super::super::mem_layout::MemoryLayoutBuilder;
-use super::super::resolve::{decode_input_resolve, find_target_interface};
+use super::super::resolve::{
+    decode_input_resolve, dispatch_mangling, find_target_interface, hook_callback_mangling,
+    sync_mangling,
+};
 
 /// Generate the adapter component bytes. `target_interface` is the
 /// fully-qualified interface name (`<ns>:<pkg>/<iface>[@<ver>]`);
@@ -427,11 +430,7 @@ fn compute_func_dispatches(
         };
         // Same mangling on both sides → matched `[async-lower]<fn>` /
         // `[async-lift-stackful]<iface>#<fn>` pair (or no prefix for sync).
-        let mangling = ManglingAndAbi::Legacy(if is_async {
-            LiftLowerAbi::AsyncStackful
-        } else {
-            LiftLowerAbi::Sync
-        });
+        let mangling = dispatch_mangling(is_async);
         let (import_module, import_field) = resolve.wasm_import_name(
             mangling,
             WasmImport::Func {
@@ -552,7 +551,7 @@ fn collect_hook_imports(
             // Tier-1 interfaces have exactly one function each.
             let func = resolve.interfaces[*id].functions.values().next()?;
             let (module, name) = resolve.wasm_import_name(
-                ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
+                hook_callback_mangling(),
                 WasmImport::Func {
                     interface: Some(key),
                     func,
@@ -725,8 +724,7 @@ fn emit_imports_section(
                 resource: rid,
                 intrinsic: ResourceIntrinsic::ImportedDrop,
             };
-            let (module_name, field_name) =
-                resolve.wasm_import_name(ManglingAndAbi::Legacy(LiftLowerAbi::Sync), imp);
+            let (module_name, field_name) = resolve.wasm_import_name(sync_mangling(), imp);
             imports.import(&module_name, &field_name, EntityType::Function(drop_ty));
             resource_drop.insert(rid, idx.alloc_func());
         }
