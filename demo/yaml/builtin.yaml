@@ -1,0 +1,27 @@
+version: 1
+
+# Inject splicer's `hello-tier1` builtin before the provider on the
+# logging chain. Builtins ship with the splicer binary; no `path:` is
+# needed.
+rules:
+  - before:
+      interface: wasi:logging/log@0.1.0
+      provider:
+        name: log-provider
+    inject:
+      - builtin: hello-tier1
+
+  # Long form — the same builtin under a custom WAC variable name.
+  # Useful when one rule injects two copies of the same builtin or when
+  # the default name would collide with a user-supplied middleware.
+  # (Commented out here because the short form above already takes the
+  # default `hello-tier1` slot — uncomment after renaming or moving.)
+  #
+  # - between:
+  #     interface: wasi:logging/log@0.1.0
+  #     inner: { name: log-provider }
+  #     outer: { name: app }
+  #   inject:
+  #     - builtin:
+  #         name: hello-tier1
+  #         alias: greeter

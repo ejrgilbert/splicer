@@ -92,6 +92,7 @@
 
 mod adapter;
 mod api;
+mod builtins;
 mod compose;
 mod contract;
 mod parse;

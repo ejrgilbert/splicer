@@ -21,7 +21,56 @@ pub struct ConfigFile {
 pub struct YamlRule {
     before: Option<YamlStrategyBefore>,
     between: Option<YamlStrategyBetween>,
-    inject: Vec<Injection>,
+    inject: Vec<YamlInjection>,
+}
+
+/// Raw YAML shape of an `inject` entry. Either:
+///
+/// - **user form** — `name: <wac-var>` plus optional `path` to a `.wasm`,
+/// - **builtin form** — `builtin:` set to either a scalar name or a map
+///   with `{ name: <builtin>, alias: <wac-var> }` (and, later,
+///   `config: {...}`).
+///
+/// The two forms are mutually exclusive; validation rejects mixed
+/// shapes. Mapped to [`Injection`] after validation.
+#[derive(Debug, Deserialize)]
+pub struct YamlInjection {
+    pub name: Option<String>,
+    pub path: Option<String>,
+    pub builtin: Option<BuiltinSpec>,
+}
+
+/// `inject: [{ builtin: ... }]` payload. Two shapes — short scalar
+/// (just the builtin's name) or a long-form map with optional extras.
+/// The long form will house `config: {...}` once builtins grow that.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum BuiltinSpec {
+    /// `builtin: hello-tier1`
+    Name(String),
+    /// `builtin: { name: hello-tier1, alias: greeter }`
+    Detailed {
+        /// Name of the builtin in the splicer registry.
+        name: String,
+        /// Optional override for the WAC variable name. Defaults to
+        /// `name` when omitted.
+        alias: Option<String>,
+    },
+}
+
+impl BuiltinSpec {
+    fn builtin_name(&self) -> &str {
+        match self {
+            BuiltinSpec::Name(n) => n,
+            BuiltinSpec::Detailed { name, .. } => name,
+        }
+    }
+    fn alias(&self) -> Option<&str> {
+        match self {
+            BuiltinSpec::Name(_) => None,
+            BuiltinSpec::Detailed { alias, .. } => alias.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +125,14 @@ pub struct Injection {
     /// middleware is referenced by name only (contract checks will
     /// produce a warning instead of a definitive result).
     pub path: Option<String>,
+    /// Name of a splicer-shipped builtin middleware (see
+    /// [`crate::builtins`]). Set by the YAML parser when an inject
+    /// entry uses `builtin: <name>`. The splice pipeline materializes
+    /// the embedded bytes to disk and populates [`Injection::path`]
+    /// before contract validation runs, so downstream stages don't
+    /// need to know about builtins.
+    #[serde(skip)]
+    pub builtin: Option<String>,
     /// Populated at runtime by `add_to_inject_plan` when this injection
     /// is resolved as a tier-1 adapter. Not part of the YAML config and
     /// not user-settable — use the `generated_adapters` field on
@@ -92,6 +149,7 @@ impl Injection {
         Self {
             name: name.into(),
             path: Some(path.into()),
+            builtin: None,
             adapter_info: None,
         }
     }
@@ -103,6 +161,20 @@ impl Injection {
         Self {
             name: name.into(),
             path: None,
+            builtin: None,
+            adapter_info: None,
+        }
+    }
+
+    /// Construct an [`Injection`] referencing a splicer-shipped builtin
+    /// by name. The splice pipeline materializes the embedded bytes
+    /// before contract validation runs.
+    pub fn from_builtin(builtin: impl Into<String>) -> Self {
+        let name = builtin.into();
+        Self {
+            name: name.clone(),
+            path: None,
+            builtin: Some(name),
             adapter_info: None,
         }
     }
@@ -137,6 +209,25 @@ pub enum SpliceRule {
         /// Middleware to inject (in order).
         inject: Vec<Injection>,
     },
+}
+
+impl SpliceRule {
+    /// The injection list for this rule. Both variants always carry
+    /// one — only the matching strategy around it differs.
+    pub fn inject(&self) -> &[Injection] {
+        match self {
+            SpliceRule::Before { inject, .. } | SpliceRule::Between { inject, .. } => inject,
+        }
+    }
+
+    /// Mutable view of the injection list, for callers that need to
+    /// rewrite entries in place (e.g. resolving builtins to disk
+    /// paths).
+    pub fn inject_mut(&mut self) -> &mut Vec<Injection> {
+        match self {
+            SpliceRule::Before { inject, .. } | SpliceRule::Between { inject, .. } => inject,
+        }
+    }
 }
 
 impl ConfigFile {
@@ -221,27 +312,66 @@ impl ConfigFile {
             for (j, inj) in rule.inject.iter().enumerate() {
                 let inj_num = j + 1;
 
-                if inj.name.is_empty() {
+                // user form vs builtin form are mutually exclusive.
+                // Builtin form scopes its WAC-var override and (later)
+                // its config inside the `builtin:` map, so top-level
+                // `name`/`path` next to `builtin:` is a misconfig.
+                match (&inj.builtin, &inj.name, &inj.path) {
+                    (None, None, _) => {
+                        bail!("rule {rule_num}, injection {inj_num}: missing 'name' or 'builtin'")
+                    }
+                    (Some(_), Some(_), _) => bail!(
+                        "rule {rule_num}, injection {inj_num}: 'builtin' replaces top-level \
+                         'name' — move the WAC-var override to 'builtin.alias'"
+                    ),
+                    (Some(_), _, Some(_)) => bail!(
+                        "rule {rule_num}, injection {inj_num}: 'builtin' and 'path' are mutually \
+                         exclusive — drop one"
+                    ),
+                    _ => {}
+                }
+                if inj.name.as_deref() == Some("") {
                     bail!("rule {rule_num}, injection {inj_num}: injection name must not be empty");
                 }
-
                 if inj.path.as_deref() == Some("") {
                     bail!(
-                        "rule {rule_num}, injection '{}': 'path' must not be empty if specified \
-                         (omit the key to leave it unset)",
-                        inj.name
+                        "rule {rule_num}, injection {inj_num}: 'path' must not be empty if \
+                         specified (omit the key to leave it unset)"
                     );
+                }
+                if let Some(spec) = &inj.builtin {
+                    if spec.builtin_name().is_empty() {
+                        bail!(
+                            "rule {rule_num}, injection {inj_num}: builtin 'name' must not be \
+                             empty"
+                        );
+                    }
+                    if spec.alias() == Some("") {
+                        bail!(
+                            "rule {rule_num}, injection {inj_num}: builtin 'alias' must not be \
+                             empty if specified (omit the key to leave it unset)"
+                        );
+                    }
                 }
 
+                // Effective WAC-var name for uniqueness: builtin form
+                // uses `alias` falling back to the builtin's name; user
+                // form uses the top-level `name`.
+                let effective_name = if let Some(spec) = &inj.builtin {
+                    spec.alias().unwrap_or_else(|| spec.builtin_name())
+                } else {
+                    inj.name.as_deref().expect("validated above")
+                };
+
                 // Global uniqueness: injection names are used as WAC identifiers.
-                if let Some(first_rule) = seen_names.get(inj.name.as_str()) {
+                if let Some(first_rule) = seen_names.get(effective_name) {
                     bail!(
-                        "injection name '{}' is used in rule {rule_num} but was already declared \
-                         in rule {first_rule}; each injection must have a globally unique name",
-                        inj.name
+                        "injection name '{effective_name}' is used in rule {rule_num} but was \
+                         already declared in rule {first_rule}; each injection must have a \
+                         globally unique name"
                     );
                 }
-                seen_names.insert(&inj.name, rule_num);
+                seen_names.insert(effective_name, rule_num);
             }
         }
 
@@ -260,6 +390,7 @@ impl ConfigFile {
                      between,
                      inject,
                  }| {
+                    let inject = inject.into_iter().map(into_injection).collect();
                     if let Some(YamlStrategyBefore {
                         interface,
                         provider,
@@ -291,6 +422,33 @@ impl ConfigFile {
                 },
             )
             .collect()
+    }
+}
+
+/// Map a validated [`YamlInjection`] to the canonical [`Injection`].
+/// `validate()` has already enforced that exactly one form (user vs
+/// builtin) is set with non-empty names. The builtin form's `alias`
+/// (if any) becomes the WAC variable name; otherwise the builtin's
+/// own name is reused.
+fn into_injection(yaml: YamlInjection) -> Injection {
+    let YamlInjection {
+        name,
+        path,
+        builtin,
+    } = yaml;
+    let (wac_name, builtin_name) = match builtin {
+        Some(spec) => {
+            let bname = spec.builtin_name().to_string();
+            let alias = spec.alias().map(str::to_string);
+            (alias.unwrap_or_else(|| bname.clone()), Some(bname))
+        }
+        None => (name.expect("validated"), None),
+    };
+    Injection {
+        name: wac_name,
+        path,
+        builtin: builtin_name,
+        adapter_info: None,
     }
 }
 
@@ -632,6 +790,160 @@ rules:
       - name: mw-a
 "#,
             "injection name 'mw-a' is used in rule 1 but was already declared in rule 1",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Builtin form
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_builtin_short_form() {
+        // `builtin: <scalar>` — name defaults from the builtin name.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - builtin: hello-tier1
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        assert_eq!(inject.len(), 1);
+        assert_eq!(inject[0].name, "hello-tier1");
+        assert_eq!(inject[0].builtin.as_deref(), Some("hello-tier1"));
+        assert!(inject[0].path.is_none());
+    }
+
+    #[test]
+    fn parse_builtin_long_form_with_alias() {
+        // `builtin: { name: ..., alias: ... }` — alias becomes WAC var.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - builtin:
+          name: hello-tier1
+          alias: greeter
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        assert_eq!(inject[0].name, "greeter");
+        assert_eq!(inject[0].builtin.as_deref(), Some("hello-tier1"));
+    }
+
+    #[test]
+    fn parse_builtin_long_form_no_alias() {
+        // `builtin: { name: ... }` without alias — name defaults from
+        // the builtin name.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - builtin:
+          name: hello-tier1
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        assert_eq!(inject[0].name, "hello-tier1");
+        assert_eq!(inject[0].builtin.as_deref(), Some("hello-tier1"));
+    }
+
+    #[test]
+    fn validate_builtin_with_top_level_name_rejected() {
+        // The builtin form scopes the WAC-var override inside the
+        // `builtin:` map; a top-level `name:` next to it is ambiguous.
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - name: greeter
+        builtin: hello-tier1
+"#,
+            "'builtin' replaces top-level 'name'",
+        );
+    }
+
+    #[test]
+    fn validate_builtin_with_path_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - builtin: hello-tier1
+        path: ./mw.wasm
+"#,
+            "'builtin' and 'path' are mutually exclusive",
+        );
+    }
+
+    #[test]
+    fn validate_neither_name_nor_builtin() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - path: ./mw.wasm
+"#,
+            "missing 'name' or 'builtin'",
+        );
+    }
+
+    #[test]
+    fn validate_builtin_long_form_empty_alias() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - builtin:
+          name: hello-tier1
+          alias: ""
+"#,
+            "builtin 'alias' must not be empty if specified",
+        );
+    }
+
+    #[test]
+    fn validate_duplicate_alias_collides_with_user_name() {
+        // The alias is the WAC var, so it must be globally unique
+        // alongside user middleware names.
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - name: greeter
+        path: ./greeter.wasm
+      - builtin:
+          name: hello-tier1
+          alias: greeter
+"#,
+            "injection name 'greeter' is used in rule 1 but was already declared in rule 1",
         );
     }
 }

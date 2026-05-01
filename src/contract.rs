@@ -271,6 +271,7 @@ mod tests {
         Injection {
             name: name.to_string(),
             adapter_info: None,
+            builtin: None,
             path: None,
         }
     }
@@ -492,6 +493,7 @@ mod tests {
         let inj = Injection {
             name: "mw".to_string(),
             adapter_info: None,
+            builtin: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);
@@ -534,6 +536,7 @@ mod tests {
         let inj = Injection {
             name: "mw".to_string(),
             adapter_info: None,
+            builtin: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);
