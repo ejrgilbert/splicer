@@ -37,44 +37,48 @@
 //! would avoid per-cell realloc traffic; defer until benchmarks
 //! show it matters.
 
+use std::collections::HashMap;
+
 use wasm_encoder::{Function, MemArg};
 use wit_parser::{Resolve, SizeAlign, Type, TypeId};
 
-/// Discriminants for the `cell` variant, in declaration order from
-/// `wit/common/world.wit`. Kept as `pub(crate)` constants rather than
-/// derived at runtime because they're write-once and lookups happen
-/// in tight emit loops.
-#[allow(dead_code)] // many cases not yet used by Phase 2-2a (primitives only)
-pub(crate) mod cell_disc {
-    pub(crate) const BOOL: u8 = 0;
-    pub(crate) const INTEGER: u8 = 1;
-    pub(crate) const FLOATING: u8 = 2;
-    pub(crate) const TEXT: u8 = 3;
-    pub(crate) const BYTES: u8 = 4;
-    pub(crate) const LIST_OF: u8 = 5;
-    pub(crate) const TUPLE_OF: u8 = 6;
-    pub(crate) const OPTION_SOME: u8 = 7;
-    pub(crate) const OPTION_NONE: u8 = 8;
-    pub(crate) const RESULT_OK: u8 = 9;
-    pub(crate) const RESULT_ERR: u8 = 10;
-    pub(crate) const RECORD_OF: u8 = 11;
-    pub(crate) const FLAGS_SET: u8 = 12;
-    pub(crate) const ENUM_CASE: u8 = 13;
-    pub(crate) const VARIANT_CASE: u8 = 14;
-    pub(crate) const RESOURCE_HANDLE: u8 = 15;
-    pub(crate) const STREAM_HANDLE: u8 = 16;
-    pub(crate) const FUTURE_HANDLE: u8 = 17;
-}
+/// `cell` variant case names that the codegen knows how to emit, in
+/// the order they appear in `wit/common/world.wit`. Used by
+/// [`CellLayout::from_resolve`] to validate the WIT and the codegen
+/// agree on the case set — a removal or rename in the WIT fires
+/// loudly here rather than producing wasm that lies about disc values.
+const EXPECTED_CELL_CASES: &[&str] = &[
+    "bool",
+    "integer",
+    "floating",
+    "text",
+    "bytes",
+    "list-of",
+    "tuple-of",
+    "option-some",
+    "option-none",
+    "result-ok",
+    "result-err",
+    "record-of",
+    "flags-set",
+    "enum-case",
+    "variant-case",
+    "resource-handle",
+    "stream-handle",
+    "future-handle",
+];
 
 /// Schema-derived layout of the `cell` variant: total size,
-/// alignment, and the byte offset where each case's payload starts
-/// (variants put all payloads at the same offset). All emit helpers
-/// hang off this struct so the canonical-ABI numbers are read from
-/// the live WIT once and never duplicated.
+/// alignment, the byte offset where each case's payload starts
+/// (variants put all payloads at the same offset), and a map from WIT
+/// case name to discriminant value. All emit helpers hang off this
+/// struct so the canonical-ABI numbers — including the discriminant
+/// ordering — are read from the live WIT once and never duplicated.
 pub(crate) struct CellLayout {
     pub size: u32,
     pub align: u32,
     payload_offset: u64,
+    discs: HashMap<String, u8>,
 }
 
 impl CellLayout {
@@ -91,11 +95,49 @@ impl CellLayout {
         let payload_offset = sizes
             .payload_offset(v.tag(), v.cases.iter().map(|c| c.ty.as_ref()))
             .size_wasm32() as u64;
+        let discs: HashMap<String, u8> = v
+            .cases
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                assert!(
+                    i < u8::MAX as usize,
+                    "CellLayout::from_resolve: `cell` variant has more than 255 cases"
+                );
+                (c.name.clone(), i as u8)
+            })
+            .collect();
+        for expected in EXPECTED_CELL_CASES {
+            assert!(
+                discs.contains_key(*expected),
+                "CellLayout::from_resolve: `cell` variant in WIT is missing case `{expected}` \
+                 (the codegen needs every case in EXPECTED_CELL_CASES — update both together)"
+            );
+        }
+        assert_eq!(
+            discs.len(),
+            EXPECTED_CELL_CASES.len(),
+            "CellLayout::from_resolve: `cell` variant has {} cases, codegen expects {}",
+            discs.len(),
+            EXPECTED_CELL_CASES.len()
+        );
         Self {
             size,
             align,
             payload_offset,
+            discs,
         }
+    }
+
+    /// Look up the discriminant value for a `cell` case by its WIT
+    /// case name (kebab-case, exactly as declared in
+    /// `wit/common/world.wit`). Panics if `name` isn't a case;
+    /// `from_resolve` validates the WIT against `EXPECTED_CELL_CASES`,
+    /// so reaching the panic implies an emit-side typo.
+    fn disc_of(&self, name: &str) -> u8 {
+        *self.discs.get(name).unwrap_or_else(|| {
+            panic!("CellLayout::disc_of: no `cell` case named `{name}`")
+        })
     }
 }
 
@@ -142,25 +184,6 @@ impl StoreKind {
             StoreKind::I8 => 0,
             StoreKind::I32 => 2,
             StoreKind::I64 | StoreKind::F64 => 3,
-        }
-    }
-
-    /// For cell variants whose payload is a single value (i.e. the
-    /// canonical-ABI flat form has exactly one slot), derive the
-    /// store kind from the discriminant. Caller is responsible for
-    /// having already widened the source value to match (e.g.
-    /// narrow ints sign- or zero-extended into an `i64` before being
-    /// stored as `cell::integer`).
-    ///
-    /// Returns `None` for variants whose payload has multiple flat
-    /// slots (`text`, `bytes`) or whose payload is a side-table
-    /// index — those cases construct their own `PayloadPart` slices.
-    fn for_primitive_disc(disc: u8) -> Option<StoreKind> {
-        match disc {
-            cell_disc::BOOL => Some(StoreKind::I8),
-            cell_disc::INTEGER => Some(StoreKind::I64),
-            cell_disc::FLOATING => Some(StoreKind::F64),
-            _ => None,
         }
     }
 }
@@ -234,16 +257,20 @@ impl CellLayout {
     }
 
     /// Emit a single-payload primitive cell — body is identical
-    /// across `bool` / `integer` / `floating`, only the disc and
+    /// across `bool` / `integer` / `floating`, only the case name and
     /// store width differ.
-    fn emit_single_payload(&self, f: &mut Function, addr_local: u32, disc: u8, payload_local: u32) {
-        let kind = StoreKind::for_primitive_disc(disc).unwrap_or_else(|| {
-            panic!("emit_single_payload: disc {disc} is not a single-payload primitive")
-        });
+    fn emit_single_payload(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        case: &str,
+        kind: StoreKind,
+        payload_local: u32,
+    ) {
         self.emit_cell(
             f,
             addr_local,
-            disc,
+            self.disc_of(case),
             &[PayloadPart {
                 source: PayloadSource::Local(payload_local),
                 kind,
@@ -254,19 +281,19 @@ impl CellLayout {
 
     /// `cell::bool(bool)` — `payload_local` is the i32 flat form (0 or 1).
     pub(crate) fn emit_bool(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
-        self.emit_single_payload(f, addr_local, cell_disc::BOOL, payload_local);
+        self.emit_single_payload(f, addr_local, "bool", StoreKind::I8, payload_local);
     }
 
     /// `cell::integer(s64)` — `payload_local` is i64, already widened
     /// from any narrower integer.
     pub(crate) fn emit_integer(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
-        self.emit_single_payload(f, addr_local, cell_disc::INTEGER, payload_local);
+        self.emit_single_payload(f, addr_local, "integer", StoreKind::I64, payload_local);
     }
 
     /// `cell::floating(f64)` — `payload_local` is f64, already
     /// promoted from f32 if necessary.
     pub(crate) fn emit_floating(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
-        self.emit_single_payload(f, addr_local, cell_disc::FLOATING, payload_local);
+        self.emit_single_payload(f, addr_local, "floating", StoreKind::F64, payload_local);
     }
 
     /// `cell::text(string)` — `(ptr, len)` pair pointing at utf-8.
@@ -280,7 +307,7 @@ impl CellLayout {
         self.emit_cell(
             f,
             addr_local,
-            cell_disc::TEXT,
+            self.disc_of("text"),
             &ptr_len_parts(ptr_local, len_local),
         );
     }
@@ -296,7 +323,7 @@ impl CellLayout {
         self.emit_cell(
             f,
             addr_local,
-            cell_disc::BYTES,
+            self.disc_of("bytes"),
             &ptr_len_parts(ptr_local, len_local),
         );
     }
@@ -396,7 +423,7 @@ impl CellLayout {
         self.emit_cell(
             f,
             addr_local,
-            cell_disc::RECORD_OF,
+            self.disc_of("record-of"),
             &[PayloadPart {
                 source: PayloadSource::ConstI32(side_table_idx as i32),
                 kind: StoreKind::I32,
@@ -421,7 +448,7 @@ impl CellLayout {
         self.emit_cell(
             f,
             addr_local,
-            cell_disc::ENUM_CASE,
+            self.disc_of("enum-case"),
             &[PayloadPart {
                 source: PayloadSource::Local(side_table_idx),
                 kind: StoreKind::I32,
@@ -560,6 +587,11 @@ mod tests {
             size: 16,
             align: 8,
             payload_offset: 8,
+            discs: EXPECTED_CELL_CASES
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ((*name).to_string(), i as u8))
+                .collect(),
         }
     }
 
@@ -648,26 +680,36 @@ mod tests {
     #[test]
     fn cell_discriminants_match_wit_declaration_order() {
         // Pin the discriminant numbering against the WIT cases listed
-        // in `wit/common/world.wit`. If anyone reorders the variant
-        // there, this test fires before lift codegen miscompiles
+        // in `wit/common/world.wit`. Built by loading the live WIT
+        // through `CellLayout::from_resolve`, so a reorder, rename, or
+        // removal in the WIT fires here before lift codegen miscompiles
         // values into wrong cell cases.
-        assert_eq!(cell_disc::BOOL, 0);
-        assert_eq!(cell_disc::INTEGER, 1);
-        assert_eq!(cell_disc::FLOATING, 2);
-        assert_eq!(cell_disc::TEXT, 3);
-        assert_eq!(cell_disc::BYTES, 4);
-        assert_eq!(cell_disc::LIST_OF, 5);
-        assert_eq!(cell_disc::TUPLE_OF, 6);
-        assert_eq!(cell_disc::OPTION_SOME, 7);
-        assert_eq!(cell_disc::OPTION_NONE, 8);
-        assert_eq!(cell_disc::RESULT_OK, 9);
-        assert_eq!(cell_disc::RESULT_ERR, 10);
-        assert_eq!(cell_disc::RECORD_OF, 11);
-        assert_eq!(cell_disc::FLAGS_SET, 12);
-        assert_eq!(cell_disc::ENUM_CASE, 13);
-        assert_eq!(cell_disc::VARIANT_CASE, 14);
-        assert_eq!(cell_disc::RESOURCE_HANDLE, 15);
-        assert_eq!(cell_disc::STREAM_HANDLE, 16);
-        assert_eq!(cell_disc::FUTURE_HANDLE, 17);
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let mut resolve = Resolve::new();
+        resolve
+            .push_str("common.wit", common_wit)
+            .expect("wit/common/world.wit must parse");
+        let cell_id = resolve
+            .interfaces
+            .iter()
+            .find_map(|(id, _)| {
+                let qname = resolve.id_of(id)?;
+                let unversioned = qname.split('@').next().unwrap_or(&qname);
+                (unversioned == "splicer:common/types").then_some(id)
+            })
+            .and_then(|id| resolve.interfaces[id].types.get("cell").copied())
+            .expect("splicer:common/types must export `cell` typedef");
+        let mut sizes = SizeAlign::default();
+        sizes.fill(&resolve);
+        let layout = CellLayout::from_resolve(&sizes, &resolve, cell_id);
+
+        for (expected_disc, name) in EXPECTED_CELL_CASES.iter().enumerate() {
+            assert_eq!(
+                layout.disc_of(name),
+                expected_disc as u8,
+                "WIT case `{name}` no longer has disc {expected_disc} — \
+                 reorder/rename detected"
+            );
+        }
     }
 }
