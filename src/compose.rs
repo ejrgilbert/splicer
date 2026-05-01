@@ -792,6 +792,7 @@ mod tests {
             inject: vec![Injection {
                 name: "a-middleware".to_string(),
                 adapter_info: None,
+                builtin: None,
                 path: None,
             }],
         }];
@@ -865,6 +866,7 @@ mod tests {
             inject: vec![Injection {
                 name: "tracing".to_string(),
                 path: Some(mdl_path.clone()),
+                builtin: None,
                 adapter_info: Some(AdapterInjectionInfo {
                     adapter_path: adapter_path.to_string(),
                     tier1_interfaces: vec![

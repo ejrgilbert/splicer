@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use cviz::parse::component::parse_component;
 
+use crate::builtins;
 use crate::compose::{build_graph_from_components, filename_from_path};
 use crate::contract::ContractResult;
-use crate::parse::config::parse_yaml;
+use crate::parse::config::{parse_yaml, SpliceRule};
 use crate::split::split_out_composition;
 use crate::wac::{generate_wac, GeneratedAdapter};
 
@@ -167,7 +168,7 @@ pub fn splice(req: SpliceRequest) -> Result<SpliceOutput> {
         skip_type_check,
     } = req;
 
-    let cfg = parse_yaml(&rules_yaml).context("Failed to parse splice rules YAML")?;
+    let mut cfg = parse_yaml(&rules_yaml).context("Failed to parse splice rules YAML")?;
 
     let bytes = std::fs::read(&composition_wasm).with_context(|| {
         format!(
@@ -193,6 +194,13 @@ pub fn splice(req: SpliceRequest) -> Result<SpliceOutput> {
         .to_string();
     let (splits_path, shim_comps) =
         split_out_composition(&composition_wasm, &Some(splits_dir_str))?;
+
+    // Materialize builtin middleware bytes to disk now that splits_dir
+    // is established. Stamps `injection.path` so the rest of the
+    // pipeline (contract validation, tier-1 detection, adapter
+    // generation, WAC) treats builtins as ordinary path-backed
+    // middleware.
+    materialize_builtins(&mut cfg, std::path::Path::new(&splits_path))?;
 
     let out = generate_wac(shim_comps, &splits_path, &graph, &cfg, None, &package_name)?;
 
@@ -281,6 +289,35 @@ pub fn compose(req: ComposeRequest) -> Result<ComposeOutput> {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// Walk every injection in `rules`; for builtin-form entries, write
+/// the embedded bytes from [`crate::builtins`] to disk under
+/// `splits_dir/builtins/` and stamp the resulting absolute path onto
+/// the injection. After this runs, every injection that came in via
+/// `builtin: ...` looks identical to a path-backed user middleware
+/// from the rest of the pipeline's perspective.
+fn materialize_builtins(rules: &mut [SpliceRule], splits_dir: &std::path::Path) -> Result<()> {
+    for rule in rules.iter_mut() {
+        for inj in rule.inject_mut().iter_mut() {
+            let Some(builtin) = inj.builtin.as_deref() else {
+                continue;
+            };
+            let path = builtins::materialize_into(splits_dir, builtin)
+                .with_context(|| format!("Failed to materialize builtin '{builtin}'"))?;
+            let path_str = path
+                .to_str()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "materialized builtin path contains non-UTF-8 bytes: {}",
+                        path.display()
+                    )
+                })?
+                .to_string();
+            inj.path = Some(path_str);
+        }
+    }
+    Ok(())
+}
+
 /// Format a `wac compose <wac_path> --dep ...` shell command line
 /// from the wac source path and the per-dependency `(package_key,
 /// wasm_path)` map returned by [`splice`] or [`compose`].
@@ -293,4 +330,142 @@ pub fn format_wac_compose_cmd(wac_path: &str, deps: &BTreeMap<String, PathBuf>) 
         ));
     }
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::config::parse_yaml;
+
+    /// `materialize_builtins` should write the embedded bytes of every
+    /// builtin-form injection to disk and stamp `inj.path` so the rest
+    /// of the pipeline sees a normal path-backed middleware.
+    #[test]
+    fn builtin_yaml_roundtrips_through_materialize() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:logging/log@0.1.0
+    inject:
+      - builtin: hello-tier1
+"#;
+        let mut rules = parse_yaml(yaml).expect("parse");
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_builtins(&mut rules, tmp.path()).expect("materialize");
+
+        let inj = &rules[0].inject()[0];
+        assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
+        let path = inj.path.as_deref().expect("path stamped");
+        let bytes = std::fs::read(path).expect("file written");
+        assert!(bytes.starts_with(b"\0asm"), "embedded bytes are wasm");
+        // `Path::ends_with` is component-aware, so this works on both
+        // unix (`builtins/hello-tier1.wasm`) and windows
+        // (`builtins\hello-tier1.wasm`).
+        assert!(
+            std::path::Path::new(path).ends_with("builtins/hello-tier1.wasm"),
+            "path lives under splits_dir/builtins/: {path}"
+        );
+    }
+
+    /// User-form injections (`name` + `path`) must pass through
+    /// untouched — only `builtin:` entries get rewritten.
+    #[test]
+    fn user_form_injection_left_alone() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:logging/log@0.1.0
+    inject:
+      - name: tracing
+        path: /opt/middleware/tracing.wasm
+"#;
+        let mut rules = parse_yaml(yaml).expect("parse");
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_builtins(&mut rules, tmp.path()).expect("materialize");
+
+        let inj = &rules[0].inject()[0];
+        assert!(inj.builtin.is_none());
+        assert_eq!(inj.path.as_deref(), Some("/opt/middleware/tracing.wasm"));
+        // The builtins/ subdir should never be created when nothing
+        // referenced a builtin.
+        assert!(!tmp.path().join("builtins").exists());
+    }
+
+    /// A mix of user-form and builtin-form injections in the same
+    /// rule list. Each is handled independently.
+    #[test]
+    fn mixed_user_and_builtin_injections() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:logging/log@0.1.0
+    inject:
+      - name: tracing
+        path: ./tracing.wasm
+      - builtin: hello-tier1
+"#;
+        let mut rules = parse_yaml(yaml).expect("parse");
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_builtins(&mut rules, tmp.path()).expect("materialize");
+
+        let inject = &rules[0].inject();
+        assert_eq!(inject[0].path.as_deref(), Some("./tracing.wasm"));
+        let materialized = inject[1].path.as_deref().unwrap();
+        assert!(std::path::Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
+    }
+
+    /// The long-form `builtin: { name: ..., alias: ... }` should land
+    /// the alias in `inj.name` (the WAC variable) while still
+    /// materializing the bytes of the builtin named in `builtin.name`.
+    #[test]
+    fn builtin_long_form_alias_used_as_wac_var() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:logging/log@0.1.0
+    inject:
+      - builtin:
+          name: hello-tier1
+          alias: greeter
+"#;
+        let mut rules = parse_yaml(yaml).expect("parse");
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_builtins(&mut rules, tmp.path()).expect("materialize");
+
+        let inj = &rules[0].inject()[0];
+        assert_eq!(inj.name, "greeter");
+        assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
+        let materialized = inj.path.as_deref().unwrap();
+        assert!(std::path::Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
+    }
+
+    /// Naming a builtin that doesn't exist surfaces a clear error
+    /// listing what's available.
+    #[test]
+    fn unknown_builtin_errors_with_available() {
+        // Construct rules directly — parse_yaml can't produce an
+        // unknown builtin, since the registry isn't consulted at
+        // parse time.
+        use crate::parse::config::{Injection, SpliceRule};
+        let mut rules = vec![SpliceRule::Before {
+            interface: "wasi:logging/log@0.1.0".into(),
+            provider_name: None,
+            provider_alias: None,
+            inject: vec![Injection {
+                name: "ghost".into(),
+                path: None,
+                builtin: Some("does-not-exist".into()),
+                adapter_info: None,
+            }],
+        }];
+        let tmp = tempfile::tempdir().unwrap();
+        let err = materialize_builtins(&mut rules, tmp.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does-not-exist"), "error names builtin: {msg}");
+        assert!(msg.contains("hello-tier1"), "error lists available: {msg}");
+    }
 }

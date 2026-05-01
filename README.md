@@ -73,6 +73,26 @@ For the full guide — including how to write a tier-1 middleware, how adapter
 detection works, and what the generated adapter does internally — see
 [docs/adapter-components.md](docs/adapter-components.md).
 
+### Builtin Middleware
+
+Splicer ships pre-built middleware components embedded in the binary.
+Reference one from a splice config without supplying a path:
+
+```yaml
+inject:
+  - builtin: hello-tier1
+```
+
+| Name          | Tier | Description                                                                                       |
+|---------------|------|---------------------------------------------------------------------------------------------------|
+| `hello-tier1` | 1    | `println!`s on every wrapped call (target interface + function name). Verifies splice rules fire. |
+
+Source crates live under [`builtins/`](builtins/); rebuild artifacts
+with `make build-builtins`.
+
+See [docs/splice-config.md](docs/splice-config.md#inject-entry-shapes)
+for the full `builtin:` schema (short + long forms).
+
 ---
 
 # Installation

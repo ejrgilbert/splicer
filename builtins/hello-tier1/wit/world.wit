@@ -1,0 +1,6 @@
+package splicer:hello-tier1@0.1.0;
+
+world hello-tier1-mdl {
+    export splicer:tier1/before@0.2.0;
+    export splicer:tier1/after@0.2.0;
+}

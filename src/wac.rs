@@ -956,6 +956,7 @@ fn add_to_inject_plan(
                     name: injection.name.clone(),
                     // Keep the original middleware path; adapter_path goes in adapter_info.
                     path: injection.path.clone(),
+                    builtin: injection.builtin.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         tier1_interfaces: matched_interfaces,
