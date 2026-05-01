@@ -28,13 +28,15 @@
 
 use std::collections::HashMap;
 
-use wasm_encoder::{Function, MemArg, ValType};
+use wasm_encoder::{Function, Instruction, MemArg, ValType};
+use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::abi::WasmSignature;
-use wit_parser::{Function as WitFunction, Resolve, Type};
+use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
 use super::super::abi::emit::{
     direct_return_type, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
+use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
 use super::blob::{write_le_i32, BlobSlice, RecordWriter};
 use super::cells::CellLayout;
@@ -226,8 +228,9 @@ pub(super) enum CellOp {
 /// — an absolute wasm-local index — that gets added to `n` at resolve
 /// time. For params, the base lives on [`ParamLift::local_base`]
 /// (cumulative param-slot cursor). For compound results, the base is
-/// the first synthetic local allocated in
-/// [`WrapperLocals::result_lift_locals`].
+/// the first synthetic local on the
+/// [`ResultEmitPlan::Compound::synth_locals`] vector built at
+/// [`alloc_wrapper_locals`] time.
 ///
 /// `PtrScratch` / `LenScratch` / `Result` are wrapper-allocated
 /// scratch locals; they don't shift with the plan's base.
@@ -556,18 +559,6 @@ pub(super) enum ResultSourceLayout {
         /// of the cell plan, not of the after-hook wiring).
         record_info_cell_idx: Vec<Option<u32>>,
     },
-}
-
-impl ResultLayout {
-    /// Returns the underlying classify-time [`CompoundResult`] for
-    /// compound result lifts (the wrapper-body emitter reads `ty` /
-    /// `plan` off it). `None` for direct / retptr-pair results.
-    pub(super) fn compound(&self) -> Option<&CompoundResult> {
-        match &self.source {
-            ResultSourceLayout::Compound { compound, .. } => Some(compound),
-            _ => None,
-        }
-    }
 }
 
 /// Result-side-table info, populated when a result is lift-able.
@@ -1219,7 +1210,12 @@ pub(super) fn build_record_info_blob(
 
 /// Locals used by the wrapper body. Allocated once up front so all
 /// downstream emit phases (param lift, hook calls, result lift, async
-/// task.return load) reference the same indices.
+/// task.return load) reference the same indices. Result-lift-only
+/// locals (Compound addr + synth slot locals, plus the pre-built
+/// `lift_from_memory` instruction sequence) live on
+/// [`ResultEmitPlan`] instead — that type bundles the result emit's
+/// per-variant data so the four-fields-must-agree invariant disappears
+/// into the sum-type discriminant.
 pub(super) struct WrapperLocals {
     /// Scratch for the cell write address.
     pub addr: u32,
@@ -1242,38 +1238,61 @@ pub(super) struct WrapperLocals {
     /// `task.return` flat loads. `None` for sync, void async, and
     /// async with retptr-passthrough task.return.
     pub tr_addr: Option<u32>,
-    /// Address local that drives `lift_from_memory` for the result-
-    /// side cell-tree lift on `Compound` results. Distinct from
-    /// `tr_addr`: a single function may use both (async + compound
-    /// result), and they fire at different points in the wrapper body.
-    /// `None` when the result lift isn't `Compound`.
-    pub result_lift_addr: Option<u32>,
-    /// Synthetic flat-slot locals capturing the result's canonical-ABI
-    /// flat values on `Compound` lifts. Indexed by the plan's
-    /// `LocalRef::Param(n)` (n is plan-local; absolute index is
-    /// `result_lift_locals[n]`). `local_base` for the result plan is
-    /// `result_lift_locals[0]` when non-empty. Empty for non-Compound
-    /// results.
-    pub result_lift_locals: Vec<u32>,
 }
 
-impl WrapperLocals {
-    /// `local_base` for the result-side plan: the absolute wasm-local
-    /// index that the result plan's `LocalRef::Param(0)` resolves to.
-    /// Panics if no Compound result locals were allocated.
-    pub(super) fn result_local_base(&self) -> u32 {
-        *self
-            .result_lift_locals
-            .first()
-            .expect("result_local_base requires Compound-allocated locals")
-    }
+/// Per-function emit-time bundle for the result-side lift. Built once
+/// in [`alloc_wrapper_locals`] from the layout-phase
+/// [`ResultLayout`] + the locals just allocated, then consumed by
+/// [`emit_wrapper_function`]'s phase-3 result-lift block via a single
+/// pattern match. Replaces the prior pile of parallel `Option`-shaped
+/// fields whose Some-ness had to agree by hand. Borrows the
+/// classify-time `CompoundResult` and the layout-time per-cell
+/// record-info index map from the owning [`FuncDispatch`].
+pub(super) enum ResultEmitPlan<'a> {
+    /// Void function or unsupported result kind: no lift fires.
+    None,
+    /// Direct primitive return — source value already in
+    /// `source_local` (captured from the handler's flat return after
+    /// the call).
+    Direct {
+        kind: LiftKind,
+        source_local: u32,
+    },
+    /// `(ptr, len)` pair lives at `retptr_offset` in static scratch.
+    /// The wrapper loads the pair into `ptr_local` / `len_local`
+    /// before lifting (today these are always `lcl.ptr_scratch` /
+    /// `lcl.len_scratch` — the variant carries them so the consumer
+    /// doesn't re-thread `&WrapperLocals` for that lookup).
+    RetptrPair {
+        kind: LiftKind,
+        retptr_offset: i32,
+        ptr_local: u32,
+        len_local: u32,
+    },
+    /// Compound result: classify-time recipe + layout offsets +
+    /// emit-time locals/loads. `addr_local` drives the
+    /// `lift_from_memory`-built `loads` sequence (which pushes
+    /// canonical-ABI flat values onto the wasm stack); the wrapper
+    /// then `local.set`s those into `synth_locals` (in reverse) for
+    /// the plan walker. `record_info_cell_idx` is the layout-phase
+    /// per-cell `RecordOf` side-table index map (borrowed off
+    /// [`ResultSourceLayout::Compound`]).
+    Compound {
+        compound: &'a CompoundResult,
+        retptr_offset: i32,
+        addr_local: u32,
+        synth_locals: Vec<u32>,
+        loads: Vec<Instruction<'static>>,
+        record_info_cell_idx: &'a [Option<u32>],
+    },
 }
 
-pub(super) fn alloc_wrapper_locals(
+pub(super) fn alloc_wrapper_locals<'a>(
     resolve: &Resolve,
+    size_align: &SizeAlign,
     locals: &mut FunctionIndices,
-    fd: &FuncDispatch,
-) -> WrapperLocals {
+    fd: &'a FuncDispatch,
+) -> (WrapperLocals, ResultEmitPlan<'a>) {
     let addr = locals.alloc_local(ValType::I32);
     let st = locals.alloc_local(ValType::I32);
     let ws = locals.alloc_local(ValType::I32);
@@ -1291,45 +1310,77 @@ pub(super) fn alloc_wrapper_locals(
         .is_some_and(|tr| !tr.sig.indirect_params && fd.result_ty.is_some());
     let tr_addr = tr_uses_flat_loads.then(|| locals.alloc_local(ValType::I32));
 
-    // Compound result lifts need: an addr local for the bindgen-driven
-    // `lift_from_memory` loads, plus one synthetic local per
-    // canonical-ABI flat slot to capture the loaded values for the
-    // plan walker. Allocate in canonical-ABI flat-type order so the
-    // `local.set`-in-reverse capture lines up with the wasm stack.
-    let (result_lift_addr, result_lift_locals) =
-        match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
-            Some(c) => {
+    // Result-emit plan: discriminate on the layout-phase `ResultLayout`
+    // and pull together the variant-specific locals/offsets/loads.
+    // Compound allocates extra locals (one i32 addr + one synth per
+    // flat slot) AND drives the bindgen for `lift_from_memory` —
+    // bindgen may allocate further scratch locals, so this must run
+    // before the wrapper-body emit freezes the locals list.
+    let result_emit = match fd.result_lift.as_ref() {
+        None => ResultEmitPlan::None,
+        Some(rl) => match &rl.source {
+            ResultSourceLayout::Direct(kind) => ResultEmitPlan::Direct {
+                kind: *kind,
+                source_local: result
+                    .expect("ResultSourceLayout::Direct → direct-return local allocated"),
+            },
+            ResultSourceLayout::RetptrPair {
+                kind,
+                retptr_offset,
+            } => ResultEmitPlan::RetptrPair {
+                kind: *kind,
+                retptr_offset: *retptr_offset,
+                ptr_local: ptr_scratch,
+                len_local: len_scratch,
+            },
+            ResultSourceLayout::Compound {
+                compound,
+                retptr_offset,
+                record_info_cell_idx,
+            } => {
                 let addr_local = locals.alloc_local(ValType::I32);
-                let flat = super::super::abi::flat_types(resolve, &c.ty, None).expect(
+                let flat = super::super::abi::flat_types(resolve, &compound.ty, None).expect(
                     "Compound result must flatten within MAX_FLAT_PARAMS — \
                      classify_result_lift only returns Compound for kinds that do",
                 );
                 debug_assert_eq!(
                     flat.len(),
-                    c.plan.flat_slot_count as usize,
+                    compound.plan.flat_slot_count as usize,
                     "canonical-ABI flat count must match plan flat_slot_count"
                 );
-                let synth: Vec<u32> = flat
+                let synth_locals: Vec<u32> = flat
                     .into_iter()
                     .map(|wt| locals.alloc_local(wasm_type_to_val(wt)))
                     .collect();
-                (Some(addr_local), synth)
+                let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, locals);
+                lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
+                let loads = bindgen.into_instructions();
+                ResultEmitPlan::Compound {
+                    compound,
+                    retptr_offset: *retptr_offset,
+                    addr_local,
+                    synth_locals,
+                    loads,
+                    record_info_cell_idx,
+                }
             }
-            None => (None, Vec::new()),
-        };
-    WrapperLocals {
-        addr,
-        st,
-        ws,
-        ptr_scratch,
-        len_scratch,
-        ext64,
-        ext_f64,
-        result,
-        tr_addr,
-        result_lift_addr,
-        result_lift_locals,
-    }
+        },
+    };
+
+    (
+        WrapperLocals {
+            addr,
+            st,
+            ws,
+            ptr_scratch,
+            len_scratch,
+            ext64,
+            ext_f64,
+            result,
+            tr_addr,
+        },
+        result_emit,
+    )
 }
 
 /// Map a wit-bindgen-core `WasmType` to a wasm-encoder `ValType`.
@@ -1496,19 +1547,18 @@ fn emit_lift_kind(
 pub(super) fn emit_lift_result(
     f: &mut Function,
     cell_layout: &CellLayout,
-    source: &ResultSourceLayout,
+    plan: &ResultEmitPlan<'_>,
     lcl: &WrapperLocals,
 ) {
-    match source {
-        ResultSourceLayout::Direct(kind) => {
-            let local = lcl
-                .result
-                .expect("ResultSourceLayout::Direct → result local must be allocated");
-            emit_lift_kind(f, cell_layout, *kind, local, local, lcl);
+    match plan {
+        ResultEmitPlan::Direct { kind, source_local } => {
+            emit_lift_kind(f, cell_layout, *kind, *source_local, *source_local, lcl);
         }
-        ResultSourceLayout::RetptrPair {
+        ResultEmitPlan::RetptrPair {
             kind,
             retptr_offset,
+            ptr_local,
+            len_local,
         } => {
             f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
@@ -1516,17 +1566,17 @@ pub(super) fn emit_lift_result(
                 align: 2,
                 memory_index: 0,
             });
-            f.instructions().local_set(lcl.ptr_scratch);
+            f.instructions().local_set(*ptr_local);
             f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
                 offset: SLICE_LEN_OFFSET as u64,
                 align: 2,
                 memory_index: 0,
             });
-            f.instructions().local_set(lcl.len_scratch);
-            emit_lift_kind(f, cell_layout, *kind, lcl.ptr_scratch, lcl.len_scratch, lcl);
+            f.instructions().local_set(*len_local);
+            emit_lift_kind(f, cell_layout, *kind, *ptr_local, *len_local, lcl);
         }
-        ResultSourceLayout::Compound { .. } => unreachable!(
+        ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
             "compound results are emitted directly via emit_lift_compound_prefix + \
              emit_lift_plan; emit_lift_result handles only single-cell sources"
         ),
@@ -1539,34 +1589,34 @@ pub(super) fn emit_lift_result(
 /// value into a synthetic local in REVERSE order (the wasm stack is
 /// LIFO — the last-pushed value is the highest-indexed flat slot).
 ///
-/// After this returns, the synthetic locals at `result_local_base ..
-/// result_local_base + plan.flat_slot_count` hold the result's flat
-/// values in canonical-ABI order, ready for [`emit_lift_plan`] to
-/// walk the cell plan.
+/// After this returns, the synthetic locals at `synth_locals[0]..
+/// synth_locals[N]` hold the result's flat values in canonical-ABI
+/// order, ready for [`emit_lift_plan`] to walk the cell plan
+/// (resolving `LocalRef::Param(0)` against `synth_locals[0]`).
 pub(super) fn emit_lift_compound_prefix(
     f: &mut Function,
     compound: &CompoundResult,
     retptr_offset: i32,
-    lift_from_memory_loads: &[wasm_encoder::Instruction<'static>],
-    result_lift_addr: u32,
-    result_lift_locals: &[u32],
+    loads: &[Instruction<'static>],
+    addr_local: u32,
+    synth_locals: &[u32],
 ) {
     debug_assert_eq!(
-        result_lift_locals.len(),
+        synth_locals.len(),
         compound.plan.flat_slot_count as usize,
         "synthetic-local count must match plan flat slot count"
     );
     // Stage retptr_offset into the addr local that the pre-built
     // bindgen loads read from.
     f.instructions().i32_const(retptr_offset);
-    f.instructions().local_set(result_lift_addr);
+    f.instructions().local_set(addr_local);
     // Push canonical-ABI flat values onto the wasm value stack.
-    for inst in lift_from_memory_loads {
+    for inst in loads {
         f.instruction(inst);
     }
     // local.set in reverse order: top-of-stack is the LAST pushed (=
     // highest plan-local index). Working back to slot 0.
-    for &local in result_lift_locals.iter().rev() {
+    for &local in synth_locals.iter().rev() {
         f.instructions().local_set(local);
     }
 }

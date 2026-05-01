@@ -46,8 +46,8 @@ use super::cells::CellLayout;
 use super::lift::{
     alloc_wrapper_locals, build_enum_info_blob, build_record_info_blob, classify_func_params,
     classify_result_lift, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    register_enum_strings, register_record_strings, ParamLayout, ParamLift, ResultLayout,
-    ResultLift, ResultSourceLayout, WrapperLocals,
+    register_enum_strings, register_record_strings, ParamLayout, ParamLift, ResultEmitPlan,
+    ResultLayout, ResultLift, ResultSourceLayout, WrapperLocals,
 };
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
@@ -1404,7 +1404,11 @@ fn emit_wrapper_function(
     let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = FunctionIndices::new(nparams);
-    let lcl = alloc_wrapper_locals(ctx.resolve, &mut locals, fd);
+    // `alloc_wrapper_locals` also drives the `lift_from_memory`
+    // bindgen for compound result lifts (it may allocate further
+    // scratch locals — must happen before the locals list freezes).
+    let (lcl, result_emit) =
+        alloc_wrapper_locals(ctx.resolve, &schema.size_align, &mut locals, fd);
 
     // For async funcs whose `task.return` takes flat-form params,
     // pre-build the load sequence — `lift_from_memory` may allocate
@@ -1417,21 +1421,6 @@ fn emit_wrapper_function(
             lift_from_memory(ctx.resolve, &mut bindgen, (), result_ty);
             bindgen.into_instructions()
         });
-
-    // Compound result lifts also pre-run the bindgen — same constraint
-    // about bindgen-allocated scratch locals having to land before the
-    // locals list is frozen. Sequence runs at after-hook emit time
-    // (Phase 3 below).
-    let result_lift_loads: Option<Vec<wasm_encoder::Instruction<'static>>> =
-        match (lcl.result_lift_addr, fd.result_lift.as_ref().and_then(|rl| rl.compound())) {
-            (Some(addr_local), Some(c)) => {
-                let mut bindgen =
-                    WasmEncoderBindgen::new(&schema.size_align, addr_local, &mut locals);
-                lift_from_memory(ctx.resolve, &mut bindgen, (), &c.ty);
-                Some(bindgen.into_instructions())
-            }
-            _ => None,
-        };
 
     let mut f = Function::new_with_locals_types(locals.into_locals());
 
@@ -1490,27 +1479,24 @@ fn emit_wrapper_function(
 
     // ── Phase 3: on-return (only if after-hook wired) ──
     if let (Some(after_idx), Some(after)) = (func_idx.after_hook_idx, fd.after.as_ref()) {
-        if let (Some(rl), Some(cells_off)) = (fd.result_lift.as_ref(), after.result_cells_offset) {
-            match &rl.source {
-                ResultSourceLayout::Compound {
+        if let Some(cells_off) = after.result_cells_offset {
+            match &result_emit {
+                ResultEmitPlan::Compound {
                     compound,
                     retptr_offset,
+                    addr_local,
+                    synth_locals,
+                    loads,
                     record_info_cell_idx,
                 } => {
                     // Memory → flat-on-stack → synthetic locals → walk plan.
-                    let loads = result_lift_loads
-                        .as_deref()
-                        .expect("Compound result → bindgen loads pre-built");
-                    let addr_local = lcl
-                        .result_lift_addr
-                        .expect("Compound result → result_lift_addr allocated");
                     emit_lift_compound_prefix(
                         &mut f,
                         compound,
                         *retptr_offset,
                         loads,
-                        addr_local,
-                        &lcl.result_lift_locals,
+                        *addr_local,
+                        synth_locals,
                     );
                     emit_lift_plan(
                         &mut f,
@@ -1518,15 +1504,16 @@ fn emit_wrapper_function(
                         cells_off,
                         &compound.plan,
                         record_info_cell_idx,
-                        lcl.result_local_base(),
+                        synth_locals[0],
                         &lcl,
                     );
                 }
-                ResultSourceLayout::Direct(_) | ResultSourceLayout::RetptrPair { .. } => {
+                ResultEmitPlan::Direct { .. } | ResultEmitPlan::RetptrPair { .. } => {
                     f.instructions().i32_const(cells_off as i32);
                     f.instructions().local_set(lcl.addr);
-                    emit_lift_result(&mut f, &schema.cell_layout, &rl.source, &lcl);
+                    emit_lift_result(&mut f, &schema.cell_layout, &result_emit, &lcl);
                 }
+                ResultEmitPlan::None => {}
             }
         }
         f.instructions().i32_const(after.params_offset);
