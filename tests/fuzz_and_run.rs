@@ -1635,6 +1635,50 @@ world mdl {
 const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
 const MIDDLEWARE_COMMON_DEP_WIT: &str = include_str!("../wit/common/world.wit");
 
+// ─── Tier-2 middleware fixture (used by `test_tier2_smoke`) ───────
+//
+// Same crate skeleton as the tier-1 middleware above, but exports
+// `splicer:tier2/before` and prints from `on-call(call, args)`. The
+// `args` slice is empty until the cells lift codegen wires in
+// (Phase 2-2b); for now we just confirm `on-call` fires with the
+// right call identity.
+
+const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
+    wit_bindgen::generate!({
+        world: "tier2-mdl",
+        async: true,
+        generate_all
+    });
+}
+
+use bindings::exports::splicer::tier2::before::Guest as BeforeGuest;
+use bindings::splicer::common::types::{CallId, Field};
+
+struct Mdl;
+
+impl BeforeGuest for Mdl {
+    async fn on_call(call: CallId, args: Vec<Field>) {
+        println!(
+            "mdl: tier2-on-call {}#{} (args={})",
+            call.interface_name,
+            call.function_name,
+            args.len()
+        );
+    }
+}
+
+bindings::export!(Mdl with_types_in bindings);
+"#;
+
+const MIDDLEWARE_TIER2_WORLD_WIT: &str = r#"package my:middleware-tier2@1.0.0;
+
+world tier2-mdl {
+    export splicer:tier2/before@0.1.0;
+}
+"#;
+
+const MIDDLEWARE_TIER2_DEP_WIT: &str = include_str!("../wit/tier2/world.wit");
+
 /// Placeholder replaced at call time with the absolute path of the
 /// middleware component. The YAML must reference an absolute path
 /// because `splicer::splice` resolves `inject.path` against the
@@ -2014,6 +2058,118 @@ fn test_canned() {
         }
         panic!("{} of the shape pipelines failed", failures.len());
     }
+}
+
+/// E2E smoke test for tier-2's `on-call` hook: scaffolds the same
+/// workspace as `test_canned` but swaps in the tier-2 middleware
+/// fixture (exports `splicer:tier2/before.on-call` instead of
+/// `splicer:tier1/{before,after}`). Splicer's classifier auto-
+/// detects tier-2 and routes through `build_tier2_adapter`.
+///
+/// Asserts the trace contains the `mdl: tier2-on-call …` line
+/// printed from the middleware's `on_call` impl, proving the hook
+/// fires under wasmtime with the right call identity. Runs the
+/// `Before` pipeline kind only — one kind is enough to prove
+/// dispatch end-to-end.
+///
+/// Args are the empty `list<field>` for now (cells lift wires in at
+/// Phase 2-2b); the assertion checks `(args=0)` accordingly.
+#[test]
+#[ignore]
+fn test_tier2_smoke() {
+    require_splicer_toolchain();
+
+    let tmp = tempfile::tempdir().expect("mktempdir");
+    let root_buf = tmp.path().to_path_buf();
+    if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
+        eprintln!("(keeping tmpdir: {})", root_buf.display());
+        std::mem::forget(tmp);
+    }
+    let root = root_buf.as_path();
+    eprintln!("tier2-smoke: work dir = {}", root.display());
+
+    // Workspace + provider + consumer scaffolding is identical to
+    // tier-1 — only the middleware crate changes.
+    std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML).expect("workspace toml");
+    write_crate(root, "provider", PROVIDER_CARGO_TOML, "// placeholder\n", &[])
+        .expect("provider scaffold");
+    write_crate(root, "consumer", CONSUMER_CARGO_TOML, "// placeholder\n", &[])
+        .expect("consumer scaffold");
+    write_crate(
+        root,
+        "middleware",
+        MIDDLEWARE_CARGO_TOML,
+        MIDDLEWARE_TIER2_LIB_RS,
+        &[
+            ("world.wit", MIDDLEWARE_TIER2_WORLD_WIT),
+            (
+                "deps/splicer-tier2-0.1.0/package.wit",
+                MIDDLEWARE_TIER2_DEP_WIT,
+            ),
+            (
+                "deps/splicer-common-0.1.0/package.wit",
+                MIDDLEWARE_COMMON_DEP_WIT,
+            ),
+        ],
+    )
+    .expect("tier-2 middleware scaffold");
+
+    // Pick the simplest primitive — u32. Sync mode keeps the
+    // moving pieces minimal for the smoke test.
+    let mode = AsyncMode::Sync;
+    let shape = Shape::Primitive {
+        name: "u32",
+        wit_type: "u32",
+        rust_ty: "u32",
+        rust_literal: "42u32",
+        expected_debug: "42",
+    };
+    write_per_shape_files(root, &shape, mode).expect("write shape files");
+
+    run_quiet(
+        Command::new("cargo")
+            .args(["build", "--target", "wasm32-wasip1", "--workspace"])
+            .current_dir(root),
+        "cargo build",
+    );
+
+    let adapter =
+        repo_root().join("tests/component-interposition/wasi_snapshot_preview1.reactor.wasm");
+    assert!(
+        adapter.exists(),
+        "wasip1 reactor adapter missing at {}",
+        adapter.display()
+    );
+
+    let provider_comp = wrap_component(root, "provider", &adapter);
+    let consumer_comp = wrap_component(root, "consumer", &adapter);
+    let middleware_comp = wrap_component(root, "middleware", &adapter);
+
+    let final_path =
+        splice_before_and_compose(root, &provider_comp, &consumer_comp, &middleware_comp);
+    let bytes = std::fs::read(&final_path).expect("read final.wasm");
+
+    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+    validator
+        .validate_all(&bytes)
+        .expect("tier-2 spliced component should validate");
+
+    let captured = invoke_run(&bytes).expect("invoke run()");
+    eprintln!("tier2-smoke: trace:\n{captured}");
+
+    let expected_marker = format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo (args=0)");
+    assert!(
+        captured.contains(&expected_marker),
+        "tier-2 on-call did not fire — trace missing `{expected_marker}`\n--- trace ---\n{captured}",
+    );
+
+    // Sanity: the underlying call still flows through. (Same
+    // expected_got check as run_pipeline_for_shape does for tier-1.)
+    let expected_got = format!("consumer: got {}", shape.expected_debug());
+    assert!(
+        captured.contains(&expected_got),
+        "tier-2 splice broke the call path — consumer didn't see `{expected_got}`\n--- trace ---\n{captured}",
+    );
 }
 
 /// Async modes every canned shape and every fuzz iteration runs

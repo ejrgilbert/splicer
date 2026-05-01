@@ -110,8 +110,11 @@ pub struct YamlProviderOpt {
 pub struct AdapterInjectionInfo {
     /// Path to the generated adapter `.wasm` file.
     pub adapter_path: String,
-    /// Tier-1 interfaces the middleware exports (e.g. `"splicer:tier1/before"`).
-    pub tier1_interfaces: Vec<String>,
+    /// Hook interfaces the middleware exports (e.g.
+    /// `"splicer:tier1/before"` or `"splicer:tier2/before"`).
+    /// Unversioned; the version is derived from the package prefix
+    /// at WAC-generation time.
+    pub matched_hook_interfaces: Vec<String>,
 }
 
 /// A middleware to inject at a splice point. Constructed from the YAML

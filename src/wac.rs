@@ -61,9 +61,11 @@ pub struct GeneratedAdapter {
     /// Target interface the adapter exports (e.g.
     /// `"wasi:http/handler@0.3.0-rc-2026-01-06"`).
     pub target_interface: String,
-    /// Tier-1 hook interfaces the wrapped middleware exports
-    /// (e.g. `"splicer:tier1/before"`).
-    pub tier1_interfaces: Vec<String>,
+    /// Hook interfaces the wrapped middleware exports
+    /// (e.g. `"splicer:tier1/before"` or `"splicer:tier2/before"`).
+    /// Unversioned; the version is derived from the package prefix
+    /// at WAC-generation time.
+    pub matched_hook_interfaces: Vec<String>,
 }
 
 /// Output of [`generate_wac`].
@@ -948,7 +950,7 @@ fn add_to_inject_plan(
                     adapter_path: adapter_path.clone(),
                     middleware_name: injection.name.clone(),
                     target_interface: interface_name.to_string(),
-                    tier1_interfaces: matched_interfaces.clone(),
+                    matched_hook_interfaces: matched_interfaces.clone(),
                 });
                 resolved.push(Injection {
                     name: injection.name.clone(),
@@ -957,7 +959,7 @@ fn add_to_inject_plan(
                     builtin: injection.builtin.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
-                        tier1_interfaces: matched_interfaces,
+                        matched_hook_interfaces: matched_interfaces,
                     }),
                 });
                 // Tier1Compatible is fully handled here; no diagnostic needed upstream.
@@ -981,14 +983,14 @@ fn add_to_inject_plan(
                     adapter_path: adapter_path.clone(),
                     middleware_name: injection.name.clone(),
                     target_interface: interface_name.to_string(),
-                    tier1_interfaces: matched_interfaces.clone(),
+                    matched_hook_interfaces: matched_interfaces.clone(),
                 });
                 resolved.push(Injection {
                     name: injection.name.clone(),
                     path: injection.path.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
-                        tier1_interfaces: matched_interfaces,
+                        matched_hook_interfaces: matched_interfaces,
                     }),
                 });
             }
@@ -1154,16 +1156,29 @@ fn create_tier1_mdl(
         ));
     }
 
-    // Proxy — wires the downstream target interface and the tier-1 hook interfaces
+    // Proxy — wires the downstream target interface and the hook interfaces
     // from the real middleware instance. The adapter's hook imports are versioned,
-    // so the WAC lines use the versioned names to match both sides.
-    use crate::contract::{versioned_interface, TIER1_VERSION};
+    // so the WAC lines use the versioned names to match both sides. Each hook
+    // interface is versioned by its own tier (tier-1 and tier-2 may evolve
+    // independently), detected by the `splicer:tierN/` package prefix.
+    use crate::contract::{
+        versioned_interface, TIER1_PACKAGE, TIER1_VERSION, TIER2_PACKAGE, TIER2_VERSION,
+    };
     let mut adapter_line = format!(
         "let {adapter_var} = new {INST_PREFIX}:{adapter_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
         iface = interface.name,
     );
-    for tier1_iface in &adapter_info.tier1_interfaces {
-        let versioned = versioned_interface(tier1_iface, TIER1_VERSION);
+    for hook_iface in &adapter_info.matched_hook_interfaces {
+        let version = if hook_iface.starts_with(&format!("{TIER1_PACKAGE}/")) {
+            TIER1_VERSION
+        } else if hook_iface.starts_with(&format!("{TIER2_PACKAGE}/")) {
+            TIER2_VERSION
+        } else {
+            anyhow::bail!(
+                "matched hook interface '{hook_iface}' is not part of any known tier package",
+            );
+        };
+        let versioned = versioned_interface(hook_iface, version);
         adapter_line.push_str(&format!(
             "\n    \"{versioned}\": {real_var}[\"{versioned}\"],"
         ));

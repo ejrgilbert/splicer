@@ -869,7 +869,7 @@ mod tests {
                 builtin: None,
                 adapter_info: Some(AdapterInjectionInfo {
                     adapter_path: adapter_path.to_string(),
-                    tier1_interfaces: vec![
+                    matched_hook_interfaces: vec![
                         "splicer:tier1/before".to_string(),
                         "splicer:tier1/after".to_string(),
                     ],
