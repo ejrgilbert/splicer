@@ -786,7 +786,7 @@ mod tests {
 
         // Inject middleware only on the `my:providers/a@0.1.0` interface.
         let rules = vec![SpliceRule::Before {
-            interface: "my:providers/a@0.1.0".to_string(),
+            interface_glob: "my:providers/a@0.1.0".to_string(),
             provider_name: Some("provider-a".to_string()),
             provider_alias: None,
             inject: vec![Injection {
@@ -860,7 +860,7 @@ mod tests {
         // records the strings into wac_deps, never reads the file.
         let mdl_path = "/tmp/tracing.wasm".to_string();
         let mk_rule = |iface: &str, provider: &str, adapter_path: &str| SpliceRule::Before {
-            interface: iface.to_string(),
+            interface_glob: iface.to_string(),
             provider_name: Some(provider.to_string()),
             provider_alias: None,
             inject: vec![Injection {

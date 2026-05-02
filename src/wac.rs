@@ -779,7 +779,7 @@ fn apply_rule_between(
     let mut full_match = false;
 
     if let SpliceRule::Between {
-        interface,
+        interface_glob: interface,
         inner_name,
         inner_alias,
         outer_name,
@@ -852,7 +852,7 @@ fn apply_rule_before(
     let mut interface_matched = false;
     let mut full_match = false;
     if let SpliceRule::Before {
-        interface,
+        interface_glob: interface,
         provider_name,
         provider_alias,
         inject,
@@ -1190,8 +1190,14 @@ fn create_tier1_mdl(
 
 fn rule_interface(rule: &SpliceRule) -> &str {
     match rule {
-        SpliceRule::Before { interface, .. } => interface,
-        SpliceRule::Between { interface, .. } => interface,
+        SpliceRule::Before {
+            interface_glob: interface,
+            ..
+        } => interface,
+        SpliceRule::Between {
+            interface_glob: interface,
+            ..
+        } => interface,
     }
 }
 

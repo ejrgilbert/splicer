@@ -452,7 +452,7 @@ rules:
         // parse time.
         use crate::parse::config::{Injection, SpliceRule};
         let mut rules = vec![SpliceRule::Before {
-            interface: "wasi:logging/log@0.1.0".into(),
+            interface_glob: "wasi:logging/log@0.1.0".into(),
             provider_name: None,
             provider_alias: None,
             inject: vec![Injection {

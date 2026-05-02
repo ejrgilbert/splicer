@@ -188,7 +188,7 @@ pub enum SpliceRule {
     Before {
         /// Glob pattern for the interface to match (e.g.
         /// `"wasi:http/*"` or `"*"`).
-        interface: String,
+        interface_glob: String,
         /// Optional provider name to scope the match.
         provider_name: Option<String>,
         /// Optional alias for the matched provider in the generated WAC.
@@ -199,7 +199,7 @@ pub enum SpliceRule {
     /// Inject middleware between two specific components on an interface edge.
     Between {
         /// Glob pattern for the interface to match.
-        interface: String,
+        interface_glob: String,
         /// Name of the inner (provider-side) component.
         inner_name: String,
         /// Optional alias for the inner component.
@@ -402,7 +402,7 @@ impl ConfigFile {
                     }) = before
                     {
                         SpliceRule::Before {
-                            interface,
+                            interface_glob: interface,
                             provider_name: provider.as_ref().and_then(|p| p.name.clone()),
                             provider_alias: provider.and_then(|p| p.alias),
                             inject,
@@ -414,7 +414,7 @@ impl ConfigFile {
                     }) = between
                     {
                         SpliceRule::Between {
-                            interface,
+                            interface_glob: interface,
                             inner_name: inner.name,
                             inner_alias: inner.alias,
                             outer_name: outer.name,
@@ -476,7 +476,7 @@ rules:
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
         let SpliceRule::Before {
-            interface,
+            interface_glob: interface,
             provider_name,
             provider_alias,
             inject,
@@ -537,7 +537,7 @@ rules:
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
         let SpliceRule::Between {
-            interface,
+            interface_glob: interface,
             inner_name,
             inner_alias,
             outer_name,
