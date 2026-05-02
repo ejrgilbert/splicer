@@ -162,9 +162,9 @@ impl LiftKind {
 //
 // A LiftPlan describes one (param | result) lift end-to-end:
 // every cell that needs to be written, in allocation order, with
-// each cell bound to its source wasm locals (via `LocalRef`) and
-// any nominal-cell side-table info it carries. `cells[0]` is the
-// root that the field-tree's `root` field points at.
+// each cell bound to its source wasm locals (concrete absolute
+// indices) and any nominal-cell side-table info it carries.
+// `cells[0]` is the root that the field-tree's `root` field points at.
 //
 // Why a flat Vec instead of a nested IR: cell indices in
 // nominal-cell side-table entries (e.g., a record's `fields`
@@ -172,42 +172,42 @@ impl LiftKind {
 // drives codegen also drives side-table emission; child indices
 // can't desync because they're a property of allocation order.
 // `cells.len()` is the slab size; total flat-slot consumption is
-// known by counting `LocalRef::Param(_)`s allocated. See
+// recorded explicitly on [`LiftPlan::flat_slot_count`]. See
 // [`docs/tiers/lift-codegen.md`](../../../docs/tiers/lift-codegen.md).
 
 /// One cell to write at a known cell-array index. Each variant
 /// captures the cell's runtime-disc semantics, its source wasm
-/// locals (via [`LocalRef`]), and any side-table info this cell
-/// contributes (e.g., enum-info / record-info entries).
+/// locals (absolute wasm-local indices), and any side-table info
+/// this cell contributes (e.g., enum-info / record-info entries).
 pub(super) enum CellOp {
     Bool {
-        local: LocalRef,
+        local: u32,
     },
     IntegerSignExt {
-        local: LocalRef,
+        local: u32,
     },
     IntegerZeroExt {
-        local: LocalRef,
+        local: u32,
     },
     Integer64 {
-        local: LocalRef,
+        local: u32,
     },
     FloatingF32 {
-        local: LocalRef,
+        local: u32,
     },
     FloatingF64 {
-        local: LocalRef,
+        local: u32,
     },
     Text {
-        ptr: LocalRef,
-        len: LocalRef,
+        ptr: u32,
+        len: u32,
     },
     Bytes {
-        ptr: LocalRef,
-        len: LocalRef,
+        ptr: u32,
+        len: u32,
     },
     EnumCase {
-        local: LocalRef,
+        local: u32,
         info: NamedListInfo,
     },
     RecordOf {
@@ -218,56 +218,6 @@ pub(super) enum CellOp {
     },
 }
 
-/// Where a payload value comes from at emit time. Kept abstract at
-/// classify time so the plan is reusable across param vs. result
-/// lifts; resolved to a concrete wasm local index via
-/// [`LocalRef::resolve`] at emit time.
-///
-/// `Param(n)` is **plan-local**: indexed from 0 within the
-/// [`LiftPlan`] that owns it. The plan's owner stores a `local_base`
-/// — an absolute wasm-local index — that gets added to `n` at resolve
-/// time. For params, the base lives on [`ParamLift::local_base`]
-/// (cumulative param-slot cursor). For compound results, the base is
-/// the first synthetic local on the
-/// [`ResultEmitPlan::Compound::synth_locals`] vector built at
-/// [`alloc_wrapper_locals`] time.
-///
-/// `PtrScratch` / `LenScratch` / `Result` are wrapper-allocated
-/// scratch locals; they don't shift with the plan's base.
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub(super) enum LocalRef {
-    /// Plan-local flat-slot index. Resolved to absolute via
-    /// `local_base + n` at emit time — see [`LocalRef::resolve`].
-    Param(u32),
-    /// `lcl.ptr_scratch` — set up before the lift for retptr-loaded results.
-    PtrScratch,
-    /// `lcl.len_scratch` — paired with `PtrScratch`.
-    LenScratch,
-    /// `lcl.result` — direct primitive return captured into a local.
-    Result,
-}
-
-impl LocalRef {
-    /// Resolve to a concrete wasm local index. `local_base` is the
-    /// absolute index that `Param(0)` of the owning plan corresponds
-    /// to — for params, the cumulative param-slot cursor when this
-    /// param's plan started; for compound results, the first
-    /// synthetic local allocated for the result. Panics for unset
-    /// scratch locals (which only happens if the plan-builder picked
-    /// an inappropriate `LocalRef` for the lift's source).
-    pub(super) fn resolve(&self, lcl: &WrapperLocals, local_base: u32) -> u32 {
-        match self {
-            LocalRef::Param(i) => local_base + *i,
-            LocalRef::PtrScratch => lcl.ptr_scratch,
-            LocalRef::LenScratch => lcl.len_scratch,
-            LocalRef::Result => lcl
-                .result
-                .expect("LocalRef::Result requires a direct-return local"),
-        }
-    }
-}
-
 /// Plan for lifting one (param | result) into a cell tree. Cells
 /// are listed in allocation order; `cells[0]` is the root that the
 /// field-tree's `root` field points at. Walked top-to-bottom by the
@@ -275,10 +225,9 @@ impl LocalRef {
 /// pull out per-kind side-table contributions.
 pub(super) struct LiftPlan {
     pub cells: Vec<CellOp>,
-    /// Total flat-slot locals consumed by the plan (i.e.
-    /// `LocalRef::Param(0..flat_slot_count)` cover every flat slot).
-    /// Owners pair this with `local_base` to know how many absolute
-    /// wasm locals to allocate / reserve after their base.
+    /// Total flat-slot locals consumed by the plan. Owners use this
+    /// to assert that the absolute wasm-local indices baked into
+    /// `cells` match the locals they intended to feed in.
     pub flat_slot_count: u32,
 }
 
@@ -314,22 +263,26 @@ impl LiftPlan {
 /// info (a child's index is just `cells.len()` after its sub-call
 /// has appended).
 ///
-/// Plan-local: `next_local` always starts at 0. The plan's owner
-/// records the count `next_local` ends at (= total flat slots
-/// consumed) and pairs it with an absolute `local_base` so
-/// [`LocalRef::resolve`] can compute absolute wasm-local indices at
-/// emit time.
+/// Caller provides `local_base` — the absolute wasm-local index that
+/// the plan's first flat slot occupies. Cells receive absolute indices
+/// `local_base..local_base + flat_slot_count` baked in at build time;
+/// the emit phase walks the plan with no further base resolution.
 struct LiftPlanBuilder {
     cells: Vec<CellOp>,
-    /// Next available plan-local flat-slot index (for `LocalRef::Param`).
+    /// Absolute wasm-local index the builder started from. Used only
+    /// to compute `flat_slot_count` at `into_plan` time.
+    local_base: u32,
+    /// Next available absolute wasm-local index. Incremented by
+    /// `bump_local` as cells consume flat slots.
     next_local: u32,
 }
 
 impl LiftPlanBuilder {
-    fn new() -> Self {
+    fn new(local_base: u32) -> Self {
         Self {
             cells: Vec::new(),
-            next_local: 0,
+            local_base,
+            next_local: local_base,
         }
     }
 
@@ -383,8 +336,8 @@ impl LiftPlanBuilder {
         root_idx
     }
 
-    fn bump_local(&mut self) -> LocalRef {
-        let r = LocalRef::Param(self.next_local);
+    fn bump_local(&mut self) -> u32 {
+        let r = self.next_local;
         self.next_local += 1;
         r
     }
@@ -423,7 +376,7 @@ impl LiftPlanBuilder {
     fn into_plan(self) -> LiftPlan {
         LiftPlan {
             cells: self.cells,
-            flat_slot_count: self.next_local,
+            flat_slot_count: self.next_local - self.local_base,
         }
     }
 }
@@ -470,17 +423,25 @@ pub(super) enum ResultSource {
 }
 
 /// Per-fn compound-result classify output: which WIT type to lift
-/// plus the cell-tree plan that consumes the flat slots. The
-/// retptr scratch byte offset, the cells-slab byte offset, and the
-/// per-cell record-info side-table indices are all layout-phase
-/// outputs — they live on [`ResultSourceLayout::Compound`], not here.
+/// plus a structural cell-tree plan. The retptr scratch byte offset,
+/// the cells-slab byte offset, and the per-cell record-info side-
+/// table indices are all layout-phase outputs — they live on
+/// [`ResultSourceLayout::Compound`], not here.
+///
+/// `plan`'s cells carry placeholder local indices (built with
+/// `local_base = 0`) — only the structural fields (cell variants,
+/// record-of `fields`, enum infos) are read by the side-table
+/// builders. The emit phase rebuilds a fresh plan with the actual
+/// synth-local base baked into the cells; the rebuilt plan lives on
+/// [`ResultEmitPlan::Compound::plan`].
 pub(super) struct CompoundResult {
     /// WIT type of the result value — kept around so the wrapper
-    /// body can drive `lift_from_memory` through `WasmEncoderBindgen`.
+    /// body can drive `lift_from_memory` through `WasmEncoderBindgen`,
+    /// and so the emit phase can rebuild the cell plan with the
+    /// correct synth-local base.
     pub ty: Type,
-    /// Cell-array plan walked by `emit_lift_plan`. Same shape as a
-    /// param's plan; `LocalRef::Param(n)` resolves to
-    /// `local_base + n` at emit time.
+    /// Structural cell plan. Local indices are placeholder
+    /// (`local_base = 0`); only cell structure is consumed.
     pub plan: LiftPlan,
 }
 
@@ -495,16 +456,14 @@ impl ResultLift {
     }
 }
 
-/// Classify-time per-parameter lift recipe. `local_base` is the
-/// absolute wasm-local index that `LocalRef::Param(0)` of the
-/// param's plan corresponds to — the cumulative flat-slot count of
-/// preceding params. Cells-slab offset + per-cell record-info
-/// indices live on the post-layout [`ParamLayout`].
+/// Classify-time per-parameter lift recipe. The plan's cells already
+/// carry absolute wasm-local indices (the plan-builder bakes them in
+/// from each param's cumulative flat-slot cursor). Cells-slab offset
+/// + per-cell record-info indices live on the post-layout
+/// [`ParamLayout`].
 pub(super) struct ParamLift {
     pub name: BlobSlice,
     pub plan: LiftPlan,
-    /// Absolute wasm-local index of `LocalRef::Param(0)` for this plan.
-    pub local_base: u32,
 }
 
 // ─── Layout-phase outputs (immutable, includes offsets) ───────────
@@ -589,8 +548,10 @@ pub(super) struct NamedListInfo {
 // ─── Classifiers ──────────────────────────────────────────────────
 
 /// Build a [`LiftPlan`] for every WIT param of `func`. `slot_cursor`
-/// threads across params, recording each param's absolute `local_base`
-/// (the function-flat-slot index its `LocalRef::Param(0)` resolves to).
+/// threads across params, seeding each param's plan with the absolute
+/// wasm-local index of its first flat slot — the cumulative flat-slot
+/// count of preceding params. Cells in the resulting plan carry their
+/// final wasm-local indices baked in.
 pub(super) fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
@@ -601,15 +562,11 @@ pub(super) fn classify_func_params(
     for param in &func.params {
         let pname = &param.name;
         let name = append_param_name(name_blob, pname);
-        let mut builder = LiftPlanBuilder::new();
+        let mut builder = LiftPlanBuilder::new(slot_cursor);
         builder.push(&param.ty, resolve);
         let plan = builder.into_plan();
         let consumed = plan.flat_slot_count;
-        params_lift.push(ParamLift {
-            name,
-            plan,
-            local_base: slot_cursor,
-        });
+        params_lift.push(ParamLift { name, plan });
         slot_cursor += consumed;
     }
     params_lift
@@ -645,12 +602,13 @@ pub(super) fn classify_result_lift(
     let kind = LiftKind::classify(ty, resolve);
 
     // Compound kinds (currently just Record) drive a LiftPlan over
-    // retptr-loaded flat slots. The plan-builder walks the WIT type
-    // exactly like it does for params; the difference is the source
-    // of `LocalRef::Param(n)` — synthetic locals populated from
-    // `lift_from_memory` instead of function-flat-slot params.
+    // retptr-loaded flat slots. Classify-time we build a structural
+    // plan with `local_base = 0` (placeholder); only the cell-tree
+    // structure is read by the side-table builders. The emit phase
+    // rebuilds a fresh plan with the actual synth-local base baked
+    // into the cells (see `alloc_wrapper_locals`).
     if matches!(kind, LiftKind::Record) {
-        let mut builder = LiftPlanBuilder::new();
+        let mut builder = LiftPlanBuilder::new(0);
         builder.push(ty, resolve);
         let plan = builder.into_plan();
         return Some(ResultLift {
@@ -1220,10 +1178,6 @@ pub(super) struct WrapperLocals {
     pub st: u32,
     /// Waitable-set handle for the wait loop.
     pub ws: u32,
-    /// Retptr-loaded ptr for Text/Bytes result lift.
-    pub ptr_scratch: u32,
-    /// Retptr-loaded len for Text/Bytes result lift.
-    pub len_scratch: u32,
     /// i64 widening source for IntegerSignExt/ZeroExt.
     pub ext64: u32,
     /// f64 promoted source for FloatingF32.
@@ -1243,8 +1197,8 @@ pub(super) struct WrapperLocals {
 /// [`emit_wrapper_function`]'s phase-3 result-lift block via a single
 /// pattern match. Replaces the prior pile of parallel `Option`-shaped
 /// fields whose Some-ness had to agree by hand. Borrows the
-/// classify-time `CompoundResult` and the layout-time per-cell
-/// record-info index map from the owning [`FuncDispatch`].
+/// layout-time per-cell record-info index map from the owning
+/// [`FuncDispatch`].
 pub(super) enum ResultEmitPlan<'a> {
     /// Void function or unsupported result kind: no lift fires.
     None,
@@ -1263,16 +1217,19 @@ pub(super) enum ResultEmitPlan<'a> {
         ptr_local: u32,
         len_local: u32,
     },
-    /// Compound result: classify-time recipe + layout offsets +
+    /// Compound result: emit-time cell plan + layout offsets +
     /// emit-time locals/loads. `addr_local` drives the
     /// `lift_from_memory`-built `loads` sequence (which pushes
     /// canonical-ABI flat values onto the wasm stack); the wrapper
     /// then `local.set`s those into `synth_locals` (in reverse) for
-    /// the plan walker. `record_info_cell_idx` is the layout-phase
-    /// per-cell `RecordOf` side-table index map (borrowed off
-    /// [`ResultSourceLayout::Compound`]).
+    /// the plan walker. The owned `plan` is rebuilt here with absolute
+    /// wasm-local indices (= `synth_locals[i]`) baked into each cell —
+    /// the classify-time [`CompoundResult::plan`] only carries
+    /// placeholder indices and is consumed by the side-table builders.
+    /// `record_info_cell_idx` is the layout-phase per-cell `RecordOf`
+    /// side-table index map (borrowed off [`ResultSourceLayout::Compound`]).
     Compound {
-        compound: &'a CompoundResult,
+        plan: LiftPlan,
         retptr_offset: i32,
         addr_local: u32,
         synth_locals: Vec<u32>,
@@ -1340,17 +1297,30 @@ pub(super) fn alloc_wrapper_locals<'a>(
                 debug_assert_eq!(
                     flat.len(),
                     compound.plan.flat_slot_count as usize,
-                    "canonical-ABI flat count must match plan flat_slot_count"
+                    "canonical-ABI flat count must match classify-time plan"
                 );
                 let synth_locals: Vec<u32> = flat
                     .into_iter()
                     .map(|wt| locals.alloc_local(wasm_type_to_val(wt)))
                     .collect();
+                // Rebuild the cell plan with absolute wasm-local
+                // indices baked in: `local_base = synth_locals[0]`
+                // means cell N's local = synth_locals[0] + N, which
+                // matches our contiguous synth-local allocation.
+                let synth_base = synth_locals[0];
+                let mut builder = LiftPlanBuilder::new(synth_base);
+                builder.push(&compound.ty, resolve);
+                let plan = builder.into_plan();
+                debug_assert_eq!(
+                    plan.cells.len(),
+                    compound.plan.cells.len(),
+                    "rebuilt emit-time plan must have same cell count as classify-time plan"
+                );
                 let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, locals);
                 lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
                 let loads = bindgen.into_instructions();
                 ResultEmitPlan::Compound {
-                    compound,
+                    plan,
                     retptr_offset: *retptr_offset,
                     addr_local,
                     synth_locals,
@@ -1366,8 +1336,6 @@ pub(super) fn alloc_wrapper_locals<'a>(
             addr,
             st,
             ws,
-            ptr_scratch,
-            len_scratch,
             ext64,
             ext_f64,
             result,
@@ -1380,16 +1348,15 @@ pub(super) fn alloc_wrapper_locals<'a>(
 /// Emit the wasm that lifts one plan into its cells slab. Walks
 /// `plan.cells` in allocation order and, for each cell, sets
 /// `lcl.addr` to that cell's absolute address (`cells_offset + i *
-/// cell_size`) and dispatches on the cell's variant. `local_base` is
-/// the absolute wasm-local index that the plan's `LocalRef::Param(0)`
-/// resolves to.
+/// cell_size`) and dispatches on the cell's variant. The cells
+/// already carry their absolute wasm-local indices; no further base
+/// resolution happens here.
 pub(super) fn emit_lift_plan(
     f: &mut Function,
     cell_layout: &CellLayout,
     cells_offset: u32,
     plan: &LiftPlan,
     record_info_indices: &[Option<u32>],
-    local_base: u32,
     lcl: &WrapperLocals,
 ) {
     debug_assert_eq!(record_info_indices.len(), plan.cells.len());
@@ -1397,14 +1364,7 @@ pub(super) fn emit_lift_plan(
         let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
         f.instructions().i32_const(cell_addr as i32);
         f.instructions().local_set(lcl.addr);
-        emit_cell_op(
-            f,
-            cell_layout,
-            op,
-            record_info_indices[cell_idx],
-            local_base,
-            lcl,
-        );
+        emit_cell_op(f, cell_layout, op, record_info_indices[cell_idx], lcl);
     }
 }
 
@@ -1419,54 +1379,39 @@ fn emit_cell_op(
     cell_layout: &CellLayout,
     op: &CellOp,
     record_info_idx: Option<u32>,
-    local_base: u32,
     lcl: &WrapperLocals,
 ) {
     let addr = lcl.addr;
     match op {
-        CellOp::Bool { local } => cell_layout.emit_bool(f, addr, local.resolve(lcl, local_base)),
+        CellOp::Bool { local } => cell_layout.emit_bool(f, addr, *local),
         CellOp::IntegerSignExt { local } => {
-            f.instructions().local_get(local.resolve(lcl, local_base));
+            f.instructions().local_get(*local);
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
         CellOp::IntegerZeroExt { local } => {
-            f.instructions().local_get(local.resolve(lcl, local_base));
+            f.instructions().local_get(*local);
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        CellOp::Integer64 { local } => {
-            cell_layout.emit_integer(f, addr, local.resolve(lcl, local_base))
-        }
+        CellOp::Integer64 { local } => cell_layout.emit_integer(f, addr, *local),
         CellOp::FloatingF32 { local } => {
-            f.instructions().local_get(local.resolve(lcl, local_base));
+            f.instructions().local_get(*local);
             f.instructions().f64_promote_f32();
             f.instructions().local_set(lcl.ext_f64);
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
-        CellOp::FloatingF64 { local } => {
-            cell_layout.emit_floating(f, addr, local.resolve(lcl, local_base))
-        }
+        CellOp::FloatingF64 { local } => cell_layout.emit_floating(f, addr, *local),
         CellOp::Text { ptr, len } => {
-            cell_layout.emit_text(
-                f,
-                addr,
-                ptr.resolve(lcl, local_base),
-                len.resolve(lcl, local_base),
-            );
+            cell_layout.emit_text(f, addr, *ptr, *len);
         }
         CellOp::Bytes { ptr, len } => {
-            cell_layout.emit_bytes(
-                f,
-                addr,
-                ptr.resolve(lcl, local_base),
-                len.resolve(lcl, local_base),
-            );
+            cell_layout.emit_bytes(f, addr, *ptr, *len);
         }
         CellOp::EnumCase { local, .. } => {
-            cell_layout.emit_enum_case(f, addr, local.resolve(lcl, local_base));
+            cell_layout.emit_enum_case(f, addr, *local);
         }
         CellOp::RecordOf { .. } => {
             let idx = record_info_idx
@@ -1579,11 +1524,11 @@ pub(super) fn emit_lift_result(
 ///
 /// After this returns, the synthetic locals at `synth_locals[0]..
 /// synth_locals[N]` hold the result's flat values in canonical-ABI
-/// order, ready for [`emit_lift_plan`] to walk the cell plan
-/// (resolving `LocalRef::Param(0)` against `synth_locals[0]`).
+/// order, ready for [`emit_lift_plan`] to walk the cell plan whose
+/// cells already reference these absolute synth-local indices.
 pub(super) fn emit_lift_compound_prefix(
     f: &mut Function,
-    compound: &CompoundResult,
+    plan_flat_slot_count: u32,
     retptr_offset: i32,
     loads: &[Instruction<'static>],
     addr_local: u32,
@@ -1591,7 +1536,7 @@ pub(super) fn emit_lift_compound_prefix(
 ) {
     debug_assert_eq!(
         synth_locals.len(),
-        compound.plan.flat_slot_count as usize,
+        plan_flat_slot_count as usize,
         "synthetic-local count must match plan flat slot count"
     );
     // Stage retptr_offset into the addr local that the pre-built
@@ -1603,7 +1548,7 @@ pub(super) fn emit_lift_compound_prefix(
         f.instruction(inst);
     }
     // local.set in reverse order: top-of-stack is the LAST pushed (=
-    // highest plan-local index). Working back to slot 0.
+    // highest flat-slot index). Working back to slot 0.
     for &local in synth_locals.iter().rev() {
         f.instructions().local_set(local);
     }

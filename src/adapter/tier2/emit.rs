@@ -1479,7 +1479,6 @@ fn emit_wrapper_function(
                 p.cells_offset,
                 &p.lift.plan,
                 &p.record_info_cell_idx,
-                p.lift.local_base,
                 &lcl,
             );
         }
@@ -1528,17 +1527,18 @@ fn emit_wrapper_function(
         if let Some(cells_off) = after.result_cells_offset {
             match &result_emit {
                 ResultEmitPlan::Compound {
-                    compound,
+                    plan,
                     retptr_offset,
                     addr_local,
                     synth_locals,
                     loads,
                     record_info_cell_idx,
+                    ..
                 } => {
                     // Memory → flat-on-stack → synthetic locals → walk plan.
                     emit_lift_compound_prefix(
                         &mut f,
-                        compound,
+                        plan.flat_slot_count,
                         *retptr_offset,
                         loads,
                         *addr_local,
@@ -1548,9 +1548,8 @@ fn emit_wrapper_function(
                         &mut f,
                         &schema.cell_layout,
                         cells_off,
-                        &compound.plan,
+                        plan,
                         record_info_cell_idx,
-                        synth_locals[0],
                         &lcl,
                     );
                 }
