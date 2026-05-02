@@ -34,7 +34,7 @@ use wit_parser::abi::WasmSignature;
 use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
 use super::super::abi::emit::{
-    direct_return_type, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
+    direct_return_type, wasm_type_to_val, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
@@ -1375,19 +1375,6 @@ pub(super) fn alloc_wrapper_locals<'a>(
         },
         result_emit,
     )
-}
-
-/// Map a wit-bindgen-core `WasmType` to a wasm-encoder `ValType`.
-/// Splicer targets wasm32, so Pointer/Length collapse to i32 and
-/// PointerOrI64 collapses to i64.
-fn wasm_type_to_val(wt: wit_parser::abi::WasmType) -> ValType {
-    use wit_parser::abi::WasmType::*;
-    match wt {
-        I32 | Pointer | Length => ValType::I32,
-        I64 | PointerOrI64 => ValType::I64,
-        F32 => ValType::F32,
-        F64 => ValType::F64,
-    }
 }
 
 /// Emit the wasm that lifts one plan into its cells slab. Walks

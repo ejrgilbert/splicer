@@ -62,6 +62,7 @@ use wit_parser::{Alignment, ArchitectureSize, Resolve, SizeAlign, Type};
 
 use super::super::indices::FunctionIndices;
 use super::compat::{cast, flat_types};
+use super::emit::wasm_type_to_val;
 
 /// Bindgen that accumulates `wasm_encoder::Instruction`s into buffers,
 /// ready to be flushed into a `Function` by [`WasmEncoderBindgen::drain_into`].
@@ -418,19 +419,6 @@ impl<'a> WasmEncoderBindgen<'a> {
         for idx in &payload_locals {
             self.emit_one(Instruction::LocalGet(*idx));
         }
-    }
-}
-
-/// Map a wit-parser `WasmType` to a `wasm_encoder::ValType`. Splicer
-/// targets wasm32, so Pointer/Length collapse to I32 and PointerOrI64
-/// collapses to I64.
-fn wasm_type_to_val(wt: WasmType) -> ValType {
-    use WasmType::*;
-    match wt {
-        I32 | Pointer | Length => ValType::I32,
-        I64 | PointerOrI64 => ValType::I64,
-        F32 => ValType::F32,
-        F64 => ValType::F64,
     }
 }
 
