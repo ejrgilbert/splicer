@@ -1,7 +1,9 @@
 use crate::adapter::generate_tier1_adapter;
 use crate::contract::{validate_contract, ContractResult};
+use anyhow::Context;
 use colored::Colorize;
 use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
+use globset::{Glob, GlobMatcher};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -227,31 +229,26 @@ pub fn generate_wac(
         }
         if !any_full_match {
             let iface = rule_interface(rule);
+            let iface_matcher = compile_interface_matcher(iface)?;
             if !any_interface_matched {
-                // Interface name itself wasn't found — suggest close matches.
+                // Interface pattern itself wasn't found — suggest direct glob hits.
                 let available: Vec<&str> =
                     chains.iter().map(|c| c.interface.name.as_str()).collect();
-                let iface_base = iface.split('@').next().unwrap_or(iface);
                 let possibly_intended: Vec<&str> = available
                     .iter()
                     .copied()
-                    .filter(|&avail| {
-                        let avail_base = avail.split('@').next().unwrap_or(avail);
-                        avail_base == iface_base
-                            || avail.starts_with(iface)
-                            || iface.starts_with(avail)
-                    })
+                    .filter(|&avail| iface_matcher.is_match(avail))
                     .collect();
                 let intended_msg = if possibly_intended.is_empty() {
                     String::new()
                 } else {
                     format!(
-                        "\n\t  Possibly intended:    [{}]",
+                        "\n\t  Matches for pattern:  [{}]",
                         possibly_intended.join(", ")
                     )
                 };
                 eprintln!(
-                    "{}: rule {} — interface '{}' was not found in the composition.\n\
+                    "{}: rule {} — interface pattern '{}' was not found in the composition.\n\
                      \t  Available interfaces: [{}]{}",
                     "WARN".yellow().bold(),
                     rule_idx + 1,
@@ -264,7 +261,7 @@ pub fn generate_wac(
                 // for chains on that interface so the user can fix their config.
                 let node_names: Vec<String> = chains
                     .iter()
-                    .filter(|c| c.interface.name == iface)
+                    .filter(|c| iface_matcher.is_match(&c.interface.name))
                     .flat_map(|c| {
                         c.chain
                             .iter()
@@ -274,7 +271,7 @@ pub fn generate_wac(
                     .into_iter()
                     .collect();
                 eprintln!(
-                    "{}: rule {} — interface '{}' matched but no node names matched.\n\
+                    "{}: rule {} — interface pattern '{}' matched but no node names matched.\n\
                      \t  Nodes on that interface: [{}]\n\
                      \t  Check the 'name' fields in your config against these exactly.",
                     "WARN".yellow().bold(),
@@ -731,6 +728,7 @@ fn warn_about_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
     shim_keys.sort();
     for shim_num in shim_keys {
         let resolved = resolve_shim(shim_num, shim_comps);
+
         if resolved != shim_num {
             eprintln!(
                 "{}: {}",
@@ -779,6 +777,7 @@ fn apply_rule_between(
     let mut contract_results = vec![];
     let mut interface_matched = false;
     let mut full_match = false;
+
     if let SpliceRule::Between {
         interface,
         inner_name,
@@ -788,6 +787,18 @@ fn apply_rule_between(
         inject,
     } = rule
     {
+        let interface_matcher = compile_interface_matcher(interface)?;
+
+        if !interface_matcher.is_match(&chain.interface.name) {
+            return Ok(RuleApplyResult {
+                contract_results,
+                interface_matched,
+                full_match,
+            });
+        }
+
+        interface_matched = true;
+
         for (i, window) in chain.chain.windows(2).enumerate() {
             let inner_id = window[0];
             let outer_id = window[1];
@@ -796,10 +807,6 @@ fn apply_rule_between(
 
             let inner_var = get_name(inner_node).to_string();
             let outer_var = get_name(outer_node).to_string();
-            if *interface != chain.interface.name {
-                continue;
-            }
-            interface_matched = true;
             if *inner_name == inner_var && *outer_name == outer_var {
                 full_match = true;
                 let new_aliases = vec![
@@ -809,7 +816,7 @@ fn apply_rule_between(
                 let consumer_path =
                     chain.consumer_split_path(i + 1, composition, splits_path, shim_comps);
                 contract_results.extend(add_to_inject_plan(
-                    interface,
+                    &chain.interface.name,
                     inject,
                     i + 1,
                     &new_aliases,
@@ -851,12 +858,21 @@ fn apply_rule_before(
         inject,
     } = rule
     {
+        let interface_matcher = compile_interface_matcher(interface)?;
+
+        if !interface_matcher.is_match(&chain.interface.name) {
+            return Ok(RuleApplyResult {
+                contract_results,
+                interface_matched,
+                full_match,
+            });
+        }
+
+        interface_matched = true;
+
         for (i, id) in chain.chain.iter().enumerate() {
-            if *interface != chain.interface.name {
-                continue;
-            }
-            interface_matched = true;
             let outer_node = &composition.nodes[id];
+
             if let Some(provider) = provider_name {
                 if get_name(outer_node) != *provider {
                     continue;
@@ -873,7 +889,7 @@ fn apply_rule_before(
                 .consumer_split_path(i + 1, composition, splits_path, shim_comps)
                 .or_else(|| chain.consumer_split_path(i, composition, splits_path, shim_comps));
             contract_results.extend(add_to_inject_plan(
-                interface,
+                &chain.interface.name,
                 inject,
                 i + 1,
                 &new_aliases,
@@ -989,6 +1005,7 @@ fn add_to_inject_plan(
     }
 
     middlewares.extend(resolved);
+
     Ok(final_results)
 }
 
@@ -1085,9 +1102,9 @@ fn create_mdl(
     wac_lines: &mut Vec<String>,
 ) -> String {
     let mw_line = format!(
-        "let {mw} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};",
-        interface = interface.name,
-    );
+		"let {mw} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};",
+		interface = interface.name,
+	);
     wac_lines.push(mw_line);
 
     mw.clone()
@@ -1131,9 +1148,9 @@ fn create_tier1_mdl(
     // so the WAC lines use the versioned names to match both sides.
     use crate::contract::{versioned_interface, TIER1_VERSION};
     let mut adapter_line = format!(
-        "let {adapter_var} = new {INST_PREFIX}:{adapter_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
-        iface = interface.name,
-    );
+		"let {adapter_var} = new {INST_PREFIX}:{adapter_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
+		iface = interface.name,
+	);
     for tier1_iface in &adapter_info.tier1_interfaces {
         let versioned = versioned_interface(tier1_iface, TIER1_VERSION);
         adapter_line.push_str(&format!(
@@ -1176,6 +1193,13 @@ fn rule_interface(rule: &SpliceRule) -> &str {
         SpliceRule::Before { interface, .. } => interface,
         SpliceRule::Between { interface, .. } => interface,
     }
+}
+
+fn compile_interface_matcher(pattern: &str) -> anyhow::Result<GlobMatcher> {
+    let glob = Glob::new(pattern)
+        .with_context(|| format!("Invalid interface glob pattern '{pattern}'"))?;
+
+    Ok(glob.compile_matcher())
 }
 
 /// Helper to get the instance name from a node

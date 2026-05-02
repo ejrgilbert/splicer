@@ -1,4 +1,5 @@
 use anyhow::bail;
+use globset::Glob;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -185,7 +186,8 @@ impl Injection {
 pub enum SpliceRule {
     /// Inject middleware before a provider on an interface edge.
     Before {
-        /// The interface to match (e.g. `"wasi:http/handler@0.3.0"`).
+        /// Glob pattern for the interface to match (e.g.
+        /// `"wasi:http/*"` or `"*"`).
         interface: String,
         /// Optional provider name to scope the match.
         provider_name: Option<String>,
@@ -196,7 +198,7 @@ pub enum SpliceRule {
     },
     /// Inject middleware between two specific components on an interface edge.
     Between {
-        /// The interface to match.
+        /// Glob pattern for the interface to match.
         interface: String,
         /// Name of the inner (provider-side) component.
         inner_name: String,
@@ -280,6 +282,9 @@ impl ConfigFile {
             if interface.is_empty() {
                 bail!("rule {rule_num}: 'interface' must not be empty");
             }
+            Glob::new(interface).map_err(|e| {
+                anyhow::anyhow!("rule {rule_num}: invalid interface glob '{interface}': {e}")
+            })?;
 
             // before-specific checks.
             if let Some(before) = &rule.before {
