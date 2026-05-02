@@ -4,8 +4,8 @@
 //! to provide regardless of which tier of adapter it backs.
 
 use wasm_encoder::{
-    CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemorySection, MemoryType, Module,
-    ValType,
+    BlockType, CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemorySection,
+    MemoryType, Module, ValType,
 };
 use wit_parser::abi::{WasmSignature, WasmType};
 use wit_parser::{Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId};
@@ -27,13 +27,21 @@ pub(crate) const EXPORT_INITIALIZE: &str = "_initialize";
 /// Both `cabi_realloc` and any per-tier scratch allocator reference it.
 pub(crate) const BUMP_POINTER_GLOBAL: u32 = 0;
 
+/// Wasm linear-memory page size (64 KiB).
+pub(crate) const WASM_PAGE_SIZE: u32 = 64 * 1024;
+
 /// Memory section + bump-pointer global. `bump_start` is the byte
 /// offset where the bump allocator begins serving allocations; both
 /// tiers compute it from their pre-allocated scratch / name regions.
+/// The memory's initial size covers everything up to `bump_start`
+/// (rounded up to a page, with a one-page floor) so static data
+/// segments instantiated above the first page don't trap; runtime
+/// `cabi_realloc` calls grow the memory beyond that as needed.
 pub(crate) fn emit_memory_and_globals(module: &mut Module, bump_start: u32) {
+    let pages_for_static = bump_start.div_ceil(WASM_PAGE_SIZE).max(1);
     let mut memory = MemorySection::new();
     memory.memory(MemoryType {
-        minimum: 1,
+        minimum: pages_for_static as u64,
         maximum: None,
         memory64: false,
         shared: false,
@@ -56,7 +64,11 @@ pub(crate) fn emit_memory_and_globals(module: &mut Module, bump_start: u32) {
 /// Standard `cabi_realloc(old_ptr, old_size, align, new_size) -> new_ptr`
 /// implementation: bump-allocator that ignores `old_*`, aligns the
 /// current bump pointer up to `align`, returns the aligned address,
-/// and advances the bump global by `new_size`.
+/// and advances the bump global by `new_size`. If the new bump
+/// position would exceed the current linear-memory size, the
+/// allocator calls `memory.grow` for the shortfall and traps on
+/// failure — turning host-side OOM into a wasm trap rather than a
+/// silent bump-pointer wrap that would corrupt static data.
 ///
 /// `align` is assumed to be a power of two (canonical-ABI guarantee).
 /// Pushes the function into `code`; caller decides where it lands in
@@ -66,10 +78,11 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection) {
     const ALIGN_LOCAL: u32 = 2;
     const NEW_SIZE_LOCAL: u32 = 3;
     let mut locals = FunctionIndices::new(PARAM_COUNT);
-    let scratch = locals.alloc_local(ValType::I32);
+    let aligned = locals.alloc_local(ValType::I32);
+    let new_bump = locals.alloc_local(ValType::I32);
     let mut f = Function::new_with_locals_types(locals.into_locals());
 
-    // scratch = (global.bump + (align - 1)) & ~(align - 1)
+    // aligned = (global.bump + (align - 1)) & ~(align - 1)
     f.instructions().global_get(BUMP_POINTER_GLOBAL);
     f.instructions().local_get(ALIGN_LOCAL);
     f.instructions().i32_const(1);
@@ -81,16 +94,52 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection) {
     f.instructions().i32_const(-1);
     f.instructions().i32_xor();
     f.instructions().i32_and();
-    f.instructions().local_set(scratch);
+    f.instructions().local_set(aligned);
 
-    // global.bump = scratch + new_size
-    f.instructions().local_get(scratch);
+    // new_bump = aligned + new_size
+    f.instructions().local_get(aligned);
     f.instructions().local_get(NEW_SIZE_LOCAL);
     f.instructions().i32_add();
+    f.instructions().local_tee(new_bump);
+
+    // if new_bump > memory.size * page_size: grow memory
+    f.instructions().memory_size(0);
+    f.instructions().i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
+    f.instructions().i32_shl();
+    f.instructions().i32_gt_u();
+    f.instructions().if_(BlockType::Empty);
+    {
+        // delta_pages = ceil((new_bump - memory.size * page_size) / page_size).
+        // The subtraction is positive in this branch, so the
+        // `(x - 1) >> log2_page + 1` ceiling is well-defined.
+        f.instructions().local_get(new_bump);
+        f.instructions().memory_size(0);
+        f.instructions().i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
+        f.instructions().i32_shl();
+        f.instructions().i32_sub();
+        f.instructions().i32_const(1);
+        f.instructions().i32_sub();
+        f.instructions().i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
+        f.instructions().i32_shr_u();
+        f.instructions().i32_const(1);
+        f.instructions().i32_add();
+        f.instructions().memory_grow(0);
+        // memory.grow returns -1 on failure; trap so the host sees a
+        // recognizable wasm trap instead of a corrupted bump pointer.
+        f.instructions().i32_const(-1);
+        f.instructions().i32_eq();
+        f.instructions().if_(BlockType::Empty);
+        f.instructions().unreachable();
+        f.instructions().end();
+    }
+    f.instructions().end();
+
+    // global.bump = new_bump
+    f.instructions().local_get(new_bump);
     f.instructions().global_set(BUMP_POINTER_GLOBAL);
 
-    // return scratch
-    f.instructions().local_get(scratch);
+    // return aligned
+    f.instructions().local_get(aligned);
     f.instructions().end();
     code.function(&f);
 }
