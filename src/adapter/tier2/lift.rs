@@ -56,12 +56,12 @@ const ENUM_INFO_CASE_NAME: &str = "case-name";
 
 /// How a WIT type maps to a `cell` variant. Wired variants are
 /// implemented end-to-end (lift codegen produces real cells);
-/// un-wired variants (Phase 2-2b / 2-4) classify here without panic
-/// but `todo!()` at the codegen layer (`cells.rs`) when actually
-/// reached at adapter-build time.
+/// un-wired variants classify here without panic but `todo!()` at
+/// the codegen layer (`cells.rs`) when actually reached at
+/// adapter-build time. Roadmap: `docs/tiers/lift-codegen.md`.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum LiftKind {
-    // ── Phase 2-2a (wired) ────────────────────────────────────────
+    // ── Wired ─────────────────────────────────────────────────────
     /// `bool` — 1 i32 slot (0/1) → `cell::bool`.
     Bool,
     /// `s8`/`s16`/`s32` — 1 i32 slot, sign-extend → `cell::integer`.
@@ -79,7 +79,7 @@ pub(super) enum LiftKind {
     /// `list<u8>` — 2 i32 slots (ptr, len) → `cell::bytes`.
     Bytes,
 
-    // ── Phase 2-2b (todo!() in cells.rs) ─────────────────────────
+    // ── Un-wired compound (todo!() in cells.rs) ──────────────────
     /// `char` → `cell::text` (utf-8 encode the i32 code point).
     Char,
     /// `list<T>` (non-u8 element) → `cell::list-of`.
@@ -99,7 +99,7 @@ pub(super) enum LiftKind {
     /// `variant { ... }` → `cell::variant-case(u32)`.
     Variant,
 
-    // ── Phase 2-4 (todo!() in cells.rs) ──────────────────────────
+    // ── Un-wired handle (todo!() in cells.rs) ────────────────────
     /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`.
     Handle,
     /// `future<T>` → `cell::future-handle(u32)`.
@@ -331,7 +331,7 @@ impl LiftPlanBuilder {
                 self.cells.push(CellOp::EnumCase { local, info });
             }
             LiftKind::Record => self.push_record(ty, resolve, root_idx),
-            other => todo!("Phase 2-2b/2-4 plan-builder for {other:?}"),
+            other => todo!("plan-builder for un-wired LiftKind {other:?}"),
         }
         root_idx
     }

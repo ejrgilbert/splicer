@@ -317,7 +317,7 @@ pub(super) struct FuncDispatch {
     pub retptr_offset: Option<i32>,
     /// How to lift the function's return value into a `cell` for the
     /// on-return hook. `None` for void or compound returns we don't
-    /// yet lift (Phase 2-2b territory).
+    /// yet lift.
     pub result_lift: Option<ResultLayout>,
     /// On-return-hook scaffolding; `Some` iff after-hook is wired.
     pub after: Option<AfterSetup>,

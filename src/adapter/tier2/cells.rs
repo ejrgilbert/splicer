@@ -31,11 +31,10 @@
 //!
 //! ## Future optimization
 //!
-//! Per the Phase 2-2 design notes (`docs/tiers/tier-2.md`), this
-//! file emits cells one-at-a-time into a `cabi_realloc`-grown
-//! buffer for simplicity. A two-pass mode (pre-count + bulk-allocate)
-//! would avoid per-cell realloc traffic; defer until benchmarks
-//! show it matters.
+//! This file emits cells one-at-a-time into a `cabi_realloc`-grown
+//! buffer for simplicity (see `docs/tiers/tier-2.md`). A two-pass
+//! mode (pre-count + bulk-allocate) would avoid per-cell realloc
+//! traffic; defer until benchmarks show it matters.
 
 use std::collections::HashMap;
 
@@ -329,7 +328,7 @@ impl CellLayout {
         );
     }
 
-    // ─── Phase 2-2b stubs — codegen lives here once compound lift lands ──
+    // ─── Un-wired stubs — codegen lives here when each kind lands ──
     //
     // Each stub names the cell variant + payload shape it'll produce
     // when implemented. They're unreachable until `LiftKind` for the
@@ -341,18 +340,18 @@ impl CellLayout {
     /// `cell::char` — char's utf-8 encoding. char isn't a cell variant
     /// of its own; we encode the i32 code point as utf-8 bytes (1–4 of
     /// them) and emit the result as `cell::text`.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_char(&self, f: &mut Function, addr_local: u32, code_point_local: u32) {
         let _ = (f, addr_local, code_point_local);
         todo!(
-            "Phase 2-2b: utf-8-encode the i32 code point into a cabi_realloc'd \
+            "utf-8-encode the i32 code point into a cabi_realloc'd \
              buffer, then emit_text(ptr, len)"
         );
     }
 
     /// `cell::list-of(list<u32>)` — payload is `(ptr, len)` of a
     /// child-cell-index array allocated upstream.
-    #[allow(dead_code)] // Phase 2-2b stub; orchestration in `emit_lift_kind` reaches it.
+    #[allow(dead_code)]
     pub(crate) fn emit_list_of(
         &self,
         f: &mut Function,
@@ -361,11 +360,11 @@ impl CellLayout {
         idx_array_len: u32,
     ) {
         let _ = (f, addr_local, idx_array_ptr, idx_array_len);
-        todo!("Phase 2-2b: cell::list-of — disc 5 + (ptr, len) at payload");
+        todo!("cell::list-of — disc 5 + (ptr, len) at payload");
     }
 
     /// `cell::tuple-of(list<u32>)` — same flat shape as list-of.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_tuple_of(
         &self,
         f: &mut Function,
@@ -374,25 +373,25 @@ impl CellLayout {
         idx_array_len: u32,
     ) {
         let _ = (f, addr_local, idx_array_ptr, idx_array_len);
-        todo!("Phase 2-2b: cell::tuple-of — disc 6 + (ptr, len) at payload");
+        todo!("cell::tuple-of — disc 6 + (ptr, len) at payload");
     }
 
     /// `cell::option-some(u32)` — single inner cell index.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_option_some(&self, f: &mut Function, addr_local: u32, inner_idx: u32) {
         let _ = (f, addr_local, inner_idx);
-        todo!("Phase 2-2b: cell::option-some — disc 7 + i32 inner cell index at payload+0");
+        todo!("cell::option-some — disc 7 + i32 inner cell index at payload+0");
     }
 
     /// `cell::option-none` — no payload, just the discriminant.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_option_none(&self, f: &mut Function, addr_local: u32) {
         let _ = (f, addr_local);
-        todo!("Phase 2-2b: cell::option-none — disc 8, no payload");
+        todo!("cell::option-none — disc 8, no payload");
     }
 
     /// `cell::result-ok(option<u32>)` — disc 9 + option<inner>.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_result_ok(
         &self,
         f: &mut Function,
@@ -401,11 +400,11 @@ impl CellLayout {
         inner_idx: u32,
     ) {
         let _ = (f, addr_local, has_payload, inner_idx);
-        todo!("Phase 2-2b: cell::result-ok(option<u32>) — disc 9 + option<u32> payload");
+        todo!("cell::result-ok(option<u32>) — disc 9 + option<u32> payload");
     }
 
     /// `cell::result-err(option<u32>)` — disc 10 + option<inner>.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_result_err(
         &self,
         f: &mut Function,
@@ -414,7 +413,7 @@ impl CellLayout {
         inner_idx: u32,
     ) {
         let _ = (f, addr_local, has_payload, inner_idx);
-        todo!("Phase 2-2b: cell::result-err(option<u32>) — disc 10 + option<u32> payload");
+        todo!("cell::result-err(option<u32>) — disc 10 + option<u32> payload");
     }
 
     /// `cell::record-of(u32)` — index into `field-tree.record-infos`.
@@ -434,10 +433,10 @@ impl CellLayout {
     }
 
     /// `cell::flags-set(u32)` — index into `field-tree.flags-infos`.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_flags_set(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
         let _ = (f, addr_local, side_table_idx);
-        todo!("Phase 2-2b: cell::flags-set — disc 12 + i32 flags-info side-table index");
+        todo!("cell::flags-set — disc 12 + i32 flags-info side-table index");
     }
 
     /// `cell::enum-case(u32)` — index into `field-tree.enum-infos`.
@@ -459,14 +458,14 @@ impl CellLayout {
     }
 
     /// `cell::variant-case(u32)` — index into `field-tree.variant-infos`.
-    #[allow(dead_code)] // Phase 2-2b stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_variant_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
         let _ = (f, addr_local, side_table_idx);
-        todo!("Phase 2-2b: cell::variant-case — disc 14 + i32 variant-info side-table index");
+        todo!("cell::variant-case — disc 14 + i32 variant-info side-table index");
     }
 
     /// `cell::resource-handle(u32)` — index into `field-tree.handle-infos`.
-    #[allow(dead_code)] // Phase 2-4 stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_resource_handle(
         &self,
         f: &mut Function,
@@ -474,11 +473,11 @@ impl CellLayout {
         handle_info_idx: u32,
     ) {
         let _ = (f, addr_local, handle_info_idx);
-        todo!("Phase 2-4: cell::resource-handle — disc 15 + i32 handle-info index");
+        todo!("cell::resource-handle — disc 15 + i32 handle-info index");
     }
 
     /// `cell::stream-handle(u32)` — index into `field-tree.handle-infos`.
-    #[allow(dead_code)] // Phase 2-4 stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_stream_handle(
         &self,
         f: &mut Function,
@@ -486,11 +485,11 @@ impl CellLayout {
         handle_info_idx: u32,
     ) {
         let _ = (f, addr_local, handle_info_idx);
-        todo!("Phase 2-4: cell::stream-handle — disc 16 + i32 handle-info index");
+        todo!("cell::stream-handle — disc 16 + i32 handle-info index");
     }
 
     /// `cell::future-handle(u32)` — index into `field-tree.handle-infos`.
-    #[allow(dead_code)] // Phase 2-4 stub.
+    #[allow(dead_code)]
     pub(crate) fn emit_future_handle(
         &self,
         f: &mut Function,
@@ -498,7 +497,7 @@ impl CellLayout {
         handle_info_idx: u32,
     ) {
         let _ = (f, addr_local, handle_info_idx);
-        todo!("Phase 2-4: cell::future-handle — disc 17 + i32 handle-info index");
+        todo!("cell::future-handle — disc 17 + i32 handle-info index");
     }
 }
 
@@ -538,7 +537,7 @@ mod tests {
     /// This is a structural smoke test — it confirms our emit doesn't
     /// produce ill-formed bytecode (alignments, store sizes, local
     /// indices in range). End-to-end "did the right value land in
-    /// memory" coverage comes via Phase 2-5's runtime fuzz.
+    /// memory" coverage comes via the runtime fuzz harness.
     fn build_and_validate(param_types: &[ValType], emit_body: impl FnOnce(&mut Function)) {
         let mut module = Module::new();
 

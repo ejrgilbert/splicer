@@ -3,9 +3,9 @@
 //! representation defined in `splicer:common/types`, then dispatches
 //! the lifted values to the middleware's tier-2 hooks.
 //!
-//! Status: scaffold + primitives only (Phase 2-2a). Full hook
-//! dispatch lands in Phase 2-3; resource/stream/future handle
-//! correlation in Phase 2-4.
+//! Status: scaffold + primitives only. Compound kinds, full hook
+//! dispatch, and resource/stream/future handle correlation are
+//! tracked in `docs/tiers/lift-codegen.md`.
 //!
 //! Submodules:
 //! - [`blob`] — typed data-segment packing helpers (`BlobSlice`,
