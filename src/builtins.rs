@@ -4,6 +4,11 @@
 //! splicer binary at compile time via `include_bytes!`. The `.wasm`
 //! files live under `assets/builtins/` and are produced by
 //! `make build-builtins` from the source crates under `builtins/`.
+//! `build.rs` auto-discovers every `.wasm` in that dir and emits the
+//! registry, so adding a builtin is two steps: drop a crate under
+//! `builtins/<name>/` and run `make build-builtins`. The next
+//! `cargo build` of splicer picks the new `.wasm` up automatically;
+//! no source edits in this file.
 //!
 //! Builtins are referenced from the splice config YAML as
 //! `inject: [{ builtin: <name> }]`. The parser populates
@@ -16,13 +21,9 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// `(name, embedded bytes)` for every shipped builtin. To add a new
-/// builtin: drop a crate under `builtins/<name>/`, run
-/// `make build-builtins`, then append a row here.
-const BUILTINS: &[(&str, &[u8])] = &[(
-    "hello-tier1",
-    include_bytes!("../assets/builtins/hello-tier1.wasm"),
-)];
+/// `(name, embedded bytes)` for every shipped builtin. Auto-generated
+/// from `assets/builtins/*.wasm` by `build.rs`.
+const BUILTINS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/builtins_registry.rs"));
 
 /// Subdirectory under `splits_dir` where materialized builtins are
 /// written. Kept separate from sub-component splits so a `make clean`
@@ -76,6 +77,12 @@ mod tests {
     #[test]
     fn hello_tier1_is_registered() {
         let bytes = lookup("hello-tier1").expect("hello-tier1 must be registered");
+        assert!(bytes.starts_with(b"\0asm"), "embedded bytes must be wasm");
+    }
+
+    #[test]
+    fn otel_bare_spans_is_registered() {
+        let bytes = lookup("otel-bare-spans").expect("otel-bare-spans must be registered");
         assert!(bytes.starts_with(b"\0asm"), "embedded bytes must be wasm");
     }
 
