@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 
 /// `(name, embedded bytes)` for every shipped builtin. Auto-generated
 /// from `assets/builtins/*.wasm` by `build.rs`.
-const BUILTINS: &[(&str, &[u8])] =
-    include!(concat!(env!("OUT_DIR"), "/builtins_registry.rs"));
+const BUILTINS: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/builtins_registry.rs"));
 
 /// Subdirectory under `splits_dir` where materialized builtins are
 /// written. Kept separate from sub-component splits so a `make clean`
@@ -83,8 +82,7 @@ mod tests {
 
     #[test]
     fn otel_bare_spans_is_registered() {
-        let bytes =
-            lookup("otel-bare-spans").expect("otel-bare-spans must be registered");
+        let bytes = lookup("otel-bare-spans").expect("otel-bare-spans must be registered");
         assert!(bytes.starts_with(b"\0asm"), "embedded bytes must be wasm");
     }
 

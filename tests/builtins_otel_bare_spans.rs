@@ -154,7 +154,7 @@ fn otel_bare_spans_emits_consistent_start_and_end() -> Result<()> {
 
         let mut results: Vec<Val> = vec![];
         on_call
-            .call_async(&mut store, &[cid.clone()], &mut results)
+            .call_async(&mut store, std::slice::from_ref(&cid), &mut results)
             .await?;
 
         let mut results: Vec<Val> = vec![];
