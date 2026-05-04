@@ -4,15 +4,13 @@
 //! drives the section-level structure that surrounds it.
 
 use wasm_encoder::{
-    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, FunctionSection,
-    ImportSection, Module, TypeSection, ValType,
+    CodeSection, EntityType, FunctionSection, ImportSection, Module, TypeSection, ValType,
 };
 use wit_parser::abi::WasmSignature;
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    emit_cabi_realloc, empty_function, val_types, GlobalIndices, EXPORT_CABI_REALLOC,
-    EXPORT_INITIALIZE, EXPORT_MEMORY,
+    emit_cabi_realloc, empty_function, val_types, GlobalIndices, WrapperExport,
 };
 use super::schema::HookImport;
 use super::wrapper_body::{emit_wrapper_function, WrapperCtx};
@@ -230,27 +228,29 @@ pub(super) fn emit_imports_and_funcs(
     }
 }
 
-pub(super) fn emit_export_section(
-    module: &mut Module,
-    per_func: &[FuncDispatch],
-    wrapper_base: u32,
+/// Build the wrapper-export descriptor list. `cabi_post_*` shims are
+/// declared right after `_initialize` (`init_idx + 1`), one per
+/// wrapper that needs one, in `per_func` order — so we walk `per_func`
+/// and bump a running index for each shim we emit.
+pub(super) fn wrapper_exports<'a>(
+    per_func: &'a [FuncDispatch],
     init_idx: u32,
-    cabi_realloc_idx: u32,
-) {
-    let mut exports = ExportSection::new();
+) -> Vec<WrapperExport<'a>> {
     let mut next_post_idx = init_idx + 1;
-    for (i, fd) in per_func.iter().enumerate() {
-        exports.export(&fd.export_name, ExportKind::Func, wrapper_base + i as u32);
-        if fd.needs_cabi_post {
-            let post_name = format!("cabi_post_{}", fd.export_name);
-            exports.export(&post_name, ExportKind::Func, next_post_idx);
-            next_post_idx += 1;
-        }
-    }
-    exports.export(EXPORT_MEMORY, ExportKind::Memory, 0);
-    exports.export(EXPORT_CABI_REALLOC, ExportKind::Func, cabi_realloc_idx);
-    exports.export(EXPORT_INITIALIZE, ExportKind::Func, init_idx);
-    module.section(&exports);
+    per_func
+        .iter()
+        .map(|fd| {
+            let cabi_post_idx = fd.needs_cabi_post.then(|| {
+                let idx = next_post_idx;
+                next_post_idx += 1;
+                idx
+            });
+            WrapperExport {
+                export_name: &fd.export_name,
+                cabi_post_idx,
+            }
+        })
+        .collect()
 }
 
 pub(super) fn emit_code_section(
@@ -274,17 +274,3 @@ pub(super) fn emit_code_section(
     module.section(&code);
 }
 
-pub(super) fn emit_data_section(module: &mut Module, segments: &[(u32, Vec<u8>)]) {
-    if segments.is_empty() {
-        return;
-    }
-    let mut data = DataSection::new();
-    for (offset, bytes) in segments {
-        data.active(
-            0,
-            &ConstExpr::i32_const(*offset as i32),
-            bytes.iter().copied(),
-        );
-    }
-    module.section(&data);
-}

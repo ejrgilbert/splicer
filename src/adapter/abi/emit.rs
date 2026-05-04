@@ -5,13 +5,14 @@
 
 use anyhow::{anyhow, bail, Result};
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemArg, MemorySection,
-    MemoryType, Module, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
+    GlobalSection, GlobalType, MemArg, MemorySection, MemoryType, Module, ValType,
 };
-use wit_parser::abi::{WasmSignature, WasmType};
-use wit_parser::{Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId};
+use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
+use wit_parser::{Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId, WasmImport, WorldId, WorldItem};
 
 use super::super::indices::FunctionIndices;
+use super::super::resolve::hook_callback_mangling;
 
 // ─── Standard wasm-component-model exports ────────────────────────
 //
@@ -161,6 +162,56 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection, bump_global: u32) {
     code.function(&f);
 }
 
+/// One wrapper-shaped export, used by [`emit_export_section`].
+pub(crate) struct WrapperExport<'a> {
+    pub export_name: &'a str,
+    /// `Some(idx)` iff the wrapper needs a paired `cabi_post_*` shim.
+    pub cabi_post_idx: Option<u32>,
+}
+
+/// Standard export section: each wrapper at `wrapper_base + i`,
+/// optionally with a `cabi_post_*` companion, plus memory,
+/// `cabi_realloc`, and `_initialize`.
+pub(crate) fn emit_export_section(
+    module: &mut Module,
+    wrappers: &[WrapperExport<'_>],
+    wrapper_base: u32,
+    init_idx: u32,
+    cabi_realloc_idx: u32,
+) {
+    let mut exports = ExportSection::new();
+    for (i, w) in wrappers.iter().enumerate() {
+        exports.export(w.export_name, ExportKind::Func, wrapper_base + i as u32);
+        if let Some(post_idx) = w.cabi_post_idx {
+            exports.export(
+                &format!("cabi_post_{}", w.export_name),
+                ExportKind::Func,
+                post_idx,
+            );
+        }
+    }
+    exports.export(EXPORT_MEMORY, ExportKind::Memory, 0);
+    exports.export(EXPORT_CABI_REALLOC, ExportKind::Func, cabi_realloc_idx);
+    exports.export(EXPORT_INITIALIZE, ExportKind::Func, init_idx);
+    module.section(&exports);
+}
+
+/// Active data segments at memory 0. No-op when `segments` is empty.
+pub(crate) fn emit_data_section(module: &mut Module, segments: &[(u32, Vec<u8>)]) {
+    if segments.is_empty() {
+        return;
+    }
+    let mut data = DataSection::new();
+    for (offset, bytes) in segments {
+        data.active(
+            0,
+            &ConstExpr::i32_const(*offset as i32),
+            bytes.iter().copied(),
+        );
+    }
+    module.section(&data);
+}
+
 /// `() -> ()` — empty body. Used for `_initialize` and per-func
 /// `cabi_post_<name>` shims.
 pub(crate) fn empty_function() -> Function {
@@ -294,6 +345,68 @@ impl RecordLayout {
             panic!("RecordLayout: no field named `{name}` (record has: {keys:?})")
         })
     }
+}
+
+/// One imported hook function — module + name + signature, plus
+/// the WIT params list (used by tiers that derive a hook-params
+/// `RecordLayout` for indirect-params lowering).
+pub(crate) struct HookImport {
+    pub module: String,
+    pub name: String,
+    pub sig: WasmSignature,
+    pub params: Vec<(String, Type)>,
+}
+
+/// Look up `target_iface` in `world_id`'s imports and return its
+/// (single) function as a [`HookImport`]. `None` if the world doesn't
+/// import that interface.
+pub(crate) fn find_imported_hook(
+    resolve: &Resolve,
+    world_id: WorldId,
+    target_iface: &str,
+) -> Option<HookImport> {
+    let world = &resolve.worlds[world_id];
+    world.imports.iter().find_map(|(key, item)| {
+        let WorldItem::Interface { id, .. } = item else {
+            return None;
+        };
+        if resolve.id_of(*id).as_deref() != Some(target_iface) {
+            return None;
+        }
+        let func = resolve.interfaces[*id].functions.values().next()?;
+        let (module, name) = resolve.wasm_import_name(
+            hook_callback_mangling(),
+            WasmImport::Func {
+                interface: Some(key),
+                func,
+            },
+        );
+        Some(HookImport {
+            module,
+            name,
+            sig: resolve.wasm_signature(AbiVariant::GuestImportAsync, func),
+            params: func.params.iter().map(|p| (p.name.clone(), p.ty)).collect(),
+        })
+    })
+}
+
+/// Synthesize the WIT for a tier's adapter world: import + export the
+/// target interface by name, plus one import per active hook
+/// interface (already-versioned, e.g. `"splicer:tier1/before@0.2.0"`).
+pub(crate) fn synthesize_adapter_world_wit(
+    package_name: &str,
+    world_name: &str,
+    target_interface: &str,
+    hook_iface_imports: &[String],
+) -> String {
+    let mut wit = format!("package {package_name};\n\nworld {world_name} {{\n");
+    wit.push_str(&format!("    import {target_interface};\n"));
+    wit.push_str(&format!("    export {target_interface};\n"));
+    for iface in hook_iface_imports {
+        wit.push_str(&format!("    import {iface};\n"));
+    }
+    wit.push_str("}\n");
+    wit
 }
 
 /// Look up a typedef in `splicer:common/types` (e.g. `"call-id"`,

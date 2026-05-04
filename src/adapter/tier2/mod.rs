@@ -52,15 +52,15 @@ use wit_parser::{
     WasmImport, WorldKey,
 };
 
-use super::abi::emit::{emit_memory_and_globals, BlobSlice};
+use super::abi::emit::{
+    emit_data_section, emit_export_section, emit_memory_and_globals, synthesize_adapter_world_wit,
+    BlobSlice,
+};
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use layout::lay_out_static_memory;
 use lift::{classify_func_params, classify_result_lift, ParamLift, ResultLift};
 use schema::compute_schema;
-use section_emit::{
-    emit_code_section, emit_data_section, emit_export_section, emit_imports_and_funcs,
-    emit_type_section,
-};
+use section_emit::{emit_code_section, emit_imports_and_funcs, emit_type_section, wrapper_exports};
 use wrapper_body::WrapperCtx;
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
@@ -96,7 +96,12 @@ pub(super) fn build_tier2_adapter(
     let world_pkg = resolve
         .push_str(
             "splicer-adapter-tier2.wit",
-            &synthesize_adapter_world_wit(target_interface, has_before, has_after),
+            &synthesize_adapter_world_wit(
+                TIER2_ADAPTER_WORLD_PACKAGE,
+                TIER2_ADAPTER_WORLD_NAME,
+                target_interface,
+                &tier2_hook_imports(has_before, has_after),
+            ),
         )
         .context("parse synthesized tier-2 adapter world WIT")?;
     let world_id = resolve
@@ -141,30 +146,17 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
 }
 
 /// Synthesize the tier-2 adapter world.
-fn synthesize_adapter_world_wit(
-    target_interface: &str,
-    has_before: bool,
-    has_after: bool,
-) -> String {
+/// Active tier-2 hook interfaces as fully-qualified versioned names.
+fn tier2_hook_imports(has_before: bool, has_after: bool) -> Vec<String> {
     use crate::contract::{versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_VERSION};
-    let mut wit =
-        format!("package {TIER2_ADAPTER_WORLD_PACKAGE};\n\nworld {TIER2_ADAPTER_WORLD_NAME} {{\n");
-    wit.push_str(&format!("    import {target_interface};\n"));
-    wit.push_str(&format!("    export {target_interface};\n"));
+    let mut out = Vec::new();
     if has_before {
-        wit.push_str(&format!(
-            "    import {};\n",
-            versioned_interface(TIER2_BEFORE, TIER2_VERSION)
-        ));
+        out.push(versioned_interface(TIER2_BEFORE, TIER2_VERSION));
     }
     if has_after {
-        wit.push_str(&format!(
-            "    import {};\n",
-            versioned_interface(TIER2_AFTER, TIER2_VERSION)
-        ));
+        out.push(versioned_interface(TIER2_AFTER, TIER2_VERSION));
     }
-    wit.push_str("}\n");
-    wit
+    out
 }
 
 /// Drive the section emitters in the right order to produce the
@@ -192,9 +184,10 @@ fn build_dispatch_module(
         plan.event_ptr,
     );
     let globals = emit_memory_and_globals(&mut module, plan.bump_start);
+    let wrapper_exports = wrapper_exports(per_func, func_idx.init_idx);
     emit_export_section(
         &mut module,
-        per_func,
+        &wrapper_exports,
         func_idx.wrapper_base,
         func_idx.init_idx,
         func_idx.cabi_realloc_idx,

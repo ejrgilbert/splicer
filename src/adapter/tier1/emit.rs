@@ -17,31 +17,30 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, ImportSection, Module, TypeSection, ValType,
+    BlockType, CodeSection, EntityType, Function, FunctionSection, ImportSection, Module,
+    TypeSection, ValType,
 };
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
     Function as WitFunction, Handle, InterfaceId, Mangling, Resolve, ResourceIntrinsic, SizeAlign,
-    Type, TypeDefKind, TypeId, TypeOwner, WasmExport, WasmExportKind, WasmImport, WorldItem,
-    WorldKey,
+    Type, TypeDefKind, TypeId, TypeOwner, WasmExport, WasmExportKind, WasmImport, WorldKey,
 };
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
     call_id_record_layout, direct_return_type, emit_alloc_call_id, emit_cabi_realloc,
-    emit_handler_call, emit_memory_and_globals, emit_populate_call_id, emit_wrapper_return,
-    empty_function, val_types, BlobSlice, GlobalIndices, RecordLayout, EXPORT_CABI_REALLOC,
-    EXPORT_INITIALIZE, EXPORT_MEMORY,
+    emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
+    emit_populate_call_id, emit_wrapper_return, empty_function, find_imported_hook,
+    synthesize_adapter_world_wit, val_types, BlobSlice, GlobalIndices, HookImport, RecordLayout,
+    WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, FunctionIndices};
 use super::super::mem_layout::MemoryLayoutBuilder;
 use super::super::resolve::{
-    decode_input_resolve, dispatch_mangling, find_target_interface, hook_callback_mangling,
-    sync_mangling,
+    decode_input_resolve, dispatch_mangling, find_target_interface, sync_mangling,
 };
 
 /// Generate the adapter component bytes. `target_interface` is the
@@ -72,7 +71,12 @@ pub(crate) fn build_adapter(
     let world_pkg = resolve
         .push_str(
             "splicer-adapter.wit",
-            &synthesize_adapter_world_wit(target_interface, has_before, has_after, has_blocking),
+            &synthesize_adapter_world_wit(
+                ADAPTER_WORLD_PACKAGE,
+                ADAPTER_WORLD_NAME,
+                target_interface,
+                &tier1_hook_imports(has_before, has_after, has_blocking),
+            ),
         )
         .context("parse synthesized adapter world WIT")?;
     let world_id = resolve
@@ -169,37 +173,24 @@ fn require_supported_case(
     Ok(())
 }
 
-/// Synthesize the adapter world: import + export the target interface
-/// by name (no type recreation), and import the active tier1 hooks.
-fn synthesize_adapter_world_wit(
-    target_interface: &str,
-    has_before: bool,
-    has_after: bool,
-    has_blocking: bool,
-) -> String {
+/// List the active tier-1 hook interfaces as fully-qualified
+/// versioned names (e.g. `"splicer:tier1/before@0.2.0"`), in
+/// before/after/blocking order.
+fn tier1_hook_imports(has_before: bool, has_after: bool, has_blocking: bool) -> Vec<String> {
     use crate::contract::{
         versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
     };
-    let mut wit = format!("package {ADAPTER_WORLD_PACKAGE};\n\nworld {ADAPTER_WORLD_NAME} {{\n");
-    wit.push_str(&format!("    import {target_interface};\n"));
-    wit.push_str(&format!("    export {target_interface};\n"));
-    let mut import_hook = |iface: &str| {
-        wit.push_str(&format!(
-            "    import {};\n",
-            versioned_interface(iface, TIER1_VERSION)
-        ));
-    };
+    let mut out = Vec::new();
     if has_before {
-        import_hook(TIER1_BEFORE);
+        out.push(versioned_interface(TIER1_BEFORE, TIER1_VERSION));
     }
     if has_after {
-        import_hook(TIER1_AFTER);
+        out.push(versioned_interface(TIER1_AFTER, TIER1_VERSION));
     }
     if has_blocking {
-        import_hook(TIER1_BLOCKING);
+        out.push(versioned_interface(TIER1_BLOCKING, TIER1_VERSION));
     }
-    wit.push_str("}\n");
-    wit
+    out
 }
 
 // ─── Dispatch core module ──────────────────────────────────────────
@@ -406,7 +397,24 @@ fn build_dispatch_module(
     let func_idx =
         emit_function_section(&mut module, &mut idx, &plan.per_func, &type_idx, func_idx);
     let globals = emit_memory_and_globals(&mut module, plan.bump_start);
-    emit_export_section(&mut module, &plan.per_func, &func_idx);
+    let wrapper_exports: Vec<WrapperExport<'_>> = plan
+        .per_func
+        .iter()
+        .enumerate()
+        .map(|(i, fd)| WrapperExport {
+            export_name: &fd.export_name,
+            cabi_post_idx: func_idx.cabi_post[i],
+        })
+        .collect();
+    emit_export_section(
+        &mut module,
+        &wrapper_exports,
+        func_idx.wrapper_base,
+        func_idx.init,
+        func_idx
+            .cabi_realloc
+            .expect("cabi_realloc is always emitted"),
+    );
     let call_id_wiring = plan.call_id_buf.as_ref().map(|buf| CallIdWiring {
         counter_global: globals.call_id_counter,
         buf,
@@ -420,7 +428,12 @@ fn build_dispatch_module(
         &globals,
         call_id_wiring,
     );
-    emit_data_section(&mut module, &plan.name_blob);
+    let data_segments = if plan.name_blob.is_empty() {
+        Vec::new()
+    } else {
+        vec![(0, plan.name_blob)]
+    };
+    emit_data_section(&mut module, &data_segments);
 
     Ok(module.finish())
 }
@@ -564,17 +577,9 @@ fn compute_func_dispatches(
     }
 }
 
-/// One tier-1 hook import — `(module, name)` from
-/// [`Resolve::wasm_import_name`] + sig from [`Resolve::wasm_signature`].
-struct HookImport {
-    module: String,
-    name: String,
-    sig: WasmSignature,
-}
-
 /// Active tier-1 hook imports. `before` / `after` share a common sig
-/// (`(ptr, len) -> i32`); `blocking` has a retptr param for the bool
-/// result (`(ptr, len, retptr) -> i32`).
+/// (`(ptr) -> i32`); `blocking` has a retptr param for the bool
+/// result (`(ptr, retptr) -> i32`).
 struct HookImports {
     before: Option<HookImport>,
     after: Option<HookImport>,
@@ -600,33 +605,10 @@ fn collect_hook_imports(
     use crate::contract::{
         versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
     };
-    let world = &resolve.worlds[world_id];
-    let resolve_one = |iface_name: &str| -> Option<HookImport> {
-        world.imports.iter().find_map(|(key, item)| {
-            let WorldItem::Interface { id, .. } = item else {
-                return None;
-            };
-            if resolve.id_of(*id).as_deref() != Some(iface_name) {
-                return None;
-            }
-            // Tier-1 interfaces have exactly one function each.
-            let func = resolve.interfaces[*id].functions.values().next()?;
-            let (module, name) = resolve.wasm_import_name(
-                hook_callback_mangling(),
-                WasmImport::Func {
-                    interface: Some(key),
-                    func,
-                },
-            );
-            let sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
-            Some(HookImport { module, name, sig })
-        })
-    };
     let pick = |active: bool, iface: &str| -> Option<HookImport> {
-        if !active {
-            return None;
-        }
-        resolve_one(&versioned_interface(iface, TIER1_VERSION))
+        active
+            .then(|| find_imported_hook(resolve, world_id, &versioned_interface(iface, TIER1_VERSION)))
+            .flatten()
     };
     HookImports {
         before: pick(has_before, TIER1_BEFORE),
@@ -880,30 +862,6 @@ fn emit_function_section(
     func_idx
 }
 
-/// Phase 6 — export section. Wrapper names come from
-/// [`Resolve::wasm_export_name`] via [`FuncDispatch::export_name`].
-fn emit_export_section(module: &mut Module, per_func: &[FuncDispatch], func_idx: &FuncIndices) {
-    let mut exports = ExportSection::new();
-    for (i, fd) in per_func.iter().enumerate() {
-        exports.export(
-            &fd.export_name,
-            ExportKind::Func,
-            func_idx.wrapper_base + i as u32,
-        );
-        if let Some(post_idx) = func_idx.cabi_post[i] {
-            let post_name = format!("cabi_post_{}", fd.export_name);
-            exports.export(&post_name, ExportKind::Func, post_idx);
-        }
-    }
-    exports.export(EXPORT_MEMORY, ExportKind::Memory, 0);
-    let realloc_idx = func_idx
-        .cabi_realloc
-        .expect("cabi_realloc is always emitted");
-    exports.export(EXPORT_CABI_REALLOC, ExportKind::Func, realloc_idx);
-    exports.export(EXPORT_INITIALIZE, ExportKind::Func, func_idx.init);
-    module.section(&exports);
-}
-
 /// Phase 7 — code section, declaration order matches phase 4.
 #[allow(clippy::too_many_arguments)]
 fn emit_code_section(
@@ -965,17 +923,6 @@ fn emit_code_section(
     }
     emit_cabi_realloc(&mut code, globals.bump);
     module.section(&code);
-}
-
-/// Phase 8 — active data segment with the concatenated `<iface>#<fn>`
-/// names the hooks see.
-fn emit_data_section(module: &mut Module, name_blob: &[u8]) {
-    if name_blob.is_empty() {
-        return;
-    }
-    let mut data = DataSection::new();
-    data.active(0, &ConstExpr::i32_const(0), name_blob.iter().copied());
-    module.section(&data);
 }
 
 /// `should-block` runtime bundle — the import fn index plus the

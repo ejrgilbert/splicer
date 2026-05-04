@@ -9,14 +9,13 @@
 //!   `splicer:tier2/after` hook imports and capture their wasm
 //!   signatures so the generated wrapper can call them.
 
-use anyhow::{anyhow, bail, Result};
-use wit_parser::abi::{AbiVariant, WasmSignature};
-use wit_parser::{Resolve, SizeAlign, Type, WasmImport, WorldId, WorldItem};
+use anyhow::{anyhow, Result};
+use wit_parser::{Resolve, SizeAlign, Type, WorldId};
 
 use super::super::abi::emit::{
-    call_id_record_layout, find_common_typeid, option_payload_offset, RecordLayout,
+    call_id_record_layout, find_common_typeid, find_imported_hook, option_payload_offset,
+    RecordLayout,
 };
-use super::super::resolve::hook_callback_mangling;
 use super::cells::CellLayout;
 
 // ─── WIT names referenced by codegen ──────────────────────────────
@@ -80,17 +79,9 @@ pub(super) struct SchemaLayouts {
     pub(super) option_payload_off: u32,
 }
 
-/// Resolved on-call hook info — module + name + signature, all
-/// sourced from `Resolve` so wit-component agrees on the canonical
-/// names.
-pub(super) struct HookImport {
-    pub(super) module: String,
-    pub(super) name: String,
-    pub(super) sig: WasmSignature,
-    /// `(name, type)` per WIT param. Used to derive the
-    /// indirect-params buffer's [`RecordLayout`] from the schema.
-    params: Vec<(String, Type)>,
-}
+// Hook import struct lives in `super::super::abi::emit::HookImport`
+// — re-exported below so tier-2 callers don't have to qualify it.
+pub(super) use super::super::abi::emit::HookImport;
 
 pub(super) fn compute_schema(
     resolve: &Resolve,
@@ -159,46 +150,14 @@ pub(super) fn compute_schema(
 
 fn find_on_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
     use crate::contract::{TIER2_BEFORE, TIER2_VERSION};
-    find_tier2_hook(
-        resolve,
-        world_id,
-        &format!("{TIER2_BEFORE}@{TIER2_VERSION}"),
-    )
+    let qname = format!("{TIER2_BEFORE}@{TIER2_VERSION}");
+    find_imported_hook(resolve, world_id, &qname)
+        .ok_or_else(|| anyhow!("synthesized adapter world is missing import of `{qname}`"))
 }
 
 fn find_on_return_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
     use crate::contract::{TIER2_AFTER, TIER2_VERSION};
-    find_tier2_hook(resolve, world_id, &format!("{TIER2_AFTER}@{TIER2_VERSION}"))
-}
-
-fn find_tier2_hook(resolve: &Resolve, world_id: WorldId, target_iface: &str) -> Result<HookImport> {
-    let world = &resolve.worlds[world_id];
-    for (key, item) in &world.imports {
-        if let WorldItem::Interface { id, .. } = item {
-            if resolve.id_of(*id).as_deref() != Some(target_iface) {
-                continue;
-            }
-            let func = resolve.interfaces[*id]
-                .functions
-                .values()
-                .next()
-                .ok_or_else(|| anyhow!("`{target_iface}` has no functions"))?;
-            let (module, name) = resolve.wasm_import_name(
-                hook_callback_mangling(),
-                WasmImport::Func {
-                    interface: Some(key),
-                    func,
-                },
-            );
-            let sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
-            let params = func.params.iter().map(|p| (p.name.clone(), p.ty)).collect();
-            return Ok(HookImport {
-                module,
-                name,
-                sig,
-                params,
-            });
-        }
-    }
-    bail!("synthesized adapter world is missing import of `{target_iface}`")
+    let qname = format!("{TIER2_AFTER}@{TIER2_VERSION}");
+    find_imported_hook(resolve, world_id, &qname)
+        .ok_or_else(|| anyhow!("synthesized adapter world is missing import of `{qname}`"))
 }
