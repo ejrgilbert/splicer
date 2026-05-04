@@ -315,6 +315,61 @@ const ON_RET_RESULT: &str = "result";
 const EVENT_SLOT_SIZE: u32 = 8;
 const EVENT_SLOT_ALIGN: u32 = 4;
 
+// ─── Layout-phase size budget ─────────────────────────────────────
+//
+// Wasm encodes static-data offsets as `i32.const` in the instruction
+// stream, so the layout phase has to keep every offset in signed-i32
+// range. One pre-check at the top of `lay_out_static_memory` bounds
+// every per-fn / per-param count that downstream `count * size`
+// arithmetic multiplies; one post-check at the end verifies the
+// final layout end. No per-site checked arithmetic needed.
+
+/// Final layout end (data + scratch + bump-allocator base) must fit
+/// in a signed i32.
+const LAYOUT_SIZE_BUDGET: u32 = i32::MAX as u32;
+
+/// Per-fn flat-slot count cap. Canonical-ABI direct-call flattens up
+/// to 16 args before retptr; nested-record flatten can go past that.
+/// 65 536 sits well above any realistic shape.
+const MAX_FLAT_SLOTS_PER_FN: u32 = 1 << 16;
+
+/// Per-param (and per-result) cell-tree cap. Bounds `cell_count *
+/// cell_size` slab sizes and the cell index used as `i32.const` in
+/// `emit_lift_plan`.
+const MAX_CELLS_PER_PARAM: u32 = 1 << 20;
+
+/// Bound every per-fn / per-param count the layout phase relies on.
+/// Once this returns `Ok`, the body of `lay_out_static_memory` can
+/// use ordinary `u32` arithmetic; the schema-derived `cell_size` /
+/// `field_size` factors are small constants, so the products fit.
+fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
+    for (fn_idx, fd) in per_func.iter().enumerate() {
+        for (p_idx, p) in fd.params.iter().enumerate() {
+            if p.plan.flat_slot_count > MAX_FLAT_SLOTS_PER_FN {
+                bail!(
+                    "fn[{fn_idx}] param[{p_idx}]: flat-slot count {} exceeds budget {MAX_FLAT_SLOTS_PER_FN}",
+                    p.plan.flat_slot_count,
+                );
+            }
+            if p.plan.cell_count() > MAX_CELLS_PER_PARAM {
+                bail!(
+                    "fn[{fn_idx}] param[{p_idx}]: cell count {} exceeds budget {MAX_CELLS_PER_PARAM}",
+                    p.plan.cell_count(),
+                );
+            }
+        }
+        if let Some(rl) = fd.result_lift.as_ref() {
+            let cells = rl.compound().map_or(1, |c| c.plan.cell_count());
+            if cells > MAX_CELLS_PER_PARAM {
+                bail!(
+                    "fn[{fn_idx}] result: cell count {cells} exceeds budget {MAX_CELLS_PER_PARAM}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Per-call values written into the on-call indirect-params buffer.
 /// Slice-typed (vs. raw i32 pairs) so callers can't swap ptr/len.
 struct OnCallCallSite {
@@ -554,8 +609,10 @@ fn lay_out_static_memory(
     schema: &SchemaLayouts,
     name_blob: &mut Vec<u8>,
     iface_name: BlobSlice,
-) -> (Vec<FuncDispatch>, StaticDataPlan) {
+) -> Result<(Vec<FuncDispatch>, StaticDataPlan)> {
     let n_funcs = per_func.len();
+
+    check_layout_budget(&per_func)?;
 
     // Side-table strings get appended to name_blob BEFORE we place
     // it — every side-table-info entry references these string
@@ -766,6 +823,9 @@ fn lay_out_static_memory(
     // placed; today that's `cell` (8) but pulling from `cell_layout`
     // keeps it tied to the schema instead of a literal.
     let bump_start = layout.end().next_multiple_of(schema.cell_layout.align);
+    if bump_start > LAYOUT_SIZE_BUDGET {
+        bail!("static-data layout end {bump_start} exceeds i32 budget {LAYOUT_SIZE_BUDGET}");
+    }
     let mut data_segments = layout.into_segments();
     // Resolve every queued cross-segment pointer in one pass. Has to
     // happen after `into_segments` so the segments aren't being
@@ -838,7 +898,7 @@ fn lay_out_static_memory(
         })
         .collect();
 
-    (
+    Ok((
         dispatches,
         StaticDataPlan {
             bump_start,
@@ -846,7 +906,7 @@ fn lay_out_static_memory(
             hook_params_ptr,
             data_segments,
         },
-    )
+    ))
 }
 
 /// Build the per-target-function classify records: classify each
@@ -1017,7 +1077,7 @@ fn build_dispatch_module(
     let classified = build_per_func_classified(resolve, target_iface, &funcs, &mut name_blob)?;
 
     let (per_func, plan) =
-        lay_out_static_memory(classified, &funcs, &schema, &mut name_blob, iface_name);
+        lay_out_static_memory(classified, &funcs, &schema, &mut name_blob, iface_name)?;
 
     let mut module = Module::new();
     let type_idx = emit_type_section(

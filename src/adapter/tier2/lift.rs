@@ -338,7 +338,11 @@ impl LiftPlanBuilder {
 
     fn bump_local(&mut self) -> u32 {
         let r = self.next_local;
-        self.next_local += 1;
+        self.next_local = self
+            .next_local
+            .checked_add(1)
+            // Tripwire; realistic blow-ups are caught by `check_layout_budget`.
+            .expect("LiftPlanBuilder flat-slot counter overflowed u32");
         r
     }
 
