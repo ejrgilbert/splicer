@@ -83,9 +83,10 @@ inject:
   - builtin: hello-tier1
 ```
 
-| Name          | Tier | Description                                                                                       |
-|---------------|------|---------------------------------------------------------------------------------------------------|
-| `hello-tier1` | 1    | `println!`s on every wrapped call (target interface + function name). Verifies splice rules fire. |
+| Name              | Tier | Description                                                                                                                          |
+|-------------------|------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `hello-tier1`     | 1    | `println!`s on every wrapped call (target interface + function name). Verifies splice rules fire.                                    |
+| `otel-bare-spans` | 1    | Emits a `wasi:otel` span around every wrapped call (timing + `code.namespace`/`code.function` attrs; no payload-derived attributes). |
 
 Source crates live under [`builtins/`](builtins/); rebuild artifacts
 with `make build-builtins`.
