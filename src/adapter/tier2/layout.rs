@@ -558,3 +558,243 @@ pub(super) fn lay_out_static_memory(
         },
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    //! Each test should be a few lines: build a [`LayoutEnv`] with
+    //! [`env`] (or [`env_with`] for hook-wiring variants), then assert
+    //! against the dispatches / plan / schema it carries. New
+    //! invariants are mostly one-liners over [`LayoutEnv::params`] /
+    //! [`LayoutEnv::dispatch`].
+    //!
+    //! The fixture WIT exposes every retptr/result branch the layout
+    //! code takes (no-args, primitive params + result, string param,
+    //! string return via retptr, multi-cell record param). Adding a
+    //! new branch = adding a function to [`TARGET_WIT`].
+    //!
+    //! Failure messages are intentionally absent — `cargo test` prints
+    //! the test name + line, which is enough to localize.
+    use super::super::build_per_func_classified;
+    use super::super::lift::ParamLayout;
+    use super::super::schema::{compute_schema, SchemaLayouts};
+    use super::super::synthesize_adapter_world_wit;
+    use super::*;
+    use wit_parser::Resolve;
+
+    const TARGET_IFACE: &str = "test:layout-fixture/t@0.0.1";
+    const TARGET_WIT: &str = r#"
+        package test:layout-fixture@0.0.1;
+        interface t {
+            record point { x: u32, y: s32 }
+            f-noargs: func();
+            f-pair-u32: func(a: u32, b: u32) -> u32;
+            f-string: func(s: string);
+            f-string-result: func(x: u32) -> string;
+            f-record: func(p: point) -> bool;
+        }
+    "#;
+
+    /// Bundle returned by [`env`] / [`env_with`]: a fully-laid-out
+    /// dispatch list paired with the schema + plan it was produced
+    /// against. Tests destructure `env.dispatches` / `env.plan` /
+    /// `env.schema` directly.
+    struct LayoutEnv {
+        dispatches: Vec<FuncDispatch>,
+        plan: StaticDataPlan,
+        schema: SchemaLayouts,
+    }
+
+    impl LayoutEnv {
+        /// `(FuncDispatch, ParamLayout)` pairs across every fn —
+        /// the right shape for per-param invariants like alignment
+        /// and overlap checks.
+        fn params(&self) -> impl Iterator<Item = (&FuncDispatch, &ParamLayout)> {
+            self.dispatches
+                .iter()
+                .flat_map(|fd| fd.params.iter().map(move |p| (fd, p)))
+        }
+
+        /// Look up a dispatch by export-name substring. Tests use
+        /// the WIT function name as the substring (mangling adds
+        /// the interface prefix but preserves the name).
+        fn dispatch(&self, name: &str) -> &FuncDispatch {
+            self.dispatches
+                .iter()
+                .find(|fd| fd.export_name.contains(name))
+                .unwrap_or_else(|| panic!("no dispatch matching `{name}`"))
+        }
+    }
+
+    fn env() -> LayoutEnv {
+        env_with(true, true)
+    }
+
+    fn env_with(has_before: bool, has_after: bool) -> LayoutEnv {
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let mut resolve = Resolve::new();
+        resolve.push_str("test.wit", TARGET_WIT).unwrap();
+        resolve.push_str("common.wit", common_wit).unwrap();
+        resolve.push_str("tier2.wit", tier2_wit).unwrap();
+        let world_wit = synthesize_adapter_world_wit(TARGET_IFACE, has_before, has_after);
+        let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
+        let world_id = resolve
+            .select_world(&[world_pkg], Some("adapter"))
+            .unwrap();
+        let target_iface = resolve
+            .interfaces
+            .iter()
+            .find_map(|(id, _)| {
+                let qname = resolve.id_of(id)?;
+                let unversioned = qname.split('@').next().unwrap_or(&qname);
+                (unversioned == "test:layout-fixture/t").then_some(id)
+            })
+            .expect("target interface must exist in fixture");
+        let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
+            .functions
+            .values()
+            .collect();
+        let schema = compute_schema(&resolve, world_id, has_before, has_after).unwrap();
+        let mut name_blob: Vec<u8> = TARGET_IFACE.as_bytes().to_vec();
+        let iface_name = BlobSlice {
+            off: 0,
+            len: TARGET_IFACE.len() as u32,
+        };
+        let classified =
+            build_per_func_classified(&resolve, target_iface, &funcs, &mut name_blob).unwrap();
+        let (dispatches, plan) =
+            lay_out_static_memory(classified, &funcs, &schema, &mut name_blob, iface_name).unwrap();
+        LayoutEnv {
+            dispatches,
+            plan,
+            schema,
+        }
+    }
+
+    // ─── Cell-slab placement ──────────────────────────────────────
+
+    #[test]
+    fn param_cells_offsets_aligned_to_cell_align() {
+        let env = env();
+        let align = env.schema.cell_layout.align;
+        assert!(env.params().all(|(_, p)| p.cells_offset % align == 0));
+    }
+
+    #[test]
+    fn param_cells_slabs_dont_overlap() {
+        let env = env();
+        let cell_size = env.schema.cell_layout.size;
+        let mut slabs: Vec<(u32, u32)> = env
+            .params()
+            .map(|(_, p)| {
+                let start = p.cells_offset;
+                (start, start + p.lift.plan.cell_count() * cell_size)
+            })
+            .collect();
+        slabs.sort();
+        assert!(slabs.windows(2).all(|w| w[0].1 <= w[1].0));
+    }
+
+    // ─── Fields-blob placement ────────────────────────────────────
+
+    #[test]
+    fn fields_buf_offsets_per_func_are_contiguous() {
+        let env = env();
+        let fs = env.schema.field_layout.size;
+        assert!(env.dispatches.windows(2).all(|w| {
+            w[0].fields_buf_offset + (w[0].params.len() as u32) * fs == w[1].fields_buf_offset
+        }));
+    }
+
+    // ─── After-hook wiring ────────────────────────────────────────
+
+    #[test]
+    fn after_setup_absent_when_after_hook_off() {
+        assert!(env_with(true, false)
+            .dispatches
+            .iter()
+            .all(|fd| fd.after.is_none()));
+    }
+
+    #[test]
+    fn after_setup_present_when_after_hook_on() {
+        assert!(env_with(true, true)
+            .dispatches
+            .iter()
+            .all(|fd| fd.after.is_some()));
+    }
+
+    #[test]
+    fn result_cells_offset_set_iff_func_has_result_lift() {
+        let env = env();
+        for fd in &env.dispatches {
+            let after = fd.after.as_ref().unwrap();
+            assert_eq!(after.result_cells_offset.is_some(), fd.result_lift.is_some());
+        }
+    }
+
+    // ─── Retptr scratch ───────────────────────────────────────────
+
+    #[test]
+    fn retptr_offset_set_iff_sig_uses_retptr() {
+        let env = env();
+        for fd in &env.dispatches {
+            assert_eq!(
+                fd.retptr_offset.is_some(),
+                fd.export_sig.retptr || fd.import_sig.retptr,
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_covers_both_retptr_polarities() {
+        // Guards [`retptr_offset_set_iff_sig_uses_retptr`] from
+        // becoming vacuous if the fixture WIT loses one shape.
+        let env = env();
+        assert!(env.dispatches.iter().any(|fd| fd.retptr_offset.is_some()));
+        assert!(env.dispatches.iter().any(|fd| fd.retptr_offset.is_none()));
+    }
+
+    // ─── Post-layout shape ────────────────────────────────────────
+
+    #[test]
+    fn dispatch_param_count_matches_wit_param_count() {
+        let env = env();
+        let counts: Vec<usize> = env.dispatches.iter().map(|fd| fd.params.len()).collect();
+        // f-noargs(0), f-pair-u32(2), f-string(1), f-string-result(1), f-record(1)
+        assert_eq!(counts, vec![0, 2, 1, 1, 1]);
+    }
+
+    // ─── Bump-allocator base ──────────────────────────────────────
+
+    #[test]
+    fn bump_start_aligned_to_cell_align() {
+        let env = env();
+        assert_eq!(env.plan.bump_start % env.schema.cell_layout.align, 0);
+    }
+
+    #[test]
+    fn bump_start_within_i32_budget() {
+        assert!(env().plan.bump_start <= i32::MAX as u32);
+    }
+
+    #[test]
+    fn data_segments_sit_below_bump_start() {
+        let env = env();
+        assert!(env
+            .plan
+            .data_segments
+            .iter()
+            .all(|(off, bytes)| off + bytes.len() as u32 <= env.plan.bump_start));
+    }
+
+    // ─── Fixture sanity (guards the property tests from running on
+    // a degenerate WIT) ──────────────────────────────────────────
+
+    #[test]
+    fn fixture_includes_void_and_non_void_funcs() {
+        let env = env();
+        assert!(env.dispatch("f-noargs").result_lift.is_none());
+        assert!(env.dispatch("f-pair-u32").result_lift.is_some());
+    }
+}
