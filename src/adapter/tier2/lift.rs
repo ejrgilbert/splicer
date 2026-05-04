@@ -39,10 +39,8 @@ use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
 use super::blob::{BlobSlice, RecordWriter, Reloc, Segment, SymRef, SymbolId};
 use super::cells::CellLayout;
-use super::emit::{
-    FuncClassified, FuncDispatch, RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME,
-    RECORD_INFO_FIELDS,
-};
+use super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
+use super::{FuncClassified, FuncDispatch};
 
 // ─── WIT names referenced by lift codegen ─────────────────────────
 //
@@ -413,7 +411,7 @@ impl LiftPlanBuilder {
 /// side-table contributions inline on the plan's `CellOp`s instead.
 pub(super) struct ResultLift {
     pub source: ResultSource,
-    pub side_table: SideTableInfo,
+    side_table: SideTableInfo,
 }
 
 pub(super) enum ResultSource {
@@ -529,10 +527,10 @@ pub(super) enum ResultSourceLayout {
 /// results (params now carry their info inline in their LiftPlan
 /// `CellOp`s).
 #[derive(Default, Clone)]
-pub(super) struct SideTableInfo {
+struct SideTableInfo {
     /// `Some` for enum-typed result lifts: carries the enum's type-name
     /// plus its case names in disc order.
-    pub enum_info: Option<NamedListInfo>,
+    enum_info: Option<NamedListInfo>,
 }
 
 /// A type-name plus an ordered list of item names. Carries
@@ -541,12 +539,12 @@ pub(super) struct SideTableInfo {
 /// `{ type-name, <item>-name }` shape (enum-info, eventually flags-info
 /// + variant-info).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NamedListInfo {
-    pub type_name: String,
+struct NamedListInfo {
+    type_name: String,
     /// Item names in WIT declaration order — the i'th entry's WIT
     /// declaration index equals `i` (matching the disc / bit-position
     /// / field-index used at runtime).
-    pub item_names: Vec<String>,
+    item_names: Vec<String>,
 }
 
 // ─── Classifiers ──────────────────────────────────────────────────
@@ -1575,7 +1573,7 @@ mod tests {
     //! `assert_eq!` against an expected value. New cases are mostly
     //! one-liners that delegate to a helper.
 
-    use super::super::emit::FuncShape;
+    use super::super::FuncShape;
     use super::*;
     use wasm_encoder::{
         CodeSection, EntityType, FunctionSection, ImportSection, MemoryType, Module, TypeSection,
