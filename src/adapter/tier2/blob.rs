@@ -16,7 +16,11 @@
 
 use super::super::abi::emit::{RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET};
 
-/// Variant disc values for `option<T>` — canonical-ABI invariants.
+// Variant disc values for `option<T>`. Fixed by the canonical-ABI
+// spec, not by any WIT we control: wit-parser models `option<T>` as
+// its own `TypeDefKind::Option(T)` (not a `Variant`), so there's no
+// case data on a `Resolve` to derive these from — they're just the
+// spec values.
 const OPTION_NONE: u8 = 0;
 const OPTION_SOME: u8 = 1;
 
