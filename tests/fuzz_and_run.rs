@@ -1603,20 +1603,32 @@ const MIDDLEWARE_LIB_RS: &str = r#"mod bindings {
     });
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
 use bindings::splicer::common::types::CallId;
+
+// Per-instance running id. on_call asserts each id is `prev + 1`;
+// on_return asserts it matches the most-recent on_call id. Together
+// these pin the contract: monotonic, +1 per call, paired across the
+// hook boundary.
+static LAST_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Mdl;
 
 impl BeforeGuest for Mdl {
     async fn on_call(call: CallId) {
+        let prev = LAST_ID.swap(call.id, Ordering::SeqCst);
+        assert_eq!(call.id, prev + 1, "call.id should be prev + 1 (got {}, prev {prev})", call.id);
         println!("mdl: before {}#{}", call.interface_name, call.function_name);
     }
 }
 
 impl AfterGuest for Mdl {
     async fn on_return(call: CallId) {
+        let last = LAST_ID.load(Ordering::SeqCst);
+        assert_eq!(call.id, last, "on_return id should match the prior on_call (last={last})");
         println!("mdl: after {}#{}", call.interface_name, call.function_name);
     }
 }
@@ -1651,9 +1663,14 @@ const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
     });
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bindings::exports::splicer::tier2::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier2::before::Guest as BeforeGuest;
 use bindings::splicer::common::types::{CallId, Cell, Field, FieldTree};
+
+// See tier-1 middleware for the invariants this enforces.
+static LAST_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Mdl;
 
@@ -1701,6 +1718,8 @@ fn fmt_result(result: &Option<FieldTree>) -> String {
 
 impl BeforeGuest for Mdl {
     async fn on_call(call: CallId, args: Vec<Field>) {
+        let prev = LAST_ID.swap(call.id, Ordering::SeqCst);
+        assert_eq!(call.id, prev + 1, "call.id should be prev + 1 (got {}, prev {prev})", call.id);
         let rendered: Vec<String> = args.iter().map(fmt_field).collect();
         println!(
             "mdl: tier2-on-call {}#{} args=[{}]",
@@ -1713,6 +1732,8 @@ impl BeforeGuest for Mdl {
 
 impl AfterGuest for Mdl {
     async fn on_return(call: CallId, result: Option<FieldTree>) {
+        let last = LAST_ID.load(Ordering::SeqCst);
+        assert_eq!(call.id, last, "on_return id should match the prior on_call (last={last})");
         println!(
             "mdl: tier2-on-return {}#{} result={}",
             call.interface_name,
