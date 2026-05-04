@@ -94,7 +94,10 @@ fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
 pub(super) struct StaticDataPlan {
     pub(super) bump_start: u32,
     pub(super) event_ptr: i32,
-    pub(super) hook_params_ptr: u32,
+    /// Byte offset of the on-call indirect-params scratch buffer.
+    /// `Some` iff `schema.before_hook` is wired (the buffer only
+    /// exists to be passed to the before-hook).
+    pub(super) hook_params_ptr: Option<u32>,
     pub(super) data_segments: Vec<(u32, Vec<u8>)>,
 }
 
@@ -188,7 +191,7 @@ fn build_after_params_blob(
     result_cells_offsets: &[Option<u32>],
     result_side_tables: &[FieldSideTables],
 ) -> Vec<u8> {
-    let Some(after_layout) = schema.on_return_params_layout.as_ref() else {
+    let Some(after_layout) = schema.after_hook.as_ref().map(|h| &h.params_layout) else {
         return Vec::new();
     };
     let mut blob: Vec<u8> = Vec::new();
@@ -428,7 +431,11 @@ pub(super) fn lay_out_static_memory(
         &result_cells_offsets,
         &result_side_tables,
     );
-    let after_params_offsets: Vec<Option<i32>> = match schema.on_return_params_layout.as_ref() {
+    let after_params_offsets: Vec<Option<i32>> = match schema
+        .after_hook
+        .as_ref()
+        .map(|h| &h.params_layout)
+    {
         Some(al) => {
             let after_base = layout.place_data(al.align, &after_blob);
             let mut cursor = after_base;
@@ -445,10 +452,10 @@ pub(super) fn lay_out_static_memory(
 
     // Scratch slots: event record + on-call indirect-params buffer.
     let event_ptr = layout.reserve_scratch(EVENT_SLOT_ALIGN, EVENT_SLOT_SIZE) as i32;
-    let hook_params_ptr = match schema.on_call_params_layout.as_ref() {
-        Some(l) => layout.reserve_scratch(l.align, l.size),
-        None => 0,
-    };
+    let hook_params_ptr = schema
+        .before_hook
+        .as_ref()
+        .map(|h| layout.reserve_scratch(h.params_layout.align, h.params_layout.size));
 
     // Per-fn retptr scratch — only for funcs whose canonical-ABI
     // shape uses one.
@@ -630,13 +637,26 @@ mod tests {
     }
 
     fn env_with(has_before: bool, has_after: bool) -> LayoutEnv {
+        use crate::contract::{versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_VERSION};
         let common_wit = include_str!("../../../wit/common/world.wit");
         let tier2_wit = include_str!("../../../wit/tier2/world.wit");
         let mut resolve = Resolve::new();
         resolve.push_str("test.wit", TARGET_WIT).unwrap();
         resolve.push_str("common.wit", common_wit).unwrap();
         resolve.push_str("tier2.wit", tier2_wit).unwrap();
-        let world_wit = synthesize_adapter_world_wit(TARGET_IFACE, has_before, has_after);
+        let mut hook_ifaces: Vec<String> = Vec::new();
+        if has_before {
+            hook_ifaces.push(versioned_interface(TIER2_BEFORE, TIER2_VERSION));
+        }
+        if has_after {
+            hook_ifaces.push(versioned_interface(TIER2_AFTER, TIER2_VERSION));
+        }
+        let world_wit = synthesize_adapter_world_wit(
+            "test:layout-fixture-adapter",
+            "adapter",
+            TARGET_IFACE,
+            &hook_ifaces,
+        );
         let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
         let world_id = resolve
             .select_world(&[world_pkg], Some("adapter"))

@@ -61,7 +61,7 @@ use layout::lay_out_static_memory;
 use lift::{classify_func_params, classify_result_lift, ParamLift, ResultLift};
 use schema::compute_schema;
 use section_emit::{emit_code_section, emit_imports_and_funcs, emit_type_section, wrapper_exports};
-use wrapper_body::WrapperCtx;
+use wrapper_body::{AfterHook, BeforeHook, WrapperCtx};
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
 const TIER2_ADAPTER_WORLD_NAME: &str = "adapter";
@@ -187,15 +187,15 @@ fn build_dispatch_module(
     let type_idx = emit_type_section(
         &mut module,
         per_func,
-        schema.before_hook.as_ref().map(|h| &h.sig),
-        schema.after_hook.as_ref().map(|h| &h.sig),
+        schema.before_hook.as_ref().map(|h| &h.import.sig),
+        schema.after_hook.as_ref().map(|h| &h.import.sig),
     );
     let func_idx = emit_imports_and_funcs(
         &mut module,
         per_func,
         &type_idx,
-        schema.before_hook.as_ref(),
-        schema.after_hook.as_ref(),
+        schema.before_hook.as_ref().map(|h| &h.import),
+        schema.after_hook.as_ref().map(|h| &h.import),
         plan.event_ptr,
     );
     let globals = emit_memory_and_globals(&mut module, plan.bump_start);
@@ -207,11 +207,39 @@ fn build_dispatch_module(
         func_idx.init_idx,
         func_idx.cabi_realloc_idx,
     );
+    // Zip the per-build hook pieces (schema layout, import idx,
+    // params-buffer offset) into one `Option<BeforeHook>` /
+    // `Option<AfterHook>`. The unreachable arms encode the
+    // "wired together or not at all" contract that today is only
+    // implicit in the construction order of `emit_imports_and_funcs`
+    // and `lay_out_static_memory`.
+    let before_hook = match (
+        schema.before_hook.as_ref(),
+        func_idx.before_hook_idx,
+        plan.hook_params_ptr,
+    ) {
+        (Some(h), Some(idx), Some(params_ptr)) => Some(BeforeHook {
+            idx,
+            layout: &h.params_layout,
+            params_ptr: params_ptr as i32,
+        }),
+        (None, None, None) => None,
+        _ => unreachable!("before-hook schema, import idx, and params-ptr wired in lockstep"),
+    };
+    let after_hook = match (schema.after_hook.as_ref(), func_idx.after_hook_idx) {
+        (Some(h), Some(idx)) => Some(AfterHook {
+            idx,
+            layout: &h.params_layout,
+        }),
+        (None, None) => None,
+        _ => unreachable!("after-hook schema and import idx wired in lockstep"),
+    };
     let wrapper_ctx = WrapperCtx {
         schema,
         resolve,
         iface_name,
-        hook_params_ptr: plan.hook_params_ptr as i32,
+        before_hook,
+        after_hook,
         call_id_counter_global: globals.call_id_counter,
     };
     emit_code_section(&mut module, per_func, &func_idx, &wrapper_ctx, &globals);
@@ -305,12 +333,12 @@ impl FuncShape {
     }
 }
 
-/// Per-function on-return hook setup, populated only when the
-/// middleware exports `splicer:tier2/after`. Bundles the two
-/// always-paired offsets (after-hook indirect-params buffer +
-/// optional result-cell scratch) so callers can branch on
-/// `Option<AfterSetup>` without separate "is after wired?" /
-/// "does this fn have a result?" checks.
+/// Per-function on-return hook offsets, populated only when the
+/// middleware exports `splicer:tier2/after`. Pairs with the per-build
+/// [`wrapper_body::AfterHook`] (import idx + on-return params layout)
+/// at emit time; the two `Option`s are populated together so callers
+/// branch once on `(Some, Some)` rather than threading separate
+/// "is after wired?" / "does this fn have a result?" checks.
 pub(in crate::adapter::tier2) struct AfterSetup {
     /// Byte offset of the pre-built on-return indirect-params buffer.
     pub params_offset: i32,

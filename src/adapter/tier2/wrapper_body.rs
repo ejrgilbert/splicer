@@ -49,7 +49,7 @@ use wit_parser::Resolve;
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
     emit_alloc_call_id, emit_handler_call, emit_populate_call_id, emit_store_i64_local,
-    emit_store_slice, emit_wrapper_return, BlobSlice, CALLID_ID,
+    emit_store_slice, emit_wrapper_return, BlobSlice, RecordLayout, CALLID_ID,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
@@ -68,9 +68,36 @@ pub(super) struct WrapperCtx<'a> {
     pub(super) schema: &'a SchemaLayouts,
     pub(super) resolve: &'a Resolve,
     pub(super) iface_name: BlobSlice,
-    pub(super) hook_params_ptr: i32,
+    /// `Some` iff the middleware exports `splicer:tier2/before` —
+    /// holds every per-build value the on-call emit path needs.
+    pub(super) before_hook: Option<BeforeHook<'a>>,
+    /// `Some` iff the middleware exports `splicer:tier2/after` —
+    /// holds every per-build value the on-return emit path needs.
+    /// Per-fn after-hook offsets live on [`FuncDispatch::after`].
+    pub(super) after_hook: Option<AfterHook<'a>>,
     /// i64 counter global; bumped once per call to publish `call-id.id`.
     pub(super) call_id_counter_global: u32,
+}
+
+/// Per-build static values for the before-hook emit path. Bundling
+/// `idx` (import index), `layout` (on-call params record layout), and
+/// `params_ptr` (indirect-params scratch buffer offset) into a single
+/// `Option` lets the wrapper-body emitter take the "before-hook
+/// wired" branch with a single `if let Some(...)` arm rather than a
+/// trio of correlated `Option`s and `expect()`s.
+pub(super) struct BeforeHook<'a> {
+    pub(super) idx: u32,
+    pub(super) layout: &'a RecordLayout,
+    pub(super) params_ptr: i32,
+}
+
+/// Per-build static values for the after-hook emit path. Per-fn
+/// offsets (params buffer + result-cell scratch) live on
+/// [`FuncDispatch::after`]; the static parts (import index +
+/// on-return params layout) are shared across all wrappers.
+pub(super) struct AfterHook<'a> {
+    pub(super) idx: u32,
+    pub(super) layout: &'a RecordLayout,
 }
 
 /// Per-call values written into the on-call indirect-params buffer.
@@ -86,26 +113,22 @@ struct OnCallCallSite {
 /// into the indirect-params buffer at `base_ptr`.
 fn emit_populate_hook_params(
     f: &mut Function,
-    base_ptr: i32,
     schema: &SchemaLayouts,
+    before: &BeforeHook<'_>,
     site: &OnCallCallSite,
 ) {
-    let on_call = schema
-        .on_call_params_layout
-        .as_ref()
-        .expect("emit_populate_hook_params called only when before-hook wired");
-    let call_off = on_call.offset_of(ON_CALL_CALL);
-    let args_off = on_call.offset_of(ON_CALL_ARGS);
+    let call_off = before.layout.offset_of(ON_CALL_CALL);
+    let args_off = before.layout.offset_of(ON_CALL_ARGS);
     emit_populate_call_id(
         f,
-        base_ptr,
+        before.params_ptr,
         call_off,
         &schema.callid_layout,
         site.iface_name,
         site.fn_name,
         site.id_local,
     );
-    emit_store_slice(f, base_ptr, args_off, site.args);
+    emit_store_slice(f, before.params_ptr, args_off, site.args);
 }
 
 pub(super) fn emit_wrapper_function(
@@ -118,7 +141,6 @@ pub(super) fn emit_wrapper_function(
     let async_funcs = &func_idx.async_funcs;
     let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
-    let any_hook = func_idx.before_hook_idx.is_some() || func_idx.after_hook_idx.is_some();
     let mut locals = FunctionIndices::new(nparams);
     // `alloc_wrapper_locals` also drives the `lift_from_memory`
     // bindgen for compound result lifts (it may allocate further
@@ -136,17 +158,16 @@ pub(super) fn emit_wrapper_function(
             lift_from_memory(ctx.resolve, &mut bindgen, (), result_ty);
             bindgen.into_instructions()
         });
-    // i64 call-id local; only allocated when a hook is wired.
-    let id_local = any_hook.then(|| locals.alloc_local(ValType::I64));
+    // i64 call-id local. Tier-2 generation requires at least one hook
+    // (`build_tier2_adapter` bails otherwise), so this is always live.
+    let id_local = locals.alloc_local(ValType::I64);
 
     let mut f = Function::new_with_locals_types(locals.into_locals());
 
-    if let Some(id_local) = id_local {
-        emit_alloc_call_id(&mut f, ctx.call_id_counter_global, id_local);
-    }
+    emit_alloc_call_id(&mut f, ctx.call_id_counter_global, id_local);
 
     // ── Phase 1: on-call (only if before-hook wired) ──
-    if let Some(before_idx) = func_idx.before_hook_idx {
+    if let Some(before) = ctx.before_hook.as_ref() {
         for p in fd.params.iter() {
             emit_lift_plan(
                 &mut f,
@@ -161,8 +182,8 @@ pub(super) fn emit_wrapper_function(
         let args_off = if nargs == 0 { 0 } else { fd.fields_buf_offset };
         emit_populate_hook_params(
             &mut f,
-            ctx.hook_params_ptr,
             schema,
+            before,
             &OnCallCallSite {
                 iface_name: ctx.iface_name,
                 fn_name: BlobSlice {
@@ -173,11 +194,11 @@ pub(super) fn emit_wrapper_function(
                     off: args_off,
                     len: nargs,
                 },
-                id_local: id_local.expect("before-hook wired → id_local allocated"),
+                id_local,
             },
         );
-        f.instructions().i32_const(ctx.hook_params_ptr);
-        canon_async::emit_call_and_wait(&mut f, before_idx, lcl.st, lcl.ws, async_funcs);
+        f.instructions().i32_const(before.params_ptr);
+        canon_async::emit_call_and_wait(&mut f, before.idx, lcl.st, lcl.ws, async_funcs);
     }
 
     // ── Phase 2: forward to handler. Bridges callee-returns ↔
@@ -204,8 +225,16 @@ pub(super) fn emit_wrapper_function(
     }
 
     // ── Phase 3: on-return (only if after-hook wired) ──
-    if let (Some(after_idx), Some(after)) = (func_idx.after_hook_idx, fd.after.as_ref()) {
-        if let Some(cells_off) = after.result_cells_offset {
+    // `ctx.after_hook` (per-build static) and `fd.after` (per-fn
+    // offsets) are populated in lockstep at layout time; the
+    // unreachable arm pins that contract.
+    let after_zip = match (ctx.after_hook.as_ref(), fd.after.as_ref()) {
+        (Some(s), Some(pf)) => Some((s, pf)),
+        (None, None) => None,
+        _ => unreachable!("after-hook ctx and per-fn data are wired in lockstep"),
+    };
+    if let Some((after_static, after_pf)) = after_zip {
+        if let Some(cells_off) = after_pf.result_cells_offset {
             match &result_emit {
                 ResultEmitPlan::Compound {
                     plan,
@@ -244,20 +273,11 @@ pub(super) fn emit_wrapper_function(
         }
         // iface/fn are prewritten by `build_after_params_blob`;
         // only `call.id` changes per call, so patch it at runtime.
-        let after_layout = schema
-            .on_return_params_layout
-            .as_ref()
-            .expect("after-hook wired → on_return_params_layout populated");
-        let id_field_off =
-            after_layout.offset_of(ON_RET_CALL) + schema.callid_layout.offset_of(CALLID_ID);
-        emit_store_i64_local(
-            &mut f,
-            after.params_offset,
-            id_field_off,
-            id_local.expect("after-hook wired → id_local allocated"),
-        );
-        f.instructions().i32_const(after.params_offset);
-        canon_async::emit_call_and_wait(&mut f, after_idx, lcl.st, lcl.ws, async_funcs);
+        let id_field_off = after_static.layout.offset_of(ON_RET_CALL)
+            + schema.callid_layout.offset_of(CALLID_ID);
+        emit_store_i64_local(&mut f, after_pf.params_offset, id_field_off, id_local);
+        f.instructions().i32_const(after_pf.params_offset);
+        canon_async::emit_call_and_wait(&mut f, after_static.idx, lcl.st, lcl.ws, async_funcs);
     }
 
     // ── Phase 4: tail. Async fns publish the result via task.return;

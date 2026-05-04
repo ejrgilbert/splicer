@@ -70,13 +70,19 @@ pub(super) struct SchemaLayouts {
     /// `tuple<string, u32>`. Field names are synthetic (see
     /// [`RECORD_FIELD_TUPLE_NAME`] / [`RECORD_FIELD_TUPLE_IDX`]).
     pub(super) record_field_tuple_layout: RecordLayout,
-    pub(super) before_hook: Option<HookImport>,
-    pub(super) after_hook: Option<HookImport>,
-    pub(super) on_call_params_layout: Option<RecordLayout>,
-    pub(super) on_return_params_layout: Option<RecordLayout>,
+    pub(super) before_hook: Option<HookSchema>,
+    pub(super) after_hook: Option<HookSchema>,
     /// Byte offset of the `option<field-tree>` payload inside the
     /// option variant.
     pub(super) option_payload_off: u32,
+}
+
+/// One hook's import descriptor + the layout of its params record.
+/// Bundled so callers can't forget that "hook wired" and "params
+/// layout known" are the same thing.
+pub(super) struct HookSchema {
+    pub(super) import: HookImport,
+    pub(super) params_layout: RecordLayout,
 }
 
 // Hook import struct lives in `super::super::abi::emit::HookImport`
@@ -118,17 +124,19 @@ pub(super) fn compute_schema(
 
     let before_hook = has_before
         .then(|| find_on_call_hook(resolve, world_id))
-        .transpose()?;
+        .transpose()?
+        .map(|import| HookSchema {
+            params_layout: RecordLayout::for_named_fields(&size_align, &import.params),
+            import,
+        });
     let after_hook = has_after
         .then(|| find_on_return_hook(resolve, world_id))
-        .transpose()?;
+        .transpose()?
+        .map(|import| HookSchema {
+            params_layout: RecordLayout::for_named_fields(&size_align, &import.params),
+            import,
+        });
 
-    let on_call_params_layout = before_hook
-        .as_ref()
-        .map(|h| RecordLayout::for_named_fields(&size_align, &h.params));
-    let on_return_params_layout = after_hook
-        .as_ref()
-        .map(|h| RecordLayout::for_named_fields(&size_align, &h.params));
     let option_payload_off = option_payload_offset(&size_align, &Type::Id(field_tree_ty_id));
 
     Ok(SchemaLayouts {
@@ -142,8 +150,6 @@ pub(super) fn compute_schema(
         record_field_tuple_layout,
         before_hook,
         after_hook,
-        on_call_params_layout,
-        on_return_params_layout,
         option_payload_off,
     })
 }

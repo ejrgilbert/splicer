@@ -31,7 +31,7 @@ Each phase has one home:
 
 | phase                | file                               | key types/fns                                                                                                |
 |----------------------|------------------------------------|--------------------------------------------------------------------------------------------------------------|
-| Classify             | `tier2/lift.rs`                    | `LiftPlan`, `CellOp`, `LocalRef`, `LiftPlanBuilder`, `classify_func_params`, `classify_result_lift`          |
+| Classify             | `tier2/lift.rs`                    | `LiftPlan`, `CellOp`, `LiftPlanBuilder`, `classify_func_params`, `classify_result_lift`                      |
 | Side-table layout    | `tier2/lift.rs`                    | `register_side_table_strings`, `build_side_table_blob`, `SideTableBlob`, `SideTableSpec`                     |
 | Static-memory layout | `tier2/emit.rs`                    | `lay_out_static_memory`, `StaticDataPlan`, `FieldSideTables`, `build_fields_blob`, `build_after_params_blob` |
 | Section + body emit  | `tier2/emit.rs` + `tier2/cells.rs` | `emit_type_section`, `emit_imports_and_funcs`, `emit_wrapper_function`, `CellLayout::emit_*`                 |
@@ -44,6 +44,77 @@ at use sites — no hardcoded offsets in adapter codegen.
 
 ---
 
+## Library leverage and what we considered
+
+The principle: **use library leaf-operations where they fit, hand-roll
+the driver pattern.** Specifically:
+
+### What we use from libraries
+
+| library | what we use | where |
+|---|---|---|
+| `wit_parser::SizeAlign` | byte sizes, alignments, record/tuple field offsets | `compute_schema`, `RecordLayout`, retptr scratch sizing |
+| `wit_parser::Resolve::push_flat` | canonical-ABI flat-slot count + types per WIT type | (planned) flat-slot allocation for retptr-loaded result locals |
+| `wit_bindgen_core::abi::lift_from_memory` | walks a WIT type from a memory address, emits wasm bytecode that pushes flat values onto the stack | async `task.return` flat loads (today); will drive retptr-loaded compound result lifts (records-as-result and beyond) |
+| `wit_bindgen_core::abi::lower_to_memory` | inverse: walks a WIT type, emits wasm that writes a typed value to memory | (anticipated) tier-3's modify-and-write-back path |
+
+These are **leaf** operations: "given an address, produce flat" or
+"given typed value, produce memory." Self-contained, well-defined I/O,
+no hidden assumptions about caller context.
+
+### What we evaluated and rejected: `wit_bindgen_core::abi::call(...)` as wrapper driver
+
+`call(resolve, variant, lift_lower, func, bindgen, async_)` is the
+library's full lift+CallInterface+lower driver. We considered using
+it as the wrapper-body emitter — implement `Bindgen` for our cell-
+tree target, let the library walk every WIT type. Concluded
+**model mismatch**, not effort:
+
+1. **The library expects a language binding.** `CallInterface`'s
+   contract is "invoke typed user code with typed args, produce a
+   typed result." Our wrapper is **flat-to-flat passthrough that
+   produces a cell tree as a side artifact** — the cell tree is
+   observation, not the value forwarded to the handler. We'd be
+   hijacking `CallInterface` to do something orthogonal.
+
+2. **Operand dual-tracking.** Each typed operand would need to carry
+   BOTH the cell index (for the side artifact) AND the original flat-
+   slot wasm locals (for forwarding to the handler). Language
+   bindings carry one representation per operand; we'd carry the
+   cost of typed lift while not actually using the typed values for
+   the call.
+
+3. **Side-table info has to leak out of the impl.** Language bindings
+   emit code, period. Our impl produces wasm body AND per-(fn, param)
+   side-table contributions (record-info entries, enum-info, etc.).
+   The `Bindgen` trait isn't designed for that secondary output
+   channel.
+
+4. **Two-pass requirement.** Static-memory layout needs cell counts
+   before code emit. `call(...)` is one pass — we'd run it twice
+   (discovery + emit) or cache an entire emit run.
+
+The hand-rolled `LiftPlan` / `CellOp` is structurally better for our
+use case: declarative, walkable by the side-table builders, tracks
+flat-locals alongside cells, one pass.
+
+### When to revisit
+
+Reconsider when:
+- **Tier-3's modify-and-write-back** lands. `lower_to_memory` already
+  applies; the rest of tier-3 may map more naturally to `call(...)` if
+  we end up doing a lift→modify→lower flow that matches the library's
+  shape.
+- The cumulative LoC of hand-rolled compound kinds (variant + list +
+  tuple + option + result) crosses ~600 LoC. Migration would still
+  cost ~700+ LoC but the LoC win starts paying off there.
+
+For variant specifically: hand-rolling needs canonical-ABI variant
+payload joining via `wit_parser::abi::join`. That math is in the
+library and we can use it without buying the full `call(...)` driver.
+
+---
+
 ## Phase 1: classify → `LiftPlan`
 
 The output of classification, per (function, param) and (function,
@@ -52,32 +123,27 @@ cell the lift needs to write, in allocation order, with `cells[0]`
 as the root.
 
 ```rust
-struct LiftPlan { cells: Vec<CellOp> }
+struct LiftPlan { cells: Vec<CellOp>, flat_slot_count: u32 }
 
 enum CellOp {
-    Bool { local: LocalRef },
-    IntegerSignExt { local: LocalRef },
-    IntegerZeroExt { local: LocalRef },
-    Integer64 { local: LocalRef },
-    FloatingF32 { local: LocalRef },
-    FloatingF64 { local: LocalRef },
-    Text { ptr: LocalRef, len: LocalRef },
-    Bytes { ptr: LocalRef, len: LocalRef },
-    EnumCase { local: LocalRef, info: NamedListInfo },
+    Bool { local: u32 },
+    IntegerSignExt { local: u32 },
+    IntegerZeroExt { local: u32 },
+    Integer64 { local: u32 },
+    FloatingF32 { local: u32 },
+    FloatingF64 { local: u32 },
+    Text { ptr: u32, len: u32 },
+    Bytes { ptr: u32, len: u32 },
+    EnumCase { local: u32, info: NamedListInfo },
     RecordOf { type_name: String, fields: Vec<(String, u32)> },
     // … one per supported WIT type ctor; new kinds add a variant ↑
 }
-
-enum LocalRef {
-    /// nth flat-slot wasm local of the function's params.
-    Param(u32),
-    /// `lcl.ptr_scratch` — set up by the wrapper before the lift.
-    PtrScratch,
-    LenScratch,
-    /// `lcl.result` — direct primitive return captured into a local.
-    Result,
-}
 ```
+
+`local` / `ptr` / `len` are **absolute wasm-local indices** baked in at
+plan-build time. The plan-builder accepts a `local_base` (the absolute
+index of the plan's first flat slot) and increments from there as cells
+consume slots.
 
 ### Why a flat plan instead of a nested IR
 
@@ -93,10 +159,11 @@ desynced facts:
    The same `Vec<CellOp>` is what codegen iterates over at emit time,
    so the index a side-table entry references is *literally* the same
    slot the codegen writes to.
-3. **Flat-slot consumption.** Each `LocalRef::Param(n)` allocated by
-   the builder pins one wasm flat slot. Total slots = `next_local -
-   first_local` after the build — no per-`LiftKind` `slot_count()`
-   table to keep in sync with the plan-builder.
+3. **Flat-slot consumption.** Each cell that names a `local` pins one
+   wasm flat slot. Total slots = `plan.flat_slot_count` (computed by
+   the builder as `next_local - local_base` at `into_plan` time) — no
+   per-`LiftKind` `slot_count()` table to keep in sync with the plan-
+   builder.
 
 Compare to the alternative we replaced: `(LiftKind, first_local,
 SideTableInfo)` triples per param, with side-table indices and cell
@@ -115,7 +182,7 @@ fn push(&mut self, ty: &Type, resolve: &Resolve) -> u32 {
     let root_idx = self.cells.len() as u32;
     match LiftKind::classify(ty, resolve) {
         // primitives: push one CellOp consuming next_local..next_local+N
-        LiftKind::Bool => { /* push Bool { local: Param(self.bump_local()) } */ }
+        LiftKind::Bool => { /* push Bool { local: self.bump_local() } */ }
         // …
 
         // compounds: push parent first, recurse on children, backfill parent
@@ -142,32 +209,29 @@ unwinds, every child's cells live at indices ≥ parent_idx + 1, and
 the parent's `fields` list captures those indices. Self-evident
 correctness (vs. trying to predict child indices ahead of time).
 
-### `LocalRef::resolve`
+### Absolute local indices baked at build time
 
-The plan is built without knowing about `WrapperLocals` (which is
-allocated per-wrapper at emit time). At emit time, we resolve each
-`LocalRef` to a concrete wasm local index:
+Cells store **absolute** wasm-local indices, not plan-local offsets.
+The plan-builder's caller provides `local_base` — the absolute index
+of the plan's first flat slot — and the builder increments from there
+as it allocates cells:
 
-```rust
-impl LocalRef {
-    fn resolve(&self, lcl: &WrapperLocals) -> u32 {
-        match self {
-            LocalRef::Param(i) => *i,
-            LocalRef::PtrScratch => lcl.ptr_scratch,
-            LocalRef::LenScratch => lcl.len_scratch,
-            LocalRef::Result => lcl.result.expect("…"),
-        }
-    }
-}
-```
+- **Params**: `local_base = slot_cursor`, the cumulative flat-slot
+  count of preceding params. Known at classify time because wasm
+  function params occupy locals `0..param_flat_count`.
+- **Compound results**: synth locals are allocated at emit time via
+  `FunctionIndices::alloc_local`. The classify-time
+  `CompoundResult::plan` is built with placeholder `local_base = 0`
+  (only its cell structure is consumed — by the side-table builders).
+  The emit phase rebuilds a fresh plan with `local_base =
+  synth_locals[0]` and stores it on `ResultEmitPlan::Compound::plan`;
+  that's the plan `emit_lift_plan` walks.
 
-Why a tagged enum vs. raw `u32`: `lcl.ptr_scratch` and
-`lcl.result` are wrapper-body scratch locals; `Param(n)` is a flat-
-slot local from the function signature. They live in disjoint local
-ranges and serve disjoint roles. Using one type forced you to know
-which kind of local an index referred to by convention. The tagged
-enum makes "scratch local" and "param flat slot" non-confusable at
-the type level.
+Why absolute indices on cells, not a plan-local offset + base
+resolved at emit time: the contiguity invariant ("synth locals occupy
+`synth_locals[0..N]`") becomes a build-time fact baked into each
+cell, not a runtime contract `emit_lift_plan` has to honor by reading
+`alloc_wrapper_locals` carefully.
 
 ---
 
@@ -379,6 +443,71 @@ table builder" doesn't apply — instead, the codegen at step 9 emits
 
 ---
 
+## Per-kind roadmap
+
+Status of each WIT type ctor as a tier-2 lift source:
+
+| kind                             | param | result          | LoC est. (delta)    | mechanism notes                                                                                                                                     |
+|----------------------------------|-------|-----------------|---------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
+| primitives (bool/int/float)      | ✓     | ✓               | —                   | shipped                                                                                                                                             |
+| string / bytes (`list<u8>`)      | ✓     | ✓ (retptr-pair) | —                   | shipped                                                                                                                                             |
+| enum                             | ✓     | ✓               | —                   | shipped — first nominal-cell side table                                                                                                             |
+| **record**                       | **✓** | **✓**           | —                   | shipped — first compound result; uses `lift_from_memory` over retptr scratch + per-result synthetic locals.                                         |
+| flags                            | ✗     | ✗               | ~150 each direction | per-call `cabi_realloc` for `set-flags: list<string>`; first kind with runtime-allocated side-table entries. Limit ≤32 flags in v1 to drop ~40 LoC. |
+| option                           | ✗     | ✗               | ~80 each direction  | runtime disc + recursive payload lift                                                                                                               |
+| result\<T,E\>                    | ✗     | ✗               | ~80 each direction  | same as option but with two payload arms                                                                                                            |
+| char                             | ✗     | ✗               | ~80 each direction  | utf-8 encode at runtime via `cabi_realloc`; emits as `cell::text`                                                                                   |
+| **variant**                      | ✗     | ✗               | ~150 each direction | hardest hand-roll: canonical-ABI payload joining via `wit_parser::abi::join`. Use the library's `join` math but keep the dispatch hand-rolled.      |
+| list (non-u8)                    | ✗     | ✗               | ~150 each direction | runtime loop over elements + `cabi_realloc` for cell-index array                                                                                    |
+| tuple                            | ✗     | ✗               | ~100 each direction | similar to record but anonymous + heterogeneous                                                                                                     |
+| handles (resource/stream/future) | ✗     | ✗               | ~200 cumulative     | new `handle-info` correlation table; per-handle u64 id assignment                                                                                   |
+| error-context                    | ✗     | ✗               | TBD                 | design TBD                                                                                                                                          |
+
+### Recommended order
+
+1. **flags** — first runtime-allocated side-table machinery.
+2. **option / result\<T,E\>** — share the disc + recursive-payload
+   pattern; ship together.
+3. **char** — leaf utf-8 encoder.
+4. **variant** — hardest hand-roll; pull in `wit_parser::abi::join`.
+5. **list / tuple** — runtime loops + index-array allocation.
+6. **handles** — correlation-id table.
+
+The result-side `LiftPlan` shape that record-as-result validated
+generalizes to all future compound results: the wrapper-body emitter
+allocates per-result synthetic locals, runs `lift_from_memory` to
+push canonical-ABI flat values from retptr scratch onto the wasm
+stack, captures them via `local.set` in reverse order, then walks
+the plan exactly like a param.
+
+### "Add a kind" recipe
+
+The checklist in [Adding a new WIT type ctor](#adding-a-new-wit-type-ctor-a-checklist) is the canonical reference. Highlights for new contributors:
+
+- **`LiftKind::classify`** already maps every WIT type ctor — start by
+  confirming the right variant is returned.
+- **Plan-builder arm in `LiftPlanBuilder::push`** is the main work.
+  For compound types, follow the `push_record` pattern: reserve the
+  parent cell first, recurse on children, backfill parent's child
+  cell indices.
+- **Side-table machinery** is generic over an extractor closure for
+  per-case kinds (enum-info shape) via `register_side_table_strings` +
+  `build_side_table_blob`. Per-instance kinds (record-info,
+  flags-info) build their own `*_info_blob` fn alongside but the
+  pattern (entries blob + tuples/strings sub-blob + per-(fn, param)
+  ranges + cell-idx assignments) is documented in `RecordInfoBlobs`.
+- **`FieldSideTables` slot** + one `write_to_tree` line per kind.
+- **`cells.rs::emit_<kind>`** — replace the `todo!()` stub with the
+  real emit. For nominal cells with adapter-build-time-known indices
+  (record-of, flags-set), use `PayloadSource::ConstI32`. For runtime-
+  disc indices (enum-case), use `PayloadSource::Local`.
+- **Test fixture in `canned_shapes`** + an arm in
+  `predict_tier2_arg_inner` matching `fmt_cell`'s output exactly.
+- **`fmt_cell` in `MIDDLEWARE_TIER2_LIB_RS`** to render the new cell
+  variant in the middleware's trace output.
+
+---
+
 ## What this doc does **not** cover
 
 - **Tier-1 codegen** (`src/adapter/tier1/`) — different model entirely,
@@ -386,7 +515,3 @@ table builder" doesn't apply — instead, the codegen at step 9 emits
 - **The `field-tree` wire format** for middleware authors — see
   [`tier-2.md`](./tier-2.md).
 - **Tier-3+ models** — not yet implemented.
-- **Result-side compound lifts** (records as return values, etc.) —
-  defer; needs a memory-load-prefix variant of the lift codegen
-  because canonical-ABI returns compounds via retptr (whole struct
-  in memory), not flat locals.
