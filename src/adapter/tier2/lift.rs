@@ -1302,10 +1302,14 @@ pub(super) fn alloc_wrapper_locals<'a>(
                 record_info_cell_idx,
             } => {
                 let addr_local = locals.alloc_local(ValType::I32);
-                let flat = super::super::abi::flat_types(resolve, &compound.ty, None).expect(
-                    "Compound result must flatten within MAX_FLAT_PARAMS — \
-                     classify_result_lift only returns Compound for kinds that do",
-                );
+                let flat = super::super::abi::flat_types(resolve, &compound.ty, None)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Compound result must flatten within MAX_FLAT_PARAMS ({}) — \
+                             classify_result_lift only returns Compound for kinds that do",
+                            Resolve::MAX_FLAT_PARAMS
+                        )
+                    });
                 debug_assert_eq!(
                     flat.len(),
                     compound.plan.flat_slot_count as usize,

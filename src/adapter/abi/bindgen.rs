@@ -314,10 +314,13 @@ impl<'a> WasmEncoderBindgen<'a> {
         arm_types: &[Option<Type>],
     ) {
         // Joined flat: [disc, ...joined_payload].
-        let joined = flat_types(resolve, variant_type, None).expect(
-            "variant flat must fit in MAX_FLAT_PARAMS — larger variants are invalid per the \
-             canonical ABI spec",
-        );
+        let joined = flat_types(resolve, variant_type, None).unwrap_or_else(|| {
+            panic!(
+                "variant flat must fit in MAX_FLAT_PARAMS ({}) — larger variants are invalid \
+                 per the canonical ABI spec",
+                Resolve::MAX_FLAT_PARAMS
+            )
+        });
         assert!(
             !joined.is_empty(),
             "variant joined flat must include at least a discriminant"
@@ -348,10 +351,13 @@ impl<'a> WasmEncoderBindgen<'a> {
             .iter()
             .map(|opt_ty| match opt_ty {
                 None => Vec::new(),
-                Some(ty) => flat_types(resolve, ty, None).expect(
-                    "arm flat must fit in MAX_FLAT_PARAMS — larger arms are invalid per the \
-                     canonical ABI spec",
-                ),
+                Some(ty) => flat_types(resolve, ty, None).unwrap_or_else(|| {
+                    panic!(
+                        "arm flat must fit in MAX_FLAT_PARAMS ({}) — larger arms are invalid \
+                         per the canonical ABI spec",
+                        Resolve::MAX_FLAT_PARAMS
+                    )
+                }),
             })
             .collect();
 
@@ -599,7 +605,7 @@ impl Bindgen for WasmEncoderBindgen<'_> {
             // `tuple<T, …, T>` (N times), so it flattens the same
             // way tuples do — every element becomes a value on the
             // wasm stack (or in a retptr buffer if `N × flat(T)` >
-            // `MAX_FLAT_PARAMS`). The payoff is zero-copy passing
+            // `Resolve::MAX_FLAT_PARAMS`). The payoff is zero-copy passing
             // of small fixed arrays (hashes, UUIDs, 3D vectors,
             // small buffers) without the realloc + pointer-chase
             // that dynamic lists require.
