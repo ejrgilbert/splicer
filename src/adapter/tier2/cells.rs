@@ -331,9 +331,9 @@ impl CellLayout {
     // ─── Un-wired stubs — codegen lives here when each kind lands ──
     //
     // Each stub names the cell variant + payload shape it'll produce
-    // when implemented. They're unreachable until `LiftKind` for the
-    // matching compound type maps to them in `tier2/lift::emit_lift_kind`.
-    // Keeping the stubs in cells.rs documents the lowest-level contract:
+    // when implemented. They're unreachable until `tier2/lift::Cell`
+    // for the matching compound type wires its `emit_cell_op` arm to
+    // call them. Keeping the stubs in cells.rs documents the lowest-level contract:
     // "to lift a record, you need `cell_layout.emit_record_of(addr,
     // side_table_idx)` to write disc 11 + i32 at payload+0".
 

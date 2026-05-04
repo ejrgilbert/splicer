@@ -514,9 +514,9 @@ pub(super) fn lay_out_static_memory(
             let result_lift = fc.result_lift.map(|rl| {
                 let ResultLift { source, .. } = rl;
                 let layout_source = match source {
-                    ResultSource::Direct(kind) => ResultSourceLayout::Direct(kind),
-                    ResultSource::RetptrPair(kind) => ResultSourceLayout::RetptrPair {
-                        kind,
+                    ResultSource::Direct(cell) => ResultSourceLayout::Direct(cell),
+                    ResultSource::RetptrPair(cell) => ResultSourceLayout::RetptrPair {
+                        cell,
                         retptr_offset: retptr_offset.expect("RetptrPair → retptr scratch reserved"),
                     },
                     ResultSource::Compound(compound) => ResultSourceLayout::Compound {

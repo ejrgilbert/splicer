@@ -13,18 +13,19 @@
 //!
 //! Three layers:
 //! - **Classify.** [`LiftPlanBuilder`] walks a WIT type and emits a
-//!   flat [`LiftPlan`] of [`CellOp`]s in allocation order — `cells[0]`
+//!   flat [`LiftPlan`] of [`Cell`]s in allocation order — `cells[0]`
 //!   is the root, child cells follow their parents. The plan owns
 //!   the cell-index space; side-table contributions reference cells
 //!   by `Vec`-position into the same plan.
 //! - **Side-table population.** [`register_side_table_strings`] +
 //!   [`build_side_table_blob`] (and per-kind facades) precompute the
 //!   per-field-tree side tables at adapter-build time. Walks the
-//!   per-param plans for nominal `CellOp` cases.
-//! - **Codegen.** [`emit_lift_param`] walks `plan.cells` and emits
-//!   one wasm cell per `CellOp`. [`emit_lift_result`] handles result
-//!   lifts (kept on the legacy `LiftKind`+`ResultSource` path until
-//!   compound result lifts land).
+//!   per-param plans for nominal `Cell` cases.
+//! - **Codegen.** [`emit_lift_plan`] walks `plan.cells` and emits
+//!   one wasm cell per [`Cell`] via [`emit_cell_op`].
+//!   [`emit_lift_result`] handles single-cell direct/retptr-pair
+//!   result lifts via [`emit_lift_kind`]; compound result lifts
+//!   reuse [`emit_lift_plan`] over retptr-loaded synth locals.
 
 use std::collections::HashMap;
 
@@ -50,111 +51,6 @@ use super::{FuncClassified, FuncDispatch};
 // names below are passed to [`SideTableSpec`] per kind.
 const INFO_TYPE_NAME: &str = "type-name";
 const ENUM_INFO_CASE_NAME: &str = "case-name";
-
-// ─── Classification + lift descriptors ────────────────────────────
-
-/// How a WIT type maps to a `cell` variant. Wired variants are
-/// implemented end-to-end (lift codegen produces real cells);
-/// un-wired variants classify here without panic but `todo!()` at
-/// the codegen layer (`cells.rs`) when actually reached at
-/// adapter-build time. Roadmap: `docs/tiers/lift-codegen.md`.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum LiftKind {
-    // ── Wired ─────────────────────────────────────────────────────
-    /// `bool` — 1 i32 slot (0/1) → `cell::bool`.
-    Bool,
-    /// `s8`/`s16`/`s32` — 1 i32 slot, sign-extend → `cell::integer`.
-    IntegerSignExt,
-    /// `u8`/`u16`/`u32` — 1 i32 slot, zero-extend → `cell::integer`.
-    IntegerZeroExt,
-    /// `s64`/`u64` — 1 i64 slot, no widen → `cell::integer`.
-    Integer64,
-    /// `f32` — 1 f32 slot, `f64.promote_f32` → `cell::floating`.
-    FloatingF32,
-    /// `f64` — 1 f64 slot, no widen → `cell::floating`.
-    FloatingF64,
-    /// `string` — 2 i32 slots (ptr, len) → `cell::text`.
-    Text,
-    /// `list<u8>` — 2 i32 slots (ptr, len) → `cell::bytes`.
-    Bytes,
-
-    // ── Un-wired compound (todo!() in cells.rs) ──────────────────
-    /// `char` → `cell::text` (utf-8 encode the i32 code point).
-    Char,
-    /// `list<T>` (non-u8 element) → `cell::list-of`.
-    ListOf,
-    /// `tuple<...>` → `cell::tuple-of`.
-    TupleOf,
-    /// `option<T>` → `cell::option-some(u32)` or `cell::option-none`.
-    Option,
-    /// `result<T, E>` → `cell::result-ok(option<u32>)` or `cell::result-err(option<u32>)`.
-    Result,
-    /// `record { ... }` → `cell::record-of(u32)` (side-table index).
-    Record,
-    /// `flags { ... }` → `cell::flags-set(u32)`.
-    Flags,
-    /// `enum { ... }` → `cell::enum-case(u32)`.
-    Enum,
-    /// `variant { ... }` → `cell::variant-case(u32)`.
-    Variant,
-
-    // ── Un-wired handle (todo!() in cells.rs) ────────────────────
-    /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`.
-    Handle,
-    /// `future<T>` → `cell::future-handle(u32)`.
-    Future,
-    /// `stream<T>` → `cell::stream-handle(u32)`.
-    Stream,
-
-    // ── Future work ──────────────────────────────────────────────
-    /// `error-context` — no cell variant yet; design TBD.
-    ErrorContext,
-}
-
-impl LiftKind {
-    /// Classify a WIT param type. Infallible: every `Type` maps to a
-    /// `LiftKind`. Codegen for un-wired variants `todo!()`s in
-    /// `cells.rs` / `slot_count` when actually reached.
-    fn classify(ty: &Type, resolve: &Resolve) -> LiftKind {
-        match ty {
-            Type::Bool => LiftKind::Bool,
-            Type::S8 | Type::S16 | Type::S32 => LiftKind::IntegerSignExt,
-            Type::U8 | Type::U16 | Type::U32 => LiftKind::IntegerZeroExt,
-            Type::S64 | Type::U64 => LiftKind::Integer64,
-            Type::F32 => LiftKind::FloatingF32,
-            Type::F64 => LiftKind::FloatingF64,
-            Type::String => LiftKind::Text,
-            Type::Char => LiftKind::Char,
-            Type::ErrorContext => LiftKind::ErrorContext,
-            Type::Id(id) => match &resolve.types[*id].kind {
-                wit_parser::TypeDefKind::List(Type::U8) => LiftKind::Bytes,
-                wit_parser::TypeDefKind::List(_) => LiftKind::ListOf,
-                wit_parser::TypeDefKind::Tuple(_) => LiftKind::TupleOf,
-                wit_parser::TypeDefKind::Record(_) => LiftKind::Record,
-                wit_parser::TypeDefKind::Variant(_) => LiftKind::Variant,
-                wit_parser::TypeDefKind::Enum(_) => LiftKind::Enum,
-                wit_parser::TypeDefKind::Flags(_) => LiftKind::Flags,
-                wit_parser::TypeDefKind::Option(_) => LiftKind::Option,
-                wit_parser::TypeDefKind::Result(_) => LiftKind::Result,
-                wit_parser::TypeDefKind::Handle(_) => LiftKind::Handle,
-                wit_parser::TypeDefKind::Future(_) => LiftKind::Future,
-                wit_parser::TypeDefKind::Stream(_) => LiftKind::Stream,
-                // Type aliases peel through and reclassify the
-                // underlying type.
-                wit_parser::TypeDefKind::Type(t) => LiftKind::classify(t, resolve),
-                wit_parser::TypeDefKind::FixedLengthList(_, _)
-                | wit_parser::TypeDefKind::Map(_, _)
-                | wit_parser::TypeDefKind::Resource
-                | wit_parser::TypeDefKind::Unknown => {
-                    todo!(
-                        "tier-2 lift: unsupported TypeDefKind {:?}",
-                        &resolve.types[*id].kind
-                    )
-                }
-            },
-        }
-    }
-}
 
 // ─── Lift plan: structural single-source-of-truth ─────────────────
 //
@@ -186,44 +82,80 @@ impl LiftKind {
 /// `local_base` to recover the absolute wasm-local index), and any
 /// side-table info this cell contributes (e.g., enum-info /
 /// record-info entries).
+///
+/// Wired variants carry full lift payload (flat-slot positions +
+/// per-kind side-table info); un-wired variants carry no payload and
+/// `todo!()` at codegen time. Un-wired variants are placeholder tags
+/// — they're never constructed today (the plan-builder `todo!()`s
+/// before reaching them), but listing them keeps the [`emit_cell_op`]
+/// match exhaustive without a `_` catchall, so adding a new wired
+/// type forces the codegen arm to be filled in. New WIT types: add
+/// one variant + one arm in [`LiftPlanBuilder::push`] + one arm in
+/// [`emit_cell_op`]. Roadmap: `docs/tiers/lift-codegen.md`.
+#[allow(dead_code)] // un-wired variants exist only for exhaustive match
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum CellOp {
-    Bool {
-        flat_slot: u32,
-    },
-    IntegerSignExt {
-        flat_slot: u32,
-    },
-    IntegerZeroExt {
-        flat_slot: u32,
-    },
-    Integer64 {
-        flat_slot: u32,
-    },
-    FloatingF32 {
-        flat_slot: u32,
-    },
-    FloatingF64 {
-        flat_slot: u32,
-    },
-    Text {
-        ptr_slot: u32,
-        len_slot: u32,
-    },
-    Bytes {
-        ptr_slot: u32,
-        len_slot: u32,
-    },
+pub(super) enum Cell {
+    // ── Wired ─────────────────────────────────────────────────────
+    /// `bool` — 1 i32 slot (0/1) → `cell::bool`.
+    Bool { flat_slot: u32 },
+    /// `s8`/`s16`/`s32` — 1 i32 slot, sign-extend → `cell::integer`.
+    IntegerSignExt { flat_slot: u32 },
+    /// `u8`/`u16`/`u32` — 1 i32 slot, zero-extend → `cell::integer`.
+    IntegerZeroExt { flat_slot: u32 },
+    /// `s64`/`u64` — 1 i64 slot, no widen → `cell::integer`.
+    Integer64 { flat_slot: u32 },
+    /// `f32` — 1 f32 slot, `f64.promote_f32` → `cell::floating`.
+    FloatingF32 { flat_slot: u32 },
+    /// `f64` — 1 f64 slot, no widen → `cell::floating`.
+    FloatingF64 { flat_slot: u32 },
+    /// `string` — 2 i32 slots (ptr, len) → `cell::text`.
+    Text { ptr_slot: u32, len_slot: u32 },
+    /// `list<u8>` — 2 i32 slots (ptr, len) → `cell::bytes`.
+    Bytes { ptr_slot: u32, len_slot: u32 },
+    /// `enum { ... }` → `cell::enum-case(u32)`. Carries the type-name +
+    /// case-names so the side-table builder can register them.
     EnumCase {
         flat_slot: u32,
         info: NamedListInfo,
     },
+    /// `record { ... }` → `cell::record-of(u32)` (side-table index).
+    /// Children live elsewhere in the same plan; `fields` references
+    /// them by `LiftPlan::cells` position.
     RecordOf {
         type_name: String,
         /// `(field-name, child-cell-idx)` per field, in WIT order.
         /// `child-cell-idx` indexes into the same `LiftPlan::cells`.
         fields: Vec<(String, u32)>,
     },
+
+    // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
+    //    + `emit_cell_op` until codegen lands) ─────────────────────
+    /// `char` → `cell::text` (utf-8 encode the i32 code point).
+    Char,
+    /// `list<T>` (non-u8 element) → `cell::list-of`.
+    ListOf,
+    /// `tuple<...>` → `cell::tuple-of`.
+    TupleOf,
+    /// `option<T>` → `cell::option-some(u32)` / `cell::option-none`.
+    Option,
+    /// `result<T, E>` → `cell::result-ok(option<u32>)` / `cell::result-err(option<u32>)`.
+    Result,
+    /// `flags { ... }` → `cell::flags-set(u32)`.
+    Flags,
+    /// `variant { ... }` → `cell::variant-case(u32)`.
+    Variant,
+
+    // ── Un-wired handle ──────────────────────────────────────────
+    /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`.
+    Handle,
+    /// `future<T>` → `cell::future-handle(u32)`.
+    Future,
+    /// `stream<T>` → `cell::stream-handle(u32)`.
+    Stream,
+
+    // ── Future work ──────────────────────────────────────────────
+    /// `error-context` — no cell variant yet; design TBD.
+    ErrorContext,
 }
 
 /// Plan for lifting one (param | result) into a cell tree. Cells
@@ -232,7 +164,7 @@ enum CellOp {
 /// emit-code phase; the side-table builder also walks `cells` to
 /// pull out per-kind side-table contributions.
 pub(super) struct LiftPlan {
-    cells: Vec<CellOp>,
+    cells: Vec<Cell>,
     /// Total flat-slot locals consumed by the plan. Cells reference
     /// flat slots in `0..flat_slot_count`; the emit phase adds the
     /// caller-supplied `local_base` to recover absolute wasm-local
@@ -245,20 +177,20 @@ impl LiftPlan {
         self.cells.len() as u32
     }
 
-    /// Iterator over every `CellOp::EnumCase` in the plan. Used by
+    /// Iterator over every `Cell::EnumCase` in the plan. Used by
     /// the side-table builder to register enum strings.
     fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
         self.cells.iter().filter_map(|op| match op {
-            CellOp::EnumCase { info, .. } => Some(info),
+            Cell::EnumCase { info, .. } => Some(info),
             _ => None,
         })
     }
 
-    /// Iterator over every `CellOp::RecordOf` in the plan. Used by
+    /// Iterator over every `Cell::RecordOf` in the plan. Used by
     /// the record-info side-table builder.
     fn record_ofs(&self) -> impl Iterator<Item = (&str, &[(String, u32)])> {
         self.cells.iter().filter_map(|op| match op {
-            CellOp::RecordOf { type_name, fields } => Some((type_name.as_str(), fields.as_slice())),
+            Cell::RecordOf { type_name, fields } => Some((type_name.as_str(), fields.as_slice())),
             _ => None,
         })
     }
@@ -279,7 +211,7 @@ impl LiftPlan {
 /// for compound results that's the first synth local allocated by
 /// `alloc_wrapper_locals`.
 struct LiftPlanBuilder {
-    cells: Vec<CellOp>,
+    cells: Vec<Cell>,
     /// Next available plan-relative flat-slot position. Incremented
     /// by `bump_flat_slot` as cells consume flat slots.
     next_flat_slot: u32,
@@ -293,52 +225,93 @@ impl LiftPlanBuilder {
         }
     }
 
-    /// Push cells for one lift; returns the root cell's index.
+    /// Push cells for one lift; returns the root cell's index. Type
+    /// aliases peel through and reclassify the underlying type.
     fn push(&mut self, ty: &Type, resolve: &Resolve) -> u32 {
         let root_idx = self.cells.len() as u32;
-        match LiftKind::classify(ty, resolve) {
-            LiftKind::Bool => {
+        match ty {
+            Type::Bool => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::Bool { flat_slot });
+                self.cells.push(Cell::Bool { flat_slot });
             }
-            LiftKind::IntegerSignExt => {
+            Type::S8 | Type::S16 | Type::S32 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::IntegerSignExt { flat_slot });
+                self.cells.push(Cell::IntegerSignExt { flat_slot });
             }
-            LiftKind::IntegerZeroExt => {
+            Type::U8 | Type::U16 | Type::U32 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::IntegerZeroExt { flat_slot });
+                self.cells.push(Cell::IntegerZeroExt { flat_slot });
             }
-            LiftKind::Integer64 => {
+            Type::S64 | Type::U64 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::Integer64 { flat_slot });
+                self.cells.push(Cell::Integer64 { flat_slot });
             }
-            LiftKind::FloatingF32 => {
+            Type::F32 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::FloatingF32 { flat_slot });
+                self.cells.push(Cell::FloatingF32 { flat_slot });
             }
-            LiftKind::FloatingF64 => {
+            Type::F64 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::FloatingF64 { flat_slot });
+                self.cells.push(Cell::FloatingF64 { flat_slot });
             }
-            LiftKind::Text => {
+            Type::String => {
                 let ptr_slot = self.bump_flat_slot();
                 let len_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::Text { ptr_slot, len_slot });
+                self.cells.push(Cell::Text { ptr_slot, len_slot });
             }
-            LiftKind::Bytes => {
-                let ptr_slot = self.bump_flat_slot();
-                let len_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::Bytes { ptr_slot, len_slot });
-            }
-            LiftKind::Enum => {
-                let info = enum_lift_info_for_type(ty, resolve)
-                    .expect("LiftKind::Enum classify implies enum-info available");
-                let flat_slot = self.bump_flat_slot();
-                self.cells.push(CellOp::EnumCase { flat_slot, info });
-            }
-            LiftKind::Record => self.push_record(ty, resolve, root_idx),
-            other => todo!("plan-builder for un-wired LiftKind {other:?}"),
+            Type::Char => todo!("plan-builder for un-wired Cell::Char"),
+            Type::ErrorContext => todo!("plan-builder for un-wired Cell::ErrorContext"),
+            Type::Id(id) => match &resolve.types[*id].kind {
+                wit_parser::TypeDefKind::List(Type::U8) => {
+                    let ptr_slot = self.bump_flat_slot();
+                    let len_slot = self.bump_flat_slot();
+                    self.cells.push(Cell::Bytes { ptr_slot, len_slot });
+                }
+                wit_parser::TypeDefKind::Enum(_) => {
+                    let info = enum_lift_info_for_type(ty, resolve)
+                        .expect("Enum kind implies enum-info available");
+                    let flat_slot = self.bump_flat_slot();
+                    self.cells.push(Cell::EnumCase { flat_slot, info });
+                }
+                wit_parser::TypeDefKind::Record(_) => self.push_record(ty, resolve, root_idx),
+                wit_parser::TypeDefKind::Type(t) => return self.push(t, resolve),
+                wit_parser::TypeDefKind::List(_) => {
+                    todo!("plan-builder for un-wired Cell::ListOf")
+                }
+                wit_parser::TypeDefKind::Tuple(_) => {
+                    todo!("plan-builder for un-wired Cell::TupleOf")
+                }
+                wit_parser::TypeDefKind::Variant(_) => {
+                    todo!("plan-builder for un-wired Cell::Variant")
+                }
+                wit_parser::TypeDefKind::Flags(_) => {
+                    todo!("plan-builder for un-wired Cell::Flags")
+                }
+                wit_parser::TypeDefKind::Option(_) => {
+                    todo!("plan-builder for un-wired Cell::Option")
+                }
+                wit_parser::TypeDefKind::Result(_) => {
+                    todo!("plan-builder for un-wired Cell::Result")
+                }
+                wit_parser::TypeDefKind::Handle(_) => {
+                    todo!("plan-builder for un-wired Cell::Handle")
+                }
+                wit_parser::TypeDefKind::Future(_) => {
+                    todo!("plan-builder for un-wired Cell::Future")
+                }
+                wit_parser::TypeDefKind::Stream(_) => {
+                    todo!("plan-builder for un-wired Cell::Stream")
+                }
+                wit_parser::TypeDefKind::FixedLengthList(_, _)
+                | wit_parser::TypeDefKind::Map(_, _)
+                | wit_parser::TypeDefKind::Resource
+                | wit_parser::TypeDefKind::Unknown => {
+                    todo!(
+                        "tier-2 lift: unsupported TypeDefKind {:?}",
+                        &resolve.types[*id].kind
+                    )
+                }
+            },
         }
         root_idx
     }
@@ -359,15 +332,15 @@ impl LiftPlanBuilder {
     /// list needs), then backfill the parent's `fields`.
     fn push_record(&mut self, ty: &Type, resolve: &Resolve, root_idx: u32) {
         let Type::Id(id) = ty else {
-            unreachable!("LiftKind::Record came from non-Id type")
+            unreachable!("Record kind came from non-Id type")
         };
         let typedef = &resolve.types[*id];
         let wit_parser::TypeDefKind::Record(r) = &typedef.kind else {
-            unreachable!("LiftKind::Record came from non-Record kind")
+            unreachable!("Record kind came from non-Record TypeDefKind")
         };
         let type_name = typedef.name.clone().unwrap_or_default();
         // Reserve the parent slot at root_idx.
-        self.cells.push(CellOp::RecordOf {
+        self.cells.push(Cell::RecordOf {
             type_name,
             fields: Vec::new(),
         });
@@ -379,7 +352,7 @@ impl LiftPlanBuilder {
         }
         // Backfill the parent's `fields` with the now-known child indices.
         match &mut self.cells[root_idx as usize] {
-            CellOp::RecordOf { fields: f, .. } => *f = fields,
+            Cell::RecordOf { fields: f, .. } => *f = fields,
             _ => unreachable!("just pushed RecordOf at root_idx"),
         }
     }
@@ -417,17 +390,23 @@ impl LiftPlanBuilder {
 /// layout phase wraps it into a [`ResultLayout`] with the offsets
 /// once those are known. `side_table` populates the result tree's
 /// side tables at adapter-build time. Compound results carry their
-/// side-table contributions inline on the plan's `CellOp`s instead.
+/// side-table contributions inline on the plan's `Cell`s instead.
 pub(super) struct ResultLift {
     pub source: ResultSource,
     side_table: SideTableInfo,
 }
 
 pub(super) enum ResultSource {
-    /// Direct primitive (no retptr): source is `lcl.result`.
-    Direct(LiftKind),
+    /// Direct primitive (no retptr): source is `lcl.result`. The
+    /// [`Cell`] carries the variant tag for emit dispatch; its
+    /// `flat_slot` field is a placeholder (the source is the single
+    /// caller-supplied local, not a plan slot).
+    Direct(Cell),
     /// `(ptr, len)` pair in retptr scratch (string / `list<u8>`).
-    RetptrPair(LiftKind),
+    /// The [`Cell`] carries the variant tag; its `ptr_slot`/`len_slot`
+    /// fields are placeholders (the source is the caller-supplied
+    /// `(ptr_local, len_local)` pair, not plan slots).
+    RetptrPair(Cell),
     /// Compound result: walk a [`LiftPlan`] over flat slots loaded
     /// from retptr scratch via `lift_from_memory`.
     Compound(CompoundResult),
@@ -492,7 +471,7 @@ pub(super) struct ParamLayout {
     /// cells, each `cell_layout.size` bytes.
     pub cells_offset: u32,
     /// Per cell of `lift.plan.cells`: the side-table index for
-    /// `CellOp::RecordOf` cells, `None` for other cell kinds.
+    /// `Cell::RecordOf` cells, `None` for other cell kinds.
     pub record_info_cell_idx: Vec<Option<u32>>,
 }
 
@@ -507,13 +486,15 @@ pub(super) struct ResultLayout {
 }
 
 pub(super) enum ResultSourceLayout {
-    /// Direct primitive (no retptr): source is `lcl.result`.
-    Direct(LiftKind),
-    /// `(ptr, len)` pair at the function's retptr scratch.
-    RetptrPair { kind: LiftKind, retptr_offset: i32 },
+    /// Direct primitive (no retptr): source is `lcl.result`. See
+    /// [`ResultSource::Direct`] for the placeholder-slot convention.
+    Direct(Cell),
+    /// `(ptr, len)` pair at the function's retptr scratch. See
+    /// [`ResultSource::RetptrPair`] for the placeholder-slot convention.
+    RetptrPair { cell: Cell, retptr_offset: i32 },
     /// Compound result: classify-time recipe plus layout offsets
     /// (retptr scratch + per-cell record-info side-table indices for
-    /// `CellOp::RecordOf` cells). The cells-slab base is _not_
+    /// `Cell::RecordOf` cells). The cells-slab base is _not_
     /// duplicated here; the wrapper body reads it off
     /// [`AfterSetup::result_cells_offset`] (the canonical source —
     /// today's compound lifts only fire from the after-hook path).
@@ -521,7 +502,7 @@ pub(super) enum ResultSourceLayout {
         compound: CompoundResult,
         retptr_offset: i32,
         /// One entry per cell of `compound.plan.cells`, in plan
-        /// order. `Some(idx)` for `CellOp::RecordOf` cells, `None`
+        /// order. `Some(idx)` for `Cell::RecordOf` cells, `None`
         /// for other kinds. Built unconditionally (it's a property
         /// of the cell plan, not of the after-hook wiring).
         record_info_cell_idx: Vec<Option<u32>>,
@@ -531,7 +512,7 @@ pub(super) enum ResultSourceLayout {
 /// Result-side-table info, populated when a result is lift-able.
 /// Mirrors the per-kind options on `SideTableInfo` but only for
 /// results (params now carry their info inline in their LiftPlan
-/// `CellOp`s).
+/// `Cell`s).
 #[derive(Default, Clone)]
 struct SideTableInfo {
     /// `Some` for enum-typed result lifts: carries the enum's type-name
@@ -545,7 +526,7 @@ struct SideTableInfo {
 /// `{ type-name, <item>-name }` shape (enum-info, eventually flags-info
 /// + variant-info).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct NamedListInfo {
+pub(super) struct NamedListInfo {
     type_name: String,
     /// Item names in WIT declaration order — the i'th entry's WIT
     /// declaration index equals `i` (matching the disc / bit-position
@@ -605,14 +586,13 @@ pub(super) fn classify_result_lift(
     result_at_retptr: bool,
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
-    let kind = LiftKind::classify(ty, resolve);
 
     // Compound kinds (currently just Record) drive a LiftPlan over
     // retptr-loaded flat slots. The plan's cells carry plan-relative
     // flat-slot positions; the emit phase supplies `local_base =
     // synth_locals[0]` (see `alloc_wrapper_locals`) so the same plan
     // serves both the side-table builders and codegen.
-    if matches!(kind, LiftKind::Record) {
+    if is_compound_result(ty, resolve) {
         let mut builder = LiftPlanBuilder::new();
         builder.push(ty, resolve);
         let plan = builder.into_plan();
@@ -622,46 +602,83 @@ pub(super) fn classify_result_lift(
         });
     }
 
-    if !result_kind_supported(kind) {
-        // Variants / option / list / etc. as result types: defer
-        // until those land. The wrapper still calls after-hook with
-        // option::none for `result`.
-        return None;
-    }
-    let side_table = side_table_info_for(ty, kind, resolve);
+    // Single-cell direct/retptr-pair path: build a one-cell plan and
+    // pull its single Cell out as the variant tag for emit dispatch.
+    // Returns None for un-wired result types (variants / option /
+    // list / etc.) — wrapper still calls after-hook with
+    // option::none for `result`.
+    let cell = single_cell_for_result(ty, resolve)?;
+    let side_table = side_table_info_for_cell(&cell);
     let source = if result_at_retptr {
-        ResultSource::RetptrPair(kind)
+        ResultSource::RetptrPair(cell)
     } else {
-        ResultSource::Direct(kind)
+        ResultSource::Direct(cell)
     };
     Some(ResultLift { source, side_table })
 }
 
-/// Whether the (non-compound) result lift codegen can handle this
-/// kind today. Compound kinds use the `Compound` arm and don't go
-/// through this check.
-fn result_kind_supported(kind: LiftKind) -> bool {
-    matches!(
-        kind,
-        LiftKind::Bool
-            | LiftKind::IntegerSignExt
-            | LiftKind::IntegerZeroExt
-            | LiftKind::Integer64
-            | LiftKind::FloatingF32
-            | LiftKind::FloatingF64
-            | LiftKind::Text
-            | LiftKind::Bytes
-            | LiftKind::Enum
-    )
+/// Whether `ty` resolves (through type aliases) to a record — the
+/// only compound kind whose result-side codegen is wired today.
+/// Other compound kinds (variants / tuples / etc.) bail out at
+/// [`classify_result_lift`] for now.
+fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
+    let Type::Id(id) = ty else { return false; };
+    match &resolve.types[*id].kind {
+        wit_parser::TypeDefKind::Record(_) => true,
+        wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
+        _ => false,
+    }
 }
 
-/// Build the `SideTableInfo` for a (type, kind) pair. Empty for
-/// primitive lifts; populated for compound lifts that need
-/// per-tree side-table entries (currently only enum).
-fn side_table_info_for(ty: &Type, kind: LiftKind, resolve: &Resolve) -> SideTableInfo {
+/// Build a single-cell [`Cell`] for a non-compound result type by
+/// running it through a one-cell [`LiftPlanBuilder`]. Returns `None`
+/// for un-wired result types — the supported set tracks the wired
+/// arms in [`emit_lift_kind`].
+fn single_cell_for_result(ty: &Type, resolve: &Resolve) -> Option<Cell> {
+    if !is_supported_direct_result(ty, resolve) {
+        return None;
+    }
+    let mut builder = LiftPlanBuilder::new();
+    builder.push(ty, resolve);
+    let plan = builder.into_plan();
+    Some(plan.cells.into_iter().next().expect("push appended a cell"))
+}
+
+/// Whitelist of WIT types whose lift codegen [`emit_lift_kind`] can
+/// drive. Mirrors the wired primitive / text / bytes / enum arms of
+/// [`LiftPlanBuilder::push`]; new direct/retptr-pair kinds wire up
+/// here.
+fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
+    match ty {
+        Type::Bool
+        | Type::S8
+        | Type::S16
+        | Type::S32
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::S64
+        | Type::U64
+        | Type::F32
+        | Type::F64
+        | Type::String => true,
+        Type::Char | Type::ErrorContext => false,
+        Type::Id(id) => match &resolve.types[*id].kind {
+            wit_parser::TypeDefKind::List(Type::U8) => true,
+            wit_parser::TypeDefKind::Enum(_) => true,
+            wit_parser::TypeDefKind::Type(t) => is_supported_direct_result(t, resolve),
+            _ => false,
+        },
+    }
+}
+
+/// Build the `SideTableInfo` for a single-cell result. Empty for
+/// primitive lifts; populated for variants that need per-tree
+/// side-table entries (currently only enum).
+fn side_table_info_for_cell(cell: &Cell) -> SideTableInfo {
     let mut info = SideTableInfo::default();
-    if matches!(kind, LiftKind::Enum) {
-        info.enum_info = enum_lift_info_for_type(ty, resolve);
+    if let Cell::EnumCase { info: enum_info, .. } = cell {
+        info.enum_info = Some(enum_info.clone());
     }
     info
 }
@@ -882,7 +899,7 @@ fn append_entries(
 
 /// Register enum-info strings for every enum-typed lift across all
 /// funcs. Thin wrapper over [`register_side_table_strings`] tied to
-/// `CellOp::EnumCase`.
+/// `Cell::EnumCase`.
 pub(super) fn register_enum_strings(
     per_func: &[FuncClassified],
     name_blob: &mut Vec<u8>,
@@ -949,7 +966,7 @@ pub(super) struct RecordTypeStrings {
 
 pub(super) type RecordStringTable = HashMap<String, RecordTypeStrings>;
 
-/// Walk every plan's [`CellOp::RecordOf`] (params + compound results);
+/// Walk every plan's [`Cell::RecordOf`] (params + compound results);
 /// for each record type seen, register its `type-name` + each
 /// `field-name` into `name_blob` (deduped per type-name). Result keyed
 /// by record type-name.
@@ -995,7 +1012,7 @@ pub(super) fn register_record_strings(
 /// into `entries`; the layout phase resolves both layers in one
 /// reloc-pass once each segment has a base.
 pub(super) struct RecordInfoBlobs {
-    /// `record-info` entries: one entry per `CellOp::RecordOf` across
+    /// `record-info` entries: one entry per `Cell::RecordOf` across
     /// all plans, laid out per-(fn, param) in plan order. Carries
     /// relocs for each entry's `fields.ptr` → tuples segment.
     pub entries: Segment,
@@ -1053,7 +1070,7 @@ impl<'a> RecordInfoBuilder<'a> {
         }
     }
 
-    /// Append entries for one plan's `CellOp::RecordOf` cells; returns
+    /// Append entries for one plan's `Cell::RecordOf` cells; returns
     /// the contiguous range [`SymRef`] (into the entries segment) +
     /// the per-cell side-table index map. Each entry's `fields.ptr`
     /// slot gets a [`Reloc`] into the tuples segment.
@@ -1062,7 +1079,7 @@ impl<'a> RecordInfoBuilder<'a> {
         let mut count: u32 = 0;
         let mut cell_idx_map: Vec<Option<u32>> = vec![None; plan.cells.len()];
         for (cell_pos, op) in plan.cells.iter().enumerate() {
-            let CellOp::RecordOf { type_name, fields } = op else {
+            let Cell::RecordOf { type_name, fields } = op else {
                 continue;
             };
             let s = self
@@ -1127,7 +1144,7 @@ impl<'a> RecordInfoBuilder<'a> {
 
 /// Lay out the per-(fn, param) and per-(fn, compound-result) record-
 /// info entries + their (name, cell-idx) tuples arena. Each
-/// `CellOp::RecordOf` in a plan contributes one entry; the entry's
+/// `Cell::RecordOf` in a plan contributes one entry; the entry's
 /// side-table index is its position in that plan's contiguous range.
 pub(super) fn build_record_info_blob(
     per_func: &[FuncClassified],
@@ -1218,15 +1235,15 @@ pub(super) enum ResultEmitPlan<'a> {
     None,
     /// Direct primitive return — source value already in
     /// `source_local` (captured from the handler's flat return after
-    /// the call).
-    Direct { kind: LiftKind, source_local: u32 },
+    /// the call). [`Cell`] carries the variant tag for emit dispatch.
+    Direct { cell: Cell, source_local: u32 },
     /// `(ptr, len)` pair lives at `retptr_offset` in static scratch.
     /// The wrapper loads the pair into `ptr_local` / `len_local`
     /// before lifting (today these are always `lcl.ptr_scratch` /
     /// `lcl.len_scratch` — the variant carries them so the consumer
     /// doesn't re-thread `&WrapperLocals` for that lookup).
     RetptrPair {
-        kind: LiftKind,
+        cell: Cell,
         retptr_offset: i32,
         ptr_local: u32,
         len_local: u32,
@@ -1240,7 +1257,7 @@ pub(super) enum ResultEmitPlan<'a> {
     /// [`CompoundResult::plan`] — its cells hold plan-relative flat
     /// slots, and the emit phase pairs them with `local_base =
     /// synth_locals[0]` to recover absolute wasm-local indices.
-    /// `record_info_cell_idx` is the layout-phase per-cell `RecordOf`
+    /// `record_info_cell_idx` is the layout-phase per-cell `Cell::RecordOf`
     /// side-table index map (borrowed off [`ResultSourceLayout::Compound`]).
     Compound {
         plan: &'a LiftPlan,
@@ -1284,16 +1301,16 @@ pub(super) fn alloc_wrapper_locals<'a>(
     let result_emit = match fd.result_lift.as_ref() {
         None => ResultEmitPlan::None,
         Some(rl) => match &rl.source {
-            ResultSourceLayout::Direct(kind) => ResultEmitPlan::Direct {
-                kind: *kind,
+            ResultSourceLayout::Direct(cell) => ResultEmitPlan::Direct {
+                cell: cell.clone(),
                 source_local: result
                     .expect("ResultSourceLayout::Direct → direct-return local allocated"),
             },
             ResultSourceLayout::RetptrPair {
-                kind,
+                cell,
                 retptr_offset,
             } => ResultEmitPlan::RetptrPair {
-                kind: *kind,
+                cell: cell.clone(),
                 retptr_offset: *retptr_offset,
                 ptr_local: ptr_scratch,
                 len_local: len_scratch,
@@ -1394,58 +1411,75 @@ pub(super) fn emit_lift_plan(
 ///
 /// `local_base` is added to each cell's plan-relative flat-slot
 /// position to recover its absolute wasm-local index. `record_info_idx`
-/// is the side-table index for `CellOp::RecordOf` cells (set by the
+/// is the side-table index for `Cell::RecordOf` cells (set by the
 /// layout phase via the static record-info builder — adapter-build-
 /// time-known, emitted as `i32.const`). Other cells don't read it.
+///
+/// The match is exhaustive without a `_` catchall: adding a new
+/// [`Cell`] variant must add an arm here. Un-wired variants `todo!()`
+/// — they're never produced by [`LiftPlanBuilder::push`] today, but
+/// keeping the arms structural rather than a wildcard means the
+/// compiler flags any new variant that's missing codegen.
 fn emit_cell_op(
     f: &mut Function,
     cell_layout: &CellLayout,
-    op: &CellOp,
+    op: &Cell,
     record_info_idx: Option<u32>,
     local_base: u32,
     lcl: &WrapperLocals,
 ) {
     let addr = lcl.addr;
     match op {
-        CellOp::Bool { flat_slot } => cell_layout.emit_bool(f, addr, local_base + *flat_slot),
-        CellOp::IntegerSignExt { flat_slot } => {
+        Cell::Bool { flat_slot } => cell_layout.emit_bool(f, addr, local_base + *flat_slot),
+        Cell::IntegerSignExt { flat_slot } => {
             f.instructions().local_get(local_base + *flat_slot);
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        CellOp::IntegerZeroExt { flat_slot } => {
+        Cell::IntegerZeroExt { flat_slot } => {
             f.instructions().local_get(local_base + *flat_slot);
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        CellOp::Integer64 { flat_slot } => {
+        Cell::Integer64 { flat_slot } => {
             cell_layout.emit_integer(f, addr, local_base + *flat_slot)
         }
-        CellOp::FloatingF32 { flat_slot } => {
+        Cell::FloatingF32 { flat_slot } => {
             f.instructions().local_get(local_base + *flat_slot);
             f.instructions().f64_promote_f32();
             f.instructions().local_set(lcl.ext_f64);
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
-        CellOp::FloatingF64 { flat_slot } => {
+        Cell::FloatingF64 { flat_slot } => {
             cell_layout.emit_floating(f, addr, local_base + *flat_slot)
         }
-        CellOp::Text { ptr_slot, len_slot } => {
+        Cell::Text { ptr_slot, len_slot } => {
             cell_layout.emit_text(f, addr, local_base + *ptr_slot, local_base + *len_slot);
         }
-        CellOp::Bytes { ptr_slot, len_slot } => {
+        Cell::Bytes { ptr_slot, len_slot } => {
             cell_layout.emit_bytes(f, addr, local_base + *ptr_slot, local_base + *len_slot);
         }
-        CellOp::EnumCase { flat_slot, .. } => {
+        Cell::EnumCase { flat_slot, .. } => {
             cell_layout.emit_enum_case(f, addr, local_base + *flat_slot);
         }
-        CellOp::RecordOf { .. } => {
+        Cell::RecordOf { .. } => {
             let idx = record_info_idx
                 .expect("record-info index missing — layout phase didn't backfill RecordOf cell");
             cell_layout.emit_record_of(f, addr, idx);
         }
+        Cell::Char
+        | Cell::ListOf
+        | Cell::TupleOf
+        | Cell::Option
+        | Cell::Result
+        | Cell::Flags
+        | Cell::Variant
+        | Cell::Handle
+        | Cell::Future
+        | Cell::Stream
+        | Cell::ErrorContext => todo!("emit_cell_op for un-wired Cell variant {op:?}"),
     }
 }
 
@@ -1453,44 +1487,60 @@ fn emit_cell_op(
 /// `slot1` are wasm locals carrying the source value(s); for single-
 /// slot kinds only `slot0` is used. Multi-slot kinds (Text/Bytes)
 /// expect `(ptr, len)` in (slot0, slot1).
+///
+/// The cell's `flat_slot` / `ptr_slot` / `len_slot` fields are
+/// ignored — direct/retptr-pair sources don't go through the
+/// plan-relative flat-slot lookup; the caller passes the source
+/// locals directly. The cell variant tag drives dispatch.
 fn emit_lift_kind(
     f: &mut Function,
     cell_layout: &CellLayout,
-    kind: LiftKind,
+    cell: &Cell,
     slot0: u32,
     slot1: u32,
     lcl: &WrapperLocals,
 ) {
     let addr = lcl.addr;
-    match kind {
-        LiftKind::Bool => cell_layout.emit_bool(f, addr, slot0),
-        LiftKind::IntegerSignExt => {
+    match cell {
+        Cell::Bool { .. } => cell_layout.emit_bool(f, addr, slot0),
+        Cell::IntegerSignExt { .. } => {
             f.instructions().local_get(slot0);
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        LiftKind::IntegerZeroExt => {
+        Cell::IntegerZeroExt { .. } => {
             f.instructions().local_get(slot0);
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        LiftKind::Integer64 => cell_layout.emit_integer(f, addr, slot0),
-        LiftKind::FloatingF32 => {
+        Cell::Integer64 { .. } => cell_layout.emit_integer(f, addr, slot0),
+        Cell::FloatingF32 { .. } => {
             f.instructions().local_get(slot0);
             f.instructions().f64_promote_f32();
             f.instructions().local_set(lcl.ext_f64);
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
-        LiftKind::FloatingF64 => cell_layout.emit_floating(f, addr, slot0),
-        LiftKind::Text => cell_layout.emit_text(f, addr, slot0, slot1),
-        LiftKind::Bytes => cell_layout.emit_bytes(f, addr, slot0, slot1),
-        LiftKind::Enum => cell_layout.emit_enum_case(f, addr, slot0),
-        // Compound result lifts aren't yet supported; classify_result_lift
-        // returns None for these so we never reach here at emit time.
-        kind => unreachable!(
-            "emit_lift_kind reached unsupported result kind {kind:?} — \
+        Cell::FloatingF64 { .. } => cell_layout.emit_floating(f, addr, slot0),
+        Cell::Text { .. } => cell_layout.emit_text(f, addr, slot0, slot1),
+        Cell::Bytes { .. } => cell_layout.emit_bytes(f, addr, slot0, slot1),
+        Cell::EnumCase { .. } => cell_layout.emit_enum_case(f, addr, slot0),
+        // Compound + un-wired variants aren't valid direct/retptr-pair
+        // sources; classify_result_lift's whitelist filters them out.
+        Cell::RecordOf { .. }
+        | Cell::Char
+        | Cell::ListOf
+        | Cell::TupleOf
+        | Cell::Option
+        | Cell::Result
+        | Cell::Flags
+        | Cell::Variant
+        | Cell::Handle
+        | Cell::Future
+        | Cell::Stream
+        | Cell::ErrorContext => unreachable!(
+            "emit_lift_kind reached unsupported result Cell {cell:?} — \
              classify_result_lift should have filtered it"
         ),
     }
@@ -1512,11 +1562,11 @@ pub(super) fn emit_lift_result(
     lcl: &WrapperLocals,
 ) {
     match plan {
-        ResultEmitPlan::Direct { kind, source_local } => {
-            emit_lift_kind(f, cell_layout, *kind, *source_local, *source_local, lcl);
+        ResultEmitPlan::Direct { cell, source_local } => {
+            emit_lift_kind(f, cell_layout, cell, *source_local, *source_local, lcl);
         }
         ResultEmitPlan::RetptrPair {
-            kind,
+            cell,
             retptr_offset,
             ptr_local,
             len_local,
@@ -1535,7 +1585,7 @@ pub(super) fn emit_lift_result(
                 memory_index: 0,
             });
             f.instructions().local_set(*len_local);
-            emit_lift_kind(f, cell_layout, *kind, *ptr_local, *len_local, lcl);
+            emit_lift_kind(f, cell_layout, cell, *ptr_local, *len_local, lcl);
         }
         ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
             "compound results are emitted directly via emit_lift_compound_prefix + \
@@ -1673,9 +1723,9 @@ mod tests {
         }
     }
 
-    /// `CellOp::RecordOf` shorthand for fixtures.
-    fn record_of(type_name: &str, fields: &[(&str, u32)]) -> CellOp {
-        CellOp::RecordOf {
+    /// `Cell::RecordOf` shorthand for fixtures.
+    fn record_of(type_name: &str, fields: &[(&str, u32)]) -> Cell {
+        Cell::RecordOf {
             type_name: type_name.into(),
             fields: fields
                 .iter()
@@ -1786,18 +1836,31 @@ mod tests {
         let mut out = Vec::new();
         for op in &plan.cells {
             match op {
-                CellOp::Bool { .. }
-                | CellOp::IntegerSignExt { .. }
-                | CellOp::IntegerZeroExt { .. }
-                | CellOp::EnumCase { .. } => out.push(ValType::I32),
-                CellOp::Integer64 { .. } => out.push(ValType::I64),
-                CellOp::FloatingF32 { .. } => out.push(ValType::F32),
-                CellOp::FloatingF64 { .. } => out.push(ValType::F64),
-                CellOp::Text { .. } | CellOp::Bytes { .. } => {
+                Cell::Bool { .. }
+                | Cell::IntegerSignExt { .. }
+                | Cell::IntegerZeroExt { .. }
+                | Cell::EnumCase { .. } => out.push(ValType::I32),
+                Cell::Integer64 { .. } => out.push(ValType::I64),
+                Cell::FloatingF32 { .. } => out.push(ValType::F32),
+                Cell::FloatingF64 { .. } => out.push(ValType::F64),
+                Cell::Text { .. } | Cell::Bytes { .. } => {
                     out.push(ValType::I32);
                     out.push(ValType::I32);
                 }
-                CellOp::RecordOf { .. } => {}
+                Cell::RecordOf { .. } => {}
+                Cell::Char
+                | Cell::ListOf
+                | Cell::TupleOf
+                | Cell::Option
+                | Cell::Result
+                | Cell::Flags
+                | Cell::Variant
+                | Cell::Handle
+                | Cell::Future
+                | Cell::Stream
+                | Cell::ErrorContext => {
+                    unreachable!("un-wired Cell variant {op:?} should not appear in test plans")
+                }
             }
         }
         out
@@ -1811,7 +1874,7 @@ mod tests {
         plan.cells
             .iter()
             .map(|op| match op {
-                CellOp::RecordOf { .. } => {
+                Cell::RecordOf { .. } => {
                     let i = idx;
                     idx += 1;
                     Some(i)
@@ -1884,13 +1947,13 @@ mod tests {
     #[test]
     fn primitives_assign_one_cell_one_slot() {
         let r = Resolve::new();
-        let cases: &[(Type, CellOp)] = &[
-            (Type::Bool, CellOp::Bool { flat_slot: 0 }),
-            (Type::S32, CellOp::IntegerSignExt { flat_slot: 0 }),
-            (Type::U32, CellOp::IntegerZeroExt { flat_slot: 0 }),
-            (Type::S64, CellOp::Integer64 { flat_slot: 0 }),
-            (Type::F32, CellOp::FloatingF32 { flat_slot: 0 }),
-            (Type::F64, CellOp::FloatingF64 { flat_slot: 0 }),
+        let cases: &[(Type, Cell)] = &[
+            (Type::Bool, Cell::Bool { flat_slot: 0 }),
+            (Type::S32, Cell::IntegerSignExt { flat_slot: 0 }),
+            (Type::U32, Cell::IntegerZeroExt { flat_slot: 0 }),
+            (Type::S64, Cell::Integer64 { flat_slot: 0 }),
+            (Type::F32, Cell::FloatingF32 { flat_slot: 0 }),
+            (Type::F64, Cell::FloatingF64 { flat_slot: 0 }),
         ];
         for (ty, expected) in cases {
             let plan = plan_for(ty, &r);
@@ -1904,7 +1967,7 @@ mod tests {
         let plan = plan_for(&Type::String, &Resolve::new());
         assert_eq!(
             plan.cells,
-            vec![CellOp::Text {
+            vec![Cell::Text {
                 ptr_slot: 0,
                 len_slot: 1
             }]
@@ -1919,7 +1982,7 @@ mod tests {
         let plan = plan_for(&bytes_ty, &r);
         assert_eq!(
             plan.cells,
-            vec![CellOp::Bytes {
+            vec![Cell::Bytes {
                 ptr_slot: 0,
                 len_slot: 1
             }]
@@ -1932,7 +1995,7 @@ mod tests {
         let r = test_resolve();
         assert_eq!(
             plan_for_named("color", &r).cells,
-            vec![CellOp::EnumCase {
+            vec![Cell::EnumCase {
                 flat_slot: 0,
                 info: enum_info("color", &["red", "green", "blue"]),
             }],
@@ -1947,8 +2010,8 @@ mod tests {
             plan.cells,
             vec![
                 record_of("point", &[("x", 1), ("y", 2)]),
-                CellOp::IntegerZeroExt { flat_slot: 0 },
-                CellOp::IntegerSignExt { flat_slot: 1 },
+                Cell::IntegerZeroExt { flat_slot: 0 },
+                Cell::IntegerSignExt { flat_slot: 1 },
             ],
         );
         assert_eq!(plan.flat_slot_count, 2);
@@ -1963,9 +2026,9 @@ mod tests {
             vec![
                 record_of("nested", &[("p", 1), ("c", 4)]),
                 record_of("point", &[("x", 2), ("y", 3)]),
-                CellOp::IntegerZeroExt { flat_slot: 0 },
-                CellOp::IntegerSignExt { flat_slot: 1 },
-                CellOp::EnumCase {
+                Cell::IntegerZeroExt { flat_slot: 0 },
+                Cell::IntegerSignExt { flat_slot: 1 },
+                Cell::EnumCase {
                     flat_slot: 2,
                     info: enum_info("color", &["red", "green", "blue"]),
                 },
@@ -1986,7 +2049,7 @@ mod tests {
         let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut name_blob);
         assert_eq!(
             params[2].plan.cells,
-            vec![CellOp::Bytes {
+            vec![Cell::Bytes {
                 ptr_slot: 0,
                 len_slot: 1
             }],
@@ -2094,7 +2157,7 @@ mod tests {
 
     #[test]
     fn emit_lift_plan_validates_every_classify_built_shape() {
-        // Every wired LiftKind: classify a fixture WIT type, emit,
+        // Every wired Cell variant: classify a fixture WIT type, emit,
         // validate. Adding a new kind = adding a row.
         let r = test_resolve();
         let primitive_plans = [

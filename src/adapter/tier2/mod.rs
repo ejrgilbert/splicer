@@ -24,7 +24,7 @@
 //! - [`cells`] — emit helpers for constructing individual `cell`
 //!   variant cases in the canonical-ABI memory layout (one helper
 //!   per primitive case so far).
-//! - [`lift`] — lift classification (`LiftKind`), per-(param|result)
+//! - [`lift`] — lift classification (`Cell`), per-(param|result)
 //!   lift descriptors, side-table population, and the wasm-encoder
 //!   codegen that writes one cell per lifted value.
 //! - [`schema`] — `splicer:common/types` typedef layouts + tier-2
