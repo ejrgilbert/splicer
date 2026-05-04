@@ -165,13 +165,67 @@ pub(super) enum FuncShape {
 }
 
 impl FuncShape {
+    /// Classify a function as sync or async, eagerly resolving the
+    /// `task.return` import for the async case.
+    pub(super) fn classify(
+        resolve: &Resolve,
+        target_world_key: &WorldKey,
+        func: &WitFunction,
+    ) -> Self {
+        if func.kind.is_async() {
+            let (module, name, sig) =
+                func.task_return_import(resolve, Some(target_world_key), Mangling::Legacy);
+            FuncShape::Async(TaskReturnImport { module, name, sig })
+        } else {
+            FuncShape::Sync
+        }
+    }
+
     pub(super) fn is_async(&self) -> bool {
         matches!(self, FuncShape::Async(_))
     }
+
     pub(super) fn task_return(&self) -> Option<&TaskReturnImport> {
         match self {
             FuncShape::Async(tr) => Some(tr),
             FuncShape::Sync => None,
+        }
+    }
+
+    /// `(import_variant, export_variant)` to pass to
+    /// `Resolve::wasm_signature` for this shape.
+    pub(super) fn abi_variants(&self) -> (AbiVariant, AbiVariant) {
+        match self {
+            FuncShape::Async(_) => (
+                AbiVariant::GuestImportAsync,
+                AbiVariant::GuestExportAsyncStackful,
+            ),
+            FuncShape::Sync => (AbiVariant::GuestImport, AbiVariant::GuestExport),
+        }
+    }
+
+    /// Whether the wrapper export needs a `cabi_post_*` companion.
+    /// Async exports never do (results land via `task.return`); sync
+    /// exports do iff the export sig retptr's the result.
+    pub(super) fn needs_cabi_post(&self, export_sig: &WasmSignature) -> bool {
+        match self {
+            FuncShape::Async(_) => false,
+            FuncShape::Sync => export_sig.retptr,
+        }
+    }
+
+    /// Whether the function's result lives at retptr scratch (vs.
+    /// flat return-value slots). Async funcs use the import-sig
+    /// retptr (canon-lower-async always retptr's a non-void result);
+    /// sync funcs use the export-sig retptr.
+    pub(super) fn result_at_retptr(
+        &self,
+        export_sig: &WasmSignature,
+        import_sig: &WasmSignature,
+    ) -> bool {
+        match self {
+            FuncShape::Async(_) => import_sig.retptr,
+            FuncShape::Sync => export_sig.retptr,
         }
     }
 }
@@ -937,16 +991,9 @@ fn build_per_func_classified(
         name_blob.extend_from_slice(func.name.as_bytes());
 
         let params_lift = classify_func_params(resolve, func, name_blob);
-        let is_async = func.kind.is_async();
-        let (import_variant, export_variant) = if is_async {
-            (
-                AbiVariant::GuestImportAsync,
-                AbiVariant::GuestExportAsyncStackful,
-            )
-        } else {
-            (AbiVariant::GuestImport, AbiVariant::GuestExport)
-        };
-        let mangling = dispatch_mangling(is_async);
+        let shape = FuncShape::classify(resolve, &target_world_key, func);
+        let (import_variant, export_variant) = shape.abi_variants();
+        let mangling = dispatch_mangling(shape.is_async());
 
         let (import_module, import_field) = resolve.wasm_import_name(
             mangling,
@@ -965,17 +1012,12 @@ fn build_per_func_classified(
         );
         let export_sig = resolve.wasm_signature(export_variant, func);
         let import_sig = resolve.wasm_signature(import_variant, func);
-        // Async exports never need cabi_post (results land via
-        // task.return, not a callee-allocated buffer).
-        let needs_cabi_post = !is_async && export_sig.retptr;
-        let result_lift = classify_result_lift(resolve, func, &export_sig, &import_sig, is_async);
-        let shape = if is_async {
-            let (module, name, sig) =
-                func.task_return_import(resolve, Some(&target_world_key), Mangling::Legacy);
-            FuncShape::Async(TaskReturnImport { module, name, sig })
-        } else {
-            FuncShape::Sync
-        };
+        let needs_cabi_post = shape.needs_cabi_post(&export_sig);
+        let result_lift = classify_result_lift(
+            resolve,
+            func,
+            shape.result_at_retptr(&export_sig, &import_sig),
+        );
 
         per_func.push(FuncClassified {
             shape,
@@ -1581,11 +1623,16 @@ fn emit_wrapper_function(
         fd.retptr_offset,
         func_idx.handler_imp_base + i as u32,
     );
-    if fd.shape.is_async() {
-        f.instructions().local_set(lcl.st);
-        canon_async::emit_wait_loop(&mut f, lcl.st, lcl.ws, async_funcs);
-    } else if let Some(local) = lcl.result {
-        f.instructions().local_set(local);
+    match &fd.shape {
+        FuncShape::Async(_) => {
+            f.instructions().local_set(lcl.st);
+            canon_async::emit_wait_loop(&mut f, lcl.st, lcl.ws, async_funcs);
+        }
+        FuncShape::Sync => {
+            if let Some(local) = lcl.result {
+                f.instructions().local_set(local);
+            }
+        }
     }
 
     // ── Phase 3: on-return (only if after-hook wired) ──

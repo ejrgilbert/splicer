@@ -30,7 +30,6 @@ use std::collections::HashMap;
 
 use wasm_encoder::{Function, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::lift_from_memory;
-use wit_parser::abi::WasmSignature;
 use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
 use super::super::abi::emit::{
@@ -592,16 +591,17 @@ fn append_param_name(name_blob: &mut Vec<u8>, name: &str) -> BlobSlice {
 /// with `None` (the wrapper still calls the after-hook with
 /// `result: option::none`).
 ///
-/// For async funcs canon-lower-async always retptr's a non-void
-/// result, so even primitive results live at the retptr scratch.
+/// `result_at_retptr` selects which sig's retptr decides where the
+/// result lands: for sync funcs that's the export sig (callee
+/// allocates), for async funcs the import sig (canon-lower-async
+/// always retptr's a non-void result, so even primitive results
+/// live at retptr scratch). The caller picks via `FuncShape`.
 /// Returns `None` only for void functions or unsupported result
 /// kinds.
 pub(super) fn classify_result_lift(
     resolve: &Resolve,
     func: &WitFunction,
-    export_sig: &WasmSignature,
-    import_sig: &WasmSignature,
-    is_async: bool,
+    result_at_retptr: bool,
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
     let kind = LiftKind::classify(ty, resolve);
@@ -629,11 +629,6 @@ pub(super) fn classify_result_lift(
         return None;
     }
     let side_table = side_table_info_for(ty, kind, resolve);
-    let result_at_retptr = if is_async {
-        import_sig.retptr
-    } else {
-        export_sig.retptr
-    };
     let source = if result_at_retptr {
         ResultSource::RetptrPair(kind)
     } else {
