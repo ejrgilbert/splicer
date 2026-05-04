@@ -1311,10 +1311,10 @@ pub(super) fn alloc_wrapper_locals<'a>(
                             Resolve::MAX_FLAT_PARAMS
                         )
                     });
-                debug_assert_eq!(
+                assert_eq!(
                     flat.len(),
                     compound.plan.flat_slot_count as usize,
-                    "canonical-ABI flat count must match classify-time plan"
+                    "canonical-ABI flat count (emit) must match classify-time plan"
                 );
                 let synth_locals: Vec<u32> = flat
                     .into_iter()
@@ -1328,7 +1328,7 @@ pub(super) fn alloc_wrapper_locals<'a>(
                 let mut builder = LiftPlanBuilder::new(synth_base);
                 builder.push(&compound.ty, resolve);
                 let plan = builder.into_plan();
-                debug_assert_eq!(
+                assert_eq!(
                     plan.cells.len(),
                     compound.plan.cells.len(),
                     "rebuilt emit-time plan must have same cell count as classify-time plan"
@@ -1376,7 +1376,11 @@ pub(super) fn emit_lift_plan(
     record_info_indices: &[Option<u32>],
     lcl: &WrapperLocals,
 ) {
-    debug_assert_eq!(record_info_indices.len(), plan.cells.len());
+    assert_eq!(
+        record_info_indices.len(),
+        plan.cells.len(),
+        "side-table record-info indices (emit input) must have one entry per classify-time plan cell"
+    );
     for (cell_idx, op) in plan.cells.iter().enumerate() {
         let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
         f.instructions().i32_const(cell_addr as i32);
@@ -1551,10 +1555,10 @@ pub(super) fn emit_lift_compound_prefix(
     addr_local: u32,
     synth_locals: &[u32],
 ) {
-    debug_assert_eq!(
+    assert_eq!(
         synth_locals.len(),
         plan_flat_slot_count as usize,
-        "synthetic-local count must match plan flat slot count"
+        "synthetic-local count (emit) must match classify-time plan flat slot count"
     );
     // Stage retptr_offset into the addr local that the pre-built
     // bindgen loads read from.
