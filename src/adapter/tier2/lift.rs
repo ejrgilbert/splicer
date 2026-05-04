@@ -1019,6 +1019,112 @@ pub(super) struct RecordInfoBlobs {
     pub per_result_cell_idx: Vec<Vec<Option<u32>>>,
 }
 
+/// Accumulator for [`build_record_info_blob`]: bundles the two
+/// segment buffers + reloc list + their static layouts/ids so each
+/// plan can be appended via a one-arg method.
+struct RecordInfoBuilder<'a> {
+    entries: Vec<u8>,
+    tuples: Vec<u8>,
+    entry_relocs: Vec<Reloc>,
+    entry_layout: &'a RecordLayout,
+    tuple_layout: &'a RecordLayout,
+    entries_id: SymbolId,
+    tuples_id: SymbolId,
+    strings: &'a RecordStringTable,
+}
+
+impl<'a> RecordInfoBuilder<'a> {
+    fn new(
+        entry_layout: &'a RecordLayout,
+        tuple_layout: &'a RecordLayout,
+        entries_id: SymbolId,
+        tuples_id: SymbolId,
+        strings: &'a RecordStringTable,
+    ) -> Self {
+        Self {
+            entries: Vec::new(),
+            tuples: Vec::new(),
+            entry_relocs: Vec::new(),
+            entry_layout,
+            tuple_layout,
+            entries_id,
+            tuples_id,
+            strings,
+        }
+    }
+
+    /// Append entries for one plan's `CellOp::RecordOf` cells; returns
+    /// the contiguous range [`SymRef`] (into the entries segment) +
+    /// the per-cell side-table index map. Each entry's `fields.ptr`
+    /// slot gets a [`Reloc`] into the tuples segment.
+    fn append_plan(&mut self, plan: &LiftPlan) -> (SymRef, Vec<Option<u32>>) {
+        let range_start = self.entries.len() as u32;
+        let mut count: u32 = 0;
+        let mut cell_idx_map: Vec<Option<u32>> = vec![None; plan.cells.len()];
+        for (cell_pos, op) in plan.cells.iter().enumerate() {
+            let CellOp::RecordOf { type_name, fields } = op else {
+                continue;
+            };
+            let s = self
+                .strings
+                .get(type_name.as_str())
+                .expect("register_record_strings registered every record type");
+            let side_idx = count;
+            cell_idx_map[cell_pos] = Some(side_idx);
+            count += 1;
+
+            let tuples_off = self.tuples.len() as u32;
+            let tuples_len = fields.len() as u32;
+            for (i, (_, child_cell_idx)) in fields.iter().enumerate() {
+                let tuple = RecordWriter::extend_zero(&mut self.tuples, self.tuple_layout);
+                tuple.write_slice(&mut self.tuples, RECORD_FIELD_TUPLE_NAME, s.field_names[i]);
+                tuple.write_i32(&mut self.tuples, RECORD_FIELD_TUPLE_IDX, *child_cell_idx as i32);
+            }
+
+            let entry = RecordWriter::extend_zero(&mut self.entries, self.entry_layout);
+            entry.write_slice(&mut self.entries, INFO_TYPE_NAME, s.type_name);
+            entry.write_slice_reloc(
+                &mut self.entries,
+                &mut self.entry_relocs,
+                RECORD_INFO_FIELDS,
+                SymRef {
+                    target: self.tuples_id,
+                    off: tuples_off,
+                    len: tuples_len,
+                },
+            );
+        }
+        (
+            SymRef {
+                target: self.entries_id,
+                off: range_start,
+                len: count,
+            },
+            cell_idx_map,
+        )
+    }
+
+    /// Finalize into the two segments. Tuples carry no relocs of
+    /// their own — every cross-segment pointer originates in the
+    /// entries segment.
+    fn finish(self) -> (Segment, Segment) {
+        (
+            Segment {
+                id: self.entries_id,
+                align: self.entry_layout.align,
+                bytes: self.entries,
+                relocs: self.entry_relocs,
+            },
+            Segment {
+                id: self.tuples_id,
+                align: self.tuple_layout.align,
+                bytes: self.tuples,
+                relocs: Vec::new(),
+            },
+        )
+    }
+}
+
 /// Lay out the per-(fn, param) and per-(fn, compound-result) record-
 /// info entries + their (name, cell-idx) tuples arena. Each
 /// `CellOp::RecordOf` in a plan contributes one entry; the entry's
@@ -1031,89 +1137,18 @@ pub(super) fn build_record_info_blob(
     entries_id: SymbolId,
     tuples_id: SymbolId,
 ) -> RecordInfoBlobs {
-    let mut entries: Vec<u8> = Vec::new();
-    let mut tuples: Vec<u8> = Vec::new();
-    let mut entry_relocs: Vec<Reloc> = Vec::new();
+    let mut builder =
+        RecordInfoBuilder::new(entry_layout, tuple_layout, entries_id, tuples_id, strings);
     let mut per_param_range: Vec<Vec<SymRef>> = Vec::with_capacity(per_func.len());
     let mut per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>> = Vec::with_capacity(per_func.len());
     let mut per_result_range: Vec<SymRef> = Vec::with_capacity(per_func.len());
     let mut per_result_cell_idx: Vec<Vec<Option<u32>>> = Vec::with_capacity(per_func.len());
 
-    /// Append entries for one plan's `CellOp::RecordOf` cells; returns
-    /// the contiguous range [`SymRef`] (into the entries segment) +
-    /// the per-cell side-table index map. Each entry's `fields.ptr`
-    /// slot gets a [`Reloc`] into the tuples segment.
-    fn append_plan(
-        plan: &LiftPlan,
-        strings: &RecordStringTable,
-        entries: &mut Vec<u8>,
-        tuples: &mut Vec<u8>,
-        entry_relocs: &mut Vec<Reloc>,
-        entry_layout: &RecordLayout,
-        tuple_layout: &RecordLayout,
-        entries_id: SymbolId,
-        tuples_id: SymbolId,
-    ) -> (SymRef, Vec<Option<u32>>) {
-        let range_start = entries.len() as u32;
-        let mut count: u32 = 0;
-        let mut cell_idx_map: Vec<Option<u32>> = vec![None; plan.cells.len()];
-        for (cell_pos, op) in plan.cells.iter().enumerate() {
-            let CellOp::RecordOf { type_name, fields } = op else {
-                continue;
-            };
-            let s = strings
-                .get(type_name.as_str())
-                .expect("register_record_strings registered every record type");
-            let side_idx = count;
-            cell_idx_map[cell_pos] = Some(side_idx);
-            count += 1;
-
-            let tuples_off = tuples.len() as u32;
-            let tuples_len = fields.len() as u32;
-            for (i, (_, child_cell_idx)) in fields.iter().enumerate() {
-                let tuple = RecordWriter::extend_zero(tuples, tuple_layout);
-                tuple.write_slice(tuples, RECORD_FIELD_TUPLE_NAME, s.field_names[i]);
-                tuple.write_i32(tuples, RECORD_FIELD_TUPLE_IDX, *child_cell_idx as i32);
-            }
-
-            let entry = RecordWriter::extend_zero(entries, entry_layout);
-            entry.write_slice(entries, INFO_TYPE_NAME, s.type_name);
-            entry.write_slice_reloc(
-                entries,
-                entry_relocs,
-                RECORD_INFO_FIELDS,
-                SymRef {
-                    target: tuples_id,
-                    off: tuples_off,
-                    len: tuples_len,
-                },
-            );
-        }
-        (
-            SymRef {
-                target: entries_id,
-                off: range_start,
-                len: count,
-            },
-            cell_idx_map,
-        )
-    }
-
     for fd in per_func {
         let mut params_ranges = Vec::with_capacity(fd.params.len());
         let mut params_cell_idx = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
-            let (range, cell_idx_map) = append_plan(
-                &p.plan,
-                strings,
-                &mut entries,
-                &mut tuples,
-                &mut entry_relocs,
-                entry_layout,
-                tuple_layout,
-                entries_id,
-                tuples_id,
-            );
+            let (range, cell_idx_map) = builder.append_plan(&p.plan);
             params_ranges.push(range);
             params_cell_idx.push(cell_idx_map);
         }
@@ -1122,36 +1157,17 @@ pub(super) fn build_record_info_blob(
 
         let (result_range, result_cell_idx_map) =
             match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
-                Some(c) => append_plan(
-                    &c.plan,
-                    strings,
-                    &mut entries,
-                    &mut tuples,
-                    &mut entry_relocs,
-                    entry_layout,
-                    tuple_layout,
-                    entries_id,
-                    tuples_id,
-                ),
+                Some(c) => builder.append_plan(&c.plan),
                 None => (SymRef::EMPTY, Vec::new()),
             };
         per_result_range.push(result_range);
         per_result_cell_idx.push(result_cell_idx_map);
     }
 
+    let (entries_seg, tuples_seg) = builder.finish();
     RecordInfoBlobs {
-        entries: Segment {
-            id: entries_id,
-            align: entry_layout.align,
-            bytes: entries,
-            relocs: entry_relocs,
-        },
-        tuples: Segment {
-            id: tuples_id,
-            align: tuple_layout.align,
-            bytes: tuples,
-            relocs: Vec::new(),
-        },
+        entries: entries_seg,
+        tuples: tuples_seg,
         per_param_range,
         per_param_cell_idx,
         per_result_range,
