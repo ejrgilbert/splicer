@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wirm = "4.0.4"
 #wirm = { path = "../../research/compilers/wirm" }
 wit-component = "0.247"
+globset = "0.4.18"
 
 [dev-dependencies]
 wat = "1"

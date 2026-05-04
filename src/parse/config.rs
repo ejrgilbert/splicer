@@ -1,4 +1,5 @@
 use anyhow::bail;
+use globset::Glob;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -185,8 +186,9 @@ impl Injection {
 pub enum SpliceRule {
     /// Inject middleware before a provider on an interface edge.
     Before {
-        /// The interface to match (e.g. `"wasi:http/handler@0.3.0"`).
-        interface: String,
+        /// Glob pattern for the interface to match (e.g.
+        /// `"wasi:http/*"` or `"*"`).
+        interface_glob: String,
         /// Optional provider name to scope the match.
         provider_name: Option<String>,
         /// Optional alias for the matched provider in the generated WAC.
@@ -196,8 +198,8 @@ pub enum SpliceRule {
     },
     /// Inject middleware between two specific components on an interface edge.
     Between {
-        /// The interface to match.
-        interface: String,
+        /// Glob pattern for the interface to match.
+        interface_glob: String,
         /// Name of the inner (provider-side) component.
         inner_name: String,
         /// Optional alias for the inner component.
@@ -280,6 +282,9 @@ impl ConfigFile {
             if interface.is_empty() {
                 bail!("rule {rule_num}: 'interface' must not be empty");
             }
+            Glob::new(interface).map_err(|e| {
+                anyhow::anyhow!("rule {rule_num}: invalid interface glob '{interface}': {e}")
+            })?;
 
             // before-specific checks.
             if let Some(before) = &rule.before {
@@ -397,7 +402,7 @@ impl ConfigFile {
                     }) = before
                     {
                         SpliceRule::Before {
-                            interface,
+                            interface_glob: interface,
                             provider_name: provider.as_ref().and_then(|p| p.name.clone()),
                             provider_alias: provider.and_then(|p| p.alias),
                             inject,
@@ -409,7 +414,7 @@ impl ConfigFile {
                     }) = between
                     {
                         SpliceRule::Between {
-                            interface,
+                            interface_glob: interface,
                             inner_name: inner.name,
                             inner_alias: inner.alias,
                             outer_name: outer.name,
@@ -471,7 +476,7 @@ rules:
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
         let SpliceRule::Before {
-            interface,
+            interface_glob: interface,
             provider_name,
             provider_alias,
             inject,
@@ -532,7 +537,7 @@ rules:
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
         let SpliceRule::Between {
-            interface,
+            interface_glob: interface,
             inner_name,
             inner_alias,
             outer_name,
