@@ -233,6 +233,25 @@ impl SpliceRule {
     }
 }
 
+/// Reject characters that could close out an `import ...;` clause
+/// and inject new WIT declarations when the value is interpolated
+/// into a synthesized adapter world. Permissive enough to admit
+/// fully-qualified use-paths (`pkg:ns/iface@ver`) and glob patterns
+/// (`wasi*`, `wasi:http/*`) alike — finer-grained shape checks
+/// happen downstream.
+fn validate_interface_name(rule_num: usize, interface: &str) -> anyhow::Result<()> {
+    let safe = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '-' | '_' | '.' | ':' | '/' | '@' | '*' | '?' | '[' | ']')
+    };
+    if let Some(bad) = interface.chars().find(|c| !safe(*c)) {
+        bail!(
+            "rule {rule_num}: 'interface' contains disallowed character {bad:?} in '{interface}'"
+        );
+    }
+    Ok(())
+}
+
 impl ConfigFile {
     /// Validate the parsed configuration, returning a descriptive error for any problem.
     ///
@@ -272,7 +291,10 @@ impl ConfigFile {
                 _ => {}
             }
 
-            // Interface name must be non-empty.
+            // Interface name must be non-empty and contain only
+            // characters that are safe to interpolate into a
+            // synthesized WIT `import ...;` clause. Permits both
+            // fully-qualified use-paths and glob patterns.
             let interface = if let Some(b) = &rule.before {
                 &b.interface
             } else if let Some(bw) = &rule.between {
@@ -283,6 +305,7 @@ impl ConfigFile {
             if interface.is_empty() {
                 bail!("rule {rule_num}: 'interface' must not be empty");
             }
+            validate_interface_name(rule_num, interface)?;
 
             // before-specific checks.
             if let Some(before) = &rule.before {
@@ -722,6 +745,53 @@ rules:
       - name: mw
 "#,
             "'interface' must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_interface_name_glob_pattern() {
+        // Glob patterns (e.g. `wasi*`, `wasi:http/*`) must pass
+        // config validation; downstream resolution does the matching.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: "wasi:http/*"
+    inject:
+      - name: mw
+"#;
+        parse_yaml(yaml).expect("glob pattern should parse cleanly");
+    }
+
+    #[test]
+    fn validate_interface_name_injection() {
+        // A semicolon and a second world declaration would inject an
+        // extra world if formatted into the synthesized adapter WIT.
+        assert_err(
+            "version: 1
+rules:
+  - before:
+      interface: \"foo;\\nworld evil { import bar/baz; }\\n\"
+    inject:
+      - name: mw
+",
+            "disallowed character",
+        );
+    }
+
+    #[test]
+    fn validate_interface_name_whitespace() {
+        // Whitespace inside the path opens an injection vector once
+        // interpolated; reject regardless of glob vs. canonical form.
+        assert_err(
+            "version: 1
+rules:
+  - before:
+      interface: \"wasi : http / handler\"
+    inject:
+      - name: mw
+",
+            "disallowed character",
         );
     }
 
