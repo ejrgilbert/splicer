@@ -670,7 +670,12 @@ fn lay_out_static_memory(
     let enum_info_id = symbols.alloc();
     let record_entries_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
-    let enum_info = build_enum_info_blob(&per_func, &enum_strings, schema, enum_info_id);
+    let enum_info = build_enum_info_blob(
+        &per_func,
+        &enum_strings,
+        &schema.enum_info_layout,
+        enum_info_id,
+    );
     let SideTableBlob {
         segment: enum_segment,
         per_param: enum_per_param_sym,
@@ -686,7 +691,8 @@ fn lay_out_static_memory(
     } = build_record_info_blob(
         &per_func,
         &record_strings,
-        schema,
+        &schema.record_info_layout,
+        &schema.record_field_tuple_layout,
         record_entries_id,
         record_tuples_id,
     );
