@@ -38,8 +38,6 @@ pub(super) const TREE_CELLS: &str = "cells";
 pub(super) const TREE_ENUM_INFOS: &str = "enum-infos";
 pub(super) const TREE_RECORD_INFOS: &str = "record-infos";
 pub(super) const TREE_ROOT: &str = "root";
-pub(super) const CALLID_IFACE: &str = "interface-name";
-pub(super) const CALLID_FN: &str = "function-name";
 /// Field name on `record record-info { … }` for the (name, cell-idx)
 /// tuple list.
 pub(super) const RECORD_INFO_FIELDS: &str = "fields";

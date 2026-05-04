@@ -4,7 +4,7 @@
 //! to provide regardless of which tier of adapter it backs.
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemorySection,
+    BlockType, CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemArg, MemorySection,
     MemoryType, Module, ValType,
 };
 use wit_parser::abi::{WasmSignature, WasmType};
@@ -293,3 +293,44 @@ pub(crate) fn option_payload_offset(sizes: &SizeAlign, payload_ty: &Type) -> u32
 /// being looked up via `SizeAlign`.
 pub(crate) const SLICE_PTR_OFFSET: u32 = 0;
 pub(crate) const SLICE_LEN_OFFSET: u32 = 4;
+
+// ─── `splicer:common/types.call-id` schema constants ──────────────
+//
+// Both tiers populate the canonical-ABI lowering of `call-id` into a
+// memory buffer the hook reads through `indirect_params`. Field names
+// must stay in lockstep with `wit/common/world.wit`'s `record call-id`
+// — `RecordLayout::offset_of` keys off these strings.
+
+pub(crate) const CALLID_IFACE: &str = "interface-name";
+pub(crate) const CALLID_FN: &str = "function-name";
+
+/// `(off, len)` pair into the static name/data blob a tier embeds in
+/// its dispatch core module. Typed (vs. raw `i32` pairs) so callers
+/// can't accidentally swap `off` / `len`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BlobSlice {
+    pub off: u32,
+    pub len: u32,
+}
+
+impl BlobSlice {
+    pub(crate) const EMPTY: BlobSlice = BlobSlice { off: 0, len: 0 };
+}
+
+/// Emit two `i32.store`s writing `slice.off` then `slice.len` into the
+/// canonical-ABI `(ptr, len)` pair starting at `base_ptr + field_off`.
+/// `align: 2` (= 4-byte) matches the canonical-ABI alignment for
+/// `string` / `list<T>`'s flat representation.
+pub(crate) fn emit_store_slice(f: &mut Function, base_ptr: i32, field_off: u32, slice: BlobSlice) {
+    let store = |f: &mut Function, sub_off: u32, value: i32| {
+        f.instructions().i32_const(base_ptr);
+        f.instructions().i32_const(value);
+        f.instructions().i32_store(MemArg {
+            offset: (field_off + sub_off) as u64,
+            align: 2,
+            memory_index: 0,
+        });
+    };
+    store(f, SLICE_PTR_OFFSET, slice.off as i32);
+    store(f, SLICE_LEN_OFFSET, slice.len as i32);
+}

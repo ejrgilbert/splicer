@@ -52,7 +52,7 @@ use wit_parser::{
     WasmImport, WorldKey,
 };
 
-use super::abi::emit::emit_memory_and_globals;
+use super::abi::emit::{emit_memory_and_globals, BlobSlice};
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use layout::lay_out_static_memory;
 use lift::{classify_func_params, classify_result_lift, ParamLift, ResultLift};
@@ -109,7 +109,7 @@ pub(super) fn build_tier2_adapter(
         .collect();
     let schema = compute_schema(&resolve, world_id, has_before, has_after)?;
 
-    let iface_name = blob::BlobSlice {
+    let iface_name = BlobSlice {
         off: 0,
         len: target_interface.len() as u32,
     };
@@ -174,7 +174,7 @@ fn build_dispatch_module(
     schema: &schema::SchemaLayouts,
     per_func: &[FuncDispatch],
     plan: layout::StaticDataPlan,
-    iface_name: blob::BlobSlice,
+    iface_name: BlobSlice,
 ) -> Vec<u8> {
     let mut module = Module::new();
     let type_idx = emit_type_section(

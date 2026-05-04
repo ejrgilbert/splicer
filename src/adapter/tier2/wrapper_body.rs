@@ -42,22 +42,21 @@
 //! call $handler
 //! ```
 
-use wasm_encoder::{CodeSection, Function, MemArg};
+use wasm_encoder::{CodeSection, Function};
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::Resolve;
 
 use super::super::abi::canon_async;
-use super::super::abi::emit::{emit_handler_call, emit_wrapper_return};
+use super::super::abi::emit::{
+    emit_handler_call, emit_store_slice, emit_wrapper_return, BlobSlice, CALLID_FN, CALLID_IFACE,
+};
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
-use super::blob::BlobSlice;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
     ResultEmitPlan, WrapperLocals,
 };
-use super::schema::{
-    SchemaLayouts, CALLID_FN, CALLID_IFACE, ON_CALL_ARGS, ON_CALL_CALL,
-};
+use super::schema::{SchemaLayouts, ON_CALL_ARGS, ON_CALL_CALL};
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
 
@@ -101,23 +100,6 @@ fn emit_populate_hook_params(
     emit_store_slice(f, base_ptr, iface_off, site.iface_name);
     emit_store_slice(f, base_ptr, fn_off, site.fn_name);
     emit_store_slice(f, base_ptr, args_off, site.args);
-}
-
-/// Emit two `i32.store`s writing `slice.off` then `slice.len` into
-/// the `(ptr, len)` pair starting at `base_ptr + field_off`.
-fn emit_store_slice(f: &mut Function, base_ptr: i32, field_off: u32, slice: BlobSlice) {
-    use super::super::abi::emit::{SLICE_LEN_OFFSET, SLICE_PTR_OFFSET};
-    let store = |f: &mut Function, sub_off: u32, value: i32| {
-        f.instructions().i32_const(base_ptr);
-        f.instructions().i32_const(value);
-        f.instructions().i32_store(MemArg {
-            offset: (field_off + sub_off) as u64,
-            align: 2,
-            memory_index: 0,
-        });
-    };
-    store(f, SLICE_PTR_OFFSET, slice.off as i32);
-    store(f, SLICE_LEN_OFFSET, slice.len as i32);
 }
 
 pub(super) fn emit_wrapper_function(

@@ -14,7 +14,7 @@
 //! This makes segment placement order commutative — no
 //! "patch-then-translate" sequence to get wrong.
 
-use super::super::abi::emit::{RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET};
+use super::super::abi::emit::{BlobSlice, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET};
 
 // Variant disc values for `option<T>`. Fixed by the canonical-ABI
 // spec, not by any WIT we control: wit-parser models `option<T>` as
@@ -184,15 +184,6 @@ fn patch_le_i32_in_segments(segs: &mut [(u32, Vec<u8>)], site: u32, value: i32) 
         }
     }
     panic!("reloc site {site} falls outside any placed segment");
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct BlobSlice {
-    pub off: u32,
-    pub len: u32,
-}
-impl BlobSlice {
-    pub(super) const EMPTY: BlobSlice = BlobSlice { off: 0, len: 0 };
 }
 
 /// Write a 32-bit little-endian integer into a byte buffer at `offset`.

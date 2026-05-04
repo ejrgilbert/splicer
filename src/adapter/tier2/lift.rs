@@ -33,11 +33,12 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
 use super::super::abi::emit::{
-    direct_return_type, wasm_type_to_val, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
+    direct_return_type, wasm_type_to_val, BlobSlice, RecordLayout, SLICE_LEN_OFFSET,
+    SLICE_PTR_OFFSET,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
-use super::blob::{BlobSlice, RecordWriter, Reloc, Segment, SymRef, SymbolId};
+use super::blob::{RecordWriter, Reloc, Segment, SymRef, SymbolId};
 use super::cells::CellLayout;
 use super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::{FuncClassified, FuncDispatch};

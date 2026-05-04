@@ -12,16 +12,17 @@
 use anyhow::{bail, Result};
 use wit_parser::Function as WitFunction;
 
+use super::super::abi::emit::{BlobSlice, CALLID_FN, CALLID_IFACE};
 use super::super::mem_layout::StaticLayout;
-use super::blob::{BlobSlice, RecordWriter, RelocPlan, SymbolBases};
+use super::blob::{RecordWriter, RelocPlan, SymbolBases};
 use super::lift::{
     build_enum_info_blob, build_record_info_blob, register_enum_strings, register_record_strings,
     ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout,
     SideTableBlob,
 };
 use super::schema::{
-    SchemaLayouts, CALLID_FN, CALLID_IFACE, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT,
-    TREE_CELLS, TREE_ENUM_INFOS, TREE_RECORD_INFOS, TREE_ROOT,
+    SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
+    TREE_ENUM_INFOS, TREE_RECORD_INFOS, TREE_ROOT,
 };
 use super::{AfterSetup, FuncClassified, FuncDispatch};
 
