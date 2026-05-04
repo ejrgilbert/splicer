@@ -142,6 +142,21 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
     if iface.functions.is_empty() {
         bail!("interface has no functions");
     }
+    // Async funcs whose flat params overflow MAX_FLAT_ASYNC_PARAMS need
+    // lower-to-memory; not yet implemented. Mirrors tier-1.
+    for (name, func) in &iface.functions {
+        if func.kind.is_async() {
+            let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
+            if import_sig.indirect_params {
+                bail!(
+                    "async function `{name}` has params that overflow \
+                     MAX_FLAT_ASYNC_PARAMS ({}) and require lower-to-memory; \
+                     not yet implemented",
+                    Resolve::MAX_FLAT_ASYNC_PARAMS
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -501,5 +516,42 @@ mod tests {
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
             .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// Async function whose params flatten to >`MAX_FLAT_ASYNC_PARAMS` (4)
+    /// canon-lowers with `indirect_params=true`, but tier-2's
+    /// `emit_handler_call` pushes flat params. Until `lower_to_memory`
+    /// lands, assert we bail rather than emit invalid wasm. Parallel to
+    /// tier-1's `test_adapter_async_indirect_params_bails`.
+    #[test]
+    fn async_indirect_params_bails() {
+        let wat = r#"(component
+            (type (;0;) (instance
+                (type (;0;) (func async
+                    (param "a" u32) (param "b" u32) (param "c" u32)
+                    (param "d" u32) (param "e" u32) (result u32)))
+                (export "many" (func (type 0)))
+            ))
+            (import "test:pkg/many@1.0.0" (instance (type 0)))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let err = build_tier2_adapter(
+            "test:pkg/many@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect_err("async indirect-params should bail until lower_to_memory lands");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not yet implemented") && msg.contains("MAX_FLAT_ASYNC_PARAMS"),
+            "bail should mention the limit and not-yet-implemented, got: {msg}"
+        );
     }
 }
