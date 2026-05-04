@@ -116,7 +116,7 @@ impl LiftKind {
     /// Classify a WIT param type. Infallible: every `Type` maps to a
     /// `LiftKind`. Codegen for un-wired variants `todo!()`s in
     /// `cells.rs` / `slot_count` when actually reached.
-    pub(super) fn classify(ty: &Type, resolve: &Resolve) -> LiftKind {
+    fn classify(ty: &Type, resolve: &Resolve) -> LiftKind {
         match ty {
             Type::Bool => LiftKind::Bool,
             Type::S8 | Type::S16 | Type::S32 => LiftKind::IntegerSignExt,
@@ -179,7 +179,7 @@ impl LiftKind {
 /// locals (absolute wasm-local indices), and any side-table info
 /// this cell contributes (e.g., enum-info / record-info entries).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum CellOp {
+enum CellOp {
     Bool {
         local: u32,
     },
@@ -224,7 +224,7 @@ pub(super) enum CellOp {
 /// emit-code phase; the side-table builder also walks `cells` to
 /// pull out per-kind side-table contributions.
 pub(super) struct LiftPlan {
-    pub cells: Vec<CellOp>,
+    cells: Vec<CellOp>,
     /// Total flat-slot locals consumed by the plan. Owners use this
     /// to assert that the absolute wasm-local indices baked into
     /// `cells` match the locals they intended to feed in.
@@ -238,7 +238,7 @@ impl LiftPlan {
 
     /// Iterator over every `CellOp::EnumCase` in the plan. Used by
     /// the side-table builder to register enum strings.
-    pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
+    fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
         self.cells.iter().filter_map(|op| match op {
             CellOp::EnumCase { info, .. } => Some(info),
             _ => None,
@@ -247,7 +247,7 @@ impl LiftPlan {
 
     /// Iterator over every `CellOp::RecordOf` in the plan. Used by
     /// the record-info side-table builder.
-    pub(super) fn record_ofs(&self) -> impl Iterator<Item = (&str, &[(String, u32)])> {
+    fn record_ofs(&self) -> impl Iterator<Item = (&str, &[(String, u32)])> {
         self.cells.iter().filter_map(|op| match op {
             CellOp::RecordOf { type_name, fields } => Some((type_name.as_str(), fields.as_slice())),
             _ => None,
@@ -708,7 +708,7 @@ fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo
 /// new kind: provide the `RecordLayout` for one entry record + the
 /// item-name field name, and pass an extractor closure that pulls
 /// this kind's info off `SideTableInfo`.
-pub(super) struct SideTableSpec<'a> {
+struct SideTableSpec<'a> {
     /// Layout of one entry record (e.g. `splicer:common/types.enum-info`).
     pub entry_layout: &'a RecordLayout,
     /// Field name on the entry record for the per-item identifier
@@ -747,7 +747,7 @@ pub(super) struct SideTableBlob {
 /// nominal cells of this kind). `from_result` reads the kind's
 /// info off the result's [`SideTableInfo`] (single info, since
 /// results today are single-cell).
-pub(super) fn register_side_table_strings(
+fn register_side_table_strings(
     per_func: &[FuncClassified],
     name_blob: &mut Vec<u8>,
     from_plan: impl Fn(&LiftPlan) -> Vec<&NamedListInfo>,
@@ -804,7 +804,7 @@ fn append_string(name_blob: &mut Vec<u8>, s: &str) -> BlobSlice {
 /// plan that contributes to this side table. (When records of enums
 /// land, this may yield multiple infos per plan — the builder
 /// handles that by appending one contiguous range per plan-cell.)
-pub(super) fn build_side_table_blob(
+fn build_side_table_blob(
     per_func: &[FuncClassified],
     strings: &StringTable,
     spec: &SideTableSpec<'_>,
@@ -1177,9 +1177,9 @@ pub(super) struct WrapperLocals {
     /// Waitable-set handle for the wait loop.
     pub ws: u32,
     /// i64 widening source for IntegerSignExt/ZeroExt.
-    pub ext64: u32,
+    ext64: u32,
     /// f64 promoted source for FloatingF32.
-    pub ext_f64: u32,
+    ext_f64: u32,
     /// Direct-return value when the export sig has a single flat
     /// result; `None` otherwise.
     pub result: Option<u32>,
@@ -1564,6 +1564,7 @@ mod tests {
     use wasm_encoder::{
         CodeSection, EntityType, FunctionSection, ImportSection, MemoryType, Module, TypeSection,
     };
+    use wit_parser::abi::WasmSignature;
 
     // ─── Fixture WIT + Resolve helpers ────────────────────────────
 
