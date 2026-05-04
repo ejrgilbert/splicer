@@ -191,7 +191,7 @@ fn build_dispatch_module(
         schema.after_hook.as_ref(),
         plan.event_ptr,
     );
-    emit_memory_and_globals(&mut module, plan.bump_start);
+    let globals = emit_memory_and_globals(&mut module, plan.bump_start);
     emit_export_section(
         &mut module,
         per_func,
@@ -204,8 +204,9 @@ fn build_dispatch_module(
         resolve,
         iface_name,
         hook_params_ptr: plan.hook_params_ptr as i32,
+        call_id_counter_global: globals.call_id_counter,
     };
-    emit_code_section(&mut module, per_func, &func_idx, &wrapper_ctx);
+    emit_code_section(&mut module, per_func, &func_idx, &wrapper_ctx, &globals);
     emit_data_section(&mut module, &plan.data_segments);
     module.finish()
 }

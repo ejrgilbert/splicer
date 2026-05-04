@@ -3,6 +3,7 @@
 //! that wit-component's `ComponentEncoder` requires the core module
 //! to provide regardless of which tier of adapter it backs.
 
+use anyhow::{anyhow, bail, Result};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, Function, GlobalSection, GlobalType, MemArg, MemorySection,
     MemoryType, Module, ValType,
@@ -23,21 +24,24 @@ pub(crate) const EXPORT_MEMORY: &str = "memory";
 pub(crate) const EXPORT_CABI_REALLOC: &str = "cabi_realloc";
 pub(crate) const EXPORT_INITIALIZE: &str = "_initialize";
 
-/// Index of the bump-pointer global emitted by [`emit_memory_and_globals`].
-/// Both `cabi_realloc` and any per-tier scratch allocator reference it.
-pub(crate) const BUMP_POINTER_GLOBAL: u32 = 0;
-
 /// Wasm linear-memory page size (64 KiB).
 pub(crate) const WASM_PAGE_SIZE: u32 = 64 * 1024;
 
-/// Memory section + bump-pointer global. `bump_start` is the byte
-/// offset where the bump allocator begins serving allocations; both
-/// tiers compute it from their pre-allocated scratch / name regions.
-/// The memory's initial size covers everything up to `bump_start`
-/// (rounded up to a page, with a one-page floor) so static data
-/// segments instantiated above the first page don't trap; runtime
-/// `cabi_realloc` calls grow the memory beyond that as needed.
-pub(crate) fn emit_memory_and_globals(module: &mut Module, bump_start: u32) {
+/// Indices of globals emitted by [`emit_memory_and_globals`].
+/// Adding a new global = one field here + one line in the emitter.
+pub(crate) struct GlobalIndices {
+    /// i32 bump pointer consumed by `cabi_realloc`.
+    pub bump: u32,
+    /// i64 monotonic per-instance counter; bumped once per call to
+    /// publish `call-id.id`. u64 won't realistically wrap.
+    pub call_id_counter: u32,
+}
+
+/// Memory section + globals (bump pointer + call-id counter).
+/// `bump_start` is where the bump allocator begins serving; initial
+/// memory covers everything below it (one-page floor) so static data
+/// segments don't trap, and `cabi_realloc` grows it from there.
+pub(crate) fn emit_memory_and_globals(module: &mut Module, bump_start: u32) -> GlobalIndices {
     let pages_for_static = bump_start.div_ceil(WASM_PAGE_SIZE).max(1);
     let mut memory = MemorySection::new();
     memory.memory(MemoryType {
@@ -50,15 +54,28 @@ pub(crate) fn emit_memory_and_globals(module: &mut Module, bump_start: u32) {
     module.section(&memory);
 
     let mut globals = GlobalSection::new();
-    globals.global(
-        GlobalType {
-            val_type: ValType::I32,
-            mutable: true,
-            shared: false,
-        },
-        &ConstExpr::i32_const(bump_start as i32),
-    );
+    let mut next_global: u32 = 0;
+    let mut alloc_global = |val_type: ValType, init: ConstExpr| {
+        globals.global(
+            GlobalType {
+                val_type,
+                mutable: true,
+                shared: false,
+            },
+            &init,
+        );
+        let idx = next_global;
+        next_global += 1;
+        idx
+    };
+    let bump = alloc_global(ValType::I32, ConstExpr::i32_const(bump_start as i32));
+    let call_id_counter = alloc_global(ValType::I64, ConstExpr::i64_const(0));
     module.section(&globals);
+
+    GlobalIndices {
+        bump,
+        call_id_counter,
+    }
 }
 
 /// Standard `cabi_realloc(old_ptr, old_size, align, new_size) -> new_ptr`
@@ -73,7 +90,7 @@ pub(crate) fn emit_memory_and_globals(module: &mut Module, bump_start: u32) {
 /// `align` is assumed to be a power of two (canonical-ABI guarantee).
 /// Pushes the function into `code`; caller decides where it lands in
 /// the function index space.
-pub(crate) fn emit_cabi_realloc(code: &mut CodeSection) {
+pub(crate) fn emit_cabi_realloc(code: &mut CodeSection, bump_global: u32) {
     const PARAM_COUNT: u32 = 4;
     const ALIGN_LOCAL: u32 = 2;
     const NEW_SIZE_LOCAL: u32 = 3;
@@ -83,7 +100,7 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection) {
     let mut f = Function::new_with_locals_types(locals.into_locals());
 
     // aligned = (global.bump + (align - 1)) & ~(align - 1)
-    f.instructions().global_get(BUMP_POINTER_GLOBAL);
+    f.instructions().global_get(bump_global);
     f.instructions().local_get(ALIGN_LOCAL);
     f.instructions().i32_const(1);
     f.instructions().i32_sub();
@@ -136,7 +153,7 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection) {
 
     // global.bump = new_bump
     f.instructions().local_get(new_bump);
-    f.instructions().global_set(BUMP_POINTER_GLOBAL);
+    f.instructions().global_set(bump_global);
 
     // return aligned
     f.instructions().local_get(aligned);
@@ -279,6 +296,37 @@ impl RecordLayout {
     }
 }
 
+/// Look up a typedef in `splicer:common/types` (e.g. `"call-id"`,
+/// `"field"`). The tier WITs travel with the common WIT in this repo,
+/// so any loaded version is canonical — version is ignored.
+pub(crate) fn find_common_typeid(resolve: &Resolve, type_name: &str) -> Result<TypeId> {
+    for (id, _) in resolve.interfaces.iter() {
+        let Some(qname) = resolve.id_of(id) else {
+            continue;
+        };
+        let unversioned = qname.split('@').next().unwrap_or(&qname);
+        if unversioned == "splicer:common/types" {
+            return resolve.interfaces[id]
+                .types
+                .get(type_name)
+                .copied()
+                .ok_or_else(|| anyhow!("`splicer:common/types` is missing typedef `{type_name}`"));
+        }
+    }
+    bail!("resolve has no `splicer:common/types` interface — was the common WIT loaded?")
+}
+
+/// [`RecordLayout`] for `splicer:common/types.call-id` — used by both
+/// tiers to lay out the canonical-ABI lowering of the hook params'
+/// call-id portion.
+pub(crate) fn call_id_record_layout(
+    resolve: &Resolve,
+    sizes: &SizeAlign,
+) -> Result<RecordLayout> {
+    let id = find_common_typeid(resolve, "call-id")?;
+    Ok(RecordLayout::for_record_typedef(sizes, resolve, id))
+}
+
 /// Byte offset of an `option<T>`'s payload area (i.e. the byte right
 /// after the 1-byte disc, padded up to `align(T)`).
 pub(crate) fn option_payload_offset(sizes: &SizeAlign, payload_ty: &Type) -> u32 {
@@ -294,19 +342,14 @@ pub(crate) fn option_payload_offset(sizes: &SizeAlign, payload_ty: &Type) -> u32
 pub(crate) const SLICE_PTR_OFFSET: u32 = 0;
 pub(crate) const SLICE_LEN_OFFSET: u32 = 4;
 
-// ─── `splicer:common/types.call-id` schema constants ──────────────
-//
-// Both tiers populate the canonical-ABI lowering of `call-id` into a
-// memory buffer the hook reads through `indirect_params`. Field names
-// must stay in lockstep with `wit/common/world.wit`'s `record call-id`
-// — `RecordLayout::offset_of` keys off these strings.
-
+// `splicer:common/types.call-id` field names — keys for
+// `RecordLayout::offset_of`. Must match `wit/common/world.wit`.
 pub(crate) const CALLID_IFACE: &str = "interface-name";
 pub(crate) const CALLID_FN: &str = "function-name";
+pub(crate) const CALLID_ID: &str = "id";
 
-/// `(off, len)` pair into the static name/data blob a tier embeds in
-/// its dispatch core module. Typed (vs. raw `i32` pairs) so callers
-/// can't accidentally swap `off` / `len`.
+/// Typed `(off, len)` pair into a tier's static blob. Avoids
+/// accidental ptr/len swaps.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BlobSlice {
     pub off: u32,
@@ -317,10 +360,8 @@ impl BlobSlice {
     pub(crate) const EMPTY: BlobSlice = BlobSlice { off: 0, len: 0 };
 }
 
-/// Emit two `i32.store`s writing `slice.off` then `slice.len` into the
-/// canonical-ABI `(ptr, len)` pair starting at `base_ptr + field_off`.
-/// `align: 2` (= 4-byte) matches the canonical-ABI alignment for
-/// `string` / `list<T>`'s flat representation.
+/// Store `slice.off` then `slice.len` as the canonical-ABI `(ptr, len)`
+/// pair at `base_ptr + field_off`.
 pub(crate) fn emit_store_slice(f: &mut Function, base_ptr: i32, field_off: u32, slice: BlobSlice) {
     let store = |f: &mut Function, sub_off: u32, value: i32| {
         f.instructions().i32_const(base_ptr);
@@ -333,4 +374,44 @@ pub(crate) fn emit_store_slice(f: &mut Function, base_ptr: i32, field_off: u32, 
     };
     store(f, SLICE_PTR_OFFSET, slice.off as i32);
     store(f, SLICE_LEN_OFFSET, slice.len as i32);
+}
+
+/// Store the i64 in `local` at `base_ptr + field_off` (8-byte align).
+pub(crate) fn emit_store_i64_local(f: &mut Function, base_ptr: i32, field_off: u32, local: u32) {
+    f.instructions().i32_const(base_ptr);
+    f.instructions().local_get(local);
+    f.instructions().i64_store(MemArg {
+        offset: field_off as u64,
+        align: 3,
+        memory_index: 0,
+    });
+}
+
+/// Bump the counter global and tee the new value into `id_local`.
+/// First id is `1`.
+pub(crate) fn emit_alloc_call_id(f: &mut Function, counter_global: u32, id_local: u32) {
+    f.instructions().global_get(counter_global);
+    f.instructions().i64_const(1);
+    f.instructions().i64_add();
+    f.instructions().local_tee(id_local);
+    f.instructions().global_set(counter_global);
+}
+
+/// Lower a `call-id` record into memory at `base_ptr + call_off`.
+/// Names are static blob slices; id comes from `id_local`.
+pub(crate) fn emit_populate_call_id(
+    f: &mut Function,
+    base_ptr: i32,
+    call_off: u32,
+    callid_layout: &RecordLayout,
+    iface_name: BlobSlice,
+    fn_name: BlobSlice,
+    id_local: u32,
+) {
+    let iface_off = call_off + callid_layout.offset_of(CALLID_IFACE);
+    let fn_off = call_off + callid_layout.offset_of(CALLID_FN);
+    let id_off = call_off + callid_layout.offset_of(CALLID_ID);
+    emit_store_slice(f, base_ptr, iface_off, iface_name);
+    emit_store_slice(f, base_ptr, fn_off, fn_name);
+    emit_store_i64_local(f, base_ptr, id_off, id_local);
 }

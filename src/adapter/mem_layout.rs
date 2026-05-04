@@ -107,14 +107,6 @@ impl MemoryLayoutBuilder {
         off
     }
 
-    /// Reserve `size` bytes for a per-func retptr scratch buffer,
-    /// aligned to the result type's natural alignment (sourced from
-    /// `wit_parser::SizeAlign`). Misaligned buffers trap on i64/f64
-    /// stores inside the canonical-ABI lowering.
-    pub fn alloc_retptr_scratch(&mut self, size: u32, align: u32) -> u32 {
-        self.alloc_aligned(size, align)
-    }
-
     /// Reserve the event-record slot written by `waitable-set.wait`.
     /// Size and alignment fall out of [`EVENT_RECORD_SHAPE`].
     pub fn alloc_event_slot(&mut self) -> u32 {
@@ -145,9 +137,11 @@ impl MemoryLayoutBuilder {
         self.alloc_aligned(size, align)
     }
 
-    /// Shared helper: align the post-name cursor up to `align`, then
-    /// reserve `size` bytes starting from that aligned offset.
-    fn alloc_aligned(&mut self, size: u32, align: u32) -> u32 {
+    /// Reserve `size` bytes aligned to `align`. Both numbers must come
+    /// from `wit_parser::SizeAlign` (retptr scratch, call-id buffer,
+    /// ...). Misaligned buffers trap on i64/f64 stores inside the
+    /// canonical-ABI lowering.
+    pub fn alloc_aligned(&mut self, size: u32, align: u32) -> u32 {
         let aligned = align_to_val(self.post_name_cursor, align);
         self.post_name_cursor = aligned + size;
         aligned

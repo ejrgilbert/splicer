@@ -42,13 +42,14 @@
 //! call $handler
 //! ```
 
-use wasm_encoder::{CodeSection, Function};
+use wasm_encoder::{CodeSection, Function, ValType};
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::Resolve;
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    emit_handler_call, emit_store_slice, emit_wrapper_return, BlobSlice, CALLID_FN, CALLID_IFACE,
+    emit_alloc_call_id, emit_handler_call, emit_populate_call_id, emit_store_i64_local,
+    emit_store_slice, emit_wrapper_return, BlobSlice, CALLID_ID,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
@@ -56,7 +57,7 @@ use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
     ResultEmitPlan, WrapperLocals,
 };
-use super::schema::{SchemaLayouts, ON_CALL_ARGS, ON_CALL_CALL};
+use super::schema::{SchemaLayouts, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL};
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
 
@@ -68,21 +69,21 @@ pub(super) struct WrapperCtx<'a> {
     pub(super) resolve: &'a Resolve,
     pub(super) iface_name: BlobSlice,
     pub(super) hook_params_ptr: i32,
+    /// i64 counter global; bumped once per call to publish `call-id.id`.
+    pub(super) call_id_counter_global: u32,
 }
 
 /// Per-call values written into the on-call indirect-params buffer.
-/// Slice-typed (vs. raw i32 pairs) so callers can't swap ptr/len.
 struct OnCallCallSite {
     iface_name: BlobSlice,
     fn_name: BlobSlice,
     args: BlobSlice,
+    /// Local holding this invocation's id (bumped at body top).
+    id_local: u32,
 }
 
-/// Emit wasm that writes the call-id (interface + function name
-/// pointers/lengths) and the per-call `list<field>` args pointer/
-/// length into the indirect-params buffer at `base_ptr`. Field
-/// offsets are looked up from the schema at use site so the
-/// canonical-ABI numbers stay schema-driven.
+/// Write the call-id record + per-call `list<field>` args pointer/len
+/// into the indirect-params buffer at `base_ptr`.
 fn emit_populate_hook_params(
     f: &mut Function,
     base_ptr: i32,
@@ -95,10 +96,15 @@ fn emit_populate_hook_params(
         .expect("emit_populate_hook_params called only when before-hook wired");
     let call_off = on_call.offset_of(ON_CALL_CALL);
     let args_off = on_call.offset_of(ON_CALL_ARGS);
-    let iface_off = call_off + schema.callid_layout.offset_of(CALLID_IFACE);
-    let fn_off = call_off + schema.callid_layout.offset_of(CALLID_FN);
-    emit_store_slice(f, base_ptr, iface_off, site.iface_name);
-    emit_store_slice(f, base_ptr, fn_off, site.fn_name);
+    emit_populate_call_id(
+        f,
+        base_ptr,
+        call_off,
+        &schema.callid_layout,
+        site.iface_name,
+        site.fn_name,
+        site.id_local,
+    );
     emit_store_slice(f, base_ptr, args_off, site.args);
 }
 
@@ -112,6 +118,7 @@ pub(super) fn emit_wrapper_function(
     let async_funcs = &func_idx.async_funcs;
     let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
+    let any_hook = func_idx.before_hook_idx.is_some() || func_idx.after_hook_idx.is_some();
     let mut locals = FunctionIndices::new(nparams);
     // `alloc_wrapper_locals` also drives the `lift_from_memory`
     // bindgen for compound result lifts (it may allocate further
@@ -129,8 +136,14 @@ pub(super) fn emit_wrapper_function(
             lift_from_memory(ctx.resolve, &mut bindgen, (), result_ty);
             bindgen.into_instructions()
         });
+    // i64 call-id local; only allocated when a hook is wired.
+    let id_local = any_hook.then(|| locals.alloc_local(ValType::I64));
 
     let mut f = Function::new_with_locals_types(locals.into_locals());
+
+    if let Some(id_local) = id_local {
+        emit_alloc_call_id(&mut f, ctx.call_id_counter_global, id_local);
+    }
 
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before_idx) = func_idx.before_hook_idx {
@@ -160,6 +173,7 @@ pub(super) fn emit_wrapper_function(
                     off: args_off,
                     len: nargs,
                 },
+                id_local: id_local.expect("before-hook wired → id_local allocated"),
             },
         );
         f.instructions().i32_const(ctx.hook_params_ptr);
@@ -228,6 +242,20 @@ pub(super) fn emit_wrapper_function(
                 ResultEmitPlan::None => {}
             }
         }
+        // iface/fn are prewritten by `build_after_params_blob`;
+        // only `call.id` changes per call, so patch it at runtime.
+        let after_layout = schema
+            .on_return_params_layout
+            .as_ref()
+            .expect("after-hook wired → on_return_params_layout populated");
+        let id_field_off =
+            after_layout.offset_of(ON_RET_CALL) + schema.callid_layout.offset_of(CALLID_ID);
+        emit_store_i64_local(
+            &mut f,
+            after.params_offset,
+            id_field_off,
+            id_local.expect("after-hook wired → id_local allocated"),
+        );
         f.instructions().i32_const(after.params_offset);
         canon_async::emit_call_and_wait(&mut f, after_idx, lcl.st, lcl.ws, async_funcs);
     }

@@ -6,13 +6,15 @@
 package splicer:common@0.1.0;
 
 interface types {
-    /// Identity of the wrapped call: the target interface
-    /// (fully-qualified, e.g. `"wasi:http/handler@0.3.0"`) plus the
-    /// canonical-ABI function name (e.g. `"handle"`,
-    /// `"[method]request.body"`, `"[constructor]request"`).
+    /// Identity of the wrapped call: target interface
+    /// (e.g. `"wasi:http/handler@0.3.0"`), canonical-ABI function
+    /// name (e.g. `"handle"`, `"[method]request.body"`), and a
+    /// monotonic per-instance id for correlating `on-call` /
+    /// `on-return` of the same invocation.
     record call-id {
         interface-name: string,
         function-name: string,
+        id: u64,
     }
 
     // ── Lifted-value representation ───────────────────────────────

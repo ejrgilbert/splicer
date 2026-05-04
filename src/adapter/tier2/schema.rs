@@ -11,9 +11,11 @@
 
 use anyhow::{anyhow, bail, Result};
 use wit_parser::abi::{AbiVariant, WasmSignature};
-use wit_parser::{Resolve, SizeAlign, Type, TypeId, WasmImport, WorldId, WorldItem};
+use wit_parser::{Resolve, SizeAlign, Type, WasmImport, WorldId, WorldItem};
 
-use super::super::abi::emit::{option_payload_offset, RecordLayout};
+use super::super::abi::emit::{
+    call_id_record_layout, find_common_typeid, option_payload_offset, RecordLayout,
+};
 use super::super::resolve::hook_callback_mangling;
 use super::cells::CellLayout;
 
@@ -26,7 +28,6 @@ use super::cells::CellLayout;
 // Typedef names in `splicer:common/types`.
 const TYPEDEF_FIELD: &str = "field";
 const TYPEDEF_FIELD_TREE: &str = "field-tree";
-const TYPEDEF_CALL_ID: &str = "call-id";
 const TYPEDEF_CELL: &str = "cell";
 const TYPEDEF_ENUM_INFO: &str = "enum-info";
 const TYPEDEF_RECORD_INFO: &str = "record-info";
@@ -103,14 +104,13 @@ pub(super) fn compute_schema(
     let field_ty_id = find_common_typeid(resolve, TYPEDEF_FIELD)?;
     let field_tree_ty_id = find_common_typeid(resolve, TYPEDEF_FIELD_TREE)?;
     let cell_ty_id = find_common_typeid(resolve, TYPEDEF_CELL)?;
-    let call_id_ty = find_common_typeid(resolve, TYPEDEF_CALL_ID)?;
     let enum_info_ty = find_common_typeid(resolve, TYPEDEF_ENUM_INFO)?;
     let record_info_ty = find_common_typeid(resolve, TYPEDEF_RECORD_INFO)?;
 
     let field_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_ty_id);
     let tree_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_tree_ty_id);
     let cell_layout = CellLayout::from_resolve(&size_align, resolve, cell_ty_id);
-    let callid_layout = RecordLayout::for_record_typedef(&size_align, resolve, call_id_ty);
+    let callid_layout = call_id_record_layout(resolve, &size_align)?;
     let enum_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, enum_info_ty);
     let record_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, record_info_ty);
     // The anonymous `tuple<string, u32>` element of `record-info.fields`
@@ -155,28 +155,6 @@ pub(super) fn compute_schema(
         on_return_params_layout,
         option_payload_off,
     })
-}
-
-/// Look up a typedef in `splicer:common/types` by name (e.g.
-/// `"field"`, `"field-tree"`, `"call-id"`). The tier WITs and the
-/// common WIT travel together in this repo, so whichever version
-/// got loaded is the canonical one — version is ignored.
-fn find_common_typeid(resolve: &Resolve, type_name: &str) -> Result<TypeId> {
-    for (id, _) in resolve.interfaces.iter() {
-        let qname = match resolve.id_of(id) {
-            Some(s) => s,
-            None => continue,
-        };
-        let unversioned = qname.split('@').next().unwrap_or(&qname);
-        if unversioned == "splicer:common/types" {
-            return resolve.interfaces[id]
-                .types
-                .get(type_name)
-                .copied()
-                .ok_or_else(|| anyhow!("`splicer:common/types` is missing typedef `{type_name}`"));
-        }
-    }
-    bail!("resolve has no `splicer:common/types` interface — was the common WIT loaded?")
 }
 
 fn find_on_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {

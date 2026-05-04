@@ -11,8 +11,8 @@ use wit_parser::abi::WasmSignature;
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    emit_cabi_realloc, empty_function, val_types, EXPORT_CABI_REALLOC, EXPORT_INITIALIZE,
-    EXPORT_MEMORY,
+    emit_cabi_realloc, empty_function, val_types, GlobalIndices, EXPORT_CABI_REALLOC,
+    EXPORT_INITIALIZE, EXPORT_MEMORY,
 };
 use super::schema::HookImport;
 use super::wrapper_body::{emit_wrapper_function, WrapperCtx};
@@ -258,6 +258,7 @@ pub(super) fn emit_code_section(
     per_func: &[FuncDispatch],
     func_idx: &FuncIndices,
     ctx: &WrapperCtx<'_>,
+    globals: &GlobalIndices,
 ) {
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
@@ -269,7 +270,7 @@ pub(super) fn emit_code_section(
             code.function(&empty_function());
         }
     }
-    emit_cabi_realloc(&mut code);
+    emit_cabi_realloc(&mut code, globals.bump);
     module.section(&code);
 }
 
