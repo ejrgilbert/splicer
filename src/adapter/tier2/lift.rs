@@ -160,9 +160,16 @@ impl LiftKind {
 //
 // A LiftPlan describes one (param | result) lift end-to-end:
 // every cell that needs to be written, in allocation order, with
-// each cell bound to its source wasm locals (concrete absolute
-// indices) and any nominal-cell side-table info it carries.
-// `cells[0]` is the root that the field-tree's `root` field points at.
+// each cell bound to its source flat slots (plan-relative, 0-based)
+// and any nominal-cell side-table info it carries. `cells[0]` is
+// the root that the field-tree's `root` field points at.
+//
+// Cells reference flat slots, NOT absolute wasm-local indices —
+// the emit phase supplies a `local_base: u32` and looks up
+// `local_base + cell.flat_slot` per cell. This keeps the same plan
+// usable for both side-table builders (which read structural fields
+// only) and the emit phase, regardless of where the plan's locals
+// end up in the wasm function.
 //
 // Why a flat Vec instead of a nested IR: cell indices in
 // nominal-cell side-table entries (e.g., a record's `fields`
@@ -174,39 +181,41 @@ impl LiftKind {
 // [`docs/tiers/lift-codegen.md`](../../../docs/tiers/lift-codegen.md).
 
 /// One cell to write at a known cell-array index. Each variant
-/// captures the cell's runtime-disc semantics, its source wasm
-/// locals (absolute wasm-local indices), and any side-table info
-/// this cell contributes (e.g., enum-info / record-info entries).
+/// captures the cell's runtime-disc semantics, its source flat
+/// slots (plan-relative, 0-based — the emit phase adds a
+/// `local_base` to recover the absolute wasm-local index), and any
+/// side-table info this cell contributes (e.g., enum-info /
+/// record-info entries).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CellOp {
     Bool {
-        local: u32,
+        flat_slot: u32,
     },
     IntegerSignExt {
-        local: u32,
+        flat_slot: u32,
     },
     IntegerZeroExt {
-        local: u32,
+        flat_slot: u32,
     },
     Integer64 {
-        local: u32,
+        flat_slot: u32,
     },
     FloatingF32 {
-        local: u32,
+        flat_slot: u32,
     },
     FloatingF64 {
-        local: u32,
+        flat_slot: u32,
     },
     Text {
-        ptr: u32,
-        len: u32,
+        ptr_slot: u32,
+        len_slot: u32,
     },
     Bytes {
-        ptr: u32,
-        len: u32,
+        ptr_slot: u32,
+        len_slot: u32,
     },
     EnumCase {
-        local: u32,
+        flat_slot: u32,
         info: NamedListInfo,
     },
     RecordOf {
@@ -224,9 +233,10 @@ enum CellOp {
 /// pull out per-kind side-table contributions.
 pub(super) struct LiftPlan {
     cells: Vec<CellOp>,
-    /// Total flat-slot locals consumed by the plan. Owners use this
-    /// to assert that the absolute wasm-local indices baked into
-    /// `cells` match the locals they intended to feed in.
+    /// Total flat-slot locals consumed by the plan. Cells reference
+    /// flat slots in `0..flat_slot_count`; the emit phase adds the
+    /// caller-supplied `local_base` to recover absolute wasm-local
+    /// indices.
     pub flat_slot_count: u32,
 }
 
@@ -256,32 +266,30 @@ impl LiftPlan {
 
 // ─── Lift plan builder ────────────────────────────────────────────
 
-/// Allocates cells + flat-slot locals while walking a WIT type.
-/// The "parent before children" recursion in [`Self::push`] is what
-/// makes child cell indices observable from the parent's side-table
-/// info (a child's index is just `cells.len()` after its sub-call
-/// has appended).
+/// Allocates cells + plan-relative flat-slot positions while walking
+/// a WIT type. The "parent before children" recursion in
+/// [`Self::push`] is what makes child cell indices observable from
+/// the parent's side-table info (a child's index is just
+/// `cells.len()` after its sub-call has appended).
 ///
-/// Caller provides `local_base` — the absolute wasm-local index that
-/// the plan's first flat slot occupies. Cells receive absolute indices
-/// `local_base..local_base + flat_slot_count` baked in at build time;
-/// the emit phase walks the plan with no further base resolution.
+/// Plans are local-base-independent: cells reference flat slots in
+/// `0..flat_slot_count`. The emit phase adds the caller-supplied
+/// `local_base` to recover the absolute wasm-local index — for
+/// params that's the cumulative slot cursor across preceding params,
+/// for compound results that's the first synth local allocated by
+/// `alloc_wrapper_locals`.
 struct LiftPlanBuilder {
     cells: Vec<CellOp>,
-    /// Absolute wasm-local index the builder started from. Used only
-    /// to compute `flat_slot_count` at `into_plan` time.
-    local_base: u32,
-    /// Next available absolute wasm-local index. Incremented by
-    /// `bump_local` as cells consume flat slots.
-    next_local: u32,
+    /// Next available plan-relative flat-slot position. Incremented
+    /// by `bump_flat_slot` as cells consume flat slots.
+    next_flat_slot: u32,
 }
 
 impl LiftPlanBuilder {
-    fn new(local_base: u32) -> Self {
+    fn new() -> Self {
         Self {
             cells: Vec::new(),
-            local_base,
-            next_local: local_base,
+            next_flat_slot: 0,
         }
     }
 
@@ -290,44 +298,44 @@ impl LiftPlanBuilder {
         let root_idx = self.cells.len() as u32;
         match LiftKind::classify(ty, resolve) {
             LiftKind::Bool => {
-                let local = self.bump_local();
-                self.cells.push(CellOp::Bool { local });
+                let flat_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::Bool { flat_slot });
             }
             LiftKind::IntegerSignExt => {
-                let local = self.bump_local();
-                self.cells.push(CellOp::IntegerSignExt { local });
+                let flat_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::IntegerSignExt { flat_slot });
             }
             LiftKind::IntegerZeroExt => {
-                let local = self.bump_local();
-                self.cells.push(CellOp::IntegerZeroExt { local });
+                let flat_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::IntegerZeroExt { flat_slot });
             }
             LiftKind::Integer64 => {
-                let local = self.bump_local();
-                self.cells.push(CellOp::Integer64 { local });
+                let flat_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::Integer64 { flat_slot });
             }
             LiftKind::FloatingF32 => {
-                let local = self.bump_local();
-                self.cells.push(CellOp::FloatingF32 { local });
+                let flat_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::FloatingF32 { flat_slot });
             }
             LiftKind::FloatingF64 => {
-                let local = self.bump_local();
-                self.cells.push(CellOp::FloatingF64 { local });
+                let flat_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::FloatingF64 { flat_slot });
             }
             LiftKind::Text => {
-                let ptr = self.bump_local();
-                let len = self.bump_local();
-                self.cells.push(CellOp::Text { ptr, len });
+                let ptr_slot = self.bump_flat_slot();
+                let len_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::Text { ptr_slot, len_slot });
             }
             LiftKind::Bytes => {
-                let ptr = self.bump_local();
-                let len = self.bump_local();
-                self.cells.push(CellOp::Bytes { ptr, len });
+                let ptr_slot = self.bump_flat_slot();
+                let len_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::Bytes { ptr_slot, len_slot });
             }
             LiftKind::Enum => {
                 let info = enum_lift_info_for_type(ty, resolve)
                     .expect("LiftKind::Enum classify implies enum-info available");
-                let local = self.bump_local();
-                self.cells.push(CellOp::EnumCase { local, info });
+                let flat_slot = self.bump_flat_slot();
+                self.cells.push(CellOp::EnumCase { flat_slot, info });
             }
             LiftKind::Record => self.push_record(ty, resolve, root_idx),
             other => todo!("plan-builder for un-wired LiftKind {other:?}"),
@@ -335,10 +343,10 @@ impl LiftPlanBuilder {
         root_idx
     }
 
-    fn bump_local(&mut self) -> u32 {
-        let r = self.next_local;
-        self.next_local = self
-            .next_local
+    fn bump_flat_slot(&mut self) -> u32 {
+        let r = self.next_flat_slot;
+        self.next_flat_slot = self
+            .next_flat_slot
             .checked_add(1)
             // Tripwire; realistic blow-ups are caught by `check_layout_budget`.
             .expect("LiftPlanBuilder flat-slot counter overflowed u32");
@@ -379,7 +387,7 @@ impl LiftPlanBuilder {
     fn into_plan(self) -> LiftPlan {
         LiftPlan {
             cells: self.cells,
-            flat_slot_count: self.next_local - self.local_base,
+            flat_slot_count: self.next_flat_slot,
         }
     }
 }
@@ -431,20 +439,17 @@ pub(super) enum ResultSource {
 /// table indices are all layout-phase outputs — they live on
 /// [`ResultSourceLayout::Compound`], not here.
 ///
-/// `plan`'s cells carry placeholder local indices (built with
-/// `local_base = 0`) — only the structural fields (cell variants,
-/// record-of `fields`, enum infos) are read by the side-table
-/// builders. The emit phase rebuilds a fresh plan with the actual
-/// synth-local base baked into the cells; the rebuilt plan lives on
-/// [`ResultEmitPlan::Compound::plan`].
+/// `plan`'s cells carry plan-relative flat-slot positions; the emit
+/// phase supplies a `local_base` (= `synth_locals[0]`) at
+/// [`emit_lift_plan`] call time. The same plan flows unchanged
+/// through both the side-table builders (which read structural
+/// fields only) and the emit phase.
 pub(super) struct CompoundResult {
     /// WIT type of the result value — kept around so the wrapper
-    /// body can drive `lift_from_memory` through `WasmEncoderBindgen`,
-    /// and so the emit phase can rebuild the cell plan with the
-    /// correct synth-local base.
+    /// body can drive `lift_from_memory` through `WasmEncoderBindgen`.
     pub ty: Type,
-    /// Structural cell plan. Local indices are placeholder
-    /// (`local_base = 0`); only cell structure is consumed.
+    /// Structural cell plan with plan-relative flat slots; the emit
+    /// phase adds the synth-local base when walking it.
     pub plan: LiftPlan,
 }
 
@@ -459,11 +464,11 @@ impl ResultLift {
     }
 }
 
-/// Classify-time per-parameter lift recipe. The plan's cells already
-/// carry absolute wasm-local indices (the plan-builder bakes them in
-/// from each param's cumulative flat-slot cursor). Cells-slab offset
-/// + per-cell record-info indices live on the post-layout
-/// [`ParamLayout`].
+/// Classify-time per-parameter lift recipe. The plan's cells carry
+/// plan-relative flat-slot positions; the emit phase supplies the
+/// `local_base` (cumulative slot cursor across preceding params) at
+/// [`emit_lift_plan`] call time. Cells-slab offset + per-cell
+/// record-info indices live on the post-layout [`ParamLayout`].
 pub(super) struct ParamLift {
     pub name: BlobSlice,
     pub plan: LiftPlan,
@@ -550,27 +555,24 @@ struct NamedListInfo {
 
 // ─── Classifiers ──────────────────────────────────────────────────
 
-/// Build a [`LiftPlan`] for every WIT param of `func`. `slot_cursor`
-/// threads across params, seeding each param's plan with the absolute
-/// wasm-local index of its first flat slot — the cumulative flat-slot
-/// count of preceding params. Cells in the resulting plan carry their
-/// final wasm-local indices baked in.
+/// Build a [`LiftPlan`] for every WIT param of `func`. Each plan's
+/// cells carry plan-relative flat-slot positions in
+/// `0..plan.flat_slot_count`; the emit phase threads a cumulative
+/// `local_base` across params to recover absolute wasm-local indices.
 pub(super) fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
     name_blob: &mut Vec<u8>,
 ) -> Vec<ParamLift> {
     let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
-    let mut slot_cursor: u32 = 0;
     for param in &func.params {
-        let pname = &param.name;
-        let name = append_param_name(name_blob, pname);
-        let mut builder = LiftPlanBuilder::new(slot_cursor);
+        let name = append_param_name(name_blob, &param.name);
+        let mut builder = LiftPlanBuilder::new();
         builder.push(&param.ty, resolve);
-        let plan = builder.into_plan();
-        let consumed = plan.flat_slot_count;
-        params_lift.push(ParamLift { name, plan });
-        slot_cursor += consumed;
+        params_lift.push(ParamLift {
+            name,
+            plan: builder.into_plan(),
+        });
     }
     params_lift
 }
@@ -606,13 +608,12 @@ pub(super) fn classify_result_lift(
     let kind = LiftKind::classify(ty, resolve);
 
     // Compound kinds (currently just Record) drive a LiftPlan over
-    // retptr-loaded flat slots. Classify-time we build a structural
-    // plan with `local_base = 0` (placeholder); only the cell-tree
-    // structure is read by the side-table builders. The emit phase
-    // rebuilds a fresh plan with the actual synth-local base baked
-    // into the cells (see `alloc_wrapper_locals`).
+    // retptr-loaded flat slots. The plan's cells carry plan-relative
+    // flat-slot positions; the emit phase supplies `local_base =
+    // synth_locals[0]` (see `alloc_wrapper_locals`) so the same plan
+    // serves both the side-table builders and codegen.
     if matches!(kind, LiftKind::Record) {
-        let mut builder = LiftPlanBuilder::new(0);
+        let mut builder = LiftPlanBuilder::new();
         builder.push(ty, resolve);
         let plan = builder.into_plan();
         return Some(ResultLift {
@@ -1230,19 +1231,19 @@ pub(super) enum ResultEmitPlan<'a> {
         ptr_local: u32,
         len_local: u32,
     },
-    /// Compound result: emit-time cell plan + layout offsets +
+    /// Compound result: classify-time cell plan + layout offsets +
     /// emit-time locals/loads. `addr_local` drives the
     /// `lift_from_memory`-built `loads` sequence (which pushes
     /// canonical-ABI flat values onto the wasm stack); the wrapper
     /// then `local.set`s those into `synth_locals` (in reverse) for
-    /// the plan walker. The owned `plan` is rebuilt here with absolute
-    /// wasm-local indices (= `synth_locals[i]`) baked into each cell —
-    /// the classify-time [`CompoundResult::plan`] only carries
-    /// placeholder indices and is consumed by the side-table builders.
+    /// the plan walker. The plan is borrowed straight from
+    /// [`CompoundResult::plan`] — its cells hold plan-relative flat
+    /// slots, and the emit phase pairs them with `local_base =
+    /// synth_locals[0]` to recover absolute wasm-local indices.
     /// `record_info_cell_idx` is the layout-phase per-cell `RecordOf`
     /// side-table index map (borrowed off [`ResultSourceLayout::Compound`]).
     Compound {
-        plan: LiftPlan,
+        plan: &'a LiftPlan,
         retptr_offset: i32,
         addr_local: u32,
         synth_locals: Vec<u32>,
@@ -1316,28 +1317,19 @@ pub(super) fn alloc_wrapper_locals<'a>(
                     compound.plan.flat_slot_count as usize,
                     "canonical-ABI flat count (emit) must match classify-time plan"
                 );
+                // Synth locals are allocated contiguously; the emit
+                // phase passes `synth_locals[0]` to `emit_lift_plan`
+                // as the plan's `local_base`, so cell N's flat slot
+                // resolves to `synth_locals[0] + N = synth_locals[N]`.
                 let synth_locals: Vec<u32> = flat
                     .into_iter()
                     .map(|wt| locals.alloc_local(wasm_type_to_val(wt)))
                     .collect();
-                // Rebuild the cell plan with absolute wasm-local
-                // indices baked in: `local_base = synth_locals[0]`
-                // means cell N's local = synth_locals[0] + N, which
-                // matches our contiguous synth-local allocation.
-                let synth_base = synth_locals[0];
-                let mut builder = LiftPlanBuilder::new(synth_base);
-                builder.push(&compound.ty, resolve);
-                let plan = builder.into_plan();
-                assert_eq!(
-                    plan.cells.len(),
-                    compound.plan.cells.len(),
-                    "rebuilt emit-time plan must have same cell count as classify-time plan"
-                );
                 let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, locals);
                 lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
                 let loads = bindgen.into_instructions();
                 ResultEmitPlan::Compound {
-                    plan,
+                    plan: &compound.plan,
                     retptr_offset: *retptr_offset,
                     addr_local,
                     synth_locals,
@@ -1365,15 +1357,17 @@ pub(super) fn alloc_wrapper_locals<'a>(
 /// Emit the wasm that lifts one plan into its cells slab. Walks
 /// `plan.cells` in allocation order and, for each cell, sets
 /// `lcl.addr` to that cell's absolute address (`cells_offset + i *
-/// cell_size`) and dispatches on the cell's variant. The cells
-/// already carry their absolute wasm-local indices; no further base
-/// resolution happens here.
+/// cell_size`) and dispatches on the cell's variant. Cells reference
+/// plan-relative flat slots; `local_base` is added per-cell to
+/// recover the absolute wasm-local index — params pass the cumulative
+/// slot cursor, compound results pass `synth_locals[0]`.
 pub(super) fn emit_lift_plan(
     f: &mut Function,
     cell_layout: &CellLayout,
     cells_offset: u32,
     plan: &LiftPlan,
     record_info_indices: &[Option<u32>],
+    local_base: u32,
     lcl: &WrapperLocals,
 ) {
     assert_eq!(
@@ -1385,54 +1379,67 @@ pub(super) fn emit_lift_plan(
         let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
         f.instructions().i32_const(cell_addr as i32);
         f.instructions().local_set(lcl.addr);
-        emit_cell_op(f, cell_layout, op, record_info_indices[cell_idx], lcl);
+        emit_cell_op(
+            f,
+            cell_layout,
+            op,
+            record_info_indices[cell_idx],
+            local_base,
+            lcl,
+        );
     }
 }
 
 /// Emit one cell's worth of wasm at the address held in `lcl.addr`.
 ///
-/// `record_info_idx` is the side-table index for `CellOp::RecordOf`
-/// cells (set by the layout phase via the static record-info builder
-/// — adapter-build-time-known, emitted as `i32.const`). Other cells
-/// don't read it.
+/// `local_base` is added to each cell's plan-relative flat-slot
+/// position to recover its absolute wasm-local index. `record_info_idx`
+/// is the side-table index for `CellOp::RecordOf` cells (set by the
+/// layout phase via the static record-info builder — adapter-build-
+/// time-known, emitted as `i32.const`). Other cells don't read it.
 fn emit_cell_op(
     f: &mut Function,
     cell_layout: &CellLayout,
     op: &CellOp,
     record_info_idx: Option<u32>,
+    local_base: u32,
     lcl: &WrapperLocals,
 ) {
     let addr = lcl.addr;
     match op {
-        CellOp::Bool { local } => cell_layout.emit_bool(f, addr, *local),
-        CellOp::IntegerSignExt { local } => {
-            f.instructions().local_get(*local);
+        CellOp::Bool { flat_slot } => cell_layout.emit_bool(f, addr, local_base + *flat_slot),
+        CellOp::IntegerSignExt { flat_slot } => {
+            f.instructions().local_get(local_base + *flat_slot);
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        CellOp::IntegerZeroExt { local } => {
-            f.instructions().local_get(*local);
+        CellOp::IntegerZeroExt { flat_slot } => {
+            f.instructions().local_get(local_base + *flat_slot);
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        CellOp::Integer64 { local } => cell_layout.emit_integer(f, addr, *local),
-        CellOp::FloatingF32 { local } => {
-            f.instructions().local_get(*local);
+        CellOp::Integer64 { flat_slot } => {
+            cell_layout.emit_integer(f, addr, local_base + *flat_slot)
+        }
+        CellOp::FloatingF32 { flat_slot } => {
+            f.instructions().local_get(local_base + *flat_slot);
             f.instructions().f64_promote_f32();
             f.instructions().local_set(lcl.ext_f64);
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
-        CellOp::FloatingF64 { local } => cell_layout.emit_floating(f, addr, *local),
-        CellOp::Text { ptr, len } => {
-            cell_layout.emit_text(f, addr, *ptr, *len);
+        CellOp::FloatingF64 { flat_slot } => {
+            cell_layout.emit_floating(f, addr, local_base + *flat_slot)
         }
-        CellOp::Bytes { ptr, len } => {
-            cell_layout.emit_bytes(f, addr, *ptr, *len);
+        CellOp::Text { ptr_slot, len_slot } => {
+            cell_layout.emit_text(f, addr, local_base + *ptr_slot, local_base + *len_slot);
         }
-        CellOp::EnumCase { local, .. } => {
-            cell_layout.emit_enum_case(f, addr, *local);
+        CellOp::Bytes { ptr_slot, len_slot } => {
+            cell_layout.emit_bytes(f, addr, local_base + *ptr_slot, local_base + *len_slot);
+        }
+        CellOp::EnumCase { flat_slot, .. } => {
+            cell_layout.emit_enum_case(f, addr, local_base + *flat_slot);
         }
         CellOp::RecordOf { .. } => {
             let idx = record_info_idx
@@ -1545,8 +1552,9 @@ pub(super) fn emit_lift_result(
 ///
 /// After this returns, the synthetic locals at `synth_locals[0]..
 /// synth_locals[N]` hold the result's flat values in canonical-ABI
-/// order, ready for [`emit_lift_plan`] to walk the cell plan whose
-/// cells already reference these absolute synth-local indices.
+/// order, ready for [`emit_lift_plan`] (called with `local_base =
+/// synth_locals[0]`) to walk the cell plan and recover the absolute
+/// synth-local indices.
 pub(super) fn emit_lift_compound_prefix(
     f: &mut Function,
     plan_flat_slot_count: u32,
@@ -1645,15 +1653,16 @@ mod tests {
 
     // ─── Plan-builder + assertion fixture constructors ────────────
 
-    /// Run the plan builder over `ty` starting at `local_base`.
-    fn plan_for(ty: &Type, resolve: &Resolve, local_base: u32) -> LiftPlan {
-        let mut b = LiftPlanBuilder::new(local_base);
+    /// Run the plan builder over `ty`. Plans carry plan-relative flat
+    /// slots; the emit phase supplies `local_base` separately.
+    fn plan_for(ty: &Type, resolve: &Resolve) -> LiftPlan {
+        let mut b = LiftPlanBuilder::new();
         b.push(ty, resolve);
         b.into_plan()
     }
 
     fn plan_for_named(name: &str, resolve: &Resolve) -> LiftPlan {
-        plan_for(&type_named(resolve, name), resolve, 0)
+        plan_for(&type_named(resolve, name), resolve)
     }
 
     /// `NamedListInfo { type_name, item_names }` shorthand for fixtures.
@@ -1686,27 +1695,21 @@ mod tests {
         }
     }
 
-    fn make_param(ty: &Type, resolve: &Resolve, base: u32) -> ParamLift {
+    fn make_param(ty: &Type, resolve: &Resolve) -> ParamLift {
         ParamLift {
             name: BlobSlice::EMPTY,
-            plan: plan_for(ty, resolve, base),
+            plan: plan_for(ty, resolve),
         }
     }
 
     /// Build a [`FuncClassified`] whose params are the WIT-named types
-    /// in `param_names`. Slot cursor threads automatically across
-    /// params. Other fields are dummies — the side-table builders only
-    /// read `params` / `result_lift`.
+    /// in `param_names`. Plans are plan-relative — no cumulative cursor
+    /// to thread. Other fields are dummies — the side-table builders
+    /// only read `params` / `result_lift`.
     fn func_with_params(resolve: &Resolve, param_names: &[&str]) -> FuncClassified {
-        let mut cursor = 0;
         let params = param_names
             .iter()
-            .map(|n| {
-                let ty = type_named(resolve, n);
-                let p = make_param(&ty, resolve, cursor);
-                cursor += p.plan.flat_slot_count;
-                p
-            })
+            .map(|n| make_param(&type_named(resolve, n), resolve))
             .collect();
         FuncClassified {
             shape: FuncShape::Sync,
@@ -1778,7 +1781,7 @@ mod tests {
     }
 
     /// Wasm `ValType` for each flat slot consumed by `plan.cells`, in
-    /// local-index order. RecordOf cells contribute no slots.
+    /// flat-slot order. RecordOf cells contribute no slots.
     fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
         let mut out = Vec::new();
         for op in &plan.cells {
@@ -1863,7 +1866,10 @@ mod tests {
             (1u32, ValType::I64),
             (1u32, ValType::F64),
         ]);
-        emit_lift_plan(&mut f, &cell_layout, 0, plan, &record_info, &lcl);
+        // Wasm function params occupy locals 0..flat_slot_count, so
+        // `local_base = 0` aligns the plan's flat slots with the
+        // params declared on the synth wasm fn.
+        emit_lift_plan(&mut f, &cell_layout, 0, plan, &record_info, 0, &lcl);
         f.instructions().end();
         code.function(&f);
         module.section(&code);
@@ -1879,24 +1885,30 @@ mod tests {
     fn primitives_assign_one_cell_one_slot() {
         let r = Resolve::new();
         let cases: &[(Type, CellOp)] = &[
-            (Type::Bool, CellOp::Bool { local: 0 }),
-            (Type::S32, CellOp::IntegerSignExt { local: 0 }),
-            (Type::U32, CellOp::IntegerZeroExt { local: 0 }),
-            (Type::S64, CellOp::Integer64 { local: 0 }),
-            (Type::F32, CellOp::FloatingF32 { local: 0 }),
-            (Type::F64, CellOp::FloatingF64 { local: 0 }),
+            (Type::Bool, CellOp::Bool { flat_slot: 0 }),
+            (Type::S32, CellOp::IntegerSignExt { flat_slot: 0 }),
+            (Type::U32, CellOp::IntegerZeroExt { flat_slot: 0 }),
+            (Type::S64, CellOp::Integer64 { flat_slot: 0 }),
+            (Type::F32, CellOp::FloatingF32 { flat_slot: 0 }),
+            (Type::F64, CellOp::FloatingF64 { flat_slot: 0 }),
         ];
         for (ty, expected) in cases {
-            let plan = plan_for(ty, &r, 0);
+            let plan = plan_for(ty, &r);
             assert_eq!(plan.cells, vec![expected.clone()], "{ty:?}");
             assert_eq!(plan.flat_slot_count, 1, "{ty:?}");
         }
     }
 
     #[test]
-    fn string_takes_two_flat_slots_at_local_base() {
-        let plan = plan_for(&Type::String, &Resolve::new(), 7);
-        assert_eq!(plan.cells, vec![CellOp::Text { ptr: 7, len: 8 }]);
+    fn string_takes_two_flat_slots() {
+        let plan = plan_for(&Type::String, &Resolve::new());
+        assert_eq!(
+            plan.cells,
+            vec![CellOp::Text {
+                ptr_slot: 0,
+                len_slot: 1
+            }]
+        );
         assert_eq!(plan.flat_slot_count, 2);
     }
 
@@ -1904,8 +1916,14 @@ mod tests {
     fn list_u8_classifies_as_bytes_cell() {
         let r = test_resolve();
         let bytes_ty = func_named(&r, "f-mixed").params[2].ty;
-        let plan = plan_for(&bytes_ty, &r, 0);
-        assert_eq!(plan.cells, vec![CellOp::Bytes { ptr: 0, len: 1 }]);
+        let plan = plan_for(&bytes_ty, &r);
+        assert_eq!(
+            plan.cells,
+            vec![CellOp::Bytes {
+                ptr_slot: 0,
+                len_slot: 1
+            }]
+        );
         assert_eq!(plan.flat_slot_count, 2);
     }
 
@@ -1915,7 +1933,7 @@ mod tests {
         assert_eq!(
             plan_for_named("color", &r).cells,
             vec![CellOp::EnumCase {
-                local: 0,
+                flat_slot: 0,
                 info: enum_info("color", &["red", "green", "blue"]),
             }],
         );
@@ -1929,8 +1947,8 @@ mod tests {
             plan.cells,
             vec![
                 record_of("point", &[("x", 1), ("y", 2)]),
-                CellOp::IntegerZeroExt { local: 0 },
-                CellOp::IntegerSignExt { local: 1 },
+                CellOp::IntegerZeroExt { flat_slot: 0 },
+                CellOp::IntegerSignExt { flat_slot: 1 },
             ],
         );
         assert_eq!(plan.flat_slot_count, 2);
@@ -1945,15 +1963,38 @@ mod tests {
             vec![
                 record_of("nested", &[("p", 1), ("c", 4)]),
                 record_of("point", &[("x", 2), ("y", 3)]),
-                CellOp::IntegerZeroExt { local: 0 },
-                CellOp::IntegerSignExt { local: 1 },
+                CellOp::IntegerZeroExt { flat_slot: 0 },
+                CellOp::IntegerSignExt { flat_slot: 1 },
                 CellOp::EnumCase {
-                    local: 2,
+                    flat_slot: 2,
                     info: enum_info("color", &["red", "green", "blue"]),
                 },
             ],
         );
         assert_eq!(plan.flat_slot_count, 3);
+    }
+
+    #[test]
+    fn classify_func_params_yields_plan_relative_slots() {
+        // f-mixed(a: bool, s: string, b: list<u8>, x: s64): each
+        // param's plan is plan-relative, not threaded with cumulative
+        // cursor. b's bytes cell holds slots (0, 1) regardless of its
+        // absolute wasm-local position (3, 4) in the wrapper. Pins
+        // the local-base-independence invariant.
+        let r = test_resolve();
+        let mut name_blob = Vec::new();
+        let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut name_blob);
+        assert_eq!(
+            params[2].plan.cells,
+            vec![CellOp::Bytes {
+                ptr_slot: 0,
+                len_slot: 1
+            }],
+        );
+        // Same WIT type → same cells whether built standalone or as
+        // a non-zero-indexed param.
+        let bytes_ty = func_named(&r, "f-mixed").params[2].ty;
+        assert_eq!(params[2].plan.cells, plan_for(&bytes_ty, &r).cells);
     }
 
     #[test]
@@ -2057,14 +2098,14 @@ mod tests {
         // validate. Adding a new kind = adding a row.
         let r = test_resolve();
         let primitive_plans = [
-            plan_for(&Type::Bool, &r, 0),
-            plan_for(&Type::S32, &r, 0),
-            plan_for(&Type::U32, &r, 0),
-            plan_for(&Type::S64, &r, 0),
-            plan_for(&Type::F32, &r, 0),
-            plan_for(&Type::F64, &r, 0),
-            plan_for(&Type::String, &r, 0),
-            plan_for(&func_named(&r, "f-mixed").params[2].ty, &r, 0), // list<u8>
+            plan_for(&Type::Bool, &r),
+            plan_for(&Type::S32, &r),
+            plan_for(&Type::U32, &r),
+            plan_for(&Type::S64, &r),
+            plan_for(&Type::F32, &r),
+            plan_for(&Type::F64, &r),
+            plan_for(&Type::String, &r),
+            plan_for(&func_named(&r, "f-mixed").params[2].ty, &r), // list<u8>
             plan_for_named("color", &r),
             plan_for_named("point", &r),
             plan_for_named("nested", &r),

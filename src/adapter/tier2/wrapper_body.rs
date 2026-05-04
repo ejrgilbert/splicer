@@ -168,6 +168,10 @@ pub(super) fn emit_wrapper_function(
 
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before) = ctx.before_hook.as_ref() {
+        // Plan cells reference plan-relative flat slots; thread the
+        // cumulative cursor as the per-param `local_base` so cell N
+        // resolves to absolute wasm-local `local_base + N`.
+        let mut local_base: u32 = 0;
         for p in fd.params.iter() {
             emit_lift_plan(
                 &mut f,
@@ -175,8 +179,10 @@ pub(super) fn emit_wrapper_function(
                 p.cells_offset,
                 &p.lift.plan,
                 &p.record_info_cell_idx,
+                local_base,
                 &lcl,
             );
+            local_base += p.lift.plan.flat_slot_count;
         }
         let nargs = fd.params.len() as u32;
         let args_off = if nargs == 0 { 0 } else { fd.fields_buf_offset };
@@ -254,12 +260,15 @@ pub(super) fn emit_wrapper_function(
                         *addr_local,
                         synth_locals,
                     );
+                    // Synth locals are contiguous; `synth_locals[0]`
+                    // is the plan's `local_base`.
                     emit_lift_plan(
                         &mut f,
                         &schema.cell_layout,
                         cells_off,
                         plan,
                         record_info_cell_idx,
+                        synth_locals[0],
                         &lcl,
                     );
                 }
