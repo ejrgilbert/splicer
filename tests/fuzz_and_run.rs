@@ -154,7 +154,14 @@ enum Shape {
         /// How `{value:?}` renders the literal.
         expected_debug: &'static str,
     },
-    Option(Box<Shape>),
+    /// `option<T>` materialized as `Some(...)` when `is_some` is
+    /// true, `None` otherwise. The inner shape is retained either
+    /// way — it drives type metadata (wit_type / rust_ty) and, for
+    /// the some-arm, the runtime literal.
+    Option {
+        inner: Box<Shape>,
+        is_some: bool,
+    },
     List(Box<Shape>),
     Tuple(Vec<Shape>),
     Record {
@@ -265,7 +272,10 @@ impl Shape {
     fn name(&self) -> String {
         match self {
             Shape::Primitive { name, .. } => (*name).to_string(),
-            Shape::Option(inner) => format!("option_{}", inner.name()),
+            Shape::Option { inner, is_some } => {
+                let arm = if *is_some { "some" } else { "none" };
+                format!("option_{arm}_{}", inner.name())
+            }
             Shape::List(inner) => format!("list_{}", inner.name()),
             Shape::Tuple(parts) => {
                 let mut s = String::from("tuple");
@@ -292,7 +302,7 @@ impl Shape {
     fn wit_type(&self) -> String {
         match self {
             Shape::Primitive { wit_type, .. } => (*wit_type).to_string(),
-            Shape::Option(inner) => format!("option<{}>", inner.wit_type()),
+            Shape::Option { inner, .. } => format!("option<{}>", inner.wit_type()),
             Shape::List(inner) => format!("list<{}>", inner.wit_type()),
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -331,7 +341,7 @@ impl Shape {
     fn collect_wit_decls(&self, out: &mut String, seen_resources: &mut HashSet<&'static str>) {
         match self {
             Shape::Primitive { .. } => {}
-            Shape::Option(inner) | Shape::List(inner) => {
+            Shape::Option { inner, .. } | Shape::List(inner) => {
                 inner.collect_wit_decls(out, seen_resources)
             }
             Shape::Tuple(parts) => {
@@ -428,7 +438,7 @@ impl Shape {
     fn rust_ty(&self, side: BindingsSide) -> String {
         match self {
             Shape::Primitive { rust_ty, .. } => (*rust_ty).to_string(),
-            Shape::Option(inner) => format!("Option<{}>", inner.rust_ty(side)),
+            Shape::Option { inner, .. } => format!("Option<{}>", inner.rust_ty(side)),
             Shape::List(inner) => format!("Vec<{}>", inner.rust_ty(side)),
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -490,7 +500,13 @@ impl Shape {
                     (*rust_literal).to_string()
                 }
             }
-            Shape::Option(inner) => format!("Some({})", inner.rust_literal(side, mode)),
+            Shape::Option { inner, is_some } => {
+                if *is_some {
+                    format!("Some({})", inner.rust_literal(side, mode))
+                } else {
+                    "None".to_string()
+                }
+            }
             Shape::List(inner) => format!("vec![{}]", inner.rust_literal(side, mode)),
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -653,7 +669,7 @@ impl Shape {
             Shape::Primitive { rust_ty, .. } => {
                 *rust_ty != "String" || matches!(mode, AsyncMode::Sync)
             }
-            Shape::Option(inner) => inner.is_copy_in(mode),
+            Shape::Option { inner, .. } => inner.is_copy_in(mode),
             Shape::List(_) => false,
             Shape::Tuple(parts) => parts.iter().all(|p| p.is_copy_in(mode)),
             Shape::Record { fields, .. } => {
@@ -682,7 +698,7 @@ impl Shape {
     fn contains_resource(&self) -> bool {
         match self {
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => false,
-            Shape::Option(inner) | Shape::List(inner) => inner.contains_resource(),
+            Shape::Option { inner, .. } | Shape::List(inner) => inner.contains_resource(),
             Shape::Tuple(parts) => parts.iter().any(Shape::contains_resource),
             Shape::Record { fields, .. } => fields.iter().any(|(_, s)| s.contains_resource()),
             Shape::Variant { cases, .. } => cases
@@ -703,7 +719,7 @@ impl Shape {
     fn collect_resources(&self, out: &mut Vec<(&'static str, &'static str)>) {
         match self {
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => {}
-            Shape::Option(inner) | Shape::List(inner) => inner.collect_resources(out),
+            Shape::Option { inner, .. } | Shape::List(inner) => inner.collect_resources(out),
             Shape::Tuple(parts) => {
                 for p in parts {
                     p.collect_resources(out);
@@ -767,7 +783,13 @@ impl Shape {
     fn expected_debug_in(&self, err_enums: &HashSet<&'static str>) -> String {
         match self {
             Shape::Primitive { expected_debug, .. } => (*expected_debug).to_string(),
-            Shape::Option(inner) => format!("Some({})", inner.expected_debug_in(err_enums)),
+            Shape::Option { inner, is_some } => {
+                if *is_some {
+                    format!("Some({})", inner.expected_debug_in(err_enums))
+                } else {
+                    "None".to_string()
+                }
+            }
             Shape::List(inner) => format!("[{}]", inner.expected_debug_in(err_enums)),
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -977,13 +999,16 @@ fn primitive_atoms() -> Vec<Shape> {
 fn tier1_shapes() -> Vec<Shape> {
     let mut v = primitive_atoms();
     v.extend(vec![
-        Shape::Option(Box::new(Shape::Primitive {
-            name: "u32",
-            wit_type: "u32",
-            rust_ty: "u32",
-            rust_literal: "7u32",
-            expected_debug: "7",
-        })),
+        Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "7u32",
+                expected_debug: "7",
+            }),
+            is_some: true,
+        },
         Shape::List(Box::new(Shape::Primitive {
             name: "u32",
             wit_type: "u32",
@@ -1278,6 +1303,32 @@ fn tier2_shapes() -> Vec<Shape> {
                 expected_debug: r#""hi""#,
             },
         ]),
+        // option<u32>: 2 flat slots ([disc, value]) → result side
+        // hits retptr. Run both arms — `some` exercises the disc=1
+        // path of the parent Option cell + the inner cell's lift;
+        // `none` exercises disc=0 and pins the canonical-ABI
+        // zero-fill assumption (the inner cell is still emitted but
+        // never followed).
+        Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: true,
+        },
+        Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: false,
+        },
     ]
 }
 
@@ -1348,12 +1399,10 @@ fn gen_shape(
     let kind: u8 = u.int_in_range(0..=max_kind)?;
     match kind {
         0 => pick_primitive(u),
-        1 => Ok(Shape::Option(Box::new(gen_shape(
-            u,
-            max_depth - 1,
-            allow_nominal,
-            counters,
-        )?))),
+        1 => Ok(Shape::Option {
+            inner: Box::new(gen_shape(u, max_depth - 1, allow_nominal, counters)?),
+            is_some: u.arbitrary()?,
+        }),
         2 => Ok(Shape::List(Box::new(gen_shape(
             u,
             max_depth - 1,
@@ -1856,6 +1905,10 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
                 .collect();
             format!("tuple({})", rendered.join(", "))
         }
+        Cell::OptionSome(child_idx) => {
+            format!("option-some({})", fmt_cell(tree, *child_idx))
+        }
+        Cell::OptionNone => "option-none".to_string(),
         other => format!("other({other:?})"),
     }
 }
@@ -2553,8 +2606,16 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 .collect::<Option<_>>()?;
             Some(format!("tuple({})", parts.join(", ")))
         }
-        // Other compound shapes (lists, options, variants, results,
-        // flags) light up here as their lift codegen lands.
+        Shape::Option { inner, is_some } => {
+            if *is_some {
+                let inner_render = predict_tier2_arg_inner(inner)?;
+                Some(format!("option-some({inner_render})"))
+            } else {
+                Some("option-none".to_string())
+            }
+        }
+        // Other compound shapes (lists, variants, results, flags)
+        // light up here as their lift codegen lands.
         _ => None,
     }
 }
