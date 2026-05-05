@@ -1,4 +1,4 @@
-//! Behavioral smoke test for the `otel-metrics` builtin.
+//! Behavioral smoke test for the `otel-bare-metrics` builtin.
 //!
 //! Instantiates the embedded component in wasmtime with a fake
 //! `wasi:otel/metrics` host that captures `export(resource-metrics)`
@@ -10,7 +10,7 @@
 //! `code.namespace` / `code.function` attributes.
 //!
 //! Requires `make build-builtins` to have populated
-//! `assets/builtins/otel-metrics.wasm` (embedded below via
+//! `assets/builtins/otel-bare-metrics.wasm` (embedded below via
 //! `include_bytes!`).
 
 use std::collections::HashMap;
@@ -53,8 +53,8 @@ fn add_otel_metrics_to_linker(
 }
 
 #[test]
-fn otel_metrics_exports_count_and_duration() -> Result<()> {
-    let bytes = include_bytes!("../assets/builtins/otel-metrics.wasm");
+fn otel_bare_metrics_exports_count_and_duration() -> Result<()> {
+    let bytes = include_bytes!("../assets/builtins/otel-bare-metrics.wasm");
     let capture = drive_call_cycle::<Capture, _>(bytes, add_otel_metrics_to_linker)?;
     let cap = capture.lock().unwrap();
 
@@ -72,7 +72,7 @@ fn otel_metrics_exports_count_and_duration() -> Result<()> {
     let scope = expect_record(field(scope_metrics, "scope"));
     assert_eq!(
         expect_string(field(scope, "name")),
-        "splicer:otel-metrics",
+        "splicer:otel-bare-metrics",
         "instrumentation scope name identifies the source"
     );
 

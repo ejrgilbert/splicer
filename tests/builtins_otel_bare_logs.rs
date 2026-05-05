@@ -1,4 +1,4 @@
-//! Behavioral smoke test for the `otel-logs` builtin.
+//! Behavioral smoke test for the `otel-bare-logs` builtin.
 //!
 //! Instantiates the embedded component in wasmtime with a fake
 //! `wasi:otel/logs` host that captures `on-emit` calls and a fake
@@ -9,7 +9,7 @@
 //! trace-correlation fields are absent (no parent ⇒ `none`).
 //!
 //! Requires `make build-builtins` to have populated
-//! `assets/builtins/otel-logs.wasm` (embedded below via
+//! `assets/builtins/otel-bare-logs.wasm` (embedded below via
 //! `include_bytes!`).
 
 use anyhow::Result;
@@ -42,9 +42,7 @@ fn empty_span_context() -> Val {
     ])
 }
 
-fn add_otel_logs_to_linker(
-    linker: &mut wasmtime::component::Linker<Host<Capture>>,
-) -> Result<()> {
+fn add_otel_logs_to_linker(linker: &mut wasmtime::component::Linker<Host<Capture>>) -> Result<()> {
     let mut logs = linker.instance(OTEL_LOGS)?;
     logs.func_new("on-emit", |store, _ty, params, _results| {
         store
@@ -73,8 +71,8 @@ fn add_otel_logs_to_linker(
 }
 
 #[test]
-fn otel_logs_emits_structured_record() -> Result<()> {
-    let bytes = include_bytes!("../assets/builtins/otel-logs.wasm");
+fn otel_bare_logs_emits_structured_record() -> Result<()> {
+    let bytes = include_bytes!("../assets/builtins/otel-bare-logs.wasm");
     let capture = drive_call_cycle::<Capture, _>(bytes, add_otel_logs_to_linker)?;
     let cap = capture.lock().unwrap();
 
@@ -137,7 +135,7 @@ fn otel_logs_emits_structured_record() -> Result<()> {
     let scope = expect_record(scope_opt.expect("instrumentation-scope present"));
     assert_eq!(
         expect_string(field(scope, "name")),
-        "splicer:otel-logs",
+        "splicer:otel-bare-logs",
         "scope name identifies the source"
     );
 

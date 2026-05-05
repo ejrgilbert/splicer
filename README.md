@@ -83,12 +83,18 @@ inject:
   - builtin: hello-tier1
 ```
 
-| Name              | Tier | Description                                                                  |
-|-------------------|------|------------------------------------------------------------------------------|
-| `hello-tier1`     | 1    | `println!`s every wrapped call. Verifies splice rules fire.                  |
-| `otel-bare-spans` | 1    | Emits a `wasi:otel` span per call (timing + call-id attrs).                  |
-| `otel-metrics`    | 1    | Emits `wasi:otel` count + duration-histogram metrics per call.               |
-| `otel-logs`       | 1    | Emits a structured `wasi:otel` log record per call (severity `INFO`).        |
+The `bare` prefix marks tier-1 builtins that see only the call-id —
+no payload-derived data on the emitted signal. Value-aware tier-2
+siblings — `otel-spans`, `otel-metrics`, `otel-logs` (unprefixed) —
+are **planned but not yet implemented**; they'll arrive once tier-2
+codegen lands.
+
+| Name                | Tier | Description                                                                |
+|---------------------|------|----------------------------------------------------------------------------|
+| `hello-tier1`       | 1    | `println!`s every wrapped call. Verifies splice rules fire.                |
+| `otel-bare-spans`   | 1    | Emits a `wasi:otel` span per call (timing + call-id attrs, no payload).    |
+| `otel-bare-metrics` | 1    | Emits `wasi:otel` count + duration metrics per call (no payload).          |
+| `otel-bare-logs`    | 1    | Emits a structured `wasi:otel` log per call (severity `INFO`, no payload). |
 
 Source crates live under [`builtins/`](builtins/); rebuild artifacts
 with `make build-builtins`.

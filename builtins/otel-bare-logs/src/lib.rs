@@ -12,7 +12,7 @@
 
 mod bindings {
     wit_bindgen::generate!({
-        world: "otel-logs-mdl",
+        world: "otel-bare-logs-mdl",
         async: true,
         generate_all,
     });
@@ -68,16 +68,16 @@ fn kv(k: &str, v: &str) -> KeyValue {
 
 fn scope() -> InstrumentationScope {
     InstrumentationScope {
-        name: "splicer:otel-logs".into(),
+        name: "splicer:otel-bare-logs".into(),
         version: Some(env!("CARGO_PKG_VERSION").into()),
         schema_url: None,
         attributes: vec![],
     }
 }
 
-pub struct OtelLogs;
+pub struct OtelBareLogs;
 
-impl AfterGuest for OtelLogs {
+impl AfterGuest for OtelBareLogs {
     async fn on_return(call: CallId) {
         let parent = outer_span_context().await;
         let (trace_id, span_id, trace_flags) = if empty_id(&parent.trace_id) {
@@ -112,4 +112,4 @@ impl AfterGuest for OtelLogs {
     }
 }
 
-bindings::export!(OtelLogs with_types_in bindings);
+bindings::export!(OtelBareLogs with_types_in bindings);

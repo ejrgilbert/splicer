@@ -2,7 +2,7 @@
 //! builtin in wasmtime against a synthetic call-id.
 //!
 //! Each builtin smoke-test (`builtins_otel_bare_spans.rs`,
-//! `builtins_otel_metrics.rs`, …) supplies its own `Capture` type and
+//! `builtins_otel_bare_metrics.rs`, …) supplies its own `Capture` type and
 //! linker-side fake host implementation; everything else (engine
 //! config, instantiation, `on-call` → `on-return` drive cycle, `Val`
 //! extractors) lives here so the per-test files stay focused on the

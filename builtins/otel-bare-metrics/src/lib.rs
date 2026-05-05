@@ -43,7 +43,7 @@
 
 mod bindings {
     wit_bindgen::generate!({
-        world: "otel-metrics-mdl",
+        world: "otel-bare-metrics-mdl",
         async: true,
         generate_all,
     });
@@ -116,7 +116,7 @@ fn kv(k: &str, v: &str) -> KeyValue {
 
 fn scope() -> InstrumentationScope {
     InstrumentationScope {
-        name: "splicer:otel-metrics".into(),
+        name: "splicer:otel-bare-metrics".into(),
         version: Some(env!("CARGO_PKG_VERSION").into()),
         schema_url: None,
         attributes: vec![],
@@ -220,9 +220,9 @@ fn build_resource_metrics(
     }
 }
 
-pub struct OtelMetrics;
+pub struct OtelBareMetrics;
 
-impl BeforeGuest for OtelMetrics {
+impl BeforeGuest for OtelBareMetrics {
     async fn on_call(call: CallId) {
         let start_time = now().await;
         pending()
@@ -234,7 +234,7 @@ impl BeforeGuest for OtelMetrics {
     }
 }
 
-impl AfterGuest for OtelMetrics {
+impl AfterGuest for OtelBareMetrics {
     async fn on_return(call: CallId) {
         let popped = pending()
             .lock()
@@ -253,4 +253,4 @@ impl AfterGuest for OtelMetrics {
     }
 }
 
-bindings::export!(OtelMetrics with_types_in bindings);
+bindings::export!(OtelBareMetrics with_types_in bindings);

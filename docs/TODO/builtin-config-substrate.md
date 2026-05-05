@@ -5,7 +5,7 @@
 Most planned tier-1 builtins beyond `hello-tier1` and `otel-bare-spans`
 need user-facing config:
 
-- `otel-metrics` aggregation: `buffer` size, `flush_after_seconds`
+- `otel-bare-metrics` aggregation: `buffer` size, `flush_after_seconds`
 - `rate-limit`: rate, burst, scope
 - `deny-list`: list of `(interface, function)` rules
 - `chaos`: failure probability, latency injection range
@@ -37,7 +37,7 @@ exporting a string-based custom WIT interface (`splicer:builtin-config`).**
 
 The substrate is **only** built and wired when the builtin imports
 `splicer:builtin-config`. Existing builtins (`hello-tier1`,
-`otel-bare-spans`, current `otel-metrics`) don't import it and are
+`otel-bare-spans`, current `otel-bare-metrics`) don't import it and are
 unaffected.
 
 ## Design space considered
@@ -164,7 +164,7 @@ rules:
       interface: wasi:http/handler@0.3.0
       provider: { name: my-service }
     inject:
-      - builtin: otel-metrics
+      - builtin: otel-bare-metrics
         config:
           buffer: 100
           flush_after_seconds: 10.0
@@ -213,8 +213,8 @@ original scalar type for error messages).
     - Integration test for an end-to-end splice with a config-consuming
       builtin
 
-7. **First consumer**: `otel-metrics` aggregation rework — see the
-   `TODO(aggregation)` block in `builtins/otel-metrics/src/lib.rs`.
+7. **First consumer**: `otel-bare-metrics` aggregation rework — see the
+   `TODO(aggregation)` block in `builtins/otel-bare-metrics/src/lib.rs`.
 
 ## Sequencing
 
@@ -225,7 +225,7 @@ branching off the tier2 branch trades that for repeated rebases against
 a moving target. Cleanest path: tier2 → main, then config substrate
 as a fresh branch off main.
 
-In the meantime, `otel-metrics` runs in always-flush (`buffer = 1`)
+In the meantime, `otel-bare-metrics` runs in always-flush (`buffer = 1`)
 mode with hardcoded defaults. The `TODO(aggregation)` block in its
 `lib.rs` lists the config keys and semantics so the rework is mechanical
 once the substrate is in place.
@@ -264,7 +264,7 @@ WIT-level rename, not a redesign.
 ## Open questions
 
 - **Per-builtin keyspace**: do we namespace keys (e.g.,
-  `otel-metrics.buffer` to avoid two co-injected builtins fighting over
+  `otel-bare-metrics.buffer` to avoid two co-injected builtins fighting over
   the same key name) or assume single-config-per-inject-site is enough?
   Current design: per-inject-site provider, so co-injected builtins
   each get their own provider — no collision, no namespacing needed.
