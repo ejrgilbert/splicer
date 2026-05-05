@@ -44,15 +44,7 @@ fn test_resolve() -> Resolve {
 }
 
 fn iface_id(resolve: &Resolve) -> wit_parser::InterfaceId {
-    resolve
-        .interfaces
-        .iter()
-        .find_map(|(id, _)| {
-            let qname = resolve.id_of(id)?;
-            let unversioned = qname.split('@').next().unwrap_or(&qname);
-            (unversioned == "test:lift/t").then_some(id)
-        })
-        .expect("test:lift/t interface not found in fixture")
+    super::super::test_utils::iface_by_unversioned_qname(resolve, "test:lift/t")
 }
 
 fn type_named(resolve: &Resolve, name: &str) -> Type {
@@ -190,15 +182,12 @@ fn synth_cell_layout() -> CellLayout {
     resolve
         .push_str("common.wit", common_wit)
         .expect("wit/common/world.wit must parse");
-    let cell_id = resolve
-        .interfaces
-        .iter()
-        .find_map(|(id, _)| {
-            let qname = resolve.id_of(id)?;
-            let unversioned = qname.split('@').next().unwrap_or(&qname);
-            (unversioned == "splicer:common/types").then_some(id)
-        })
-        .and_then(|id| resolve.interfaces[id].types.get("cell").copied())
+    let common_id =
+        super::super::test_utils::iface_by_unversioned_qname(&resolve, "splicer:common/types");
+    let cell_id = resolve.interfaces[common_id]
+        .types
+        .get("cell")
+        .copied()
         .expect("splicer:common/types must export `cell`");
     let mut sizes = SizeAlign::default();
     sizes.fill(&resolve);

@@ -689,15 +689,12 @@ mod tests {
         resolve
             .push_str("common.wit", common_wit)
             .expect("wit/common/world.wit must parse");
-        let cell_id = resolve
-            .interfaces
-            .iter()
-            .find_map(|(id, _)| {
-                let qname = resolve.id_of(id)?;
-                let unversioned = qname.split('@').next().unwrap_or(&qname);
-                (unversioned == "splicer:common/types").then_some(id)
-            })
-            .and_then(|id| resolve.interfaces[id].types.get("cell").copied())
+        let iface_id =
+            super::super::test_utils::iface_by_unversioned_qname(&resolve, "splicer:common/types");
+        let cell_id = resolve.interfaces[iface_id]
+            .types
+            .get("cell")
+            .copied()
             .expect("splicer:common/types must export `cell` typedef");
         let mut sizes = SizeAlign::default();
         sizes.fill(&resolve);

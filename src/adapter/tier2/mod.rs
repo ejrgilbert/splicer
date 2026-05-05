@@ -41,6 +41,8 @@ pub(super) mod layout;
 pub(super) mod lift;
 pub(super) mod schema;
 pub(super) mod section_emit;
+#[cfg(test)]
+mod test_utils;
 pub(super) mod wrapper_body;
 
 use anyhow::{bail, Context, Result};

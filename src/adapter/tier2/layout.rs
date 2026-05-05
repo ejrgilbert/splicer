@@ -47,13 +47,22 @@ const LAYOUT_SIZE_BUDGET: u32 = i32::MAX as u32;
 
 /// Per-fn flat-slot count cap. Canonical-ABI direct-call flattens up
 /// to 16 args before retptr; nested-record flatten can go past that.
-/// 65 536 sits well above any realistic shape.
+/// 65 536 sits well above any realistic shape. Reduced under
+/// `cfg(test)` so the bail can be exercised without generating a WIT
+/// at the production limit.
+#[cfg(not(test))]
 const MAX_FLAT_SLOTS_PER_FN: u32 = 1 << 16;
+#[cfg(test)]
+const MAX_FLAT_SLOTS_PER_FN: u32 = 16;
 
 /// Per-param (and per-result) cell-tree cap. Bounds `cell_count *
 /// cell_size` slab sizes and the cell index used as `i32.const` in
-/// `emit_lift_plan`.
+/// `emit_lift_plan`. Reduced under `cfg(test)` so the bail can be
+/// exercised without generating a WIT at the production limit.
+#[cfg(not(test))]
 const MAX_CELLS_PER_PARAM: u32 = 1 << 20;
+#[cfg(test)]
+const MAX_CELLS_PER_PARAM: u32 = 8;
 
 /// Bound every per-fn / per-param count the layout phase relies on.
 /// Once this returns `Ok`, the body of `lay_out_static_memory` can
@@ -671,15 +680,10 @@ mod tests {
         );
         let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
         let world_id = resolve.select_world(&[world_pkg], Some("adapter")).unwrap();
-        let target_iface = resolve
-            .interfaces
-            .iter()
-            .find_map(|(id, _)| {
-                let qname = resolve.id_of(id)?;
-                let unversioned = qname.split('@').next().unwrap_or(&qname);
-                (unversioned == "test:layout-fixture/t").then_some(id)
-            })
-            .expect("target interface must exist in fixture");
+        let target_iface = super::super::test_utils::iface_by_unversioned_qname(
+            &resolve,
+            "test:layout-fixture/t",
+        );
         let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
             .functions
             .values()
@@ -826,5 +830,102 @@ mod tests {
         let env = env();
         assert!(env.dispatch("f-noargs").result_lift.is_none());
         assert!(env.dispatch("f-pair-u32").result_lift.is_some());
+    }
+
+    // ─── Layout-budget bails ──────────────────────────────────────
+
+    /// Drive the same pipeline as [`env_with`] but for an arbitrary
+    /// target WIT, returning the `lay_out_static_memory` result so
+    /// the budget tests can assert on its `Err`. `target_iface` is
+    /// the unversioned qname (`pkg:ns/iface`); the fixture WIT must
+    /// declare exactly one matching package + interface.
+    fn try_lay_out(target_wit: &str, target_iface_qname: &str) -> Result<()> {
+        use crate::contract::{versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_VERSION};
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let mut resolve = Resolve::new();
+        resolve.push_str("test.wit", target_wit).unwrap();
+        resolve.push_str("common.wit", common_wit).unwrap();
+        resolve.push_str("tier2.wit", tier2_wit).unwrap();
+        let hook_ifaces = vec![
+            versioned_interface(TIER2_BEFORE, TIER2_VERSION),
+            versioned_interface(TIER2_AFTER, TIER2_VERSION),
+        ];
+        let target_versioned = format!("{target_iface_qname}@0.0.1");
+        let world_wit = synthesize_adapter_world_wit(
+            "test:budget-fixture-adapter",
+            "adapter",
+            &target_versioned,
+            &hook_ifaces,
+        );
+        let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
+        let world_id = resolve.select_world(&[world_pkg], Some("adapter")).unwrap();
+        let target_iface =
+            super::super::test_utils::iface_by_unversioned_qname(&resolve, target_iface_qname);
+        let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
+            .functions
+            .values()
+            .collect();
+        let schema = compute_schema(&resolve, world_id, true, true).unwrap();
+        let mut names = NameInterner::new();
+        let iface_name = names.intern(&target_versioned);
+        let classified = build_per_func_classified(&resolve, target_iface, &funcs, &mut names)?;
+        lay_out_static_memory(classified, &funcs, &schema, names, iface_name).map(|_| ())
+    }
+
+    #[test]
+    fn flat_slot_budget_bails_when_param_flatten_exceeds_cap() {
+        // `flat_slot_count` is per-param: a record param flattens to
+        // one slot per leaf primitive field. `MAX_FLAT_SLOTS_PER_FN
+        // + 1` u32 fields pushes one record param over the cap.
+        // (The cell-budget check runs after the flat-slot check, so
+        // the flat-slot bail fires first even though this shape also
+        // exceeds `MAX_CELLS_PER_PARAM`.)
+        let n = MAX_FLAT_SLOTS_PER_FN + 1;
+        let fields = (0..n)
+            .map(|i| format!("f{i}: u32"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wit = format!(
+            "package test:budget-flat@0.0.1;\n\
+             interface t {{\n\
+                 record big {{ {fields} }}\n\
+                 bloat: func(b: big);\n\
+             }}\n"
+        );
+        let err = try_lay_out(&wit, "test:budget-flat/t")
+            .expect_err("flat-slot budget should bail at MAX_FLAT_SLOTS_PER_FN + 1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flat-slot count")
+                && msg.contains(&MAX_FLAT_SLOTS_PER_FN.to_string()),
+            "bail should name the budget, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cell_budget_bails_when_record_param_exceeds_cap() {
+        // Each leaf field contributes one cell, plus one `RecordOf`
+        // for the parent. `MAX_CELLS_PER_PARAM` leaf u32 fields gives
+        // `MAX_CELLS_PER_PARAM + 1` cells — one over.
+        let n = MAX_CELLS_PER_PARAM;
+        let fields = (0..n)
+            .map(|i| format!("f{i}: u32"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wit = format!(
+            "package test:budget-cells@0.0.1;\n\
+             interface t {{\n\
+                 record big {{ {fields} }}\n\
+                 bloat: func(b: big);\n\
+             }}\n"
+        );
+        let err = try_lay_out(&wit, "test:budget-cells/t")
+            .expect_err("cell budget should bail at MAX_CELLS_PER_PARAM + 1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cell count") && msg.contains(&MAX_CELLS_PER_PARAM.to_string()),
+            "bail should name the budget, got: {msg}"
+        );
     }
 }
