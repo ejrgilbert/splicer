@@ -288,7 +288,9 @@ impl Shape {
             Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
             Shape::Variant { wit_name, .. } => format!("variant_{}", wit_name),
             Shape::Enum { wit_name, .. } => format!("enum_{}", wit_name),
-            Shape::Flags { wit_name, .. } => format!("flags_{}", wit_name),
+            Shape::Flags {
+                wit_name, selected, ..
+            } => format!("flags_{wit_name}_0x{selected:x}"),
             Shape::Result_ { ok, err, is_ok } => {
                 let arm = if *is_ok { "ok" } else { "err" };
                 let ok_s = ok.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
@@ -1260,6 +1262,23 @@ fn tier2_shapes() -> Vec<Shape> {
             cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
             selected: 1,
         },
+        // Flags with a mixed bitmask — exercises the bit-walk's
+        // skip-then-set transition (bit 0 set, bit 1 unset, bit 2 set)
+        // so a future "always-write" bug wouldn't pass.
+        Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0b101,
+        },
+        // Empty bitmask — pins the zero-flag edge case (loop body
+        // never enters; set-flags.len patched to 0).
+        Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0,
+        },
         Shape::Record {
             wit_name: "point",
             rust_name: "Point",
@@ -1925,6 +1944,13 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
                 .get(*side_idx as usize)
                 .expect("enum_infos idx in range");
             format!("enum({}::{})", info.type_name, info.case_name)
+        }
+        Cell::FlagsSet(side_idx) => {
+            let info = tree
+                .flags_infos
+                .get(*side_idx as usize)
+                .expect("flags_infos idx in range");
+            format!("flags({} {{ {} }})", info.type_name, info.set_flags.join(", "))
         }
         Cell::RecordOf(side_idx) => {
             let info = tree
@@ -2635,6 +2661,23 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
         } => {
             let case = cases.get(*selected).map(|(c, _)| *c)?;
             Some(format!("enum({wit_name}::{case})"))
+        }
+        Shape::Flags {
+            wit_name,
+            flags,
+            selected,
+            ..
+        } => {
+            // Bit-walk in declaration order matches the wrapper's
+            // emit_flags_runtime_fill loop: bits 0..N tested in order,
+            // set bits append to set_flags in that order.
+            let active: Vec<&str> = flags
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (selected >> i) & 1 == 1)
+                .map(|(_, (wit_flag, _))| *wit_flag)
+                .collect();
+            Some(format!("flags({wit_name} {{ {} }})", active.join(", ")))
         }
         Shape::Record {
             wit_name, fields, ..
