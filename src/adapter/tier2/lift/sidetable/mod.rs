@@ -22,13 +22,71 @@
 use std::collections::HashMap;
 
 use super::super::super::abi::emit::{BlobSlice, RecordLayout};
-use super::super::blob::{NameInterner, RecordWriter, Segment, SymRef, SymbolId};
+use super::super::blob::{
+    resolve, NameInterner, RecordWriter, Segment, SymRef, SymbolBases, SymbolId,
+};
 use super::super::FuncClassified;
 use super::classify::SideTableInfo;
 use super::plan::{LiftPlan, NamedListInfo};
 
 pub(super) mod enum_info;
 pub(super) mod record_info;
+pub(super) mod tuple_indices;
+
+// ─── Per-cell side-table indices ─────────────────────────────────
+//
+// Several side-table kinds carry a per-(fn, param | result, plan-cell)
+// `Option<T>` lookup: `Some(value)` for cells of the relevant kind,
+// `None` for other cell kinds. Today: record-info (`T = u32`) and
+// tuple-indices (`T = SymRef`). New kinds plug in by parameterising
+// `T` and pushing into the same shape.
+
+/// Per-(fn, param) and per-(fn, result) per-plan-cell `Option<T>`
+/// map. Internal nesting is `Vec<Vec<Vec<…>>>` / `Vec<Vec<…>>` but
+/// hidden behind [`Self::for_param`] / [`Self::for_result`].
+pub(crate) struct PerCellIndices<T> {
+    pub(super) per_param: Vec<Vec<Vec<Option<T>>>>,
+    pub(super) per_result: Vec<Vec<Option<T>>>,
+}
+
+impl<T> PerCellIndices<T> {
+    pub(crate) fn for_param(&self, fn_idx: usize, param_idx: usize) -> &[Option<T>] {
+        &self.per_param[fn_idx][param_idx]
+    }
+
+    /// Per-cell map for one fn's compound result. Empty slice for
+    /// non-compound (or void) results.
+    pub(crate) fn for_result(&self, fn_idx: usize) -> &[Option<T>] {
+        &self.per_result[fn_idx]
+    }
+}
+
+impl PerCellIndices<SymRef> {
+    /// Resolve one (fn, param)'s symbolic cell slots to absolute
+    /// [`BlobSlice`]s. Length matches that param's `plan.cells.len()`.
+    pub(crate) fn resolve_param(
+        &self,
+        fn_idx: usize,
+        param_idx: usize,
+        symbols: &SymbolBases,
+    ) -> Vec<Option<BlobSlice>> {
+        resolve_cell_syms(self.for_param(fn_idx, param_idx), symbols)
+    }
+
+    pub(crate) fn resolve_result(
+        &self,
+        fn_idx: usize,
+        symbols: &SymbolBases,
+    ) -> Vec<Option<BlobSlice>> {
+        resolve_cell_syms(self.for_result(fn_idx), symbols)
+    }
+}
+
+fn resolve_cell_syms(syms: &[Option<SymRef>], symbols: &SymbolBases) -> Vec<Option<BlobSlice>> {
+    syms.iter()
+        .map(|s| s.map(|s| resolve(Some(s), symbols)))
+        .collect()
+}
 
 // ─── WIT names referenced by lift codegen ─────────────────────────
 //

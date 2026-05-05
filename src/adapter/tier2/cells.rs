@@ -363,17 +363,33 @@ impl CellLayout {
         todo!("cell::list-of — disc 5 + (ptr, len) at payload");
     }
 
-    /// `cell::tuple-of(list<u32>)` — same flat shape as list-of.
-    #[allow(dead_code)]
+    /// `cell::tuple-of(list<u32>)` — payload `(ptr, len)` of a static
+    /// child-index array. Both values are build-time constants
+    /// (segment base + per-cell offset, and the child count).
     pub(crate) fn emit_tuple_of(
         &self,
         f: &mut Function,
         addr_local: u32,
-        idx_array_ptr: u32,
-        idx_array_len: u32,
+        indices_off: u32,
+        indices_len: u32,
     ) {
-        let _ = (f, addr_local, idx_array_ptr, idx_array_len);
-        todo!("cell::tuple-of — disc 6 + (ptr, len) at payload");
+        self.emit_cell(
+            f,
+            addr_local,
+            self.disc_of("tuple-of"),
+            &[
+                PayloadPart {
+                    source: PayloadSource::ConstI32(indices_off as i32),
+                    kind: StoreKind::I32,
+                    offset: 0,
+                },
+                PayloadPart {
+                    source: PayloadSource::ConstI32(indices_len as i32),
+                    kind: StoreKind::I32,
+                    offset: 4,
+                },
+            ],
+        );
     }
 
     /// `cell::option-some(u32)` — single inner cell index.
@@ -632,6 +648,13 @@ mod tests {
         build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
             cl.emit_bytes(f, 0, 1, 2)
         });
+    }
+
+    #[test]
+    fn tuple_of_cell_emits_valid_wasm() {
+        // params: (addr_local: i32). off/len are i32.const, no locals.
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_tuple_of(f, 0, 0x100, 3));
     }
 
     /// Structural fuzz over the primitive cell-emit helpers — for each

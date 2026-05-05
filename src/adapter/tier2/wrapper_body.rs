@@ -53,7 +53,7 @@ use super::super::abi::emit::{
 use super::super::indices::LocalsBuilder;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    ResultEmitPlan, WrapperLocals,
+    CellSideRefs, ResultEmitPlan, WrapperLocals,
 };
 use super::schema::{SchemaLayouts, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL};
 use super::section_emit::FuncIndices;
@@ -165,7 +165,10 @@ pub(super) fn emit_wrapper_function(
                 &schema.cell_layout,
                 p.cells_offset,
                 &p.lift.plan,
-                &p.record_info_cell_idx,
+                CellSideRefs {
+                    record_info_cell_idx: &p.record_info_cell_idx,
+                    tuple_indices_cell_idx: &p.tuple_indices_cell_idx,
+                },
                 local_base,
                 &lcl,
             );
@@ -235,8 +238,7 @@ pub(super) fn emit_wrapper_function(
                     addr_local,
                     synth_locals,
                     loads,
-                    record_info_cell_idx,
-                    ..
+                    side_refs,
                 } => {
                     // Memory → flat-on-stack → synthetic locals → walk plan.
                     emit_lift_compound_prefix(
@@ -254,7 +256,7 @@ pub(super) fn emit_wrapper_function(
                         &schema.cell_layout,
                         cells_off,
                         plan,
-                        record_info_cell_idx,
+                        *side_refs,
                         synth_locals[0],
                         &lcl,
                     );

@@ -29,10 +29,14 @@ const TEST_WIT: &str = r#"
         record point { x: u32, y: s32 }
         record nested { p: point, c: color }
         record pair { a: u8, b: u8 }
+        record point-and-tuple { p: point, t: tuple<u8, s32> }
         f-mixed: func(a: bool, s: string, b: list<u8>, x: s64);
         f-color: func(c: color);
         f-point: func(p: point);
         f-mix-records: func(p: point, n: nested);
+        f-tuple: func(t: tuple<u8, s32>);
+        f-tuple-of-tuple: func(t: tuple<u8, tuple<s32, s32>>);
+        f-record-with-tuple: func(rt: point-and-tuple);
     }
 "#;
 
@@ -211,10 +215,9 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
                 out.push(ValType::I32);
                 out.push(ValType::I32);
             }
-            Cell::RecordOf { .. } => {}
+            Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
             Cell::Char
             | Cell::ListOf
-            | Cell::TupleOf
             | Cell::Option
             | Cell::Result
             | Cell::Flags
@@ -248,6 +251,26 @@ fn auto_record_info_indices(plan: &LiftPlan) -> Vec<Option<u32>> {
         .collect()
 }
 
+/// Tuple-indices a single-plan `build_tuple_indices_blob` would
+/// assign — `Some` per `TupleOf` cell, `None` otherwise. Offsets
+/// are relative to segment base 0; the emit phase only validates
+/// `(off, len)` const stores, not their values.
+fn auto_tuple_indices(plan: &LiftPlan) -> Vec<Option<BlobSlice>> {
+    let mut cursor: u32 = 0;
+    plan.cells
+        .iter()
+        .map(|op| match op {
+            Cell::TupleOf { children } => {
+                let off = cursor;
+                let len = children.len() as u32;
+                cursor += len * 4;
+                Some(BlobSlice { off, len })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Round-trip a plan through `emit_lift_plan` and validate the
 /// resulting wasm module. Wasm function params come straight from
 /// the plan's flat slots; `WrapperLocals` extras (addr/ext64/
@@ -255,6 +278,7 @@ fn auto_record_info_indices(plan: &LiftPlan) -> Vec<Option<u32>> {
 fn validate_emit_lift_plan(plan: &LiftPlan) {
     let cell_layout = synth_cell_layout();
     let record_info = auto_record_info_indices(plan);
+    let tuple_indices = auto_tuple_indices(plan);
     let param_types = plan_param_types(plan);
     let n = plan.flat_slot_count;
     let lcl = WrapperLocals {
@@ -298,7 +322,18 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
     // Wasm function params occupy locals 0..flat_slot_count, so
     // `local_base = 0` aligns the plan's flat slots with the
     // params declared on the synth wasm fn.
-    emit_lift_plan(&mut f, &cell_layout, 0, plan, &record_info, 0, &lcl);
+    emit_lift_plan(
+        &mut f,
+        &cell_layout,
+        0,
+        plan,
+        super::emit::CellSideRefs {
+            record_info_cell_idx: &record_info,
+            tuple_indices_cell_idx: &tuple_indices,
+        },
+        0,
+        &lcl,
+    );
     f.instructions().end();
     code.function(&f);
     module.section(&code);
@@ -416,6 +451,89 @@ fn nested_record_walks_depth_first() {
     );
     assert_eq!(plan.root(), 4);
     assert_eq!(plan.flat_slot_count, 3);
+}
+
+#[test]
+fn tuple_lays_children_before_parent() {
+    // tuple<u8, s32>: u8 → cell 0, s32 → cell 1, TupleOf parent → cell 2.
+    // Plan-relative flat slots: u8 slot 0, s32 slot 1, parent consumes none.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let f = func_named(&r, "f-tuple");
+    let plan = plan_for(&f.params[0].ty, &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerSignExt { flat_slot: 1 },
+            Cell::TupleOf {
+                children: vec![0, 1]
+            },
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn nested_tuple_walks_depth_first() {
+    // tuple<u8, tuple<s32, s32>>:
+    //   u8     → cell 0 (slot 0)
+    //   s32    → cell 1 (slot 1)
+    //   s32    → cell 2 (slot 2)
+    //   inner  → cell 3 (children=[1, 2])
+    //   outer  → cell 4 (children=[0, 3])
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let f = func_named(&r, "f-tuple-of-tuple");
+    let plan = plan_for(&f.params[0].ty, &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerSignExt { flat_slot: 1 },
+            Cell::IntegerSignExt { flat_slot: 2 },
+            Cell::TupleOf {
+                children: vec![1, 2]
+            },
+            Cell::TupleOf {
+                children: vec![0, 3]
+            },
+        ],
+    );
+    assert_eq!(plan.root(), 4);
+    assert_eq!(plan.flat_slot_count, 3);
+}
+
+#[test]
+fn record_with_tuple_field_recurses_into_tuple() {
+    // point-and-tuple { p: point, t: tuple<u8, s32> }
+    //   p.x   → cell 0 (slot 0, u32)
+    //   p.y   → cell 1 (slot 1, s32)
+    //   point → cell 2 (RecordOf)
+    //   t.0   → cell 3 (slot 2, u8)
+    //   t.1   → cell 4 (slot 3, s32)
+    //   t     → cell 5 (TupleOf children=[3, 4])
+    //   pat   → cell 6 (RecordOf p=2, t=5)
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("point-and-tuple", &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerSignExt { flat_slot: 1 },
+            record_of(&mut names, "point", &[("x", 0), ("y", 1)]),
+            Cell::IntegerZeroExt { flat_slot: 2 },
+            Cell::IntegerSignExt { flat_slot: 3 },
+            Cell::TupleOf {
+                children: vec![3, 4]
+            },
+            record_of(&mut names, "point-and-tuple", &[("p", 2), ("t", 5)]),
+        ],
+    );
+    assert_eq!(plan.root(), 6);
+    assert_eq!(plan.flat_slot_count, 4);
 }
 
 #[test]
@@ -548,7 +666,7 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
     for (fn_idx, fn_expected) in expected.iter().enumerate() {
         for (param_idx, param_expected) in fn_expected.iter().enumerate() {
             assert_eq!(
-                blobs.per_param_cell_idx.for_param(fn_idx, param_idx),
+                blobs.per_cell_idx.for_param(fn_idx, param_idx),
                 *param_expected,
                 "fn {fn_idx} param {param_idx}",
             );
@@ -579,6 +697,13 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_named("color", &r, &mut names),
         plan_for_named("point", &r, &mut names),
         plan_for_named("nested", &r, &mut names),
+        plan_for(&func_named(&r, "f-tuple").params[0].ty, &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-tuple-of-tuple").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for_named("point-and-tuple", &r, &mut names),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan);

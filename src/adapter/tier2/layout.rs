@@ -16,8 +16,9 @@ use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, SymbolBases};
 use super::lift::{
-    build_enum_info_blob, build_record_info_blob, register_enum_strings, ParamLayout,
-    RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
+    build_enum_info_blob, build_record_info_blob, build_tuple_indices_blob, register_enum_strings,
+    ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout,
+    SideTableBlob, TupleIndicesBlob,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -333,6 +334,7 @@ pub(super) fn lay_out_static_memory(
     let enum_info_id = symbols.alloc();
     let record_entries_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
+    let tuple_indices_id = symbols.alloc();
     let enum_info = build_enum_info_blob(
         &per_func,
         &enum_strings,
@@ -348,9 +350,8 @@ pub(super) fn lay_out_static_memory(
         entries: record_entries_seg,
         tuples: record_tuples_seg,
         per_param_range: record_per_param_range_sym,
-        per_param_cell_idx,
         per_result_range: record_per_result_range_sym,
-        per_result_cell_idx,
+        per_cell_idx: record_info_per_cell,
     } = build_record_info_blob(
         &per_func,
         &schema.record_info_layout,
@@ -358,11 +359,14 @@ pub(super) fn lay_out_static_memory(
         record_entries_id,
         record_tuples_id,
     );
+    let TupleIndicesBlob {
+        segment: tuple_indices_seg,
+        per_cell_idx: tuple_indices_per_cell,
+    } = build_tuple_indices_blob(&per_func, tuple_indices_id);
 
     // Order doesn't matter for correctness — each placement assigns
-    // a base, relocs land later. Tuples-then-entries-then-enums is
-    // just a convenient order to coalesce same-alignment segments
-    // back-to-back.
+    // a base, relocs land later. Coalesced same-alignment segments
+    // sit back-to-back as a side effect of the order chosen here.
     let (record_tuples_base, record_tuples_idx) =
         layout.place_data(record_tuples_seg.align, &record_tuples_seg.bytes);
     symbols.set(record_tuples_seg.id, record_tuples_base);
@@ -386,8 +390,17 @@ pub(super) fn lay_out_static_memory(
     symbols.set(enum_segment.id, enum_info_base);
     relocs.record_segment(enum_info_idx, enum_info_base, enum_segment.relocs);
 
+    let (tuple_indices_base, tuple_indices_idx) =
+        layout.place_data(tuple_indices_seg.align, &tuple_indices_seg.bytes);
+    symbols.set(tuple_indices_seg.id, tuple_indices_base);
+    relocs.record_segment(
+        tuple_indices_idx,
+        tuple_indices_base,
+        tuple_indices_seg.relocs,
+    );
+
     // Resolve per-(fn, param) and per-(fn, result) [`SymRef`]s to
-    // absolute [`BlobSlice`]s now that all three segments have bases.
+    // absolute [`BlobSlice`]s now that every segment has a base.
     let enum_per_param: Vec<Vec<BlobSlice>> = enum_per_param_sym
         .into_iter()
         .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
@@ -404,6 +417,10 @@ pub(super) fn lay_out_static_memory(
         .into_iter()
         .map(|s| resolve(s, &symbols))
         .collect();
+    // Tuple-indices stay symbolic until the FuncDispatch assembly
+    // resolves them per (fn, param | result) via
+    // [`PerCellIndices::resolve_param`] /
+    // [`PerCellIndices::resolve_result`].
 
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
@@ -526,7 +543,9 @@ pub(super) fn lay_out_static_memory(
                 .map(|(p_idx, lift)| ParamLayout {
                     lift,
                     cells_offset: fn_cells_offsets[p_idx],
-                    record_info_cell_idx: per_param_cell_idx.for_param(i, p_idx).to_vec(),
+                    record_info_cell_idx: record_info_per_cell.for_param(i, p_idx).to_vec(),
+                    tuple_indices_cell_idx: tuple_indices_per_cell
+                        .resolve_param(i, p_idx, &symbols),
                 })
                 .collect();
 
@@ -543,7 +562,8 @@ pub(super) fn lay_out_static_memory(
                     ResultSource::Compound(compound) => ResultSourceLayout::Compound {
                         compound,
                         retptr_offset: retptr_offset.expect("Compound → retptr scratch reserved"),
-                        record_info_cell_idx: per_result_cell_idx[i].clone(),
+                        record_info_cell_idx: record_info_per_cell.for_result(i).to_vec(),
+                        tuple_indices_cell_idx: tuple_indices_per_cell.resolve_result(i, &symbols),
                     },
                 };
                 ResultLayout {
@@ -680,10 +700,8 @@ mod tests {
         );
         let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
         let world_id = resolve.select_world(&[world_pkg], Some("adapter")).unwrap();
-        let target_iface = super::super::test_utils::iface_by_unversioned_qname(
-            &resolve,
-            "test:layout-fixture/t",
-        );
+        let target_iface =
+            super::super::test_utils::iface_by_unversioned_qname(&resolve, "test:layout-fixture/t");
         let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
             .functions
             .values()
@@ -897,8 +915,7 @@ mod tests {
             .expect_err("flat-slot budget should bail at MAX_FLAT_SLOTS_PER_FN + 1");
         let msg = err.to_string();
         assert!(
-            msg.contains("flat-slot count")
-                && msg.contains(&MAX_FLAT_SLOTS_PER_FN.to_string()),
+            msg.contains("flat-slot count") && msg.contains(&MAX_FLAT_SLOTS_PER_FN.to_string()),
             "bail should name the budget, got: {msg}"
         );
     }

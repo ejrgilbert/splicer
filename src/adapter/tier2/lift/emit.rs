@@ -7,7 +7,7 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Resolve, SizeAlign};
 
 use super::super::super::abi::emit::{
-    direct_return_type, wasm_type_to_val, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
+    direct_return_type, wasm_type_to_val, BlobSlice, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
 use super::super::super::abi::WasmEncoderBindgen;
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
@@ -97,8 +97,17 @@ pub(crate) enum ResultEmitPlan<'a> {
         addr_local: u32,
         synth_locals: Vec<u32>,
         loads: Vec<Instruction<'static>>,
-        record_info_cell_idx: &'a [Option<u32>],
+        side_refs: CellSideRefs<'a>,
     },
+}
+
+/// Per-plan-cell side-table lookups bundled for [`emit_lift_plan`].
+/// One slice per kind, parallel to `plan.cells`. Adding a kind =
+/// adding a slice here + a [`emit_cell_op`] arm.
+#[derive(Clone, Copy)]
+pub(crate) struct CellSideRefs<'a> {
+    pub record_info_cell_idx: &'a [Option<u32>],
+    pub tuple_indices_cell_idx: &'a [Option<BlobSlice>],
 }
 
 /// Allocate every local the wrapper body will reference, build the
@@ -160,7 +169,12 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 compound,
                 retptr_offset,
                 record_info_cell_idx,
+                tuple_indices_cell_idx,
             } => {
+                let side_refs = CellSideRefs {
+                    record_info_cell_idx,
+                    tuple_indices_cell_idx,
+                };
                 let addr_local = builder.alloc_local(ValType::I32);
                 let flat = super::super::super::abi::flat_types(resolve, &compound.ty, None)
                     .unwrap_or_else(|| {
@@ -192,7 +206,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                     addr_local,
                     synth_locals,
                     loads,
-                    record_info_cell_idx,
+                    side_refs,
                 }
             }
         },
@@ -245,14 +259,19 @@ pub(crate) fn emit_lift_plan(
     cell_layout: &CellLayout,
     cells_offset: u32,
     plan: &LiftPlan,
-    record_info_indices: &[Option<u32>],
+    side_refs: CellSideRefs<'_>,
     local_base: u32,
     lcl: &WrapperLocals,
 ) {
     assert_eq!(
-        record_info_indices.len(),
+        side_refs.record_info_cell_idx.len(),
         plan.cells.len(),
         "side-table record-info indices (emit input) must have one entry per classify-time plan cell"
+    );
+    assert_eq!(
+        side_refs.tuple_indices_cell_idx.len(),
+        plan.cells.len(),
+        "side-table tuple-indices (emit input) must have one entry per classify-time plan cell"
     );
     for (cell_idx, op) in plan.cells.iter().enumerate() {
         let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
@@ -262,7 +281,8 @@ pub(crate) fn emit_lift_plan(
             f,
             cell_layout,
             op,
-            record_info_indices[cell_idx],
+            side_refs.record_info_cell_idx[cell_idx],
+            side_refs.tuple_indices_cell_idx[cell_idx],
             local_base,
             lcl,
         );
@@ -287,6 +307,7 @@ fn emit_cell_op(
     cell_layout: &CellLayout,
     op: &Cell,
     record_info_idx: Option<u32>,
+    tuple_indices_slice: Option<BlobSlice>,
     local_base: u32,
     lcl: &WrapperLocals,
 ) {
@@ -329,9 +350,13 @@ fn emit_cell_op(
                 .expect("record-info index missing — layout phase didn't backfill RecordOf cell");
             cell_layout.emit_record_of(f, addr, idx);
         }
+        Cell::TupleOf { .. } => {
+            let slice = tuple_indices_slice
+                .expect("tuple-indices slice missing — layout phase didn't backfill TupleOf cell");
+            cell_layout.emit_tuple_of(f, addr, slice.off, slice.len);
+        }
         Cell::Char
         | Cell::ListOf
-        | Cell::TupleOf
         | Cell::Option
         | Cell::Result
         | Cell::Flags
@@ -389,9 +414,9 @@ fn emit_lift_kind(
         // Compound + un-wired variants aren't valid direct/retptr-pair
         // sources; classify_result_lift's whitelist filters them out.
         Cell::RecordOf { .. }
+        | Cell::TupleOf { .. }
         | Cell::Char
         | Cell::ListOf
-        | Cell::TupleOf
         | Cell::Option
         | Cell::Result
         | Cell::Flags

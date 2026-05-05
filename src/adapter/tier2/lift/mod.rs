@@ -43,10 +43,11 @@ pub(super) use classify::{
 };
 pub(super) use emit::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    ResultEmitPlan, WrapperLocals,
+    CellSideRefs, ResultEmitPlan, WrapperLocals,
 };
 pub(super) use sidetable::enum_info::{build_enum_info_blob, register_enum_strings};
 pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
+pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
 pub(super) use sidetable::SideTableBlob;
 
 #[cfg(test)]

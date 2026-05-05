@@ -16,27 +16,7 @@ use super::super::super::schema::{
 };
 use super::super::super::FuncClassified;
 use super::super::plan::{Cell, LiftPlan};
-use super::INFO_TYPE_NAME;
-
-/// Per-(fn, param, plan-cell) record-info side-table indices. Wraps
-/// the raw triple-`Vec` so call sites read through [`for_param`]
-/// instead of three layers of `[i][j][k]`.
-///
-/// [`for_param`]: RecordInfoIndices::for_param
-pub(crate) struct RecordInfoIndices {
-    /// One Vec per function; each holds one Vec per param; each holds
-    /// per-plan-cell side-table indices (`None` for non-`RecordOf`
-    /// cells). The lift codegen reads this when emitting
-    /// `cell::record-of(idx)`.
-    per_param: Vec<Vec<Vec<Option<u32>>>>,
-}
-
-impl RecordInfoIndices {
-    /// Borrow one param's per-cell index map.
-    pub(crate) fn for_param(&self, fn_idx: usize, param_idx: usize) -> &[Option<u32>] {
-        &self.per_param[fn_idx][param_idx]
-    }
-}
+use super::{PerCellIndices, INFO_TYPE_NAME};
 
 /// Output of [`build_record_info_blob`]. Two [`Segment`]s — the
 /// `entries` segment carries one [`Reloc`] per record-cell, pointing
@@ -56,17 +36,14 @@ pub(crate) struct RecordInfoBlobs {
     /// targeting the entries segment. `None` for params with no
     /// `RecordOf` cells.
     pub per_param_range: Vec<Vec<Option<SymRef>>>,
-    /// Per (fn, param, plan-cell): record-info side-table index
-    /// (`None` for non-`RecordOf` cells). See [`RecordInfoIndices`].
-    pub per_param_cell_idx: RecordInfoIndices,
     /// Per (fn): result-side range. `None` for void / non-Compound
     /// results; populated for `Compound` results so the result tree's
     /// `record-infos` slot can patch in.
     pub per_result_range: Vec<Option<SymRef>>,
-    /// Per (fn): for each cell of the result's plan, its assigned
-    /// record-info side-table index (None for non-`RecordOf` cells).
-    /// Empty Vec for non-Compound results.
-    pub per_result_cell_idx: Vec<Vec<Option<u32>>>,
+    /// Per-cell side-table indices: `Some(i)` on `Cell::RecordOf`
+    /// cells, `None` elsewhere. Indexed via
+    /// [`PerCellIndices::for_param`] / [`PerCellIndices::for_result`].
+    pub per_cell_idx: PerCellIndices<u32>,
 }
 
 /// Accumulator for [`build_record_info_blob`]: bundles the two
@@ -216,10 +193,10 @@ pub(crate) fn build_record_info_blob(
         entries: entries_seg,
         tuples: tuples_seg,
         per_param_range,
-        per_param_cell_idx: RecordInfoIndices {
-            per_param: per_param_cell_idx,
-        },
         per_result_range,
-        per_result_cell_idx,
+        per_cell_idx: PerCellIndices {
+            per_param: per_param_cell_idx,
+            per_result: per_result_cell_idx,
+        },
     }
 }

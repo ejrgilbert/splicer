@@ -129,6 +129,10 @@ pub(crate) struct ParamLayout {
     /// Per cell of `lift.plan.cells`: the side-table index for
     /// `Cell::RecordOf` cells, `None` for other cell kinds.
     pub record_info_cell_idx: Vec<Option<u32>>,
+    /// Per cell of `lift.plan.cells`: absolute `(off, len)` into
+    /// the tuple-indices segment for `Cell::TupleOf` cells, `None`
+    /// for other kinds. Emitted as `i32.const`s into the cell payload.
+    pub tuple_indices_cell_idx: Vec<Option<BlobSlice>>,
 }
 
 /// Post-layout per-result lift descriptor: a sum-type `source`
@@ -163,6 +167,9 @@ pub(crate) enum ResultSourceLayout {
         /// for other kinds. Built unconditionally (it's a property
         /// of the cell plan, not of the after-hook wiring).
         record_info_cell_idx: Vec<Option<u32>>,
+        /// Parallel to `record_info_cell_idx`. See
+        /// [`ParamLayout::tuple_indices_cell_idx`].
+        tuple_indices_cell_idx: Vec<Option<BlobSlice>>,
     },
 }
 

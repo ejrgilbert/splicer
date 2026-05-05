@@ -88,8 +88,13 @@ pub(crate) enum Cell {
     Char,
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
-    /// `tuple<...>` → `cell::tuple-of`.
-    TupleOf,
+    /// `tuple<...>` → `cell::tuple-of(list<u32>)`. `children` are
+    /// plan-cell indices into the same [`LiftPlan::cells`]. The layout
+    /// phase packs each `children` array into the shared tuple-indices
+    /// segment; the emit phase reads the resulting per-cell
+    /// [`BlobSlice`] (off `tuple_indices_cell_idx`) and writes
+    /// `(ptr, len)` constants.
+    TupleOf { children: Vec<u32> },
     /// `option<T>` → `cell::option-some(u32)` / `cell::option-none`.
     Option,
     /// `result<T, E>` → `cell::result-ok(option<u32>)` / `cell::result-err(option<u32>)`.
@@ -253,12 +258,10 @@ impl LiftPlanBuilder {
                     self.push_cell(Cell::EnumCase { flat_slot, info })
                 }
                 wit_parser::TypeDefKind::Record(_) => self.push_record(ty, resolve, names),
+                wit_parser::TypeDefKind::Tuple(_) => self.push_tuple(ty, resolve, names),
                 wit_parser::TypeDefKind::Type(t) => self.push(t, resolve, names),
                 wit_parser::TypeDefKind::List(_) => {
                     todo!("plan-builder for un-wired Cell::ListOf")
-                }
-                wit_parser::TypeDefKind::Tuple(_) => {
-                    todo!("plan-builder for un-wired Cell::TupleOf")
                 }
                 wit_parser::TypeDefKind::Variant(_) => {
                     todo!("plan-builder for un-wired Cell::Variant")
@@ -340,6 +343,24 @@ impl LiftPlanBuilder {
         // Push the fully-built parent. Lands at the current end of
         // `cells`, after all of its children.
         self.push_cell(Cell::RecordOf { type_name, fields })
+    }
+
+    /// Same shape as [`Self::push_record`], minus the type/field
+    /// names — `tuple<...>` is anonymous; the cell payload is just
+    /// child cell indices.
+    fn push_tuple(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
+        let Type::Id(id) = ty else {
+            unreachable!("Tuple kind came from non-Id type")
+        };
+        let typedef = &resolve.types[*id];
+        let wit_parser::TypeDefKind::Tuple(t) = &typedef.kind else {
+            unreachable!("Tuple kind came from non-Tuple TypeDefKind")
+        };
+        let mut children = Vec::with_capacity(t.types.len());
+        for elem_ty in &t.types {
+            children.push(self.push(elem_ty, resolve, names));
+        }
+        self.push_cell(Cell::TupleOf { children })
     }
 
     pub(super) fn into_plan(self, root: u32) -> LiftPlan {
