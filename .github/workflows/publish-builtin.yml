@@ -1,0 +1,136 @@
+name: Publish Builtin
+
+on:
+  workflow_dispatch:
+    inputs:
+      builtin:
+        description: "Which builtin under builtins/ to publish"
+        required: true
+        type: choice
+        options:
+          - hello-tier1
+          - otel-bare-logs
+          - otel-bare-metrics
+          - otel-bare-spans
+      description:
+        description: "Package description shown on GHCR"
+        required: false
+        type: string
+        default: "Splicer builtin middleware component"
+
+env:
+  # Pinned to match publish-wit.yml. Do not bump without coordinating: newer wkg
+  # emits component-model encodings older wkg can't decode, and wkg 0.14+ has
+  # stricter name validation that rejects `[async]` externs in wasi:http et al.
+  WKG_VERSION: "0.13.0"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      packages: write
+      contents: read
+      attestations: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install build-time tooling
+        run: |
+          cargo binstall -y "wkg@${{ env.WKG_VERSION }}"
+          cargo binstall -y wasm-tools
+
+      - name: Add wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          toml="builtins/${{ inputs.builtin }}/Cargo.toml"
+          version=$(grep -E '^version = ' "$toml" \
+            | head -n 1 \
+            | sed -E 's/version = "([^"]+)".*/\1/')
+          if [ -z "$version" ]; then
+            echo "::error file=$toml::Could not find 'version = \"<x>\"' declaration"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $version"
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fail if version already published
+        env:
+          REF: "ghcr.io/${{ github.repository_owner }}/splicer/builtins/${{ inputs.builtin }}:${{ steps.version.outputs.version }}"
+        run: |
+          if docker manifest inspect "$REF" >/dev/null 2>&1; then
+            echo "::error file=builtins/${{ inputs.builtin }}/Cargo.toml::$REF is already published. Bump the version in Cargo.toml before publishing."
+            exit 1
+          fi
+          echo "$REF not yet published — proceeding."
+
+      - name: Build builtin component
+        env:
+          # Resolves cross-package WIT `use` clauses against ghcr.io
+          # for any wasi:* deps the builtin pulls in.
+          WKG_CONFIG_FILE: ${{ github.workspace }}/wkg-registries.toml
+        run: |
+          make "assets/builtins/${{ inputs.builtin }}.wasm"
+
+      - name: Publish to GitHub Container Registry
+        id: publish
+        # Pinned to the commit that wires `inputs.wkg` through to the
+        # installer (PR #12). The latest tag (v5) predates this, so a
+        # tag pin would silently install latest wkg and reject the
+        # `[async]` externs we emit. Match publish-wit.yml.
+        # TODO: Pin to a tag once it's available
+        uses: bytecodealliance/wkg-github-action@5b7005d1fc81c8c3380a059e58345033e3a97638
+        with:
+          wkg: ${{ env.WKG_VERSION }}
+          file: assets/builtins/${{ inputs.builtin }}.wasm
+          oci-reference-without-tag: ghcr.io/${{ github.repository_owner }}/splicer/builtins/${{ inputs.builtin }}
+          version: ${{ steps.version.outputs.version }}
+          description: ${{ inputs.description }}
+          source: https://github.com/${{ github.repository }}
+          homepage: https://github.com/${{ github.repository }}
+          licenses: Apache-2.0
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/splicer/builtins/${{ inputs.builtin }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Summarize published artifact
+        env:
+          REF: "ghcr.io/${{ github.repository_owner }}/splicer/builtins/${{ inputs.builtin }}:${{ steps.version.outputs.version }}"
+          WEB_URL: "https://github.com/${{ github.repository_owner }}/splicer/pkgs/container/splicer%2Fbuiltins%2F${{ inputs.builtin }}"
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          {
+            echo "### Published builtin component"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| OCI reference | \`$REF\` |"
+            echo "| Digest | \`$DIGEST\` |"
+            echo "| Package page | $WEB_URL |"
+            echo ""
+            echo "Pull with:"
+            echo '```'
+            echo "wkg oci pull $REF"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Published $REF"
+          echo "See: $WEB_URL"
