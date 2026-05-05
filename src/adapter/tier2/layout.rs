@@ -15,11 +15,13 @@ use wit_parser::Function as WitFunction;
 use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, SymbolBases};
+use super::lift::plan::Cell;
 use super::lift::{
     back_fill_flags_len_addrs, build_enum_info_blob, build_flags_info_blob, build_record_info_blob,
     build_tuple_indices_blob, flags_scratch_sizes, fold_cell_side_data, register_enum_strings,
-    register_flags_strings, FlagsInfoBlobs, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
-    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob,
+    register_flags_strings, CellSideData, FlagsInfoBlobs, FlagsRuntimeFill, ParamLayout,
+    RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
+    TupleIndicesBlob,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -96,6 +98,19 @@ fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Wrap the per-fn flags fill into a `CellSideData::Flags` when the
+/// result cell is `Cell::Flags`, else `None`. Shared between the
+/// `Direct` and `RetptrPair` arms.
+fn single_cell_flags_side_data(cell: &Cell, fill: &Option<FlagsRuntimeFill>) -> CellSideData {
+    match cell {
+        Cell::Flags { .. } => CellSideData::Flags(Box::new(
+            fill.clone()
+                .expect("flags single-cell result → flags-info builder must produce a fill"),
+        )),
+        _ => CellSideData::None,
+    }
 }
 
 /// Output of the static-memory layout phase: the addresses the
@@ -365,6 +380,7 @@ pub(super) fn lay_out_static_memory(
         per_param_range: flags_per_param_range_sym,
         per_result_range: flags_per_result_range_sym,
         per_cell_fill: mut flags_per_cell_fill,
+        per_result_single_fill: mut flags_per_result_single_fill,
     } = build_flags_info_blob(
         &per_func,
         &flags_strings,
@@ -428,6 +444,7 @@ pub(super) fn lay_out_static_memory(
     debug_assert!(flags_entries_seg.relocs.is_empty());
     back_fill_flags_len_addrs(
         &mut flags_per_cell_fill,
+        &mut flags_per_result_single_fill,
         flags_entries_base,
         &schema.flags_info_layout,
     );
@@ -607,11 +624,21 @@ pub(super) fn lay_out_static_memory(
             let result_lift = fc.result_lift.map(|rl| {
                 let ResultLift { source, .. } = rl;
                 let layout_source = match source {
-                    ResultSource::Direct(cell) => ResultSourceLayout::Direct(cell),
-                    ResultSource::RetptrPair(cell) => ResultSourceLayout::RetptrPair {
-                        cell,
-                        retptr_offset: retptr_offset.expect("RetptrPair → retptr scratch reserved"),
-                    },
+                    ResultSource::Direct(cell) => {
+                        let side_data =
+                            single_cell_flags_side_data(&cell, &flags_per_result_single_fill[i]);
+                        ResultSourceLayout::Direct { cell, side_data }
+                    }
+                    ResultSource::RetptrPair(cell) => {
+                        let side_data =
+                            single_cell_flags_side_data(&cell, &flags_per_result_single_fill[i]);
+                        ResultSourceLayout::RetptrPair {
+                            cell,
+                            retptr_offset: retptr_offset
+                                .expect("RetptrPair → retptr scratch reserved"),
+                            side_data,
+                        }
+                    }
                     ResultSource::Compound(compound) => {
                         let tuple_slices = tuple_indices_per_cell.resolve_result(i, &symbols);
                         let cell_side = fold_cell_side_data(

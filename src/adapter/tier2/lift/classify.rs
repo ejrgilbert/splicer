@@ -145,10 +145,20 @@ pub(crate) struct ResultLayout {
 pub(crate) enum ResultSourceLayout {
     /// Direct primitive (no retptr): source is `lcl.result`. See
     /// [`ResultSource::Direct`] for the placeholder-slot convention.
-    Direct(Cell),
-    /// `(ptr, len)` pair at the function's retptr scratch. See
-    /// [`ResultSource::RetptrPair`] for the placeholder-slot convention.
-    RetptrPair { cell: Cell, retptr_offset: i32 },
+    /// `side_data` carries any per-kind layout-phase bookkeeping
+    /// (today: `Flags(Box<FlagsRuntimeFill>)` for flags-typed
+    /// results); `None` for kinds that lift purely from the source
+    /// local.
+    Direct { cell: Cell, side_data: CellSideData },
+    /// Single-cell result loaded from retptr scratch — the wrapper
+    /// reads the first two i32s at `retptr_offset` (Text/Bytes use
+    /// both as `(ptr, len)`; flags / single-i32 returns via async
+    /// retptr only use the first). `side_data` mirrors `Direct`.
+    RetptrPair {
+        cell: Cell,
+        retptr_offset: i32,
+        side_data: CellSideData,
+    },
     /// Compound result: classify-time recipe + retptr scratch +
     /// per-cell side-table data. The cells-slab base lives on
     /// [`super::super::AfterSetup::result_cells_offset`] (today's
@@ -162,15 +172,16 @@ pub(crate) enum ResultSourceLayout {
     },
 }
 
-/// Result-side-table info, populated when a result is lift-able.
-/// Mirrors the per-kind options on `SideTableInfo` but only for
-/// results (params now carry their info inline in their LiftPlan
-/// `Cell`s).
+/// Result-side per-kind info. Populated when a single-cell direct
+/// result needs side-table entries (enum cases / flag names).
 #[derive(Default, Clone)]
 pub(super) struct SideTableInfo {
-    /// `Some` for enum-typed result lifts: carries the enum's type-name
-    /// plus its case names in disc order.
+    /// `Some` for enum-typed result lifts: type-name + case names in
+    /// disc order.
     pub(super) enum_info: Option<NamedListInfo>,
+    /// `Some` for flags-typed result lifts: type-name + flag names in
+    /// declaration (= bit) order.
+    pub(super) flags_info: Option<NamedListInfo>,
 }
 
 // ─── Classifiers ──────────────────────────────────────────────────
@@ -233,9 +244,8 @@ pub(crate) fn classify_result_lift(
 
     // Single-cell direct/retptr-pair path: build a one-cell plan and
     // pull its single Cell out as the variant tag for emit dispatch.
-    // Returns None for un-wired result types (variant / list /
-    // flags / etc.) — wrapper still calls after-hook with
-    // option::none for `result`.
+    // Returns None for un-wired result types (variant / list / etc.)
+    // — wrapper still calls after-hook with option::none for `result`.
     let cell = single_cell_for_result(ty, resolve, names)?;
     let side_table = side_table_info_for_cell(&cell);
     let source = if result_at_retptr {
@@ -249,7 +259,9 @@ pub(crate) fn classify_result_lift(
 /// Whether `ty` resolves (through type aliases) to a compound kind
 /// whose result-side codegen is wired today: `record`, `tuple<...>`,
 /// `option<T>`, or `result<T, E>`. Other compound kinds (variant /
-/// flags / etc.) bail out at [`classify_result_lift`] for now.
+/// etc.) bail out at [`classify_result_lift`] for now. Flags is
+/// single-cell, not compound, and goes through the Direct/RetptrPair
+/// path.
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
@@ -279,9 +291,9 @@ fn single_cell_for_result(ty: &Type, resolve: &Resolve, names: &mut NameInterner
 }
 
 /// Whitelist of WIT types whose lift codegen [`super::emit::emit_lift_kind`]
-/// can drive. Mirrors the wired primitive / text / bytes / enum arms
-/// of [`LiftPlanBuilder::push`]; new direct/retptr-pair kinds wire up
-/// here.
+/// can drive. Mirrors the wired primitive / text / bytes / enum / flags
+/// arms of [`LiftPlanBuilder::push`]; new direct/retptr-pair kinds wire
+/// up here.
 fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
     match ty {
         Type::Bool
@@ -300,6 +312,7 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
         Type::Id(id) => match &resolve.types[*id].kind {
             wit_parser::TypeDefKind::List(Type::U8) => true,
             wit_parser::TypeDefKind::Enum(_) => true,
+            wit_parser::TypeDefKind::Flags(_) => true,
             wit_parser::TypeDefKind::Type(t) => is_supported_direct_result(t, resolve),
             _ => false,
         },
@@ -307,15 +320,18 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
 }
 
 /// Build the `SideTableInfo` for a single-cell result. Empty for
-/// primitive lifts; populated for variants that need per-tree
-/// side-table entries (currently only enum).
+/// primitive lifts; populated for kinds that need per-tree side-table
+/// entries (today: enum, flags).
 fn side_table_info_for_cell(cell: &Cell) -> SideTableInfo {
     let mut info = SideTableInfo::default();
-    if let Cell::EnumCase {
-        info: enum_info, ..
-    } = cell
-    {
-        info.enum_info = Some(enum_info.clone());
+    match cell {
+        Cell::EnumCase {
+            info: enum_info, ..
+        } => info.enum_info = Some(enum_info.clone()),
+        Cell::Flags {
+            info: flags_info, ..
+        } => info.flags_info = Some(flags_info.clone()),
+        _ => {}
     }
     info
 }

@@ -299,6 +299,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 flags_cursor += U32_BYTES;
                 let fill = FlagsRuntimeFill {
                     side_table_idx: flags_idx,
+                    entry_seg_off: 0, // not exercised by validate_emit_lift_plan
                     set_flags_len_addr: Some(set_flags_len_addr as i32),
                     scratch_addr: scratch_addr as i32,
                     flag_names: info

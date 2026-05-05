@@ -63,27 +63,35 @@ pub(crate) struct WrapperLocals {
 /// in [`alloc_wrapper_locals`] from the layout-phase
 /// [`super::classify::ResultLayout`] + the locals just allocated, then
 /// consumed by the wrapper-body emitter's phase-3 result-lift block
-/// via a single pattern match. Replaces the prior pile of parallel
-/// `Option`-shaped fields whose Some-ness had to agree by hand.
-/// Borrows the layout-time per-cell record-info index map from the
-/// owning [`FuncDispatch`].
+/// via a single pattern match. Compound borrows the layout-time
+/// per-cell side-table data; Direct / RetptrPair carry it inline.
 pub(crate) enum ResultEmitPlan<'a> {
     /// Void function or unsupported result kind: no lift fires.
     None,
     /// Direct primitive return — source value already in
     /// `source_local` (captured from the handler's flat return after
-    /// the call). [`Cell`] carries the variant tag for emit dispatch.
-    Direct { cell: Cell, source_local: u32 },
+    /// the call). [`Cell`] carries the variant tag for emit dispatch;
+    /// `side_data` carries any per-kind layout-phase bookkeeping
+    /// (today: `Flags` for flags-typed results), `None` for kinds
+    /// whose lift reads only `source_local`.
+    Direct {
+        cell: Cell,
+        source_local: u32,
+        side_data: CellSideData,
+    },
     /// `(ptr, len)` pair lives at `retptr_offset` in static scratch.
     /// The wrapper loads the pair into `ptr_local` / `len_local`
     /// before lifting (today these are always `lcl.ptr_scratch` /
     /// `lcl.len_scratch` — the variant carries them so the consumer
     /// doesn't re-thread `&WrapperLocals` for that lookup).
+    /// `side_data` mirrors [`Self::Direct`] for flags-typed async
+    /// retptr returns; `None` for Text / Bytes.
     RetptrPair {
         cell: Cell,
         retptr_offset: i32,
         ptr_local: u32,
         len_local: u32,
+        side_data: CellSideData,
     },
     /// Compound result: classify-time cell plan + layout offsets +
     /// emit-time locals/loads. `addr_local` drives the
@@ -154,19 +162,22 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let result_emit = match fd.result_lift.as_ref() {
         None => ResultEmitPlan::None,
         Some(rl) => match &rl.source {
-            ResultSourceLayout::Direct(cell) => ResultEmitPlan::Direct {
+            ResultSourceLayout::Direct { cell, side_data } => ResultEmitPlan::Direct {
                 cell: cell.clone(),
                 source_local: result
                     .expect("ResultSourceLayout::Direct → direct-return local allocated"),
+                side_data: side_data.clone(),
             },
             ResultSourceLayout::RetptrPair {
                 cell,
                 retptr_offset,
+                side_data,
             } => ResultEmitPlan::RetptrPair {
                 cell: cell.clone(),
                 retptr_offset: *retptr_offset,
                 ptr_local: ptr_scratch,
                 len_local: len_scratch,
+                side_data: side_data.clone(),
             },
             ResultSourceLayout::Compound {
                 compound,
@@ -466,6 +477,7 @@ fn emit_lift_kind(
     f: &mut Function,
     cell_layout: &CellLayout,
     cell: &Cell,
+    side_data: &CellSideData,
     slot0: u32,
     slot1: u32,
     lcl: &WrapperLocals,
@@ -496,6 +508,13 @@ fn emit_lift_kind(
         Cell::Text { .. } => cell_layout.emit_text(f, addr, slot0, slot1),
         Cell::Bytes { .. } => cell_layout.emit_bytes(f, addr, slot0, slot1),
         Cell::EnumCase { .. } => cell_layout.emit_enum_case(f, addr, slot0),
+        Cell::Flags { .. } => {
+            let CellSideData::Flags(fill) = side_data else {
+                panic!("Flags cell paired with non-Flags side data {side_data:?}");
+            };
+            emit_flags_runtime_fill(f, slot0, fill, lcl);
+            cell_layout.emit_flags_set(f, addr, fill.side_table_idx);
+        }
         // Compound + un-wired variants aren't valid direct/retptr-pair
         // sources; classify_result_lift's whitelist filters them out.
         Cell::RecordOf { .. }
@@ -504,7 +523,6 @@ fn emit_lift_kind(
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }
-        | Cell::Flags { .. }
         | Cell::Variant
         | Cell::Handle
         | Cell::Future
@@ -532,14 +550,27 @@ pub(crate) fn emit_lift_result(
     lcl: &WrapperLocals,
 ) {
     match plan {
-        ResultEmitPlan::Direct { cell, source_local } => {
-            emit_lift_kind(f, cell_layout, cell, *source_local, *source_local, lcl);
+        ResultEmitPlan::Direct {
+            cell,
+            source_local,
+            side_data,
+        } => {
+            emit_lift_kind(
+                f,
+                cell_layout,
+                cell,
+                side_data,
+                *source_local,
+                *source_local,
+                lcl,
+            );
         }
         ResultEmitPlan::RetptrPair {
             cell,
             retptr_offset,
             ptr_local,
             len_local,
+            side_data,
         } => {
             f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
@@ -555,7 +586,7 @@ pub(crate) fn emit_lift_result(
                 memory_index: 0,
             });
             f.instructions().local_set(*len_local);
-            emit_lift_kind(f, cell_layout, cell, *ptr_local, *len_local, lcl);
+            emit_lift_kind(f, cell_layout, cell, side_data, *ptr_local, *len_local, lcl);
         }
         ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
             "compound results are emitted directly via emit_lift_compound_prefix + \

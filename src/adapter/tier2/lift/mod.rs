@@ -49,11 +49,11 @@ pub(super) use emit::{
 pub(super) use sidetable::enum_info::{build_enum_info_blob, register_enum_strings};
 pub(super) use sidetable::flags_info::{
     back_fill_len_addrs as back_fill_flags_len_addrs, build_flags_info_blob, flags_scratch_sizes,
-    register_flags_strings, FlagsInfoBlobs,
+    register_flags_strings, FlagsInfoBlobs, FlagsRuntimeFill,
 };
 pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
 pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
-pub(super) use sidetable::{fold_cell_side_data, SideTableBlob};
+pub(super) use sidetable::{fold_cell_side_data, CellSideData, SideTableBlob};
 
 #[cfg(test)]
 mod tests;
