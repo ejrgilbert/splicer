@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use super::super::super::abi::emit::{BlobSlice, RecordLayout};
-use super::super::blob::{RecordWriter, Segment, SymRef, SymbolId};
+use super::super::blob::{NameInterner, RecordWriter, Segment, SymRef, SymbolId};
 use super::super::FuncClassified;
 use super::classify::SideTableInfo;
 use super::plan::{LiftPlan, NamedListInfo};
@@ -71,10 +71,11 @@ pub(crate) struct SideTableBlob {
 }
 
 /// Walk every param / result; for each lift that surfaces a
-/// [`NamedListInfo`] of this kind, append its strings to `name_blob`
-/// (deduped per type-name). Returns the per-type string offsets so
-/// the side-table builder can stitch entries together without
-/// re-scanning `name_blob`.
+/// [`NamedListInfo`] of this kind, intern its strings into `names`
+/// (the interner already dedupes, so type-name + item-names that
+/// recur across functions share one copy in the blob). Returns the
+/// per-type string offsets so the side-table builder can stitch
+/// entries together without re-scanning the blob.
 ///
 /// `from_plan` extracts the kind's infos from a per-param
 /// [`LiftPlan`] (multiple infos possible if the plan has multiple
@@ -83,7 +84,7 @@ pub(crate) struct SideTableBlob {
 /// results today are single-cell).
 pub(super) fn register_side_table_strings(
     per_func: &[FuncClassified],
-    name_blob: &mut Vec<u8>,
+    names: &mut NameInterner,
     from_plan: impl Fn(&LiftPlan) -> Vec<&NamedListInfo>,
     from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
 ) -> StringTable {
@@ -91,41 +92,28 @@ pub(super) fn register_side_table_strings(
     for fd in per_func {
         for p in &fd.params {
             for info in from_plan(&p.plan) {
-                ensure_registered(&mut table, name_blob, info);
+                ensure_registered(&mut table, names, info);
             }
         }
         if let Some(rl) = &fd.result_lift {
             if let Some(info) = from_result(&rl.side_table) {
-                ensure_registered(&mut table, name_blob, info);
+                ensure_registered(&mut table, names, info);
             }
         }
     }
     table
 }
 
-fn ensure_registered(table: &mut StringTable, name_blob: &mut Vec<u8>, info: &NamedListInfo) {
+fn ensure_registered(table: &mut StringTable, names: &mut NameInterner, info: &NamedListInfo) {
     if table.contains_key(&info.type_name) {
         return;
     }
-    let type_name = append_string(name_blob, &info.type_name);
-    let items = info
-        .item_names
-        .iter()
-        .map(|n| append_string(name_blob, n))
-        .collect();
+    let type_name = names.intern(&info.type_name);
+    let items = info.item_names.iter().map(|n| names.intern(n)).collect();
     table.insert(
         info.type_name.clone(),
         NamedListStrings { type_name, items },
     );
-}
-
-pub(super) fn append_string(name_blob: &mut Vec<u8>, s: &str) -> BlobSlice {
-    let off = name_blob.len() as u32;
-    name_blob.extend_from_slice(s.as_bytes());
-    BlobSlice {
-        off,
-        len: s.len() as u32,
-    }
 }
 
 /// Lay out one per-case-kind side table. For per-case kinds (enum,

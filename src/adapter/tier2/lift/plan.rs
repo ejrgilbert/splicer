@@ -24,6 +24,9 @@
 
 use wit_parser::{Resolve, Type};
 
+use super::super::super::abi::emit::BlobSlice;
+use super::super::blob::NameInterner;
+
 /// One cell to write at a known cell-array index. Each variant
 /// captures the cell's runtime-disc semantics, its source flat
 /// slots (plan-relative, 0-based — the emit phase adds a
@@ -66,12 +69,15 @@ pub(crate) enum Cell {
     EnumCase { flat_slot: u32, info: NamedListInfo },
     /// `record { ... }` → `cell::record-of(u32)` (side-table index).
     /// Children live elsewhere in the same plan; `fields` references
-    /// them by `LiftPlan::cells` position.
+    /// them by `LiftPlan::cells` position. `type_name` and each
+    /// field's name are pre-interned [`BlobSlice`]s into the shared
+    /// name blob — the side-table builder writes them straight into
+    /// the `record-info` segment without re-interning.
     RecordOf {
-        type_name: String,
+        type_name: BlobSlice,
         /// `(field-name, child-cell-idx)` per field, in WIT order.
         /// `child-cell-idx` indexes into the same `LiftPlan::cells`.
-        fields: Vec<(String, u32)>,
+        fields: Vec<(BlobSlice, u32)>,
     },
 
     // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
@@ -123,10 +129,11 @@ impl LiftPlan {
     /// for both the per-param and the compound-result classifiers —
     /// each builds one plan from one `Type`, the only difference is
     /// what the caller wraps it in (`ParamLift` vs `CompoundResult`)
-    /// and what `local_base` the emit phase supplies.
-    pub(super) fn for_type(ty: &Type, resolve: &Resolve) -> Self {
+    /// and what `local_base` the emit phase supplies. `names` interns
+    /// every record type-name and field-name as the plan is built.
+    pub(super) fn for_type(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Self {
         let mut builder = LiftPlanBuilder::new();
-        builder.push(ty, resolve);
+        builder.push(ty, resolve, names);
         builder.into_plan()
     }
 
@@ -139,15 +146,6 @@ impl LiftPlan {
     pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
         self.cells.iter().filter_map(|op| match op {
             Cell::EnumCase { info, .. } => Some(info),
-            _ => None,
-        })
-    }
-
-    /// Iterator over every `Cell::RecordOf` in the plan. Used by
-    /// the record-info side-table builder.
-    pub(super) fn record_ofs(&self) -> impl Iterator<Item = (&str, &[(String, u32)])> {
-        self.cells.iter().filter_map(|op| match op {
-            Cell::RecordOf { type_name, fields } => Some((type_name.as_str(), fields.as_slice())),
             _ => None,
         })
     }
@@ -184,7 +182,9 @@ impl LiftPlanBuilder {
 
     /// Push cells for one lift; returns the root cell's index. Type
     /// aliases peel through and reclassify the underlying type.
-    pub(super) fn push(&mut self, ty: &Type, resolve: &Resolve) -> u32 {
+    /// `names` interns record type-names and field-names so the
+    /// resulting [`Cell::RecordOf`]s carry pre-interned [`BlobSlice`]s.
+    pub(super) fn push(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
         let root_idx = self.cells.len() as u32;
         match ty {
             Type::Bool => {
@@ -230,8 +230,10 @@ impl LiftPlanBuilder {
                     let flat_slot = self.bump_flat_slot();
                     self.cells.push(Cell::EnumCase { flat_slot, info });
                 }
-                wit_parser::TypeDefKind::Record(_) => self.push_record(ty, resolve, root_idx),
-                wit_parser::TypeDefKind::Type(t) => return self.push(t, resolve),
+                wit_parser::TypeDefKind::Record(_) => {
+                    self.push_record(ty, resolve, names, root_idx)
+                }
+                wit_parser::TypeDefKind::Type(t) => return self.push(t, resolve, names),
                 wit_parser::TypeDefKind::List(_) => {
                     todo!("plan-builder for un-wired Cell::ListOf")
                 }
@@ -286,8 +288,16 @@ impl LiftPlanBuilder {
     /// Records: push the parent first, recurse on each field
     /// (children get appended to `cells` AFTER the parent, so their
     /// returned root indices are the indices the parent's `fields`
-    /// list needs), then backfill the parent's `fields`.
-    fn push_record(&mut self, ty: &Type, resolve: &Resolve, root_idx: u32) {
+    /// list needs), then backfill the parent's `fields`. The
+    /// type-name and field-name strings are interned into `names`
+    /// up-front so the pushed cell already carries [`BlobSlice`]s.
+    fn push_record(
+        &mut self,
+        ty: &Type,
+        resolve: &Resolve,
+        names: &mut NameInterner,
+        root_idx: u32,
+    ) {
         let Type::Id(id) = ty else {
             unreachable!("Record kind came from non-Id type")
         };
@@ -295,7 +305,7 @@ impl LiftPlanBuilder {
         let wit_parser::TypeDefKind::Record(r) = &typedef.kind else {
             unreachable!("Record kind came from non-Record TypeDefKind")
         };
-        let type_name = typedef.name.clone().unwrap_or_default();
+        let type_name = names.intern(typedef.name.as_deref().unwrap_or(""));
         // Reserve the parent slot at root_idx.
         self.cells.push(Cell::RecordOf {
             type_name,
@@ -304,8 +314,9 @@ impl LiftPlanBuilder {
         // Recurse on each field; children get appended after parent.
         let mut fields = Vec::with_capacity(r.fields.len());
         for field in &r.fields {
-            let child_idx = self.push(&field.ty, resolve);
-            fields.push((field.name.clone(), child_idx));
+            let name_slice = names.intern(&field.name);
+            let child_idx = self.push(&field.ty, resolve, names);
+            fields.push((name_slice, child_idx));
         }
         // Backfill the parent's `fields` with the now-known child indices.
         match &mut self.cells[root_idx as usize] {

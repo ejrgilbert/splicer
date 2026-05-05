@@ -14,6 +14,8 @@
 //! This makes segment placement order commutative — no
 //! "patch-then-translate" sequence to get wrong.
 
+use std::collections::HashMap;
+
 use super::super::abi::emit::{BlobSlice, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET};
 
 // Variant disc values for `option<T>`. Fixed by the canonical-ABI
@@ -23,6 +25,50 @@ use super::super::abi::emit::{BlobSlice, RecordLayout, SLICE_LEN_OFFSET, SLICE_P
 // spec values.
 const OPTION_NONE: u8 = 0;
 const OPTION_SOME: u8 = 1;
+
+/// Append-only string interner whose handle type is [`BlobSlice`].
+/// Wraps the `Vec<u8>` that backs the tier-2 name-blob data segment;
+/// the order in which `intern` is called determines the byte offsets
+/// reported back as [`BlobSlice::off`] — that ordering used to be a
+/// comment ("appending order determines offset") and is now a type
+/// contract: callers can only produce a [`BlobSlice`] by going through
+/// `intern`, and the only way to surface the bytes is `into_bytes`.
+///
+/// Repeat calls with the same string return the same [`BlobSlice`]
+/// (offset + length) so `point` mentioned in two different functions
+/// only contributes one copy of `"point"` / `"x"` / `"y"` to the blob.
+pub(crate) struct NameInterner {
+    bytes: Vec<u8>,
+    seen: HashMap<String, BlobSlice>,
+}
+
+impl NameInterner {
+    pub(crate) fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Append `s` to the blob if not already present, returning the
+    /// `(offset, len)` slice for it.
+    pub(crate) fn intern(&mut self, s: &str) -> BlobSlice {
+        if let Some(&slice) = self.seen.get(s) {
+            return slice;
+        }
+        let slice = BlobSlice {
+            off: self.bytes.len() as u32,
+            len: s.len() as u32,
+        };
+        self.bytes.extend_from_slice(s.as_bytes());
+        self.seen.insert(s.to_string(), slice);
+        slice
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
 
 /// Identifier handed out by [`SymbolBases::alloc`]; names a future
 /// data-segment base address that is not yet known at build time.

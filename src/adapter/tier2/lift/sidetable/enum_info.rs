@@ -4,7 +4,7 @@
 //! `enum_info` field on `SideTableInfo`.
 
 use super::super::super::super::abi::emit::RecordLayout;
-use super::super::super::blob::SymbolId;
+use super::super::super::blob::{NameInterner, SymbolId};
 use super::super::super::FuncClassified;
 use super::{
     build_side_table_blob, register_side_table_strings, SideTableBlob, SideTableSpec, StringTable,
@@ -17,11 +17,11 @@ const ENUM_INFO_CASE_NAME: &str = "case-name";
 /// `Cell::EnumCase`.
 pub(crate) fn register_enum_strings(
     per_func: &[FuncClassified],
-    name_blob: &mut Vec<u8>,
+    names: &mut NameInterner,
 ) -> StringTable {
     register_side_table_strings(
         per_func,
-        name_blob,
+        names,
         |plan| plan.enum_infos().collect(),
         |st| st.enum_info.as_ref(),
     )

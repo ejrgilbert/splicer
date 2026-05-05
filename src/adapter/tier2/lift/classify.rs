@@ -17,6 +17,7 @@
 use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
+use super::super::blob::NameInterner;
 use super::plan::{Cell, LiftPlan, NamedListInfo};
 
 // ─── Result-lift descriptors (classify-time, immutable) ───────────
@@ -185,26 +186,17 @@ pub(super) struct SideTableInfo {
 pub(crate) fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
-    name_blob: &mut Vec<u8>,
+    names: &mut NameInterner,
 ) -> Vec<ParamLift> {
     let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
     for param in &func.params {
-        let name = append_param_name(name_blob, &param.name);
+        let name = names.intern(&param.name);
         params_lift.push(ParamLift {
             name,
-            plan: LiftPlan::for_type(&param.ty, resolve),
+            plan: LiftPlan::for_type(&param.ty, resolve, names),
         });
     }
     params_lift
-}
-
-fn append_param_name(name_blob: &mut Vec<u8>, name: &str) -> BlobSlice {
-    let off = name_blob.len() as u32;
-    name_blob.extend_from_slice(name.as_bytes());
-    BlobSlice {
-        off,
-        len: name.len() as u32,
-    }
 }
 
 /// Classify the function's return value for on-return lift. Direct
@@ -224,6 +216,7 @@ pub(crate) fn classify_result_lift(
     resolve: &Resolve,
     func: &WitFunction,
     result_at_retptr: bool,
+    names: &mut NameInterner,
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
 
@@ -233,7 +226,7 @@ pub(crate) fn classify_result_lift(
     // synth_locals[0]` (see `alloc_wrapper_locals`) so the same plan
     // serves both the side-table builders and codegen.
     if is_compound_result(ty, resolve) {
-        let plan = LiftPlan::for_type(ty, resolve);
+        let plan = LiftPlan::for_type(ty, resolve, names);
         return Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
             side_table: SideTableInfo::default(),
@@ -245,7 +238,7 @@ pub(crate) fn classify_result_lift(
     // Returns None for un-wired result types (variants / option /
     // list / etc.) — wrapper still calls after-hook with
     // option::none for `result`.
-    let cell = single_cell_for_result(ty, resolve)?;
+    let cell = single_cell_for_result(ty, resolve, names)?;
     let side_table = side_table_info_for_cell(&cell);
     let source = if result_at_retptr {
         ResultSource::RetptrPair(cell)
@@ -273,12 +266,14 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
 /// Build a single-cell [`Cell`] for a non-compound result type by
 /// running it through a one-cell [`LiftPlanBuilder`]. Returns `None`
 /// for un-wired result types — the supported set tracks the wired
-/// arms in [`super::emit::emit_lift_kind`].
-fn single_cell_for_result(ty: &Type, resolve: &Resolve) -> Option<Cell> {
+/// arms in [`super::emit::emit_lift_kind`]. Direct/retptr-pair
+/// kinds never produce a `RecordOf`, so the interner is just
+/// threaded through for [`LiftPlan::for_type`]'s uniform signature.
+fn single_cell_for_result(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Option<Cell> {
     if !is_supported_direct_result(ty, resolve) {
         return None;
     }
-    let plan = LiftPlan::for_type(ty, resolve);
+    let plan = LiftPlan::for_type(ty, resolve, names);
     Some(plan.cells.into_iter().next().expect("push appended a cell"))
 }
 

@@ -57,6 +57,7 @@ use super::abi::emit::{
     BlobSlice,
 };
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
+use blob::NameInterner;
 use layout::lay_out_static_memory;
 use lift::{classify_func_params, classify_result_lift, ParamLift, ResultLift};
 use schema::compute_schema;
@@ -114,15 +115,11 @@ pub(super) fn build_tier2_adapter(
         .collect();
     let schema = compute_schema(&resolve, world_id, has_before, has_after)?;
 
-    let iface_name = BlobSlice {
-        off: 0,
-        len: target_interface.len() as u32,
-    };
-    let mut name_blob: Vec<u8> = target_interface.as_bytes().to_vec();
-    let classified = build_per_func_classified(&resolve, target_iface, &funcs, &mut name_blob)?;
+    let mut names = NameInterner::new();
+    let iface_name = names.intern(target_interface);
+    let classified = build_per_func_classified(&resolve, target_iface, &funcs, &mut names)?;
 
-    let (per_func, plan) =
-        lay_out_static_memory(classified, &funcs, &schema, &mut name_blob, iface_name)?;
+    let (per_func, plan) = lay_out_static_memory(classified, &funcs, &schema, names, iface_name)?;
 
     let mut core_module = build_dispatch_module(&resolve, &schema, &per_func, plan, iface_name);
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
@@ -432,23 +429,22 @@ pub(in crate::adapter::tier2) struct FuncDispatch {
 /// the result for on-return lift. Output has no static-memory
 /// offsets — those are computed by [`layout::lay_out_static_memory`],
 /// which consumes the `Vec<FuncClassified>` and returns a parallel
-/// `Vec<FuncDispatch>` with the offsets filled in. Appends fn names
-/// + param names to `name_blob` as it goes.
+/// `Vec<FuncDispatch>` with the offsets filled in. Interns fn names,
+/// param names, and any record/field names referenced by lift plans
+/// into `names` as it goes.
 fn build_per_func_classified(
     resolve: &Resolve,
     target_iface: InterfaceId,
     funcs: &[&WitFunction],
-    name_blob: &mut Vec<u8>,
+    names: &mut NameInterner,
 ) -> Result<Vec<FuncClassified>> {
     let target_world_key = WorldKey::Interface(target_iface);
     let mut per_func: Vec<FuncClassified> = Vec::with_capacity(funcs.len());
 
     for func in funcs {
-        let fn_name_offset = name_blob.len() as i32;
-        let fn_name_len = func.name.len() as i32;
-        name_blob.extend_from_slice(func.name.as_bytes());
+        let fn_name_slice = names.intern(&func.name);
 
-        let params_lift = classify_func_params(resolve, func, name_blob);
+        let params_lift = classify_func_params(resolve, func, names);
         let shape = FuncShape::classify(resolve, &target_world_key, func);
         let (import_variant, export_variant) = shape.abi_variants();
         let mangling = dispatch_mangling(shape.is_async());
@@ -475,6 +471,7 @@ fn build_per_func_classified(
             resolve,
             func,
             shape.result_at_retptr(&export_sig, &import_sig),
+            names,
         );
 
         per_func.push(FuncClassified {
@@ -486,8 +483,8 @@ fn build_per_func_classified(
             export_sig,
             import_sig,
             needs_cabi_post,
-            fn_name_offset,
-            fn_name_len,
+            fn_name_offset: fn_name_slice.off as i32,
+            fn_name_len: fn_name_slice.len as i32,
             params: params_lift,
             result_lift,
         });

@@ -14,11 +14,10 @@ use wit_parser::Function as WitFunction;
 
 use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
-use super::blob::{resolve, RecordWriter, RelocPlan, SymbolBases};
+use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, SymbolBases};
 use super::lift::{
-    build_enum_info_blob, build_record_info_blob, register_enum_strings, register_record_strings,
-    ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout,
-    SideTableBlob,
+    build_enum_info_blob, build_record_info_blob, register_enum_strings, ParamLayout,
+    RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -253,24 +252,26 @@ pub(super) fn lay_out_static_memory(
     per_func: Vec<FuncClassified>,
     funcs: &[&WitFunction],
     schema: &SchemaLayouts,
-    name_blob: &mut Vec<u8>,
+    mut names: NameInterner,
     iface_name: BlobSlice,
 ) -> Result<(Vec<FuncDispatch>, StaticDataPlan)> {
     let n_funcs = per_func.len();
 
     check_layout_budget(&per_func)?;
 
-    // Side-table strings get appended to name_blob BEFORE we place
-    // it — every side-table-info entry references these string
+    // Side-table strings get appended to the name interner BEFORE we
+    // place it — every side-table-info entry references these string
     // offsets, so they have to land in the data segment first.
-    let enum_strings = register_enum_strings(&per_func, name_blob);
-    let record_strings = register_record_strings(&per_func, name_blob);
+    // Record-info strings are already interned at plan-build time;
+    // only enum-info strings need a registration pass here.
+    let enum_strings = register_enum_strings(&per_func, &mut names);
 
     let mut layout = StaticLayout::new();
     let mut symbols = SymbolBases::new();
     let mut relocs = RelocPlan::new();
 
-    layout.place_data(1, name_blob);
+    let name_blob = names.into_bytes();
+    layout.place_data(1, &name_blob);
 
     // Cells slabs first — fields records embed pointers to these.
     // Each param contributes `plan.cell_count() * cell_size` bytes;
@@ -336,7 +337,6 @@ pub(super) fn lay_out_static_memory(
         per_result_cell_idx,
     } = build_record_info_blob(
         &per_func,
-        &record_strings,
         &schema.record_info_layout,
         &schema.record_field_tuple_layout,
         record_entries_id,
@@ -668,15 +668,12 @@ mod tests {
             .values()
             .collect();
         let schema = compute_schema(&resolve, world_id, has_before, has_after).unwrap();
-        let mut name_blob: Vec<u8> = TARGET_IFACE.as_bytes().to_vec();
-        let iface_name = BlobSlice {
-            off: 0,
-            len: TARGET_IFACE.len() as u32,
-        };
+        let mut names = NameInterner::new();
+        let iface_name = names.intern(TARGET_IFACE);
         let classified =
-            build_per_func_classified(&resolve, target_iface, &funcs, &mut name_blob).unwrap();
+            build_per_func_classified(&resolve, target_iface, &funcs, &mut names).unwrap();
         let (dispatches, plan) =
-            lay_out_static_memory(classified, &funcs, &schema, &mut name_blob, iface_name).unwrap();
+            lay_out_static_memory(classified, &funcs, &schema, names, iface_name).unwrap();
         LayoutEnv {
             dispatches,
             plan,

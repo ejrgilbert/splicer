@@ -515,7 +515,7 @@ pub(crate) fn store_slice_in_blob(blob: &mut [u8], off: usize, slice: BlobSlice)
 
 /// Typed `(off, len)` pair into a tier's static blob. Avoids
 /// accidental ptr/len swaps.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BlobSlice {
     pub off: u32,
     pub len: u32,

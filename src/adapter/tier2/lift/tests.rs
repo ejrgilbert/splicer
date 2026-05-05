@@ -11,6 +11,7 @@ use wit_parser::abi::WasmSignature;
 use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
 use super::super::super::abi::emit::{BlobSlice, RecordLayout};
+use super::super::blob::NameInterner;
 use super::super::cells::CellLayout;
 use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::super::{FuncClassified, FuncShape};
@@ -74,13 +75,16 @@ fn func_named<'a>(resolve: &'a Resolve, name: &str) -> &'a WitFunction {
 // ─── Plan-builder + assertion fixture constructors ────────────
 
 /// Thin alias for [`LiftPlan::for_type`] — keeps the in-test call
-/// sites short.
-fn plan_for(ty: &Type, resolve: &Resolve) -> LiftPlan {
-    LiftPlan::for_type(ty, resolve)
+/// sites short. Tests that don't compare against a [`Cell::RecordOf`]
+/// fixture pass a fresh interner; tests that do thread the same one
+/// through both the plan-builder and [`record_of`] so the
+/// pre-interned [`BlobSlice`]s match (the interner dedupes).
+fn plan_for(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
+    LiftPlan::for_type(ty, resolve, names)
 }
 
-fn plan_for_named(name: &str, resolve: &Resolve) -> LiftPlan {
-    plan_for(&type_named(resolve, name), resolve)
+fn plan_for_named(name: &str, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
+    plan_for(&type_named(resolve, name), resolve, names)
 }
 
 /// `NamedListInfo { type_name, item_names }` shorthand for fixtures.
@@ -91,12 +95,14 @@ fn enum_info(type_name: &str, items: &[&str]) -> NamedListInfo {
     }
 }
 
-/// `Cell::RecordOf` shorthand for fixtures.
-fn record_of(type_name: &str, fields: &[(&str, u32)]) -> Cell {
-    Cell::RecordOf {
-        type_name: type_name.into(),
-        fields: fields.iter().map(|(n, i)| ((*n).to_string(), *i)).collect(),
-    }
+/// `Cell::RecordOf` shorthand for fixtures. Interns `type_name` and
+/// each field name into `names`; pass the same interner that built
+/// the actual plan and the dedup keeps the [`BlobSlice`]s aligned
+/// regardless of which side ran first.
+fn record_of(names: &mut NameInterner, type_name: &str, fields: &[(&str, u32)]) -> Cell {
+    let type_name = names.intern(type_name);
+    let fields = fields.iter().map(|(n, i)| (names.intern(n), *i)).collect();
+    Cell::RecordOf { type_name, fields }
 }
 
 // ─── FuncClassified fixtures ──────────────────────────────────
@@ -110,10 +116,10 @@ fn dummy_sig() -> WasmSignature {
     }
 }
 
-fn make_param(ty: &Type, resolve: &Resolve) -> ParamLift {
+fn make_param(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> ParamLift {
     ParamLift {
         name: BlobSlice::EMPTY,
-        plan: plan_for(ty, resolve),
+        plan: plan_for(ty, resolve, names),
     }
 }
 
@@ -121,10 +127,14 @@ fn make_param(ty: &Type, resolve: &Resolve) -> ParamLift {
 /// in `param_names`. Plans are plan-relative — no cumulative cursor
 /// to thread. Other fields are dummies — the side-table builders
 /// only read `params` / `result_lift`.
-fn func_with_params(resolve: &Resolve, param_names: &[&str]) -> FuncClassified {
+fn func_with_params(
+    resolve: &Resolve,
+    names: &mut NameInterner,
+    param_names: &[&str],
+) -> FuncClassified {
     let params = param_names
         .iter()
-        .map(|n| make_param(&type_named(resolve, n), resolve))
+        .map(|n| make_param(&type_named(resolve, n), resolve, names))
         .collect();
     FuncClassified {
         shape: FuncShape::Sync,
@@ -312,6 +322,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
 #[test]
 fn primitives_assign_one_cell_one_slot() {
     let r = Resolve::new();
+    let mut names = NameInterner::new();
     let cases: &[(Type, Cell)] = &[
         (Type::Bool, Cell::Bool { flat_slot: 0 }),
         (Type::S32, Cell::IntegerSignExt { flat_slot: 0 }),
@@ -321,7 +332,7 @@ fn primitives_assign_one_cell_one_slot() {
         (Type::F64, Cell::FloatingF64 { flat_slot: 0 }),
     ];
     for (ty, expected) in cases {
-        let plan = plan_for(ty, &r);
+        let plan = plan_for(ty, &r, &mut names);
         assert_eq!(plan.cells, vec![expected.clone()], "{ty:?}");
         assert_eq!(plan.flat_slot_count, 1, "{ty:?}");
     }
@@ -329,7 +340,8 @@ fn primitives_assign_one_cell_one_slot() {
 
 #[test]
 fn string_takes_two_flat_slots() {
-    let plan = plan_for(&Type::String, &Resolve::new());
+    let mut names = NameInterner::new();
+    let plan = plan_for(&Type::String, &Resolve::new(), &mut names);
     assert_eq!(
         plan.cells,
         vec![Cell::Text {
@@ -343,8 +355,9 @@ fn string_takes_two_flat_slots() {
 #[test]
 fn list_u8_classifies_as_bytes_cell() {
     let r = test_resolve();
+    let mut names = NameInterner::new();
     let bytes_ty = func_named(&r, "f-mixed").params[2].ty;
-    let plan = plan_for(&bytes_ty, &r);
+    let plan = plan_for(&bytes_ty, &r, &mut names);
     assert_eq!(
         plan.cells,
         vec![Cell::Bytes {
@@ -358,8 +371,9 @@ fn list_u8_classifies_as_bytes_cell() {
 #[test]
 fn enum_carries_named_list_info() {
     let r = test_resolve();
+    let mut names = NameInterner::new();
     assert_eq!(
-        plan_for_named("color", &r).cells,
+        plan_for_named("color", &r, &mut names).cells,
         vec![Cell::EnumCase {
             flat_slot: 0,
             info: enum_info("color", &["red", "green", "blue"]),
@@ -370,11 +384,12 @@ fn enum_carries_named_list_info() {
 #[test]
 fn record_lays_parent_before_children() {
     let r = test_resolve();
-    let plan = plan_for_named("point", &r);
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("point", &r, &mut names);
     assert_eq!(
         plan.cells,
         vec![
-            record_of("point", &[("x", 1), ("y", 2)]),
+            record_of(&mut names, "point", &[("x", 1), ("y", 2)]),
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
         ],
@@ -385,12 +400,13 @@ fn record_lays_parent_before_children() {
 #[test]
 fn nested_record_walks_depth_first() {
     let r = test_resolve();
-    let plan = plan_for_named("nested", &r);
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("nested", &r, &mut names);
     assert_eq!(
         plan.cells,
         vec![
-            record_of("nested", &[("p", 1), ("c", 4)]),
-            record_of("point", &[("x", 2), ("y", 3)]),
+            record_of(&mut names, "nested", &[("p", 1), ("c", 4)]),
+            record_of(&mut names, "point", &[("x", 2), ("y", 3)]),
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
             Cell::EnumCase {
@@ -410,8 +426,8 @@ fn classify_func_params_yields_plan_relative_slots() {
     // absolute wasm-local position (3, 4) in the wrapper. Pins
     // the local-base-independence invariant.
     let r = test_resolve();
-    let mut name_blob = Vec::new();
-    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut name_blob);
+    let mut names = NameInterner::new();
+    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names);
     assert_eq!(
         params[2].plan.cells,
         vec![Cell::Bytes {
@@ -422,7 +438,10 @@ fn classify_func_params_yields_plan_relative_slots() {
     // Same WIT type → same cells whether built standalone or as
     // a non-zero-indexed param.
     let bytes_ty = func_named(&r, "f-mixed").params[2].ty;
-    assert_eq!(params[2].plan.cells, plan_for(&bytes_ty, &r).cells);
+    assert_eq!(
+        params[2].plan.cells,
+        plan_for(&bytes_ty, &r, &mut names).cells,
+    );
 }
 
 #[test]
@@ -432,8 +451,8 @@ fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
     // it passes to `emit_lift_plan`. f-mixed(a: bool, s: string,
     // b: list<u8>, x: s64) → cumulative starts 0, 1, 3, 5; total 6.
     let r = test_resolve();
-    let mut name_blob = Vec::new();
-    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut name_blob);
+    let mut names = NameInterner::new();
+    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names);
     let starts: Vec<u32> = params
         .iter()
         .scan(0u32, |acc, p| {
@@ -451,31 +470,42 @@ fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
 #[test]
 fn enum_strings_dedup_across_funcs() {
     let r = test_resolve();
+    let mut names = NameInterner::new();
     let funcs = vec![
-        func_with_params(&r, &["color"]),
-        func_with_params(&r, &["color"]),
+        func_with_params(&r, &mut names, &["color"]),
+        func_with_params(&r, &mut names, &["color"]),
     ];
-    let mut name_blob = Vec::new();
-    let table = register_enum_strings(&funcs, &mut name_blob);
+    let table = register_enum_strings(&funcs, &mut names);
     assert_eq!(table.len(), 1);
-    assert_eq!(name_blob, b"colorredgreenblue");
+    assert_eq!(names.into_bytes(), b"colorredgreenblue");
 }
 
 #[test]
-fn record_strings_dedup_across_funcs_and_nested() {
+fn name_interner_dedupes_record_strings_across_plans() {
     // f-point shares `point` with f-mix-records, and the `nested`
-    // record contains a `point` field — both should fold into one
-    // string-table entry for `point`.
+    // record contains a `point` field — the plan-builder interns
+    // type-names + field-names directly, and the [`NameInterner`]
+    // dedup folds repeats into one copy. Pins the property the old
+    // `register_record_strings` test was actually asserting (one
+    // string per type-name across the whole interface).
     let r = test_resolve();
-    let funcs = vec![
-        func_with_params(&r, &["point"]),
-        func_with_params(&r, &["point", "nested"]),
+    let mut names = NameInterner::new();
+    let _ = vec![
+        func_with_params(&r, &mut names, &["point"]),
+        func_with_params(&r, &mut names, &["point", "nested"]),
     ];
-    let mut name_blob = Vec::new();
-    let table = register_record_strings(&funcs, &mut name_blob);
-    let mut keys: Vec<&str> = table.keys().map(String::as_str).collect();
-    keys.sort();
-    assert_eq!(keys, vec!["nested", "point"]);
+    let bytes = names.into_bytes();
+    let count = |needle: &str| {
+        let n = needle.as_bytes();
+        bytes.windows(n.len()).filter(|w| *w == n).count()
+    };
+    // Each name appears exactly once in the blob: the plan-builder
+    // walks `point` three times (standalone + nested + as a field
+    // type) but the interner dedupes it down to one.
+    assert_eq!(count("point"), 1);
+    assert_eq!(count("nested"), 1);
+    assert_eq!(count("x"), 1);
+    assert_eq!(count("y"), 1);
 }
 
 // ─── Record-info side-table layout ────────────────────────────
@@ -486,14 +516,13 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
     // f-point(p: point):                 1 RecordOf cell
     // f-mix-records(p: point, n: nested): 1 + 2 RecordOf cells
     let r = test_resolve();
+    let mut names = NameInterner::new();
     let funcs = vec![
-        func_with_params(&r, &["point"]),
-        func_with_params(&r, &["point", "nested"]),
+        func_with_params(&r, &mut names, &["point"]),
+        func_with_params(&r, &mut names, &["point", "nested"]),
     ];
     let (entry, tuple) = synth_record_info_layouts(&r);
-    let mut name_blob = Vec::new();
-    let strings = register_record_strings(&funcs, &mut name_blob);
-    let blobs = build_record_info_blob(&funcs, &strings, &entry, &tuple, 0, 1);
+    let blobs = build_record_info_blob(&funcs, &entry, &tuple, 0, 1);
 
     // Range lengths per (fn, param). New cases drop in here.
     let lens: Vec<Vec<u32>> = blobs
@@ -533,18 +562,19 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
     // Every wired Cell variant: classify a fixture WIT type, emit,
     // validate. Adding a new kind = adding a row.
     let r = test_resolve();
+    let mut names = NameInterner::new();
     let primitive_plans = [
-        plan_for(&Type::Bool, &r),
-        plan_for(&Type::S32, &r),
-        plan_for(&Type::U32, &r),
-        plan_for(&Type::S64, &r),
-        plan_for(&Type::F32, &r),
-        plan_for(&Type::F64, &r),
-        plan_for(&Type::String, &r),
-        plan_for(&func_named(&r, "f-mixed").params[2].ty, &r), // list<u8>
-        plan_for_named("color", &r),
-        plan_for_named("point", &r),
-        plan_for_named("nested", &r),
+        plan_for(&Type::Bool, &r, &mut names),
+        plan_for(&Type::S32, &r, &mut names),
+        plan_for(&Type::U32, &r, &mut names),
+        plan_for(&Type::S64, &r, &mut names),
+        plan_for(&Type::F32, &r, &mut names),
+        plan_for(&Type::F64, &r, &mut names),
+        plan_for(&Type::String, &r, &mut names),
+        plan_for(&func_named(&r, "f-mixed").params[2].ty, &r, &mut names), // list<u8>
+        plan_for_named("color", &r, &mut names),
+        plan_for_named("point", &r, &mut names),
+        plan_for_named("nested", &r, &mut names),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan);

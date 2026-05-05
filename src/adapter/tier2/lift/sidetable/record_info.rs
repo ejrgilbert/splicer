@@ -9,69 +9,14 @@
 //! pointer into it. Two segments to place, two layers of pointer
 //! patching.
 
-use std::collections::HashMap;
-
-use super::super::super::super::abi::emit::{BlobSlice, RecordLayout};
+use super::super::super::super::abi::emit::RecordLayout;
 use super::super::super::blob::{RecordWriter, Reloc, Segment, SymRef, SymbolId};
 use super::super::super::schema::{
     RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS,
 };
 use super::super::super::FuncClassified;
 use super::super::plan::{Cell, LiftPlan};
-use super::{append_string, INFO_TYPE_NAME};
-
-/// Per-record-type strings registered in the shared `name_blob`.
-/// Field-name strings dedupe per record type — two params of the
-/// same record type reuse the strings. Cross-type collisions (e.g.
-/// `"name"` appearing in `person` and `pet`) currently get
-/// registered twice; promote to global string-dedup if it shows up
-/// in profiling.
-pub(crate) struct RecordTypeStrings {
-    pub type_name: BlobSlice,
-    /// Per field, in WIT declaration order.
-    pub field_names: Vec<BlobSlice>,
-}
-
-pub(crate) type RecordStringTable = HashMap<String, RecordTypeStrings>;
-
-/// Walk every plan's [`Cell::RecordOf`] (params + compound results);
-/// for each record type seen, register its `type-name` + each
-/// `field-name` into `name_blob` (deduped per type-name). Result keyed
-/// by record type-name.
-pub(crate) fn register_record_strings(
-    per_func: &[FuncClassified],
-    name_blob: &mut Vec<u8>,
-) -> RecordStringTable {
-    let mut table = RecordStringTable::new();
-    let register_plan =
-        |plan: &LiftPlan, name_blob: &mut Vec<u8>, table: &mut RecordStringTable| {
-            for (type_name, fields) in plan.record_ofs() {
-                if !table.contains_key(type_name) {
-                    let tn = append_string(name_blob, type_name);
-                    let fns = fields
-                        .iter()
-                        .map(|(name, _)| append_string(name_blob, name))
-                        .collect();
-                    table.insert(
-                        type_name.to_string(),
-                        RecordTypeStrings {
-                            type_name: tn,
-                            field_names: fns,
-                        },
-                    );
-                }
-            }
-        };
-    for fd in per_func {
-        for p in &fd.params {
-            register_plan(&p.plan, name_blob, &mut table);
-        }
-        if let Some(c) = fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
-            register_plan(&c.plan, name_blob, &mut table);
-        }
-    }
-    table
-}
+use super::INFO_TYPE_NAME;
 
 /// Per-(fn, param, plan-cell) record-info side-table indices. Wraps
 /// the raw triple-`Vec` so call sites read through [`for_param`]
@@ -135,7 +80,6 @@ struct RecordInfoBuilder<'a> {
     tuple_layout: &'a RecordLayout,
     entries_id: SymbolId,
     tuples_id: SymbolId,
-    strings: &'a RecordStringTable,
 }
 
 impl<'a> RecordInfoBuilder<'a> {
@@ -144,7 +88,6 @@ impl<'a> RecordInfoBuilder<'a> {
         tuple_layout: &'a RecordLayout,
         entries_id: SymbolId,
         tuples_id: SymbolId,
-        strings: &'a RecordStringTable,
     ) -> Self {
         Self {
             entries: Vec::new(),
@@ -154,7 +97,6 @@ impl<'a> RecordInfoBuilder<'a> {
             tuple_layout,
             entries_id,
             tuples_id,
-            strings,
         }
     }
 
@@ -162,7 +104,9 @@ impl<'a> RecordInfoBuilder<'a> {
     /// the contiguous range [`SymRef`] (into the entries segment) +
     /// the per-cell side-table index map. `None` for plans with no
     /// `RecordOf` cells. Each entry's `fields.ptr` slot gets a
-    /// [`Reloc`] into the tuples segment.
+    /// [`Reloc`] into the tuples segment. Type-name and field-name
+    /// strings are read straight off each cell's pre-interned
+    /// [`super::super::super::super::abi::emit::BlobSlice`]s.
     fn append_plan(&mut self, plan: &LiftPlan) -> (Option<SymRef>, Vec<Option<u32>>) {
         let range_start = self.entries.len() as u32;
         let mut count: u32 = 0;
@@ -171,19 +115,15 @@ impl<'a> RecordInfoBuilder<'a> {
             let Cell::RecordOf { type_name, fields } = op else {
                 continue;
             };
-            let s = self
-                .strings
-                .get(type_name.as_str())
-                .expect("register_record_strings registered every record type");
             let side_idx = count;
             cell_idx_map[cell_pos] = Some(side_idx);
             count += 1;
 
             let tuples_off = self.tuples.len() as u32;
             let tuples_len = fields.len() as u32;
-            for (i, (_, child_cell_idx)) in fields.iter().enumerate() {
+            for (field_name, child_cell_idx) in fields {
                 let tuple = RecordWriter::extend_zero(&mut self.tuples, self.tuple_layout);
-                tuple.write_slice(&mut self.tuples, RECORD_FIELD_TUPLE_NAME, s.field_names[i]);
+                tuple.write_slice(&mut self.tuples, RECORD_FIELD_TUPLE_NAME, *field_name);
                 tuple.write_i32(
                     &mut self.tuples,
                     RECORD_FIELD_TUPLE_IDX,
@@ -192,7 +132,7 @@ impl<'a> RecordInfoBuilder<'a> {
             }
 
             let entry = RecordWriter::extend_zero(&mut self.entries, self.entry_layout);
-            entry.write_slice(&mut self.entries, INFO_TYPE_NAME, s.type_name);
+            entry.write_slice(&mut self.entries, INFO_TYPE_NAME, *type_name);
             let tuples_ref = (tuples_len > 0).then_some(SymRef {
                 target: self.tuples_id,
                 off: tuples_off,
@@ -240,14 +180,12 @@ impl<'a> RecordInfoBuilder<'a> {
 /// side-table index is its position in that plan's contiguous range.
 pub(crate) fn build_record_info_blob(
     per_func: &[FuncClassified],
-    strings: &RecordStringTable,
     entry_layout: &RecordLayout,
     tuple_layout: &RecordLayout,
     entries_id: SymbolId,
     tuples_id: SymbolId,
 ) -> RecordInfoBlobs {
-    let mut builder =
-        RecordInfoBuilder::new(entry_layout, tuple_layout, entries_id, tuples_id, strings);
+    let mut builder = RecordInfoBuilder::new(entry_layout, tuple_layout, entries_id, tuples_id);
     let mut per_param_range: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
     let mut per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>> = Vec::with_capacity(per_func.len());
     let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());

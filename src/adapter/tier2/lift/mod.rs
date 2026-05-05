@@ -45,9 +45,7 @@ pub(super) use emit::{
     ResultEmitPlan, WrapperLocals,
 };
 pub(super) use sidetable::enum_info::{build_enum_info_blob, register_enum_strings};
-pub(super) use sidetable::record_info::{
-    build_record_info_blob, register_record_strings, RecordInfoBlobs,
-};
+pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
 pub(super) use sidetable::SideTableBlob;
 
 #[cfg(test)]
