@@ -89,10 +89,6 @@ jobs:
           echo "$REF not yet published — proceeding."
 
       - name: Build builtin component
-        env:
-          # Resolves cross-package WIT `use` clauses against ghcr.io
-          # for any wasi:* deps the builtin pulls in.
-          WKG_CONFIG_FILE: ${{ github.workspace }}/wkg-registries.toml
         run: |
           make "assets/builtins/${{ inputs.builtin }}.wasm"
 
