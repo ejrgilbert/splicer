@@ -1,0 +1,22 @@
+package splicer:otel-metrics@0.1.0;
+
+/// Builtin: emit `wasi:otel` metrics around every wrapped call. Each
+/// wrapped call, on `on-return`, exports a delta-temporality
+/// `resource-metrics` payload with two instruments:
+///
+///   * `splicer.call.count`    — `u64-sum`, monotonic, value 1
+///   * `splicer.call.duration` — `f64-histogram`, seconds, single sample
+///
+/// Both data points carry `code.namespace` / `code.function`
+/// attributes built from the call-id (matching the attribute keys on
+/// `splicer:otel-bare-spans`). Per-call export is wasteful at high
+/// QPS — a downstream collector re-aggregates the deltas — but it
+/// requires no in-component aggregation state and mirrors how
+/// `otel-bare-spans` emits one `on-end` per call.
+world otel-metrics-mdl {
+    import wasi:otel/metrics@0.2.0-rc.2;
+    import wasi:clocks/wall-clock@0.2.0;
+
+    export splicer:tier1/before@0.2.0;
+    export splicer:tier1/after@0.2.0;
+}
