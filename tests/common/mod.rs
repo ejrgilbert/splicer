@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -215,4 +216,23 @@ pub fn expect_enum(v: &Val) -> &str {
     } else {
         panic!("expected enum, got {v:?}")
     }
+}
+
+/// Read a built builtin's bytes from disk. Honors `SPLICER_BUILTINS_DIR`
+/// (the same env var splicer's runtime fetch reads); otherwise looks in
+/// `<crate-root>/assets/builtins/`. Panics with a `make build-builtins`
+/// hint if the file is missing — these tests instantiate real
+/// components and have no useful behavior to fall back on.
+pub fn read_builtin(name: &str) -> Vec<u8> {
+    let dir = std::env::var_os("SPLICER_BUILTINS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/builtins"));
+    let path = dir.join(format!("{name}.wasm"));
+    std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "couldn't read {}: {e}\n\
+             run `make build-builtins`, or set SPLICER_BUILTINS_DIR=<dir>",
+            path.display()
+        )
+    })
 }

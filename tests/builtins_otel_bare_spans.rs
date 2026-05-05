@@ -8,8 +8,8 @@
 //! the expected `code.namespace` / `code.function` attributes.
 //!
 //! Requires `make build-builtins` to have populated
-//! `assets/builtins/otel-bare-spans.wasm` (embedded below via
-//! `include_bytes!`).
+//! `assets/builtins/otel-bare-spans.wasm`, or `SPLICER_BUILTINS_DIR`
+//! pointing at a directory containing it.
 
 use anyhow::Result;
 use wasmtime::component::Val;
@@ -78,8 +78,8 @@ fn add_otel_tracing_to_linker(
 
 #[test]
 fn otel_bare_spans_emits_consistent_start_and_end() -> Result<()> {
-    let bytes = include_bytes!("../assets/builtins/otel-bare-spans.wasm");
-    let capture = drive_call_cycle::<Capture, _>(bytes, add_otel_tracing_to_linker)?;
+    let bytes = common::read_builtin("otel-bare-spans");
+    let capture = drive_call_cycle::<Capture, _>(&bytes, add_otel_tracing_to_linker)?;
     let cap = capture.lock().unwrap();
 
     assert_eq!(cap.starts.len(), 1, "exactly one on-start call expected");

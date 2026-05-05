@@ -9,8 +9,8 @@
 //! trace-correlation fields are absent (no parent ⇒ `none`).
 //!
 //! Requires `make build-builtins` to have populated
-//! `assets/builtins/otel-bare-logs.wasm` (embedded below via
-//! `include_bytes!`).
+//! `assets/builtins/otel-bare-logs.wasm`, or `SPLICER_BUILTINS_DIR`
+//! pointing at a directory containing it.
 
 use anyhow::Result;
 use wasmtime::component::Val;
@@ -72,8 +72,8 @@ fn add_otel_logs_to_linker(linker: &mut wasmtime::component::Linker<Host<Capture
 
 #[test]
 fn otel_bare_logs_emits_structured_record() -> Result<()> {
-    let bytes = include_bytes!("../assets/builtins/otel-bare-logs.wasm");
-    let capture = drive_call_cycle::<Capture, _>(bytes, add_otel_logs_to_linker)?;
+    let bytes = common::read_builtin("otel-bare-logs");
+    let capture = drive_call_cycle::<Capture, _>(&bytes, add_otel_logs_to_linker)?;
     let cap = capture.lock().unwrap();
 
     assert_eq!(cap.logs.len(), 1, "exactly one on-emit call expected");
