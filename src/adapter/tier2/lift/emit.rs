@@ -616,11 +616,16 @@ fn emit_lift_kind(
             emit_flags_runtime_fill(f, slot0, fill, lcl);
             cell_layout.emit_flags_set(f, addr, fill.side_table_idx);
         }
+        Cell::Char { .. } => {
+            let CellSideData::Char { scratch_addr } = side_data else {
+                panic!("Char cell paired with non-Char side data {side_data:?}");
+            };
+            cell_layout.emit_char(f, addr, slot0, *scratch_addr, lcl.char_len);
+        }
         // Compound + un-wired variants aren't valid direct/retptr-pair
         // sources; classify_result_lift's whitelist filters them out.
         Cell::RecordOf { .. }
         | Cell::TupleOf { .. }
-        | Cell::Char { .. }
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }

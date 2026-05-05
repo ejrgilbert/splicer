@@ -21,8 +21,9 @@ use super::lift::{
     build_enum_info_blob, build_flags_info_blob, build_record_info_blob, build_tuple_indices_blob,
     build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes, fold_cell_side_data,
     register_enum_strings, register_flags_strings, register_variant_strings, CellSideData,
-    FlagsInfoBlobs, FlagsRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
-    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
+    CharScratchMaps, FlagsInfoBlobs, FlagsRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout,
+    ResultLift, ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob,
+    VariantInfoBlobs,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -101,15 +102,26 @@ fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
     Ok(())
 }
 
-/// Wrap the per-fn flags fill into a `CellSideData::Flags` when the
-/// result cell is `Cell::Flags`, else `None`. Shared between the
-/// `Direct` and `RetptrPair` arms.
-fn single_cell_flags_side_data(cell: &Cell, fill: &Option<FlagsRuntimeFill>) -> CellSideData {
+/// Wrap the per-fn fills into a `CellSideData` for a single-cell
+/// (Direct / RetptrPair) result. Each kind that needs runtime
+/// bookkeeping plumbs its per-fn `Option<…>` here; primitives without
+/// side data fall through to `None`. New kinds add a match arm + a
+/// fill argument.
+fn single_cell_side_data(
+    cell: &Cell,
+    flags_fill: &Option<FlagsRuntimeFill>,
+    char_scratch: &Option<i32>,
+) -> CellSideData {
     match cell {
-        Cell::Flags { .. } => CellSideData::Flags(Box::new(
-            fill.clone()
-                .expect("flags single-cell result → flags-info builder must produce a fill"),
-        )),
+        Cell::Flags { .. } => {
+            CellSideData::Flags(Box::new(flags_fill.clone().expect(
+                "flags single-cell result → flags-info builder must produce a fill",
+            )))
+        }
+        Cell::Char { .. } => CellSideData::Char {
+            scratch_addr: char_scratch
+                .expect("char single-cell result → char-info builder must produce a scratch addr"),
+        },
         _ => CellSideData::None,
     }
 }
@@ -359,11 +371,14 @@ pub(super) fn lay_out_static_memory(
         .into_iter()
         .map(|n_bytes| layout.reserve_scratch(1, n_bytes))
         .collect();
-    let char_scratch_map = {
+    let CharScratchMaps {
+        per_cell: char_scratch_map,
+        per_result_single: char_per_result_single,
+    } = {
         let mut iter = char_scratch_addrs.iter().copied();
-        let map = build_char_scratch_map(&per_func, &mut iter);
+        let maps = build_char_scratch_map(&per_func, &mut iter);
         debug_assert!(iter.next().is_none());
-        map
+        maps
     };
 
     // Build the per-(fn, field) enum-info and record-info side
@@ -676,13 +691,19 @@ pub(super) fn lay_out_static_memory(
                 let ResultLift { source, .. } = rl;
                 let layout_source = match source {
                     ResultSource::Direct(cell) => {
-                        let side_data =
-                            single_cell_flags_side_data(&cell, &flags_per_result_single_fill[i]);
+                        let side_data = single_cell_side_data(
+                            &cell,
+                            &flags_per_result_single_fill[i],
+                            &char_per_result_single[i],
+                        );
                         ResultSourceLayout::Direct { cell, side_data }
                     }
                     ResultSource::RetptrPair(cell) => {
-                        let side_data =
-                            single_cell_flags_side_data(&cell, &flags_per_result_single_fill[i]);
+                        let side_data = single_cell_side_data(
+                            &cell,
+                            &flags_per_result_single_fill[i],
+                            &char_per_result_single[i],
+                        );
                         ResultSourceLayout::RetptrPair {
                             cell,
                             retptr_offset: retptr_offset

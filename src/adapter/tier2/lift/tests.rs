@@ -1013,6 +1013,25 @@ fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
 // ─── Side-table scratch sizing parity ─────────────────────────
 
 #[test]
+fn char_scratch_sizes_count_single_cell_char_result() {
+    // Regression: `char_scratch_sizes` must pick up a single-cell
+    // char result by checking the classified `Cell::Char` (not the
+    // raw `result_ty`), so a `type my-char = char` alias works.
+    use super::classify::SideTableInfo;
+    use super::sidetable::char_info::char_scratch_sizes;
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let mut fd = func_with_params(&r, &mut names, &[]);
+    fd.result_ty = Some(Type::Char);
+    fd.result_lift = Some(ResultLift {
+        source: ResultSource::Direct(Cell::Char { flat_slot: 0 }),
+        side_table: SideTableInfo::default(),
+    });
+    // 1 char-result × 4 bytes scratch.
+    assert_eq!(char_scratch_sizes(&[fd]), vec![MAX_UTF8_LEN]);
+}
+
+#[test]
 fn flags_scratch_sizes_count_both_param_and_result_cells() {
     // Regression: `flags_scratch_sizes` must walk per-fn params AND
     // the compound result plan, in the order `build_flags_info_blob`

@@ -918,6 +918,47 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `Cell::Char` as a Direct result. Drives
+    /// `is_supported_direct_result(Char) → Direct` + the per-result
+    /// scratch reservation + utf-8 encoder + cell::text emit. Sync
+    /// returns char as a flat i32 (no retptr).
+    #[test]
+    fn dispatch_module_with_char_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "make") (result i32) i32.const 0x4E2D)
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "make" (core func $make))
+                (type $make-ty (func (result char)))
+                (func $make-lifted (type $make-ty) (canon lift (core func $make)))
+                (instance $api-inst (export "make" (func $make-lifted)))
+                (export "my:chret/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:chret/api@1.0.0" (instance $api "my:chret/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:chret/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for char result");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// End-to-end test for `Cell::Variant` as a Compound result.
     /// Drives `is_compound_result(Variant) → Compound → lift_from_memory`
     /// + the N-way disc dispatch on the result side. `shape { circle,

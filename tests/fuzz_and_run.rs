@@ -292,10 +292,7 @@ impl Shape {
                 selected,
                 ..
             } => {
-                let case = cases
-                    .get(*selected)
-                    .map(|c| c.wit_name)
-                    .unwrap_or("oob");
+                let case = cases.get(*selected).map(|c| c.wit_name).unwrap_or("oob");
                 format!("variant_{wit_name}_{case}")
             }
             Shape::Enum { wit_name, .. } => format!("enum_{}", wit_name),
