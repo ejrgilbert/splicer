@@ -1,18 +1,12 @@
 package splicer:otel-bare-spans@0.1.0;
 
-/// Builtin: emit a "bare" `wasi:otel` span around every wrapped call.
-/// Each span carries timing, the call's (interface, function) name,
-/// and an inherited trace-id when the host has an active outer span;
-/// no payload-derived attributes (args/results stay invisible by
-/// construction — a tier-1 hook only sees the call-id, never the
-/// values). Use a value-aware otel builtin instead when you need
-/// `http.method`, `db.statement`, etc. on the spans.
+/// Emits one `wasi:otel` span per wrapped call: timing,
+/// `code.namespace` / `code.function` attrs, and the host's outer
+/// trace-id when present. No payload-derived attrs (tier-1 sees only
+/// the call-id).
 ///
-/// On `on-call` we mint a span-context (inheriting the host's
-/// `outer-span-context` trace-id when one is active) and notify the
-/// host via `tracing.on-start`. On `on-return` we pop the matching
-/// pending span and notify via `tracing.on-end` with start/end
-/// timestamps.
+/// Value-aware sibling `splicer:otel-spans` is planned post-tier2 —
+/// **not yet implemented**.
 world otel-bare-spans-mdl {
     import wasi:otel/tracing@0.2.0-rc.2;
     import wasi:clocks/wall-clock@0.2.0;

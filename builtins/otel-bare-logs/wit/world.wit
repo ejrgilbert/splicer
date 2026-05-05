@@ -1,0 +1,17 @@
+package splicer:otel-bare-logs@0.1.0;
+
+/// Emits one structured `wasi:otel` log record per wrapped call:
+/// severity `INFO`, event-name `call.invoked`, body `<iface>::<fn>`,
+/// `code.namespace` / `code.function` attrs, and trace-correlation
+/// fields when the host has an active span. No payload-derived fields
+/// (tier-1 sees only the call-id).
+///
+/// Value-aware sibling `splicer:otel-logs` is planned post-tier2 —
+/// **not yet implemented**.
+world otel-bare-logs-mdl {
+    import wasi:otel/logs@0.2.0-rc.2;
+    import wasi:otel/tracing@0.2.0-rc.2;
+    import wasi:clocks/wall-clock@0.2.0;
+
+    export splicer:tier1/after@0.2.0;
+}

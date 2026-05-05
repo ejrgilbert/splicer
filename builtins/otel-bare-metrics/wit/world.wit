@@ -1,0 +1,19 @@
+package splicer:otel-bare-metrics@0.1.0;
+
+/// Emits two `wasi:otel` metrics per wrapped call, delta-temporality:
+///
+///   * `component.call.count`    — `u64-sum`, monotonic, value 1
+///   * `component.call.duration` — `f64-histogram`, seconds, 1 sample
+///
+/// Both carry `code.namespace` / `code.function` attrs from the
+/// call-id. No payload-derived attrs (tier-1 sees only the call-id).
+///
+/// Value-aware sibling `splicer:otel-metrics` is planned post-tier2 —
+/// **not yet implemented**.
+world otel-bare-metrics-mdl {
+    import wasi:otel/metrics@0.2.0-rc.2;
+    import wasi:clocks/wall-clock@0.2.0;
+
+    export splicer:tier1/before@0.2.0;
+    export splicer:tier1/after@0.2.0;
+}

@@ -2,7 +2,7 @@
 //! builtin in wasmtime against a synthetic call-id.
 //!
 //! Each builtin smoke-test (`builtins_otel_bare_spans.rs`,
-//! `builtins_otel_metrics.rs`, …) supplies its own `Capture` type and
+//! `builtins_otel_bare_metrics.rs`, …) supplies its own `Capture` type and
 //! linker-side fake host implementation; everything else (engine
 //! config, instantiation, `on-call` → `on-return` drive cycle, `Val`
 //! extractors) lives here so the per-test files stay focused on the
@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use wasmtime::component::{Component, Linker, ResourceTable, Val};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
@@ -90,37 +90,33 @@ where
     rt.block_on(async {
         let instance = linker.instantiate_async(&mut store, &component).await?;
 
-        let before_idx = instance
-            .get_export_index(&mut store, None, SPLICER_BEFORE)
-            .context("missing before export")?;
-        let on_call_idx = instance
-            .get_export_index(&mut store, Some(&before_idx), "on-call")
-            .context("missing on-call export")?;
+        // Tier-1 builtins may export any non-empty subset of
+        // {before, after, blocking}. Drive whichever this builtin
+        // actually exports; downstream assertions will catch a
+        // degenerate component that exports nothing useful.
         let on_call = instance
-            .get_func(&mut store, on_call_idx)
-            .context("on-call is not a func")?;
-
-        let after_idx = instance
-            .get_export_index(&mut store, None, SPLICER_AFTER)
-            .context("missing after export")?;
-        let on_return_idx = instance
-            .get_export_index(&mut store, Some(&after_idx), "on-return")
-            .context("missing on-return export")?;
+            .get_export_index(&mut store, None, SPLICER_BEFORE)
+            .and_then(|idx| instance.get_export_index(&mut store, Some(&idx), "on-call"))
+            .and_then(|idx| instance.get_func(&mut store, idx));
         let on_return = instance
-            .get_func(&mut store, on_return_idx)
-            .context("on-return is not a func")?;
+            .get_export_index(&mut store, None, SPLICER_AFTER)
+            .and_then(|idx| instance.get_export_index(&mut store, Some(&idx), "on-return"))
+            .and_then(|idx| instance.get_func(&mut store, idx));
 
         let cid = call_id_val(TARGET_IFACE, TARGET_FN);
 
-        let mut results: Vec<Val> = vec![];
-        on_call
-            .call_async(&mut store, std::slice::from_ref(&cid), &mut results)
-            .await?;
-
-        let mut results: Vec<Val> = vec![];
-        on_return
-            .call_async(&mut store, &[cid], &mut results)
-            .await?;
+        if let Some(on_call) = on_call {
+            let mut results: Vec<Val> = vec![];
+            on_call
+                .call_async(&mut store, std::slice::from_ref(&cid), &mut results)
+                .await?;
+        }
+        if let Some(on_return) = on_return {
+            let mut results: Vec<Val> = vec![];
+            on_return
+                .call_async(&mut store, &[cid], &mut results)
+                .await?;
+        }
 
         Ok::<_, anyhow::Error>(())
     })?;

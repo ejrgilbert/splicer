@@ -87,8 +87,14 @@ mod tests {
     }
 
     #[test]
-    fn otel_metrics_is_registered() {
-        let bytes = lookup("otel-metrics").expect("otel-metrics must be registered");
+    fn otel_bare_metrics_is_registered() {
+        let bytes = lookup("otel-bare-metrics").expect("otel-bare-metrics must be registered");
+        assert!(bytes.starts_with(b"\0asm"), "embedded bytes must be wasm");
+    }
+
+    #[test]
+    fn otel_bare_logs_is_registered() {
+        let bytes = lookup("otel-bare-logs").expect("otel-bare-logs must be registered");
         assert!(bytes.starts_with(b"\0asm"), "embedded bytes must be wasm");
     }
 
