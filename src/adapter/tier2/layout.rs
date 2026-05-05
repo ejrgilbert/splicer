@@ -493,7 +493,6 @@ pub(super) fn lay_out_static_memory(
         .enumerate()
         .map(|(i, fc)| {
             let fn_cells_offsets = &cells_offsets[i];
-            let fn_param_record_idxs = &per_param_cell_idx[i];
             let params: Vec<ParamLayout> = fc
                 .params
                 .into_iter()
@@ -501,7 +500,7 @@ pub(super) fn lay_out_static_memory(
                 .map(|(p_idx, lift)| ParamLayout {
                     lift,
                     cells_offset: fn_cells_offsets[p_idx],
-                    record_info_cell_idx: fn_param_record_idxs[p_idx].clone(),
+                    record_info_cell_idx: per_param_cell_idx.for_param(i, p_idx).to_vec(),
                 })
                 .collect();
 

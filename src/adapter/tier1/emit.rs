@@ -374,9 +374,11 @@ fn build_dispatch_module(
         target_iface,
         target_interface_name,
         &funcs,
-        needs_async_runtime,
-        has_blocking,
-        callid_layout,
+        SlotReservations {
+            needs_async_runtime,
+            has_blocking,
+            callid_layout,
+        },
     );
     let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after, has_blocking);
     let mut idx = DispatchIndices::new();
@@ -442,13 +444,28 @@ fn build_dispatch_module(
 struct DispatchPlan {
     per_func: Vec<FuncDispatch>,
     name_blob: Vec<u8>,
-    /// `Some` iff `needs_async_runtime`.
+    /// `Some` iff `SlotReservations::needs_async_runtime`.
     event_ptr: Option<i32>,
-    /// `Some` iff `has_blocking`.
+    /// `Some` iff `SlotReservations::has_blocking`.
     block_result_ptr: Option<i32>,
-    /// `Some` iff any hook is wired.
+    /// `Some` iff any hook is wired (i.e. `callid_layout` is `Some`).
     call_id_buf: Option<CallIdBuf>,
     bump_start: u32,
+}
+
+/// Gates for the fixed-slot allocations [`compute_func_dispatches`]
+/// makes after the per-func name + retptr slots. Each field controls
+/// one slot in the dispatch module's static memory.
+struct SlotReservations {
+    /// Reserve the canon-async event record. Set when any hook is
+    /// wired or the target has any async function.
+    needs_async_runtime: bool,
+    /// Reserve the block-result scratch. Set when the target has any
+    /// blocking function.
+    has_blocking: bool,
+    /// `Some` iff any hook is wired — drives the call-id buffer's
+    /// size + alignment.
+    callid_layout: Option<CallIdLayout>,
 }
 
 /// Phase 1 — per-func dispatch shapes, name bytes, and memory-slot
@@ -460,9 +477,7 @@ fn compute_func_dispatches(
     target_iface: InterfaceId,
     target_interface_name: &str,
     funcs: &[&WitFunction],
-    needs_async_runtime: bool,
-    has_blocking: bool,
-    callid_layout: Option<CallIdLayout>,
+    slots: SlotReservations,
 ) -> DispatchPlan {
     let iface_name_bytes = target_interface_name.len() as u32;
     let total_fn_name_bytes: u32 = funcs.iter().map(|f| f.name.len() as u32).sum();
@@ -556,9 +571,13 @@ fn compute_func_dispatches(
     // [`MemoryLayoutBuilder`] is single-cursor — fixed slots land
     // AFTER per-func name + retptr allocations, in the same order
     // the legacy path uses.
-    let event_ptr = needs_async_runtime.then(|| layout.alloc_event_slot() as i32);
-    let block_result_ptr = has_blocking.then(|| layout.alloc_block_result() as i32);
-    let call_id_buf = callid_layout.map(|callid_layout| {
+    let event_ptr = slots
+        .needs_async_runtime
+        .then(|| layout.alloc_event_slot() as i32);
+    let block_result_ptr = slots
+        .has_blocking
+        .then(|| layout.alloc_block_result() as i32);
+    let call_id_buf = slots.callid_layout.map(|callid_layout| {
         let offset = layout.alloc_aligned(callid_layout.size(), callid_layout.align()) as i32;
         CallIdBuf {
             offset,

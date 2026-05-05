@@ -73,6 +73,26 @@ pub(crate) fn register_record_strings(
     table
 }
 
+/// Per-(fn, param, plan-cell) record-info side-table indices. Wraps
+/// the raw triple-`Vec` so call sites read through [`for_param`]
+/// instead of three layers of `[i][j][k]`.
+///
+/// [`for_param`]: RecordInfoIndices::for_param
+pub(crate) struct RecordInfoIndices {
+    /// One Vec per function; each holds one Vec per param; each holds
+    /// per-plan-cell side-table indices (`None` for non-`RecordOf`
+    /// cells). The lift codegen reads this when emitting
+    /// `cell::record-of(idx)`.
+    per_param: Vec<Vec<Vec<Option<u32>>>>,
+}
+
+impl RecordInfoIndices {
+    /// Borrow one param's per-cell index map.
+    pub(crate) fn for_param(&self, fn_idx: usize, param_idx: usize) -> &[Option<u32>] {
+        &self.per_param[fn_idx][param_idx]
+    }
+}
+
 /// Output of [`build_record_info_blob`]. Two [`Segment`]s — the
 /// `entries` segment carries one [`Reloc`] per record-cell, pointing
 /// each entry's `fields.ptr` at the matching range inside the
@@ -91,10 +111,9 @@ pub(crate) struct RecordInfoBlobs {
     /// targeting the entries segment. `None` for params with no
     /// `RecordOf` cells.
     pub per_param_range: Vec<Vec<Option<SymRef>>>,
-    /// Per (fn, param): for each plan cell, its assigned record-info
-    /// side-table index (None for non-`RecordOf` cells). The lift
-    /// codegen reads this when emitting `cell::record-of(idx)`.
-    pub per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>>,
+    /// Per (fn, param, plan-cell): record-info side-table index
+    /// (`None` for non-`RecordOf` cells). See [`RecordInfoIndices`].
+    pub per_param_cell_idx: RecordInfoIndices,
     /// Per (fn): result-side range. `None` for void / non-Compound
     /// results; populated for `Compound` results so the result tree's
     /// `record-infos` slot can patch in.
@@ -259,7 +278,9 @@ pub(crate) fn build_record_info_blob(
         entries: entries_seg,
         tuples: tuples_seg,
         per_param_range,
-        per_param_cell_idx,
+        per_param_cell_idx: RecordInfoIndices {
+            per_param: per_param_cell_idx,
+        },
         per_result_range,
         per_result_cell_idx,
     }

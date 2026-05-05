@@ -505,16 +505,22 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
 
     // Cell-idx maps reset per range — index counts up only inside
     // one (fn, param), not across them.
-    assert_eq!(
-        blobs.per_param_cell_idx,
+    let expected: Vec<Vec<&[Option<u32>]>> = vec![
+        vec![&[Some(0), None, None]],
         vec![
-            vec![vec![Some(0), None, None]],
-            vec![
-                vec![Some(0), None, None],
-                vec![Some(0), Some(1), None, None, None],
-            ],
+            &[Some(0), None, None],
+            &[Some(0), Some(1), None, None, None],
         ],
-    );
+    ];
+    for (fn_idx, fn_expected) in expected.iter().enumerate() {
+        for (param_idx, param_expected) in fn_expected.iter().enumerate() {
+            assert_eq!(
+                blobs.per_param_cell_idx.for_param(fn_idx, param_idx),
+                *param_expected,
+                "fn {fn_idx} param {param_idx}",
+            );
+        }
+    }
 
     // 4 record entries → 4 relocs into the tuples segment.
     assert_eq!(blobs.entries.relocs.len(), 4);
