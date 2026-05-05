@@ -1260,6 +1260,24 @@ fn tier2_shapes() -> Vec<Shape> {
                 ),
             ],
         },
+        // Multi-element so the result side flattens to >1 slot
+        // (retptr) and exercises the Compound `lift_from_memory` path.
+        Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            },
+            Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("hi")"#,
+                expected_debug: r#""hi""#,
+            },
+        ]),
     ]
 }
 
@@ -1831,6 +1849,13 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
                 .collect();
             format!("record({} {{ {} }})", info.type_name, rendered.join(", "))
         }
+        Cell::TupleOf(child_indices) => {
+            let rendered: Vec<String> = child_indices
+                .iter()
+                .map(|child_idx| fmt_cell(tree, *child_idx))
+                .collect();
+            format!("tuple({})", rendered.join(", "))
+        }
         other => format!("other({other:?})"),
     }
 }
@@ -2204,7 +2229,7 @@ fn consumer_shape_dep_wit(shape: &Shape, mode: AsyncMode) -> String {
 /// `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
-fn test_canned() {
+fn test_tier1_canned() {
     require_splicer_toolchain();
 
     let tmp = tempfile::tempdir().expect("mktempdir");
@@ -2279,7 +2304,7 @@ fn test_canned() {
 /// with `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
-fn test_tier2_canned_primitives() {
+fn test_tier2_canned() {
     require_splicer_toolchain();
     let workspace = scaffold_tier2_workspace();
 
@@ -2521,8 +2546,15 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 .collect::<Option<_>>()?;
             Some(format!("record({wit_name} {{ {} }})", parts.join(", ")))
         }
-        // Other compound shapes (lists, options, variants, tuples,
-        // results, flags) light up here as their lift codegen lands.
+        Shape::Tuple(elems) => {
+            let parts: Vec<String> = elems
+                .iter()
+                .map(predict_tier2_arg_inner)
+                .collect::<Option<_>>()?;
+            Some(format!("tuple({})", parts.join(", ")))
+        }
+        // Other compound shapes (lists, options, variants, results,
+        // flags) light up here as their lift codegen lands.
         _ => None,
     }
 }
