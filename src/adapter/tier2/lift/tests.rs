@@ -276,6 +276,8 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
         ext_f64: n + 2,
         result: None,
         tr_addr: None,
+        id_local: 0,
+        task_return_loads: None,
     };
 
     let mut module = Module::new();

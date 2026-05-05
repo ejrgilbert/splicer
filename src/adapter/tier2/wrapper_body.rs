@@ -42,8 +42,7 @@
 //! call $handler
 //! ```
 
-use wasm_encoder::{CodeSection, Function, ValType};
-use wit_bindgen_core::abi::lift_from_memory;
+use wasm_encoder::{CodeSection, Function};
 use wit_parser::Resolve;
 
 use super::super::abi::canon_async;
@@ -51,8 +50,7 @@ use super::super::abi::emit::{
     emit_alloc_call_id, emit_handler_call, emit_populate_call_id, emit_store_i64_local,
     emit_store_slice, emit_wrapper_return, BlobSlice, RecordLayout,
 };
-use super::super::abi::WasmEncoderBindgen;
-use super::super::indices::FunctionIndices;
+use super::super::indices::LocalsBuilder;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
     ResultEmitPlan, WrapperLocals,
@@ -141,30 +139,19 @@ pub(super) fn emit_wrapper_function(
     let async_funcs = &func_idx.async_funcs;
     let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
-    let mut locals = FunctionIndices::new(nparams);
-    // `alloc_wrapper_locals` also drives the `lift_from_memory`
-    // bindgen for compound result lifts (it may allocate further
-    // scratch locals — must happen before the locals list freezes).
-    let (lcl, result_emit) = alloc_wrapper_locals(ctx.resolve, &schema.size_align, &mut locals, fd);
+    let builder = LocalsBuilder::new(nparams);
+    // `alloc_wrapper_locals` consumes the builder: it allocates every
+    // wrapper local (incl. compound-result synth locals + task.return
+    // bindgen scratch + the call-id local), pre-builds the lift load
+    // sequences, and returns a `FrozenLocals`. After this point there
+    // is no `LocalsBuilder` in scope, so additional `alloc_local` calls
+    // are a compile error.
+    let (lcl, result_emit, frozen) =
+        alloc_wrapper_locals(ctx.resolve, &schema.size_align, builder, fd);
 
-    // For async funcs whose `task.return` takes flat-form params,
-    // pre-build the load sequence — `lift_from_memory` may allocate
-    // additional bindgen scratch locals, which must happen before
-    // the locals list is frozen below.
-    let task_return_loads: Option<Vec<wasm_encoder::Instruction<'static>>> =
-        lcl.tr_addr.map(|addr_local| {
-            let result_ty = fd.result_ty.as_ref().expect("flat loads → result_ty");
-            let mut bindgen = WasmEncoderBindgen::new(&schema.size_align, addr_local, &mut locals);
-            lift_from_memory(ctx.resolve, &mut bindgen, (), result_ty);
-            bindgen.into_instructions()
-        });
-    // i64 call-id local. Tier-2 generation requires at least one hook
-    // (`build_tier2_adapter` bails otherwise), so this is always live.
-    let id_local = locals.alloc_local(ValType::I64);
+    let mut f = Function::new_with_locals_types(frozen.locals);
 
-    let mut f = Function::new_with_locals_types(locals.into_locals());
-
-    emit_alloc_call_id(&mut f, ctx.call_id_counter_global, id_local);
+    emit_alloc_call_id(&mut f, ctx.call_id_counter_global, lcl.id_local);
 
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before) = ctx.before_hook.as_ref() {
@@ -200,7 +187,7 @@ pub(super) fn emit_wrapper_function(
                     off: args_off,
                     len: nargs,
                 },
-                id_local,
+                id_local: lcl.id_local,
             },
         );
         f.instructions().i32_const(before.params_ptr);
@@ -284,7 +271,7 @@ pub(super) fn emit_wrapper_function(
         // only `call.id` changes per call, so patch it at runtime.
         let id_field_off =
             after_static.layout.offset_of(ON_RET_CALL) + schema.callid_layout.id_off();
-        emit_store_i64_local(&mut f, after_pf.params_offset, id_field_off, id_local);
+        emit_store_i64_local(&mut f, after_pf.params_offset, id_field_off, lcl.id_local);
         f.instructions().i32_const(after_pf.params_offset);
         canon_async::emit_call_and_wait(&mut f, after_static.idx, lcl.st, lcl.ws, async_funcs);
     }
@@ -293,7 +280,7 @@ pub(super) fn emit_wrapper_function(
     // sync fns return the direct value (or static retptr).
     match &fd.shape {
         FuncShape::Async(_) => {
-            emit_task_return(&mut f, fd, func_idx, i, &lcl, task_return_loads.as_deref());
+            emit_task_return(&mut f, fd, func_idx, i, &lcl);
         }
         FuncShape::Sync => {
             emit_wrapper_return(&mut f, lcl.result, fd.export_sig.retptr, fd.retptr_offset);
@@ -315,7 +302,6 @@ fn emit_task_return(
     func_idx: &FuncIndices,
     i: usize,
     lcl: &WrapperLocals,
-    task_return_loads: Option<&[wasm_encoder::Instruction<'static>]>,
 ) {
     let imp_task_return =
         func_idx.task_return_idx[i].expect("async func must have task.return import");
@@ -332,12 +318,16 @@ fn emit_task_return(
         f.instructions().call(imp_task_return);
     } else {
         let addr_local = lcl.tr_addr.expect("flat loads → tr_addr local");
+        let task_return_loads = lcl
+            .task_return_loads
+            .as_deref()
+            .expect("flat loads → instruction sequence");
         f.instructions().i32_const(
             fd.retptr_offset
                 .expect("async non-void result → retptr_offset"),
         );
         f.instructions().local_set(addr_local);
-        for inst in task_return_loads.expect("flat loads → instruction sequence") {
+        for inst in task_return_loads {
             f.instruction(inst);
         }
         f.instructions().call(imp_task_return);

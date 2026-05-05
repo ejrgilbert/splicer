@@ -13,7 +13,7 @@ use wit_parser::{
     Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId, WasmImport, WorldId, WorldItem,
 };
 
-use super::super::indices::FunctionIndices;
+use super::super::indices::LocalsBuilder;
 use super::super::resolve::hook_callback_mangling;
 
 // ─── Standard wasm-component-model exports ────────────────────────
@@ -97,10 +97,10 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection, bump_global: u32) {
     const PARAM_COUNT: u32 = 4;
     const ALIGN_LOCAL: u32 = 2;
     const NEW_SIZE_LOCAL: u32 = 3;
-    let mut locals = FunctionIndices::new(PARAM_COUNT);
+    let mut locals = LocalsBuilder::new(PARAM_COUNT);
     let aligned = locals.alloc_local(ValType::I32);
     let new_bump = locals.alloc_local(ValType::I32);
-    let mut f = Function::new_with_locals_types(locals.into_locals());
+    let mut f = Function::new_with_locals_types(locals.freeze().locals);
 
     // aligned = (global.bump + (align - 1)) & ~(align - 1)
     f.instructions().global_get(bump_global);

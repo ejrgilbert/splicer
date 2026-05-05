@@ -10,17 +10,17 @@ use super::super::super::abi::emit::{
     direct_return_type, wasm_type_to_val, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
 use super::super::super::abi::WasmEncoderBindgen;
-use super::super::super::indices::FunctionIndices;
+use super::super::super::indices::{FrozenLocals, LocalsBuilder};
 use super::super::cells::CellLayout;
 use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
 use super::plan::{Cell, LiftPlan};
 
-/// Locals used by the wrapper body. Allocated once up front so all
-/// downstream emit phases (param lift, hook calls, result lift, async
-/// task.return load) reference the same indices. Result-lift-only
-/// locals (Compound addr + synth slot locals, plus the pre-built
-/// `lift_from_memory` instruction sequence) live on
+/// Locals + pre-built load sequences used by the wrapper body.
+/// Allocated once up front so all downstream emit phases (param lift,
+/// hook calls, result lift, async task.return load) reference the same
+/// indices. Result-lift-only locals (Compound addr + synth slot locals,
+/// plus the pre-built `lift_from_memory` instruction sequence) live on
 /// [`ResultEmitPlan`] instead — that type bundles the result emit's
 /// per-variant data so the four-fields-must-agree invariant disappears
 /// into the sum-type discriminant.
@@ -42,6 +42,15 @@ pub(crate) struct WrapperLocals {
     /// `task.return` flat loads. `None` for sync, void async, and
     /// async with retptr-passthrough task.return.
     pub tr_addr: Option<u32>,
+    /// i64 call-id local. Tier-2 always wires at least one hook
+    /// (`build_tier2_adapter` bails otherwise), so this is always live.
+    pub id_local: u32,
+    /// Pre-built bindgen load sequence for async `task.return` flat
+    /// args. `Some` exactly when [`Self::tr_addr`] is `Some`, sourced
+    /// from `lift_from_memory` driven by the same builder that allocated
+    /// every other local. Stored here (not synthesized at emit time) so
+    /// every local the bindgen needed is already in [`FrozenLocals`].
+    pub task_return_loads: Option<Vec<Instruction<'static>>>,
 }
 
 /// Per-function emit-time bundle for the result-side lift. Built once
@@ -92,20 +101,29 @@ pub(crate) enum ResultEmitPlan<'a> {
     },
 }
 
+/// Allocate every local the wrapper body will reference, build the
+/// (data-driven) compound-result and async-task-return load sequences,
+/// then [`LocalsBuilder::freeze`] the result and hand back the frozen
+/// locals list. Taking `builder` by value is the typestate hinge: the
+/// caller surrenders its ability to allocate further locals before
+/// receiving the [`FrozenLocals`] that feeds
+/// `Function::new_with_locals_types`, so "allocate after freeze" is a
+/// compile error rather than a runtime panic when wasm validation
+/// trips on out-of-range locals.
 pub(crate) fn alloc_wrapper_locals<'a>(
     resolve: &Resolve,
     size_align: &SizeAlign,
-    locals: &mut FunctionIndices,
+    mut builder: LocalsBuilder,
     fd: &'a FuncDispatch,
-) -> (WrapperLocals, ResultEmitPlan<'a>) {
-    let addr = locals.alloc_local(ValType::I32);
-    let st = locals.alloc_local(ValType::I32);
-    let ws = locals.alloc_local(ValType::I32);
-    let ptr_scratch = locals.alloc_local(ValType::I32);
-    let len_scratch = locals.alloc_local(ValType::I32);
-    let ext64 = locals.alloc_local(ValType::I64);
-    let ext_f64 = locals.alloc_local(ValType::F64);
-    let result = direct_return_type(&fd.export_sig).map(|t| locals.alloc_local(t));
+) -> (WrapperLocals, ResultEmitPlan<'a>, FrozenLocals) {
+    let addr = builder.alloc_local(ValType::I32);
+    let st = builder.alloc_local(ValType::I32);
+    let ws = builder.alloc_local(ValType::I32);
+    let ptr_scratch = builder.alloc_local(ValType::I32);
+    let len_scratch = builder.alloc_local(ValType::I32);
+    let ext64 = builder.alloc_local(ValType::I64);
+    let ext_f64 = builder.alloc_local(ValType::F64);
+    let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
     // values out of the retptr scratch.
@@ -113,14 +131,14 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         .shape
         .task_return()
         .is_some_and(|tr| !tr.sig.indirect_params && fd.result_ty.is_some());
-    let tr_addr = tr_uses_flat_loads.then(|| locals.alloc_local(ValType::I32));
+    let tr_addr = tr_uses_flat_loads.then(|| builder.alloc_local(ValType::I32));
 
     // Result-emit plan: discriminate on the layout-phase `ResultLayout`
     // and pull together the variant-specific locals/offsets/loads.
     // Compound allocates extra locals (one i32 addr + one synth per
     // flat slot) AND drives the bindgen for `lift_from_memory` —
     // bindgen may allocate further scratch locals, so this must run
-    // before the wrapper-body emit freezes the locals list.
+    // before the locals list freezes.
     let result_emit = match fd.result_lift.as_ref() {
         None => ResultEmitPlan::None,
         Some(rl) => match &rl.source {
@@ -143,7 +161,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 retptr_offset,
                 record_info_cell_idx,
             } => {
-                let addr_local = locals.alloc_local(ValType::I32);
+                let addr_local = builder.alloc_local(ValType::I32);
                 let flat = super::super::super::abi::flat_types(resolve, &compound.ty, None)
                     .unwrap_or_else(|| {
                         panic!(
@@ -163,9 +181,9 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 // resolves to `synth_locals[0] + N = synth_locals[N]`.
                 let synth_locals: Vec<u32> = flat
                     .into_iter()
-                    .map(|wt| locals.alloc_local(wasm_type_to_val(wt)))
+                    .map(|wt| builder.alloc_local(wasm_type_to_val(wt)))
                     .collect();
-                let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, locals);
+                let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, &mut builder);
                 lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
                 let loads = bindgen.into_instructions();
                 ResultEmitPlan::Compound {
@@ -180,6 +198,24 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         },
     };
 
+    // Async task.return flat-loads run a second `lift_from_memory`
+    // pass over `result_ty`; that bindgen may allocate scratch locals
+    // too, so it has to happen before we freeze.
+    let task_return_loads: Option<Vec<Instruction<'static>>> = tr_addr.map(|addr_local| {
+        let result_ty = fd
+            .result_ty
+            .as_ref()
+            .expect("flat task.return loads → result_ty");
+        let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, &mut builder);
+        lift_from_memory(resolve, &mut bindgen, (), result_ty);
+        bindgen.into_instructions()
+    });
+
+    // i64 call-id local. Tier-2 generation requires at least one hook
+    // (`build_tier2_adapter` bails otherwise), so this is always live.
+    let id_local = builder.alloc_local(ValType::I64);
+
+    let frozen = builder.freeze();
     (
         WrapperLocals {
             addr,
@@ -189,8 +225,11 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             ext_f64,
             result,
             tr_addr,
+            id_local,
+            task_return_loads,
         },
         result_emit,
+        frozen,
     )
 }
 

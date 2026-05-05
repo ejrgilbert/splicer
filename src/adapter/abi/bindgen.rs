@@ -60,7 +60,7 @@ use wasm_encoder::{BlockType, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::{Bindgen, Bitcast, Instruction as AbiInst, WasmType};
 use wit_parser::{Alignment, ArchitectureSize, Resolve, SizeAlign, Type};
 
-use super::super::indices::FunctionIndices;
+use super::super::indices::LocalsBuilder;
 use super::compat::{cast, flat_types};
 use super::emit::wasm_type_to_val;
 
@@ -85,10 +85,10 @@ pub(crate) struct WasmEncoderBindgen<'a> {
     /// `iter_addr_local`; see [`WasmEncoderBindgen::current_addr_local`].
     addr_local: u32,
     /// Shared local allocator — the bindgen routes its dynamic
-    /// allocations through the same [`FunctionIndices`] the caller
+    /// allocations through the same [`LocalsBuilder`] the caller
     /// uses for its own locals, so all of the function's locals land
     /// in one contiguous, correctly-indexed block.
-    indices: &'a mut FunctionIndices,
+    indices: &'a mut LocalsBuilder,
 }
 
 /// An active block being captured. Tracks its instruction buffer and
@@ -126,9 +126,9 @@ struct CompletedBlock {
 impl<'a> WasmEncoderBindgen<'a> {
     /// Create a new bindgen. The caller sets up `addr_local` (an
     /// i32 local holding the base address for loads) and hands in a
-    /// `&mut FunctionIndices` for all dynamic local allocation the
+    /// `&mut LocalsBuilder` for all dynamic local allocation the
     /// bindgen needs.
-    pub fn new(sizes: &'a SizeAlign, addr_local: u32, indices: &'a mut FunctionIndices) -> Self {
+    pub fn new(sizes: &'a SizeAlign, addr_local: u32, indices: &'a mut LocalsBuilder) -> Self {
         Self {
             main: Vec::new(),
             block_buffers: Vec::new(),
@@ -141,7 +141,7 @@ impl<'a> WasmEncoderBindgen<'a> {
 
     /// Consume the bindgen and return the accumulated wasm
     /// instructions. Locals were allocated through the caller's
-    /// [`FunctionIndices`], so they're already tracked there.
+    /// [`LocalsBuilder`], so they're already tracked there.
     pub fn into_instructions(self) -> Vec<Instruction<'static>> {
         assert!(
             self.block_buffers.is_empty(),
@@ -156,7 +156,7 @@ impl<'a> WasmEncoderBindgen<'a> {
     }
 
     /// Allocate a new local of the given type via the shared
-    /// [`FunctionIndices`].
+    /// [`LocalsBuilder`].
     fn alloc_local(&mut self, ty: ValType) -> u32 {
         self.indices.alloc_local(ty)
     }
@@ -766,7 +766,7 @@ mod tests {
     fn lift_u32_emits_one_load() {
         let resolve = Resolve::default();
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::U32);
 
@@ -778,7 +778,7 @@ mod tests {
     fn lift_u64_emits_i64_load() {
         let resolve = Resolve::default();
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(4);
+        let mut indices = LocalsBuilder::new(4);
         let mut bg = WasmEncoderBindgen::new(&sizes, 3, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::U64);
 
@@ -823,7 +823,7 @@ mod tests {
             span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::Id(record_id));
 
@@ -838,7 +838,7 @@ mod tests {
     fn lift_string_emits_ptr_len_loads() {
         let resolve = Resolve::default();
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::String);
 
@@ -864,7 +864,7 @@ mod tests {
             span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
 
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(count(&bg, |i| matches!(i, Instruction::Unreachable)), 1);
         let _insts = bg.into_instructions();
         // Bindgen allocated exactly one disc local + one payload local (both i32).
-        assert_eq!(indices.into_locals(), vec![ValType::I32, ValType::I32]);
+        assert_eq!(indices.freeze().locals, vec![ValType::I32, ValType::I32]);
     }
 
     /// `result<u8, u64>` — heterogeneous arms. Joined flat is
@@ -898,7 +898,7 @@ mod tests {
             span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
 
@@ -910,7 +910,7 @@ mod tests {
         );
         let _insts = bg.into_instructions();
         // Disc local (i32) + payload local (i64).
-        assert_eq!(indices.into_locals(), vec![ValType::I32, ValType::I64]);
+        assert_eq!(indices.freeze().locals, vec![ValType::I32, ValType::I64]);
     }
 
     /// `option<u32>` — None arm has no payload, so zero-padding is
@@ -927,7 +927,7 @@ mod tests {
             span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::Id(opt_id));
 
@@ -963,7 +963,7 @@ mod tests {
             span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
 
@@ -980,7 +980,7 @@ mod tests {
         // Joined flat: [disc=i32, PointerOrI64→i64, Length→i32].
         // Locals: disc(i32), payload[0]=i64, payload[1]=i32.
         assert_eq!(
-            indices.into_locals(),
+            indices.freeze().locals,
             vec![ValType::I32, ValType::I64, ValType::I32]
         );
     }
@@ -1001,7 +1001,7 @@ mod tests {
             span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::Id(list_id));
 
@@ -1014,7 +1014,7 @@ mod tests {
         assert_eq!(count(&bg, |i| matches!(i, Instruction::I32Const(4))), 3);
         // Bindgen allocated one i32 local for the iteration address.
         let _insts = bg.into_instructions();
-        assert_eq!(indices.into_locals(), vec![ValType::I32]);
+        assert_eq!(indices.freeze().locals, vec![ValType::I32]);
     }
 
     /// Dynamic `list<T>` flattens to `[Pointer, Length]`, the same
@@ -1045,7 +1045,7 @@ mod tests {
             span: Span::default(),
         });
         let sizes = new_sizes(&resolve);
-        let mut indices = FunctionIndices::new(1);
+        let mut indices = LocalsBuilder::new(1);
         let mut bg = WasmEncoderBindgen::new(&sizes, 0, &mut indices);
         lift_from_memory(&resolve, &mut bg, (), &Type::Id(result_id));
 

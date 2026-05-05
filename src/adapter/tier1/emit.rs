@@ -36,7 +36,7 @@ use super::super::abi::emit::{
     val_types, BlobSlice, CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
-use super::super::indices::{DispatchIndices, FunctionIndices};
+use super::super::indices::{DispatchIndices, LocalsBuilder};
 use super::super::mem_layout::MemoryLayoutBuilder;
 use super::super::resolve::{
     decode_input_resolve, dispatch_mangling, find_target_interface, sync_mangling,
@@ -972,7 +972,7 @@ fn emit_wrapper_body(
     call_id_wiring: Option<CallIdWiring<'_>>,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
-    let mut locals = FunctionIndices::new(nparams);
+    let mut locals = LocalsBuilder::new(nparams);
     let result_local = direct_return_type(&fd.export_sig).map(|t| locals.alloc_local(t));
     // Wait-loop scratch (subtask + waitable-set handles); shared
     // across on-call / on-return / blocking awaits.
@@ -987,7 +987,7 @@ fn emit_wrapper_body(
         buf: w.buf,
         id_local: locals.alloc_local(ValType::I64),
     });
-    let mut f = Function::new_with_locals_types(locals.into_locals());
+    let mut f = Function::new_with_locals_types(locals.freeze().locals);
 
     if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
         emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
@@ -1092,7 +1092,7 @@ fn emit_async_wrapper_body(
     call_id_wiring: Option<CallIdWiring<'_>>,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
-    let mut locals = FunctionIndices::new(nparams);
+    let mut locals = LocalsBuilder::new(nparams);
     // Wait-loop scratch, shared across hook awaits + the handler await.
     let st = locals.alloc_local(ValType::I32);
     let ws = locals.alloc_local(ValType::I32);
@@ -1123,7 +1123,7 @@ fn emit_async_wrapper_body(
         id_local: locals.alloc_local(ValType::I64),
     });
 
-    let mut f = Function::new_with_locals_types(locals.into_locals());
+    let mut f = Function::new_with_locals_types(locals.freeze().locals);
 
     if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
         emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
