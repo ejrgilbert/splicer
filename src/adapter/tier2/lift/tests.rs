@@ -42,6 +42,10 @@ const TEST_WIT: &str = r#"
         f-option-option: func(o: option<option<u32>>);
         record point-and-option { p: point, o: option<u32> }
         f-record-with-option: func(rwo: point-and-option);
+        f-result-u32-string: func(r: result<u32, string>);
+        f-result-unit-err: func(r: result<_, string>);
+        f-result-ok-unit: func(r: result<u32>);
+        f-result-both-unit: func(r: result);
     }
 "#;
 
@@ -225,10 +229,10 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
                 put(*len_slot, ValType::I32);
             }
             Cell::Option { disc_slot, .. } => put(*disc_slot, ValType::I32),
+            Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
             Cell::Char
             | Cell::ListOf
-            | Cell::Result
             | Cell::Flags
             | Cell::Variant
             | Cell::Handle
@@ -660,6 +664,115 @@ fn record_with_option_field_recurses_into_option() {
 }
 
 #[test]
+fn result_u32_string_shares_arms_flat_slots() {
+    // result<u32, string>: joined flat = [i32 disc, i32, i32].
+    // Ok=u32 claims slot 1; Err=string claims slots 1, 2 (sharing
+    // slot 1 via the save-and-restore cursor). Cell order:
+    //   IntegerZeroExt {flat_slot:1}  // ok arm leaf
+    //   Text {ptr:1, len:2}           // err arm leaf
+    //   Result { disc:0, ok:Some(0), err:Some(1) }
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-u32-string").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::Text {
+                ptr_slot: 1,
+                len_slot: 2,
+            },
+            Cell::Result {
+                disc_slot: 0,
+                ok_idx: Some(0),
+                err_idx: Some(1),
+            },
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 3);
+}
+
+#[test]
+fn result_unit_ok_skips_ok_child() {
+    // result<_, string>: Ok arm is unit, no child cell. Err=string
+    // claims slots 1, 2. ok_idx=None, err_idx=Some(0).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-unit-err").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::Text {
+                ptr_slot: 1,
+                len_slot: 2,
+            },
+            Cell::Result {
+                disc_slot: 0,
+                ok_idx: None,
+                err_idx: Some(0),
+            },
+        ],
+    );
+    assert_eq!(plan.flat_slot_count, 3);
+}
+
+#[test]
+fn result_unit_err_skips_err_child() {
+    // result<u32>: only Ok arm has a payload. ok_idx=Some(0),
+    // err_idx=None. Total 2 slots (disc + u32).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-ok-unit").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::Result {
+                disc_slot: 0,
+                ok_idx: Some(0),
+                err_idx: None,
+            },
+        ],
+    );
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn result_both_unit_is_disc_only() {
+    // result<_, _>: both arms unit. Just the disc, no children.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-both-unit").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(
+        plan.cells,
+        vec![Cell::Result {
+            disc_slot: 0,
+            ok_idx: None,
+            err_idx: None,
+        }],
+    );
+    assert_eq!(plan.root(), 0);
+    assert_eq!(plan.flat_slot_count, 1);
+}
+
+#[test]
 fn classify_func_params_yields_plan_relative_slots() {
     // f-mixed(a: bool, s: string, b: list<u8>, x: s64): each
     // param's plan is plan-relative, not threaded with cumulative
@@ -839,6 +952,26 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &mut names,
         ),
         plan_for_named("point-and-option", &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-result-u32-string").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-unit-err").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-ok-unit").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-both-unit").params[0].ty,
+            &r,
+            &mut names,
+        ),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan);

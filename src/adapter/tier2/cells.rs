@@ -413,8 +413,7 @@ impl CellLayout {
         self.emit_cell(f, addr_local, self.disc_of("option-none"), &[]);
     }
 
-    /// `cell::result-ok(option<u32>)` — disc 9 + option<inner>.
-    #[allow(dead_code)]
+    /// `cell::result-ok(option<u32>)`.
     pub(crate) fn emit_result_ok(
         &self,
         f: &mut Function,
@@ -422,12 +421,10 @@ impl CellLayout {
         has_payload: bool,
         inner_idx: u32,
     ) {
-        let _ = (f, addr_local, has_payload, inner_idx);
-        todo!("cell::result-ok(option<u32>) — disc 9 + option<u32> payload");
+        self.emit_result_arm(f, addr_local, "result-ok", has_payload, inner_idx);
     }
 
-    /// `cell::result-err(option<u32>)` — disc 10 + option<inner>.
-    #[allow(dead_code)]
+    /// `cell::result-err(option<u32>)`.
     pub(crate) fn emit_result_err(
         &self,
         f: &mut Function,
@@ -435,8 +432,35 @@ impl CellLayout {
         has_payload: bool,
         inner_idx: u32,
     ) {
-        let _ = (f, addr_local, has_payload, inner_idx);
-        todo!("cell::result-err(option<u32>) — disc 10 + option<u32> payload");
+        self.emit_result_arm(f, addr_local, "result-err", has_payload, inner_idx);
+    }
+
+    /// Shared body for both result arms: cell disc + an inline
+    /// `option<u32>` in the cell payload (option-disc at +0, inner
+    /// idx at +4 when has_payload). Skipping the +4 store on `none`
+    /// matches `emit_option_none`'s "disc only" pattern; readers gate
+    /// on the option-disc.
+    fn emit_result_arm(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        case: &str,
+        has_payload: bool,
+        inner_idx: u32,
+    ) {
+        let mut parts = vec![PayloadPart {
+            source: PayloadSource::ConstI32(if has_payload { 1 } else { 0 }),
+            kind: StoreKind::I32,
+            offset: 0,
+        }];
+        if has_payload {
+            parts.push(PayloadPart {
+                source: PayloadSource::ConstI32(inner_idx as i32),
+                kind: StoreKind::I32,
+                offset: 4,
+            });
+        }
+        self.emit_cell(f, addr_local, self.disc_of(case), &parts);
     }
 
     /// `cell::record-of(u32)` — index into `field-tree.record-infos`.
@@ -676,6 +700,32 @@ mod tests {
         // params: (addr_local: i32). disc-only, no payload writes.
         let cl = synth_cell_layout();
         build_and_validate(&[ValType::I32], |f| cl.emit_option_none(f, 0));
+    }
+
+    #[test]
+    fn result_ok_with_payload_emits_valid_wasm() {
+        // params: (addr_local: i32). option<u32> payload (disc=1, idx).
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_result_ok(f, 0, true, 5));
+    }
+
+    #[test]
+    fn result_ok_unit_emits_valid_wasm() {
+        // params: (addr_local: i32). option<u32> payload (disc=0).
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_result_ok(f, 0, false, 0));
+    }
+
+    #[test]
+    fn result_err_with_payload_emits_valid_wasm() {
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_result_err(f, 0, true, 7));
+    }
+
+    #[test]
+    fn result_err_unit_emits_valid_wasm() {
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_result_err(f, 0, false, 0));
     }
 
     /// Structural fuzz over the primitive cell-emit helpers — for each

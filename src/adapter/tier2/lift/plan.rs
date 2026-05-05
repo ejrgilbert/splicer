@@ -26,7 +26,8 @@
 
 use wit_parser::{Resolve, Type};
 
-use super::super::super::abi::emit::BlobSlice;
+use super::super::super::abi::emit::{wasm_type_to_val, BlobSlice};
+use super::super::super::abi::flat_types;
 use super::super::blob::NameInterner;
 
 /// One cell to write at a known cell-array index. Each variant
@@ -93,6 +94,18 @@ pub(crate) enum Cell {
     /// always emitted; canonical-ABI lower zeroes T's slots on `none`
     /// and readers gate on the parent's disc.
     Option { disc_slot: u32, child_idx: u32 },
+    /// `result<T, E>` → `cell::result-ok(option<u32>)` /
+    /// `cell::result-err(option<u32>)`. Flat layout:
+    /// `[i32 disc, ...join(flat(T), flat(E))]`. Both arms' child cells
+    /// live in `cells`; the wrong-arm cells read shared flat slots
+    /// and produce harmless garbage on inactive disc. `ok_idx` /
+    /// `err_idx` are `None` for unit arms (`result<_, E>` /
+    /// `result<T, _>`).
+    Result {
+        disc_slot: u32,
+        ok_idx: Option<u32>,
+        err_idx: Option<u32>,
+    },
 
     // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
     //    + `emit_cell_op` until codegen lands) ─────────────────────
@@ -100,8 +113,6 @@ pub(crate) enum Cell {
     Char,
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
-    /// `result<T, E>` → `cell::result-ok(option<u32>)` / `cell::result-err(option<u32>)`.
-    Result,
     /// `flags { ... }` → `cell::flags-set(u32)`.
     Flags,
     /// `variant { ... }` → `cell::variant-case(u32)`.
@@ -273,9 +284,7 @@ impl LiftPlanBuilder {
                     todo!("plan-builder for un-wired Cell::Flags")
                 }
                 wit_parser::TypeDefKind::Option(inner) => self.push_option(inner, resolve, names),
-                wit_parser::TypeDefKind::Result(_) => {
-                    todo!("plan-builder for un-wired Cell::Result")
-                }
+                wit_parser::TypeDefKind::Result(_) => self.push_result(ty, resolve, names),
                 wit_parser::TypeDefKind::Handle(_) => {
                     todo!("plan-builder for un-wired Cell::Handle")
                 }
@@ -372,6 +381,80 @@ impl LiftPlanBuilder {
         self.push_cell(Cell::Option {
             disc_slot,
             child_idx,
+        })
+    }
+
+    /// `result<T, E>`: bump disc, then walk both arms while sharing
+    /// the same flat-slot range (the canonical-ABI joined layout has
+    /// each post-disc slot serving both arms). Saving + restoring
+    /// `next_flat_slot` between arms is the trick: T claims slots
+    /// `[base..base+|flat(T)|)`, E claims `[base..base+|flat(E)|)`,
+    /// and the cursor advances to `max(after_t, after_e)`.
+    ///
+    /// Bails for arms whose flat type widens under the canonical-ABI
+    /// join — e.g. `result<u32, f64>` widens slot 1 to I64,
+    /// `result<u32, u64>` widens slot 1 to I64. Phase 1 only handles
+    /// the no-widening case: every populated arm's per-slot wasm
+    /// type must equal the joined type. Equivalently, T and E must
+    /// produce identical widths at every flat position
+    /// (typically when both flatten to i32 only — common with
+    /// `result<i32-flat, string>`). Bitcast-on-leaf-read is a
+    /// follow-up.
+    fn push_result(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
+        let Type::Id(id) = ty else {
+            unreachable!("Result kind came from non-Id type")
+        };
+        let wit_parser::TypeDefKind::Result(r) = &resolve.types[*id].kind else {
+            unreachable!("Result kind came from non-Result TypeDefKind")
+        };
+        let r = r.clone();
+
+        // Joined flat (= [I32 disc, ...join(flat(ok), flat(err))]).
+        // Each populated arm's per-position flat must equal the
+        // joined per-position; otherwise leaf cells would need
+        // bitcasts that Phase 1 doesn't yet emit.
+        let joined = flat_types(resolve, ty, None)
+            .expect("result<T, E> must flatten within MAX_FLAT_PARAMS");
+        // Compare at wasm-level: `Pointer`/`Length` compare equal to
+        // `I32`, `PointerOrI64` to `I64`. The per-slot wasm type is
+        // what determines whether leaf cells can read the slot
+        // without a bitcast.
+        let check_arm = |arm: &Option<Type>, label: &str| {
+            if let Some(t) = arm {
+                let arm_flat =
+                    flat_types(resolve, t, None).expect("arm flat fits — joined fit, so arm fits");
+                for (i, &arm_ty) in arm_flat.iter().enumerate() {
+                    let arm_val = wasm_type_to_val(arm_ty);
+                    let joined_val = wasm_type_to_val(joined[1 + i]);
+                    if arm_val != joined_val {
+                        todo!(
+                            "result<T, E> with joined-flat widening on the {label} arm \
+                             (slot {} arm-val {:?} vs joined-val {:?}) is not yet supported",
+                            1 + i,
+                            arm_val,
+                            joined_val,
+                        );
+                    }
+                }
+            }
+        };
+        check_arm(&r.ok, "ok");
+        check_arm(&r.err, "err");
+
+        let disc_slot = self.bump_flat_slot();
+        let arms_base = self.next_flat_slot;
+        let ok_idx = r.ok.as_ref().map(|t| self.push(t, resolve, names));
+        let after_ok = self.next_flat_slot;
+
+        self.next_flat_slot = arms_base;
+        let err_idx = r.err.as_ref().map(|t| self.push(t, resolve, names));
+        let after_err = self.next_flat_slot;
+
+        self.next_flat_slot = after_ok.max(after_err);
+        self.push_cell(Cell::Result {
+            disc_slot,
+            ok_idx,
+            err_idx,
         })
     }
 

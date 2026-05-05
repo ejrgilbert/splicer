@@ -783,6 +783,50 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `Cell::Result` as a param: branching emit
+    /// (result-ok / result-err with option<u32> payload) and the
+    /// canonical-ABI joined-flat slot sharing across both arms.
+    /// `result<u32, u32>` keeps the canon-lift options minimal (no
+    /// realloc / memory required) — both arms share the joined slot,
+    /// no widening needed.
+    #[test]
+    fn dispatch_module_with_result_param_roundtrips() {
+        // result<u32, u32> flat = [i32 disc, i32 (joined u32/u32)].
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume") (param i32 i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (type $consume-ty (func (param "r" (result u32 (error u32)))))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:res/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:res/api@1.0.0" (instance $api "my:res/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:res/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for result param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// Async function whose params flatten to >`MAX_FLAT_ASYNC_PARAMS` (4)
     /// canon-lowers with `indirect_params=true`, but tier-2's
     /// `emit_handler_call` pushes flat params. Until `lower_to_memory`

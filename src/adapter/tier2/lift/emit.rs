@@ -367,9 +367,22 @@ fn emit_cell_op(
             cell_layout.emit_option_none(f, addr);
             f.instructions().end();
         }
+        Cell::Result {
+            disc_slot,
+            ok_idx,
+            err_idx,
+        } => {
+            // disc=0 → result-ok; disc=1 → result-err. `wasm if` fires
+            // on non-zero, so the err arm goes in the `if` block.
+            f.instructions().local_get(local_base + *disc_slot);
+            f.instructions().if_(BlockType::Empty);
+            cell_layout.emit_result_err(f, addr, err_idx.is_some(), err_idx.unwrap_or(0));
+            f.instructions().else_();
+            cell_layout.emit_result_ok(f, addr, ok_idx.is_some(), ok_idx.unwrap_or(0));
+            f.instructions().end();
+        }
         Cell::Char
         | Cell::ListOf
-        | Cell::Result
         | Cell::Flags
         | Cell::Variant
         | Cell::Handle
@@ -429,7 +442,7 @@ fn emit_lift_kind(
         | Cell::Char
         | Cell::ListOf
         | Cell::Option { .. }
-        | Cell::Result
+        | Cell::Result { .. }
         | Cell::Flags
         | Cell::Variant
         | Cell::Handle
