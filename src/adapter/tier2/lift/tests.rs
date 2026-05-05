@@ -10,7 +10,7 @@ use wasm_encoder::{
 use wit_parser::abi::WasmSignature;
 use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
-use super::super::super::abi::emit::{BlobSlice, RecordLayout, STRING_FLAT_BYTES};
+use super::super::super::abi::emit::{BlobSlice, RecordLayout, MAX_UTF8_LEN, STRING_FLAT_BYTES};
 use super::super::blob::NameInterner;
 use super::super::cells::CellLayout;
 use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
@@ -233,7 +233,8 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             | Cell::IntegerSignExt { flat_slot }
             | Cell::IntegerZeroExt { flat_slot }
             | Cell::EnumCase { flat_slot, .. }
-            | Cell::Flags { flat_slot, .. } => put(*flat_slot, ValType::I32),
+            | Cell::Flags { flat_slot, .. }
+            | Cell::Char { flat_slot } => put(*flat_slot, ValType::I32),
             Cell::Integer64 { flat_slot } => put(*flat_slot, ValType::I64),
             Cell::FloatingF32 { flat_slot } => put(*flat_slot, ValType::F32),
             Cell::FloatingF64 { flat_slot } => put(*flat_slot, ValType::F64),
@@ -245,12 +246,7 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::Variant { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
-            Cell::Char
-            | Cell::ListOf
-            | Cell::Handle
-            | Cell::Future
-            | Cell::Stream
-            | Cell::ErrorContext => {
+            Cell::ListOf | Cell::Handle | Cell::Future | Cell::Stream | Cell::ErrorContext => {
                 unreachable!("un-wired Cell variant {op:?} should not appear in test plans")
             }
         }
@@ -282,6 +278,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
     let mut flags_cursor: u32 = FLAGS_SCRATCH_BASE;
     let mut flags_idx: u32 = 0;
     let mut variant_idx: u32 = 0;
+    let mut char_cursor: u32 = 0x3000;
     plan.cells
         .iter()
         .map(|op| match op {
@@ -352,6 +349,13 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 variant_idx += 1;
                 CellSideData::Variant(Box::new(fill))
             }
+            Cell::Char { .. } => {
+                let scratch_addr = char_cursor;
+                char_cursor += MAX_UTF8_LEN;
+                CellSideData::Char {
+                    scratch_addr: scratch_addr as i32,
+                }
+            }
             _ => CellSideData::None,
         })
         .collect()
@@ -371,8 +375,9 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
         ws: 0,
         flags_addr: n + 1,
         flags_count: n + 2,
-        ext64: n + 3,
-        ext_f64: n + 4,
+        char_len: n + 3,
+        ext64: n + 4,
+        ext_f64: n + 5,
         result: None,
         tr_addr: None,
         id_local: 0,
@@ -401,7 +406,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
     module.section(&funcs);
     let mut code = CodeSection::new();
     let mut f = Function::new([
-        (3u32, ValType::I32),
+        (4u32, ValType::I32),
         (1u32, ValType::I64),
         (1u32, ValType::F64),
     ]);
@@ -477,6 +482,15 @@ fn list_u8_classifies_as_bytes_cell() {
         }]
     );
     assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn char_assigns_one_cell_one_slot() {
+    let r = Resolve::new();
+    let mut names = NameInterner::new();
+    let plan = plan_for(&Type::Char, &r, &mut names);
+    assert_eq!(plan.cells, vec![Cell::Char { flat_slot: 0 }]);
+    assert_eq!(plan.flat_slot_count, 1);
 }
 
 #[test]
@@ -1135,6 +1149,7 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for(&Type::F32, &r, &mut names),
         plan_for(&Type::F64, &r, &mut names),
         plan_for(&Type::String, &r, &mut names),
+        plan_for(&Type::Char, &r, &mut names),
         plan_for(&func_named(&r, "f-mixed").params[2].ty, &r, &mut names), // list<u8>
         plan_for_named("color", &r, &mut names),
         plan_for_named("fperms", &r, &mut names),

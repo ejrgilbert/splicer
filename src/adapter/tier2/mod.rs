@@ -3,9 +3,10 @@
 //! representation defined in `splicer:common/types`, then dispatches
 //! the lifted values to the middleware's tier-2 hooks.
 //!
-//! Wired: primitives, `string`, `list<u8>`, `enum`, `record`,
-//! `tuple<...>` (both sides, sync + async). Remaining `Cell` variants
-//! `todo!()` in [`lift::plan::LiftPlanBuilder`] / [`cells::CellLayout`].
+//! Wired: primitives, `string`, `list<u8>`, `char`, `enum`, `flags`,
+//! `record`, `tuple<...>`, `option<T>`, `result<T, E>`, `variant`
+//! (both sides, sync + async). Un-wired: `list<T>` (non-u8),
+//! handles (`own`/`borrow`/`stream`/`future`), `error-context`.
 //! Roadmap: `docs/tiers/lift-codegen.md`.
 //!
 //! Pipeline (driven by [`build_dispatch_module`]):
@@ -824,6 +825,46 @@ mod tests {
             tier2_wit,
         )
         .expect("tier-2 adapter generation should succeed for flags param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// End-to-end test for `Cell::Char` as a param. Drives the
+    /// utf-8 encoder + per-cell scratch reservation + cell::text emit.
+    /// `char` flattens to a single i32 (the code point).
+    #[test]
+    fn dispatch_module_with_char_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (type $consume-ty (func (param "c" char)))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:ch/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:ch/api@1.0.0" (instance $api "my:ch/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:ch/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for char param");
 
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)

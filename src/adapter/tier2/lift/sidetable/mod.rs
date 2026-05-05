@@ -29,6 +29,7 @@ use super::super::FuncClassified;
 use super::classify::SideTableInfo;
 use super::plan::{Cell, LiftPlan, NamedListInfo};
 
+pub(super) mod char_info;
 pub(super) mod enum_info;
 pub(super) mod flags_info;
 pub(super) mod record_info;
@@ -61,6 +62,12 @@ pub(crate) enum CellSideData {
     /// `cell::variant-case(u32)` payload + the addresses the wrapper
     /// disc-dispatch patches at runtime (case-name + payload option).
     Variant(Box<VariantRuntimeFill>),
+    /// Per-cell utf-8 scratch buffer base for `Cell::Char`. The
+    /// wrapper utf-8-encodes the i32 code point into this buffer
+    /// (1–4 bytes) and emits `cell::text(scratch_addr, len)`.
+    Char {
+        scratch_addr: i32,
+    },
 }
 
 /// Fold the per-builder per-cell maps into one [`Vec<CellSideData>`]
@@ -72,11 +79,13 @@ pub(crate) fn fold_cell_side_data(
     tuple_indices: &[Option<BlobSlice>],
     flags_fill: &[Option<FlagsRuntimeFill>],
     variant_fill: &[Option<VariantRuntimeFill>],
+    char_scratch: &[Option<i32>],
 ) -> Vec<CellSideData> {
     debug_assert_eq!(record_info.len(), plan.cells.len());
     debug_assert_eq!(tuple_indices.len(), plan.cells.len());
     debug_assert_eq!(flags_fill.len(), plan.cells.len());
     debug_assert_eq!(variant_fill.len(), plan.cells.len());
+    debug_assert_eq!(char_scratch.len(), plan.cells.len());
     plan.cells
         .iter()
         .enumerate()
@@ -97,6 +106,9 @@ pub(crate) fn fold_cell_side_data(
                     .clone()
                     .expect("Variant cell missing runtime-fill bundle"),
             )),
+            Cell::Char { .. } => CellSideData::Char {
+                scratch_addr: char_scratch[i].expect("Char cell missing scratch addr"),
+            },
             _ => CellSideData::None,
         })
         .collect()

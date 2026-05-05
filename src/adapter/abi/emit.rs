@@ -462,6 +462,12 @@ pub(crate) const SLICE_LEN_OFFSET: u32 = 4;
 /// `string` lowering, also the per-element stride of any `list<string>`.
 pub(crate) const STRING_FLAT_BYTES: u32 = 8;
 
+/// Maximum bytes a single Unicode scalar takes in UTF-8 — derived
+/// from `char::MAX.len_utf8()` so the source of truth is the standard
+/// library's char definition (which matches the Unicode standard the
+/// canonical-ABI's `char` references).
+pub(crate) const MAX_UTF8_LEN: u32 = char::MAX.len_utf8() as u32;
+
 /// Canonical-ABI discriminant values for `option<T>`. Fixed by the
 /// spec — wit-parser models `option<T>` as its own `TypeDefKind::Option(T)`
 /// (not a `Variant`), so there's no per-case data on a `Resolve` to

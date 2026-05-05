@@ -43,6 +43,9 @@ pub(crate) struct WrapperLocals {
     /// (re-used across every flags cell in a sequential wrapper body).
     pub(super) flags_addr: u32,
     pub(super) flags_count: u32,
+    /// Length local for the `Cell::Char` utf-8 encoder; staged into
+    /// `cell::text(ptr, len)`. Re-used across every char cell.
+    pub(super) char_len: u32,
     /// Direct-return value when the export sig has a single flat
     /// result; `None` otherwise.
     pub result: Option<u32>,
@@ -145,6 +148,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let ext_f64 = builder.alloc_local(ValType::F64);
     let flags_addr = builder.alloc_local(ValType::I32);
     let flags_count = builder.alloc_local(ValType::I32);
+    let char_len = builder.alloc_local(ValType::I32);
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -251,6 +255,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             ext_f64,
             flags_addr,
             flags_count,
+            char_len,
             result,
             tr_addr,
             id_local,
@@ -402,12 +407,21 @@ fn emit_cell_op(
             emit_variant_runtime_fill(f, local_base + *disc_slot, fill);
             cell_layout.emit_variant_case(f, lcl.addr, fill.side_table_idx);
         }
-        Cell::Char
-        | Cell::ListOf
-        | Cell::Handle
-        | Cell::Future
-        | Cell::Stream
-        | Cell::ErrorContext => todo!("emit_cell_op for un-wired Cell variant {op:?}"),
+        Cell::Char { flat_slot } => {
+            let CellSideData::Char { scratch_addr } = side_data else {
+                panic!("Char cell paired with non-Char side data {side_data:?}");
+            };
+            cell_layout.emit_char(
+                f,
+                lcl.addr,
+                local_base + *flat_slot,
+                *scratch_addr,
+                lcl.char_len,
+            );
+        }
+        Cell::ListOf | Cell::Handle | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+            todo!("emit_cell_op for un-wired Cell variant {op:?}")
+        }
     }
 }
 
@@ -606,7 +620,7 @@ fn emit_lift_kind(
         // sources; classify_result_lift's whitelist filters them out.
         Cell::RecordOf { .. }
         | Cell::TupleOf { .. }
-        | Cell::Char
+        | Cell::Char { .. }
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }

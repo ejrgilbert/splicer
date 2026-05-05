@@ -17,12 +17,12 @@ use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, SymbolBases};
 use super::lift::plan::Cell;
 use super::lift::{
-    back_fill_flags_len_addrs, back_fill_variant_entry_addrs, build_enum_info_blob,
-    build_flags_info_blob, build_record_info_blob, build_tuple_indices_blob,
-    build_variant_info_blob, flags_scratch_sizes, fold_cell_side_data, register_enum_strings,
-    register_flags_strings, register_variant_strings, CellSideData, FlagsInfoBlobs,
-    FlagsRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift, ResultSource,
-    ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
+    back_fill_flags_len_addrs, back_fill_variant_entry_addrs, build_char_scratch_map,
+    build_enum_info_blob, build_flags_info_blob, build_record_info_blob, build_tuple_indices_blob,
+    build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes, fold_cell_side_data,
+    register_enum_strings, register_flags_strings, register_variant_strings, CellSideData,
+    FlagsInfoBlobs, FlagsRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
+    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -353,6 +353,18 @@ pub(super) fn lay_out_static_memory(
         .into_iter()
         .map(|n_bytes| layout.reserve_scratch(4, n_bytes))
         .collect();
+    // Per-Cell::Char utf-8 scratch — 4 bytes (max sequence length)
+    // per cell, byte-aligned (utf-8 stores are i32.store8).
+    let char_scratch_addrs: Vec<u32> = char_scratch_sizes(&per_func)
+        .into_iter()
+        .map(|n_bytes| layout.reserve_scratch(1, n_bytes))
+        .collect();
+    let char_scratch_map = {
+        let mut iter = char_scratch_addrs.iter().copied();
+        let map = build_char_scratch_map(&per_func, &mut iter);
+        debug_assert!(iter.next().is_none());
+        map
+    };
 
     // Build the per-(fn, field) enum-info and record-info side
     // tables. Each builder produces [`Segment`]s carrying their bytes
@@ -648,6 +660,7 @@ pub(super) fn lay_out_static_memory(
                         &tuple_slices,
                         flags_per_cell_fill.for_param(i, p_idx),
                         variant_per_cell_fill.for_param(i, p_idx),
+                        char_scratch_map.for_param(i, p_idx),
                     );
                     ParamLayout {
                         lift,
@@ -685,6 +698,7 @@ pub(super) fn lay_out_static_memory(
                             &tuple_slices,
                             flags_per_cell_fill.for_result(i),
                             variant_per_cell_fill.for_result(i),
+                            char_scratch_map.for_result(i),
                         );
                         ResultSourceLayout::Compound {
                             compound,

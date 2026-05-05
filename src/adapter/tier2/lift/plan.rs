@@ -67,6 +67,10 @@ pub(crate) enum Cell {
     Text { ptr_slot: u32, len_slot: u32 },
     /// `list<u8>` — 2 i32 slots (ptr, len) → `cell::bytes`.
     Bytes { ptr_slot: u32, len_slot: u32 },
+    /// `char` — 1 i32 slot (code point); utf-8 encode into a per-cell
+    /// scratch buffer (1–4 bytes), then write `cell::text(ptr, len)`
+    /// referencing the scratch.
+    Char { flat_slot: u32 },
     /// `enum { ... }` → `cell::enum-case(u32)`. Carries the type-name +
     /// case-names so the side-table builder can register them.
     EnumCase { flat_slot: u32, info: NamedListInfo },
@@ -124,8 +128,6 @@ pub(crate) enum Cell {
 
     // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
     //    + `emit_cell_op` until codegen lands) ─────────────────────
-    /// `char` → `cell::text` (utf-8 encode the i32 code point).
-    Char,
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
 
@@ -287,7 +289,10 @@ impl LiftPlanBuilder {
                 let len_slot = self.bump_flat_slot();
                 self.push_cell(Cell::Text { ptr_slot, len_slot })
             }
-            Type::Char => todo!("plan-builder for un-wired Cell::Char"),
+            Type::Char => {
+                let flat_slot = self.bump_flat_slot();
+                self.push_cell(Cell::Char { flat_slot })
+            }
             Type::ErrorContext => todo!("plan-builder for un-wired Cell::ErrorContext"),
             Type::Id(id) => match &resolve.types[*id].kind {
                 wit_parser::TypeDefKind::List(Type::U8) => {
