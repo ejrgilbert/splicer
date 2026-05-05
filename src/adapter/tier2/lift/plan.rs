@@ -107,14 +107,16 @@ pub(crate) enum Cell {
         err_idx: Option<u32>,
     },
 
+    /// `flags { ... }` → `cell::flags-set(u32)`. Single i32 lift slot
+    /// (canonical-ABI caps flags at 32 bits).
+    Flags { flat_slot: u32, info: NamedListInfo },
+
     // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
     //    + `emit_cell_op` until codegen lands) ─────────────────────
     /// `char` → `cell::text` (utf-8 encode the i32 code point).
     Char,
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
-    /// `flags { ... }` → `cell::flags-set(u32)`.
-    Flags,
     /// `variant { ... }` → `cell::variant-case(u32)`.
     Variant,
 
@@ -183,6 +185,15 @@ impl LiftPlan {
     pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
         self.cells.iter().filter_map(|op| match op {
             Cell::EnumCase { info, .. } => Some(info),
+            _ => None,
+        })
+    }
+
+    /// Iterator over every `Cell::Flags` in the plan. Used by the
+    /// side-table builder to register flag-type and flag-name strings.
+    pub(super) fn flags_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
+        self.cells.iter().filter_map(|op| match op {
+            Cell::Flags { info, .. } => Some(info),
             _ => None,
         })
     }
@@ -281,7 +292,10 @@ impl LiftPlanBuilder {
                     todo!("plan-builder for un-wired Cell::Variant")
                 }
                 wit_parser::TypeDefKind::Flags(_) => {
-                    todo!("plan-builder for un-wired Cell::Flags")
+                    let info = flags_lift_info_for_type(ty, resolve)
+                        .expect("Flags kind implies flags-info available");
+                    let flat_slot = self.bump_flat_slot();
+                    self.push_cell(Cell::Flags { flat_slot, info })
                 }
                 wit_parser::TypeDefKind::Option(inner) => self.push_option(inner, resolve, names),
                 wit_parser::TypeDefKind::Result(_) => self.push_result(ty, resolve, names),
@@ -469,9 +483,9 @@ impl LiftPlanBuilder {
 
 /// A type-name plus an ordered list of item names. Carries
 /// enough info to populate any of the `*-info` side-table records
-/// in `splicer:common/types` that share the
-/// `{ type-name, <item>-name }` shape (enum-info, eventually flags-info
-/// + variant-info).
+/// in `splicer:common/types` that share the `{ type-name, <item> }`
+/// shape (enum-info's `case-name`, flags-info's `set-flags`,
+/// eventually variant-info).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NamedListInfo {
     pub(super) type_name: String,
@@ -495,6 +509,26 @@ fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo
     };
     let type_name = typedef.name.as_ref()?.clone();
     let item_names: Vec<String> = e.cases.iter().map(|c| c.name.clone()).collect();
+    Some(NamedListInfo {
+        type_name,
+        item_names,
+    })
+}
+
+/// Extract `(type-name, flag-names)` from a flags-typed `Type::Id`.
+/// Returns `None` if the type isn't a flags type or lacks a name —
+/// the runtime bitmask is meaningless without the flag names a reader
+/// would render.
+fn flags_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo> {
+    let Type::Id(id) = ty else {
+        return None;
+    };
+    let typedef = &resolve.types[*id];
+    let wit_parser::TypeDefKind::Flags(fl) = &typedef.kind else {
+        return None;
+    };
+    let type_name = typedef.name.as_ref()?.clone();
+    let item_names: Vec<String> = fl.flags.iter().map(|f| f.name.clone()).collect();
     Some(NamedListInfo {
         type_name,
         item_names,

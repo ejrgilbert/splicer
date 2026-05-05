@@ -783,6 +783,53 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `Cell::Flags` as a param. Nominal types
+    /// (flags / enum / record) must be `(export … (type …))`'d from
+    /// the api instance — otherwise wit-component's decode rejects
+    /// the inner instance with `instance not valid to be used as
+    /// export`. Anonymous types (option / result / tuple) sidestep
+    /// the rule.
+    #[test]
+    fn dispatch_module_with_flags_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (type $perms (flags "read" "write" "exec"))
+                (export $perms-export "fperms" (type $perms))
+                (type $consume-ty (func (param "p" $perms-export)))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
+                (instance $api-inst
+                    (export "fperms" (type $perms-export))
+                    (export "consume" (func $consume-lifted)))
+                (export "my:fl/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:fl/api@1.0.0" (instance $api "my:fl/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:fl/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for flags param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// End-to-end test for `Cell::Result` as a param: branching emit
     /// (result-ok / result-err with option<u32> payload) and the
     /// canonical-ABI joined-flat slot sharing across both arms.

@@ -27,19 +27,75 @@ use super::super::blob::{
 };
 use super::super::FuncClassified;
 use super::classify::SideTableInfo;
-use super::plan::{LiftPlan, NamedListInfo};
+use super::plan::{Cell, LiftPlan, NamedListInfo};
 
 pub(super) mod enum_info;
+pub(super) mod flags_info;
 pub(super) mod record_info;
 pub(super) mod tuple_indices;
 
+use flags_info::FlagsRuntimeFill;
+
+/// Per-plan-cell side-table data the emit phase reads. One entry per
+/// `plan.cells` position; `None` for cells that lift purely from flat
+/// slots. Heavy payloads (Flags, eventually Variant) are Boxed so the
+/// enum stays ~16 bytes — adding a kind = one variant + one
+/// [`super::emit::emit_cell_op`] arm.
+#[derive(Clone, Debug)]
+pub(crate) enum CellSideData {
+    None,
+    /// `cell::record-of(u32)` payload — build-time-known side-table idx.
+    Record {
+        idx: u32,
+    },
+    /// `cell::tuple-of(list<u32>)` payload — `(off, len)` of the
+    /// child-index array in the tuple-indices segment.
+    Tuple {
+        slice: BlobSlice,
+    },
+    /// `cell::flags-set(u32)` payload + the addresses the wrapper
+    /// bit-walk patches at runtime.
+    Flags(Box<FlagsRuntimeFill>),
+}
+
+/// Fold the per-builder per-cell maps into one [`Vec<CellSideData>`]
+/// parallel to `plan.cells`. Single match-on-`Cell` is the only place
+/// that decides "this cell wants that kind's bookkeeping."
+pub(crate) fn fold_cell_side_data(
+    plan: &LiftPlan,
+    record_info: &[Option<u32>],
+    tuple_indices: &[Option<BlobSlice>],
+    flags_fill: &[Option<FlagsRuntimeFill>],
+) -> Vec<CellSideData> {
+    debug_assert_eq!(record_info.len(), plan.cells.len());
+    debug_assert_eq!(tuple_indices.len(), plan.cells.len());
+    debug_assert_eq!(flags_fill.len(), plan.cells.len());
+    plan.cells
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| match cell {
+            Cell::RecordOf { .. } => CellSideData::Record {
+                idx: record_info[i].expect("RecordOf cell missing record-info idx"),
+            },
+            Cell::TupleOf { .. } => CellSideData::Tuple {
+                slice: tuple_indices[i].expect("TupleOf cell missing tuple-indices slice"),
+            },
+            Cell::Flags { .. } => CellSideData::Flags(Box::new(
+                flags_fill[i]
+                    .clone()
+                    .expect("Flags cell missing runtime-fill bundle"),
+            )),
+            _ => CellSideData::None,
+        })
+        .collect()
+}
+
 // ─── Per-cell side-table indices ─────────────────────────────────
 //
-// Several side-table kinds carry a per-(fn, param | result, plan-cell)
-// `Option<T>` lookup: `Some(value)` for cells of the relevant kind,
-// `None` for other cell kinds. Today: record-info (`T = u32`) and
-// tuple-indices (`T = SymRef`). New kinds plug in by parameterising
-// `T` and pushing into the same shape.
+// Each builder produces its own `PerCellIndices<T>` (record-info: u32,
+// tuple-indices: SymRef, flags: FlagsRuntimeFill). The layout phase
+// folds these into one `Vec<CellSideData>` per (fn, param | result)
+// via [`fold_cell_side_data`].
 
 /// Per-(fn, param) and per-(fn, result) per-plan-cell `Option<T>`
 /// map. Internal nesting is `Vec<Vec<Vec<…>>>` / `Vec<Vec<…>>` but
@@ -162,7 +218,11 @@ pub(super) fn register_side_table_strings(
     table
 }
 
-fn ensure_registered(table: &mut StringTable, names: &mut NameInterner, info: &NamedListInfo) {
+pub(super) fn ensure_registered(
+    table: &mut StringTable,
+    names: &mut NameInterner,
+    info: &NamedListInfo,
+) {
     if table.contains_key(&info.type_name) {
         return;
     }

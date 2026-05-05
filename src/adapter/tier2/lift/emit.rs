@@ -7,7 +7,7 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Resolve, SizeAlign};
 
 use super::super::super::abi::emit::{
-    direct_return_type, wasm_type_to_val, BlobSlice, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
+    direct_return_type, wasm_type_to_val, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
 use super::super::super::abi::WasmEncoderBindgen;
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
@@ -15,6 +15,8 @@ use super::super::cells::CellLayout;
 use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
 use super::plan::{Cell, LiftPlan};
+use super::sidetable::flags_info::FlagsRuntimeFill;
+use super::sidetable::CellSideData;
 
 /// Locals + pre-built load sequences used by the wrapper body.
 /// Allocated once up front so all downstream emit phases (param lift,
@@ -35,6 +37,10 @@ pub(crate) struct WrapperLocals {
     pub(super) ext64: u32,
     /// f64 promoted source for FloatingF32.
     pub(super) ext_f64: u32,
+    /// Cursor + count locals for the `Cell::Flags` bit-walk
+    /// (re-used across every flags cell in a sequential wrapper body).
+    pub(super) flags_addr: u32,
+    pub(super) flags_count: u32,
     /// Direct-return value when the export sig has a single flat
     /// result; `None` otherwise.
     pub result: Option<u32>,
@@ -81,16 +87,11 @@ pub(crate) enum ResultEmitPlan<'a> {
     },
     /// Compound result: classify-time cell plan + layout offsets +
     /// emit-time locals/loads. `addr_local` drives the
-    /// `lift_from_memory`-built `loads` sequence (which pushes
-    /// canonical-ABI flat values onto the wasm stack); the wrapper
-    /// then `local.set`s those into `synth_locals` (in reverse) for
-    /// the plan walker. The plan is borrowed straight from
-    /// [`super::classify::CompoundResult::plan`] — its cells hold
-    /// plan-relative flat slots, and the emit phase pairs them with
-    /// `local_base = synth_locals[0]` to recover absolute wasm-local
-    /// indices. `record_info_cell_idx` is the layout-phase per-cell
-    /// `Cell::RecordOf` side-table index map (borrowed off
-    /// [`ResultSourceLayout::Compound`]).
+    /// `lift_from_memory`-built `loads` sequence; the wrapper
+    /// `local.set`s the values into `synth_locals` (in reverse) for
+    /// the plan walker, with `local_base = synth_locals[0]`.
+    /// `side_refs` borrows the per-cell side-table data off
+    /// [`ResultSourceLayout::Compound::cell_side`].
     Compound {
         plan: &'a LiftPlan,
         retptr_offset: i32,
@@ -101,13 +102,13 @@ pub(crate) enum ResultEmitPlan<'a> {
     },
 }
 
-/// Per-plan-cell side-table lookups bundled for [`emit_lift_plan`].
-/// One slice per kind, parallel to `plan.cells`. Adding a kind =
-/// adding a slice here + a [`emit_cell_op`] arm.
+/// Per-plan-cell side-table data borrowed off `ParamLayout` /
+/// `ResultSourceLayout::Compound` for [`emit_lift_plan`]. One entry
+/// per cell — adding a new side-table kind is a [`CellSideData`]
+/// variant + a [`emit_cell_op`] arm, no field-shape changes here.
 #[derive(Clone, Copy)]
 pub(crate) struct CellSideRefs<'a> {
-    pub record_info_cell_idx: &'a [Option<u32>],
-    pub tuple_indices_cell_idx: &'a [Option<BlobSlice>],
+    pub cell_side: &'a [CellSideData],
 }
 
 /// Allocate every local the wrapper body will reference, build the
@@ -132,6 +133,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let len_scratch = builder.alloc_local(ValType::I32);
     let ext64 = builder.alloc_local(ValType::I64);
     let ext_f64 = builder.alloc_local(ValType::F64);
+    let flags_addr = builder.alloc_local(ValType::I32);
+    let flags_count = builder.alloc_local(ValType::I32);
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -168,13 +171,9 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             ResultSourceLayout::Compound {
                 compound,
                 retptr_offset,
-                record_info_cell_idx,
-                tuple_indices_cell_idx,
+                cell_side,
             } => {
-                let side_refs = CellSideRefs {
-                    record_info_cell_idx,
-                    tuple_indices_cell_idx,
-                };
+                let side_refs = CellSideRefs { cell_side };
                 let addr_local = builder.alloc_local(ValType::I32);
                 let flat = super::super::super::abi::flat_types(resolve, &compound.ty, None)
                     .unwrap_or_else(|| {
@@ -237,6 +236,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             ws,
             ext64,
             ext_f64,
+            flags_addr,
+            flags_count,
             result,
             tr_addr,
             id_local,
@@ -264,14 +265,9 @@ pub(crate) fn emit_lift_plan(
     lcl: &WrapperLocals,
 ) {
     assert_eq!(
-        side_refs.record_info_cell_idx.len(),
+        side_refs.cell_side.len(),
         plan.cells.len(),
-        "side-table record-info indices (emit input) must have one entry per classify-time plan cell"
-    );
-    assert_eq!(
-        side_refs.tuple_indices_cell_idx.len(),
-        plan.cells.len(),
-        "side-table tuple-indices (emit input) must have one entry per classify-time plan cell"
+        "side-table data (emit input) must have one entry per classify-time plan cell"
     );
     for (cell_idx, op) in plan.cells.iter().enumerate() {
         let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
@@ -281,8 +277,7 @@ pub(crate) fn emit_lift_plan(
             f,
             cell_layout,
             op,
-            side_refs.record_info_cell_idx[cell_idx],
-            side_refs.tuple_indices_cell_idx[cell_idx],
+            &side_refs.cell_side[cell_idx],
             local_base,
             lcl,
         );
@@ -290,24 +285,21 @@ pub(crate) fn emit_lift_plan(
 }
 
 /// Emit one cell's worth of wasm at the address held in `lcl.addr`.
-///
 /// `local_base` is added to each cell's plan-relative flat-slot
-/// position to recover its absolute wasm-local index. `record_info_idx`
-/// is the side-table index for `Cell::RecordOf` cells (set by the
-/// layout phase via the static record-info builder — adapter-build-
-/// time-known, emitted as `i32.const`). Other cells don't read it.
+/// position to recover its absolute wasm-local index. `side_data`
+/// carries the layout-phase side-table bookkeeping for cells whose
+/// kind needs any (record / tuple / flags); primitives ignore it.
 ///
 /// The match is exhaustive without a `_` catchall: adding a new
 /// [`Cell`] variant must add an arm here. Un-wired variants `todo!()`
 /// — they're never produced by [`super::plan::LiftPlanBuilder::push`]
-/// today, but keeping the arms structural rather than a wildcard
-/// means the compiler flags any new variant that's missing codegen.
+/// today, but the structural arms force the compiler to flag any new
+/// variant missing codegen.
 fn emit_cell_op(
     f: &mut Function,
     cell_layout: &CellLayout,
     op: &Cell,
-    record_info_idx: Option<u32>,
-    tuple_indices_slice: Option<BlobSlice>,
+    side_data: &CellSideData,
     local_base: u32,
     lcl: &WrapperLocals,
 ) {
@@ -346,13 +338,15 @@ fn emit_cell_op(
             cell_layout.emit_enum_case(f, addr, local_base + *flat_slot);
         }
         Cell::RecordOf { .. } => {
-            let idx = record_info_idx
-                .expect("record-info index missing — layout phase didn't backfill RecordOf cell");
-            cell_layout.emit_record_of(f, addr, idx);
+            let CellSideData::Record { idx } = side_data else {
+                panic!("RecordOf cell paired with non-Record side data {side_data:?}");
+            };
+            cell_layout.emit_record_of(f, addr, *idx);
         }
         Cell::TupleOf { .. } => {
-            let slice = tuple_indices_slice
-                .expect("tuple-indices slice missing — layout phase didn't backfill TupleOf cell");
+            let CellSideData::Tuple { slice } = side_data else {
+                panic!("TupleOf cell paired with non-Tuple side data {side_data:?}");
+            };
             cell_layout.emit_tuple_of(f, addr, slice.off, slice.len);
         }
         Cell::Option {
@@ -381,15 +375,82 @@ fn emit_cell_op(
             cell_layout.emit_result_ok(f, addr, ok_idx.is_some(), ok_idx.unwrap_or(0));
             f.instructions().end();
         }
+        Cell::Flags { flat_slot, .. } => {
+            let CellSideData::Flags(fill) = side_data else {
+                panic!("Flags cell paired with non-Flags side data {side_data:?}");
+            };
+            emit_flags_runtime_fill(f, local_base + *flat_slot, fill, lcl);
+            cell_layout.emit_flags_set(f, lcl.addr, fill.side_table_idx);
+        }
         Cell::Char
         | Cell::ListOf
-        | Cell::Flags
         | Cell::Variant
         | Cell::Handle
         | Cell::Future
         | Cell::Stream
         | Cell::ErrorContext => todo!("emit_cell_op for un-wired Cell variant {op:?}"),
     }
+}
+
+/// Per-bit unrolled bit-walk filling the cell's scratch buffer with
+/// `(name_ptr, name_len)` pairs and patching `set-flags.len`. Unrolled
+/// rather than looped — at ≤ 8 bits per typical flag type the
+/// overhead of a counter + `br_if` outweighs the static instructions.
+/// Single-threaded today; the static buffer is unsafe under concurrent
+/// calls (revisit when tier-2 grows concurrency).
+fn emit_flags_runtime_fill(
+    f: &mut Function,
+    bitmask_local: u32,
+    fill: &FlagsRuntimeFill,
+    lcl: &WrapperLocals,
+) {
+    /// Log2 alignment of an i32 store (4-byte). `MemArg::align` takes
+    /// log2 form; this is wasm-encoder convention, not Resolve-derived.
+    const I32_LOG2_ALIGN: u32 = 2;
+    let store_i32 = |off: u32| MemArg {
+        offset: off as u64,
+        align: I32_LOG2_ALIGN,
+        memory_index: 0,
+    };
+
+    f.instructions().i32_const(fill.scratch_addr);
+    f.instructions().local_set(lcl.flags_addr);
+    f.instructions().i32_const(0);
+    f.instructions().local_set(lcl.flags_count);
+
+    for (i, name) in fill.flag_names.iter().enumerate() {
+        // (bitmask >> i) & 1
+        f.instructions().local_get(bitmask_local);
+        f.instructions().i32_const(i as i32);
+        f.instructions().i32_shr_u();
+        f.instructions().i32_const(1);
+        f.instructions().i32_and();
+        f.instructions().if_(BlockType::Empty);
+        // *flags_addr = name.off; *(flags_addr + SLICE_LEN_OFFSET) = name.len
+        f.instructions().local_get(lcl.flags_addr);
+        f.instructions().i32_const(name.off as i32);
+        f.instructions().i32_store(store_i32(SLICE_PTR_OFFSET));
+        f.instructions().local_get(lcl.flags_addr);
+        f.instructions().i32_const(name.len as i32);
+        f.instructions().i32_store(store_i32(SLICE_LEN_OFFSET));
+        // flags_addr += sizeof(string); flags_count += 1
+        f.instructions().local_get(lcl.flags_addr);
+        f.instructions().i32_const(STRING_FLAT_BYTES as i32);
+        f.instructions().i32_add();
+        f.instructions().local_set(lcl.flags_addr);
+        f.instructions().local_get(lcl.flags_count);
+        f.instructions().i32_const(1);
+        f.instructions().i32_add();
+        f.instructions().local_set(lcl.flags_count);
+        f.instructions().end();
+    }
+
+    let len_addr = fill
+        .set_flags_len_addr
+        .expect("set_flags_len_addr unset — layout must run back_fill_flags_len_addrs");
+    f.instructions().i32_const(len_addr);
+    f.instructions().local_get(lcl.flags_count);
+    f.instructions().i32_store(store_i32(0));
 }
 
 /// Shared lift body for direct-return result values. `slot0` /
@@ -443,7 +504,7 @@ fn emit_lift_kind(
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }
-        | Cell::Flags
+        | Cell::Flags { .. }
         | Cell::Variant
         | Cell::Handle
         | Cell::Future

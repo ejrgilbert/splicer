@@ -166,8 +166,7 @@ pub(super) fn emit_wrapper_function(
                 p.cells_offset,
                 &p.lift.plan,
                 CellSideRefs {
-                    record_info_cell_idx: &p.record_info_cell_idx,
-                    tuple_indices_cell_idx: &p.tuple_indices_cell_idx,
+                    cell_side: &p.cell_side,
                 },
                 local_base,
                 &lcl,

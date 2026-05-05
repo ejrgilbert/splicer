@@ -458,6 +458,9 @@ pub(crate) fn option_payload_offset(sizes: &SizeAlign, payload_ty: &Type) -> u32
 /// being looked up via `SizeAlign`.
 pub(crate) const SLICE_PTR_OFFSET: u32 = 0;
 pub(crate) const SLICE_LEN_OFFSET: u32 = 4;
+/// Total size of the flat `(ptr, len)` pair — the canonical-ABI
+/// `string` lowering, also the per-element stride of any `list<string>`.
+pub(crate) const STRING_FLAT_BYTES: u32 = 8;
 
 // `splicer:common/types.call-id` field names — encapsulated by
 // [`CallIdLayout`]'s typed accessors so call sites can't fat-finger

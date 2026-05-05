@@ -29,6 +29,7 @@ const TYPEDEF_FIELD: &str = "field";
 const TYPEDEF_FIELD_TREE: &str = "field-tree";
 const TYPEDEF_CELL: &str = "cell";
 const TYPEDEF_ENUM_INFO: &str = "enum-info";
+const TYPEDEF_FLAGS_INFO: &str = "flags-info";
 const TYPEDEF_RECORD_INFO: &str = "record-info";
 
 // Field names within those records.
@@ -36,8 +37,12 @@ pub(super) const FIELD_NAME: &str = "name";
 pub(super) const FIELD_TREE: &str = "tree";
 pub(super) const TREE_CELLS: &str = "cells";
 pub(super) const TREE_ENUM_INFOS: &str = "enum-infos";
+pub(super) const TREE_FLAGS_INFOS: &str = "flags-infos";
 pub(super) const TREE_RECORD_INFOS: &str = "record-infos";
 pub(super) const TREE_ROOT: &str = "root";
+/// Field name on `record flags-info { … }` for the (runtime-filled)
+/// list of currently-set flag names.
+pub(super) const FLAGS_INFO_SET_FLAGS: &str = "set-flags";
 /// Field name on `record record-info { … }` for the (name, cell-idx)
 /// tuple list.
 pub(super) const RECORD_INFO_FIELDS: &str = "fields";
@@ -63,6 +68,9 @@ pub(super) struct SchemaLayouts {
     pub(super) cell_layout: CellLayout,
     pub(super) callid_layout: CallIdLayout,
     pub(super) enum_info_layout: RecordLayout,
+    /// Layout of `record flags-info { type-name, set-flags }` (the
+    /// per-flags-cell side-table entry).
+    pub(super) flags_info_layout: RecordLayout,
     /// Layout of `record record-info { type-name, fields }` (the
     /// per-record-cell side-table entry).
     pub(super) record_info_layout: RecordLayout,
@@ -102,6 +110,7 @@ pub(super) fn compute_schema(
     let field_tree_ty_id = find_common_typeid(resolve, TYPEDEF_FIELD_TREE)?;
     let cell_ty_id = find_common_typeid(resolve, TYPEDEF_CELL)?;
     let enum_info_ty = find_common_typeid(resolve, TYPEDEF_ENUM_INFO)?;
+    let flags_info_ty = find_common_typeid(resolve, TYPEDEF_FLAGS_INFO)?;
     let record_info_ty = find_common_typeid(resolve, TYPEDEF_RECORD_INFO)?;
 
     let field_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_ty_id);
@@ -109,6 +118,7 @@ pub(super) fn compute_schema(
     let cell_layout = CellLayout::from_resolve(&size_align, resolve, cell_ty_id);
     let callid_layout = call_id_layout(resolve, &size_align)?;
     let enum_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, enum_info_ty);
+    let flags_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, flags_info_ty);
     let record_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, record_info_ty);
     // The anonymous `tuple<string, u32>` element of `record-info.fields`
     // — synthesize a RecordLayout for it with positional names so the
@@ -146,6 +156,7 @@ pub(super) fn compute_schema(
         cell_layout,
         callid_layout,
         enum_info_layout,
+        flags_info_layout,
         record_info_layout,
         record_field_tuple_layout,
         before_hook,

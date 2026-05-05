@@ -10,12 +10,14 @@ use wasm_encoder::{
 use wit_parser::abi::WasmSignature;
 use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
-use super::super::super::abi::emit::{BlobSlice, RecordLayout};
+use super::super::super::abi::emit::{BlobSlice, RecordLayout, STRING_FLAT_BYTES};
 use super::super::blob::NameInterner;
 use super::super::cells::CellLayout;
 use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::super::{FuncClassified, FuncShape};
 use super::plan::{Cell, LiftPlan, NamedListInfo};
+use super::sidetable::flags_info::FlagsRuntimeFill;
+use super::sidetable::CellSideData;
 use super::*;
 
 // ─── Fixture WIT + Resolve helpers ────────────────────────────
@@ -26,17 +28,22 @@ const TEST_WIT: &str = r#"
     package test:lift@0.0.1;
     interface t {
         enum color { red, green, blue }
+        flags fperms { read, write, exec }
         record point { x: u32, y: s32 }
         record nested { p: point, c: color }
         record pair { a: u8, b: u8 }
         record point-and-tuple { p: point, t: tuple<u8, s32> }
+        record perms-pair { primary: fperms, secondary: fperms }
         f-mixed: func(a: bool, s: string, b: list<u8>, x: s64);
         f-color: func(c: color);
+        f-flags: func(p: fperms);
         f-point: func(p: point);
         f-mix-records: func(p: point, n: nested);
         f-tuple: func(t: tuple<u8, s32>);
         f-tuple-of-tuple: func(t: tuple<u8, tuple<s32, s32>>);
         f-record-with-tuple: func(rt: point-and-tuple);
+        f-record-with-flags: func(rwf: perms-pair);
+        f-perms-result: func() -> perms-pair;
         f-option-u32: func(o: option<u32>);
         f-option-string: func(o: option<string>);
         f-option-option: func(o: option<option<u32>>);
@@ -220,7 +227,8 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             Cell::Bool { flat_slot }
             | Cell::IntegerSignExt { flat_slot }
             | Cell::IntegerZeroExt { flat_slot }
-            | Cell::EnumCase { flat_slot, .. } => put(*flat_slot, ValType::I32),
+            | Cell::EnumCase { flat_slot, .. }
+            | Cell::Flags { flat_slot, .. } => put(*flat_slot, ValType::I32),
             Cell::Integer64 { flat_slot } => put(*flat_slot, ValType::I64),
             Cell::FloatingF32 { flat_slot } => put(*flat_slot, ValType::F32),
             Cell::FloatingF64 { flat_slot } => put(*flat_slot, ValType::F64),
@@ -233,7 +241,6 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
             Cell::Char
             | Cell::ListOf
-            | Cell::Flags
             | Cell::Variant
             | Cell::Handle
             | Cell::Future
@@ -249,60 +256,85 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
         .collect()
 }
 
-/// Side-table indices a single-plan run of `build_record_info_blob`
-/// would assign — `Some(i)` for the i'th RecordOf cell in plan
-/// order, `None` for non-RecordOf cells.
-fn auto_record_info_indices(plan: &LiftPlan) -> Vec<Option<u32>> {
-    let mut idx = 0u32;
+/// Synthesize the [`CellSideData`] sequence a real layout phase
+/// would attach to `plan.cells` — record/tuple/flags entries get
+/// stub addresses (just need to be in-memory for wasm validation);
+/// runtime value-correctness is the canned-shape harness's job.
+fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
+    /// Bytes per child-index in `tuple-indices` (canonical-ABI u32).
+    const U32_BYTES: u32 = 4;
+    /// Mid-page cursor for the synth flags-scratch buffer — anywhere
+    /// in linear memory works; sitting away from page 0 keeps stub
+    /// addresses clearly distinct from null.
+    const FLAGS_SCRATCH_BASE: u32 = 0x1000;
+    /// Stride between stub flag-name `(off, len)` slices.
+    const STUB_FLAG_NAME_STRIDE: u32 = 16;
+    /// Stub flag-name length (any non-zero u32 works).
+    const STUB_FLAG_NAME_LEN: u32 = 4;
+
+    let mut record_idx: u32 = 0;
+    let mut tuple_cursor: u32 = 0;
+    let mut flags_cursor: u32 = FLAGS_SCRATCH_BASE;
+    let mut flags_idx: u32 = 0;
     plan.cells
         .iter()
         .map(|op| match op {
             Cell::RecordOf { .. } => {
-                let i = idx;
-                idx += 1;
-                Some(i)
+                let idx = record_idx;
+                record_idx += 1;
+                CellSideData::Record { idx }
             }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Tuple-indices a single-plan `build_tuple_indices_blob` would
-/// assign — `Some` per `TupleOf` cell, `None` otherwise. Offsets
-/// are relative to segment base 0; the emit phase only validates
-/// `(off, len)` const stores, not their values.
-fn auto_tuple_indices(plan: &LiftPlan) -> Vec<Option<BlobSlice>> {
-    let mut cursor: u32 = 0;
-    plan.cells
-        .iter()
-        .map(|op| match op {
             Cell::TupleOf { children } => {
-                let off = cursor;
+                let off = tuple_cursor;
                 let len = children.len() as u32;
-                cursor += len * 4;
-                Some(BlobSlice { off, len })
+                tuple_cursor += len * U32_BYTES;
+                CellSideData::Tuple {
+                    slice: BlobSlice { off, len },
+                }
             }
-            _ => None,
+            Cell::Flags { info, .. } => {
+                let scratch_addr = flags_cursor;
+                flags_cursor += info.item_names.len() as u32 * STRING_FLAT_BYTES;
+                let set_flags_len_addr = flags_cursor;
+                flags_cursor += U32_BYTES;
+                let fill = FlagsRuntimeFill {
+                    side_table_idx: flags_idx,
+                    set_flags_len_addr: Some(set_flags_len_addr as i32),
+                    scratch_addr: scratch_addr as i32,
+                    flag_names: info
+                        .item_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| BlobSlice {
+                            off: i as u32 * STUB_FLAG_NAME_STRIDE,
+                            len: STUB_FLAG_NAME_LEN,
+                        })
+                        .collect(),
+                };
+                flags_idx += 1;
+                CellSideData::Flags(Box::new(fill))
+            }
+            _ => CellSideData::None,
         })
         .collect()
 }
 
 /// Round-trip a plan through `emit_lift_plan` and validate the
-/// resulting wasm module. Wasm function params come straight from
-/// the plan's flat slots; `WrapperLocals` extras (addr/ext64/
-/// ext_f64) sit in three locals declared above the params.
+/// resulting wasm module. Plan flat slots map straight to wasm fn
+/// params; the wrapper-locals extras sit above them.
 fn validate_emit_lift_plan(plan: &LiftPlan) {
     let cell_layout = synth_cell_layout();
-    let record_info = auto_record_info_indices(plan);
-    let tuple_indices = auto_tuple_indices(plan);
+    let cell_side = auto_cell_side_data(plan);
     let param_types = plan_param_types(plan);
     let n = plan.flat_slot_count;
     let lcl = WrapperLocals {
         addr: n,
         st: 0,
         ws: 0,
-        ext64: n + 1,
-        ext_f64: n + 2,
+        flags_addr: n + 1,
+        flags_count: n + 2,
+        ext64: n + 3,
+        ext_f64: n + 4,
         result: None,
         tr_addr: None,
         id_local: 0,
@@ -331,7 +363,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
     module.section(&funcs);
     let mut code = CodeSection::new();
     let mut f = Function::new([
-        (1u32, ValType::I32),
+        (3u32, ValType::I32),
         (1u32, ValType::I64),
         (1u32, ValType::F64),
     ]);
@@ -344,8 +376,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
         0,
         plan,
         super::emit::CellSideRefs {
-            record_info_cell_idx: &record_info,
-            tuple_indices_cell_idx: &tuple_indices,
+            cell_side: &cell_side,
         },
         0,
         &lcl,
@@ -421,6 +452,55 @@ fn enum_carries_named_list_info() {
             info: enum_info("color", &["red", "green", "blue"]),
         }],
     );
+}
+
+#[test]
+fn flags_assigns_one_cell_one_slot() {
+    // `fperms` has 3 flags; canonical-ABI lowers them all into a
+    // single i32 (caps at 32 bits). Plan is one Flags cell at
+    // flat_slot 0 carrying the full NamedListInfo.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("fperms", &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![Cell::Flags {
+            flat_slot: 0,
+            info: enum_info("fperms", &["read", "write", "exec"]),
+        }],
+    );
+    assert_eq!(plan.flat_slot_count, 1);
+}
+
+#[test]
+fn record_with_flags_field_recurses_into_flags() {
+    // perms-pair { primary: fperms, secondary: fperms }
+    //   primary    → cell 0 (Flags slot 0)
+    //   secondary  → cell 1 (Flags slot 1)
+    //   pp         → cell 2 (RecordOf primary=0, secondary=1)
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("perms-pair", &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::Flags {
+                flat_slot: 0,
+                info: enum_info("fperms", &["read", "write", "exec"]),
+            },
+            Cell::Flags {
+                flat_slot: 1,
+                info: enum_info("fperms", &["read", "write", "exec"]),
+            },
+            record_of(
+                &mut names,
+                "perms-pair",
+                &[("primary", 0), ("secondary", 1)],
+            ),
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
@@ -819,6 +899,35 @@ fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
     assert_eq!(params.last().unwrap().plan.flat_slot_count, 1);
 }
 
+// ─── Side-table scratch sizing parity ─────────────────────────
+
+#[test]
+fn flags_scratch_sizes_count_both_param_and_result_cells() {
+    // Regression: `flags_scratch_sizes` must walk per-fn params AND
+    // the compound result plan, in the order `build_flags_info_blob`
+    // consumes addresses — otherwise a record-result-with-flags
+    // crashes the builder's `scratch_addrs.next()` expect.
+    use super::classify::{CompoundResult, SideTableInfo};
+    use super::sidetable::flags_info::flags_scratch_sizes;
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let fd_param = func_with_params(&r, &mut names, &["fperms"]);
+    let mut fd_result = func_with_params(&r, &mut names, &[]);
+    fd_result.result_lift = Some(ResultLift {
+        source: ResultSource::Compound(CompoundResult {
+            ty: type_named(&r, "perms-pair"),
+            plan: plan_for_named("perms-pair", &r, &mut names),
+        }),
+        side_table: SideTableInfo::default(),
+    });
+    // 1 flags param + 2 flags inside the record result → 3 slabs of
+    // 3 flags × 8 bytes each.
+    assert_eq!(
+        flags_scratch_sizes(&[fd_param, fd_result]),
+        vec![24, 24, 24]
+    );
+}
+
 // ─── Side-table dedup ─────────────────────────────────────────
 
 #[test]
@@ -931,8 +1040,10 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for(&Type::String, &r, &mut names),
         plan_for(&func_named(&r, "f-mixed").params[2].ty, &r, &mut names), // list<u8>
         plan_for_named("color", &r, &mut names),
+        plan_for_named("fperms", &r, &mut names),
         plan_for_named("point", &r, &mut names),
         plan_for_named("nested", &r, &mut names),
+        plan_for_named("perms-pair", &r, &mut names),
         plan_for(&func_named(&r, "f-tuple").params[0].ty, &r, &mut names),
         plan_for(
             &func_named(&r, "f-tuple-of-tuple").params[0].ty,

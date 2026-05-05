@@ -16,13 +16,14 @@ use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, SymbolBases};
 use super::lift::{
-    build_enum_info_blob, build_record_info_blob, build_tuple_indices_blob, register_enum_strings,
-    ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout,
-    SideTableBlob, TupleIndicesBlob,
+    back_fill_flags_len_addrs, build_enum_info_blob, build_flags_info_blob, build_record_info_blob,
+    build_tuple_indices_blob, flags_scratch_sizes, fold_cell_side_data, register_enum_strings,
+    register_flags_strings, FlagsInfoBlobs, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
+    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
-    TREE_RECORD_INFOS, TREE_ROOT,
+    TREE_FLAGS_INFOS, TREE_RECORD_INFOS, TREE_ROOT,
 };
 use super::{AfterSetup, FuncClassified, FuncDispatch};
 
@@ -118,8 +119,8 @@ pub(super) struct StaticDataPlan {
 #[derive(Clone, Copy, Default)]
 struct FieldSideTables {
     enum_infos: BlobSlice,
+    flags_infos: BlobSlice,
     record_infos: BlobSlice,
-    // flags_infos: BlobSlice,
     // variant_infos: BlobSlice,
     // handle_infos: BlobSlice,
 }
@@ -127,8 +128,9 @@ struct FieldSideTables {
 impl FieldSideTables {
     fn write_to_tree(&self, blob: &mut [u8], tree: &RecordWriter) {
         tree.write_slice(blob, TREE_ENUM_INFOS, self.enum_infos);
+        tree.write_slice(blob, TREE_FLAGS_INFOS, self.flags_infos);
         tree.write_slice(blob, TREE_RECORD_INFOS, self.record_infos);
-        // tree.write_slice(blob, TREE_FLAGS_INFOS, self.flags_infos);
+        // tree.write_slice(blob, TREE_VARIANT_INFOS, self.variant_infos);
         // ...
     }
 }
@@ -280,8 +282,9 @@ pub(super) fn lay_out_static_memory(
     // place it — every side-table-info entry references these string
     // offsets, so they have to land in the data segment first.
     // Record-info strings are already interned at plan-build time;
-    // only enum-info strings need a registration pass here.
+    // enum-info and flags-info both need a registration pass here.
     let enum_strings = register_enum_strings(&per_func, &mut names);
+    let flags_strings = register_flags_strings(&per_func, &mut names);
 
     let mut layout = StaticLayout::new();
     let mut symbols = SymbolBases::new();
@@ -325,6 +328,15 @@ pub(super) fn lay_out_static_memory(
         vec![None; n_funcs]
     };
 
+    // Reserve per-Cell::Flags scratch *before* building the flags-info
+    // entries so each entry's `set-flags.ptr` can land as an absolute
+    // address (no reloc needed). 4-byte alignment matches string
+    // `(ptr, len)` i32 pairs.
+    let flags_scratch_addrs: Vec<u32> = flags_scratch_sizes(&per_func)
+        .into_iter()
+        .map(|n_bytes| layout.reserve_scratch(4, n_bytes))
+        .collect();
+
     // Build the per-(fn, field) enum-info and record-info side
     // tables. Each builder produces [`Segment`]s carrying their bytes
     // + any in-segment relocs (record-info's `entries` references
@@ -332,6 +344,7 @@ pub(super) fn lay_out_static_memory(
     // every cross-segment ptr is a queued reloc, not a write that
     // gets patched after the fact.
     let enum_info_id = symbols.alloc();
+    let flags_info_id = symbols.alloc();
     let record_entries_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
@@ -346,6 +359,23 @@ pub(super) fn lay_out_static_memory(
         per_param: enum_per_param_sym,
         per_result: enum_per_result_sym,
     } = enum_info;
+    let mut flags_scratch_iter = flags_scratch_addrs.iter().copied();
+    let FlagsInfoBlobs {
+        entries: flags_entries_seg,
+        per_param_range: flags_per_param_range_sym,
+        per_result_range: flags_per_result_range_sym,
+        per_cell_fill: mut flags_per_cell_fill,
+    } = build_flags_info_blob(
+        &per_func,
+        &flags_strings,
+        &schema.flags_info_layout,
+        flags_info_id,
+        &mut flags_scratch_iter,
+    );
+    debug_assert!(
+        flags_scratch_iter.next().is_none(),
+        "flags scratch reservations must be consumed exactly once per Cell::Flags",
+    );
     let RecordInfoBlobs {
         entries: record_entries_seg,
         tuples: record_tuples_seg,
@@ -390,6 +420,18 @@ pub(super) fn lay_out_static_memory(
     symbols.set(enum_segment.id, enum_info_base);
     relocs.record_segment(enum_info_idx, enum_info_base, enum_segment.relocs);
 
+    // Flags-info entries: place, then back-fill the per-cell
+    // `set_flags_len_addr` (only knowable after placement).
+    let (flags_entries_base, _flags_entries_idx) =
+        layout.place_data(flags_entries_seg.align, &flags_entries_seg.bytes);
+    symbols.set(flags_entries_seg.id, flags_entries_base);
+    debug_assert!(flags_entries_seg.relocs.is_empty());
+    back_fill_flags_len_addrs(
+        &mut flags_per_cell_fill,
+        flags_entries_base,
+        &schema.flags_info_layout,
+    );
+
     let (tuple_indices_base, tuple_indices_idx) =
         layout.place_data(tuple_indices_seg.align, &tuple_indices_seg.bytes);
     symbols.set(tuple_indices_seg.id, tuple_indices_base);
@@ -409,6 +451,14 @@ pub(super) fn lay_out_static_memory(
         .into_iter()
         .map(|s| resolve(s, &symbols))
         .collect();
+    let flags_per_param_range: Vec<Vec<BlobSlice>> = flags_per_param_range_sym
+        .into_iter()
+        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
+        .collect();
+    let flags_per_result_range: Vec<BlobSlice> = flags_per_result_range_sym
+        .into_iter()
+        .map(|s| resolve(s, &symbols))
+        .collect();
     let record_per_param_range: Vec<Vec<BlobSlice>> = record_per_param_range_sym
         .into_iter()
         .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
@@ -425,26 +475,22 @@ pub(super) fn lay_out_static_memory(
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
     // blob writers don't grow another arg per kind.
-    let param_side_tables: Vec<Vec<FieldSideTables>> = enum_per_param
-        .iter()
-        .zip(record_per_param_range.iter())
-        .map(|(enums, records)| {
-            enums
-                .iter()
-                .zip(records.iter())
-                .map(|(&enum_infos, &record_infos)| FieldSideTables {
-                    enum_infos,
-                    record_infos,
+    let param_side_tables: Vec<Vec<FieldSideTables>> = (0..n_funcs)
+        .map(|fn_idx| {
+            (0..per_func[fn_idx].params.len())
+                .map(|p_idx| FieldSideTables {
+                    enum_infos: enum_per_param[fn_idx][p_idx],
+                    flags_infos: flags_per_param_range[fn_idx][p_idx],
+                    record_infos: record_per_param_range[fn_idx][p_idx],
                 })
                 .collect()
         })
         .collect();
-    let result_side_tables: Vec<FieldSideTables> = enum_per_result
-        .iter()
-        .zip(record_per_result_range.iter())
-        .map(|(&enum_infos, &record_infos)| FieldSideTables {
-            enum_infos,
-            record_infos,
+    let result_side_tables: Vec<FieldSideTables> = (0..n_funcs)
+        .map(|fn_idx| FieldSideTables {
+            enum_infos: enum_per_result[fn_idx],
+            flags_infos: flags_per_result_range[fn_idx],
+            record_infos: record_per_result_range[fn_idx],
         })
         .collect();
 
@@ -540,12 +586,19 @@ pub(super) fn lay_out_static_memory(
                 .params
                 .into_iter()
                 .enumerate()
-                .map(|(p_idx, lift)| ParamLayout {
-                    lift,
-                    cells_offset: fn_cells_offsets[p_idx],
-                    record_info_cell_idx: record_info_per_cell.for_param(i, p_idx).to_vec(),
-                    tuple_indices_cell_idx: tuple_indices_per_cell
-                        .resolve_param(i, p_idx, &symbols),
+                .map(|(p_idx, lift)| {
+                    let tuple_slices = tuple_indices_per_cell.resolve_param(i, p_idx, &symbols);
+                    let cell_side = fold_cell_side_data(
+                        &lift.plan,
+                        record_info_per_cell.for_param(i, p_idx),
+                        &tuple_slices,
+                        flags_per_cell_fill.for_param(i, p_idx),
+                    );
+                    ParamLayout {
+                        lift,
+                        cells_offset: fn_cells_offsets[p_idx],
+                        cell_side,
+                    }
                 })
                 .collect();
 
@@ -559,12 +612,21 @@ pub(super) fn lay_out_static_memory(
                         cell,
                         retptr_offset: retptr_offset.expect("RetptrPair → retptr scratch reserved"),
                     },
-                    ResultSource::Compound(compound) => ResultSourceLayout::Compound {
-                        compound,
-                        retptr_offset: retptr_offset.expect("Compound → retptr scratch reserved"),
-                        record_info_cell_idx: record_info_per_cell.for_result(i).to_vec(),
-                        tuple_indices_cell_idx: tuple_indices_per_cell.resolve_result(i, &symbols),
-                    },
+                    ResultSource::Compound(compound) => {
+                        let tuple_slices = tuple_indices_per_cell.resolve_result(i, &symbols);
+                        let cell_side = fold_cell_side_data(
+                            &compound.plan,
+                            record_info_per_cell.for_result(i),
+                            &tuple_slices,
+                            flags_per_cell_fill.for_result(i),
+                        );
+                        ResultSourceLayout::Compound {
+                            compound,
+                            retptr_offset: retptr_offset
+                                .expect("Compound → retptr scratch reserved"),
+                            cell_side,
+                        }
+                    }
                 };
                 ResultLayout {
                     source: layout_source,

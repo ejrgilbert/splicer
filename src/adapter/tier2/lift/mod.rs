@@ -1,7 +1,7 @@
 //! Tier-2 lift codegen: classifying WIT types into cell variants,
 //! emitting the wasm that writes one cell per (param | result),
 //! and laying out the per-field-tree side tables (`enum-infos`,
-//! `record-infos`; `flags-infos` / `variant-infos` / `handle-infos`
+//! `record-infos`, `flags-infos`; `variant-infos` / `handle-infos`
 //! join as their lift codegen lands).
 //!
 //! See [`docs/tiers/lift-codegen.md`](../../../../docs/tiers/lift-codegen.md)
@@ -22,7 +22,8 @@
 //!   [`classify::ResultLayout`] once cells-slab + retptr-scratch
 //!   offsets are known.
 //! - [`sidetable`] — precompute the per-field-tree side tables
-//!   (enum-info / record-info) at adapter-build time. Walks the
+//!   (enum-info / record-info / flags-info; flags-info entries get
+//!   runtime-filled per call) at adapter-build time. Walks the
 //!   per-param plans for nominal `Cell` cases.
 //! - [`emit`] — walks `plan.cells` and emits one wasm cell per
 //!   [`plan::Cell`] via `emit_cell_op`. [`emit::emit_lift_result`]
@@ -46,9 +47,13 @@ pub(super) use emit::{
     CellSideRefs, ResultEmitPlan, WrapperLocals,
 };
 pub(super) use sidetable::enum_info::{build_enum_info_blob, register_enum_strings};
+pub(super) use sidetable::flags_info::{
+    back_fill_len_addrs as back_fill_flags_len_addrs, build_flags_info_blob, flags_scratch_sizes,
+    register_flags_strings, FlagsInfoBlobs,
+};
 pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
 pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
-pub(super) use sidetable::SideTableBlob;
+pub(super) use sidetable::{fold_cell_side_data, SideTableBlob};
 
 #[cfg(test)]
 mod tests;

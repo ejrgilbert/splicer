@@ -19,6 +19,7 @@ use wit_parser::{Function as WitFunction, Resolve, Type};
 use super::super::super::abi::emit::BlobSlice;
 use super::super::blob::NameInterner;
 use super::plan::{Cell, LiftPlan, NamedListInfo};
+use super::sidetable::CellSideData;
 
 // ─── Result-lift descriptors (classify-time, immutable) ───────────
 //
@@ -36,8 +37,8 @@ use super::plan::{Cell, LiftPlan, NamedListInfo};
 //   the wrapper `local.set`s those into per-result synthetic locals
 //   (in reverse, since the stack is LIFO) for the plan walker.
 //
-// All offsets (retptr_offset for RetptrPair / Compound, cells_offset
-// + record_info_cell_idx for Compound) live on the post-layout
+// All offsets (retptr_offset for RetptrPair / Compound; cells_offset
+// + per-cell side-table data for Compound) live on the post-layout
 // [`ResultLayout`] / [`ResultSourceLayout`]; this classify-time type
 // has no offsets and never gets mutated.
 
@@ -69,8 +70,8 @@ pub(crate) enum ResultSource {
 
 /// Per-fn compound-result classify output: which WIT type to lift
 /// plus a structural cell-tree plan. The retptr scratch byte offset,
-/// the cells-slab byte offset, and the per-cell record-info side-
-/// table indices are all layout-phase outputs — they live on
+/// the cells-slab byte offset, and the per-cell side-table data are
+/// all layout-phase outputs — they live on
 /// [`ResultSourceLayout::Compound`], not here.
 ///
 /// `plan`'s cells carry plan-relative flat-slot positions; the emit
@@ -102,8 +103,7 @@ impl ResultLift {
 /// plan-relative flat-slot positions; the emit phase supplies the
 /// `local_base` (cumulative slot cursor across preceding params) at
 /// [`super::emit::emit_lift_plan`] call time. Cells-slab offset +
-/// per-cell record-info indices live on the post-layout
-/// [`ParamLayout`].
+/// per-cell side-table data live on the post-layout [`ParamLayout`].
 pub(crate) struct ParamLift {
     pub name: BlobSlice,
     pub plan: LiftPlan,
@@ -119,20 +119,17 @@ pub(crate) struct ParamLift {
 // structurally impossible with this split.
 
 /// Post-layout per-parameter lift descriptor: the classify-time
-/// data plus its cells-slab offset + per-cell record-info indices.
+/// data plus its cells-slab offset + per-cell side-table bookkeeping.
 pub(crate) struct ParamLayout {
     pub lift: ParamLift,
     /// Byte offset of this param's contiguous cells slab within
     /// the static data segment; the slab holds `lift.plan.cell_count()`
     /// cells, each `cell_layout.size` bytes.
     pub cells_offset: u32,
-    /// Per cell of `lift.plan.cells`: the side-table index for
-    /// `Cell::RecordOf` cells, `None` for other cell kinds.
-    pub record_info_cell_idx: Vec<Option<u32>>,
-    /// Per cell of `lift.plan.cells`: absolute `(off, len)` into
-    /// the tuple-indices segment for `Cell::TupleOf` cells, `None`
-    /// for other kinds. Emitted as `i32.const`s into the cell payload.
-    pub tuple_indices_cell_idx: Vec<Option<BlobSlice>>,
+    /// One [`CellSideData`] entry per `lift.plan.cells` position,
+    /// holding the side-table bookkeeping the emit phase needs (idx,
+    /// blob slice, runtime-fill, …) for cells whose kind has any.
+    pub cell_side: Vec<CellSideData>,
 }
 
 /// Post-layout per-result lift descriptor: a sum-type `source`
@@ -152,24 +149,16 @@ pub(crate) enum ResultSourceLayout {
     /// `(ptr, len)` pair at the function's retptr scratch. See
     /// [`ResultSource::RetptrPair`] for the placeholder-slot convention.
     RetptrPair { cell: Cell, retptr_offset: i32 },
-    /// Compound result: classify-time recipe plus layout offsets
-    /// (retptr scratch + per-cell record-info side-table indices for
-    /// `Cell::RecordOf` cells). The cells-slab base is _not_
-    /// duplicated here; the wrapper body reads it off
-    /// [`super::super::AfterSetup::result_cells_offset`] (the
-    /// canonical source — today's compound lifts only fire from the
-    /// after-hook path).
+    /// Compound result: classify-time recipe + retptr scratch +
+    /// per-cell side-table data. The cells-slab base lives on
+    /// [`super::super::AfterSetup::result_cells_offset`] (today's
+    /// compound lifts only fire from the after-hook path).
     Compound {
         compound: CompoundResult,
         retptr_offset: i32,
-        /// One entry per cell of `compound.plan.cells`, in plan
-        /// order. `Some(idx)` for `Cell::RecordOf` cells, `None`
-        /// for other kinds. Built unconditionally (it's a property
-        /// of the cell plan, not of the after-hook wiring).
-        record_info_cell_idx: Vec<Option<u32>>,
-        /// Parallel to `record_info_cell_idx`. See
-        /// [`ParamLayout::tuple_indices_cell_idx`].
-        tuple_indices_cell_idx: Vec<Option<BlobSlice>>,
+        /// One entry per `compound.plan.cells` position. See
+        /// [`ParamLayout::cell_side`].
+        cell_side: Vec<CellSideData>,
     },
 }
 
