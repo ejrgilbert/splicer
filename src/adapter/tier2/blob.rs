@@ -165,6 +165,9 @@ pub(super) struct RelocPlan {
 }
 
 struct PendingReloc {
+    /// Index into `data_segments` of the entry holding the slot.
+    /// Captured at queue time so resolve skips the segment scan.
+    seg_idx: usize,
     /// Absolute byte offset of the 4-byte slot to overwrite.
     site: u32,
     target: SymbolId,
@@ -178,13 +181,13 @@ impl RelocPlan {
         }
     }
 
-    /// Record that `seg` was placed with its bytes starting at
-    /// `seg_base`. Each of its relocs becomes a pending absolute-site
-    /// write; the segment's symbol must already have been registered
-    /// by the caller via [`SymbolBases::set`].
-    pub(super) fn record_segment(&mut self, seg_base: u32, relocs: Vec<Reloc>) {
+    /// Record that `seg` landed inside `data_segments[seg_idx]` at
+    /// absolute `seg_base`. Caller must have already registered the
+    /// segment's symbol via [`SymbolBases::set`].
+    pub(super) fn record_segment(&mut self, seg_idx: usize, seg_base: u32, relocs: Vec<Reloc>) {
         for r in relocs {
             self.pending.push(PendingReloc {
+                seg_idx,
                 site: seg_base + r.site,
                 target: r.target,
                 addend: r.addend,
@@ -192,30 +195,16 @@ impl RelocPlan {
         }
     }
 
-    /// Apply every queued reloc against the placed `data_segments`,
-    /// writing `bases[target] + addend` as a little-endian i32 at
-    /// each site.
+    /// Write `bases[target] + addend` as little-endian i32 at every
+    /// queued site. O(n) in relocs — each carries its `seg_idx`.
     pub(super) fn resolve(self, symbols: &SymbolBases, data_segments: &mut [(u32, Vec<u8>)]) {
         for r in self.pending {
             let value = (symbols.base_of(r.target) as i32).wrapping_add(r.addend);
-            patch_le_i32_in_segments(data_segments, r.site, value);
-        }
-    }
-}
-
-/// Find the placed segment containing absolute byte `site` and
-/// overwrite its 4-byte slot with `value` (little-endian). Splits in
-/// the data segment list don't matter — this scans them all.
-fn patch_le_i32_in_segments(segs: &mut [(u32, Vec<u8>)], site: u32, value: i32) {
-    for (base, bytes) in segs.iter_mut() {
-        let len = bytes.len() as u32;
-        if site >= *base && site + 4 <= *base + len {
-            let off = (site - *base) as usize;
+            let (entry_base, bytes) = &mut data_segments[r.seg_idx];
+            let off = (r.site - *entry_base) as usize;
             bytes[off..off + 4].copy_from_slice(&value.to_le_bytes());
-            return;
         }
     }
-    panic!("reloc site {site} falls outside any placed segment");
 }
 
 /// Write a 32-bit little-endian integer into a byte buffer at `offset`.
@@ -314,5 +303,102 @@ impl<'a> RecordWriter<'a> {
     /// fills it in via a separate writer anchored there.
     pub(super) fn write_option_some(&self, blob: &mut [u8], field: &str) {
         self.write_u8(blob, field, OPTION_SOME);
+    }
+}
+
+#[cfg(test)]
+mod reloc_tests {
+    use super::*;
+
+    /// Many segments × many relocs — guards the seg_idx threading.
+    #[test]
+    fn resolve_writes_each_site_in_owning_segment() {
+        const N: u32 = 64;
+        const SLOTS_PER_SEG: u32 = 8;
+        const SEG_BYTES: u32 = SLOTS_PER_SEG * 4;
+        // Leave a 4-byte gap between segments so they don't coalesce
+        // and seg_idx == placement order.
+        const STRIDE: u32 = SEG_BYTES + 4;
+
+        let mut symbols = SymbolBases::new();
+        let mut plan = RelocPlan::new();
+        let mut data_segments: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut targets: Vec<SymbolId> = Vec::new();
+
+        for i in 0..N {
+            let id = symbols.alloc();
+            let base = i * STRIDE;
+            symbols.set(id, base);
+            data_segments.push((base, vec![0u8; SEG_BYTES as usize]));
+            targets.push(id);
+        }
+
+        // Each segment patches all 8 slots, each pointing at a
+        // different segment's base + a unique addend.
+        for (seg_idx, (base, _)) in data_segments.iter().enumerate() {
+            let relocs: Vec<Reloc> = (0..SLOTS_PER_SEG)
+                .map(|s| Reloc {
+                    site: s * 4,
+                    target: targets[(seg_idx + s as usize) % N as usize],
+                    addend: (seg_idx as i32) * 100 + s as i32,
+                })
+                .collect();
+            plan.record_segment(seg_idx, *base, relocs);
+        }
+
+        plan.resolve(&symbols, &mut data_segments);
+
+        for (seg_idx, (_, bytes)) in data_segments.iter().enumerate() {
+            for s in 0..SLOTS_PER_SEG as usize {
+                let off = s * 4;
+                let written = i32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                let target_base = ((seg_idx + s) % N as usize) as i32 * STRIDE as i32;
+                let addend = (seg_idx as i32) * 100 + s as i32;
+                assert_eq!(written, target_base + addend);
+            }
+        }
+    }
+
+    /// Coalesced placements share an entry; each reloc still hits
+    /// the right local offset.
+    #[test]
+    fn resolve_handles_coalesced_segments() {
+        let mut symbols = SymbolBases::new();
+        let mut plan = RelocPlan::new();
+
+        let id_a = symbols.alloc();
+        let id_b = symbols.alloc();
+        symbols.set(id_a, 0);
+        symbols.set(id_b, 8);
+
+        // Single coalesced entry holds both placements.
+        let mut data_segments = vec![(0u32, vec![0u8; 16])];
+
+        // Placement A: bytes 0..8, site at offset 4 → target B (=8).
+        plan.record_segment(
+            0,
+            0,
+            vec![Reloc {
+                site: 4,
+                target: id_b,
+                addend: 0,
+            }],
+        );
+        // Placement B: bytes 8..16, site at offset 0 → target A (=0) + 3.
+        plan.record_segment(
+            0,
+            8,
+            vec![Reloc {
+                site: 0,
+                target: id_a,
+                addend: 3,
+            }],
+        );
+
+        plan.resolve(&symbols, &mut data_segments);
+
+        let bytes = &data_segments[0].1;
+        assert_eq!(i32::from_le_bytes(bytes[4..8].try_into().unwrap()), 8);
+        assert_eq!(i32::from_le_bytes(bytes[8..12].try_into().unwrap()), 3);
     }
 }

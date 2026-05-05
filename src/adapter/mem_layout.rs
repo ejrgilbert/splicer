@@ -189,9 +189,11 @@ impl StaticLayout {
         }
     }
 
-    /// Place a data-bearing section aligned to `align`. Returns
-    /// the byte offset where the section starts.
-    pub fn place_data(&mut self, align: u32, bytes: &[u8]) -> u32 {
+    /// Place a data-bearing section aligned to `align`. Returns the
+    /// byte offset and the index of the `(base, bytes)` entry in
+    /// [`Self::into_segments`] containing it. Index is meaningless
+    /// for empty `bytes`; callers must not queue relocs against one.
+    pub fn place_data(&mut self, align: u32, bytes: &[u8]) -> (u32, usize) {
         let offset = align_to_val(self.cursor, align);
         if !bytes.is_empty() {
             // Coalesce with the previous segment if there was no gap.
@@ -207,7 +209,7 @@ impl StaticLayout {
             }
         }
         self.cursor = offset + bytes.len() as u32;
-        offset
+        (offset, self.segments.len().saturating_sub(1))
     }
 
     /// Reserve a scratch (uninitialized) section aligned to `align`.
@@ -239,9 +241,11 @@ mod static_layout_tests {
     #[test]
     fn coalesces_adjacent_data() {
         let mut l = StaticLayout::new();
-        let a = l.place_data(1, b"abc");
-        let b = l.place_data(1, b"de");
+        let (a, ai) = l.place_data(1, b"abc");
+        let (b, bi) = l.place_data(1, b"de");
         assert_eq!((a, b), (0, 3));
+        // Both calls land in the single coalesced entry.
+        assert_eq!((ai, bi), (0, 0));
         assert_eq!(l.end(), 5);
         let segs = l.into_segments();
         assert_eq!(segs.len(), 1);
@@ -252,18 +256,20 @@ mod static_layout_tests {
     #[test]
     fn alignment_pads_cursor() {
         let mut l = StaticLayout::new();
-        assert_eq!(l.place_data(1, b"x"), 0); // cursor → 1
-        assert_eq!(l.place_data(4, b"yyyy"), 4); // padded to 4
+        assert_eq!(l.place_data(1, b"x").0, 0); // cursor → 1
+        assert_eq!(l.place_data(4, b"yyyy").0, 4); // padded to 4
         assert_eq!(l.end(), 8);
     }
 
     #[test]
     fn scratch_breaks_coalescing() {
         let mut l = StaticLayout::new();
-        let a = l.place_data(1, b"AAAA"); // 0..4
+        let (a, ai) = l.place_data(1, b"AAAA"); // 0..4
         let scratch = l.reserve_scratch(1, 8); // 4..12
-        let b = l.place_data(1, b"BB"); // 12..14
+        let (b, bi) = l.place_data(1, b"BB"); // 12..14
         assert_eq!((a, scratch, b), (0, 4, 12));
+        // Scratch in between forces a new entry for B.
+        assert_eq!((ai, bi), (0, 1));
         let segs = l.into_segments();
         assert_eq!(segs.len(), 2);
         assert_eq!((segs[0].0, &segs[0].1[..]), (0, &b"AAAA"[..]));
@@ -275,8 +281,9 @@ mod static_layout_tests {
         let mut l = StaticLayout::new();
         l.place_data(1, b"AA"); // 0..2
         l.reserve_scratch(8, 0); // pure align-up: cursor → 8
-        let b = l.place_data(1, b"B"); // 8..9
+        let (b, bi) = l.place_data(1, b"B"); // 8..9
         assert_eq!(b, 8);
+        assert_eq!(bi, 1);
         let segs = l.into_segments();
         assert_eq!(segs.len(), 2);
     }

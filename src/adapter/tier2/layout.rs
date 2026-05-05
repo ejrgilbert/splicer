@@ -278,7 +278,7 @@ pub(super) fn lay_out_static_memory(
     let mut relocs = RelocPlan::new();
 
     let name_blob = names.into_bytes();
-    layout.place_data(1, &name_blob);
+    let _ = layout.place_data(1, &name_blob);
 
     // Cells slabs first — fields records embed pointers to these.
     // Each param contributes `plan.cell_count() * cell_size` bytes;
@@ -354,18 +354,28 @@ pub(super) fn lay_out_static_memory(
     // a base, relocs land later. Tuples-then-entries-then-enums is
     // just a convenient order to coalesce same-alignment segments
     // back-to-back.
-    let record_tuples_base = layout.place_data(record_tuples_seg.align, &record_tuples_seg.bytes);
+    let (record_tuples_base, record_tuples_idx) =
+        layout.place_data(record_tuples_seg.align, &record_tuples_seg.bytes);
     symbols.set(record_tuples_seg.id, record_tuples_base);
-    relocs.record_segment(record_tuples_base, record_tuples_seg.relocs);
+    relocs.record_segment(
+        record_tuples_idx,
+        record_tuples_base,
+        record_tuples_seg.relocs,
+    );
 
-    let record_entries_base =
+    let (record_entries_base, record_entries_idx) =
         layout.place_data(record_entries_seg.align, &record_entries_seg.bytes);
     symbols.set(record_entries_seg.id, record_entries_base);
-    relocs.record_segment(record_entries_base, record_entries_seg.relocs);
+    relocs.record_segment(
+        record_entries_idx,
+        record_entries_base,
+        record_entries_seg.relocs,
+    );
 
-    let enum_info_base = layout.place_data(enum_segment.align, &enum_segment.bytes);
+    let (enum_info_base, enum_info_idx) =
+        layout.place_data(enum_segment.align, &enum_segment.bytes);
     symbols.set(enum_segment.id, enum_info_base);
-    relocs.record_segment(enum_info_base, enum_segment.relocs);
+    relocs.record_segment(enum_info_idx, enum_info_base, enum_segment.relocs);
 
     // Resolve per-(fn, param) and per-(fn, result) [`SymRef`]s to
     // absolute [`BlobSlice`]s now that all three segments have bases.
@@ -416,7 +426,7 @@ pub(super) fn lay_out_static_memory(
     // each param's reserved slab slot, plus per-kind side-table
     // pointers patched per-param.
     let fields_blob = build_fields_blob(&per_func, schema, &cells_offsets, &param_side_tables);
-    let fields_base = layout.place_data(schema.field_layout.align, &fields_blob);
+    let (fields_base, _) = layout.place_data(schema.field_layout.align, &fields_blob);
     let fields_buf_offsets: Vec<u32> = {
         let mut cursor = fields_base;
         per_func
@@ -440,7 +450,7 @@ pub(super) fn lay_out_static_memory(
     let after_params_offsets: Vec<Option<i32>> =
         match schema.after_hook.as_ref().map(|h| &h.params_layout) {
             Some(al) => {
-                let after_base = layout.place_data(al.align, &after_blob);
+                let (after_base, _) = layout.place_data(al.align, &after_blob);
                 let mut cursor = after_base;
                 (0..n_funcs)
                     .map(|_| {
