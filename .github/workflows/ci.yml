@@ -71,9 +71,22 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
 
       # Caching per OS
       - uses: Swatinem/rust-cache@v2
+
+      # The builtin smoke tests under tests/builtins_otel_*.rs read from
+      # assets/builtins/<name>.wasm at runtime; that dir is no longer
+      # checked in, so CI builds the components before `cargo test`.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wkg@${{ env.WKG_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+
+      - name: Build builtins
+        shell: bash
+        run: make build-builtins
 
       - name: Build
         run: cargo build --locked --verbose

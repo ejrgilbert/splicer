@@ -335,11 +335,14 @@ pub fn format_wac_compose_cmd(wac_path: &str, deps: &BTreeMap<String, PathBuf>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::with_fake_builtins;
     use crate::parse::config::parse_yaml;
+    use std::path::Path;
 
-    /// `materialize_builtins` should write the embedded bytes of every
-    /// builtin-form injection to disk and stamp `inj.path` so the rest
-    /// of the pipeline sees a normal path-backed middleware.
+    /// `materialize_builtins` should resolve every builtin-form
+    /// injection's bytes (here, from a local override) and stamp
+    /// `inj.path` so the rest of the pipeline sees a normal
+    /// path-backed middleware.
     #[test]
     fn builtin_yaml_roundtrips_through_materialize() {
         let yaml = r#"
@@ -350,22 +353,24 @@ rules:
     inject:
       - builtin: hello-tier1
 "#;
-        let mut rules = parse_yaml(yaml).expect("parse");
-        let tmp = tempfile::tempdir().unwrap();
-        materialize_builtins(&mut rules, tmp.path()).expect("materialize");
+        with_fake_builtins(&["hello-tier1"], || {
+            let mut rules = parse_yaml(yaml).expect("parse");
+            let tmp = tempfile::tempdir().unwrap();
+            materialize_builtins(&mut rules, tmp.path()).expect("materialize");
 
-        let inj = &rules[0].inject()[0];
-        assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
-        let path = inj.path.as_deref().expect("path stamped");
-        let bytes = std::fs::read(path).expect("file written");
-        assert!(bytes.starts_with(b"\0asm"), "embedded bytes are wasm");
-        // `Path::ends_with` is component-aware, so this works on both
-        // unix (`builtins/hello-tier1.wasm`) and windows
-        // (`builtins\hello-tier1.wasm`).
-        assert!(
-            std::path::Path::new(path).ends_with("builtins/hello-tier1.wasm"),
-            "path lives under splits_dir/builtins/: {path}"
-        );
+            let inj = &rules[0].inject()[0];
+            assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
+            let path = inj.path.as_deref().expect("path stamped");
+            let bytes = std::fs::read(path).expect("file written");
+            assert!(bytes.starts_with(b"\0asm"), "materialized bytes are wasm");
+            // `Path::ends_with` is component-aware, so this works on both
+            // unix (`builtins/hello-tier1.wasm`) and windows
+            // (`builtins\hello-tier1.wasm`).
+            assert!(
+                Path::new(path).ends_with("builtins/hello-tier1.wasm"),
+                "path lives under splits_dir/builtins/: {path}"
+            );
+        });
     }
 
     /// User-form injections (`name` + `path`) must pass through
@@ -407,14 +412,16 @@ rules:
         path: ./tracing.wasm
       - builtin: hello-tier1
 "#;
-        let mut rules = parse_yaml(yaml).expect("parse");
-        let tmp = tempfile::tempdir().unwrap();
-        materialize_builtins(&mut rules, tmp.path()).expect("materialize");
+        with_fake_builtins(&["hello-tier1"], || {
+            let mut rules = parse_yaml(yaml).expect("parse");
+            let tmp = tempfile::tempdir().unwrap();
+            materialize_builtins(&mut rules, tmp.path()).expect("materialize");
 
-        let inject = &rules[0].inject();
-        assert_eq!(inject[0].path.as_deref(), Some("./tracing.wasm"));
-        let materialized = inject[1].path.as_deref().unwrap();
-        assert!(std::path::Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
+            let inject = &rules[0].inject();
+            assert_eq!(inject[0].path.as_deref(), Some("./tracing.wasm"));
+            let materialized = inject[1].path.as_deref().unwrap();
+            assert!(Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
+        });
     }
 
     /// The long-form `builtin: { name: ..., alias: ... }` should land
@@ -432,15 +439,17 @@ rules:
           name: hello-tier1
           alias: greeter
 "#;
-        let mut rules = parse_yaml(yaml).expect("parse");
-        let tmp = tempfile::tempdir().unwrap();
-        materialize_builtins(&mut rules, tmp.path()).expect("materialize");
+        with_fake_builtins(&["hello-tier1"], || {
+            let mut rules = parse_yaml(yaml).expect("parse");
+            let tmp = tempfile::tempdir().unwrap();
+            materialize_builtins(&mut rules, tmp.path()).expect("materialize");
 
-        let inj = &rules[0].inject()[0];
-        assert_eq!(inj.name, "greeter");
-        assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
-        let materialized = inj.path.as_deref().unwrap();
-        assert!(std::path::Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
+            let inj = &rules[0].inject()[0];
+            assert_eq!(inj.name, "greeter");
+            assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
+            let materialized = inj.path.as_deref().unwrap();
+            assert!(Path::new(materialized).ends_with("builtins/hello-tier1.wasm"));
+        });
     }
 
     /// Naming a builtin that doesn't exist surfaces a clear error

@@ -1,6 +1,7 @@
 # Generated
 splits/
 output.wac
+assets
 
 # Wasm things
 *.wat

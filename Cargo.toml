@@ -45,6 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wirm = "4.0.4"
 #wirm = { path = "../../research/compilers/wirm" }
 wit-component = "0.247"
+oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [dev-dependencies]
 wat = "1"

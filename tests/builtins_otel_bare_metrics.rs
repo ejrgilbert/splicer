@@ -10,8 +10,8 @@
 //! `code.namespace` / `code.function` attributes.
 //!
 //! Requires `make build-builtins` to have populated
-//! `assets/builtins/otel-bare-metrics.wasm` (embedded below via
-//! `include_bytes!`).
+//! `assets/builtins/otel-bare-metrics.wasm`, or `SPLICER_BUILTINS_DIR`
+//! pointing at a directory containing it.
 
 use std::collections::HashMap;
 
@@ -54,8 +54,8 @@ fn add_otel_metrics_to_linker(
 
 #[test]
 fn otel_bare_metrics_exports_count_and_duration() -> Result<()> {
-    let bytes = include_bytes!("../assets/builtins/otel-bare-metrics.wasm");
-    let capture = drive_call_cycle::<Capture, _>(bytes, add_otel_metrics_to_linker)?;
+    let bytes = common::read_builtin("otel-bare-metrics");
+    let capture = drive_call_cycle::<Capture, _>(&bytes, add_otel_metrics_to_linker)?;
     let cap = capture.lock().unwrap();
 
     assert_eq!(cap.exports.len(), 1, "exactly one export call expected");
