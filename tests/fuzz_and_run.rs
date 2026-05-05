@@ -102,7 +102,7 @@ const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 // output (used only by the pre-splice sanity check).
 //
 // Compounds recurse: Option/List/Tuple wrap another Shape and Record
-// carries a named field list. `canned_shapes()` is the hardcoded
+// carries a named field list. `tier1_shapes()` is the hardcoded
 // deterministic coverage; `gen_shape()` drives the same enum from an
 // `arbitrary::Unstructured` for the fuzz test below.
 
@@ -208,7 +208,7 @@ enum Shape {
         is_ok: bool,
     },
     // ResourceOwn and ResourceBorrow are wired through every Shape
-    // method but not yet activated in `canned_shapes()` or the fuzz
+    // method but not yet activated in `tier1_shapes()` or the fuzz
     // generator — the consumer/provider scaffolds need resource codegen
     // first. `allow(dead_code)` until that lands.
     /// `own<T>` — owning handle to a nullary-constructor resource.
@@ -974,7 +974,7 @@ fn primitive_atoms() -> Vec<Shape> {
     ]
 }
 
-fn canned_shapes() -> Vec<Shape> {
+fn tier1_shapes() -> Vec<Shape> {
     let mut v = primitive_atoms();
     v.extend(vec![
         Shape::Option(Box::new(Shape::Primitive {
@@ -1131,6 +1131,136 @@ fn canned_shapes() -> Vec<Shape> {
         },
     ]);
     v
+}
+
+/// Subset of shapes whose tier-2 lift codegen exists today. Explicit
+/// by design — adding a shape here is the deliberate signal that its
+/// `cells.rs` emit + `lift.rs` wiring have landed and the pipeline is
+/// ready to exercise it end-to-end. The list is hand-maintained rather
+/// than derived from `tier1_shapes()` so that adding a tier-1 shape
+/// without landing its tier-2 codegen does not silently expand the
+/// tier-2 sweep. `predict_tier2_arg_inner` (the value-rendering helper)
+/// must return `Some` for every entry; the assertion in
+/// `test_tier2_canned_primitives` enforces that.
+fn tier2_shapes() -> Vec<Shape> {
+    vec![
+        Shape::Primitive {
+            name: "u8",
+            wit_type: "u8",
+            rust_ty: "u8",
+            rust_literal: "7u8",
+            expected_debug: "7",
+        },
+        Shape::Primitive {
+            name: "s8",
+            wit_type: "s8",
+            rust_ty: "i8",
+            rust_literal: "-7i8",
+            expected_debug: "-7",
+        },
+        Shape::Primitive {
+            name: "u16",
+            wit_type: "u16",
+            rust_ty: "u16",
+            rust_literal: "500u16",
+            expected_debug: "500",
+        },
+        Shape::Primitive {
+            name: "s16",
+            wit_type: "s16",
+            rust_ty: "i16",
+            rust_literal: "-500i16",
+            expected_debug: "-500",
+        },
+        Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "42u32",
+            expected_debug: "42",
+        },
+        Shape::Primitive {
+            name: "s32",
+            wit_type: "s32",
+            rust_ty: "i32",
+            rust_literal: "-42i32",
+            expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "u64",
+            wit_type: "u64",
+            rust_ty: "u64",
+            rust_literal: "9000u64",
+            expected_debug: "9000",
+        },
+        Shape::Primitive {
+            name: "s64",
+            wit_type: "s64",
+            rust_ty: "i64",
+            rust_literal: "-42i64",
+            expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "f32",
+            wit_type: "f32",
+            rust_ty: "f32",
+            rust_literal: "1.5f32",
+            expected_debug: "1.5",
+        },
+        Shape::Primitive {
+            name: "f64",
+            wit_type: "f64",
+            rust_ty: "f64",
+            rust_literal: "2.5f64",
+            expected_debug: "2.5",
+        },
+        Shape::Primitive {
+            name: "bool",
+            wit_type: "bool",
+            rust_ty: "bool",
+            rust_literal: "true",
+            expected_debug: "true",
+        },
+        Shape::Primitive {
+            name: "string",
+            wit_type: "string",
+            rust_ty: "String",
+            rust_literal: r#"String::from("hello")"#,
+            expected_debug: r#""hello""#,
+        },
+        Shape::Enum {
+            wit_name: "color",
+            rust_name: "Color",
+            cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+            selected: 1,
+        },
+        Shape::Record {
+            wit_name: "point",
+            rust_name: "Point",
+            fields: vec![
+                (
+                    "x",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "3u32",
+                        expected_debug: "3",
+                    },
+                ),
+                (
+                    "y",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "5u32",
+                        expected_debug: "5",
+                    },
+                ),
+            ],
+        },
+    ]
 }
 
 // ─── Arbitrary-driven generator (used by test_fuzz) ─
@@ -2070,7 +2200,7 @@ fn consumer_shape_dep_wit(shape: &Shape, mode: AsyncMode) -> String {
 
 /// Loop the whole pipeline over the canned shape list, reusing the
 /// cargo workspace for incremental compilation. Default set is
-/// everything in `canned_shapes()`; override via
+/// everything in `tier1_shapes()`; override via
 /// `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
@@ -2092,7 +2222,7 @@ fn test_canned() {
     assert!(
         !shapes.is_empty(),
         "SPLICER_RUNTIME_SHAPES selected no shapes; known: {}",
-        canned_shapes()
+        tier1_shapes()
             .iter()
             .map(Shape::name)
             .collect::<Vec<_>>()
@@ -2137,40 +2267,27 @@ fn test_canned() {
     }
 }
 
-/// Tier-2 canned-primitive sweep. For each primitive shape the
-/// tier-2 lift currently supports, drive the full pipeline end-
-/// to-end and assert the middleware sees the cell variant + value
-/// the lift codegen should produce. Pins both the discriminant
-/// (cell-variant case) and the widened payload (i64-extend for
-/// integers, f64-promote for `f32`, ptr/len readback for `string`).
+/// Tier-2 canned-primitive sweep. For each shape in `tier2_shapes()`,
+/// drive the full pipeline end-to-end and assert the middleware sees
+/// the cell variant + value the lift codegen should produce. Pins both
+/// the discriminant (cell-variant case) and the widened payload
+/// (i64-extend for integers, f64-promote for `f32`, ptr/len readback
+/// for `string`).
 ///
-/// Filters to the kinds `LiftKind::classify` accepts today; `char`
-/// is deferred to a later slice (utf-8 encoding required at lift
-/// time). Override the shape list with
-/// `SPLICER_RUNTIME_SHAPES=name1,name2`.
+/// Coverage is the explicit `tier2_shapes()` list — grep that function
+/// to see exactly which kinds are exercised. Override the shape list
+/// with `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
 fn test_tier2_canned_primitives() {
     require_splicer_toolchain();
     let workspace = scaffold_tier2_workspace();
 
-    // Same shape set as tier-1's `primitive_atoms`, minus the
-    // unsupported entries. Listed by `Shape::name` for env-var
-    // selection compatibility.
-    // Walk the full canned shape set; `predict_tier2_args_marker`
-    // gates each shape on whether tier-2's lift codegen handles it
-    // today. Compound shapes light up here as Phase 2-2b lands their
-    // `cells.rs` impls.
-    let supported = canned_shapes()
-        .into_iter()
-        .filter(|s| predict_tier2_args_marker(s).is_some())
-        .collect::<Vec<_>>();
-
     let shapes = match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
-        None => supported,
+        None => tier2_shapes(),
         Some(csv) => {
             let wanted: Vec<String> = csv.split(',').map(|s| s.trim().to_string()).collect();
-            supported
+            tier2_shapes()
                 .into_iter()
                 .filter(|s| wanted.iter().any(|w| *w == s.name()))
                 .collect()
@@ -2192,8 +2309,8 @@ fn test_tier2_canned_primitives() {
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let captured = run_tier2_pipeline_for_shape(&workspace, shape);
-            let expected_args =
-                predict_tier2_args_marker(shape).expect("filtered to supported shapes above");
+            let expected_args = predict_tier2_args_marker(shape)
+                .expect("every tier2_shapes() entry must be renderable by predict_tier2_arg_inner");
             let expected_marker =
                 format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo args=[{expected_args}]");
             assert!(
@@ -2201,16 +2318,13 @@ fn test_tier2_canned_primitives() {
                 "tier-2 on-call rendered the wrong cell for `{shape_name}` — \
                  expected substring `{expected_marker}`\n--- trace ---\n{captured}",
             );
-            // On-return marker — pinned for shapes whose result lift
-            // is wired (same predicate as the args side, since `foo`
-            // echoes the value back). For shapes whose result is
-            // not yet lifted, the after-hook still fires with
-            // `result=none`.
+            // `foo` echoes the value back, so the result side renders
+            // through the same predictor as the args side.
             let expected_result_inner = predict_tier2_result_marker(shape)
-                .map(|s| format!("result={s}"))
-                .unwrap_or_else(|| "result=none".to_string());
-            let expected_return_marker =
-                format!("mdl: tier2-on-return {TARGET_INTERFACE}#foo {expected_result_inner}");
+                .expect("every tier2_shapes() entry must be renderable by predict_tier2_arg_inner");
+            let expected_return_marker = format!(
+                "mdl: tier2-on-return {TARGET_INTERFACE}#foo result={expected_result_inner}"
+            );
             assert!(
                 captured.contains(&expected_return_marker),
                 "tier-2 on-return rendered the wrong cell for `{shape_name}` — \
@@ -2339,24 +2453,24 @@ fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> St
     invoke_run(&bytes).expect("invoke run()")
 }
 
-/// Compute the expected `args=[…]` substring for one primitive
-/// shape. Mirrors the cell-discriminant + payload shape that
-/// `LiftKind::classify` + the `emit_*_cell` helpers produce, in the
-/// formatting `MIDDLEWARE_TIER2_LIB_RS::fmt_cell` emits.
+/// Compute the expected `args=[…]` substring for one shape. Mirrors
+/// the cell-discriminant + payload shape that `LiftKind::classify` +
+/// the `emit_*_cell` helpers produce, in the formatting
+/// `MIDDLEWARE_TIER2_LIB_RS::fmt_cell` emits.
 ///
-/// Returns `None` for shapes the lift codegen doesn't yet handle
-/// (e.g. `char`, compound shapes); callers filter those out.
+/// Returns `None` for shapes the value-rendering helper
+/// (`predict_tier2_arg_inner`) doesn't know how to format yet. Callers
+/// in `test_tier2_canned_primitives` iterate `tier2_shapes()`, so
+/// every entry must be renderable — `None` becomes a panic via
+/// `.expect`.
 fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
     let inner = predict_tier2_arg_inner(shape)?;
     Some(format!("x: {inner}"))
 }
 
 /// Compute the expected `result=…` substring for one shape's
-/// on-return marker. Returns `None` for shapes whose result lift
-/// isn't yet wired (compound kinds beyond record). Callers should
-/// only assert it when `predict_tier2_args_marker` (which gates the
-/// param side) and this both return `Some` — both directions must
-/// be lift-able for the test to pin both markers.
+/// on-return marker. `foo` echoes the value back, so the same
+/// per-shape rendering applies to the return path.
 fn predict_tier2_result_marker(shape: &Shape) -> Option<String> {
     predict_tier2_arg_inner(shape)
 }
@@ -2546,10 +2660,10 @@ fn test_fuzz() {
 }
 
 /// Pick which shapes to run. Without the env var, the full
-/// `canned_shapes()`. With it, only shapes whose `name()` matches
+/// `tier1_shapes()`. With it, only shapes whose `name()` matches
 /// one of the comma-separated entries.
 fn select_shapes() -> Vec<Shape> {
-    let all = canned_shapes();
+    let all = tier1_shapes();
     match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
         None => all,
         Some(csv) => {
