@@ -286,7 +286,18 @@ impl Shape {
                 s
             }
             Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
-            Shape::Variant { wit_name, .. } => format!("variant_{}", wit_name),
+            Shape::Variant {
+                wit_name,
+                cases,
+                selected,
+                ..
+            } => {
+                let case = cases
+                    .get(*selected)
+                    .map(|c| c.wit_name)
+                    .unwrap_or("oob");
+                format!("variant_{wit_name}_{case}")
+            }
             Shape::Enum { wit_name, .. } => format!("enum_{}", wit_name),
             Shape::Flags {
                 wit_name, selected, ..
@@ -1279,6 +1290,79 @@ fn tier2_shapes() -> Vec<Shape> {
             flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
             selected: 0,
         },
+        // Variant with a payload-bearing case active — exercises the
+        // N-way disc dispatch hitting a non-first arm + the case's
+        // payload-lift path.
+        Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 1,
+        },
+        // Same shape, unit case active — pins the dispatch path that
+        // skips the payload write (option-none on the entry's payload).
+        Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 0,
+        },
         Shape::Record {
             wit_name: "point",
             rust_name: "Point",
@@ -1951,6 +2035,17 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
                 .get(*side_idx as usize)
                 .expect("flags_infos idx in range");
             format!("flags({} {{ {} }})", info.type_name, info.set_flags.join(", "))
+        }
+        Cell::VariantCase(side_idx) => {
+            let info = tree
+                .variant_infos
+                .get(*side_idx as usize)
+                .expect("variant_infos idx in range");
+            let payload = match info.payload {
+                Some(child_idx) => format!("some({})", fmt_cell(tree, child_idx)),
+                None => "none".to_string(),
+            };
+            format!("variant-case({}::{}, {})", info.type_name, info.case_name, payload)
         }
         Cell::RecordOf(side_idx) => {
             let info = tree
@@ -2678,6 +2773,22 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 .map(|(_, (wit_flag, _))| *wit_flag)
                 .collect();
             Some(format!("flags({wit_name} {{ {} }})", active.join(", ")))
+        }
+        Shape::Variant {
+            wit_name,
+            cases,
+            selected,
+            ..
+        } => {
+            let case = cases.get(*selected)?;
+            let payload = match &case.payload {
+                Some(p) => format!("some({})", predict_tier2_arg_inner(p)?),
+                None => "none".to_string(),
+            };
+            Some(format!(
+                "variant-case({wit_name}::{}, {payload})",
+                case.wit_name
+            ))
         }
         Shape::Record {
             wit_name, fields, ..
