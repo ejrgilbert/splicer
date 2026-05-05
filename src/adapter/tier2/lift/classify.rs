@@ -244,7 +244,7 @@ pub(crate) fn classify_result_lift(
 
     // Single-cell direct/retptr-pair path: build a one-cell plan and
     // pull its single Cell out as the variant tag for emit dispatch.
-    // Returns None for un-wired result types (variant / list / etc.)
+    // Returns None for un-wired result types (list / char / handles)
     // — wrapper still calls after-hook with option::none for `result`.
     let cell = single_cell_for_result(ty, resolve, names)?;
     let side_table = side_table_info_for_cell(&cell);
@@ -258,10 +258,8 @@ pub(crate) fn classify_result_lift(
 
 /// Whether `ty` resolves (through type aliases) to a compound kind
 /// whose result-side codegen is wired today: `record`, `tuple<...>`,
-/// `option<T>`, or `result<T, E>`. Other compound kinds (variant /
-/// etc.) bail out at [`classify_result_lift`] for now. Flags is
-/// single-cell, not compound, and goes through the Direct/RetptrPair
-/// path.
+/// `option<T>`, `result<T, E>`, or `variant`. Flags is single-cell,
+/// not compound, and goes through the Direct/RetptrPair path.
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
@@ -270,7 +268,8 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
         wit_parser::TypeDefKind::Record(_)
         | wit_parser::TypeDefKind::Tuple(_)
         | wit_parser::TypeDefKind::Option(_)
-        | wit_parser::TypeDefKind::Result(_) => true,
+        | wit_parser::TypeDefKind::Result(_)
+        | wit_parser::TypeDefKind::Variant(_) => true,
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
         _ => false,
     }

@@ -877,6 +877,111 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `Cell::Variant` as a Compound result.
+    /// Drives `is_compound_result(Variant) → Compound → lift_from_memory`
+    /// + the N-way disc dispatch on the result side. `shape { circle,
+    /// sq(u32), tri(u32) }` joined-flat = [i32 disc, i32 (joined u32/u32)]
+    ///   → 2 slots → retptr.
+    #[test]
+    fn dispatch_module_with_variant_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "make") (result i32)
+                        i32.const 0x1000
+                        i32.const 2
+                        i32.store
+                        i32.const 0x1000
+                        i32.const 42
+                        i32.store offset=4
+                        i32.const 0x1000
+                    )
+                    (func (export "cabi_post_make") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "make" (core func $make))
+                (alias core export $i "cabi_post_make" (core func $make_post))
+                (alias core export $i "memory" (core memory $mem))
+                (type $shape (variant (case "circle") (case "sq" u32) (case "tri" u32)))
+                (export $shape-export "shape" (type $shape))
+                (type $make-ty (func (result $shape-export)))
+                (func $make-lifted (type $make-ty)
+                    (canon lift (core func $make) (memory $mem)
+                        (post-return (func $make_post))))
+                (instance $api-inst
+                    (export "shape" (type $shape-export))
+                    (export "make" (func $make-lifted)))
+                (export "my:vtret/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:vtret/api@1.0.0" (instance $api "my:vtret/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:vtret/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for variant result");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// Single-flat-slot variant (`variant { only }` → just disc, no
+    /// payloads) — comes back flat, not retptr. The
+    /// `is_compound_result(Variant) && result_at_retptr` gate falls
+    /// through to single-cell path; variant isn't in
+    /// `is_supported_direct_result`, so classify returns None → no
+    /// lift, after-hook sees `result: option::none`. Pins the
+    /// fall-through against future regressions.
+    #[test]
+    fn dispatch_module_with_single_slot_variant_result_falls_through() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "noop") (result i32) i32.const 0)
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "noop" (core func $noop))
+                (type $only (variant (case "only")))
+                (export $only-export "only" (type $only))
+                (type $noop-ty (func (result $only-export)))
+                (func $noop-lifted (type $noop-ty) (canon lift (core func $noop)))
+                (instance $api-inst
+                    (export "only" (type $only-export))
+                    (export "noop" (func $noop-lifted)))
+                (export "my:vt1/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:vt1/api@1.0.0" (instance $api "my:vt1/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let bytes = build_tier2_adapter(
+            "my:vt1/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("single-slot variant must fall through to no-lift, not panic");
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted adapter component should validate");
+    }
+
     /// End-to-end test for `Cell::Flags` as a Direct result. Drives
     /// the bit-walk reading from `lcl.result` (the i32 the export sig
     /// returns) plus the per-result-direct flags-info entry the layout
