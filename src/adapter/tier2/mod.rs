@@ -827,6 +827,104 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `result<T, E>` as a compound result.
+    /// Drives `is_compound_result(Result) → Compound → lift_from_memory`
+    /// and the if/else branching emit at the parent Result cell.
+    /// `result<u32, u32>` flattens to 2 slots → retptr; canon lift's
+    /// `memory` + `post-return` materialize it via the
+    /// callee-allocates pattern.
+    #[test]
+    fn dispatch_module_with_result_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "either") (param i32) (result i32)
+                        i32.const 0x1000
+                        i32.const 0
+                        i32.store
+                        i32.const 0x1000
+                        local.get 0
+                        i32.store offset=4
+                        i32.const 0x1000
+                    )
+                    (func (export "cabi_post_either") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "either" (core func $either))
+                (alias core export $i "cabi_post_either" (core func $either_post))
+                (alias core export $i "memory" (core memory $mem))
+                (type $either-ty (func (param "x" u32) (result (result u32 (error u32)))))
+                (func $either-lifted (type $either-ty)
+                    (canon lift (core func $either) (memory $mem)
+                        (post-return (func $either_post))))
+                (instance $api-inst (export "either" (func $either-lifted)))
+                (export "my:res-ret/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:res-ret/api@1.0.0" (instance $api "my:res-ret/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:res-ret/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for result result");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// Single-flat-slot compound result (`result<_, _>`) — flat is
+    /// just the i32 disc, comes back direct (not retptr). Pins the
+    /// `result_at_retptr` fall-through gate for the Result Compound
+    /// branch — must build successfully, after-hook sees
+    /// `result: option::none`.
+    #[test]
+    fn dispatch_module_with_single_slot_result_result_falls_through() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "noop") (result i32)
+                        i32.const 0
+                    )
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "noop" (core func $noop))
+                (type $noop-ty (func (result (result))))
+                (func $noop-lifted (type $noop-ty) (canon lift (core func $noop)))
+                (instance $api-inst (export "noop" (func $noop-lifted)))
+                (export "my:res1/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:res1/api@1.0.0" (instance $api "my:res1/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let bytes = build_tier2_adapter(
+            "my:res1/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("single-slot result must fall through to no-lift, not panic");
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted adapter component should validate");
+    }
+
     /// Async function whose params flatten to >`MAX_FLAT_ASYNC_PARAMS` (4)
     /// canon-lowers with `indirect_params=true`, but tier-2's
     /// `emit_handler_call` pushes flat params. Until `lower_to_memory`

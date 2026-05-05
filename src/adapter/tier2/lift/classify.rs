@@ -227,12 +227,13 @@ pub(crate) fn classify_result_lift(
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
 
-    // Compound kinds (record, tuple, option) drive a LiftPlan over
-    // retptr-loaded flat slots. Only fires when canonical-ABI actually
-    // routes the result through retptr — single-slot edge cases (e.g.
-    // `tuple<u32>`, `record { a: u32 }`) come back flat and have no
-    // memory for `lift_from_memory` to read from, so they fall through
-    // to the no-lift path (after-hook sees `result: option::none`).
+    // Compound kinds (record, tuple, option, result) drive a
+    // LiftPlan over retptr-loaded flat slots. Only fires when
+    // canonical-ABI actually routes the result through retptr —
+    // single-slot edge cases (e.g. `tuple<u32>`, `record { a: u32 }`,
+    // `result<_, _>`) come back flat and have no memory for
+    // `lift_from_memory` to read from, so they fall through to the
+    // no-lift path (after-hook sees `result: option::none`).
     if is_compound_result(ty, resolve) && result_at_retptr {
         let plan = LiftPlan::for_type(ty, resolve, names);
         return Some(ResultLift {
@@ -244,7 +245,7 @@ pub(crate) fn classify_result_lift(
     // Single-cell direct/retptr-pair path: build a one-cell plan and
     // pull its single Cell out as the variant tag for emit dispatch.
     // Returns None for un-wired result types (variant / list /
-    // result / etc.) — wrapper still calls after-hook with
+    // flags / etc.) — wrapper still calls after-hook with
     // option::none for `result`.
     let cell = single_cell_for_result(ty, resolve, names)?;
     let side_table = side_table_info_for_cell(&cell);
@@ -258,8 +259,8 @@ pub(crate) fn classify_result_lift(
 
 /// Whether `ty` resolves (through type aliases) to a compound kind
 /// whose result-side codegen is wired today: `record`, `tuple<...>`,
-/// or `option<T>`. Other compound kinds (variant / result / etc.)
-/// bail out at [`classify_result_lift`] for now.
+/// `option<T>`, or `result<T, E>`. Other compound kinds (variant /
+/// flags / etc.) bail out at [`classify_result_lift`] for now.
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
@@ -267,7 +268,8 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     match &resolve.types[*id].kind {
         wit_parser::TypeDefKind::Record(_)
         | wit_parser::TypeDefKind::Tuple(_)
-        | wit_parser::TypeDefKind::Option(_) => true,
+        | wit_parser::TypeDefKind::Option(_)
+        | wit_parser::TypeDefKind::Result(_) => true,
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
         _ => false,
     }

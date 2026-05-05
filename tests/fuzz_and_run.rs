@@ -289,10 +289,11 @@ impl Shape {
             Shape::Variant { wit_name, .. } => format!("variant_{}", wit_name),
             Shape::Enum { wit_name, .. } => format!("enum_{}", wit_name),
             Shape::Flags { wit_name, .. } => format!("flags_{}", wit_name),
-            Shape::Result_ { ok, err, .. } => {
+            Shape::Result_ { ok, err, is_ok } => {
+                let arm = if *is_ok { "ok" } else { "err" };
                 let ok_s = ok.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
                 let err_s = err.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
-                format!("result_{ok_s}_{err_s}")
+                format!("result_{arm}_{ok_s}_{err_s}")
             }
             Shape::ResourceOwn { wit_name, .. } => format!("own_{wit_name}"),
             Shape::ResourceBorrow { wit_name, .. } => format!("borrow_{wit_name}"),
@@ -1329,6 +1330,45 @@ fn tier2_shapes() -> Vec<Shape> {
             }),
             is_some: false,
         },
+        // result<u32, u32>: 2 flat slots (disc + joined value) → result
+        // side hits retptr. Both arms have matching widths so no
+        // joined-flat widening (Phase 1 only handles the no-bitcast
+        // case). Run both arms — `ok` exercises disc=0 + ok-arm child
+        // emit; `err` exercises disc=1.
+        Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: true,
+        },
+        Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: false,
+        },
     ]
 }
 
@@ -1909,7 +1949,16 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
             format!("option-some({})", fmt_cell(tree, *child_idx))
         }
         Cell::OptionNone => "option-none".to_string(),
+        Cell::ResultOk(payload) => fmt_result_arm(tree, "result-ok", payload),
+        Cell::ResultErr(payload) => fmt_result_arm(tree, "result-err", payload),
         other => format!("other({other:?})"),
+    }
+}
+
+fn fmt_result_arm(tree: &FieldTree, arm: &str, payload: &Option<u32>) -> String {
+    match payload {
+        Some(idx) => format!("{arm}(some({}))", fmt_cell(tree, *idx)),
+        None => format!("{arm}(none)"),
     }
 }
 
@@ -2614,8 +2663,22 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 Some("option-none".to_string())
             }
         }
-        // Other compound shapes (lists, variants, results, flags)
-        // light up here as their lift codegen lands.
+        // The active arm's `Some(<predict>)` follows the cell payload's
+        // inline `option<u32>`; an absent (unit) arm renders as `none`.
+        Shape::Result_ { ok, err, is_ok } => {
+            let (arm_name, arm_shape) = if *is_ok {
+                ("result-ok", ok)
+            } else {
+                ("result-err", err)
+            };
+            let payload_render = match arm_shape.as_ref() {
+                Some(s) => format!("some({})", predict_tier2_arg_inner(s)?),
+                None => "none".to_string(),
+            };
+            Some(format!("{arm_name}({payload_render})"))
+        }
+        // Other compound shapes (lists, variants, flags) light up here
+        // as their lift codegen lands.
         _ => None,
     }
 }
