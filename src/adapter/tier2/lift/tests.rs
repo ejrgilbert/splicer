@@ -17,6 +17,7 @@ use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECO
 use super::super::{FuncClassified, FuncShape};
 use super::plan::{Cell, LiftPlan, NamedListInfo};
 use super::sidetable::flags_info::FlagsRuntimeFill;
+use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::CellSideData;
 use super::*;
 
@@ -29,11 +30,13 @@ const TEST_WIT: &str = r#"
     interface t {
         enum color { red, green, blue }
         flags fperms { read, write, exec }
+        variant shape { circle, sq(u32), tri(u32) }
         record point { x: u32, y: s32 }
         record nested { p: point, c: color }
         record pair { a: u8, b: u8 }
         record point-and-tuple { p: point, t: tuple<u8, s32> }
         record perms-pair { primary: fperms, secondary: fperms }
+        record shape-pair { lhs: shape, rhs: shape }
         f-mixed: func(a: bool, s: string, b: list<u8>, x: s64);
         f-color: func(c: color);
         f-flags: func(p: fperms);
@@ -44,6 +47,8 @@ const TEST_WIT: &str = r#"
         f-record-with-tuple: func(rt: point-and-tuple);
         f-record-with-flags: func(rwf: perms-pair);
         f-perms-result: func() -> perms-pair;
+        f-variant-shape: func(s: shape);
+        f-record-with-variant: func(rwv: shape-pair);
         f-option-u32: func(o: option<u32>);
         f-option-string: func(o: option<string>);
         f-option-option: func(o: option<option<u32>>);
@@ -238,10 +243,10 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             }
             Cell::Option { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
+            Cell::Variant { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
             Cell::Char
             | Cell::ListOf
-            | Cell::Variant
             | Cell::Handle
             | Cell::Future
             | Cell::Stream
@@ -276,6 +281,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
     let mut tuple_cursor: u32 = 0;
     let mut flags_cursor: u32 = FLAGS_SCRATCH_BASE;
     let mut flags_idx: u32 = 0;
+    let mut variant_idx: u32 = 0;
     plan.cells
         .iter()
         .map(|op| match op {
@@ -314,6 +320,37 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 };
                 flags_idx += 1;
                 CellSideData::Flags(Box::new(fill))
+            }
+            Cell::Variant {
+                info,
+                per_case_payload,
+                ..
+            } => {
+                /// Synth offsets for variant entry-slot stubs — anywhere
+                /// in linear memory works.
+                const VARIANT_BASE: u32 = 0x2000;
+                let case_name_addr = VARIANT_BASE + variant_idx * 32;
+                let payload_disc_addr = case_name_addr + 16;
+                let payload_value_addr = case_name_addr + 20;
+                let fill = VariantRuntimeFill {
+                    side_table_idx: variant_idx,
+                    entry_seg_off: 0,
+                    case_name_addr: Some(case_name_addr as i32),
+                    payload_disc_addr: Some(payload_disc_addr as i32),
+                    payload_value_addr: Some(payload_value_addr as i32),
+                    case_names: info
+                        .item_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| BlobSlice {
+                            off: i as u32 * STUB_FLAG_NAME_STRIDE,
+                            len: STUB_FLAG_NAME_LEN,
+                        })
+                        .collect(),
+                    per_case_payload: per_case_payload.clone(),
+                };
+                variant_idx += 1;
+                CellSideData::Variant(Box::new(fill))
             }
             _ => CellSideData::None,
         })
@@ -471,6 +508,65 @@ fn flags_assigns_one_cell_one_slot() {
         }],
     );
     assert_eq!(plan.flat_slot_count, 1);
+}
+
+#[test]
+fn variant_lays_disc_first_then_arms_share_slots() {
+    // shape { circle, sq(u32), tri(u32) }: 3 cases, 2 with payload.
+    // Joined flat = [i32 disc, i32 (joined u32/u32)]. Cell order:
+    //   sq's u32   → cell 0 (slot 1)
+    //   tri's u32  → cell 1 (slot 1, shares with sq's slot)
+    //   Variant    → cell 2 (disc=0, per_case_payload=[None, Some(0), Some(1)])
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("shape", &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::Variant {
+                disc_slot: 0,
+                per_case_payload: vec![None, Some(0), Some(1)],
+                info: enum_info("shape", &["circle", "sq", "tri"]),
+            },
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn record_with_variant_field_recurses_into_variant() {
+    // shape-pair { lhs: shape, rhs: shape }: each variant claims one
+    // disc slot + one shared-payload slot; arms share inside each
+    // variant but lhs and rhs occupy independent slots.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("shape-pair", &r, &mut names);
+    let shape_info = enum_info("shape", &["circle", "sq", "tri"]);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::Variant {
+                disc_slot: 0,
+                per_case_payload: vec![None, Some(0), Some(1)],
+                info: shape_info.clone(),
+            },
+            Cell::IntegerZeroExt { flat_slot: 3 },
+            Cell::IntegerZeroExt { flat_slot: 3 },
+            Cell::Variant {
+                disc_slot: 2,
+                per_case_payload: vec![None, Some(3), Some(4)],
+                info: shape_info,
+            },
+            record_of(&mut names, "shape-pair", &[("lhs", 2), ("rhs", 5)]),
+        ],
+    );
+    assert_eq!(plan.root(), 6);
+    assert_eq!(plan.flat_slot_count, 4);
 }
 
 #[test]
@@ -1042,9 +1138,11 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for(&func_named(&r, "f-mixed").params[2].ty, &r, &mut names), // list<u8>
         plan_for_named("color", &r, &mut names),
         plan_for_named("fperms", &r, &mut names),
+        plan_for_named("shape", &r, &mut names),
         plan_for_named("point", &r, &mut names),
         plan_for_named("nested", &r, &mut names),
         plan_for_named("perms-pair", &r, &mut names),
+        plan_for_named("shape-pair", &r, &mut names),
         plan_for(&func_named(&r, "f-tuple").params[0].ty, &r, &mut names),
         plan_for(
             &func_named(&r, "f-tuple-of-tuple").params[0].ty,

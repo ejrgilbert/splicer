@@ -16,15 +16,9 @@
 
 use std::collections::HashMap;
 
-use super::super::abi::emit::{BlobSlice, RecordLayout, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET};
-
-// Variant disc values for `option<T>`. Fixed by the canonical-ABI
-// spec, not by any WIT we control: wit-parser models `option<T>` as
-// its own `TypeDefKind::Option(T)` (not a `Variant`), so there's no
-// case data on a `Resolve` to derive these from — they're just the
-// spec values.
-const OPTION_NONE: u8 = 0;
-const OPTION_SOME: u8 = 1;
+use super::super::abi::emit::{
+    BlobSlice, RecordLayout, OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
+};
 
 /// Append-only string interner whose handle type is [`BlobSlice`].
 /// Wraps the `Vec<u8>` that backs the tier-2 name-blob data segment;

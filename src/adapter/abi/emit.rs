@@ -462,6 +462,19 @@ pub(crate) const SLICE_LEN_OFFSET: u32 = 4;
 /// `string` lowering, also the per-element stride of any `list<string>`.
 pub(crate) const STRING_FLAT_BYTES: u32 = 8;
 
+/// Canonical-ABI discriminant values for `option<T>`. Fixed by the
+/// spec — wit-parser models `option<T>` as its own `TypeDefKind::Option(T)`
+/// (not a `Variant`), so there's no per-case data on a `Resolve` to
+/// derive these from.
+pub(crate) const OPTION_NONE: u8 = 0;
+pub(crate) const OPTION_SOME: u8 = 1;
+
+/// Log2 alignment values for wasm `i32.store` / `i32.store8`.
+/// `MemArg::align` is in log2 form; these are wasm-format constants,
+/// not Resolve-derivable.
+pub(crate) const I32_STORE_LOG2_ALIGN: u32 = 2;
+pub(crate) const I8_STORE_LOG2_ALIGN: u32 = 0;
+
 // `splicer:common/types.call-id` field names — encapsulated by
 // [`CallIdLayout`]'s typed accessors so call sites can't fat-finger
 // the keys. Must match `wit/common/world.wit`.
@@ -536,7 +549,7 @@ pub(crate) fn emit_store_slice(f: &mut Function, base_ptr: i32, field_off: u32, 
         f.instructions().i32_const(value);
         f.instructions().i32_store(MemArg {
             offset: (field_off + sub_off) as u64,
-            align: 2,
+            align: I32_STORE_LOG2_ALIGN,
             memory_index: 0,
         });
     };

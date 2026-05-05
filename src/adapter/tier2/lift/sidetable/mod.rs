@@ -33,8 +33,10 @@ pub(super) mod enum_info;
 pub(super) mod flags_info;
 pub(super) mod record_info;
 pub(super) mod tuple_indices;
+pub(super) mod variant_info;
 
 use flags_info::FlagsRuntimeFill;
+use variant_info::VariantRuntimeFill;
 
 /// Per-plan-cell side-table data the emit phase reads. One entry per
 /// `plan.cells` position; `None` for cells that lift purely from flat
@@ -56,6 +58,9 @@ pub(crate) enum CellSideData {
     /// `cell::flags-set(u32)` payload + the addresses the wrapper
     /// bit-walk patches at runtime.
     Flags(Box<FlagsRuntimeFill>),
+    /// `cell::variant-case(u32)` payload + the addresses the wrapper
+    /// disc-dispatch patches at runtime (case-name + payload option).
+    Variant(Box<VariantRuntimeFill>),
 }
 
 /// Fold the per-builder per-cell maps into one [`Vec<CellSideData>`]
@@ -66,10 +71,12 @@ pub(crate) fn fold_cell_side_data(
     record_info: &[Option<u32>],
     tuple_indices: &[Option<BlobSlice>],
     flags_fill: &[Option<FlagsRuntimeFill>],
+    variant_fill: &[Option<VariantRuntimeFill>],
 ) -> Vec<CellSideData> {
     debug_assert_eq!(record_info.len(), plan.cells.len());
     debug_assert_eq!(tuple_indices.len(), plan.cells.len());
     debug_assert_eq!(flags_fill.len(), plan.cells.len());
+    debug_assert_eq!(variant_fill.len(), plan.cells.len());
     plan.cells
         .iter()
         .enumerate()
@@ -85,6 +92,11 @@ pub(crate) fn fold_cell_side_data(
                     .clone()
                     .expect("Flags cell missing runtime-fill bundle"),
             )),
+            Cell::Variant { .. } => CellSideData::Variant(Box::new(
+                variant_fill[i]
+                    .clone()
+                    .expect("Variant cell missing runtime-fill bundle"),
+            )),
             _ => CellSideData::None,
         })
         .collect()
@@ -93,9 +105,10 @@ pub(crate) fn fold_cell_side_data(
 // ─── Per-cell side-table indices ─────────────────────────────────
 //
 // Each builder produces its own `PerCellIndices<T>` (record-info: u32,
-// tuple-indices: SymRef, flags: FlagsRuntimeFill). The layout phase
-// folds these into one `Vec<CellSideData>` per (fn, param | result)
-// via [`fold_cell_side_data`].
+// tuple-indices: SymRef, flags: FlagsRuntimeFill, variant:
+// VariantRuntimeFill). The layout phase folds these into one
+// `Vec<CellSideData>` per (fn, param | result) via
+// [`fold_cell_side_data`].
 
 /// Per-(fn, param) and per-(fn, result) per-plan-cell `Option<T>`
 /// map. Internal nesting is `Vec<Vec<Vec<…>>>` / `Vec<Vec<…>>` but

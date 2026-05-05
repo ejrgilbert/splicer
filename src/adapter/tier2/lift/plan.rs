@@ -110,6 +110,17 @@ pub(crate) enum Cell {
     /// `flags { ... }` → `cell::flags-set(u32)`. Single i32 lift slot
     /// (canonical-ABI caps flags at 32 bits).
     Flags { flat_slot: u32, info: NamedListInfo },
+    /// `variant { ... }` → `cell::variant-case(u32)`. Flat layout
+    /// `[disc, ...joined_flat_of_each_case]`. `per_case_payload[i]`
+    /// is `Some(child_idx)` for cases with a payload, `None` for unit.
+    /// Inactive arms' children get garbage from joined slots; the
+    /// runtime patches `case-name` + `payload` per call so readers
+    /// gate on disc and never follow them.
+    Variant {
+        disc_slot: u32,
+        per_case_payload: Vec<Option<u32>>,
+        info: NamedListInfo,
+    },
 
     // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
     //    + `emit_cell_op` until codegen lands) ─────────────────────
@@ -117,8 +128,6 @@ pub(crate) enum Cell {
     Char,
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
-    /// `variant { ... }` → `cell::variant-case(u32)`.
-    Variant,
 
     // ── Un-wired handle ──────────────────────────────────────────
     /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`.
@@ -194,6 +203,16 @@ impl LiftPlan {
     pub(super) fn flags_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
         self.cells.iter().filter_map(|op| match op {
             Cell::Flags { info, .. } => Some(info),
+            _ => None,
+        })
+    }
+
+    /// Iterator over every `Cell::Variant` in the plan. Used by the
+    /// side-table builder to register variant-type and case-name
+    /// strings.
+    pub(super) fn variant_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
+        self.cells.iter().filter_map(|op| match op {
+            Cell::Variant { info, .. } => Some(info),
             _ => None,
         })
     }
@@ -288,9 +307,7 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::List(_) => {
                     todo!("plan-builder for un-wired Cell::ListOf")
                 }
-                wit_parser::TypeDefKind::Variant(_) => {
-                    todo!("plan-builder for un-wired Cell::Variant")
-                }
+                wit_parser::TypeDefKind::Variant(_) => self.push_variant(ty, resolve, names),
                 wit_parser::TypeDefKind::Flags(_) => {
                     let info = flags_lift_info_for_type(ty, resolve)
                         .expect("Flags kind implies flags-info available");
@@ -472,6 +489,68 @@ impl LiftPlanBuilder {
         })
     }
 
+    /// `variant { ... }`: bump disc, walk each case's payload (if
+    /// any) sharing the same flat-slot range — generalizes
+    /// [`Self::push_result`] to N arms. Bails on joined-flat
+    /// widening, same as result.
+    fn push_variant(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
+        let Type::Id(id) = ty else {
+            unreachable!("Variant kind came from non-Id type")
+        };
+        let typedef = &resolve.types[*id];
+        let wit_parser::TypeDefKind::Variant(v) = &typedef.kind else {
+            unreachable!("Variant kind came from non-Variant TypeDefKind")
+        };
+        let v = v.clone();
+        let info = variant_lift_info_for_type(ty, resolve)
+            .expect("Variant kind implies variant-info available");
+
+        // Joined flat (= [I32 disc, ...join(flat of each case)]).
+        // Each populated case's per-position flat must equal the
+        // joined per-position; otherwise leaf cells would need
+        // bitcasts that Phase 1 doesn't yet emit.
+        let joined =
+            flat_types(resolve, ty, None).expect("variant must flatten within MAX_FLAT_PARAMS");
+        for case in &v.cases {
+            let Some(t) = case.ty.as_ref() else {
+                continue;
+            };
+            let arm_flat =
+                flat_types(resolve, t, None).expect("case flat fits — joined fit, so case fits");
+            for (i, &arm_ty) in arm_flat.iter().enumerate() {
+                let arm_val = wasm_type_to_val(arm_ty);
+                let joined_val = wasm_type_to_val(joined[1 + i]);
+                if arm_val != joined_val {
+                    todo!(
+                        "variant with joined-flat widening on case `{}` \
+                         (slot {} arm-val {:?} vs joined-val {:?}) is not yet supported",
+                        case.name,
+                        1 + i,
+                        arm_val,
+                        joined_val,
+                    );
+                }
+            }
+        }
+
+        let disc_slot = self.bump_flat_slot();
+        let arms_base = self.next_flat_slot;
+        let mut max_after = arms_base;
+        let mut per_case_payload: Vec<Option<u32>> = Vec::with_capacity(v.cases.len());
+        for case in &v.cases {
+            self.next_flat_slot = arms_base;
+            let child_idx = case.ty.as_ref().map(|t| self.push(t, resolve, names));
+            max_after = max_after.max(self.next_flat_slot);
+            per_case_payload.push(child_idx);
+        }
+        self.next_flat_slot = max_after;
+        self.push_cell(Cell::Variant {
+            disc_slot,
+            per_case_payload,
+            info,
+        })
+    }
+
     pub(super) fn into_plan(self, root: u32) -> LiftPlan {
         LiftPlan {
             cells: self.cells,
@@ -509,6 +588,24 @@ fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo
     };
     let type_name = typedef.name.as_ref()?.clone();
     let item_names: Vec<String> = e.cases.iter().map(|c| c.name.clone()).collect();
+    Some(NamedListInfo {
+        type_name,
+        item_names,
+    })
+}
+
+/// Extract `(type-name, case-names)` from a variant-typed `Type::Id`.
+/// Returns `None` if the type isn't a variant or lacks a name.
+fn variant_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo> {
+    let Type::Id(id) = ty else {
+        return None;
+    };
+    let typedef = &resolve.types[*id];
+    let wit_parser::TypeDefKind::Variant(v) = &typedef.kind else {
+        return None;
+    };
+    let type_name = typedef.name.as_ref()?.clone();
+    let item_names: Vec<String> = v.cases.iter().map(|c| c.name.clone()).collect();
     Some(NamedListInfo {
         type_name,
         item_names,

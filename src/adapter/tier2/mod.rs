@@ -830,6 +830,53 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `Cell::Variant` as a param. Drives the
+    /// N-way disc dispatch + per-arm case-name + payload writes,
+    /// plus the per-cell variant-info side-table entry placement.
+    /// Same nominal-type WAT shape as the flags tests.
+    #[test]
+    fn dispatch_module_with_variant_param_roundtrips() {
+        // variant shape { circle, sq(u32), tri(u32) } flattens to
+        // [i32 disc, i32 (joined u32/u32)] = 2 i32 params.
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume") (param i32 i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (type $shape (variant (case "circle") (case "sq" u32) (case "tri" u32)))
+                (export $shape-export "shape" (type $shape))
+                (type $consume-ty (func (param "s" $shape-export)))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
+                (instance $api-inst
+                    (export "shape" (type $shape-export))
+                    (export "consume" (func $consume-lifted)))
+                (export "my:vt/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:vt/api@1.0.0" (instance $api "my:vt/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:vt/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for variant param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// End-to-end test for `Cell::Flags` as a Direct result. Drives
     /// the bit-walk reading from `lcl.result` (the i32 the export sig
     /// returns) plus the per-result-direct flags-info entry the layout

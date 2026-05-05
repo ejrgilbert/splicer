@@ -53,6 +53,10 @@ pub(super) use sidetable::flags_info::{
 };
 pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
 pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
+pub(super) use sidetable::variant_info::{
+    back_fill_entry_addrs as back_fill_variant_entry_addrs, build_variant_info_blob,
+    register_variant_strings, VariantInfoBlobs,
+};
 pub(super) use sidetable::{fold_cell_side_data, CellSideData, SideTableBlob};
 
 #[cfg(test)]

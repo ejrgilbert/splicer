@@ -31,6 +31,7 @@ const TYPEDEF_CELL: &str = "cell";
 const TYPEDEF_ENUM_INFO: &str = "enum-info";
 const TYPEDEF_FLAGS_INFO: &str = "flags-info";
 const TYPEDEF_RECORD_INFO: &str = "record-info";
+const TYPEDEF_VARIANT_INFO: &str = "variant-info";
 
 // Field names within those records.
 pub(super) const FIELD_NAME: &str = "name";
@@ -39,10 +40,15 @@ pub(super) const TREE_CELLS: &str = "cells";
 pub(super) const TREE_ENUM_INFOS: &str = "enum-infos";
 pub(super) const TREE_FLAGS_INFOS: &str = "flags-infos";
 pub(super) const TREE_RECORD_INFOS: &str = "record-infos";
+pub(super) const TREE_VARIANT_INFOS: &str = "variant-infos";
 pub(super) const TREE_ROOT: &str = "root";
 /// Field name on `record flags-info { … }` for the (runtime-filled)
 /// list of currently-set flag names.
 pub(super) const FLAGS_INFO_SET_FLAGS: &str = "set-flags";
+/// Field names on `record variant-info { … }`. `case-name` and
+/// `payload` are runtime-filled per call.
+pub(super) const VARIANT_INFO_CASE_NAME: &str = "case-name";
+pub(super) const VARIANT_INFO_PAYLOAD: &str = "payload";
 /// Field name on `record record-info { … }` for the (name, cell-idx)
 /// tuple list.
 pub(super) const RECORD_INFO_FIELDS: &str = "fields";
@@ -74,6 +80,13 @@ pub(super) struct SchemaLayouts {
     /// Layout of `record record-info { type-name, fields }` (the
     /// per-record-cell side-table entry).
     pub(super) record_info_layout: RecordLayout,
+    /// Layout of `record variant-info { type-name, case-name, payload }`
+    /// (the per-variant-cell side-table entry).
+    pub(super) variant_info_layout: RecordLayout,
+    /// Byte offset of the `option<u32>` payload's u32 slot inside the
+    /// variant-info `payload` field. Derived from `payload`'s
+    /// `option<u32>`-shaped layout.
+    pub(super) variant_info_payload_value_off: u32,
     /// Layout of one element of `record-info.fields`, an anonymous
     /// `tuple<string, u32>`. Field names are synthetic (see
     /// [`RECORD_FIELD_TUPLE_NAME`] / [`RECORD_FIELD_TUPLE_IDX`]).
@@ -112,6 +125,7 @@ pub(super) fn compute_schema(
     let enum_info_ty = find_common_typeid(resolve, TYPEDEF_ENUM_INFO)?;
     let flags_info_ty = find_common_typeid(resolve, TYPEDEF_FLAGS_INFO)?;
     let record_info_ty = find_common_typeid(resolve, TYPEDEF_RECORD_INFO)?;
+    let variant_info_ty = find_common_typeid(resolve, TYPEDEF_VARIANT_INFO)?;
 
     let field_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_ty_id);
     let tree_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_tree_ty_id);
@@ -120,6 +134,12 @@ pub(super) fn compute_schema(
     let enum_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, enum_info_ty);
     let flags_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, flags_info_ty);
     let record_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, record_info_ty);
+    let variant_info_layout =
+        RecordLayout::for_record_typedef(&size_align, resolve, variant_info_ty);
+    // `payload` field on variant-info is `option<u32>`. The
+    // wrapper writes the disc byte at +0 within the payload field
+    // and the u32 idx at +variant_info_payload_value_off.
+    let variant_info_payload_value_off = option_payload_offset(&size_align, &Type::U32);
     // The anonymous `tuple<string, u32>` element of `record-info.fields`
     // — synthesize a RecordLayout for it with positional names so the
     // record-info builder can do `offset_of(RECORD_FIELD_TUPLE_NAME)` /
@@ -158,6 +178,8 @@ pub(super) fn compute_schema(
         enum_info_layout,
         flags_info_layout,
         record_info_layout,
+        variant_info_layout,
+        variant_info_payload_value_off,
         record_field_tuple_layout,
         before_hook,
         after_hook,

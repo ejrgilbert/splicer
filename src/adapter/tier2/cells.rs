@@ -513,11 +513,21 @@ impl CellLayout {
         );
     }
 
-    /// `cell::variant-case(u32)` — index into `field-tree.variant-infos`.
-    #[allow(dead_code)]
+    /// `cell::variant-case(u32)` — build-time-known index into
+    /// `field-tree.variant-infos`. The pointed-at entry's `case-name`
+    /// and `payload` are patched at runtime by the dispatch emitted
+    /// alongside this.
     pub(crate) fn emit_variant_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
-        let _ = (f, addr_local, side_table_idx);
-        todo!("cell::variant-case — disc 14 + i32 variant-info side-table index");
+        self.emit_cell(
+            f,
+            addr_local,
+            self.disc_of("variant-case"),
+            &[PayloadPart {
+                source: PayloadSource::ConstI32(side_table_idx as i32),
+                kind: StoreKind::I32,
+                offset: 0,
+            }],
+        );
     }
 
     /// `cell::resource-handle(u32)` — index into `field-tree.handle-infos`.
@@ -743,6 +753,13 @@ mod tests {
         // additional locals.
         let cl = synth_cell_layout();
         build_and_validate(&[ValType::I32], |f| cl.emit_flags_set(f, 0, 11));
+    }
+
+    #[test]
+    fn variant_case_cell_emits_valid_wasm() {
+        // params: (addr_local: i32). side_table_idx is i32.const.
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_variant_case(f, 0, 5));
     }
 
     /// Structural fuzz over the primitive cell-emit helpers — for each

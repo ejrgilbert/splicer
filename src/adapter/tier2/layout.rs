@@ -17,15 +17,16 @@ use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, SymbolBases};
 use super::lift::plan::Cell;
 use super::lift::{
-    back_fill_flags_len_addrs, build_enum_info_blob, build_flags_info_blob, build_record_info_blob,
-    build_tuple_indices_blob, flags_scratch_sizes, fold_cell_side_data, register_enum_strings,
-    register_flags_strings, CellSideData, FlagsInfoBlobs, FlagsRuntimeFill, ParamLayout,
-    RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
-    TupleIndicesBlob,
+    back_fill_flags_len_addrs, back_fill_variant_entry_addrs, build_enum_info_blob,
+    build_flags_info_blob, build_record_info_blob, build_tuple_indices_blob,
+    build_variant_info_blob, flags_scratch_sizes, fold_cell_side_data, register_enum_strings,
+    register_flags_strings, register_variant_strings, CellSideData, FlagsInfoBlobs,
+    FlagsRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift, ResultSource,
+    ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
-    TREE_FLAGS_INFOS, TREE_RECORD_INFOS, TREE_ROOT,
+    TREE_FLAGS_INFOS, TREE_RECORD_INFOS, TREE_ROOT, TREE_VARIANT_INFOS,
 };
 use super::{AfterSetup, FuncClassified, FuncDispatch};
 
@@ -136,7 +137,7 @@ struct FieldSideTables {
     enum_infos: BlobSlice,
     flags_infos: BlobSlice,
     record_infos: BlobSlice,
-    // variant_infos: BlobSlice,
+    variant_infos: BlobSlice,
     // handle_infos: BlobSlice,
 }
 
@@ -145,8 +146,8 @@ impl FieldSideTables {
         tree.write_slice(blob, TREE_ENUM_INFOS, self.enum_infos);
         tree.write_slice(blob, TREE_FLAGS_INFOS, self.flags_infos);
         tree.write_slice(blob, TREE_RECORD_INFOS, self.record_infos);
-        // tree.write_slice(blob, TREE_VARIANT_INFOS, self.variant_infos);
-        // ...
+        tree.write_slice(blob, TREE_VARIANT_INFOS, self.variant_infos);
+        // tree.write_slice(blob, TREE_HANDLE_INFOS, self.handle_infos);
     }
 }
 
@@ -300,6 +301,7 @@ pub(super) fn lay_out_static_memory(
     // enum-info and flags-info both need a registration pass here.
     let enum_strings = register_enum_strings(&per_func, &mut names);
     let flags_strings = register_flags_strings(&per_func, &mut names);
+    let variant_strings = register_variant_strings(&per_func, &mut names);
 
     let mut layout = StaticLayout::new();
     let mut symbols = SymbolBases::new();
@@ -363,6 +365,7 @@ pub(super) fn lay_out_static_memory(
     let record_entries_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
+    let variant_info_id = symbols.alloc();
     let enum_info = build_enum_info_blob(
         &per_func,
         &enum_strings,
@@ -409,6 +412,17 @@ pub(super) fn lay_out_static_memory(
         segment: tuple_indices_seg,
         per_cell_idx: tuple_indices_per_cell,
     } = build_tuple_indices_blob(&per_func, tuple_indices_id);
+    let VariantInfoBlobs {
+        entries: variant_entries_seg,
+        per_param_range: variant_per_param_range_sym,
+        per_result_range: variant_per_result_range_sym,
+        per_cell_fill: mut variant_per_cell_fill,
+    } = build_variant_info_blob(
+        &per_func,
+        &variant_strings,
+        &schema.variant_info_layout,
+        variant_info_id,
+    );
 
     // Order doesn't matter for correctness — each placement assigns
     // a base, relocs land later. Coalesced same-alignment segments
@@ -458,6 +472,19 @@ pub(super) fn lay_out_static_memory(
         tuple_indices_seg.relocs,
     );
 
+    // Variant-info entries: same pattern as flags-info — place, then
+    // back-fill the per-cell `case_name_addr` + `payload_addr`.
+    let (variant_entries_base, _variant_entries_idx) =
+        layout.place_data(variant_entries_seg.align, &variant_entries_seg.bytes);
+    symbols.set(variant_entries_seg.id, variant_entries_base);
+    debug_assert!(variant_entries_seg.relocs.is_empty());
+    back_fill_variant_entry_addrs(
+        &mut variant_per_cell_fill,
+        variant_entries_base,
+        &schema.variant_info_layout,
+        schema.variant_info_payload_value_off,
+    );
+
     // Resolve per-(fn, param) and per-(fn, result) [`SymRef`]s to
     // absolute [`BlobSlice`]s now that every segment has a base.
     let enum_per_param: Vec<Vec<BlobSlice>> = enum_per_param_sym
@@ -484,6 +511,14 @@ pub(super) fn lay_out_static_memory(
         .into_iter()
         .map(|s| resolve(s, &symbols))
         .collect();
+    let variant_per_param_range: Vec<Vec<BlobSlice>> = variant_per_param_range_sym
+        .into_iter()
+        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
+        .collect();
+    let variant_per_result_range: Vec<BlobSlice> = variant_per_result_range_sym
+        .into_iter()
+        .map(|s| resolve(s, &symbols))
+        .collect();
     // Tuple-indices stay symbolic until the FuncDispatch assembly
     // resolves them per (fn, param | result) via
     // [`PerCellIndices::resolve_param`] /
@@ -499,6 +534,7 @@ pub(super) fn lay_out_static_memory(
                     enum_infos: enum_per_param[fn_idx][p_idx],
                     flags_infos: flags_per_param_range[fn_idx][p_idx],
                     record_infos: record_per_param_range[fn_idx][p_idx],
+                    variant_infos: variant_per_param_range[fn_idx][p_idx],
                 })
                 .collect()
         })
@@ -508,6 +544,7 @@ pub(super) fn lay_out_static_memory(
             enum_infos: enum_per_result[fn_idx],
             flags_infos: flags_per_result_range[fn_idx],
             record_infos: record_per_result_range[fn_idx],
+            variant_infos: variant_per_result_range[fn_idx],
         })
         .collect();
 
@@ -610,6 +647,7 @@ pub(super) fn lay_out_static_memory(
                         record_info_per_cell.for_param(i, p_idx),
                         &tuple_slices,
                         flags_per_cell_fill.for_param(i, p_idx),
+                        variant_per_cell_fill.for_param(i, p_idx),
                     );
                     ParamLayout {
                         lift,
@@ -646,6 +684,7 @@ pub(super) fn lay_out_static_memory(
                             record_info_per_cell.for_result(i),
                             &tuple_slices,
                             flags_per_cell_fill.for_result(i),
+                            variant_per_cell_fill.for_result(i),
                         );
                         ResultSourceLayout::Compound {
                             compound,

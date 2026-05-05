@@ -7,7 +7,8 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Resolve, SizeAlign};
 
 use super::super::super::abi::emit::{
-    direct_return_type, wasm_type_to_val, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
+    direct_return_type, wasm_type_to_val, I32_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, OPTION_NONE,
+    OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
 use super::super::super::abi::WasmEncoderBindgen;
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
@@ -16,6 +17,7 @@ use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
 use super::plan::{Cell, LiftPlan};
 use super::sidetable::flags_info::FlagsRuntimeFill;
+use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::CellSideData;
 
 /// Locals + pre-built load sequences used by the wrapper body.
@@ -393,9 +395,15 @@ fn emit_cell_op(
             emit_flags_runtime_fill(f, local_base + *flat_slot, fill, lcl);
             cell_layout.emit_flags_set(f, lcl.addr, fill.side_table_idx);
         }
+        Cell::Variant { disc_slot, .. } => {
+            let CellSideData::Variant(fill) = side_data else {
+                panic!("Variant cell paired with non-Variant side data {side_data:?}");
+            };
+            emit_variant_runtime_fill(f, local_base + *disc_slot, fill);
+            cell_layout.emit_variant_case(f, lcl.addr, fill.side_table_idx);
+        }
         Cell::Char
         | Cell::ListOf
-        | Cell::Variant
         | Cell::Handle
         | Cell::Future
         | Cell::Stream
@@ -415,12 +423,9 @@ fn emit_flags_runtime_fill(
     fill: &FlagsRuntimeFill,
     lcl: &WrapperLocals,
 ) {
-    /// Log2 alignment of an i32 store (4-byte). `MemArg::align` takes
-    /// log2 form; this is wasm-encoder convention, not Resolve-derived.
-    const I32_LOG2_ALIGN: u32 = 2;
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
-        align: I32_LOG2_ALIGN,
+        align: I32_STORE_LOG2_ALIGN,
         memory_index: 0,
     };
 
@@ -462,6 +467,88 @@ fn emit_flags_runtime_fill(
     f.instructions().i32_const(len_addr);
     f.instructions().local_get(lcl.flags_count);
     f.instructions().i32_store(store_i32(0));
+}
+
+/// N-way disc dispatch for one `Cell::Variant` cell. For each case
+/// `i ∈ 0..N` the wrapper writes:
+///   - `case_names[i]` `(ptr, len)` into `case_name_addr`
+///   - option<u32> at `payload_disc_addr` / `payload_value_addr`:
+///     `some(child_idx)` for payload-bearing cases, `none` for unit
+///
+/// Encoded as nested if/else (compares disc to each case_idx). For
+/// typical variants (≤ 8 cases) the nested depth is manageable;
+/// `br_table` is a future optimization. Same single-threaded
+/// constraint as flags's bit-walk — the static segment is unsafe
+/// under concurrent calls.
+fn emit_variant_runtime_fill(f: &mut Function, disc_local: u32, fill: &VariantRuntimeFill) {
+    let store_i32 = |off: u32| MemArg {
+        offset: off as u64,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    };
+    let store_i8 = |off: u32| MemArg {
+        offset: off as u64,
+        align: I8_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    };
+
+    let case_name_addr = fill
+        .case_name_addr
+        .expect("case_name_addr unset — layout must run back_fill_variant_entry_addrs");
+    let payload_disc_addr = fill
+        .payload_disc_addr
+        .expect("payload_disc_addr unset — layout must run back_fill_variant_entry_addrs");
+    let payload_value_addr = fill
+        .payload_value_addr
+        .expect("payload_value_addr unset — layout must run back_fill_variant_entry_addrs");
+
+    debug_assert_eq!(fill.case_names.len(), fill.per_case_payload.len());
+
+    // Nested if/else: for each case `i`, `if disc == i { write case
+    // i's data }` else recurse to the next case. The last arm has
+    // no else (unreachable canonical-ABI disc out of range — wasm
+    // validators don't require unreachable for completeness here
+    // since the ABI guarantees disc < N).
+    for (i, name) in fill.case_names.iter().enumerate() {
+        let is_last = i + 1 == fill.case_names.len();
+        if !is_last {
+            f.instructions().local_get(disc_local);
+            f.instructions().i32_const(i as i32);
+            f.instructions().i32_eq();
+            f.instructions().if_(BlockType::Empty);
+        }
+        // case-name = case_names[i]
+        f.instructions().i32_const(case_name_addr);
+        f.instructions().i32_const(name.off as i32);
+        f.instructions().i32_store(store_i32(SLICE_PTR_OFFSET));
+        f.instructions().i32_const(case_name_addr);
+        f.instructions().i32_const(name.len as i32);
+        f.instructions().i32_store(store_i32(SLICE_LEN_OFFSET));
+        // payload = some(child_idx) or none
+        match fill.per_case_payload[i] {
+            Some(child_idx) => {
+                f.instructions().i32_const(payload_disc_addr);
+                f.instructions().i32_const(OPTION_SOME as i32);
+                f.instructions().i32_store8(store_i8(0));
+                f.instructions().i32_const(payload_value_addr);
+                f.instructions().i32_const(child_idx as i32);
+                f.instructions().i32_store(store_i32(0));
+            }
+            None => {
+                f.instructions().i32_const(payload_disc_addr);
+                f.instructions().i32_const(OPTION_NONE as i32);
+                f.instructions().i32_store8(store_i8(0));
+                // value slot left untouched (irrelevant when disc=0)
+            }
+        }
+        if !is_last {
+            f.instructions().else_();
+        }
+    }
+    // Close all the nested `if`s — N-1 ends.
+    for _ in 0..fill.case_names.len().saturating_sub(1) {
+        f.instructions().end();
+    }
 }
 
 /// Shared lift body for direct-return result values. `slot0` /
@@ -523,7 +610,7 @@ fn emit_lift_kind(
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }
-        | Cell::Variant
+        | Cell::Variant { .. }
         | Cell::Handle
         | Cell::Future
         | Cell::Stream
@@ -575,14 +662,14 @@ pub(crate) fn emit_lift_result(
             f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
                 offset: SLICE_PTR_OFFSET as u64,
-                align: 2,
+                align: I32_STORE_LOG2_ALIGN,
                 memory_index: 0,
             });
             f.instructions().local_set(*ptr_local);
             f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
                 offset: SLICE_LEN_OFFSET as u64,
-                align: 2,
+                align: I32_STORE_LOG2_ALIGN,
                 memory_index: 0,
             });
             f.instructions().local_set(*len_local);
