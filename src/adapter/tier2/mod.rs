@@ -4,8 +4,7 @@
 //! the lifted values to the middleware's tier-2 hooks.
 //!
 //! Wired: primitives, `string`, `list<u8>`, `enum`, `record`,
-//! `tuple<...>` (params; compound-result side per `is_compound_result`
-//! whitelist) — both sides, sync + async. Remaining `Cell` variants
+//! `tuple<...>` (both sides, sync + async). Remaining `Cell` variants
 //! `todo!()` in [`lift::plan::LiftPlanBuilder`] / [`cells::CellLayout`].
 //! Roadmap: `docs/tiers/lift-codegen.md`.
 //!
@@ -583,6 +582,103 @@ mod tests {
             tier2_wit,
         )
         .expect("tier-2 adapter generation should succeed for tuple param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// Single-flat-slot compound result (`tuple<u32>`) — comes back
+    /// flat, not via retptr, so `is_compound_result` falls through to
+    /// no-lift. Build must succeed (after-hook sees `result:
+    /// option::none`); the regression guard is the lack of a panic
+    /// from `Compound → retptr scratch reserved`.
+    #[test]
+    fn dispatch_module_with_single_slot_tuple_result_falls_through() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "one-val") (param i32) (result i32)
+                        local.get 0
+                    )
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "one-val" (core func $one))
+                (type $one-ty (func (param "x" u32) (result (tuple u32))))
+                (func $one-lifted (type $one-ty) (canon lift (core func $one)))
+                (instance $api-inst (export "one-val" (func $one-lifted)))
+                (export "my:tup1/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:tup1/api@1.0.0" (instance $api "my:tup1/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let bytes = build_tier2_adapter(
+            "my:tup1/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("single-slot tuple result must fall through to no-lift, not panic");
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted adapter component should validate");
+    }
+
+    /// End-to-end test for `tuple<...>` as a compound result —
+    /// drives `is_compound_result(Tuple) → Compound → lift_from_memory`.
+    /// Result flattens to 2 slots → retptr; canon lift's `memory` +
+    /// `post-return` options materialize it via the callee-allocates
+    /// pattern.
+    #[test]
+    fn dispatch_module_with_tuple_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "two-vals") (param i32) (result i32)
+                        i32.const 0x1000
+                        local.get 0
+                        i32.store
+                        i32.const 0x1000
+                        i32.const -1
+                        i32.store offset=4
+                        i32.const 0x1000
+                    )
+                    (func (export "cabi_post_two-vals") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "two-vals" (core func $two))
+                (alias core export $i "cabi_post_two-vals" (core func $two_post))
+                (alias core export $i "memory" (core memory $mem))
+                (type $two-ty (func (param "x" u32) (result (tuple u32 s32))))
+                (func $two-lifted (type $two-ty)
+                    (canon lift (core func $two) (memory $mem)
+                        (post-return (func $two_post))))
+                (instance $api-inst (export "two-vals" (func $two-lifted)))
+                (export "my:tup-ret/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:tup-ret/api@1.0.0" (instance $api "my:tup-ret/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:tup-ret/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for tuple result");
 
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)

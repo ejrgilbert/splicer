@@ -227,12 +227,13 @@ pub(crate) fn classify_result_lift(
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
 
-    // Compound kinds (currently just Record) drive a LiftPlan over
-    // retptr-loaded flat slots. The plan's cells carry plan-relative
-    // flat-slot positions; the emit phase supplies `local_base =
-    // synth_locals[0]` (see `alloc_wrapper_locals`) so the same plan
-    // serves both the side-table builders and codegen.
-    if is_compound_result(ty, resolve) {
+    // Compound kinds (record, tuple) drive a LiftPlan over
+    // retptr-loaded flat slots. Only fires when canonical-ABI actually
+    // routes the result through retptr — single-slot edge cases (e.g.
+    // `tuple<u32>`, `record { a: u32 }`) come back flat and have no
+    // memory for `lift_from_memory` to read from, so they fall through
+    // to the no-lift path (after-hook sees `result: option::none`).
+    if is_compound_result(ty, resolve) && result_at_retptr {
         let plan = LiftPlan::for_type(ty, resolve, names);
         return Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
@@ -255,16 +256,16 @@ pub(crate) fn classify_result_lift(
     Some(ResultLift { source, side_table })
 }
 
-/// Whether `ty` resolves (through type aliases) to a record — the
-/// only compound kind whose result-side codegen is wired today.
-/// Other compound kinds (variants / tuples / etc.) bail out at
+/// Whether `ty` resolves (through type aliases) to a compound kind
+/// whose result-side codegen is wired today: `record` or `tuple<...>`.
+/// Other compound kinds (variant / option / etc.) bail out at
 /// [`classify_result_lift`] for now.
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
     };
     match &resolve.types[*id].kind {
-        wit_parser::TypeDefKind::Record(_) => true,
+        wit_parser::TypeDefKind::Record(_) | wit_parser::TypeDefKind::Tuple(_) => true,
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
         _ => false,
     }
