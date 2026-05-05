@@ -93,6 +93,12 @@ mod tests {
     }
 
     #[test]
+    fn otel_logs_is_registered() {
+        let bytes = lookup("otel-logs").expect("otel-logs must be registered");
+        assert!(bytes.starts_with(b"\0asm"), "embedded bytes must be wasm");
+    }
+
+    #[test]
     fn unknown_returns_none() {
         assert!(lookup("does-not-exist").is_none());
     }

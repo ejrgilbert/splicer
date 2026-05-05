@@ -1,0 +1,5 @@
+# Populated by `wkg wit fetch` (or `wkg wit build`); rebuilt from
+# overrides in wkg.toml on every build.
+wit/deps/
+wkg.lock
+target/
