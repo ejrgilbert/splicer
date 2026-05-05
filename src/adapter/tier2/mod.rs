@@ -727,6 +727,62 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `option<T>` as a compound result. Drives
+    /// `is_compound_result(Option) → Compound → lift_from_memory` and
+    /// the if/else branching emit at the parent Option cell. Result
+    /// flattens to 2 slots → retptr; canon lift's `memory` +
+    /// `post-return` materialize it via the callee-allocates pattern.
+    #[test]
+    fn dispatch_module_with_option_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "maybe-val") (param i32) (result i32)
+                        i32.const 0x1000
+                        i32.const 1
+                        i32.store
+                        i32.const 0x1000
+                        local.get 0
+                        i32.store offset=4
+                        i32.const 0x1000
+                    )
+                    (func (export "cabi_post_maybe-val") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "maybe-val" (core func $maybe))
+                (alias core export $i "cabi_post_maybe-val" (core func $maybe_post))
+                (alias core export $i "memory" (core memory $mem))
+                (type $maybe-ty (func (param "x" u32) (result (option u32))))
+                (func $maybe-lifted (type $maybe-ty)
+                    (canon lift (core func $maybe) (memory $mem)
+                        (post-return (func $maybe_post))))
+                (instance $api-inst (export "maybe-val" (func $maybe-lifted)))
+                (export "my:opt-ret/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:opt-ret/api@1.0.0" (instance $api "my:opt-ret/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:opt-ret/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for option result");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// Async function whose params flatten to >`MAX_FLAT_ASYNC_PARAMS` (4)
     /// canon-lowers with `indirect_params=true`, but tier-2's
     /// `emit_handler_call` pushes flat params. Until `lower_to_memory`

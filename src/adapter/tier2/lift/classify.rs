@@ -227,7 +227,7 @@ pub(crate) fn classify_result_lift(
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
 
-    // Compound kinds (record, tuple) drive a LiftPlan over
+    // Compound kinds (record, tuple, option) drive a LiftPlan over
     // retptr-loaded flat slots. Only fires when canonical-ABI actually
     // routes the result through retptr — single-slot edge cases (e.g.
     // `tuple<u32>`, `record { a: u32 }`) come back flat and have no
@@ -243,8 +243,8 @@ pub(crate) fn classify_result_lift(
 
     // Single-cell direct/retptr-pair path: build a one-cell plan and
     // pull its single Cell out as the variant tag for emit dispatch.
-    // Returns None for un-wired result types (variants / option /
-    // list / etc.) — wrapper still calls after-hook with
+    // Returns None for un-wired result types (variant / list /
+    // result / etc.) — wrapper still calls after-hook with
     // option::none for `result`.
     let cell = single_cell_for_result(ty, resolve, names)?;
     let side_table = side_table_info_for_cell(&cell);
@@ -257,15 +257,17 @@ pub(crate) fn classify_result_lift(
 }
 
 /// Whether `ty` resolves (through type aliases) to a compound kind
-/// whose result-side codegen is wired today: `record` or `tuple<...>`.
-/// Other compound kinds (variant / option / etc.) bail out at
-/// [`classify_result_lift`] for now.
+/// whose result-side codegen is wired today: `record`, `tuple<...>`,
+/// or `option<T>`. Other compound kinds (variant / result / etc.)
+/// bail out at [`classify_result_lift`] for now.
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
     };
     match &resolve.types[*id].kind {
-        wit_parser::TypeDefKind::Record(_) | wit_parser::TypeDefKind::Tuple(_) => true,
+        wit_parser::TypeDefKind::Record(_)
+        | wit_parser::TypeDefKind::Tuple(_)
+        | wit_parser::TypeDefKind::Option(_) => true,
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
         _ => false,
     }
