@@ -429,15 +429,14 @@ pub(crate) fn find_common_typeid(resolve: &Resolve, type_name: &str) -> Result<T
     bail!("resolve has no `splicer:common/types` interface — was the common WIT loaded?")
 }
 
-/// [`RecordLayout`] for `splicer:common/types.call-id` — used by both
+/// [`CallIdLayout`] for `splicer:common/types.call-id` — used by both
 /// tiers to lay out the canonical-ABI lowering of the hook params'
 /// call-id portion.
-pub(crate) fn call_id_record_layout(
-    resolve: &Resolve,
-    sizes: &SizeAlign,
-) -> Result<RecordLayout> {
+pub(crate) fn call_id_layout(resolve: &Resolve, sizes: &SizeAlign) -> Result<CallIdLayout> {
     let id = find_common_typeid(resolve, "call-id")?;
-    Ok(RecordLayout::for_record_typedef(sizes, resolve, id))
+    Ok(CallIdLayout(RecordLayout::for_record_typedef(
+        sizes, resolve, id,
+    )))
 }
 
 /// Byte offset of an `option<T>`'s payload area (i.e. the byte right
@@ -455,11 +454,61 @@ pub(crate) fn option_payload_offset(sizes: &SizeAlign, payload_ty: &Type) -> u32
 pub(crate) const SLICE_PTR_OFFSET: u32 = 0;
 pub(crate) const SLICE_LEN_OFFSET: u32 = 4;
 
-// `splicer:common/types.call-id` field names — keys for
-// `RecordLayout::offset_of`. Must match `wit/common/world.wit`.
-pub(crate) const CALLID_IFACE: &str = "interface-name";
-pub(crate) const CALLID_FN: &str = "function-name";
-pub(crate) const CALLID_ID: &str = "id";
+// `splicer:common/types.call-id` field names — encapsulated by
+// [`CallIdLayout`]'s typed accessors so call sites can't fat-finger
+// the keys. Must match `wit/common/world.wit`.
+const CALLID_IFACE: &str = "interface-name";
+const CALLID_FN: &str = "function-name";
+const CALLID_ID: &str = "id";
+
+/// Typed accessor over a `splicer:common/types.call-id` record's
+/// canonical-ABI layout. Wraps a [`RecordLayout`]; exposes one method
+/// per WIT field so a typo at the call site is a compile error instead
+/// of a runtime `RecordLayout::offset_of` panic.
+pub(crate) struct CallIdLayout(RecordLayout);
+
+impl CallIdLayout {
+    pub(crate) fn size(&self) -> u32 {
+        self.0.size
+    }
+    pub(crate) fn align(&self) -> u32 {
+        self.0.align
+    }
+    pub(crate) fn iface_off(&self) -> u32 {
+        self.0.offset_of(CALLID_IFACE)
+    }
+    pub(crate) fn fn_off(&self) -> u32 {
+        self.0.offset_of(CALLID_FN)
+    }
+    pub(crate) fn id_off(&self) -> u32 {
+        self.0.offset_of(CALLID_ID)
+    }
+
+    /// Build-time twin of [`emit_populate_call_id`] for the name
+    /// fields: store `iface_name` and `fn_name` into a call-id
+    /// sub-record anchored at `base` in `blob`. The id field is left
+    /// untouched — it gets written at runtime by the wasm sequence
+    /// emitted by [`emit_populate_call_id`].
+    pub(crate) fn store_names_in_blob(
+        &self,
+        blob: &mut [u8],
+        base: usize,
+        iface_name: BlobSlice,
+        fn_name: BlobSlice,
+    ) {
+        store_slice_in_blob(blob, base + self.iface_off() as usize, iface_name);
+        store_slice_in_blob(blob, base + self.fn_off() as usize, fn_name);
+    }
+}
+
+/// Build-time twin of [`emit_store_slice`]: store a `(ptr, len)`
+/// canonical-ABI slice pair into a byte buffer at `off`.
+pub(crate) fn store_slice_in_blob(blob: &mut [u8], off: usize, slice: BlobSlice) {
+    blob[off + SLICE_PTR_OFFSET as usize..][..4]
+        .copy_from_slice(&(slice.off as i32).to_le_bytes());
+    blob[off + SLICE_LEN_OFFSET as usize..][..4]
+        .copy_from_slice(&(slice.len as i32).to_le_bytes());
+}
 
 /// Typed `(off, len)` pair into a tier's static blob. Avoids
 /// accidental ptr/len swaps.
@@ -516,14 +565,14 @@ pub(crate) fn emit_populate_call_id(
     f: &mut Function,
     base_ptr: i32,
     call_off: u32,
-    callid_layout: &RecordLayout,
+    callid_layout: &CallIdLayout,
     iface_name: BlobSlice,
     fn_name: BlobSlice,
     id_local: u32,
 ) {
-    let iface_off = call_off + callid_layout.offset_of(CALLID_IFACE);
-    let fn_off = call_off + callid_layout.offset_of(CALLID_FN);
-    let id_off = call_off + callid_layout.offset_of(CALLID_ID);
+    let iface_off = call_off + callid_layout.iface_off();
+    let fn_off = call_off + callid_layout.fn_off();
+    let id_off = call_off + callid_layout.id_off();
     emit_store_slice(f, base_ptr, iface_off, iface_name);
     emit_store_slice(f, base_ptr, fn_off, fn_name);
     emit_store_i64_local(f, base_ptr, id_off, id_local);

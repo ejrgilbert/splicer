@@ -12,7 +12,7 @@
 use anyhow::{bail, Result};
 use wit_parser::Function as WitFunction;
 
-use super::super::abi::emit::{BlobSlice, CALLID_FN, CALLID_IFACE};
+use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
 use super::blob::{RecordWriter, RelocPlan, SymbolBases};
 use super::lift::{
@@ -197,11 +197,10 @@ fn build_after_params_blob(
     let mut blob: Vec<u8> = Vec::new();
     for (fn_idx, fd) in per_func.iter().enumerate() {
         let entry = RecordWriter::extend_zero(&mut blob, after_layout);
-        let call = entry.nested(ON_RET_CALL, &schema.callid_layout);
-        call.write_slice(&mut blob, CALLID_IFACE, iface_name);
-        call.write_slice(
+        schema.callid_layout.store_names_in_blob(
             &mut blob,
-            CALLID_FN,
+            entry.field_offset(ON_RET_CALL),
+            iface_name,
             BlobSlice {
                 off: fd.fn_name_offset as u32,
                 len: fd.fn_name_len as u32,

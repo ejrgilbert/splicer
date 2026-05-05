@@ -49,7 +49,7 @@ use wit_parser::Resolve;
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
     emit_alloc_call_id, emit_handler_call, emit_populate_call_id, emit_store_i64_local,
-    emit_store_slice, emit_wrapper_return, BlobSlice, RecordLayout, CALLID_ID,
+    emit_store_slice, emit_wrapper_return, BlobSlice, RecordLayout,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::FunctionIndices;
@@ -282,8 +282,8 @@ pub(super) fn emit_wrapper_function(
         }
         // iface/fn are prewritten by `build_after_params_blob`;
         // only `call.id` changes per call, so patch it at runtime.
-        let id_field_off = after_static.layout.offset_of(ON_RET_CALL)
-            + schema.callid_layout.offset_of(CALLID_ID);
+        let id_field_off =
+            after_static.layout.offset_of(ON_RET_CALL) + schema.callid_layout.id_off();
         emit_store_i64_local(&mut f, after_pf.params_offset, id_field_off, id_local);
         f.instructions().i32_const(after_pf.params_offset);
         canon_async::emit_call_and_wait(&mut f, after_static.idx, lcl.st, lcl.ws, async_funcs);

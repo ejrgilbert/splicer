@@ -30,11 +30,10 @@ use wit_parser::{
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
-    call_id_record_layout, direct_return_type, emit_alloc_call_id, emit_cabi_realloc,
-    emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
-    emit_populate_call_id, emit_wrapper_return, empty_function, find_imported_hook,
-    synthesize_adapter_world_wit, val_types, BlobSlice, GlobalIndices, HookImport, RecordLayout,
-    WrapperExport,
+    call_id_layout, direct_return_type, emit_alloc_call_id, emit_cabi_realloc, emit_data_section,
+    emit_export_section, emit_handler_call, emit_memory_and_globals, emit_populate_call_id,
+    emit_wrapper_return, empty_function, find_imported_hook, synthesize_adapter_world_wit,
+    val_types, BlobSlice, CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, FunctionIndices};
@@ -286,7 +285,7 @@ const ADAPTER_WORLD_NAME: &str = "adapter";
 /// callsite in this dispatch module.
 struct CallIdBuf {
     offset: i32,
-    layout: RecordLayout,
+    layout: CallIdLayout,
 }
 
 /// Wrapper-body view: counter global to bump + the static buffer.
@@ -363,11 +362,11 @@ fn build_dispatch_module(
     let any_hook = has_before || has_after || has_blocking;
     let mut sizes = SizeAlign::default();
     sizes.fill(resolve);
-    // The call-id `RecordLayout` is needed iff any hook is wired (to
-    // populate the indirect-params buffer); also drives the buffer's
-    // size + alignment in [`compute_func_dispatches`].
-    let call_id_layout = any_hook
-        .then(|| call_id_record_layout(resolve, &sizes))
+    // The [`CallIdLayout`] is needed iff any hook is wired (to populate
+    // the indirect-params buffer); also drives the buffer's size +
+    // alignment in [`compute_func_dispatches`].
+    let callid_layout = any_hook
+        .then(|| call_id_layout(resolve, &sizes))
         .transpose()?;
     let plan = compute_func_dispatches(
         resolve,
@@ -377,7 +376,7 @@ fn build_dispatch_module(
         &funcs,
         needs_async_runtime,
         has_blocking,
-        call_id_layout,
+        callid_layout,
     );
     let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after, has_blocking);
     let mut idx = DispatchIndices::new();
@@ -463,7 +462,7 @@ fn compute_func_dispatches(
     funcs: &[&WitFunction],
     needs_async_runtime: bool,
     has_blocking: bool,
-    call_id_layout: Option<RecordLayout>,
+    callid_layout: Option<CallIdLayout>,
 ) -> DispatchPlan {
     let iface_name_bytes = target_interface_name.len() as u32;
     let total_fn_name_bytes: u32 = funcs.iter().map(|f| f.name.len() as u32).sum();
@@ -559,8 +558,8 @@ fn compute_func_dispatches(
     // the legacy path uses.
     let event_ptr = needs_async_runtime.then(|| layout.alloc_event_slot() as i32);
     let block_result_ptr = has_blocking.then(|| layout.alloc_block_result() as i32);
-    let call_id_buf = call_id_layout.map(|callid_layout| {
-        let offset = layout.alloc_aligned(callid_layout.size, callid_layout.align) as i32;
+    let call_id_buf = callid_layout.map(|callid_layout| {
+        let offset = layout.alloc_aligned(callid_layout.size(), callid_layout.align()) as i32;
         CallIdBuf {
             offset,
             layout: callid_layout,

@@ -13,7 +13,7 @@ use anyhow::{anyhow, Result};
 use wit_parser::{Resolve, SizeAlign, Type, WorldId};
 
 use super::super::abi::emit::{
-    call_id_record_layout, find_common_typeid, find_imported_hook, option_payload_offset,
+    call_id_layout, find_common_typeid, find_imported_hook, option_payload_offset, CallIdLayout,
     RecordLayout,
 };
 use super::cells::CellLayout;
@@ -61,7 +61,7 @@ pub(super) struct SchemaLayouts {
     pub(super) field_layout: RecordLayout,
     pub(super) tree_layout: RecordLayout,
     pub(super) cell_layout: CellLayout,
-    pub(super) callid_layout: RecordLayout,
+    pub(super) callid_layout: CallIdLayout,
     pub(super) enum_info_layout: RecordLayout,
     /// Layout of `record record-info { type-name, fields }` (the
     /// per-record-cell side-table entry).
@@ -107,7 +107,7 @@ pub(super) fn compute_schema(
     let field_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_ty_id);
     let tree_layout = RecordLayout::for_record_typedef(&size_align, resolve, field_tree_ty_id);
     let cell_layout = CellLayout::from_resolve(&size_align, resolve, cell_ty_id);
-    let callid_layout = call_id_record_layout(resolve, &size_align)?;
+    let callid_layout = call_id_layout(resolve, &size_align)?;
     let enum_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, enum_info_ty);
     let record_info_layout = RecordLayout::for_record_typedef(&size_align, resolve, record_info_ty);
     // The anonymous `tuple<string, u32>` element of `record-info.fields`
