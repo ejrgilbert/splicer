@@ -2,7 +2,7 @@
 //! cell per (param | result) into the cells slab, plus the result-
 //! lift emission for direct / retptr-pair / compound result kinds.
 
-use wasm_encoder::{Function, Instruction, MemArg, ValType};
+use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Resolve, SizeAlign};
 
@@ -355,9 +355,20 @@ fn emit_cell_op(
                 .expect("tuple-indices slice missing — layout phase didn't backfill TupleOf cell");
             cell_layout.emit_tuple_of(f, addr, slice.off, slice.len);
         }
+        Cell::Option {
+            disc_slot,
+            child_idx,
+        } => {
+            // disc=1 (some) → option-some(child_idx); disc=0 (none) → option-none.
+            f.instructions().local_get(local_base + *disc_slot);
+            f.instructions().if_(BlockType::Empty);
+            cell_layout.emit_option_some(f, addr, *child_idx);
+            f.instructions().else_();
+            cell_layout.emit_option_none(f, addr);
+            f.instructions().end();
+        }
         Cell::Char
         | Cell::ListOf
-        | Cell::Option
         | Cell::Result
         | Cell::Flags
         | Cell::Variant
@@ -417,7 +428,7 @@ fn emit_lift_kind(
         | Cell::TupleOf { .. }
         | Cell::Char
         | Cell::ListOf
-        | Cell::Option
+        | Cell::Option { .. }
         | Cell::Result
         | Cell::Flags
         | Cell::Variant

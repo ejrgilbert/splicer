@@ -81,13 +81,6 @@ pub(crate) enum Cell {
         /// `child-cell-idx` indexes into the same `LiftPlan::cells`.
         fields: Vec<(BlobSlice, u32)>,
     },
-
-    // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
-    //    + `emit_cell_op` until codegen lands) ─────────────────────
-    /// `char` → `cell::text` (utf-8 encode the i32 code point).
-    Char,
-    /// `list<T>` (non-u8 element) → `cell::list-of`.
-    ListOf,
     /// `tuple<...>` → `cell::tuple-of(list<u32>)`. `children` are
     /// plan-cell indices into the same [`LiftPlan::cells`]. The layout
     /// phase packs each `children` array into the shared tuple-indices
@@ -96,7 +89,17 @@ pub(crate) enum Cell {
     /// `(ptr, len)` constants.
     TupleOf { children: Vec<u32> },
     /// `option<T>` → `cell::option-some(u32)` / `cell::option-none`.
-    Option,
+    /// Flat layout: `[i32 disc, ...flat(T)]`. The child cell is
+    /// always emitted; canonical-ABI lower zeroes T's slots on `none`
+    /// and readers gate on the parent's disc.
+    Option { disc_slot: u32, child_idx: u32 },
+
+    // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
+    //    + `emit_cell_op` until codegen lands) ─────────────────────
+    /// `char` → `cell::text` (utf-8 encode the i32 code point).
+    Char,
+    /// `list<T>` (non-u8 element) → `cell::list-of`.
+    ListOf,
     /// `result<T, E>` → `cell::result-ok(option<u32>)` / `cell::result-err(option<u32>)`.
     Result,
     /// `flags { ... }` → `cell::flags-set(u32)`.
@@ -269,9 +272,7 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::Flags(_) => {
                     todo!("plan-builder for un-wired Cell::Flags")
                 }
-                wit_parser::TypeDefKind::Option(_) => {
-                    todo!("plan-builder for un-wired Cell::Option")
-                }
+                wit_parser::TypeDefKind::Option(inner) => self.push_option(inner, resolve, names),
                 wit_parser::TypeDefKind::Result(_) => {
                     todo!("plan-builder for un-wired Cell::Result")
                 }
@@ -361,6 +362,17 @@ impl LiftPlanBuilder {
             children.push(self.push(elem_ty, resolve, names));
         }
         self.push_cell(Cell::TupleOf { children })
+    }
+
+    /// Allocate the disc slot first, then recurse into the inner
+    /// type — matches the canonical-ABI `[disc, ...flat(T)]` order.
+    fn push_option(&mut self, inner: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
+        let disc_slot = self.bump_flat_slot();
+        let child_idx = self.push(inner, resolve, names);
+        self.push_cell(Cell::Option {
+            disc_slot,
+            child_idx,
+        })
     }
 
     pub(super) fn into_plan(self, root: u32) -> LiftPlan {

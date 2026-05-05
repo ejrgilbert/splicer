@@ -37,6 +37,11 @@ const TEST_WIT: &str = r#"
         f-tuple: func(t: tuple<u8, s32>);
         f-tuple-of-tuple: func(t: tuple<u8, tuple<s32, s32>>);
         f-record-with-tuple: func(rt: point-and-tuple);
+        f-option-u32: func(o: option<u32>);
+        f-option-string: func(o: option<string>);
+        f-option-option: func(o: option<option<u32>>);
+        record point-and-option { p: point, o: option<u32> }
+        f-record-with-option: func(rwo: point-and-option);
     }
 "#;
 
@@ -199,26 +204,30 @@ fn synth_cell_layout() -> CellLayout {
 }
 
 /// Wasm `ValType` for each flat slot consumed by `plan.cells`, in
-/// flat-slot order. RecordOf cells contribute no slots.
+/// flat-slot order. RecordOf / TupleOf cells contribute no slots.
+/// Indexed by `flat_slot` rather than cell order — `Cell::Option`
+/// allocates the disc before recursing into the child, so flat-slot
+/// order can diverge from cell order.
 fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
-    let mut out = Vec::new();
+    let mut by_slot: Vec<Option<ValType>> = vec![None; plan.flat_slot_count as usize];
+    let mut put = |slot: u32, ty: ValType| by_slot[slot as usize] = Some(ty);
     for op in &plan.cells {
         match op {
-            Cell::Bool { .. }
-            | Cell::IntegerSignExt { .. }
-            | Cell::IntegerZeroExt { .. }
-            | Cell::EnumCase { .. } => out.push(ValType::I32),
-            Cell::Integer64 { .. } => out.push(ValType::I64),
-            Cell::FloatingF32 { .. } => out.push(ValType::F32),
-            Cell::FloatingF64 { .. } => out.push(ValType::F64),
-            Cell::Text { .. } | Cell::Bytes { .. } => {
-                out.push(ValType::I32);
-                out.push(ValType::I32);
+            Cell::Bool { flat_slot }
+            | Cell::IntegerSignExt { flat_slot }
+            | Cell::IntegerZeroExt { flat_slot }
+            | Cell::EnumCase { flat_slot, .. } => put(*flat_slot, ValType::I32),
+            Cell::Integer64 { flat_slot } => put(*flat_slot, ValType::I64),
+            Cell::FloatingF32 { flat_slot } => put(*flat_slot, ValType::F32),
+            Cell::FloatingF64 { flat_slot } => put(*flat_slot, ValType::F64),
+            Cell::Text { ptr_slot, len_slot } | Cell::Bytes { ptr_slot, len_slot } => {
+                put(*ptr_slot, ValType::I32);
+                put(*len_slot, ValType::I32);
             }
+            Cell::Option { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
             Cell::Char
             | Cell::ListOf
-            | Cell::Option
             | Cell::Result
             | Cell::Flags
             | Cell::Variant
@@ -230,7 +239,10 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             }
         }
     }
-    out
+    by_slot
+        .into_iter()
+        .map(|t| t.expect("every flat slot must be claimed by some cell"))
+        .collect()
 }
 
 /// Side-table indices a single-plan run of `build_record_info_blob`
@@ -537,6 +549,117 @@ fn record_with_tuple_field_recurses_into_tuple() {
 }
 
 #[test]
+fn option_allocates_disc_before_inner() {
+    // option<u32>: disc i32 → slot 0, inner u32 → slot 1.
+    // Cell order is children-before-parent, so the IntegerZeroExt for
+    // the inner u32 lands at cell 0 (with flat_slot=1) and the Option
+    // parent at cell 1 (with disc_slot=0).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(&func_named(&r, "f-option-u32").params[0].ty, &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::Option {
+                disc_slot: 0,
+                child_idx: 0,
+            },
+        ],
+    );
+    assert_eq!(plan.root(), 1);
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn option_of_string_keeps_canonical_disc_first() {
+    // option<string>: [disc i32, ptr i32, len i32] in canonical-ABI
+    // order. Plan-builder bumps disc first (slot 0), then string's
+    // (ptr=1, len=2). Cell ordering still places the leaf first.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-option-string").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::Text {
+                ptr_slot: 1,
+                len_slot: 2,
+            },
+            Cell::Option {
+                disc_slot: 0,
+                child_idx: 0,
+            },
+        ],
+    );
+    assert_eq!(plan.flat_slot_count, 3);
+}
+
+#[test]
+fn nested_option_walks_disc_per_layer() {
+    // option<option<u32>>: outer disc → slot 0, inner disc → slot 1,
+    // u32 → slot 2. Cell order: leaf u32 (cell 0), inner Option (cell
+    // 1, disc=1, child=0), outer Option (cell 2, disc=0, child=1).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-option-option").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 2 },
+            Cell::Option {
+                disc_slot: 1,
+                child_idx: 0,
+            },
+            Cell::Option {
+                disc_slot: 0,
+                child_idx: 1,
+            },
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 3);
+}
+
+#[test]
+fn record_with_option_field_recurses_into_option() {
+    // point-and-option { p: point, o: option<u32> }
+    //   p.x  → cell 0 (slot 0, u32)
+    //   p.y  → cell 1 (slot 1, s32)
+    //   p    → cell 2 (RecordOf)
+    //   o.inner → cell 3 (slot 3, u32)  -- disc bumped first → slot 2
+    //   o    → cell 4 (Option { disc:2, child:3 })
+    //   pao  → cell 5 (RecordOf p=2, o=4)
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("point-and-option", &r, &mut names);
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerSignExt { flat_slot: 1 },
+            record_of(&mut names, "point", &[("x", 0), ("y", 1)]),
+            Cell::IntegerZeroExt { flat_slot: 3 },
+            Cell::Option {
+                disc_slot: 2,
+                child_idx: 3,
+            },
+            record_of(&mut names, "point-and-option", &[("p", 2), ("o", 4)]),
+        ],
+    );
+    assert_eq!(plan.root(), 5);
+    assert_eq!(plan.flat_slot_count, 4);
+}
+
+#[test]
 fn classify_func_params_yields_plan_relative_slots() {
     // f-mixed(a: bool, s: string, b: list<u8>, x: s64): each
     // param's plan is plan-relative, not threaded with cumulative
@@ -704,6 +827,18 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &mut names,
         ),
         plan_for_named("point-and-tuple", &r, &mut names),
+        plan_for(&func_named(&r, "f-option-u32").params[0].ty, &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-option-string").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-option-option").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for_named("point-and-option", &r, &mut names),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan);

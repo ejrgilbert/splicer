@@ -328,14 +328,15 @@ impl CellLayout {
         );
     }
 
-    // ─── Un-wired stubs — codegen lives here when each kind lands ──
+    // ─── Compound / structural cell emitters ───────────────────────
     //
-    // Each stub names the cell variant + payload shape it'll produce
-    // when implemented. They're unreachable until `tier2/lift::Cell`
-    // for the matching compound type wires its `emit_cell_op` arm to
-    // call them. Keeping the stubs in cells.rs documents the lowest-level contract:
-    // "to lift a record, you need `cell_layout.emit_record_of(addr,
-    // side_table_idx)` to write disc 11 + i32 at payload+0".
+    // One helper per non-primitive `cell` variant, in WIT-declaration
+    // order. Helpers for kinds whose `emit_cell_op` arm is wired live
+    // alongside `todo!()` stubs for the rest — when a new kind lands,
+    // its stub turns into a real implementation here. Keeping the
+    // contract on `CellLayout` (rather than in the lift codegen)
+    // documents the lowest-level shape: "to lift a record, call
+    // `cell_layout.emit_record_of(addr, side_table_idx)`".
 
     /// `cell::char` — char's utf-8 encoding. char isn't a cell variant
     /// of its own; we encode the i32 code point as utf-8 bytes (1–4 of
@@ -392,18 +393,24 @@ impl CellLayout {
         );
     }
 
-    /// `cell::option-some(u32)` — single inner cell index.
-    #[allow(dead_code)]
+    /// `cell::option-some(u32)` — inner cell index. Build-time const,
+    /// same shape as `record-of`'s side-table-index payload.
     pub(crate) fn emit_option_some(&self, f: &mut Function, addr_local: u32, inner_idx: u32) {
-        let _ = (f, addr_local, inner_idx);
-        todo!("cell::option-some — disc 7 + i32 inner cell index at payload+0");
+        self.emit_cell(
+            f,
+            addr_local,
+            self.disc_of("option-some"),
+            &[PayloadPart {
+                source: PayloadSource::ConstI32(inner_idx as i32),
+                kind: StoreKind::I32,
+                offset: 0,
+            }],
+        );
     }
 
-    /// `cell::option-none` — no payload, just the discriminant.
-    #[allow(dead_code)]
+    /// `cell::option-none` — disc only.
     pub(crate) fn emit_option_none(&self, f: &mut Function, addr_local: u32) {
-        let _ = (f, addr_local);
-        todo!("cell::option-none — disc 8, no payload");
+        self.emit_cell(f, addr_local, self.disc_of("option-none"), &[]);
     }
 
     /// `cell::result-ok(option<u32>)` — disc 9 + option<inner>.
@@ -655,6 +662,20 @@ mod tests {
         // params: (addr_local: i32). off/len are i32.const, no locals.
         let cl = synth_cell_layout();
         build_and_validate(&[ValType::I32], |f| cl.emit_tuple_of(f, 0, 0x100, 3));
+    }
+
+    #[test]
+    fn option_some_cell_emits_valid_wasm() {
+        // params: (addr_local: i32). inner_idx is an i32.const.
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_option_some(f, 0, 7));
+    }
+
+    #[test]
+    fn option_none_cell_emits_valid_wasm() {
+        // params: (addr_local: i32). disc-only, no payload writes.
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32], |f| cl.emit_option_none(f, 0));
     }
 
     /// Structural fuzz over the primitive cell-emit helpers — for each
