@@ -16,7 +16,7 @@ use super::super::schema::{
     RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS,
 };
 use super::super::{FuncClassified, FuncShape};
-use super::plan::{Cell, LiftPlan, LiftPlanBuilder, NamedListInfo};
+use super::plan::{Cell, LiftPlan, NamedListInfo};
 use super::*;
 
 // ─── Fixture WIT + Resolve helpers ────────────────────────────
@@ -75,12 +75,10 @@ fn func_named<'a>(resolve: &'a Resolve, name: &str) -> &'a WitFunction {
 
 // ─── Plan-builder + assertion fixture constructors ────────────
 
-/// Run the plan builder over `ty`. Plans carry plan-relative flat
-/// slots; the emit phase supplies `local_base` separately.
+/// Thin alias for [`LiftPlan::for_type`] — keeps the in-test call
+/// sites short.
 fn plan_for(ty: &Type, resolve: &Resolve) -> LiftPlan {
-    let mut b = LiftPlanBuilder::new();
-    b.push(ty, resolve);
-    b.into_plan()
+    LiftPlan::for_type(ty, resolve)
 }
 
 fn plan_for_named(name: &str, resolve: &Resolve) -> LiftPlan {
@@ -433,9 +431,11 @@ fn classify_func_params_yields_plan_relative_slots() {
 }
 
 #[test]
-fn classify_func_params_threads_slot_cursor_across_params() {
-    // f-mixed(a: bool, s: string, b: list<u8>, x: s64).
-    // Cumulative slot starts: 0, 1, 3, 5; total 6.
+fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
+    // Classify outputs plan-relative slots; the emit phase chains
+    // per-param `flat_slot_count` into the cumulative `local_base`
+    // it passes to `emit_lift_plan`. f-mixed(a: bool, s: string,
+    // b: list<u8>, x: s64) → cumulative starts 0, 1, 3, 5; total 6.
     let r = test_resolve();
     let mut name_blob = Vec::new();
     let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut name_blob);

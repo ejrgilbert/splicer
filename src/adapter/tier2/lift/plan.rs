@@ -122,6 +122,17 @@ pub(crate) struct LiftPlan {
 }
 
 impl LiftPlan {
+    /// Build a plan from a single WIT type. The unified entry point
+    /// for both the per-param and the compound-result classifiers —
+    /// each builds one plan from one `Type`, the only difference is
+    /// what the caller wraps it in (`ParamLift` vs `CompoundResult`)
+    /// and what `local_base` the emit phase supplies.
+    pub(super) fn for_type(ty: &Type, resolve: &Resolve) -> Self {
+        let mut builder = LiftPlanBuilder::new();
+        builder.push(ty, resolve);
+        builder.into_plan()
+    }
+
     pub(crate) fn cell_count(&self) -> u32 {
         self.cells.len() as u32
     }

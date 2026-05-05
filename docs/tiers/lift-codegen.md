@@ -126,24 +126,26 @@ as the root.
 struct LiftPlan { cells: Vec<CellOp>, flat_slot_count: u32 }
 
 enum CellOp {
-    Bool { local: u32 },
-    IntegerSignExt { local: u32 },
-    IntegerZeroExt { local: u32 },
-    Integer64 { local: u32 },
-    FloatingF32 { local: u32 },
-    FloatingF64 { local: u32 },
-    Text { ptr: u32, len: u32 },
-    Bytes { ptr: u32, len: u32 },
-    EnumCase { local: u32, info: NamedListInfo },
+    Bool { flat_slot: u32 },
+    IntegerSignExt { flat_slot: u32 },
+    IntegerZeroExt { flat_slot: u32 },
+    Integer64 { flat_slot: u32 },
+    FloatingF32 { flat_slot: u32 },
+    FloatingF64 { flat_slot: u32 },
+    Text { ptr_slot: u32, len_slot: u32 },
+    Bytes { ptr_slot: u32, len_slot: u32 },
+    EnumCase { flat_slot: u32, info: NamedListInfo },
     RecordOf { type_name: String, fields: Vec<(String, u32)> },
     // … one per supported WIT type ctor; new kinds add a variant ↑
 }
 ```
 
-`local` / `ptr` / `len` are **absolute wasm-local indices** baked in at
-plan-build time. The plan-builder accepts a `local_base` (the absolute
-index of the plan's first flat slot) and increments from there as cells
-consume slots.
+`flat_slot` / `ptr_slot` / `len_slot` are **plan-relative flat-slot
+positions** in `0..flat_slot_count`. The emit phase supplies a
+`local_base: u32` per call to `emit_lift_plan` and adds it to each
+cell's slot position to recover the absolute wasm-local index. One
+classify-time plan serves both side-table builders (which read only
+structural fields) and codegen, with no rebuild between phases.
 
 ### Why a flat plan instead of a nested IR
 
@@ -159,9 +161,9 @@ desynced facts:
    The same `Vec<CellOp>` is what codegen iterates over at emit time,
    so the index a side-table entry references is *literally* the same
    slot the codegen writes to.
-3. **Flat-slot consumption.** Each cell that names a `local` pins one
-   wasm flat slot. Total slots = `plan.flat_slot_count` (computed by
-   the builder as `next_local - local_base` at `into_plan` time) — no
+3. **Flat-slot consumption.** Each cell that names a `flat_slot` pins
+   one wasm flat slot. Total slots = `plan.flat_slot_count` (the
+   builder's `next_flat_slot` counter at `into_plan` time) — no
    per-`LiftKind` `slot_count()` table to keep in sync with the plan-
    builder.
 
@@ -209,29 +211,27 @@ unwinds, every child's cells live at indices ≥ parent_idx + 1, and
 the parent's `fields` list captures those indices. Self-evident
 correctness (vs. trying to predict child indices ahead of time).
 
-### Absolute local indices baked at build time
+### Plan-relative flat slots, base supplied at emit time
 
-Cells store **absolute** wasm-local indices, not plan-local offsets.
-The plan-builder's caller provides `local_base` — the absolute index
-of the plan's first flat slot — and the builder increments from there
-as it allocates cells:
+Cells store **plan-relative** flat-slot positions in
+`0..flat_slot_count`, not absolute wasm-local indices. The emit phase
+supplies `local_base: u32` per call to `emit_lift_plan` and adds it to
+each cell's slot position to recover the absolute index:
 
-- **Params**: `local_base = slot_cursor`, the cumulative flat-slot
-  count of preceding params. Known at classify time because wasm
-  function params occupy locals `0..param_flat_count`.
-- **Compound results**: synth locals are allocated at emit time via
-  `FunctionIndices::alloc_local`. The classify-time
-  `CompoundResult::plan` is built with placeholder `local_base = 0`
-  (only its cell structure is consumed — by the side-table builders).
-  The emit phase rebuilds a fresh plan with `local_base =
-  synth_locals[0]` and stores it on `ResultEmitPlan::Compound::plan`;
-  that's the plan `emit_lift_plan` walks.
+- **Params**: `local_base = cumulative slot cursor` across preceding
+  params, advanced by each param's `plan.flat_slot_count`. The cursor
+  starts at 0 because wasm function params occupy locals
+  `0..param_flat_count`.
+- **Compound results**: `local_base = synth_locals[0]`, the first of
+  `flat_slot_count` synth locals allocated by `alloc_wrapper_locals`
+  for `lift_from_memory`'s flat output. The synth locals are
+  contiguous, so cell N's slot resolves to `synth_locals[0] + N`.
 
-Why absolute indices on cells, not a plan-local offset + base
-resolved at emit time: the contiguity invariant ("synth locals occupy
-`synth_locals[0..N]`") becomes a build-time fact baked into each
-cell, not a runtime contract `emit_lift_plan` has to honor by reading
-`alloc_wrapper_locals` carefully.
+Why plan-relative slots, not absolute indices baked at build time: the
+same classify-time `LiftPlan` serves both phases — side-table builders
+(structural reads only) and codegen (reads + adds `local_base`) — with
+no rebuild step. The "synth locals are contiguous" invariant lives at
+the alloc site, not on every cell.
 
 ---
 

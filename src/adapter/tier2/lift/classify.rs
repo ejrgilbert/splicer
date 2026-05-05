@@ -5,11 +5,19 @@
 //! per-tree side tables. The layout phase wraps these into
 //! [`ParamLayout`] / [`ResultLayout`] once cells-slab + retptr-scratch
 //! offsets are known.
+//!
+//! Params and results share one classify pattern:
+//! [`LiftPlan::for_type`] over the param/result `Type`, wrapped in a
+//! per-side struct ([`ParamLift`] / [`CompoundResult`]). All flat-slot
+//! positions are plan-relative; the emit phase supplies `local_base`
+//! per call (cumulative cursor for params; `synth_locals[0]` for
+//! compound results) so the same plan flows unchanged through
+//! side-table builders and codegen.
 
 use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
-use super::plan::{Cell, LiftPlan, LiftPlanBuilder, NamedListInfo};
+use super::plan::{Cell, LiftPlan, NamedListInfo};
 
 // ─── Result-lift descriptors (classify-time, immutable) ───────────
 //
@@ -182,11 +190,9 @@ pub(crate) fn classify_func_params(
     let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
     for param in &func.params {
         let name = append_param_name(name_blob, &param.name);
-        let mut builder = LiftPlanBuilder::new();
-        builder.push(&param.ty, resolve);
         params_lift.push(ParamLift {
             name,
-            plan: builder.into_plan(),
+            plan: LiftPlan::for_type(&param.ty, resolve),
         });
     }
     params_lift
@@ -227,9 +233,7 @@ pub(crate) fn classify_result_lift(
     // synth_locals[0]` (see `alloc_wrapper_locals`) so the same plan
     // serves both the side-table builders and codegen.
     if is_compound_result(ty, resolve) {
-        let mut builder = LiftPlanBuilder::new();
-        builder.push(ty, resolve);
-        let plan = builder.into_plan();
+        let plan = LiftPlan::for_type(ty, resolve);
         return Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
             side_table: SideTableInfo::default(),
@@ -272,9 +276,7 @@ fn single_cell_for_result(ty: &Type, resolve: &Resolve) -> Option<Cell> {
     if !is_supported_direct_result(ty, resolve) {
         return None;
     }
-    let mut builder = LiftPlanBuilder::new();
-    builder.push(ty, resolve);
-    let plan = builder.into_plan();
+    let plan = LiftPlan::for_type(ty, resolve);
     Some(plan.cells.into_iter().next().expect("push appended a cell"))
 }
 
