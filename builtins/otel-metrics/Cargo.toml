@@ -1,0 +1,16 @@
+[package]
+name = "otel-metrics"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace so the main `cargo build` of splicer doesn't try
+# to build this for the host target. Build manually with `make
+# build-builtins`.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.51.0", features = ["default", "async-spawn", "inter-task-wakeup", "async"] }

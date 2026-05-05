@@ -87,6 +87,7 @@ inject:
 |-------------------|------|--------------------------------------------------------------------------------------------------------------------------------------|
 | `hello-tier1`     | 1    | `println!`s on every wrapped call (target interface + function name). Verifies splice rules fire.                                    |
 | `otel-bare-spans` | 1    | Emits a `wasi:otel` span around every wrapped call (timing + `code.namespace`/`code.function` attrs; no payload-derived attributes). |
+| `otel-metrics`    | 1    | Per-call `wasi:otel` metrics export: `component.call.count` + `component.call.duration` histogram, both delta-temporality, attributed by interface/function. |
 
 Source crates live under [`builtins/`](builtins/); rebuild artifacts
 with `make build-builtins`.
