@@ -1264,6 +1264,30 @@ fn tier2_shapes() -> Vec<Shape> {
             rust_literal: r#"String::from("hello")"#,
             expected_debug: r#""hello""#,
         },
+        // ASCII char — utf-8 1-byte branch.
+        Shape::Primitive {
+            name: "char_ascii",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'x'",
+            expected_debug: "'x'",
+        },
+        // BMP char (U+4E2D 中) — utf-8 3-byte branch.
+        Shape::Primitive {
+            name: "char_bmp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'中'",
+            expected_debug: "'中'",
+        },
+        // Supplementary-plane char (U+1F389 🎉) — utf-8 4-byte branch.
+        Shape::Primitive {
+            name: "char_smp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'🎉'",
+            expected_debug: "'🎉'",
+        },
         Shape::Enum {
             wit_name: "color",
             rust_name: "Color",
@@ -2730,19 +2754,25 @@ fn predict_tier2_result_marker(shape: &Shape) -> Option<String> {
 fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
     match shape {
         Shape::Primitive {
-            name,
+            wit_type,
+            rust_literal,
             expected_debug,
             ..
-        } => match *name {
+        } => match *wit_type {
             "bool" => Some(format!("bool({expected_debug})")),
             "u8" | "s8" | "u16" | "s16" | "u32" | "s32" | "u64" | "s64" => {
                 Some(format!("integer({expected_debug})"))
             }
             "f32" | "f64" => Some(format!("floating({expected_debug})")),
             "string" => Some(format!("text({expected_debug})")),
-            // `char` lift requires utf-8 encoding at the wrapper
-            // level; deferred to a follow-up slice.
-            "char" => None,
+            // `char` lifts to `cell::text(<utf-8 bytes>)`. Strip the
+            // surrounding single quotes from the rust char literal
+            // (`'x'` → `x`) and Debug-format as a string to match
+            // `fmt_cell`'s `text({s:?})` rendering.
+            "char" => {
+                let inner = rust_literal.trim_start_matches('\'').trim_end_matches('\'');
+                Some(format!("text({inner:?})"))
+            }
             _ => None,
         },
         Shape::Enum {
