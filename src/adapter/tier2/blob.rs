@@ -28,12 +28,6 @@ const OPTION_SOME: u8 = 1;
 /// data-segment base address that is not yet known at build time.
 pub(crate) type SymbolId = u32;
 
-/// Sentinel for a [`SymRef`] that points nowhere; paired with
-/// `len == 0`, marks a missing slice. Picked as `u32::MAX` so that
-/// hitting `SymbolBases::base_of` with it would panic loudly if
-/// `len == 0` ever stops gating the resolve.
-pub(super) const NO_SYMBOL: SymbolId = u32::MAX;
-
 /// One pending pointer write into a [`Segment`]'s bytes. After every
 /// segment has a base in the [`SymbolBases`], the layout pass writes
 /// `bases[target] + addend` as a little-endian i32 at
@@ -56,9 +50,11 @@ pub(crate) struct Segment {
 }
 
 /// A `(ptr, len)` pair that points into segment `target` at relative
-/// `off`. Held in builder outputs until [`Self::resolve`] looks up
+/// `off`. Held in builder outputs until [`resolve`] looks up
 /// `target`'s placed base; calling resolve consumes the symbolic form
-/// so a "translate twice" mistake becomes a type error.
+/// so a "translate twice" mistake becomes a type error. Absence is
+/// modeled by the surrounding [`Option`] — `None` resolves to
+/// [`BlobSlice::EMPTY`].
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SymRef {
     pub(super) target: SymbolId,
@@ -66,26 +62,16 @@ pub(super) struct SymRef {
     pub(super) len: u32,
 }
 
-impl SymRef {
-    pub(super) const EMPTY: SymRef = SymRef {
-        target: NO_SYMBOL,
-        off: 0,
-        len: 0,
-    };
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub(super) fn resolve(self, symbols: &SymbolBases) -> BlobSlice {
-        if self.is_empty() {
-            BlobSlice::EMPTY
-        } else {
-            BlobSlice {
-                off: symbols.base_of(self.target) + self.off,
-                len: self.len,
-            }
-        }
+/// Resolve an optional [`SymRef`] to an absolute [`BlobSlice`]. `None`
+/// maps to [`BlobSlice::EMPTY`]; `Some` looks the target up in
+/// `symbols` and adds `off`.
+pub(super) fn resolve(sym: Option<SymRef>, symbols: &SymbolBases) -> BlobSlice {
+    match sym {
+        None => BlobSlice::EMPTY,
+        Some(s) => BlobSlice {
+            off: symbols.base_of(s.target) + s.off,
+            len: s.len,
+        },
     }
 }
 
@@ -246,23 +232,28 @@ impl<'a> RecordWriter<'a> {
     /// Like [`Self::write_slice`] but for a slice that points into
     /// another segment that hasn't been placed yet. The `len` lands
     /// directly; the `ptr` slot stays zero and a [`Reloc`] is pushed
-    /// onto `relocs` for the layout phase to resolve.
+    /// onto `relocs` for the layout phase to resolve. `None` leaves
+    /// the slot zeroed (no reloc, len = 0).
     pub(super) fn write_slice_reloc(
         &self,
         blob: &mut [u8],
         relocs: &mut Vec<Reloc>,
         field: &str,
-        sym: SymRef,
+        sym: Option<SymRef>,
     ) {
         let off = self.field_offset(field);
-        if !sym.is_empty() {
-            relocs.push(Reloc {
-                site: (off + SLICE_PTR_OFFSET as usize) as u32,
-                target: sym.target,
-                addend: sym.off as i32,
-            });
-        }
-        write_le_i32(blob, off + SLICE_LEN_OFFSET as usize, sym.len as i32);
+        let len = match sym {
+            Some(s) => {
+                relocs.push(Reloc {
+                    site: (off + SLICE_PTR_OFFSET as usize) as u32,
+                    target: s.target,
+                    addend: s.off as i32,
+                });
+                s.len
+            }
+            None => 0,
+        };
+        write_le_i32(blob, off + SLICE_LEN_OFFSET as usize, len as i32);
     }
 
     /// Set the `option<T>` discriminant byte at `field` to `none`.

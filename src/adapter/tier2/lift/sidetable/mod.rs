@@ -61,12 +61,13 @@ pub(crate) struct NamedListStrings {
 
 /// Output of [`build_side_table_blob`]: the entry-record [`Segment`]
 /// plus per-(fn, param) and per-(fn, result) [`SymRef`]s into it.
-/// Resolution to absolute [`BlobSlice`]s happens once the segment's
-/// base is known.
+/// `None` marks "no entries for this slot" — params/results that
+/// don't carry this side-table kind. Resolution to absolute
+/// [`BlobSlice`]s happens once the segment's base is known.
 pub(crate) struct SideTableBlob {
     pub segment: Segment,
-    pub per_param: Vec<Vec<SymRef>>,
-    pub per_result: Vec<SymRef>,
+    pub per_param: Vec<Vec<Option<SymRef>>>,
+    pub per_result: Vec<Option<SymRef>>,
 }
 
 /// Walk every param / result; for each lift that surfaces a
@@ -146,8 +147,8 @@ pub(super) fn build_side_table_blob(
     from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
 ) -> SideTableBlob {
     let mut bytes: Vec<u8> = Vec::new();
-    let mut per_param: Vec<Vec<SymRef>> = Vec::with_capacity(per_func.len());
-    let mut per_result: Vec<SymRef> = Vec::with_capacity(per_func.len());
+    let mut per_param: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
+    let mut per_result: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
     for fd in per_func {
         let mut params = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
@@ -190,10 +191,8 @@ fn append_entries(
     spec: &SideTableSpec<'_>,
     segment_id: SymbolId,
     info: Option<&NamedListInfo>,
-) -> SymRef {
-    let Some(info) = info else {
-        return SymRef::EMPTY;
-    };
+) -> Option<SymRef> {
+    let info = info?;
     let s = strings
         .get(&info.type_name)
         .expect("register_side_table_strings ran for every info");
@@ -204,9 +203,9 @@ fn append_entries(
         entry.write_slice(blob, INFO_TYPE_NAME, s.type_name);
         entry.write_slice(blob, spec.item_name_field, s.items[item_idx]);
     }
-    SymRef {
+    Some(SymRef {
         target: segment_id,
         off: blob_off,
         len,
-    }
+    })
 }

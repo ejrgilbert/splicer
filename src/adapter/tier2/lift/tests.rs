@@ -504,7 +504,7 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
     let lens: Vec<Vec<u32>> = blobs
         .per_param_range
         .iter()
-        .map(|fns| fns.iter().map(|sr| sr.len).collect())
+        .map(|fns| fns.iter().map(|sr| sr.map_or(0, |s| s.len)).collect())
         .collect();
     assert_eq!(lens, vec![vec![1], vec![1, 2]]);
 

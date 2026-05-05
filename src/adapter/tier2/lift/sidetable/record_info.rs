@@ -88,16 +88,17 @@ pub(crate) struct RecordInfoBlobs {
     /// `fields: list<tuple<string, u32>>`.
     pub tuples: Segment,
     /// Per (fn, param): the param's contiguous record-info range,
-    /// targeting the entries segment.
-    pub per_param_range: Vec<Vec<SymRef>>,
+    /// targeting the entries segment. `None` for params with no
+    /// `RecordOf` cells.
+    pub per_param_range: Vec<Vec<Option<SymRef>>>,
     /// Per (fn, param): for each plan cell, its assigned record-info
     /// side-table index (None for non-`RecordOf` cells). The lift
     /// codegen reads this when emitting `cell::record-of(idx)`.
     pub per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>>,
-    /// Per (fn): result-side range. `SymRef::EMPTY` for void /
-    /// non-Compound results; populated for `Compound` results so the
-    /// result tree's `record-infos` slot can patch in.
-    pub per_result_range: Vec<SymRef>,
+    /// Per (fn): result-side range. `None` for void / non-Compound
+    /// results; populated for `Compound` results so the result tree's
+    /// `record-infos` slot can patch in.
+    pub per_result_range: Vec<Option<SymRef>>,
     /// Per (fn): for each cell of the result's plan, its assigned
     /// record-info side-table index (None for non-`RecordOf` cells).
     /// Empty Vec for non-Compound results.
@@ -140,9 +141,10 @@ impl<'a> RecordInfoBuilder<'a> {
 
     /// Append entries for one plan's `Cell::RecordOf` cells; returns
     /// the contiguous range [`SymRef`] (into the entries segment) +
-    /// the per-cell side-table index map. Each entry's `fields.ptr`
-    /// slot gets a [`Reloc`] into the tuples segment.
-    fn append_plan(&mut self, plan: &LiftPlan) -> (SymRef, Vec<Option<u32>>) {
+    /// the per-cell side-table index map. `None` for plans with no
+    /// `RecordOf` cells. Each entry's `fields.ptr` slot gets a
+    /// [`Reloc`] into the tuples segment.
+    fn append_plan(&mut self, plan: &LiftPlan) -> (Option<SymRef>, Vec<Option<u32>>) {
         let range_start = self.entries.len() as u32;
         let mut count: u32 = 0;
         let mut cell_idx_map: Vec<Option<u32>> = vec![None; plan.cells.len()];
@@ -168,25 +170,24 @@ impl<'a> RecordInfoBuilder<'a> {
 
             let entry = RecordWriter::extend_zero(&mut self.entries, self.entry_layout);
             entry.write_slice(&mut self.entries, INFO_TYPE_NAME, s.type_name);
+            let tuples_ref = (tuples_len > 0).then_some(SymRef {
+                target: self.tuples_id,
+                off: tuples_off,
+                len: tuples_len,
+            });
             entry.write_slice_reloc(
                 &mut self.entries,
                 &mut self.entry_relocs,
                 RECORD_INFO_FIELDS,
-                SymRef {
-                    target: self.tuples_id,
-                    off: tuples_off,
-                    len: tuples_len,
-                },
+                tuples_ref,
             );
         }
-        (
-            SymRef {
-                target: self.entries_id,
-                off: range_start,
-                len: count,
-            },
-            cell_idx_map,
-        )
+        let range = (count > 0).then_some(SymRef {
+            target: self.entries_id,
+            off: range_start,
+            len: count,
+        });
+        (range, cell_idx_map)
     }
 
     /// Finalize into the two segments. Tuples carry no relocs of
@@ -224,9 +225,9 @@ pub(crate) fn build_record_info_blob(
 ) -> RecordInfoBlobs {
     let mut builder =
         RecordInfoBuilder::new(entry_layout, tuple_layout, entries_id, tuples_id, strings);
-    let mut per_param_range: Vec<Vec<SymRef>> = Vec::with_capacity(per_func.len());
+    let mut per_param_range: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
     let mut per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>> = Vec::with_capacity(per_func.len());
-    let mut per_result_range: Vec<SymRef> = Vec::with_capacity(per_func.len());
+    let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
     let mut per_result_cell_idx: Vec<Vec<Option<u32>>> = Vec::with_capacity(per_func.len());
 
     for fd in per_func {
@@ -243,7 +244,7 @@ pub(crate) fn build_record_info_blob(
         let (result_range, result_cell_idx_map) =
             match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
                 Some(c) => builder.append_plan(&c.plan),
-                None => (SymRef::EMPTY, Vec::new()),
+                None => (None, Vec::new()),
             };
         per_result_range.push(result_range);
         per_result_cell_idx.push(result_cell_idx_map);

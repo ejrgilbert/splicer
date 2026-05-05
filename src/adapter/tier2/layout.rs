@@ -14,7 +14,7 @@ use wit_parser::Function as WitFunction;
 
 use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
-use super::blob::{RecordWriter, RelocPlan, SymbolBases};
+use super::blob::{resolve, RecordWriter, RelocPlan, SymbolBases};
 use super::lift::{
     build_enum_info_blob, build_record_info_blob, register_enum_strings, register_record_strings,
     ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout,
@@ -364,19 +364,19 @@ pub(super) fn lay_out_static_memory(
     // absolute [`BlobSlice`]s now that all three segments have bases.
     let enum_per_param: Vec<Vec<BlobSlice>> = enum_per_param_sym
         .into_iter()
-        .map(|v| v.into_iter().map(|s| s.resolve(&symbols)).collect())
+        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
         .collect();
     let enum_per_result: Vec<BlobSlice> = enum_per_result_sym
         .into_iter()
-        .map(|s| s.resolve(&symbols))
+        .map(|s| resolve(s, &symbols))
         .collect();
     let record_per_param_range: Vec<Vec<BlobSlice>> = record_per_param_range_sym
         .into_iter()
-        .map(|v| v.into_iter().map(|s| s.resolve(&symbols)).collect())
+        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
         .collect();
     let record_per_result_range: Vec<BlobSlice> = record_per_result_range_sym
         .into_iter()
-        .map(|s| s.resolve(&symbols))
+        .map(|s| resolve(s, &symbols))
         .collect();
 
     // Bundle every kind's per-(fn, param) and per-(fn, result)
