@@ -273,4 +273,3 @@ pub(super) fn emit_code_section(
     emit_cabi_realloc(&mut code, globals.bump);
     module.section(&code);
 }
-

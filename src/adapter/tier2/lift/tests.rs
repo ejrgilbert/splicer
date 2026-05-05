@@ -12,9 +12,7 @@ use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
 use super::super::super::abi::emit::{BlobSlice, RecordLayout};
 use super::super::cells::CellLayout;
-use super::super::schema::{
-    RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS,
-};
+use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::super::{FuncClassified, FuncShape};
 use super::plan::{Cell, LiftPlan, NamedListInfo};
 use super::*;
@@ -97,10 +95,7 @@ fn enum_info(type_name: &str, items: &[&str]) -> NamedListInfo {
 fn record_of(type_name: &str, fields: &[(&str, u32)]) -> Cell {
     Cell::RecordOf {
         type_name: type_name.into(),
-        fields: fields
-            .iter()
-            .map(|(n, i)| ((*n).to_string(), *i))
-            .collect(),
+        fields: fields.iter().map(|(n, i)| ((*n).to_string(), *i)).collect(),
     }
 }
 

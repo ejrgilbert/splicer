@@ -1,6 +1,6 @@
 //! Wrapper-body emit: builds the wasm function body for one
 //! exported wrapper. Drives the four-phase shape (build call-id
-//! + on-call → call handler → on-return → tail / `task.return`)
+//! and on-call → call handler → on-return → tail / `task.return`)
 //! and threads the schema-layout addresses + lift codegen helpers.
 //!
 //! Wrapper body shape:

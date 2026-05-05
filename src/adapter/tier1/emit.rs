@@ -606,7 +606,13 @@ fn collect_hook_imports(
     };
     let pick = |active: bool, iface: &str| -> Option<HookImport> {
         active
-            .then(|| find_imported_hook(resolve, world_id, &versioned_interface(iface, TIER1_VERSION)))
+            .then(|| {
+                find_imported_hook(
+                    resolve,
+                    world_id,
+                    &versioned_interface(iface, TIER1_VERSION),
+                )
+            })
             .flatten()
     };
     HookImports {

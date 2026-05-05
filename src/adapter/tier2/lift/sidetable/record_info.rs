@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use super::super::super::super::abi::emit::{BlobSlice, RecordLayout};
-use super::super::super::blob::{Reloc, RecordWriter, Segment, SymRef, SymbolId};
+use super::super::super::blob::{RecordWriter, Reloc, Segment, SymRef, SymbolId};
 use super::super::super::schema::{
     RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS,
 };
@@ -165,7 +165,11 @@ impl<'a> RecordInfoBuilder<'a> {
             for (i, (_, child_cell_idx)) in fields.iter().enumerate() {
                 let tuple = RecordWriter::extend_zero(&mut self.tuples, self.tuple_layout);
                 tuple.write_slice(&mut self.tuples, RECORD_FIELD_TUPLE_NAME, s.field_names[i]);
-                tuple.write_i32(&mut self.tuples, RECORD_FIELD_TUPLE_IDX, *child_cell_idx as i32);
+                tuple.write_i32(
+                    &mut self.tuples,
+                    RECORD_FIELD_TUPLE_IDX,
+                    *child_cell_idx as i32,
+                );
             }
 
             let entry = RecordWriter::extend_zero(&mut self.entries, self.entry_layout);

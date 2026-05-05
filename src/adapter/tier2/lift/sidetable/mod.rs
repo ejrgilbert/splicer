@@ -23,9 +23,9 @@ use std::collections::HashMap;
 
 use super::super::super::abi::emit::{BlobSlice, RecordLayout};
 use super::super::blob::{RecordWriter, Segment, SymRef, SymbolId};
+use super::super::FuncClassified;
 use super::classify::SideTableInfo;
 use super::plan::{LiftPlan, NamedListInfo};
-use super::super::FuncClassified;
 
 pub(super) mod enum_info;
 pub(super) mod record_info;

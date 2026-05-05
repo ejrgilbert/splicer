@@ -266,9 +266,7 @@ fn emit_cell_op(
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        Cell::Integer64 { flat_slot } => {
-            cell_layout.emit_integer(f, addr, local_base + *flat_slot)
-        }
+        Cell::Integer64 { flat_slot } => cell_layout.emit_integer(f, addr, local_base + *flat_slot),
         Cell::FloatingF32 { flat_slot } => {
             f.instructions().local_get(local_base + *flat_slot);
             f.instructions().f64_promote_f32();

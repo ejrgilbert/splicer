@@ -260,7 +260,9 @@ pub(crate) fn classify_result_lift(
 /// Other compound kinds (variants / tuples / etc.) bail out at
 /// [`classify_result_lift`] for now.
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
-    let Type::Id(id) = ty else { return false; };
+    let Type::Id(id) = ty else {
+        return false;
+    };
     match &resolve.types[*id].kind {
         wit_parser::TypeDefKind::Record(_) => true,
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
@@ -313,7 +315,10 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
 /// side-table entries (currently only enum).
 fn side_table_info_for_cell(cell: &Cell) -> SideTableInfo {
     let mut info = SideTableInfo::default();
-    if let Cell::EnumCase { info: enum_info, .. } = cell {
+    if let Cell::EnumCase {
+        info: enum_info, ..
+    } = cell
+    {
         info.enum_info = Some(enum_info.clone());
     }
     info

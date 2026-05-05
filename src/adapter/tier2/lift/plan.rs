@@ -63,10 +63,7 @@ pub(crate) enum Cell {
     Bytes { ptr_slot: u32, len_slot: u32 },
     /// `enum { ... }` → `cell::enum-case(u32)`. Carries the type-name +
     /// case-names so the side-table builder can register them.
-    EnumCase {
-        flat_slot: u32,
-        info: NamedListInfo,
-    },
+    EnumCase { flat_slot: u32, info: NamedListInfo },
     /// `record { ... }` → `cell::record-of(u32)` (side-table index).
     /// Children live elsewhere in the same plan; `fields` references
     /// them by `LiftPlan::cells` position.

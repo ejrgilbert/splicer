@@ -9,7 +9,9 @@ use wasm_encoder::{
     GlobalSection, GlobalType, MemArg, MemorySection, MemoryType, Module, ValType,
 };
 use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
-use wit_parser::{Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId, WasmImport, WorldId, WorldItem};
+use wit_parser::{
+    Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId, WasmImport, WorldId, WorldItem,
+};
 
 use super::super::indices::FunctionIndices;
 use super::super::resolve::hook_callback_mangling;
@@ -122,7 +124,8 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection, bump_global: u32) {
 
     // if new_bump > memory.size * page_size: grow memory
     f.instructions().memory_size(0);
-    f.instructions().i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
+    f.instructions()
+        .i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
     f.instructions().i32_shl();
     f.instructions().i32_gt_u();
     f.instructions().if_(BlockType::Empty);
@@ -132,12 +135,14 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection, bump_global: u32) {
         // `(x - 1) >> log2_page + 1` ceiling is well-defined.
         f.instructions().local_get(new_bump);
         f.instructions().memory_size(0);
-        f.instructions().i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
+        f.instructions()
+            .i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
         f.instructions().i32_shl();
         f.instructions().i32_sub();
         f.instructions().i32_const(1);
         f.instructions().i32_sub();
-        f.instructions().i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
+        f.instructions()
+            .i32_const(WASM_PAGE_SIZE.trailing_zeros() as i32);
         f.instructions().i32_shr_u();
         f.instructions().i32_const(1);
         f.instructions().i32_add();
@@ -504,10 +509,8 @@ impl CallIdLayout {
 /// Build-time twin of [`emit_store_slice`]: store a `(ptr, len)`
 /// canonical-ABI slice pair into a byte buffer at `off`.
 pub(crate) fn store_slice_in_blob(blob: &mut [u8], off: usize, slice: BlobSlice) {
-    blob[off + SLICE_PTR_OFFSET as usize..][..4]
-        .copy_from_slice(&(slice.off as i32).to_le_bytes());
-    blob[off + SLICE_LEN_OFFSET as usize..][..4]
-        .copy_from_slice(&(slice.len as i32).to_le_bytes());
+    blob[off + SLICE_PTR_OFFSET as usize..][..4].copy_from_slice(&(slice.off as i32).to_le_bytes());
+    blob[off + SLICE_LEN_OFFSET as usize..][..4].copy_from_slice(&(slice.len as i32).to_le_bytes());
 }
 
 /// Typed `(off, len)` pair into a tier's static blob. Avoids

@@ -21,8 +21,8 @@ use super::lift::{
     SideTableBlob,
 };
 use super::schema::{
-    SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
-    TREE_ENUM_INFOS, TREE_RECORD_INFOS, TREE_ROOT,
+    SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
+    TREE_RECORD_INFOS, TREE_ROOT,
 };
 use super::{AfterSetup, FuncClassified, FuncDispatch};
 
@@ -430,24 +430,21 @@ pub(super) fn lay_out_static_memory(
         &result_cells_offsets,
         &result_side_tables,
     );
-    let after_params_offsets: Vec<Option<i32>> = match schema
-        .after_hook
-        .as_ref()
-        .map(|h| &h.params_layout)
-    {
-        Some(al) => {
-            let after_base = layout.place_data(al.align, &after_blob);
-            let mut cursor = after_base;
-            (0..n_funcs)
-                .map(|_| {
-                    let here = cursor as i32;
-                    cursor += al.size;
-                    Some(here)
-                })
-                .collect()
-        }
-        None => vec![None; n_funcs],
-    };
+    let after_params_offsets: Vec<Option<i32>> =
+        match schema.after_hook.as_ref().map(|h| &h.params_layout) {
+            Some(al) => {
+                let after_base = layout.place_data(al.align, &after_blob);
+                let mut cursor = after_base;
+                (0..n_funcs)
+                    .map(|_| {
+                        let here = cursor as i32;
+                        cursor += al.size;
+                        Some(here)
+                    })
+                    .collect()
+            }
+            None => vec![None; n_funcs],
+        };
 
     // Scratch slots: event record + on-call indirect-params buffer.
     let event_ptr = layout.reserve_scratch(EVENT_SLOT_ALIGN, EVENT_SLOT_SIZE) as i32;
@@ -657,9 +654,7 @@ mod tests {
             &hook_ifaces,
         );
         let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
-        let world_id = resolve
-            .select_world(&[world_pkg], Some("adapter"))
-            .unwrap();
+        let world_id = resolve.select_world(&[world_pkg], Some("adapter")).unwrap();
         let target_iface = resolve
             .interfaces
             .iter()
@@ -748,7 +743,10 @@ mod tests {
         let env = env();
         for fd in &env.dispatches {
             let after = fd.after.as_ref().unwrap();
-            assert_eq!(after.result_cells_offset.is_some(), fd.result_lift.is_some());
+            assert_eq!(
+                after.result_cells_offset.is_some(),
+                fd.result_lift.is_some()
+            );
         }
     }
 
