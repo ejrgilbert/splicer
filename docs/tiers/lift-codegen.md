@@ -119,11 +119,13 @@ library and we can use it without buying the full `call(...)` driver.
 
 The output of classification, per (function, param) and (function,
 result), is a **`LiftPlan`** — a flat `Vec<CellOp>` describing every
-cell the lift needs to write, in allocation order, with `cells[0]`
-as the root.
+cell the lift needs to write, in allocation order. Children land in
+`cells` before their parents; the root cell's index is recorded
+explicitly on `LiftPlan::root` so the field-tree's `root` field can
+walk straight to it without assuming `cells[0]`.
 
 ```rust
-struct LiftPlan { cells: Vec<CellOp>, flat_slot_count: u32 }
+struct LiftPlan { cells: Vec<CellOp>, flat_slot_count: u32, root: u32 }
 
 enum CellOp {
     Bool { flat_slot: u32 },
@@ -177,39 +179,40 @@ same vector.
 
 ### Building a plan
 
-`LiftPlanBuilder` allocates cells parent-first via mutual recursion:
+`LiftPlanBuilder` allocates cells **children-first**: each `push`
+sub-call appends its own cells and returns the index where its root
+landed, then the caller pushes the parent referencing those
+already-known indices.
 
 ```rust
 fn push(&mut self, ty: &Type, resolve: &Resolve) -> u32 {
-    let root_idx = self.cells.len() as u32;
     match LiftKind::classify(ty, resolve) {
-        // primitives: push one CellOp consuming next_local..next_local+N
-        LiftKind::Bool => { /* push Bool { local: self.bump_local() } */ }
+        // primitives: push one CellOp consuming next_local..next_local+N,
+        // return the index it landed at
+        LiftKind::Bool => self.push_cell(CellOp::Bool { local: self.bump_local() }),
         // …
 
-        // compounds: push parent first, recurse on children, backfill parent
+        // compounds: recurse on children first, then push the
+        // fully-built parent referencing the now-known child indices
         LiftKind::Record => {
-            self.cells.push(CellOp::RecordOf { type_name, fields: vec![] });
-            let parent = root_idx as usize;
             let mut fields = vec![];
             for f in record_fields(ty, resolve) {
-                let child_idx = self.push(&f.ty, resolve);  // ← appends after parent
+                let child_idx = self.push(&f.ty, resolve);  // ← appends and returns
                 fields.push((f.name.clone(), child_idx));
             }
-            if let CellOp::RecordOf { fields: f, .. } = &mut self.cells[parent] {
-                *f = fields;
-            }
+            self.push_cell(CellOp::RecordOf { type_name, fields })
         }
         // …
     }
-    root_idx
 }
 ```
 
-The recursion order is **parent-before-children**: when the recursion
-unwinds, every child's cells live at indices ≥ parent_idx + 1, and
-the parent's `fields` list captures those indices. Self-evident
-correctness (vs. trying to predict child indices ahead of time).
+The recursion order is **children-before-parent**: by the time a
+parent is pushed, every index in its `fields` list already names a
+cell that exists, so the parent cell can be appended fully
+constructed (no mutation after push, no back-fill). The root index
+the top-level `push` returns is what `for_type` records on
+`LiftPlan::root`.
 
 ### Plan-relative flat slots, base supplied at emit time
 
@@ -487,9 +490,10 @@ The checklist in [Adding a new WIT type ctor](#adding-a-new-wit-type-ctor-a-chec
 - **`LiftKind::classify`** already maps every WIT type ctor — start by
   confirming the right variant is returned.
 - **Plan-builder arm in `LiftPlanBuilder::push`** is the main work.
-  For compound types, follow the `push_record` pattern: reserve the
-  parent cell first, recurse on children, backfill parent's child
-  cell indices.
+  For compound types, follow the `push_record` pattern: recurse on
+  children first (collecting their returned indices), then push the
+  fully-built parent cell — no back-fill needed, the parent's
+  `fields` list references already-pushed cells.
 - **Side-table machinery** is generic over an extractor closure for
   per-case kinds (enum-info shape) via `register_side_table_strings` +
   `build_side_table_blob`. Per-instance kinds (record-info,

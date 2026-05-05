@@ -11,9 +11,10 @@
 //! Three layers, one submodule each:
 //! - [`plan`] — [`plan::LiftPlanBuilder`] walks a WIT type and emits
 //!   a flat [`plan::LiftPlan`] of [`plan::Cell`]s in allocation order
-//!   — `cells[0]` is the root, child cells follow their parents. The
-//!   plan owns the cell-index space; side-table contributions
-//!   reference cells by `Vec`-position into the same plan.
+//!   — children land in `cells` before their parents, with the root
+//!   cell's index recorded on [`plan::LiftPlan::root`]. The plan owns
+//!   the cell-index space; side-table contributions reference cells
+//!   by `Vec`-position into the same plan.
 //! - [`classify`] — wraps a plan into per-(param | result) lift
 //!   recipes ([`classify::ParamLift`], [`classify::ResultLift`]) plus
 //!   the side-table info needed to populate per-tree side tables.

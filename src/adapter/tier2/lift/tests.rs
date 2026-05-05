@@ -382,18 +382,22 @@ fn enum_carries_named_list_info() {
 }
 
 #[test]
-fn record_lays_parent_before_children() {
+fn record_lays_children_before_parent() {
     let r = test_resolve();
     let mut names = NameInterner::new();
     let plan = plan_for_named("point", &r, &mut names);
+    // Children-first: u32 + s32 land at indices 0 and 1, the parent
+    // RecordOf is appended last and references them. Plan.root
+    // points at the parent's cell index (2), not at cells[0].
     assert_eq!(
         plan.cells,
         vec![
-            record_of(&mut names, "point", &[("x", 1), ("y", 2)]),
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
+            record_of(&mut names, "point", &[("x", 0), ("y", 1)]),
         ],
     );
+    assert_eq!(plan.root(), 2);
     assert_eq!(plan.flat_slot_count, 2);
 }
 
@@ -402,19 +406,24 @@ fn nested_record_walks_depth_first() {
     let r = test_resolve();
     let mut names = NameInterner::new();
     let plan = plan_for_named("nested", &r, &mut names);
+    // Depth-first, children-before-parent: the inner `point`'s
+    // primitive children land at 0/1, then `point`'s parent at 2,
+    // then the `color` enum at 3, then the outer `nested` parent at
+    // 4. plan.root() is the outer parent.
     assert_eq!(
         plan.cells,
         vec![
-            record_of(&mut names, "nested", &[("p", 1), ("c", 4)]),
-            record_of(&mut names, "point", &[("x", 2), ("y", 3)]),
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
+            record_of(&mut names, "point", &[("x", 0), ("y", 1)]),
             Cell::EnumCase {
                 flat_slot: 2,
                 info: enum_info("color", &["red", "green", "blue"]),
             },
+            record_of(&mut names, "nested", &[("p", 2), ("c", 3)]),
         ],
     );
+    assert_eq!(plan.root(), 4);
     assert_eq!(plan.flat_slot_count, 3);
 }
 
@@ -533,12 +542,16 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
     assert_eq!(lens, vec![vec![1], vec![1, 2]]);
 
     // Cell-idx maps reset per range — index counts up only inside
-    // one (fn, param), not across them.
+    // one (fn, param), not across them. Children-first plan order
+    // puts each RecordOf cell after its descendants, so the
+    // `Some(_)` slots land at the *end* of each map (and, for
+    // `nested`, the inner `point` parent picks up side-table idx 0
+    // before the outer `nested` parent picks up idx 1).
     let expected: Vec<Vec<&[Option<u32>]>> = vec![
-        vec![&[Some(0), None, None]],
+        vec![&[None, None, Some(0)]],
         vec![
-            &[Some(0), None, None],
-            &[Some(0), Some(1), None, None, None],
+            &[None, None, Some(0)],
+            &[None, None, Some(0), None, Some(1)],
         ],
     ];
     for (fn_idx, fn_expected) in expected.iter().enumerate() {

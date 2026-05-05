@@ -3,8 +3,10 @@
 //! A [`LiftPlan`] describes one (param | result) lift end-to-end:
 //! every cell that needs to be written, in allocation order, with
 //! each cell bound to its source flat slots (plan-relative, 0-based)
-//! and any nominal-cell side-table info it carries. `cells[0]` is
-//! the root that the field-tree's `root` field points at.
+//! and any nominal-cell side-table info it carries. The root cell —
+//! the one the field-tree's `root` field points at — lives at
+//! [`LiftPlan::root`]; the plan-builder records it explicitly so the
+//! root's position in `cells` doesn't have to coincide with index 0.
 //!
 //! Cells reference flat slots, NOT absolute wasm-local indices —
 //! the emit phase supplies a `local_base: u32` and looks up
@@ -111,8 +113,13 @@ pub(crate) enum Cell {
 }
 
 /// Plan for lifting one (param | result) into a cell tree. Cells
-/// are listed in allocation order; `cells[0]` is the root that the
-/// field-tree's `root` field points at. Walked top-to-bottom by the
+/// are listed in allocation order: children land in `cells` before
+/// their parents, so a record's `fields` list always references
+/// already-pushed indices and the parent cell can be appended fully
+/// constructed (no back-fill). [`LiftPlan::root`] records the index
+/// of the root cell — for primitives it's `0` (the only cell), for
+/// records it's the parent at the end of the slab. The field-tree's
+/// `root` field points at this index. Walked top-to-bottom by the
 /// emit-code phase; the side-table builder also walks `cells` to
 /// pull out per-kind side-table contributions.
 pub(crate) struct LiftPlan {
@@ -122,6 +129,10 @@ pub(crate) struct LiftPlan {
     /// caller-supplied `local_base` to recover absolute wasm-local
     /// indices.
     pub flat_slot_count: u32,
+    /// Index of the root cell within `cells`. The plan-builder
+    /// pushes children before parents, so for compound shapes this
+    /// is the last-appended cell rather than `cells[0]`.
+    root: u32,
 }
 
 impl LiftPlan {
@@ -133,12 +144,19 @@ impl LiftPlan {
     /// every record type-name and field-name as the plan is built.
     pub(super) fn for_type(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Self {
         let mut builder = LiftPlanBuilder::new();
-        builder.push(ty, resolve, names);
-        builder.into_plan()
+        let root = builder.push(ty, resolve, names);
+        builder.into_plan(root)
     }
 
     pub(crate) fn cell_count(&self) -> u32 {
         self.cells.len() as u32
+    }
+
+    /// Index of the root cell — the entry point the field-tree's
+    /// `root` field stores. Matches the value the plan-builder
+    /// returned from the top-level [`LiftPlanBuilder::push`].
+    pub(crate) fn root(&self) -> u32 {
+        self.root
     }
 
     /// Iterator over every `Cell::EnumCase` in the plan. Used by
@@ -154,10 +172,12 @@ impl LiftPlan {
 // ─── Lift plan builder ────────────────────────────────────────────
 
 /// Allocates cells + plan-relative flat-slot positions while walking
-/// a WIT type. The "parent before children" recursion in
-/// [`Self::push`] is what makes child cell indices observable from
-/// the parent's side-table info (a child's index is just
-/// `cells.len()` after its sub-call has appended).
+/// a WIT type. Recursion is **children before parent**: each
+/// [`Self::push`] sub-call appends its cells to `cells`, then the
+/// caller pushes the parent referencing the now-known child indices.
+/// Side-table entries that name a child cell (e.g. `RecordOf::fields`)
+/// can therefore be built fully and pushed once, with no back-fill —
+/// the parent cell is immutable as soon as it lands in `cells`.
 ///
 /// Plans are local-base-independent: cells reference flat slots in
 /// `0..flat_slot_count`. The emit phase adds the caller-supplied
@@ -180,41 +200,43 @@ impl LiftPlanBuilder {
         }
     }
 
-    /// Push cells for one lift; returns the root cell's index. Type
-    /// aliases peel through and reclassify the underlying type.
-    /// `names` interns record type-names and field-names so the
-    /// resulting [`Cell::RecordOf`]s carry pre-interned [`BlobSlice`]s.
+    /// Push cells for one lift; returns the index of the just-pushed
+    /// root cell. For primitives that's `cells.len()` before the
+    /// push (single cell at the end); for compound shapes it's the
+    /// parent cell, appended after its children. Type aliases peel
+    /// through and reclassify the underlying type. `names` interns
+    /// record type-names and field-names so the resulting
+    /// [`Cell::RecordOf`]s carry pre-interned [`BlobSlice`]s.
     pub(super) fn push(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
-        let root_idx = self.cells.len() as u32;
         match ty {
             Type::Bool => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(Cell::Bool { flat_slot });
+                self.push_cell(Cell::Bool { flat_slot })
             }
             Type::S8 | Type::S16 | Type::S32 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(Cell::IntegerSignExt { flat_slot });
+                self.push_cell(Cell::IntegerSignExt { flat_slot })
             }
             Type::U8 | Type::U16 | Type::U32 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(Cell::IntegerZeroExt { flat_slot });
+                self.push_cell(Cell::IntegerZeroExt { flat_slot })
             }
             Type::S64 | Type::U64 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(Cell::Integer64 { flat_slot });
+                self.push_cell(Cell::Integer64 { flat_slot })
             }
             Type::F32 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(Cell::FloatingF32 { flat_slot });
+                self.push_cell(Cell::FloatingF32 { flat_slot })
             }
             Type::F64 => {
                 let flat_slot = self.bump_flat_slot();
-                self.cells.push(Cell::FloatingF64 { flat_slot });
+                self.push_cell(Cell::FloatingF64 { flat_slot })
             }
             Type::String => {
                 let ptr_slot = self.bump_flat_slot();
                 let len_slot = self.bump_flat_slot();
-                self.cells.push(Cell::Text { ptr_slot, len_slot });
+                self.push_cell(Cell::Text { ptr_slot, len_slot })
             }
             Type::Char => todo!("plan-builder for un-wired Cell::Char"),
             Type::ErrorContext => todo!("plan-builder for un-wired Cell::ErrorContext"),
@@ -222,18 +244,16 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::List(Type::U8) => {
                     let ptr_slot = self.bump_flat_slot();
                     let len_slot = self.bump_flat_slot();
-                    self.cells.push(Cell::Bytes { ptr_slot, len_slot });
+                    self.push_cell(Cell::Bytes { ptr_slot, len_slot })
                 }
                 wit_parser::TypeDefKind::Enum(_) => {
                     let info = enum_lift_info_for_type(ty, resolve)
                         .expect("Enum kind implies enum-info available");
                     let flat_slot = self.bump_flat_slot();
-                    self.cells.push(Cell::EnumCase { flat_slot, info });
+                    self.push_cell(Cell::EnumCase { flat_slot, info })
                 }
-                wit_parser::TypeDefKind::Record(_) => {
-                    self.push_record(ty, resolve, names, root_idx)
-                }
-                wit_parser::TypeDefKind::Type(t) => return self.push(t, resolve, names),
+                wit_parser::TypeDefKind::Record(_) => self.push_record(ty, resolve, names),
+                wit_parser::TypeDefKind::Type(t) => self.push(t, resolve, names),
                 wit_parser::TypeDefKind::List(_) => {
                     todo!("plan-builder for un-wired Cell::ListOf")
                 }
@@ -272,7 +292,6 @@ impl LiftPlanBuilder {
                 }
             },
         }
-        root_idx
     }
 
     fn bump_flat_slot(&mut self) -> u32 {
@@ -285,19 +304,21 @@ impl LiftPlanBuilder {
         r
     }
 
-    /// Records: push the parent first, recurse on each field
-    /// (children get appended to `cells` AFTER the parent, so their
-    /// returned root indices are the indices the parent's `fields`
-    /// list needs), then backfill the parent's `fields`. The
-    /// type-name and field-name strings are interned into `names`
-    /// up-front so the pushed cell already carries [`BlobSlice`]s.
-    fn push_record(
-        &mut self,
-        ty: &Type,
-        resolve: &Resolve,
-        names: &mut NameInterner,
-        root_idx: u32,
-    ) {
+    /// Append `cell` and return the index it landed at.
+    fn push_cell(&mut self, cell: Cell) -> u32 {
+        let idx = self.cells.len() as u32;
+        self.cells.push(cell);
+        idx
+    }
+
+    /// Records: recurse on each field first (each sub-call appends
+    /// its cells and returns the index of its root), then push the
+    /// parent referencing those already-known child indices. The
+    /// parent cell is constructed in full before it lands in `cells`,
+    /// so there is no back-fill step. The type-name and field-name
+    /// strings are interned into `names` up-front so the pushed cell
+    /// already carries [`BlobSlice`]s.
+    fn push_record(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
         let Type::Id(id) = ty else {
             unreachable!("Record kind came from non-Id type")
         };
@@ -306,29 +327,26 @@ impl LiftPlanBuilder {
             unreachable!("Record kind came from non-Record TypeDefKind")
         };
         let type_name = names.intern(typedef.name.as_deref().unwrap_or(""));
-        // Reserve the parent slot at root_idx.
-        self.cells.push(Cell::RecordOf {
-            type_name,
-            fields: Vec::new(),
-        });
-        // Recurse on each field; children get appended after parent.
+        // Intern field-names + recurse on each field. Each recursive
+        // push appends the child's cells to `cells` and returns the
+        // child's root index — by the time this loop finishes, every
+        // index in `fields` references a cell that already exists.
         let mut fields = Vec::with_capacity(r.fields.len());
         for field in &r.fields {
             let name_slice = names.intern(&field.name);
             let child_idx = self.push(&field.ty, resolve, names);
             fields.push((name_slice, child_idx));
         }
-        // Backfill the parent's `fields` with the now-known child indices.
-        match &mut self.cells[root_idx as usize] {
-            Cell::RecordOf { fields: f, .. } => *f = fields,
-            _ => unreachable!("just pushed RecordOf at root_idx"),
-        }
+        // Push the fully-built parent. Lands at the current end of
+        // `cells`, after all of its children.
+        self.push_cell(Cell::RecordOf { type_name, fields })
     }
 
-    pub(super) fn into_plan(self) -> LiftPlan {
+    pub(super) fn into_plan(self, root: u32) -> LiftPlan {
         LiftPlan {
             cells: self.cells,
             flat_slot_count: self.next_flat_slot,
+            root,
         }
     }
 }

@@ -125,13 +125,17 @@ impl FieldSideTables {
 
 /// Single-pass build of a `field` record + its embedded
 /// `field-tree` for one (function, param) pair. `cells` points at
-/// the param's contiguous cells slab (`(slab-offset, cell-count)`).
-/// `side_tables` patches the field-tree's per-kind-infos lists for
-/// any kinds the param's plan carries.
+/// the param's contiguous cells slab (`(slab-offset, cell-count)`),
+/// and `root` is the cell-array index the field-tree should walk
+/// from — sourced from the param's [`super::lift::ParamLift::plan`]'s
+/// [`super::lift::plan::LiftPlan::root`]. `side_tables` patches the
+/// field-tree's per-kind-infos lists for any kinds the param's plan
+/// carries.
 fn write_field_record(
     blob: &mut Vec<u8>,
     schema: &SchemaLayouts,
     cells: BlobSlice,
+    root: u32,
     name: BlobSlice,
     side_tables: FieldSideTables,
 ) {
@@ -140,8 +144,7 @@ fn write_field_record(
     let tree = field.nested(FIELD_TREE, &schema.tree_layout);
     tree.write_slice(blob, TREE_CELLS, cells);
     side_tables.write_to_tree(blob, &tree);
-    // Root cell is always `cells[0]` for the plan-builder.
-    tree.write_i32(blob, TREE_ROOT, 0);
+    tree.write_i32(blob, TREE_ROOT, root as i32);
 }
 
 /// Build the contiguous fields blob: one `field` record per
@@ -159,9 +162,10 @@ fn build_fields_blob(
     for (fn_idx, fd) in per_func.iter().enumerate() {
         for (i, p) in fd.params.iter().enumerate() {
             // The field-tree's `cells.ptr` points at the param's
-            // slab; `cells.len = plan.cell_count()`. `root` is always
-            // 0 because the plan-builder allocates the root cell
-            // first into each plan.
+            // slab; `cells.len = plan.cell_count()`; `root` is the
+            // index recorded by the plan-builder (children-first
+            // ordering means root is the last-pushed cell for
+            // compound shapes, `0` for primitives).
             write_field_record(
                 &mut blob,
                 schema,
@@ -169,6 +173,7 @@ fn build_fields_blob(
                     off: cells_offsets[fn_idx][i],
                     len: p.plan.cell_count(),
                 },
+                p.plan.root(),
                 p.name,
                 param_side_tables[fn_idx][i],
             );
@@ -212,13 +217,15 @@ fn build_after_params_blob(
                     entry.field_offset(ON_RET_RESULT) + schema.option_payload_off as usize;
                 let tree = RecordWriter::at(&schema.tree_layout, tree_base);
                 // Compound result: cells.len = plan.cell_count (slab
-                // holds the full cell tree); single-cell result
-                // (Direct / RetptrPair): len = 1.
-                let cells_len = fd
+                // holds the full cell tree) and root = plan.root()
+                // (children-first ordering puts the parent at the
+                // end of the slab). Single-cell result (Direct /
+                // RetptrPair): len = 1, root = 0.
+                let (cells_len, root) = fd
                     .result_lift
                     .as_ref()
                     .and_then(|rl| rl.compound())
-                    .map_or(1, |c| c.plan.cell_count());
+                    .map_or((1, 0), |c| (c.plan.cell_count(), c.plan.root()));
                 tree.write_slice(
                     &mut blob,
                     TREE_CELLS,
@@ -228,7 +235,7 @@ fn build_after_params_blob(
                     },
                 );
                 result_side_tables[fn_idx].write_to_tree(&mut blob, &tree);
-                tree.write_i32(&mut blob, TREE_ROOT, 0);
+                tree.write_i32(&mut blob, TREE_ROOT, root as i32);
             }
             None => entry.write_option_none(&mut blob, ON_RET_RESULT),
         }
