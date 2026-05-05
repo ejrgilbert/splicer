@@ -19,10 +19,14 @@ on:
         default: "Splicer builtin middleware component"
 
 env:
-  # Pinned to match publish-wit.yml. Do not bump without coordinating: newer wkg
-  # emits component-model encodings older wkg can't decode, and wkg 0.14+ has
-  # stricter name validation that rejects `[async]` externs in wasi:http et al.
+  # Match publish-wit.yml
   WKG_VERSION: "0.13.0"
+
+  # Media types match the OCI Wasm convention used across the bytecodealliance
+  # ecosystem so pull-side tooling (oci-distribution / oci-wasm) recognizes
+  # the artifact as a wasm component.
+  ARTIFACT_TYPE: "application/vnd.bytecodealliance.wasm.component.v0"
+  LAYER_MEDIA_TYPE: "application/wasm"
 
 jobs:
   publish:
@@ -41,12 +45,17 @@ jobs:
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install build-time tooling
+        # wkg + wasm-tools are needed by the Makefile pattern rule (wkg wit
+        # fetch + wasm-tools component new). Push doesn't use wkg.
         run: |
           cargo binstall -y "wkg@${{ env.WKG_VERSION }}"
           cargo binstall -y wasm-tools
 
       - name: Add wasm32-wasip1 target
         run: rustup target add wasm32-wasip1
+
+      - name: Setup oras
+        uses: oras-project/setup-oras@v1
 
       - name: Extract version from Cargo.toml
         id: version
@@ -89,21 +98,30 @@ jobs:
 
       - name: Publish to GitHub Container Registry
         id: publish
-        # Pinned to the commit that wires `inputs.wkg` through to the
-        # installer (PR #12). The latest tag (v5) predates this, so a
-        # tag pin would silently install latest wkg and reject the
-        # `[async]` externs we emit. Match publish-wit.yml.
-        # TODO: Pin to a tag once it's available
-        uses: bytecodealliance/wkg-github-action@5b7005d1fc81c8c3380a059e58345033e3a97638
-        with:
-          wkg: ${{ env.WKG_VERSION }}
-          file: assets/builtins/${{ inputs.builtin }}.wasm
-          oci-reference-without-tag: ghcr.io/${{ github.repository_owner }}/splicer/builtins/${{ inputs.builtin }}
-          version: ${{ steps.version.outputs.version }}
-          description: ${{ inputs.description }}
-          source: https://github.com/${{ github.repository }}
-          homepage: https://github.com/${{ github.repository }}
-          licenses: Apache-2.0
+        env:
+          REF: "ghcr.io/${{ github.repository_owner }}/splicer/builtins/${{ inputs.builtin }}:${{ steps.version.outputs.version }}"
+          FILE: "assets/builtins/${{ inputs.builtin }}.wasm"
+          DESCRIPTION: ${{ inputs.description }}
+          SOURCE_URL: "https://github.com/${{ github.repository }}"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          json=$(oras push "$REF" \
+            --artifact-type "$ARTIFACT_TYPE" \
+            "$FILE:$LAYER_MEDIA_TYPE" \
+            --annotation "org.opencontainers.image.description=$DESCRIPTION" \
+            --annotation "org.opencontainers.image.source=$SOURCE_URL" \
+            --annotation "org.opencontainers.image.url=$SOURCE_URL" \
+            --annotation "org.opencontainers.image.version=$VERSION" \
+            --annotation "org.opencontainers.image.licenses=Apache-2.0" \
+            --format json)
+          digest=$(echo "$json" | jq -r '.digest')
+          if [ -z "$digest" ] || [ "$digest" = "null" ]; then
+            echo "::error::oras push did not return a digest. Output was: $json"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Pushed $REF @ $digest"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v1
@@ -129,7 +147,7 @@ jobs:
             echo ""
             echo "Pull with:"
             echo '```'
-            echo "wkg oci pull $REF"
+            echo "oras pull $REF"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Published $REF"
