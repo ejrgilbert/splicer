@@ -62,7 +62,11 @@ fn otel_metrics_exports_count_and_duration() -> Result<()> {
 
     let resource_metrics = expect_record(&cap.exports[0]);
     let scope_metrics_list = expect_list(field(resource_metrics, "scope-metrics"));
-    assert_eq!(scope_metrics_list.len(), 1, "exactly one scope-metrics entry");
+    assert_eq!(
+        scope_metrics_list.len(),
+        1,
+        "exactly one scope-metrics entry"
+    );
 
     let scope_metrics = expect_record(&scope_metrics_list[0]);
     let scope = expect_record(field(scope_metrics, "scope"));
@@ -144,7 +148,10 @@ fn otel_metrics_exports_count_and_duration() -> Result<()> {
         "bucket-counts is bounds.len() + 1 (overflow)"
     );
     let total_count: u64 = bucket_counts.iter().map(expect_u64).sum();
-    assert_eq!(total_count, 1, "exactly one sample distributed across buckets");
+    assert_eq!(
+        total_count, 1,
+        "exactly one sample distributed across buckets"
+    );
 
     // sum / min / max all come from the same single sample, so they
     // must agree. Don't pin a specific value (clock jitter), but they
