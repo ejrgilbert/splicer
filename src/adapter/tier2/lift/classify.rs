@@ -291,8 +291,8 @@ fn single_cell_for_result(ty: &Type, resolve: &Resolve, names: &mut NameInterner
 
 /// Whitelist of WIT types whose lift codegen [`super::emit::emit_lift_kind`]
 /// can drive. Mirrors the wired primitive / text / bytes / enum / flags
-/// / char arms of [`LiftPlanBuilder::push`]; new direct/retptr-pair
-/// kinds wire up here.
+/// / char / handle arms of [`LiftPlanBuilder::push`]; new direct/retptr-
+/// pair kinds wire up here.
 fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
     match ty {
         Type::Bool
@@ -313,6 +313,7 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
             wit_parser::TypeDefKind::List(Type::U8) => true,
             wit_parser::TypeDefKind::Enum(_) => true,
             wit_parser::TypeDefKind::Flags(_) => true,
+            wit_parser::TypeDefKind::Handle(_) => true,
             wit_parser::TypeDefKind::Type(t) => is_supported_direct_result(t, resolve),
             _ => false,
         },

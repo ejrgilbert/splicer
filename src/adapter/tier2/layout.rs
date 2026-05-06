@@ -22,8 +22,9 @@ use super::lift::{
     build_record_info_blob, build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes,
     flags_scratch_sizes, fold_cell_side_data, register_enum_strings, register_flags_strings,
     register_variant_strings, CellFillSources, CellSideData, CharScratchMaps, FlagsInfoBlobs,
-    FlagsRuntimeFill, HandleInfoBlobs, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
-    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
+    FlagsRuntimeFill, HandleInfoBlobs, HandleRuntimeFill, ParamLayout, RecordInfoBlobs,
+    ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob,
+    VariantInfoBlobs,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -102,27 +103,59 @@ fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
     Ok(())
 }
 
-/// Wrap the per-fn fills into a `CellSideData` for a single-cell
-/// (Direct / RetptrPair) result. Each kind that needs runtime
-/// bookkeeping plumbs its per-fn `Option<…>` here; primitives without
-/// side data fall through to `None`. New kinds add a match arm + a
-/// fill argument.
-fn single_cell_side_data(
-    cell: &Cell,
-    flags_fill: &Option<FlagsRuntimeFill>,
-    char_scratch: &Option<i32>,
-) -> CellSideData {
+/// Per-fn fills for a single-cell (Direct / RetptrPair) result.
+/// Adding a kind = one struct field + one [`single_cell_side_data`]
+/// arm. Mirrors [`CellFillSources`]'s shape but per-fn instead of
+/// per-cell.
+struct SingleCellFills<'a> {
+    flags_fill: &'a Option<FlagsRuntimeFill>,
+    char_scratch: &'a Option<i32>,
+    handle_fill: &'a Option<HandleRuntimeFill>,
+}
+
+/// Wrap the per-fn fills into a [`CellSideData`] for a single-cell
+/// result. Match is exhaustive — Compound + un-wired kinds are
+/// `unreachable!()` because [`super::lift::classify_result_lift`]
+/// filters them out of the Direct / RetptrPair path.
+fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideData {
     match cell {
         Cell::Flags { .. } => {
-            CellSideData::Flags(Box::new(flags_fill.clone().expect(
+            CellSideData::Flags(Box::new(fills.flags_fill.clone().expect(
                 "flags single-cell result → flags-info builder must produce a fill",
             )))
         }
         Cell::Char { .. } => CellSideData::Char {
-            scratch_addr: char_scratch
+            scratch_addr: fills
+                .char_scratch
                 .expect("char single-cell result → char-info builder must produce a scratch addr"),
         },
-        _ => CellSideData::None,
+        Cell::Handle { .. } => {
+            CellSideData::Handle(Box::new(fills.handle_fill.clone().expect(
+                "handle single-cell result → handle-info builder must produce a fill",
+            )))
+        }
+        // Direct/RetptrPair-eligible kinds with no side-table contribution.
+        Cell::Bool { .. }
+        | Cell::IntegerSignExt { .. }
+        | Cell::IntegerZeroExt { .. }
+        | Cell::Integer64 { .. }
+        | Cell::FloatingF32 { .. }
+        | Cell::FloatingF64 { .. }
+        | Cell::Text { .. }
+        | Cell::Bytes { .. }
+        | Cell::EnumCase { .. } => CellSideData::None,
+        // Compound + un-wired — classify_result_lift filters these out.
+        Cell::RecordOf { .. }
+        | Cell::TupleOf { .. }
+        | Cell::Option { .. }
+        | Cell::Result { .. }
+        | Cell::Variant { .. }
+        | Cell::ListOf
+        | Cell::Future
+        | Cell::Stream
+        | Cell::ErrorContext => {
+            unreachable!("single_cell_side_data reached unsupported result Cell {cell:?}")
+        }
     }
 }
 
@@ -489,6 +522,7 @@ pub(super) fn lay_out_static_memory(
         per_param_range: handle_per_param_range_sym,
         per_result_range: handle_per_result_range_sym,
         per_cell_fill: mut handle_per_cell_fill,
+        per_result_single_fill: mut handle_per_result_single_fill,
     } = build_handle_info_blob(&per_func, &schema.handle_info_layout, handle_info_id);
 
     // Order doesn't matter for correctness — each placement assigns
@@ -521,6 +555,7 @@ pub(super) fn lay_out_static_memory(
         place_segment(&mut layout, &mut symbols, &mut relocs, handle_entries_seg);
     back_fill_handle_id_addrs(
         &mut handle_per_cell_fill,
+        &mut handle_per_result_single_fill,
         handle_entries_base,
         &schema.handle_info_layout,
     );
@@ -695,19 +730,21 @@ pub(super) fn lay_out_static_memory(
                 let ResultLift { source, .. } = rl;
                 let layout_source = match source {
                     ResultSource::Direct(cell) => {
-                        let side_data = single_cell_side_data(
-                            &cell,
-                            &flags_per_result_single_fill[i],
-                            &char_per_result_single[i],
-                        );
+                        let fills = SingleCellFills {
+                            flags_fill: &flags_per_result_single_fill[i],
+                            char_scratch: &char_per_result_single[i],
+                            handle_fill: &handle_per_result_single_fill[i],
+                        };
+                        let side_data = single_cell_side_data(&cell, &fills);
                         ResultSourceLayout::Direct { cell, side_data }
                     }
                     ResultSource::RetptrPair(cell) => {
-                        let side_data = single_cell_side_data(
-                            &cell,
-                            &flags_per_result_single_fill[i],
-                            &char_per_result_single[i],
-                        );
+                        let fills = SingleCellFills {
+                            flags_fill: &flags_per_result_single_fill[i],
+                            char_scratch: &char_per_result_single[i],
+                            handle_fill: &handle_per_result_single_fill[i],
+                        };
+                        let side_data = single_cell_side_data(&cell, &fills);
                         ResultSourceLayout::RetptrPair {
                             cell,
                             retptr_offset: retptr_offset

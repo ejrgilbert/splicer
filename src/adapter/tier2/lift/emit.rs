@@ -648,16 +648,21 @@ fn emit_lift_kind(
             };
             cell_layout.emit_char(f, addr, slot0, *scratch_addr, lcl.char_len);
         }
+        Cell::Handle { .. } => {
+            let CellSideData::Handle(fill) = side_data else {
+                panic!("Handle cell paired with non-Handle side data {side_data:?}");
+            };
+            emit_handle_runtime_fill(f, slot0, fill);
+            cell_layout.emit_resource_handle(f, addr, fill.side_table_idx);
+        }
         // Compound + un-wired variants aren't valid direct/retptr-pair
         // sources; classify_result_lift's whitelist filters them out.
-        // Handle is single-cell but its result-side codegen is Phase 3.
         Cell::RecordOf { .. }
         | Cell::TupleOf { .. }
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }
         | Cell::Variant { .. }
-        | Cell::Handle { .. }
         | Cell::Future
         | Cell::Stream
         | Cell::ErrorContext => unreachable!(

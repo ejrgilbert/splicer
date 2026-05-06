@@ -55,6 +55,7 @@ pub(super) use sidetable::flags_info::{
 };
 pub(super) use sidetable::handle_info::{
     back_fill_id_addrs as back_fill_handle_id_addrs, build_handle_info_blob, HandleInfoBlobs,
+    HandleRuntimeFill,
 };
 pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
 pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
