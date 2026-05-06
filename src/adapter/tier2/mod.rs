@@ -5,9 +5,10 @@
 //!
 //! Wired: primitives, `string`, `list<u8>`, `char`, `enum`, `flags`,
 //! `record`, `tuple<...>`, `option<T>`, `result<T, E>`, `variant`
-//! (both sides, sync + async). Un-wired: `list<T>` (non-u8),
-//! handles (`own`/`borrow`/`stream`/`future`), `error-context`.
-//! Roadmap: `docs/tiers/lift-codegen.md`.
+//! (both sides, sync + async); `own<R>` / `borrow<R>` resource
+//! handles (param side only — result side is roadmap phase 3).
+//! Un-wired: `list<T>` (non-u8), `stream<T>` / `future<T>`,
+//! `error-context`. Roadmap: `docs/tiers/lift-codegen.md`.
 //!
 //! Pipeline (driven by [`build_dispatch_module`]):
 //! 1. Classify — [`build_per_func_classified`] walks each target
@@ -912,6 +913,62 @@ mod tests {
             tier2_wit,
         )
         .expect("tier-2 adapter generation should succeed for variant param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// End-to-end test for `Cell::Handle` as a param. Drives the
+    /// per-cell handle-info entry placement + the runtime
+    /// `i64.extend_i32_u` write into the entry's `id` slot. Resource
+    /// type is exported by the inner component; `own<R>` and
+    /// `borrow<R>` both flatten to a single i32 (the canonical-ABI
+    /// handle), and the lift codegen treats them identically.
+    #[test]
+    fn dispatch_module_with_resource_handle_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume-own") (param i32))
+                    (func (export "consume-borrow") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume-own" (core func $consume-own))
+                (alias core export $i "consume-borrow" (core func $consume-borrow))
+                (type $r (resource (rep i32)))
+                (export $r-export "my-res" (type $r))
+                (type $own-r (own $r-export))
+                (type $borrow-r (borrow $r-export))
+                (type $consume-own-ty (func (param "h" $own-r)))
+                (type $consume-borrow-ty (func (param "h" $borrow-r)))
+                (func $consume-own-lifted (type $consume-own-ty)
+                    (canon lift (core func $consume-own)))
+                (func $consume-borrow-lifted (type $consume-borrow-ty)
+                    (canon lift (core func $consume-borrow)))
+                (instance $api-inst
+                    (export "my-res" (type $r-export))
+                    (export "consume-own" (func $consume-own-lifted))
+                    (export "consume-borrow" (func $consume-borrow-lifted)))
+                (export "my:rh/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:rh/api@1.0.0" (instance $api "my:rh/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:rh/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for resource handle param");
 
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)

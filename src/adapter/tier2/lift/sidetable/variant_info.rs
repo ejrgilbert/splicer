@@ -11,7 +11,10 @@ use super::super::super::blob::{NameInterner, RecordWriter, Segment, SymRef, Sym
 use super::super::super::schema::{VARIANT_INFO_CASE_NAME, VARIANT_INFO_PAYLOAD};
 use super::super::super::FuncClassified;
 use super::super::plan::{Cell, LiftPlan};
-use super::{ensure_registered, PerCellIndices, StringTable, INFO_TYPE_NAME};
+use super::{
+    ensure_registered, walk_per_cell_plans, PerCellIndices, PerCellPlanWalk, StringTable,
+    INFO_TYPE_NAME,
+};
 
 /// Per-(plan-cell) emit-phase data for one `Cell::Variant`.
 #[derive(Clone, Debug)]
@@ -74,9 +77,9 @@ pub(crate) fn register_variant_strings(
     table
 }
 
-/// Lay out the variant-info entries (one per `Cell::Variant`). All
-/// runtime-filled fields (`case-name` slot, `payload` slot) stay
-/// zeroed in the segment; the emit phase patches them per call.
+/// One variant-info entry per `Cell::Variant`. Runtime-filled
+/// fields (`case-name`, `payload`) stay zeroed in the segment;
+/// the wrapper patches them per call.
 pub(crate) fn build_variant_info_blob(
     per_func: &[FuncClassified],
     strings: &StringTable,
@@ -84,35 +87,12 @@ pub(crate) fn build_variant_info_blob(
     entries_id: SymbolId,
 ) -> VariantInfoBlobs {
     let mut builder = VariantInfoBuilder::new(entry_layout, entries_id);
-    let mut per_param_range: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
-    let mut per_param_fill: Vec<Vec<Vec<Option<VariantRuntimeFill>>>> =
-        Vec::with_capacity(per_func.len());
-    let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
-    let mut per_result_fill: Vec<Vec<Option<VariantRuntimeFill>>> =
-        Vec::with_capacity(per_func.len());
-
-    for fd in per_func {
-        let mut params_ranges = Vec::with_capacity(fd.params.len());
-        let mut params_fill = Vec::with_capacity(fd.params.len());
-        for p in &fd.params {
-            let (range, fill_map) = builder.append_plan(&p.plan, strings);
-            params_ranges.push(range);
-            params_fill.push(fill_map);
-        }
-        per_param_range.push(params_ranges);
-        per_param_fill.push(params_fill);
-
-        // Compound result plans can nest `Cell::Variant`. Direct
-        // variant-result lands in Phase 3.
-        let (result_range, result_fill_map) =
-            match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
-                Some(c) => builder.append_plan(&c.plan, strings),
-                None => (None, Vec::new()),
-            };
-        per_result_range.push(result_range);
-        per_result_fill.push(result_fill_map);
-    }
-
+    let PerCellPlanWalk {
+        per_param_range,
+        per_param_fill,
+        per_result_range,
+        per_result_fill,
+    } = walk_per_cell_plans(per_func, |plan| builder.append_plan(plan, strings));
     VariantInfoBlobs {
         entries: builder.finish(),
         per_param_range,

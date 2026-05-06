@@ -126,14 +126,21 @@ pub(crate) enum Cell {
         info: NamedListInfo,
     },
 
+    /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`. Single
+    /// i32 lift slot (canonical-ABI handle); the side-table entry
+    /// carries `(type-name, id)` with `id` = handle bits zero-extended
+    /// per call. `type_name` is interned at plan-build time.
+    Handle {
+        flat_slot: u32,
+        type_name: BlobSlice,
+    },
+
     // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
     //    + `emit_cell_op` until codegen lands) ─────────────────────
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
 
     // ── Un-wired handle ──────────────────────────────────────────
-    /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`.
-    Handle,
     /// `future<T>` → `cell::future-handle(u32)`.
     Future,
     /// `stream<T>` → `cell::stream-handle(u32)`.
@@ -321,9 +328,7 @@ impl LiftPlanBuilder {
                 }
                 wit_parser::TypeDefKind::Option(inner) => self.push_option(inner, resolve, names),
                 wit_parser::TypeDefKind::Result(_) => self.push_result(ty, resolve, names),
-                wit_parser::TypeDefKind::Handle(_) => {
-                    todo!("plan-builder for un-wired Cell::Handle")
-                }
+                wit_parser::TypeDefKind::Handle(h) => self.push_handle(h, resolve, names),
                 wit_parser::TypeDefKind::Future(_) => {
                     todo!("plan-builder for un-wired Cell::Future")
                 }
@@ -553,6 +558,26 @@ impl LiftPlanBuilder {
             disc_slot,
             per_case_payload,
             info,
+        })
+    }
+
+    /// `own<R>` / `borrow<R>` share `Cell::Handle` — both flatten to
+    /// one i32 (the canonical-ABI handle). Anonymous resources fall
+    /// back to "" for type-name (matches `push_record`).
+    fn push_handle(
+        &mut self,
+        h: &wit_parser::Handle,
+        resolve: &Resolve,
+        names: &mut NameInterner,
+    ) -> u32 {
+        let resource_id = match h {
+            wit_parser::Handle::Own(id) | wit_parser::Handle::Borrow(id) => *id,
+        };
+        let type_name = names.intern(resolve.types[resource_id].name.as_deref().unwrap_or(""));
+        let flat_slot = self.bump_flat_slot();
+        self.push_cell(Cell::Handle {
+            flat_slot,
+            type_name,
         })
     }
 

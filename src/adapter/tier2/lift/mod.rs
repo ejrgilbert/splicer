@@ -1,8 +1,7 @@
 //! Tier-2 lift codegen: classifying WIT types into cell variants,
 //! emitting the wasm that writes one cell per (param | result),
 //! and laying out the per-field-tree side tables (`enum-infos`,
-//! `record-infos`, `flags-infos`; `variant-infos` / `handle-infos`
-//! join as their lift codegen lands).
+//! `record-infos`, `flags-infos`, `variant-infos`, `handle-infos`).
 //!
 //! See [`docs/tiers/lift-codegen.md`](../../../../docs/tiers/lift-codegen.md)
 //! for the cross-tier design (data flow, invariants, why the plan
@@ -54,13 +53,16 @@ pub(super) use sidetable::flags_info::{
     back_fill_len_addrs as back_fill_flags_len_addrs, build_flags_info_blob, flags_scratch_sizes,
     register_flags_strings, FlagsInfoBlobs, FlagsRuntimeFill,
 };
+pub(super) use sidetable::handle_info::{
+    back_fill_id_addrs as back_fill_handle_id_addrs, build_handle_info_blob, HandleInfoBlobs,
+};
 pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
 pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
 pub(super) use sidetable::variant_info::{
     back_fill_entry_addrs as back_fill_variant_entry_addrs, build_variant_info_blob,
     register_variant_strings, VariantInfoBlobs,
 };
-pub(super) use sidetable::{fold_cell_side_data, CellSideData, SideTableBlob};
+pub(super) use sidetable::{fold_cell_side_data, CellFillSources, CellSideData, SideTableBlob};
 
 #[cfg(test)]
 mod tests;

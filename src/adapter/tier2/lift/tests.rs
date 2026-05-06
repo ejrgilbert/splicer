@@ -17,6 +17,7 @@ use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECO
 use super::super::{FuncClassified, FuncShape};
 use super::plan::{Cell, LiftPlan, NamedListInfo};
 use super::sidetable::flags_info::FlagsRuntimeFill;
+use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::CellSideData;
 use super::*;
@@ -58,6 +59,11 @@ const TEST_WIT: &str = r#"
         f-result-unit-err: func(r: result<_, string>);
         f-result-ok-unit: func(r: result<u32>);
         f-result-both-unit: func(r: result);
+        resource my-res;
+        record handle-pair { primary: own<my-res>, secondary: borrow<my-res> }
+        f-handle-own: func(h: own<my-res>);
+        f-handle-borrow: func(h: borrow<my-res>);
+        f-record-with-handle: func(hp: handle-pair);
     }
 "#;
 
@@ -234,7 +240,8 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             | Cell::IntegerZeroExt { flat_slot }
             | Cell::EnumCase { flat_slot, .. }
             | Cell::Flags { flat_slot, .. }
-            | Cell::Char { flat_slot } => put(*flat_slot, ValType::I32),
+            | Cell::Char { flat_slot }
+            | Cell::Handle { flat_slot, .. } => put(*flat_slot, ValType::I32),
             Cell::Integer64 { flat_slot } => put(*flat_slot, ValType::I64),
             Cell::FloatingF32 { flat_slot } => put(*flat_slot, ValType::F32),
             Cell::FloatingF64 { flat_slot } => put(*flat_slot, ValType::F64),
@@ -246,7 +253,7 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::Variant { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
-            Cell::ListOf | Cell::Handle | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+            Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
                 unreachable!("un-wired Cell variant {op:?} should not appear in test plans")
             }
         }
@@ -279,6 +286,8 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
     let mut flags_idx: u32 = 0;
     let mut variant_idx: u32 = 0;
     let mut char_cursor: u32 = 0x3000;
+    let mut handle_idx: u32 = 0;
+    let mut handle_id_cursor: u32 = 0x4000;
     plan.cells
         .iter()
         .map(|op| match op {
@@ -356,7 +365,36 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                     scratch_addr: scratch_addr as i32,
                 }
             }
-            _ => CellSideData::None,
+            Cell::Handle { .. } => {
+                /// Bytes per `handle-info.id` (u64, 8-aligned).
+                const U64_BYTES: u32 = 8;
+                let id_addr = handle_id_cursor;
+                handle_id_cursor += U64_BYTES;
+                let fill = HandleRuntimeFill {
+                    side_table_idx: handle_idx,
+                    entry_seg_off: 0, // not exercised by validate_emit_lift_plan
+                    id_addr: Some(id_addr as i32),
+                };
+                handle_idx += 1;
+                CellSideData::Handle(Box::new(fill))
+            }
+            // Mirror the production `fold_cell_side_data` exhaustivity
+            // contract — primitives and control-flow cells return
+            // None, un-wired variants `unreachable!()`.
+            Cell::Bool { .. }
+            | Cell::IntegerSignExt { .. }
+            | Cell::IntegerZeroExt { .. }
+            | Cell::Integer64 { .. }
+            | Cell::FloatingF32 { .. }
+            | Cell::FloatingF64 { .. }
+            | Cell::Text { .. }
+            | Cell::Bytes { .. }
+            | Cell::EnumCase { .. }
+            | Cell::Option { .. }
+            | Cell::Result { .. } => CellSideData::None,
+            Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+                unreachable!("auto_cell_side_data reached un-wired Cell variant {op:?}")
+            }
         })
         .collect()
 }
@@ -581,6 +619,78 @@ fn record_with_variant_field_recurses_into_variant() {
     );
     assert_eq!(plan.root(), 6);
     assert_eq!(plan.flat_slot_count, 4);
+}
+
+#[test]
+fn handle_assigns_one_cell_one_slot() {
+    // own<my-res>: a single i32 (the canonical-ABI handle) → one
+    // Cell::Handle with the resource's pre-interned type-name. The
+    // interner dedupes, so re-interning "my-res" off the same
+    // `names` returns the BlobSlice already on the cell.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(&func_named(&r, "f-handle-own").params[0].ty, &r, &mut names);
+    let res_name = names.intern("my-res");
+    assert_eq!(
+        plan.cells,
+        vec![Cell::Handle {
+            flat_slot: 0,
+            type_name: res_name,
+        }],
+    );
+    assert_eq!(plan.root(), 0);
+    assert_eq!(plan.flat_slot_count, 1);
+}
+
+#[test]
+fn borrow_handle_takes_same_shape_as_own() {
+    // borrow<R> and own<R> both flatten to a single i32 (the canonical-
+    // ABI handle); the lift codegen treats them identically. The
+    // ownership distinction is the adapter's job, not the lift's.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let own_plan = plan_for(&func_named(&r, "f-handle-own").params[0].ty, &r, &mut names);
+    let borrow_plan = plan_for(
+        &func_named(&r, "f-handle-borrow").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(own_plan.cells, borrow_plan.cells);
+    assert_eq!(own_plan.flat_slot_count, borrow_plan.flat_slot_count);
+}
+
+#[test]
+fn record_with_handle_field_recurses_into_handle() {
+    // handle-pair { primary: own<my-res>, secondary: borrow<my-res> }
+    //   primary    → cell 0 (Handle slot 0)
+    //   secondary  → cell 1 (Handle slot 1)
+    //   hp         → cell 2 (RecordOf primary=0, secondary=1)
+    // Both fields point at the same `my-res` resource, so the
+    // pre-interned type-name BlobSlice is shared (interner dedupes).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("handle-pair", &r, &mut names);
+    let res_name = names.intern("my-res");
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::Handle {
+                flat_slot: 0,
+                type_name: res_name,
+            },
+            Cell::Handle {
+                flat_slot: 1,
+                type_name: res_name,
+            },
+            record_of(
+                &mut names,
+                "handle-pair",
+                &[("primary", 0), ("secondary", 1)],
+            ),
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
@@ -1216,6 +1326,13 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &r,
             &mut names,
         ),
+        plan_for(&func_named(&r, "f-handle-own").params[0].ty, &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-handle-borrow").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for_named("handle-pair", &r, &mut names),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan);

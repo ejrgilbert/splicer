@@ -244,8 +244,8 @@ pub(crate) fn classify_result_lift(
 
     // Single-cell direct/retptr-pair path: build a one-cell plan and
     // pull its single Cell out as the variant tag for emit dispatch.
-    // Returns None for un-wired result types (list / char / handles)
-    // — wrapper still calls after-hook with option::none for `result`.
+    // Returns None for un-wired result types (list / handles) —
+    // wrapper still calls after-hook with option::none for `result`.
     let cell = single_cell_for_result(ty, resolve, names)?;
     let side_table = side_table_info_for_cell(&cell);
     let source = if result_at_retptr {

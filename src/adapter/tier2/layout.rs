@@ -14,20 +14,20 @@ use wit_parser::Function as WitFunction;
 
 use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
-use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, SymbolBases};
+use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, Segment, SymRef, SymbolBases};
 use super::lift::plan::Cell;
 use super::lift::{
-    back_fill_flags_len_addrs, back_fill_variant_entry_addrs, build_char_scratch_map,
-    build_enum_info_blob, build_flags_info_blob, build_record_info_blob, build_tuple_indices_blob,
-    build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes, fold_cell_side_data,
-    register_enum_strings, register_flags_strings, register_variant_strings, CellSideData,
-    CharScratchMaps, FlagsInfoBlobs, FlagsRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout,
-    ResultLift, ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob,
-    VariantInfoBlobs,
+    back_fill_flags_len_addrs, back_fill_handle_id_addrs, back_fill_variant_entry_addrs,
+    build_char_scratch_map, build_enum_info_blob, build_flags_info_blob, build_handle_info_blob,
+    build_record_info_blob, build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes,
+    flags_scratch_sizes, fold_cell_side_data, register_enum_strings, register_flags_strings,
+    register_variant_strings, CellFillSources, CellSideData, CharScratchMaps, FlagsInfoBlobs,
+    FlagsRuntimeFill, HandleInfoBlobs, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
+    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
-    TREE_FLAGS_INFOS, TREE_RECORD_INFOS, TREE_ROOT, TREE_VARIANT_INFOS,
+    TREE_FLAGS_INFOS, TREE_HANDLE_INFOS, TREE_RECORD_INFOS, TREE_ROOT, TREE_VARIANT_INFOS,
 };
 use super::{AfterSetup, FuncClassified, FuncDispatch};
 
@@ -150,7 +150,7 @@ struct FieldSideTables {
     flags_infos: BlobSlice,
     record_infos: BlobSlice,
     variant_infos: BlobSlice,
-    // handle_infos: BlobSlice,
+    handle_infos: BlobSlice,
 }
 
 impl FieldSideTables {
@@ -159,7 +159,7 @@ impl FieldSideTables {
         tree.write_slice(blob, TREE_FLAGS_INFOS, self.flags_infos);
         tree.write_slice(blob, TREE_RECORD_INFOS, self.record_infos);
         tree.write_slice(blob, TREE_VARIANT_INFOS, self.variant_infos);
-        // tree.write_slice(blob, TREE_HANDLE_INFOS, self.handle_infos);
+        tree.write_slice(blob, TREE_HANDLE_INFOS, self.handle_infos);
     }
 }
 
@@ -283,6 +283,39 @@ fn build_after_params_blob(
     blob
 }
 
+/// Place one segment, register its symbol, queue its cross-segment
+/// relocs (no-op when `seg.relocs` is empty). Returns the placed base.
+fn place_segment(
+    layout: &mut StaticLayout,
+    symbols: &mut SymbolBases,
+    relocs: &mut RelocPlan,
+    seg: Segment,
+) -> u32 {
+    let (base, idx) = layout.place_data(seg.align, &seg.bytes);
+    symbols.set(seg.id, base);
+    relocs.record_segment(idx, base, seg.relocs);
+    base
+}
+
+/// Resolve a per-(fn, param) and per-fn pair of `SymRef` grids to
+/// absolute `BlobSlice` grids. Mechanical mapping shared by every
+/// per-cell side-table kind whose ranges land in `FieldSideTables`.
+fn resolve_param_result_ranges(
+    symbols: &SymbolBases,
+    per_param_sym: Vec<Vec<Option<SymRef>>>,
+    per_result_sym: Vec<Option<SymRef>>,
+) -> (Vec<Vec<BlobSlice>>, Vec<BlobSlice>) {
+    let per_param = per_param_sym
+        .into_iter()
+        .map(|v| v.into_iter().map(|s| resolve(s, symbols)).collect())
+        .collect();
+    let per_result = per_result_sym
+        .into_iter()
+        .map(|s| resolve(s, symbols))
+        .collect();
+    (per_param, per_result)
+}
+
 /// Reserve scratch + place data segments for everything the wrapper
 /// body references at runtime, then assemble immutable
 /// [`FuncDispatch`] records combining each [`FuncClassified`] with
@@ -393,6 +426,7 @@ pub(super) fn lay_out_static_memory(
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
     let variant_info_id = symbols.alloc();
+    let handle_info_id = symbols.alloc();
     let enum_info = build_enum_info_blob(
         &per_func,
         &enum_strings,
@@ -450,106 +484,73 @@ pub(super) fn lay_out_static_memory(
         &schema.variant_info_layout,
         variant_info_id,
     );
+    let HandleInfoBlobs {
+        entries: handle_entries_seg,
+        per_param_range: handle_per_param_range_sym,
+        per_result_range: handle_per_result_range_sym,
+        per_cell_fill: mut handle_per_cell_fill,
+    } = build_handle_info_blob(&per_func, &schema.handle_info_layout, handle_info_id);
 
     // Order doesn't matter for correctness — each placement assigns
     // a base, relocs land later. Coalesced same-alignment segments
     // sit back-to-back as a side effect of the order chosen here.
-    let (record_tuples_base, record_tuples_idx) =
-        layout.place_data(record_tuples_seg.align, &record_tuples_seg.bytes);
-    symbols.set(record_tuples_seg.id, record_tuples_base);
-    relocs.record_segment(
-        record_tuples_idx,
-        record_tuples_base,
-        record_tuples_seg.relocs,
-    );
+    place_segment(&mut layout, &mut symbols, &mut relocs, record_tuples_seg);
+    place_segment(&mut layout, &mut symbols, &mut relocs, record_entries_seg);
+    place_segment(&mut layout, &mut symbols, &mut relocs, enum_segment);
+    place_segment(&mut layout, &mut symbols, &mut relocs, tuple_indices_seg);
 
-    let (record_entries_base, record_entries_idx) =
-        layout.place_data(record_entries_seg.align, &record_entries_seg.bytes);
-    symbols.set(record_entries_seg.id, record_entries_base);
-    relocs.record_segment(
-        record_entries_idx,
-        record_entries_base,
-        record_entries_seg.relocs,
-    );
-
-    let (enum_info_base, enum_info_idx) =
-        layout.place_data(enum_segment.align, &enum_segment.bytes);
-    symbols.set(enum_segment.id, enum_info_base);
-    relocs.record_segment(enum_info_idx, enum_info_base, enum_segment.relocs);
-
-    // Flags-info entries: place, then back-fill the per-cell
-    // `set_flags_len_addr` (only knowable after placement).
-    let (flags_entries_base, _flags_entries_idx) =
-        layout.place_data(flags_entries_seg.align, &flags_entries_seg.bytes);
-    symbols.set(flags_entries_seg.id, flags_entries_base);
-    debug_assert!(flags_entries_seg.relocs.is_empty());
+    // Runtime-filled entry segments: place, then back-fill per-cell
+    // slot addresses (only knowable after placement).
+    let flags_entries_base =
+        place_segment(&mut layout, &mut symbols, &mut relocs, flags_entries_seg);
     back_fill_flags_len_addrs(
         &mut flags_per_cell_fill,
         &mut flags_per_result_single_fill,
         flags_entries_base,
         &schema.flags_info_layout,
     );
-
-    let (tuple_indices_base, tuple_indices_idx) =
-        layout.place_data(tuple_indices_seg.align, &tuple_indices_seg.bytes);
-    symbols.set(tuple_indices_seg.id, tuple_indices_base);
-    relocs.record_segment(
-        tuple_indices_idx,
-        tuple_indices_base,
-        tuple_indices_seg.relocs,
-    );
-
-    // Variant-info entries: same pattern as flags-info — place, then
-    // back-fill the per-cell `case_name_addr` + `payload_addr`.
-    let (variant_entries_base, _variant_entries_idx) =
-        layout.place_data(variant_entries_seg.align, &variant_entries_seg.bytes);
-    symbols.set(variant_entries_seg.id, variant_entries_base);
-    debug_assert!(variant_entries_seg.relocs.is_empty());
+    let variant_entries_base =
+        place_segment(&mut layout, &mut symbols, &mut relocs, variant_entries_seg);
     back_fill_variant_entry_addrs(
         &mut variant_per_cell_fill,
         variant_entries_base,
         &schema.variant_info_layout,
         schema.variant_info_payload_value_off,
     );
+    let handle_entries_base =
+        place_segment(&mut layout, &mut symbols, &mut relocs, handle_entries_seg);
+    back_fill_handle_id_addrs(
+        &mut handle_per_cell_fill,
+        handle_entries_base,
+        &schema.handle_info_layout,
+    );
 
-    // Resolve per-(fn, param) and per-(fn, result) [`SymRef`]s to
-    // absolute [`BlobSlice`]s now that every segment has a base.
-    let enum_per_param: Vec<Vec<BlobSlice>> = enum_per_param_sym
-        .into_iter()
-        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
-        .collect();
-    let enum_per_result: Vec<BlobSlice> = enum_per_result_sym
-        .into_iter()
-        .map(|s| resolve(s, &symbols))
-        .collect();
-    let flags_per_param_range: Vec<Vec<BlobSlice>> = flags_per_param_range_sym
-        .into_iter()
-        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
-        .collect();
-    let flags_per_result_range: Vec<BlobSlice> = flags_per_result_range_sym
-        .into_iter()
-        .map(|s| resolve(s, &symbols))
-        .collect();
-    let record_per_param_range: Vec<Vec<BlobSlice>> = record_per_param_range_sym
-        .into_iter()
-        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
-        .collect();
-    let record_per_result_range: Vec<BlobSlice> = record_per_result_range_sym
-        .into_iter()
-        .map(|s| resolve(s, &symbols))
-        .collect();
-    let variant_per_param_range: Vec<Vec<BlobSlice>> = variant_per_param_range_sym
-        .into_iter()
-        .map(|v| v.into_iter().map(|s| resolve(s, &symbols)).collect())
-        .collect();
-    let variant_per_result_range: Vec<BlobSlice> = variant_per_result_range_sym
-        .into_iter()
-        .map(|s| resolve(s, &symbols))
-        .collect();
-    // Tuple-indices stay symbolic until the FuncDispatch assembly
-    // resolves them per (fn, param | result) via
-    // [`PerCellIndices::resolve_param`] /
-    // [`PerCellIndices::resolve_result`].
+    // Resolve per-(fn, param) and per-fn `SymRef`s to absolute
+    // `BlobSlice`s now that every segment has a base. Tuple-indices
+    // stay symbolic until the FuncDispatch assembly resolves them
+    // per (fn, param | result) via `PerCellIndices::resolve_*`.
+    let (enum_per_param, enum_per_result) =
+        resolve_param_result_ranges(&symbols, enum_per_param_sym, enum_per_result_sym);
+    let (flags_per_param_range, flags_per_result_range) = resolve_param_result_ranges(
+        &symbols,
+        flags_per_param_range_sym,
+        flags_per_result_range_sym,
+    );
+    let (record_per_param_range, record_per_result_range) = resolve_param_result_ranges(
+        &symbols,
+        record_per_param_range_sym,
+        record_per_result_range_sym,
+    );
+    let (variant_per_param_range, variant_per_result_range) = resolve_param_result_ranges(
+        &symbols,
+        variant_per_param_range_sym,
+        variant_per_result_range_sym,
+    );
+    let (handle_per_param_range, handle_per_result_range) = resolve_param_result_ranges(
+        &symbols,
+        handle_per_param_range_sym,
+        handle_per_result_range_sym,
+    );
 
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
@@ -562,6 +563,7 @@ pub(super) fn lay_out_static_memory(
                     flags_infos: flags_per_param_range[fn_idx][p_idx],
                     record_infos: record_per_param_range[fn_idx][p_idx],
                     variant_infos: variant_per_param_range[fn_idx][p_idx],
+                    handle_infos: handle_per_param_range[fn_idx][p_idx],
                 })
                 .collect()
         })
@@ -572,6 +574,7 @@ pub(super) fn lay_out_static_memory(
             flags_infos: flags_per_result_range[fn_idx],
             record_infos: record_per_result_range[fn_idx],
             variant_infos: variant_per_result_range[fn_idx],
+            handle_infos: handle_per_result_range[fn_idx],
         })
         .collect();
 
@@ -669,14 +672,15 @@ pub(super) fn lay_out_static_memory(
                 .enumerate()
                 .map(|(p_idx, lift)| {
                     let tuple_slices = tuple_indices_per_cell.resolve_param(i, p_idx, &symbols);
-                    let cell_side = fold_cell_side_data(
-                        &lift.plan,
-                        record_info_per_cell.for_param(i, p_idx),
-                        &tuple_slices,
-                        flags_per_cell_fill.for_param(i, p_idx),
-                        variant_per_cell_fill.for_param(i, p_idx),
-                        char_scratch_map.for_param(i, p_idx),
-                    );
+                    let sources = CellFillSources {
+                        record_info: record_info_per_cell.for_param(i, p_idx),
+                        tuple_indices: &tuple_slices,
+                        flags_fill: flags_per_cell_fill.for_param(i, p_idx),
+                        variant_fill: variant_per_cell_fill.for_param(i, p_idx),
+                        char_scratch: char_scratch_map.for_param(i, p_idx),
+                        handle_fill: handle_per_cell_fill.for_param(i, p_idx),
+                    };
+                    let cell_side = fold_cell_side_data(&lift.plan, &sources);
                     ParamLayout {
                         lift,
                         cells_offset: fn_cells_offsets[p_idx],
@@ -713,14 +717,15 @@ pub(super) fn lay_out_static_memory(
                     }
                     ResultSource::Compound(compound) => {
                         let tuple_slices = tuple_indices_per_cell.resolve_result(i, &symbols);
-                        let cell_side = fold_cell_side_data(
-                            &compound.plan,
-                            record_info_per_cell.for_result(i),
-                            &tuple_slices,
-                            flags_per_cell_fill.for_result(i),
-                            variant_per_cell_fill.for_result(i),
-                            char_scratch_map.for_result(i),
-                        );
+                        let sources = CellFillSources {
+                            record_info: record_info_per_cell.for_result(i),
+                            tuple_indices: &tuple_slices,
+                            flags_fill: flags_per_cell_fill.for_result(i),
+                            variant_fill: variant_per_cell_fill.for_result(i),
+                            char_scratch: char_scratch_map.for_result(i),
+                            handle_fill: handle_per_cell_fill.for_result(i),
+                        };
+                        let cell_side = fold_cell_side_data(&compound.plan, &sources);
                         ResultSourceLayout::Compound {
                             compound,
                             retptr_offset: retptr_offset

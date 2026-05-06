@@ -16,7 +16,7 @@ use super::super::super::schema::{
 };
 use super::super::super::FuncClassified;
 use super::super::plan::{Cell, LiftPlan};
-use super::{PerCellIndices, INFO_TYPE_NAME};
+use super::{walk_per_cell_plans, PerCellIndices, PerCellPlanWalk, INFO_TYPE_NAME};
 
 /// Output of [`build_record_info_blob`]. Two [`Segment`]s — the
 /// `entries` segment carries one [`Reloc`] per record-cell, pointing
@@ -151,10 +151,9 @@ impl<'a> RecordInfoBuilder<'a> {
     }
 }
 
-/// Lay out the per-(fn, param) and per-(fn, compound-result) record-
-/// info entries + their (name, cell-idx) tuples arena. Each
-/// `Cell::RecordOf` in a plan contributes one entry; the entry's
-/// side-table index is its position in that plan's contiguous range.
+/// One `record-info` entry per `Cell::RecordOf` (param + compound
+/// result plans). The entry's side-table index is its position in
+/// that plan's contiguous range.
 pub(crate) fn build_record_info_blob(
     per_func: &[FuncClassified],
     entry_layout: &RecordLayout,
@@ -163,31 +162,12 @@ pub(crate) fn build_record_info_blob(
     tuples_id: SymbolId,
 ) -> RecordInfoBlobs {
     let mut builder = RecordInfoBuilder::new(entry_layout, tuple_layout, entries_id, tuples_id);
-    let mut per_param_range: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
-    let mut per_param_cell_idx: Vec<Vec<Vec<Option<u32>>>> = Vec::with_capacity(per_func.len());
-    let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
-    let mut per_result_cell_idx: Vec<Vec<Option<u32>>> = Vec::with_capacity(per_func.len());
-
-    for fd in per_func {
-        let mut params_ranges = Vec::with_capacity(fd.params.len());
-        let mut params_cell_idx = Vec::with_capacity(fd.params.len());
-        for p in &fd.params {
-            let (range, cell_idx_map) = builder.append_plan(&p.plan);
-            params_ranges.push(range);
-            params_cell_idx.push(cell_idx_map);
-        }
-        per_param_range.push(params_ranges);
-        per_param_cell_idx.push(params_cell_idx);
-
-        let (result_range, result_cell_idx_map) =
-            match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
-                Some(c) => builder.append_plan(&c.plan),
-                None => (None, Vec::new()),
-            };
-        per_result_range.push(result_range);
-        per_result_cell_idx.push(result_cell_idx_map);
-    }
-
+    let PerCellPlanWalk {
+        per_param_range,
+        per_param_fill: per_param_cell_idx,
+        per_result_range,
+        per_result_fill: per_result_cell_idx,
+    } = walk_per_cell_plans(per_func, |plan| builder.append_plan(plan));
     let (entries_seg, tuples_seg) = builder.finish();
     RecordInfoBlobs {
         entries: entries_seg,

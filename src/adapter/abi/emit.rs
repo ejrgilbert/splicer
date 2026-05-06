@@ -475,11 +475,12 @@ pub(crate) const MAX_UTF8_LEN: u32 = char::MAX.len_utf8() as u32;
 pub(crate) const OPTION_NONE: u8 = 0;
 pub(crate) const OPTION_SOME: u8 = 1;
 
-/// Log2 alignment values for wasm `i32.store` / `i32.store8`.
-/// `MemArg::align` is in log2 form; these are wasm-format constants,
-/// not Resolve-derivable.
+/// Log2 alignment values for wasm `i32.store` / `i32.store8` /
+/// `i64.store`. `MemArg::align` is in log2 form; these are wasm-
+/// format constants, not Resolve-derivable.
 pub(crate) const I32_STORE_LOG2_ALIGN: u32 = 2;
 pub(crate) const I8_STORE_LOG2_ALIGN: u32 = 0;
+pub(crate) const I64_STORE_LOG2_ALIGN: u32 = 3;
 
 // `splicer:common/types.call-id` field names — encapsulated by
 // [`CallIdLayout`]'s typed accessors so call sites can't fat-finger
@@ -569,7 +570,7 @@ pub(crate) fn emit_store_i64_local(f: &mut Function, base_ptr: i32, field_off: u
     f.instructions().local_get(local);
     f.instructions().i64_store(MemArg {
         offset: field_off as u64,
-        align: 3,
+        align: I64_STORE_LOG2_ALIGN,
         memory_index: 0,
     });
 }

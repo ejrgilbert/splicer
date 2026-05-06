@@ -7,8 +7,9 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Resolve, SizeAlign};
 
 use super::super::super::abi::emit::{
-    direct_return_type, wasm_type_to_val, I32_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, OPTION_NONE,
-    OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
+    direct_return_type, wasm_type_to_val, I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN,
+    I8_STORE_LOG2_ALIGN, OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
+    STRING_FLAT_BYTES,
 };
 use super::super::super::abi::WasmEncoderBindgen;
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
@@ -17,6 +18,7 @@ use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
 use super::plan::{Cell, LiftPlan};
 use super::sidetable::flags_info::FlagsRuntimeFill;
+use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::CellSideData;
 
@@ -419,10 +421,34 @@ fn emit_cell_op(
                 lcl.char_len,
             );
         }
-        Cell::ListOf | Cell::Handle | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+        Cell::Handle { flat_slot, .. } => {
+            let CellSideData::Handle(fill) = side_data else {
+                panic!("Handle cell paired with non-Handle side data {side_data:?}");
+            };
+            emit_handle_runtime_fill(f, local_base + *flat_slot, fill);
+            cell_layout.emit_resource_handle(f, lcl.addr, fill.side_table_idx);
+        }
+        Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
             todo!("emit_cell_op for un-wired Cell variant {op:?}")
         }
     }
+}
+
+/// Patch one `Cell::Handle`'s `id: u64` slot per call: zero-extend
+/// the i32 handle bits. Per-instance correlation (same bits → same
+/// id) — see `handle-info` in `wit/common/world.wit`.
+fn emit_handle_runtime_fill(f: &mut Function, handle_local: u32, fill: &HandleRuntimeFill) {
+    let id_addr = fill
+        .id_addr
+        .expect("id_addr unset — layout must run back_fill_handle_id_addrs");
+    f.instructions().i32_const(id_addr);
+    f.instructions().local_get(handle_local);
+    f.instructions().i64_extend_i32_u();
+    f.instructions().i64_store(MemArg {
+        offset: 0,
+        align: I64_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    });
 }
 
 /// Per-bit unrolled bit-walk filling the cell's scratch buffer with
@@ -624,13 +650,14 @@ fn emit_lift_kind(
         }
         // Compound + un-wired variants aren't valid direct/retptr-pair
         // sources; classify_result_lift's whitelist filters them out.
+        // Handle is single-cell but its result-side codegen is Phase 3.
         Cell::RecordOf { .. }
         | Cell::TupleOf { .. }
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }
         | Cell::Variant { .. }
-        | Cell::Handle
+        | Cell::Handle { .. }
         | Cell::Future
         | Cell::Stream
         | Cell::ErrorContext => unreachable!(

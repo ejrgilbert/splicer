@@ -32,11 +32,13 @@ use super::plan::{Cell, LiftPlan, NamedListInfo};
 pub(super) mod char_info;
 pub(super) mod enum_info;
 pub(super) mod flags_info;
+pub(super) mod handle_info;
 pub(super) mod record_info;
 pub(super) mod tuple_indices;
 pub(super) mod variant_info;
 
 use flags_info::FlagsRuntimeFill;
+use handle_info::HandleRuntimeFill;
 use variant_info::VariantRuntimeFill;
 
 /// Per-plan-cell side-table data the emit phase reads. One entry per
@@ -68,6 +70,23 @@ pub(crate) enum CellSideData {
     Char {
         scratch_addr: i32,
     },
+    /// `cell::resource-handle(u32)` payload + the wrapper-patched
+    /// `id` slot address. Boxed for the same reason as Flags/Variant.
+    Handle(Box<HandleRuntimeFill>),
+}
+
+/// Per-cell fill maps for one (fn, param | result), each parallel to
+/// `plan.cells` and sourced from the matching side-table builder.
+/// Bundled to keep [`fold_cell_side_data`]'s signature stable as new
+/// kinds land — adding one here + the matching `fold_cell_side_data`
+/// arm is the full change.
+pub(crate) struct CellFillSources<'a> {
+    pub record_info: &'a [Option<u32>],
+    pub tuple_indices: &'a [Option<BlobSlice>],
+    pub flags_fill: &'a [Option<FlagsRuntimeFill>],
+    pub variant_fill: &'a [Option<VariantRuntimeFill>],
+    pub char_scratch: &'a [Option<i32>],
+    pub handle_fill: &'a [Option<HandleRuntimeFill>],
 }
 
 /// Fold the per-builder per-cell maps into one [`Vec<CellSideData>`]
@@ -75,43 +94,119 @@ pub(crate) enum CellSideData {
 /// that decides "this cell wants that kind's bookkeeping."
 pub(crate) fn fold_cell_side_data(
     plan: &LiftPlan,
-    record_info: &[Option<u32>],
-    tuple_indices: &[Option<BlobSlice>],
-    flags_fill: &[Option<FlagsRuntimeFill>],
-    variant_fill: &[Option<VariantRuntimeFill>],
-    char_scratch: &[Option<i32>],
+    sources: &CellFillSources<'_>,
 ) -> Vec<CellSideData> {
-    debug_assert_eq!(record_info.len(), plan.cells.len());
-    debug_assert_eq!(tuple_indices.len(), plan.cells.len());
-    debug_assert_eq!(flags_fill.len(), plan.cells.len());
-    debug_assert_eq!(variant_fill.len(), plan.cells.len());
-    debug_assert_eq!(char_scratch.len(), plan.cells.len());
+    let n = plan.cells.len();
+    debug_assert_eq!(sources.record_info.len(), n);
+    debug_assert_eq!(sources.tuple_indices.len(), n);
+    debug_assert_eq!(sources.flags_fill.len(), n);
+    debug_assert_eq!(sources.variant_fill.len(), n);
+    debug_assert_eq!(sources.char_scratch.len(), n);
+    debug_assert_eq!(sources.handle_fill.len(), n);
     plan.cells
         .iter()
         .enumerate()
         .map(|(i, cell)| match cell {
+            // Side-data-bearing kinds.
             Cell::RecordOf { .. } => CellSideData::Record {
-                idx: record_info[i].expect("RecordOf cell missing record-info idx"),
+                idx: sources.record_info[i].expect("RecordOf cell missing record-info idx"),
             },
             Cell::TupleOf { .. } => CellSideData::Tuple {
-                slice: tuple_indices[i].expect("TupleOf cell missing tuple-indices slice"),
+                slice: sources.tuple_indices[i].expect("TupleOf cell missing tuple-indices slice"),
             },
             Cell::Flags { .. } => CellSideData::Flags(Box::new(
-                flags_fill[i]
+                sources.flags_fill[i]
                     .clone()
                     .expect("Flags cell missing runtime-fill bundle"),
             )),
             Cell::Variant { .. } => CellSideData::Variant(Box::new(
-                variant_fill[i]
+                sources.variant_fill[i]
                     .clone()
                     .expect("Variant cell missing runtime-fill bundle"),
             )),
             Cell::Char { .. } => CellSideData::Char {
-                scratch_addr: char_scratch[i].expect("Char cell missing scratch addr"),
+                scratch_addr: sources.char_scratch[i].expect("Char cell missing scratch addr"),
             },
-            _ => CellSideData::None,
+            Cell::Handle { .. } => CellSideData::Handle(Box::new(
+                sources.handle_fill[i]
+                    .clone()
+                    .expect("Handle cell missing runtime-fill bundle"),
+            )),
+            // Wired primitives + control-flow cells that read purely
+            // from flat slots — no side-table contribution. Listed
+            // explicitly (no `_` catchall) so adding a new wired
+            // variant forces a fold-arm decision at compile time,
+            // mirroring [`super::emit::emit_cell_op`].
+            Cell::Bool { .. }
+            | Cell::IntegerSignExt { .. }
+            | Cell::IntegerZeroExt { .. }
+            | Cell::Integer64 { .. }
+            | Cell::FloatingF32 { .. }
+            | Cell::FloatingF64 { .. }
+            | Cell::Text { .. }
+            | Cell::Bytes { .. }
+            | Cell::EnumCase { .. }
+            | Cell::Option { .. }
+            | Cell::Result { .. } => CellSideData::None,
+            // Un-wired — plan-builder `todo!()`s before constructing
+            // these. Reaching this arm means an un-wired variant
+            // slipped through the plan-builder's gate.
+            Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+                unreachable!("fold_cell_side_data reached un-wired Cell variant {cell:?}")
+            }
         })
         .collect()
+}
+
+// ─── Per-cell-fill plan walk (record / variant / handle) ─────────
+//
+// Shared outer loop: walk every (fn, param) plan + the compound-
+// result plan (if any), collecting `(range, per-cell-fill)` from
+// each `append_plan` call. Flags has its own loop because of the
+// single-cell-result branch; tuple-indices has no range concept.
+
+pub(super) struct PerCellPlanWalk<T> {
+    pub per_param_range: Vec<Vec<Option<SymRef>>>,
+    pub per_param_fill: Vec<Vec<Vec<Option<T>>>>,
+    pub per_result_range: Vec<Option<SymRef>>,
+    pub per_result_fill: Vec<Vec<Option<T>>>,
+}
+
+pub(super) fn walk_per_cell_plans<T>(
+    per_func: &[FuncClassified],
+    mut append_plan: impl FnMut(&LiftPlan) -> (Option<SymRef>, Vec<Option<T>>),
+) -> PerCellPlanWalk<T> {
+    let mut per_param_range: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
+    let mut per_param_fill: Vec<Vec<Vec<Option<T>>>> = Vec::with_capacity(per_func.len());
+    let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
+    let mut per_result_fill: Vec<Vec<Option<T>>> = Vec::with_capacity(per_func.len());
+
+    for fd in per_func {
+        let mut params_ranges = Vec::with_capacity(fd.params.len());
+        let mut params_fill = Vec::with_capacity(fd.params.len());
+        for p in &fd.params {
+            let (range, fill_map) = append_plan(&p.plan);
+            params_ranges.push(range);
+            params_fill.push(fill_map);
+        }
+        per_param_range.push(params_ranges);
+        per_param_fill.push(params_fill);
+
+        let (result_range, result_fill_map) =
+            match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
+                Some(c) => append_plan(&c.plan),
+                None => (None, Vec::new()),
+            };
+        per_result_range.push(result_range);
+        per_result_fill.push(result_fill_map);
+    }
+
+    PerCellPlanWalk {
+        per_param_range,
+        per_param_fill,
+        per_result_range,
+        per_result_fill,
+    }
 }
 
 // ─── Per-cell side-table indices ─────────────────────────────────
