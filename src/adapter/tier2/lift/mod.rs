@@ -26,7 +26,7 @@
 //!   per-param plans for nominal `Cell` cases.
 //! - [`emit`] — walks `plan.cells` and emits one wasm cell per
 //!   [`plan::Cell`] via `emit_cell_op`. [`emit::emit_lift_result`]
-//!   handles single-cell direct/retptr-pair result lifts;
+//!   handles Direct (sync flat) result lifts;
 //!   compound result lifts reuse [`emit::emit_lift_plan`] over
 //!   retptr-loaded synth locals.
 

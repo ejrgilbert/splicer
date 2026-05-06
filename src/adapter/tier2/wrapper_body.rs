@@ -260,7 +260,7 @@ pub(super) fn emit_wrapper_function(
                         &lcl,
                     );
                 }
-                ResultEmitPlan::Direct { .. } | ResultEmitPlan::RetptrPair { .. } => {
+                ResultEmitPlan::Direct { .. } => {
                     f.instructions().i32_const(cells_off as i32);
                     f.instructions().local_set(lcl.addr);
                     emit_lift_result(&mut f, &schema.cell_layout, &result_emit, &lcl);

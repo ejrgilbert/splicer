@@ -50,10 +50,10 @@ pub(crate) struct FlagsInfoBlobs {
     pub per_param_range: Vec<Vec<Option<SymRef>>>,
     pub per_result_range: Vec<Option<SymRef>>,
     pub per_cell_fill: PerCellIndices<FlagsRuntimeFill>,
-    /// Per-fn fill for a single-cell flags result (Direct or RetptrPair
-    /// — both lift one `Cell::Flags`, with no plan to attach it to).
-    /// `Some` when the func's result classifies as a single
-    /// `Cell::Flags`.
+    /// Per-fn fill for a Direct (sync flat) `Cell::Flags` result —
+    /// no plan to attach it to since `lcl.result` is the source.
+    /// Retptr-loaded flags results route through Compound and
+    /// register via `per_cell_fill`.
     pub per_result_single_fill: Vec<Option<FlagsRuntimeFill>>,
 }
 
@@ -120,9 +120,9 @@ pub(crate) fn build_flags_info_blob(
         per_param_range.push(params_ranges);
         per_param_fill.push(params_fill);
 
-        // Result side: Compound (record/tuple/option/result with
-        // possibly-nested flags) walks the plan; single-cell flags
-        // (Direct or RetptrPair) appends one entry inline.
+        // Result side: Compound (multi-cell + retptr-loaded single-
+        // cell) walks the plan; Direct (sync flat) appends one
+        // entry inline.
         let (result_range, result_fill_map, single_fill) = match fd.result_lift.as_ref() {
             Some(rl) => match (rl.compound(), rl.side_table.flags_info.as_ref()) {
                 (Some(c), None) => {
@@ -200,8 +200,8 @@ impl<'a> FlagsInfoBuilder<'a> {
         (range, fill_map)
     }
 
-    /// Append one entry for a single-cell flags result (Direct or
-    /// RetptrPair). Mirrors [`Self::append_plan`] for the no-plan case.
+    /// Append one entry for a Direct (sync flat) flags result.
+    /// Mirrors [`Self::append_plan`] for the no-plan case.
     fn append_direct(
         &mut self,
         info: &NamedListInfo,

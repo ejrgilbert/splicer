@@ -103,20 +103,19 @@ fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
     Ok(())
 }
 
-/// Per-fn fills for a single-cell (Direct / RetptrPair) result.
-/// Adding a kind = one struct field + one [`single_cell_side_data`]
-/// arm. Mirrors [`CellFillSources`]'s shape but per-fn instead of
-/// per-cell.
+/// Per-fn fills for a Direct (sync flat) result. Adding a kind =
+/// one struct field + one [`single_cell_side_data`] arm. Mirrors
+/// [`CellFillSources`]'s shape but per-fn instead of per-cell.
 struct SingleCellFills<'a> {
     flags_fill: &'a Option<FlagsRuntimeFill>,
     char_scratch: &'a Option<i32>,
     handle_fill: &'a Option<HandleRuntimeFill>,
 }
 
-/// Wrap the per-fn fills into a [`CellSideData`] for a single-cell
-/// result. Match is exhaustive — Compound + un-wired kinds are
-/// `unreachable!()` because [`super::lift::classify_result_lift`]
-/// filters them out of the Direct / RetptrPair path.
+/// Wrap the per-fn fills into a [`CellSideData`] for a Direct
+/// result. Match is exhaustive — multi-slot + compound + un-wired
+/// kinds are `unreachable!()` because [`super::lift::classify_result_lift`]
+/// routes them through Compound.
 fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideData {
     match cell {
         Cell::Flags { .. } => {
@@ -134,7 +133,7 @@ fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideDa
                 "handle single-cell result → handle-info builder must produce a fill",
             )))
         }
-        // Direct/RetptrPair-eligible kinds with no side-table contribution.
+        // Direct-eligible kinds with no side-table contribution.
         Cell::Bool { .. }
         | Cell::IntegerSignExt { .. }
         | Cell::IntegerZeroExt { .. }
@@ -259,7 +258,7 @@ fn build_fields_blob(
 /// with `result: option::some(field-tree)` pre-wired for funcs that
 /// have a result lift, `option::none` for the rest.
 /// `result_cells_offsets[fn_idx]` is the byte offset of that fn's
-/// 1-cell (Direct/RetptrPair) or N-cell (Compound) result slab;
+/// 1-cell (Direct) or N-cell (Compound) result slab;
 /// `None` when the after-hook isn't relevant for this fn.
 fn build_after_params_blob(
     per_func: &[FuncClassified],
@@ -292,8 +291,7 @@ fn build_after_params_blob(
                 // Compound result: cells.len = plan.cell_count (slab
                 // holds the full cell tree) and root = plan.root()
                 // (children-first ordering puts the parent at the
-                // end of the slab). Single-cell result (Direct /
-                // RetptrPair): len = 1, root = 0.
+                // end of the slab). Direct result: len = 1, root = 0.
                 let (cells_len, root) = fd
                     .result_lift
                     .as_ref()
@@ -737,20 +735,6 @@ pub(super) fn lay_out_static_memory(
                         };
                         let side_data = single_cell_side_data(&cell, &fills);
                         ResultSourceLayout::Direct { cell, side_data }
-                    }
-                    ResultSource::RetptrPair(cell) => {
-                        let fills = SingleCellFills {
-                            flags_fill: &flags_per_result_single_fill[i],
-                            char_scratch: &char_per_result_single[i],
-                            handle_fill: &handle_per_result_single_fill[i],
-                        };
-                        let side_data = single_cell_side_data(&cell, &fills);
-                        ResultSourceLayout::RetptrPair {
-                            cell,
-                            retptr_offset: retptr_offset
-                                .expect("RetptrPair → retptr scratch reserved"),
-                            side_data,
-                        }
                     }
                     ResultSource::Compound(compound) => {
                         let tuple_slices = tuple_indices_per_cell.resolve_result(i, &symbols);

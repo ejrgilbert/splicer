@@ -23,24 +23,25 @@ use super::sidetable::CellSideData;
 
 // ─── Result-lift descriptors (classify-time, immutable) ───────────
 //
-// Three shapes:
+// Two shapes:
 //
-// - `Direct(kind)` — primitive that fits in one flat slot, captured
-//   into `lcl.result` after the handler call.
-// - `RetptrPair(kind)` — `(ptr, len)` for string / `list<u8>` returns;
-//   the wrapper loads the pair from retptr scratch into
-//   `lcl.ptr_scratch` / `lcl.len_scratch` before lifting.
-// - `Compound(CompoundResult)` — record / tuple / etc. that lives in
-//   memory at retptr scratch. Driven by a [`LiftPlan`] symmetric with
-//   the per-param plans; `wit_bindgen_core::abi::lift_from_memory`
-//   pushes flat values onto the wasm stack from retptr_offset, and
-//   the wrapper `local.set`s those into per-result synthetic locals
+// - `Direct(kind)` — sync flat return: a single-flat-slot value
+//   captured into `lcl.result` after the handler call. No memory
+//   load.
+// - `Compound(CompoundResult)` — anything routed through retptr
+//   scratch. Driven by a [`LiftPlan`] symmetric with the per-param
+//   plans; `wit_bindgen_core::abi::lift_from_memory` pushes flat
+//   values onto the wasm stack from `retptr_offset`, and the
+//   wrapper `local.set`s those into per-result synthetic locals
 //   (in reverse, since the stack is LIFO) for the plan walker.
+//   Multi-cell compounds (record / tuple / option / result /
+//   variant) and single-cell-at-retptr kinds (string / `list<u8>`
+//   / async-retptr'd flags / char / handle) share this path.
 //
-// All offsets (retptr_offset for RetptrPair / Compound; cells_offset
-// + per-cell side-table data for Compound) live on the post-layout
-// [`ResultLayout`] / [`ResultSourceLayout`]; this classify-time type
-// has no offsets and never gets mutated.
+// All offsets (retptr_offset + cells_offset + per-cell side-table
+// data for Compound) live on the post-layout [`ResultLayout`] /
+// [`ResultSourceLayout`]; this classify-time type has no offsets
+// and never gets mutated.
 
 /// Classify-time descriptor for the function's return value. The
 /// layout phase wraps it into a [`ResultLayout`] with the offsets
@@ -53,18 +54,16 @@ pub(crate) struct ResultLift {
 }
 
 pub(crate) enum ResultSource {
-    /// Direct primitive (no retptr): source is `lcl.result`. The
-    /// [`Cell`] carries the variant tag for emit dispatch; its
-    /// `flat_slot` field is a placeholder (the source is the single
-    /// caller-supplied local, not a plan slot).
+    /// Sync flat return: the value lands in `lcl.result` after the
+    /// handler call — no memory load. The [`Cell`] carries the variant
+    /// tag for emit dispatch; its `flat_slot` field is a placeholder
+    /// (the source is `lcl.result`, not a plan slot).
     Direct(Cell),
-    /// `(ptr, len)` pair in retptr scratch (string / `list<u8>`).
-    /// The [`Cell`] carries the variant tag; its `ptr_slot`/`len_slot`
-    /// fields are placeholders (the source is the caller-supplied
-    /// `(ptr_local, len_local)` pair, not plan slots).
-    RetptrPair(Cell),
-    /// Compound result: walk a [`LiftPlan`] over flat slots loaded
-    /// from retptr scratch via `lift_from_memory`.
+    /// Result loaded from retptr scratch via [`LiftPlan`] +
+    /// `lift_from_memory`. Covers both multi-cell compound shapes
+    /// (record / tuple / option / result / variant) and single-cell
+    /// kinds whose flat representation lives in memory (string /
+    /// `list<u8>` / async-retptr'd flags / char / handle).
     Compound(CompoundResult),
 }
 
@@ -143,26 +142,17 @@ pub(crate) struct ResultLayout {
 }
 
 pub(crate) enum ResultSourceLayout {
-    /// Direct primitive (no retptr): source is `lcl.result`. See
+    /// Sync flat return: source is `lcl.result`. See
     /// [`ResultSource::Direct`] for the placeholder-slot convention.
     /// `side_data` carries any per-kind layout-phase bookkeeping
-    /// (today: `Flags(Box<FlagsRuntimeFill>)` for flags-typed
-    /// results); `None` for kinds that lift purely from the source
-    /// local.
+    /// (Flags / Char / Handle); `None` for kinds that lift purely
+    /// from the source local.
     Direct { cell: Cell, side_data: CellSideData },
-    /// Single-cell result loaded from retptr scratch — the wrapper
-    /// reads the first two i32s at `retptr_offset` (Text/Bytes use
-    /// both as `(ptr, len)`; flags / single-i32 returns via async
-    /// retptr only use the first). `side_data` mirrors `Direct`.
-    RetptrPair {
-        cell: Cell,
-        retptr_offset: i32,
-        side_data: CellSideData,
-    },
-    /// Compound result: classify-time recipe + retptr scratch +
-    /// per-cell side-table data. The cells-slab base lives on
-    /// [`super::super::AfterSetup::result_cells_offset`] (today's
-    /// compound lifts only fire from the after-hook path).
+    /// Result loaded from retptr scratch: classify-time recipe +
+    /// retptr offset + per-cell side-table data. The cells-slab base
+    /// lives on [`super::super::AfterSetup::result_cells_offset`].
+    /// Both multi-cell compounds and single-cell-at-retptr kinds
+    /// route through here; their plan handles N≥1 cells uniformly.
     Compound {
         compound: CompoundResult,
         retptr_offset: i32,
@@ -206,19 +196,23 @@ pub(crate) fn classify_func_params(
     params_lift
 }
 
-/// Classify the function's return value for on-return lift. Direct
-/// primitive returns capture into `lcl.result`; string / `list<u8>`
-/// returns ride retptr. Compound returns we don't yet lift bail out
-/// with `None` (the wrapper still calls the after-hook with
-/// `result: option::none`).
+/// Classify the function's return value for on-return lift. Two
+/// shapes:
+///
+/// - **Direct**: sync flat return — the value lands in `lcl.result`
+///   after the handler call, no memory load. Single flat slot only
+///   (canonical-ABI for sync flat returns).
+/// - **Compound**: result loaded from retptr scratch via
+///   `lift_from_memory` + a [`LiftPlan`]. Covers every retptr-routed
+///   shape (multi-cell compounds + single-cell kinds whose flat
+///   representation lives in memory: string / `list<u8>` / async-
+///   retptr'd flags/char/handle).
 ///
 /// `result_at_retptr` selects which sig's retptr decides where the
-/// result lands: for sync funcs that's the export sig (callee
-/// allocates), for async funcs the import sig (canon-lower-async
-/// always retptr's a non-void result, so even primitive results
-/// live at retptr scratch). The caller picks via `FuncShape`.
-/// Returns `None` only for void functions or unsupported result
-/// kinds.
+/// result lands: for sync funcs that's the export sig, for async the
+/// import sig (canon-lower-async always retptr's non-void). Returns
+/// `None` for void or unsupported result types — the wrapper still
+/// calls after-hook with `result: option::none`.
 pub(crate) fn classify_result_lift(
     resolve: &Resolve,
     func: &WitFunction,
@@ -227,14 +221,15 @@ pub(crate) fn classify_result_lift(
 ) -> Option<ResultLift> {
     let ty = func.result.as_ref()?;
 
-    // Compound kinds (record, tuple, option, result) drive a
-    // LiftPlan over retptr-loaded flat slots. Only fires when
-    // canonical-ABI actually routes the result through retptr —
-    // single-slot edge cases (e.g. `tuple<u32>`, `record { a: u32 }`,
-    // `result<_, _>`) come back flat and have no memory for
-    // `lift_from_memory` to read from, so they fall through to the
-    // no-lift path (after-hook sees `result: option::none`).
-    if is_compound_result(ty, resolve) && result_at_retptr {
+    // Retptr-routed: every wired result type drives a LiftPlan over
+    // `lift_from_memory`-loaded slots. Multi-cell compounds AND
+    // single-cell kinds use the same machinery; the plan handles
+    // either by walking N=1+ cells. The retptr gate skips single-
+    // flat-slot compounds (e.g. `tuple<u32>`, `record { a: u32 }`,
+    // `result<_, _>`) — they come back flat with no retptr scratch
+    // for `lift_from_memory` to read from, so they fall through to
+    // the no-lift path.
+    if result_at_retptr && is_supported_result(ty, resolve) {
         let plan = LiftPlan::for_type(ty, resolve, names);
         return Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
@@ -242,24 +237,29 @@ pub(crate) fn classify_result_lift(
         });
     }
 
-    // Single-cell direct/retptr-pair path: build a one-cell plan and
-    // pull its single Cell out as the variant tag for emit dispatch.
-    // Returns None for un-wired result types (list / handles) —
-    // wrapper still calls after-hook with option::none for `result`.
+    // Direct (sync flat return): the value sits in `lcl.result`. Only
+    // single-flat-slot kinds reach here. Returns None for un-wired
+    // result types — wrapper still calls after-hook with
+    // `result: option::none`.
     let cell = single_cell_for_result(ty, resolve, names)?;
     let side_table = side_table_info_for_cell(&cell);
-    let source = if result_at_retptr {
-        ResultSource::RetptrPair(cell)
-    } else {
-        ResultSource::Direct(cell)
-    };
-    Some(ResultLift { source, side_table })
+    Some(ResultLift {
+        source: ResultSource::Direct(cell),
+        side_table,
+    })
+}
+
+/// Whether `ty`'s result-side codegen is wired — i.e., we can build
+/// a [`LiftPlan`] whose every cell is a wired variant. Union of
+/// [`is_compound_result`] (multi-cell shapes) and
+/// [`is_supported_direct_result`] (single-cell shapes).
+fn is_supported_result(ty: &Type, resolve: &Resolve) -> bool {
+    is_compound_result(ty, resolve) || is_supported_direct_result(ty, resolve)
 }
 
 /// Whether `ty` resolves (through type aliases) to a compound kind
 /// whose result-side codegen is wired today: `record`, `tuple<...>`,
-/// `option<T>`, `result<T, E>`, or `variant`. Flags is single-cell,
-/// not compound, and goes through the Direct/RetptrPair path.
+/// `option<T>`, `result<T, E>`, or `variant`.
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
@@ -275,12 +275,11 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     }
 }
 
-/// Build a single-cell [`Cell`] for a non-compound result type by
-/// running it through a one-cell [`LiftPlanBuilder`]. Returns `None`
-/// for un-wired result types — the supported set tracks the wired
-/// arms in [`super::emit::emit_lift_kind`]. Direct/retptr-pair
-/// kinds never produce a `RecordOf`, so the interner is just
-/// threaded through for [`LiftPlan::for_type`]'s uniform signature.
+/// Build a single-cell [`Cell`] for a Direct (sync flat) result.
+/// Returns `None` for un-wired result types — the supported set
+/// tracks the wired arms in [`super::emit::emit_lift_kind`]. Direct
+/// kinds never produce a `RecordOf`, so `names` is just threaded
+/// through for [`LiftPlan::for_type`]'s uniform signature.
 fn single_cell_for_result(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Option<Cell> {
     if !is_supported_direct_result(ty, resolve) {
         return None;

@@ -30,19 +30,16 @@ pub(crate) struct HandleInfoBlobs {
     pub per_param_range: Vec<Vec<Option<SymRef>>>,
     pub per_result_range: Vec<Option<SymRef>>,
     pub per_cell_fill: PerCellIndices<HandleRuntimeFill>,
-    /// Per-fn fill for a single-cell handle result (Direct or
-    /// RetptrPair — both lift one `Cell::Handle`, with no plan to
-    /// attach it to). `Some` when the func's result classifies as a
-    /// single `Cell::Handle`. Mirrors flags's per-result-single shape.
+    /// Per-fn fill for a Direct (sync flat) `Cell::Handle` result —
+    /// no plan to attach it to since `lcl.result` is the source.
+    /// Retptr-loaded handle results route through Compound and
+    /// register via `per_cell_fill`.
     pub per_result_single_fill: Vec<Option<HandleRuntimeFill>>,
 }
 
 /// One `handle-info` entry per `Cell::Handle` (param plan, compound
-/// result plan, or single-cell Direct/RetptrPair handle result). The
-/// param + compound-result walks run via [`walk_per_cell_plans`];
-/// single-cell handle results need a separate per-fn pass since the
-/// `Cell::Handle` lives directly on `ResultSource::Direct` /
-/// `ResultSource::RetptrPair`, not inside a plan.
+/// result plan, or Direct sync-flat handle result). The plan walk
+/// runs via [`walk_per_cell_plans`]; Direct results layer on top.
 pub(crate) fn build_handle_info_blob(
     per_func: &[FuncClassified],
     entry_layout: &RecordLayout,
@@ -55,23 +52,22 @@ pub(crate) fn build_handle_info_blob(
         per_result_range: walked_result_range,
         per_result_fill,
     } = walk_per_cell_plans(per_func, |plan| builder.append_plan(plan));
-    // walk_per_cell_plans only visits compound results; layer
-    // single-cell handle results on top, in fn order. classify
-    // guarantees these two paths are mutually exclusive (a result is
-    // either Compound or Direct/RetptrPair, never both).
+    // walk_per_cell_plans visits param + compound-result plans;
+    // layer Direct (sync flat) handle results on top in fn order.
+    // classify makes these mutually exclusive (a result is either
+    // Compound or Direct, never both).
     let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
     let mut per_result_single_fill: Vec<Option<HandleRuntimeFill>> =
         Vec::with_capacity(per_func.len());
     for (fn_idx, fd) in per_func.iter().enumerate() {
         let walked = walked_result_range[fn_idx];
         let single_handle = fd.result_lift.as_ref().and_then(|rl| match &rl.source {
-            ResultSource::Direct(Cell::Handle { type_name, .. })
-            | ResultSource::RetptrPair(Cell::Handle { type_name, .. }) => Some(*type_name),
+            ResultSource::Direct(Cell::Handle { type_name, .. }) => Some(*type_name),
             _ => None,
         });
         match (walked, single_handle) {
             (Some(_), Some(_)) => unreachable!(
-                "Compound + single-cell handle result on same fn — classify invariant broken"
+                "Compound + Direct handle result on same fn — classify invariant broken"
             ),
             (None, Some(type_name)) => {
                 let (range, fill) = builder.append_direct(type_name);
@@ -131,8 +127,8 @@ impl<'a> HandleInfoBuilder<'a> {
         (range, fill_map)
     }
 
-    /// Append one entry for a single-cell handle result (Direct or
-    /// RetptrPair). Mirrors flags's no-plan case.
+    /// Append one entry for a Direct (sync flat) handle result.
+    /// Mirrors flags's no-plan case.
     fn append_direct(&mut self, type_name: BlobSlice) -> (SymRef, HandleRuntimeFill) {
         let range_start = self.entries.len() as u32;
         let fill = self.append_one(type_name, 0);

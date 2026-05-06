@@ -1,6 +1,6 @@
 //! Codegen: walk a [`LiftPlan`] and emit the wasm that writes one
 //! cell per (param | result) into the cells slab, plus the result-
-//! lift emission for direct / retptr-pair / compound result kinds.
+//! lift emission for Direct (sync flat) and Compound result kinds.
 
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::lift_from_memory;
@@ -69,44 +69,23 @@ pub(crate) struct WrapperLocals {
 /// Per-function emit-time bundle for the result-side lift. Built once
 /// in [`alloc_wrapper_locals`] from the layout-phase
 /// [`super::classify::ResultLayout`] + the locals just allocated, then
-/// consumed by the wrapper-body emitter's phase-3 result-lift block
-/// via a single pattern match. Compound borrows the layout-time
-/// per-cell side-table data; Direct / RetptrPair carry it inline.
+/// consumed by phase-3 of the wrapper-body emitter via a pattern
+/// match. Direct carries side-data inline; Compound borrows it.
 pub(crate) enum ResultEmitPlan<'a> {
-    /// Void function or unsupported result kind: no lift fires.
+    /// Void or unsupported result: no lift fires.
     None,
-    /// Direct primitive return — source value already in
-    /// `source_local` (captured from the handler's flat return after
-    /// the call). [`Cell`] carries the variant tag for emit dispatch;
-    /// `side_data` carries any per-kind layout-phase bookkeeping
-    /// (today: `Flags` for flags-typed results), `None` for kinds
-    /// whose lift reads only `source_local`.
+    /// Sync flat return — source already in `source_local`.
+    /// `side_data` carries any per-kind bookkeeping (Flags / Char /
+    /// Handle); `None` for primitives that need none.
     Direct {
         cell: Cell,
         source_local: u32,
         side_data: CellSideData,
     },
-    /// `(ptr, len)` pair lives at `retptr_offset` in static scratch.
-    /// The wrapper loads the pair into `ptr_local` / `len_local`
-    /// before lifting (today these are always `lcl.ptr_scratch` /
-    /// `lcl.len_scratch` — the variant carries them so the consumer
-    /// doesn't re-thread `&WrapperLocals` for that lookup).
-    /// `side_data` mirrors [`Self::Direct`] for flags-typed async
-    /// retptr returns; `None` for Text / Bytes.
-    RetptrPair {
-        cell: Cell,
-        retptr_offset: i32,
-        ptr_local: u32,
-        len_local: u32,
-        side_data: CellSideData,
-    },
-    /// Compound result: classify-time cell plan + layout offsets +
-    /// emit-time locals/loads. `addr_local` drives the
+    /// Retptr-loaded result. `addr_local` drives the
     /// `lift_from_memory`-built `loads` sequence; the wrapper
-    /// `local.set`s the values into `synth_locals` (in reverse) for
-    /// the plan walker, with `local_base = synth_locals[0]`.
-    /// `side_refs` borrows the per-cell side-table data off
-    /// [`ResultSourceLayout::Compound::cell_side`].
+    /// `local.set`s values into `synth_locals` (LIFO) for the plan
+    /// walker, with `local_base = synth_locals[0]`.
     Compound {
         plan: &'a LiftPlan,
         retptr_offset: i32,
@@ -144,8 +123,6 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let addr = builder.alloc_local(ValType::I32);
     let st = builder.alloc_local(ValType::I32);
     let ws = builder.alloc_local(ValType::I32);
-    let ptr_scratch = builder.alloc_local(ValType::I32);
-    let len_scratch = builder.alloc_local(ValType::I32);
     let ext64 = builder.alloc_local(ValType::I64);
     let ext_f64 = builder.alloc_local(ValType::F64);
     let flags_addr = builder.alloc_local(ValType::I32);
@@ -174,17 +151,6 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 cell: cell.clone(),
                 source_local: result
                     .expect("ResultSourceLayout::Direct → direct-return local allocated"),
-                side_data: side_data.clone(),
-            },
-            ResultSourceLayout::RetptrPair {
-                cell,
-                retptr_offset,
-                side_data,
-            } => ResultEmitPlan::RetptrPair {
-                cell: cell.clone(),
-                retptr_offset: *retptr_offset,
-                ptr_local: ptr_scratch,
-                len_local: len_scratch,
                 side_data: side_data.clone(),
             },
             ResultSourceLayout::Compound {
@@ -591,73 +557,67 @@ fn emit_variant_runtime_fill(f: &mut Function, disc_local: u32, fill: &VariantRu
     }
 }
 
-/// Shared lift body for direct-return result values. `slot0` /
-/// `slot1` are wasm locals carrying the source value(s); for single-
-/// slot kinds only `slot0` is used. Multi-slot kinds (Text/Bytes)
-/// expect `(ptr, len)` in (slot0, slot1).
-///
-/// The cell's `flat_slot` / `ptr_slot` / `len_slot` fields are
-/// ignored — direct/retptr-pair sources don't go through the
-/// plan-relative flat-slot lookup; the caller passes the source
-/// locals directly. The cell variant tag drives dispatch.
+/// Lift a Direct (sync flat return) result. Only single-flat-slot
+/// kinds reach here — multi-slot kinds (Text/Bytes) and compound
+/// shapes always retptr and route through Compound. The cell's
+/// `flat_slot` field is ignored — `source` is `lcl.result` directly.
 fn emit_lift_kind(
     f: &mut Function,
     cell_layout: &CellLayout,
     cell: &Cell,
     side_data: &CellSideData,
-    slot0: u32,
-    slot1: u32,
+    source: u32,
     lcl: &WrapperLocals,
 ) {
     let addr = lcl.addr;
     match cell {
-        Cell::Bool { .. } => cell_layout.emit_bool(f, addr, slot0),
+        Cell::Bool { .. } => cell_layout.emit_bool(f, addr, source),
         Cell::IntegerSignExt { .. } => {
-            f.instructions().local_get(slot0);
+            f.instructions().local_get(source);
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
         Cell::IntegerZeroExt { .. } => {
-            f.instructions().local_get(slot0);
+            f.instructions().local_get(source);
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        Cell::Integer64 { .. } => cell_layout.emit_integer(f, addr, slot0),
+        Cell::Integer64 { .. } => cell_layout.emit_integer(f, addr, source),
         Cell::FloatingF32 { .. } => {
-            f.instructions().local_get(slot0);
+            f.instructions().local_get(source);
             f.instructions().f64_promote_f32();
             f.instructions().local_set(lcl.ext_f64);
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
-        Cell::FloatingF64 { .. } => cell_layout.emit_floating(f, addr, slot0),
-        Cell::Text { .. } => cell_layout.emit_text(f, addr, slot0, slot1),
-        Cell::Bytes { .. } => cell_layout.emit_bytes(f, addr, slot0, slot1),
-        Cell::EnumCase { .. } => cell_layout.emit_enum_case(f, addr, slot0),
+        Cell::FloatingF64 { .. } => cell_layout.emit_floating(f, addr, source),
+        Cell::EnumCase { .. } => cell_layout.emit_enum_case(f, addr, source),
         Cell::Flags { .. } => {
             let CellSideData::Flags(fill) = side_data else {
                 panic!("Flags cell paired with non-Flags side data {side_data:?}");
             };
-            emit_flags_runtime_fill(f, slot0, fill, lcl);
+            emit_flags_runtime_fill(f, source, fill, lcl);
             cell_layout.emit_flags_set(f, addr, fill.side_table_idx);
         }
         Cell::Char { .. } => {
             let CellSideData::Char { scratch_addr } = side_data else {
                 panic!("Char cell paired with non-Char side data {side_data:?}");
             };
-            cell_layout.emit_char(f, addr, slot0, *scratch_addr, lcl.char_len);
+            cell_layout.emit_char(f, addr, source, *scratch_addr, lcl.char_len);
         }
         Cell::Handle { .. } => {
             let CellSideData::Handle(fill) = side_data else {
                 panic!("Handle cell paired with non-Handle side data {side_data:?}");
             };
-            emit_handle_runtime_fill(f, slot0, fill);
+            emit_handle_runtime_fill(f, source, fill);
             cell_layout.emit_resource_handle(f, addr, fill.side_table_idx);
         }
-        // Compound + un-wired variants aren't valid direct/retptr-pair
-        // sources; classify_result_lift's whitelist filters them out.
-        Cell::RecordOf { .. }
+        // Multi-slot + compound + un-wired kinds always retptr;
+        // classify_result_lift routes them through Compound.
+        Cell::Text { .. }
+        | Cell::Bytes { .. }
+        | Cell::RecordOf { .. }
         | Cell::TupleOf { .. }
         | Cell::ListOf
         | Cell::Option { .. }
@@ -666,8 +626,8 @@ fn emit_lift_kind(
         | Cell::Future
         | Cell::Stream
         | Cell::ErrorContext => unreachable!(
-            "emit_lift_kind reached unsupported result Cell {cell:?} — \
-             classify_result_lift should have filtered it"
+            "emit_lift_kind reached non-Direct Cell {cell:?} — \
+             classify_result_lift should have routed it through Compound"
         ),
     }
 }
@@ -693,53 +653,11 @@ pub(crate) fn emit_lift_result(
             source_local,
             side_data,
         } => {
-            emit_lift_kind(
-                f,
-                cell_layout,
-                cell,
-                side_data,
-                *source_local,
-                *source_local,
-                lcl,
-            );
-        }
-        ResultEmitPlan::RetptrPair {
-            cell,
-            retptr_offset,
-            ptr_local,
-            len_local,
-            side_data,
-        } => {
-            // First slot — used by every RetptrPair-eligible kind.
-            f.instructions().i32_const(*retptr_offset);
-            f.instructions().i32_load(MemArg {
-                offset: SLICE_PTR_OFFSET as u64,
-                align: I32_STORE_LOG2_ALIGN,
-                memory_index: 0,
-            });
-            f.instructions().local_set(*ptr_local);
-            // Second slot — only the `(ptr, len)` kinds (Text/Bytes)
-            // reserve 8 bytes of retptr scratch and use both slots.
-            // Single-slot kinds (Flags/Char/Handle) reserve 4 bytes
-            // only, so loading offset+4 would read past the scratch
-            // into adjacent static data; skip the load. `len_local`
-            // stays at its zero-initialized value (locals are
-            // zeroed on function entry); `emit_lift_kind`'s arms for
-            // the single-slot kinds never read it.
-            if matches!(cell, Cell::Text { .. } | Cell::Bytes { .. }) {
-                f.instructions().i32_const(*retptr_offset);
-                f.instructions().i32_load(MemArg {
-                    offset: SLICE_LEN_OFFSET as u64,
-                    align: I32_STORE_LOG2_ALIGN,
-                    memory_index: 0,
-                });
-                f.instructions().local_set(*len_local);
-            }
-            emit_lift_kind(f, cell_layout, cell, side_data, *ptr_local, *len_local, lcl);
+            emit_lift_kind(f, cell_layout, cell, side_data, *source_local, lcl);
         }
         ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
-            "compound results are emitted directly via emit_lift_compound_prefix + \
-             emit_lift_plan; emit_lift_result handles only single-cell sources"
+            "Compound is emitted via emit_lift_compound_prefix + emit_lift_plan; \
+             emit_lift_result handles only Direct sources"
         ),
     }
 }
