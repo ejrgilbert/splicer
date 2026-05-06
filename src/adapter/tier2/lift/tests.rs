@@ -71,6 +71,11 @@ const TEST_WIT: &str = r#"
         f-record-with-stream: async func(rs: stream-pair);
         f-error-context: func(e: error-context);
         f-result-with-err-ctx: func(r: result<s32, error-context>);
+        f-list-u32: func(xs: list<u32>);
+        f-list-string: func(xs: list<string>);
+        f-list-of-list: func(xs: list<list<u32>>);
+        record list-pair { items: list<string>, scores: list<u32> }
+        f-list-of-record: func(xs: list<point>);
     }
 "#;
 
@@ -261,8 +266,11 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::Variant { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
-            Cell::ListOf => {
-                unreachable!("un-wired Cell variant {op:?} should not appear in test plans")
+            Cell::ListOf {
+                ptr_slot, len_slot, ..
+            } => {
+                put(*ptr_slot, ValType::I32);
+                put(*len_slot, ValType::I32);
             }
         }
     }
@@ -400,9 +408,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
             | Cell::EnumCase { .. }
             | Cell::Option { .. }
             | Cell::Result { .. } => CellSideData::None,
-            Cell::ListOf => {
-                unreachable!("auto_cell_side_data reached un-wired Cell variant {op:?}")
-            }
+            Cell::ListOf { .. } => CellSideData::None,
         })
         .collect()
 }
@@ -864,6 +870,133 @@ fn result_with_error_context_err_arm_recurses_into_handle() {
     );
     assert_eq!(plan.root(), 2);
     assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn list_of_primitive_carries_element_plan() {
+    // list<u32>: parent (ptr, len) → 2 i32 slots, 1 cell. Element
+    // plan has its own flat slots — independent from the parent.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names);
+    assert_eq!(plan.cells.len(), 1);
+    let Cell::ListOf {
+        ptr_slot,
+        len_slot,
+        element_plan,
+    } = &plan.cells[0]
+    else {
+        panic!("expected Cell::ListOf, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(*ptr_slot, 0);
+    assert_eq!(*len_slot, 1);
+    assert_eq!(plan.flat_slot_count, 2);
+    assert_eq!(plan.root(), 0);
+    // Element plan: u32 → one IntegerZeroExt cell, one flat slot.
+    assert_eq!(
+        element_plan.cells,
+        vec![Cell::IntegerZeroExt { flat_slot: 0 }],
+    );
+    assert_eq!(element_plan.flat_slot_count, 1);
+    assert_eq!(element_plan.root(), 0);
+}
+
+#[test]
+fn list_of_string_element_plan_uses_two_local_slots() {
+    // list<string>: element string is (ptr, len) → 2 flat slots,
+    // local to the element plan. Parent still 2 slots + 1 cell.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-string").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(plan.flat_slot_count, 2);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected Cell::ListOf");
+    };
+    assert_eq!(
+        element_plan.cells,
+        vec![Cell::Text {
+            ptr_slot: 0,
+            len_slot: 1,
+        }],
+    );
+    assert_eq!(element_plan.flat_slot_count, 2);
+}
+
+#[test]
+fn list_of_list_nests_element_plans() {
+    // list<list<u32>>: outer parent (ptr, len) holds inner list<u32>
+    // as its element plan, which itself is a (ptr, len) + ListOf.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-of-list").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(plan.cells.len(), 1);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected outer Cell::ListOf");
+    };
+    assert_eq!(element_plan.cells.len(), 1);
+    let Cell::ListOf {
+        ptr_slot,
+        len_slot,
+        element_plan: inner_inner,
+    } = &element_plan.cells[0]
+    else {
+        panic!("expected inner Cell::ListOf");
+    };
+    assert_eq!(*ptr_slot, 0);
+    assert_eq!(*len_slot, 1);
+    assert_eq!(
+        inner_inner.cells,
+        vec![Cell::IntegerZeroExt { flat_slot: 0 }]
+    );
+    assert_eq!(inner_inner.flat_slot_count, 1);
+}
+
+#[test]
+fn list_of_record_element_plan_carries_record_cells() {
+    // list<point>: element point is a record with two fields, so the
+    // element plan holds the static record-of cells + parent record.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-of-record").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected Cell::ListOf");
+    };
+    // point { x: u32, y: s32 } → 2 leaf cells + 1 record-of parent.
+    assert_eq!(element_plan.cells.len(), 3);
+    assert_eq!(element_plan.flat_slot_count, 2);
+    assert_eq!(element_plan.root(), 2);
+}
+
+#[test]
+fn record_with_list_field_recurses_into_list() {
+    // list-pair { items: list<string>, scores: list<u32> }
+    //   items   → cell 0 (ListOf, slots 0..1)
+    //   scores  → cell 1 (ListOf, slots 2..3)
+    //   parent  → cell 2 (RecordOf items=0, scores=1)
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("list-pair", &r, &mut names);
+    assert_eq!(plan.cells.len(), 3);
+    assert!(matches!(plan.cells[0], Cell::ListOf { .. }));
+    assert!(matches!(plan.cells[1], Cell::ListOf { .. }));
+    assert_eq!(
+        plan.cells[2],
+        record_of(&mut names, "list-pair", &[("items", 0), ("scores", 1)],),
+    );
+    assert_eq!(plan.flat_slot_count, 4);
+    assert_eq!(plan.root(), 2);
 }
 
 #[test]

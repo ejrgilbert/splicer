@@ -139,10 +139,16 @@ pub(crate) enum Cell {
         kind: HandleKind,
     },
 
-    // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
-    //    + `emit_cell_op` until codegen lands) ─────────────────────
-    /// `list<T>` (non-u8 element) → `cell::list-of`.
-    ListOf,
+    /// `list<T>` (non-u8 — `list<u8>` fast-paths through `Cell::Bytes`)
+    /// → `cell::list-of`. Flat layout `(i32 ptr, i32 len)`.
+    /// `element_plan` is built recursively in a fresh sub-builder so
+    /// its flat slots and cells are local to one element (re-used per
+    /// iteration at runtime; not counted in [`LiftPlan::cell_count`]).
+    ListOf {
+        ptr_slot: u32,
+        len_slot: u32,
+        element_plan: Box<LiftPlan>,
+    },
 }
 
 /// Which `cell::*-handle` variant a [`Cell::Handle`] should emit.
@@ -188,6 +194,7 @@ impl HandleKind {
 /// `root` field points at this index. Walked top-to-bottom by the
 /// emit-code phase; the side-table builder also walks `cells` to
 /// pull out per-kind side-table contributions.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LiftPlan {
     pub(super) cells: Vec<Cell>,
     /// Total flat-slot locals consumed by the plan. Cells reference
@@ -353,9 +360,7 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::Record(_) => self.push_record(ty, resolve, names),
                 wit_parser::TypeDefKind::Tuple(_) => self.push_tuple(ty, resolve, names),
                 wit_parser::TypeDefKind::Type(t) => self.push(t, resolve, names),
-                wit_parser::TypeDefKind::List(_) => {
-                    todo!("plan-builder for un-wired Cell::ListOf")
-                }
+                wit_parser::TypeDefKind::List(elem) => self.push_list_of(elem, resolve, names),
                 wit_parser::TypeDefKind::Variant(_) => self.push_variant(ty, resolve, names),
                 wit_parser::TypeDefKind::Flags(_) => {
                     let info = flags_lift_info_for_type(ty, resolve)
@@ -662,6 +667,19 @@ impl LiftPlanBuilder {
             flat_slot,
             type_name,
             kind,
+        })
+    }
+
+    /// `list<T>` (non-u8) — `(ptr, len)` flat; element plan built
+    /// in a fresh sub-builder so its slots are local to one element.
+    fn push_list_of(&mut self, elem: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
+        let element_plan = LiftPlan::for_type(elem, resolve, names);
+        let ptr_slot = self.bump_flat_slot();
+        let len_slot = self.bump_flat_slot();
+        self.push_cell(Cell::ListOf {
+            ptr_slot,
+            len_slot,
+            element_plan: Box::new(element_plan),
         })
     }
 

@@ -149,7 +149,7 @@ fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideDa
         | Cell::Option { .. }
         | Cell::Result { .. }
         | Cell::Variant { .. }
-        | Cell::ListOf => {
+        | Cell::ListOf { .. } => {
             unreachable!("single_cell_side_data reached unsupported result Cell {cell:?}")
         }
     }
