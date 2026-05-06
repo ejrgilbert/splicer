@@ -104,8 +104,8 @@ mod tests;
 
 // ── Top-level entry points ────────────────────────────────────────
 pub use api::{
-    compose, format_wac_compose_cmd, splice, ComponentInput, ComposeOutput, ComposeRequest,
-    SpliceOutput, SpliceRequest,
+    compose, compose_wac, format_wac_compose_cmd, splice, ComponentInput, ComposeOutput,
+    ComposeRequest, SpliceOutput, SpliceRequest,
 };
 
 /// Re-export so consumers pick up the exact cviz version splicer

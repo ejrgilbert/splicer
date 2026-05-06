@@ -3,10 +3,13 @@
 //! the full API guide.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cviz::parse::component::parse_component;
+use wac_graph::EncodeOptions;
+use wac_parser::Document;
+use wac_resolver::{packages, FileSystemPackageResolver};
 
 use crate::builtins;
 use crate::compose::{build_graph_from_components, filename_from_path};
@@ -87,6 +90,14 @@ impl SpliceOutput {
     pub fn wac_compose_cmd(&self, wac_path: &str) -> String {
         format_wac_compose_cmd(wac_path, &self.wac_deps)
     }
+
+    /// Compose this output into a single Wasm component, in-process.
+    /// Equivalent to running `wac compose` on the generated WAC with
+    /// every dependency supplied from [`SpliceOutput::wac_deps`]. The
+    /// returned bytes are wasmparser-validated before return.
+    pub fn to_wasm(&self) -> Result<Vec<u8>> {
+        compose_wac(&self.wac, &self.wac_deps, Path::new("."))
+    }
 }
 
 // ── Compose request / output ───────────────────────────────────────────────
@@ -139,6 +150,12 @@ impl ComposeOutput {
     /// Format a `wac compose <wac_path> --dep ...` shell command.
     pub fn wac_compose_cmd(&self, wac_path: &str) -> String {
         format_wac_compose_cmd(wac_path, &self.wac_deps)
+    }
+
+    /// Compose this output into a single Wasm component, in-process.
+    /// See [`SpliceOutput::to_wasm`].
+    pub fn to_wasm(&self) -> Result<Vec<u8>> {
+        compose_wac(&self.wac, &self.wac_deps, Path::new("."))
     }
 }
 
@@ -285,6 +302,41 @@ pub fn compose(req: ComposeRequest) -> Result<ComposeOutput> {
         diagnostics: out.diagnostics,
         generated_adapters: out.generated_adapters,
     })
+}
+
+/// In-process equivalent of `wac compose`: parse `wac`, resolve
+/// each package reference against `wac_deps` (falling back to
+/// `search_base` on the filesystem for anything the map doesn't
+/// cover), and encode the result into wasmparser-validated bytes.
+///
+/// Most callers want [`SpliceOutput::to_wasm`] or
+/// [`ComposeOutput::to_wasm`] — those wrap this function with
+/// sensible defaults.
+pub fn compose_wac(
+    wac: &str,
+    wac_deps: &BTreeMap<String, PathBuf>,
+    search_base: &Path,
+) -> Result<Vec<u8>> {
+    let doc = Document::parse(wac).context("Failed to parse generated WAC source")?;
+    let keys = packages(&doc).context("Failed to discover packages from WAC")?;
+
+    let overrides: HashMap<String, PathBuf> = wac_deps.clone().into_iter().collect();
+    let resolver = FileSystemPackageResolver::new(search_base, overrides, true);
+    let pkgs = resolver
+        .resolve(&keys)
+        .context("Failed to resolve WAC packages")?;
+
+    let resolution = doc.resolve(pkgs).context("Failed to resolve WAC document")?;
+    let composed: Vec<u8> = resolution
+        .encode(EncodeOptions::default())
+        .context("Failed to encode composed component")?;
+
+    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+    validator
+        .validate_all(&composed)
+        .context("Composed component bytes failed wasmparser validation")?;
+
+    Ok(composed)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
