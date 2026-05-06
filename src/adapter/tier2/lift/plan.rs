@@ -143,14 +143,10 @@ pub(crate) enum Cell {
     //    + `emit_cell_op` until codegen lands) ─────────────────────
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
-
-    // ── Future work ──────────────────────────────────────────────
-    /// `error-context` — no cell variant yet; design TBD.
-    ErrorContext,
 }
 
 /// Which `cell::*-handle` variant a [`Cell::Handle`] should emit.
-/// All three share the canonical-ABI representation (single i32
+/// All four share the canonical-ABI representation (single i32
 /// handle), the `handle-info` side-table layout, and the lift
 /// codegen — only the cell-disc differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +157,13 @@ pub(crate) enum HandleKind {
     Stream,
     /// `future<T>` → `cell::future-handle`.
     Future,
+    /// `error-context` → `cell::error-context-handle`. Just-an-id
+    /// rendering — the canonical-ABI `error-context.debug-message`
+    /// builtin would let us surface the string, but cross-component
+    /// error-context lift is currently broken in wasmtime (≤44, "very
+    /// incomplete" per its own config docstring) so the wrapper never
+    /// gets to call it. Revisit when host catches up.
+    ErrorContext,
 }
 
 impl HandleKind {
@@ -170,6 +173,7 @@ impl HandleKind {
             HandleKind::Resource => "resource-handle",
             HandleKind::Stream => "stream-handle",
             HandleKind::Future => "future-handle",
+            HandleKind::ErrorContext => "error-context-handle",
         }
     }
 }
@@ -323,7 +327,17 @@ impl LiftPlanBuilder {
                 let flat_slot = self.bump_flat_slot();
                 self.push_cell(Cell::Char { flat_slot })
             }
-            Type::ErrorContext => todo!("plan-builder for un-wired Cell::ErrorContext"),
+            Type::ErrorContext => {
+                // No nested type to surface; the cell-disc already
+                // names the kind. `handle-info.type-name` stays empty.
+                let type_name = names.intern("");
+                let flat_slot = self.bump_flat_slot();
+                self.push_cell(Cell::Handle {
+                    flat_slot,
+                    type_name,
+                    kind: HandleKind::ErrorContext,
+                })
+            }
             Type::Id(id) => match &resolve.types[*id].kind {
                 wit_parser::TypeDefKind::List(Type::U8) => {
                     let ptr_slot = self.bump_flat_slot();

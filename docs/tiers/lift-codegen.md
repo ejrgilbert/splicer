@@ -464,7 +464,7 @@ Status of each WIT type ctor as a tier-2 lift source:
 | list (non-u8)                    | ✗     | ✗               | ~150 each direction | runtime loop over elements + `cabi_realloc` for cell-index array                                                                                    |
 | tuple                            | ✗     | ✗               | ~100 each direction | similar to record but anonymous + heterogeneous                                                                                                     |
 | handles (resource/stream/future) | ✗     | ✗               | ~200 cumulative     | new `handle-info` correlation table; per-handle u64 id assignment                                                                                   |
-| error-context                    | ✗     | ✗               | TBD                 | design TBD                                                                                                                                          |
+| error-context                    | ✓     | ✓               | —                   | shipped — id-only via `cell::error-context-handle`. `debug-message` upgrade deferred until wasmtime fixes cross-component error-context transfer (≤44 broken). See [tier-2.md](tier-2.md#error-context-is-id-only--host-limitation). |
 
 ### Recommended order
 

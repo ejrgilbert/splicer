@@ -396,7 +396,7 @@ fn emit_cell_op(
             emit_handle_runtime_fill(f, local_base + *flat_slot, fill);
             cell_layout.emit_handle_cell(f, lcl.addr, kind.cell_disc_case(), fill.side_table_idx);
         }
-        Cell::ListOf | Cell::ErrorContext => {
+        Cell::ListOf => {
             todo!("emit_cell_op for un-wired Cell variant {op:?}")
         }
     }
@@ -624,8 +624,7 @@ fn emit_lift_kind(
         | Cell::ListOf
         | Cell::Option { .. }
         | Cell::Result { .. }
-        | Cell::Variant { .. }
-        | Cell::ErrorContext => unreachable!(
+        | Cell::Variant { .. } => unreachable!(
             "emit_lift_kind reached non-Direct Cell {cell:?} — \
              classify_result_lift should have routed it through Compound"
         ),

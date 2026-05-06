@@ -74,11 +74,14 @@ interface types {
         payload: option<u32>,
     }
 
-    /// `own<R>` / `borrow<R>` / `stream<T>` / `future<T>` payload —
-    /// resource (or element) type name + opaque correlation id. The
-    /// id is **not** a usable handle; the adapter still owns
-    /// canonical-ABI ownership semantics. Useful for correlating
-    /// the same handle's appearances across multiple calls.
+    /// `own<R>` / `borrow<R>` / `stream<T>` / `future<T>` /
+    /// `error-context` payload — resource (or element) type name +
+    /// opaque correlation id. The id is **not** a usable handle;
+    /// the adapter still owns canonical-ABI ownership semantics.
+    /// Useful for correlating the same handle's appearances across
+    /// multiple calls. For `error-context-handle` the `type-name`
+    /// is empty — the cell-disc already names the kind, and there
+    /// is no nested type to surface.
     record handle-info {
         type-name: string,
         id: u64,
@@ -113,6 +116,12 @@ interface types {
         resource-handle(u32),                  // → handle-infos[idx]
         stream-handle(u32),                    // → handle-infos[idx]
         future-handle(u32),                    // → handle-infos[idx]
+        // `error-context` is lifted as just an opaque id — the canonical-ABI
+        // `error-context.debug-message` builtin would let us surface the
+        // string, but cross-component error-context lift is currently broken
+        // in wasmtime (<=44, "very incomplete" per its own config docstring),
+        // so the wrapper never gets to call it. Revisit when host catches up.
+        error-context-handle(u32),             // → handle-infos[idx]
     }
 
     /// A lifted value tree: a flat array of cells, side tables for

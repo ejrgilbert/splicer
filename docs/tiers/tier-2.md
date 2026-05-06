@@ -62,6 +62,7 @@ variant cell {
     resource-handle(u32),                  // → handle-infos[idx]
     stream-handle(u32),
     future-handle(u32),
+    error-context-handle(u32),             // id-only; see "Resource, …" below
 }
 
 record record-info {
@@ -138,19 +139,44 @@ can format the tree themselves; tools that want structured access
 tree directly. Splicer emits one format and lets the tool decide what
 to do with it.
 
-## Resource, stream, and future handles
+## Resource, stream, future, and error-context handles
 
-Resource, stream, and future handles all surface as opaque
-`handle-info { type-name, id }` correlation records (`resource-handle`,
-`stream-handle`, `future-handle`). The type-name identifies the kind
+Resource, stream, future, and error-context handles all surface as
+opaque `handle-info { type-name, id }` correlation records
+(`resource-handle`, `stream-handle`, `future-handle`,
+`error-context-handle`). The type-name identifies the kind
 (`"request"`, `"u8"` for `stream<u8>`, `"response"` for
-`future<response>`); the `u64` is **not** a usable handle. The
-middleware cannot invoke methods on it, read its contents, escape it
-past the call boundary, or drop it. The adapter still owns
-canonical-ABI ownership semantics (`own<R>`'s drop, `borrow<R>`'s
-lifetime, stream/future cleanup); the ID is purely for reasoning about
-identity (e.g. "this `request` was seen on `handle` and again as the
-parent of the `body` resource three calls later").
+`future<response>`; **empty** for `error-context` — the cell-disc
+already names the kind and there is no nested type to surface). The
+`u64` is **not** a usable handle. The middleware cannot invoke methods
+on it, read its contents, escape it past the call boundary, or drop
+it. The adapter still owns canonical-ABI ownership semantics
+(`own<R>`'s drop, `borrow<R>`'s lifetime, stream/future cleanup); the
+ID is purely for reasoning about identity (e.g. "this `request` was
+seen on `handle` and again as the parent of the `body` resource three
+calls later").
+
+### `error-context` is id-only — host limitation
+
+The canonical ABI defines `error-context.debug-message`, which would
+let the wrapper read the debug string in its own component (no
+cross-component hop needed for the string itself). We deliberately do
+**not** call it today: wasmtime ≤44 ships an incomplete
+`error-context` implementation ("very incomplete" per its own
+`wasm_component_model_error_context` config docstring). The
+`error_context_transfer` libcall fired by the FACT trampoline crashes
+with `unknown handle index` when an `error-context` crosses any
+component boundary — including a wrapper interposed via splicer or
+even a wac-shim in a fan-in topology. The wrapper's wasm code never
+runs, so option-2 (read the debug message) cannot be validated end-
+to-end on current hosts.
+
+When wasmtime's error-context support matures, this will be upgraded
+to surface the debug string. The on-the-wire shape will change (likely
+a sibling cell variant, e.g. `error-context-message(string)`, or
+extending `handle-info.type-name` to carry the message); middleware
+that pattern-matches on `error-context-handle` today should be ready
+to switch.
 
 ### What this means for resource-bearing target interfaces
 

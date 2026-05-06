@@ -306,8 +306,8 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
         | Type::F32
         | Type::F64
         | Type::String
-        | Type::Char => true,
-        Type::ErrorContext => false,
+        | Type::Char
+        | Type::ErrorContext => true,
         Type::Id(id) => match &resolve.types[*id].kind {
             wit_parser::TypeDefKind::List(Type::U8) => true,
             wit_parser::TypeDefKind::Enum(_) => true,

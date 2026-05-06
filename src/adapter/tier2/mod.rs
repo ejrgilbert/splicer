@@ -5,9 +5,9 @@
 //!
 //! Wired: primitives, `string`, `list<u8>`, `char`, `enum`, `flags`,
 //! `record`, `tuple<...>`, `option<T>`, `result<T, E>`, `variant`,
-//! `own<R>` / `borrow<R>` resource handles, `stream<T>` / `future<T>`
-//! (all share `Cell::Handle` — same canonical-ABI shape, different
-//! cell-disc). Un-wired: `list<T>` (non-u8), `error-context`.
+//! `own<R>` / `borrow<R>` resource handles, `stream<T>` / `future<T>`,
+//! `error-context` (all share `Cell::Handle` — same canonical-ABI
+//! shape, different cell-disc). Un-wired: `list<T>` (non-u8).
 //! Roadmap: `docs/tiers/lift-codegen.md`.
 //!
 //! Pipeline (driven by [`build_dispatch_module`]):
@@ -1116,7 +1116,9 @@ mod tests {
             common_wit,
             tier2_wit,
         )
-        .expect("tier-2 adapter generation should succeed for factored-types resource handle result");
+        .expect(
+            "tier-2 adapter generation should succeed for factored-types resource handle result",
+        );
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
             .expect("emitted tier-2 adapter component should validate");
@@ -1157,6 +1159,88 @@ mod tests {
             tier2_wit,
         )
         .expect("tier-2 adapter generation should succeed for char result");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// End-to-end test for `error-context` as a param. Same single-
+    /// i32 canonical-ABI shape as a resource handle, but as a
+    /// primitive — no resource declaration / factored-types ceremony.
+    /// Drives `Type::ErrorContext → Cell::Handle { kind: ErrorContext }`
+    /// → `cell::error-context-handle`.
+    #[test]
+    fn dispatch_module_with_error_context_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (type $consume-ty (func (param "e" error-context)))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:ec/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:ec/api@1.0.0" (instance $api "my:ec/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:ec/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for error-context param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// End-to-end test for `error-context` as a Direct result. Sync
+    /// single-i32 return → no retptr; routes through
+    /// `is_supported_direct_result(ErrorContext) = true`.
+    #[test]
+    fn dispatch_module_with_error_context_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "make") (result i32) i32.const 0)
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "make" (core func $make))
+                (type $make-ty (func (result error-context)))
+                (func $make-lifted (type $make-ty) (canon lift (core func $make)))
+                (instance $api-inst (export "make" (func $make-lifted)))
+                (export "my:ecret/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:ecret/api@1.0.0" (instance $api "my:ecret/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:ecret/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for error-context result");
 
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)

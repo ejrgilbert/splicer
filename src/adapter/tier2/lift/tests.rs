@@ -69,6 +69,8 @@ const TEST_WIT: &str = r#"
         f-stream-of-res: async func(s: stream<my-res>);
         record stream-pair { events: stream<u32>, ack: future<u32> }
         f-record-with-stream: async func(rs: stream-pair);
+        f-error-context: func(e: error-context);
+        f-result-with-err-ctx: func(r: result<s32, error-context>);
     }
 "#;
 
@@ -259,7 +261,7 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::Variant { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
-            Cell::ListOf | Cell::ErrorContext => {
+            Cell::ListOf => {
                 unreachable!("un-wired Cell variant {op:?} should not appear in test plans")
             }
         }
@@ -398,7 +400,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
             | Cell::EnumCase { .. }
             | Cell::Option { .. }
             | Cell::Result { .. } => CellSideData::None,
-            Cell::ListOf | Cell::ErrorContext => {
+            Cell::ListOf => {
                 unreachable!("auto_cell_side_data reached un-wired Cell variant {op:?}")
             }
         })
@@ -791,6 +793,67 @@ fn record_with_stream_and_future_fields_recurses_into_handle() {
                 kind: HandleKind::Future,
             },
             record_of(&mut names, "stream-pair", &[("events", 0), ("ack", 1)],),
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn error_context_assigns_one_cell_one_slot() {
+    // `error-context`: a single i32 (canonical-ABI handle); type-name
+    // empty (no nested type to surface — the cell-disc names the kind).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-error-context").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let empty = names.intern("");
+    assert_eq!(
+        plan.cells,
+        vec![Cell::Handle {
+            flat_slot: 0,
+            type_name: empty,
+            kind: HandleKind::ErrorContext,
+        }],
+    );
+    assert_eq!(plan.root(), 0);
+    assert_eq!(plan.flat_slot_count, 1);
+}
+
+#[test]
+fn result_with_error_context_err_arm_recurses_into_handle() {
+    // result<s32, error-context>: the typical error-context usage
+    // shape. flat layout = [i32 disc, i32 (joined s32/error-context)]
+    //   ok payload → cell 0 (IntegerSignExt slot 1, s32)
+    //   err payload → cell 1 (Handle slot 1, kind=ErrorContext)
+    //   parent      → cell 2 (Result disc=0, ok=Some(0), err=Some(1))
+    // The err-arm Handle cell shares flat slot 1 with the ok-arm
+    // payload cell — joined result layout.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-with-err-ctx").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let empty = names.intern("");
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerSignExt { flat_slot: 1 },
+            Cell::Handle {
+                flat_slot: 1,
+                type_name: empty,
+                kind: HandleKind::ErrorContext,
+            },
+            Cell::Result {
+                disc_slot: 0,
+                ok_idx: Some(0),
+                err_idx: Some(1),
+            },
         ],
     );
     assert_eq!(plan.root(), 2);
@@ -1449,6 +1512,16 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &mut names,
         ),
         plan_for_named("stream-pair", &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-error-context").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-with-err-ctx").params[0].ty,
+            &r,
+            &mut names,
+        ),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan);

@@ -153,7 +153,7 @@ pub(crate) fn fold_cell_side_data(
             // Un-wired — plan-builder `todo!()`s before constructing
             // these. Reaching this arm means an un-wired variant
             // slipped through the plan-builder's gate.
-            Cell::ListOf | Cell::ErrorContext => {
+            Cell::ListOf => {
                 unreachable!("fold_cell_side_data reached un-wired Cell variant {cell:?}")
             }
         })

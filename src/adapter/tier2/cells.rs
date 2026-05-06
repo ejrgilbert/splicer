@@ -67,6 +67,7 @@ const EXPECTED_CELL_CASES: &[&str] = &[
     "resource-handle",
     "stream-handle",
     "future-handle",
+    "error-context-handle",
 ];
 
 /// Schema-derived layout of the `cell` variant: total size,
@@ -924,7 +925,12 @@ mod tests {
         // share the same body — exercise each so a disc-name typo
         // surfaces here.
         let cl = synth_cell_layout();
-        for disc_case in ["resource-handle", "stream-handle", "future-handle"] {
+        for disc_case in [
+            "resource-handle",
+            "stream-handle",
+            "future-handle",
+            "error-context-handle",
+        ] {
             build_and_validate(&[ValType::I32], |f| cl.emit_handle_cell(f, 0, disc_case, 9));
         }
     }
