@@ -353,4 +353,3 @@ fn splice_plan_works_even_when_compose_would_fail() {
     assert!(dir.path().join("splits").exists());
     assert!(!dir.path().join("composed.wasm").exists());
 }
-
