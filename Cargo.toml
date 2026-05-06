@@ -41,6 +41,7 @@ wasmparser = "0.247.0"
 wasm-encoder = { version = "0.247.0", features = ["wasmparser"] }
 wit-parser = "0.247"
 wit-bindgen-core = "0.57.1"
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wirm = "4.0.4"
 #wirm = { path = "../../research/compilers/wirm" }

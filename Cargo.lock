@@ -4211,6 +4211,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "wac-graph",
  "wac-parser",

@@ -104,7 +104,7 @@ pub fn generate_wac(
     // Without this, the notice would fire twice — once from the adapter
     // generator's `consumer_split_path` lookup, once from the wac-dep
     // map — because both paths call `resolve_shim` for the same shim.
-    warn_about_shim_resolutions(&shim_comps);
+    log_shim_resolutions(&shim_comps);
 
     let mut wac_lines = vec![format!("package {pkg_name};")];
 
@@ -697,7 +697,7 @@ fn gen_wac_args(
     deps
 }
 /// Pure: follow the shim chain until landing on a non-shim split.
-/// See [`warn_about_shim_resolutions`] for the user-facing notice that
+/// See [`log_shim_resolutions`] for the debug-level notice that
 /// fires once per non-trivial resolution at the top of [`generate_wac`].
 fn resolve_shim(mut component_num: usize, shim_comps: &HashMap<usize, usize>) -> usize {
     while is_shim_split_num(component_num, shim_comps) {
@@ -722,25 +722,23 @@ fn resolved_split_num(
     resolve_shim(node_split_num(node_id, composition), shim_comps)
 }
 
-/// Emit one WARN per non-trivial `shim → resolved` mapping in
+/// Emit one debug-level note per non-trivial `shim → resolved` mapping in
 /// `shim_comps`. Called once at the start of [`generate_wac`] so the
 /// same assumption isn't announced twice when both the adapter-gen and
 /// wac-dep paths later call [`resolve_shim`] for the same shim.
-fn warn_about_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
+///
+/// Hidden behind `RUST_LOG` (default off) since the heuristic is reliable
+/// in the common case; opt in via `RUST_LOG=splicer=debug` to see it.
+fn log_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
     let mut shim_keys: Vec<usize> = shim_comps.keys().copied().collect();
     shim_keys.sort();
     for shim_num in shim_keys {
         let resolved = resolve_shim(shim_num, shim_comps);
         if resolved != shim_num {
-            eprintln!(
-                "{}: {}",
-                "WARN".yellow().bold(),
-                format!(
-                    "\tAssumption made! It is likely that split{shim_num} is a shim component,\n\
-                     \tdefaulting to split{resolved} instead in the generated wac command!\n\
-                     \tIf this assumption is incorrect, modify the generated wac command."
-                )
-                .yellow()
+            tracing::debug!(
+                "Assumption made: split{shim_num} appears to be a shim component, \
+                 defaulting to split{resolved} in the generated wac command. \
+                 If this is incorrect, modify the generated wac command."
             );
         }
     }
