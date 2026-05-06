@@ -107,6 +107,8 @@ fn main() -> Result<()> {
     );
 
     println!();
-    println!("All done — splicer's output became a composed component without leaving the process.");
+    println!(
+        "All done — splicer's output became a composed component without leaving the process."
+    );
     Ok(())
 }

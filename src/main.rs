@@ -63,7 +63,12 @@ enum Command {
         /// Directory where split sub-components are written. When
         /// omitted, splits go to a tempdir (cleaned up on success);
         /// passing this flag persists them on disk.
-        #[arg(short = 'd', long = "splits-dir", alias = "dir-splits", value_name = "DIR")]
+        #[arg(
+            short = 'd',
+            long = "splits-dir",
+            alias = "dir-splits",
+            value_name = "DIR"
+        )]
         splits_dir: Option<PathBuf>,
 
         /// Package name written at the top of the generated WAC.

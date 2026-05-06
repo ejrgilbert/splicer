@@ -299,7 +299,9 @@ pub fn compose_wac(wac: &str, wac_deps: &BTreeMap<String, PathBuf>) -> Result<Ve
         .resolve(&keys)
         .context("Failed to resolve WAC packages")?;
 
-    let resolution = doc.resolve(pkgs).context("Failed to resolve WAC document")?;
+    let resolution = doc
+        .resolve(pkgs)
+        .context("Failed to resolve WAC document")?;
     let composed: Vec<u8> = resolution
         .encode(EncodeOptions::default())
         .context("Failed to encode composed component")?;
