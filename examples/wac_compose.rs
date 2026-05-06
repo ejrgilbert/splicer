@@ -14,7 +14,7 @@
 //! 2. Writes them to a temp directory.
 //! 3. Calls [`splicer::compose`] to discover the composition graph and
 //!    emit a WAC source plus a `wac_deps` map.
-//! 4. Calls [`ComposeOutput::to_wasm`] to turn that into a single
+//! 4. Calls [`Bundle::to_wasm`] to turn that into a single
 //!    composed Wasm component, in-process — no shell-out, no manual
 //!    plumbing through the `wac-*` crates.
 //!
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
     // ── 3. Compose to a single Wasm component, in-process ────────────────
     let composed = out.to_wasm().context("compose to wasm")?;
     println!(
-        "✓ ComposeOutput::to_wasm produced and validated {} bytes",
+        "✓ Bundle::to_wasm produced and validated {} bytes",
         composed.len()
     );
 
