@@ -48,7 +48,6 @@ enum Command {
         /// Bare flag uses ./output.wac; pass a path to override.
         #[arg(
             long = "emit-wac",
-            alias = "output-wac",
             value_name = "PATH",
             num_args = 0..=1,
             default_missing_value = DEFAULT_OUTPUT_WAC,
@@ -63,12 +62,7 @@ enum Command {
         /// Directory where split sub-components are written. When
         /// omitted, splits go to a tempdir (cleaned up on success);
         /// passing this flag persists them on disk.
-        #[arg(
-            short = 'd',
-            long = "splits-dir",
-            alias = "dir-splits",
-            value_name = "DIR"
-        )]
+        #[arg(short = 'd', long = "splits-dir", value_name = "DIR")]
         splits_dir: Option<PathBuf>,
 
         /// Package name written at the top of the generated WAC.
@@ -107,7 +101,6 @@ enum Command {
         /// Bare flag uses ./output.wac; pass a path to override.
         #[arg(
             long = "emit-wac",
-            alias = "output-wac",
             value_name = "PATH",
             num_args = 0..=1,
             default_missing_value = DEFAULT_OUTPUT_WAC,

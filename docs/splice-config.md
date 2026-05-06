@@ -7,7 +7,7 @@ The splice configuration describes **where and how middleware should be inserted
 This file is passed to:
 
 ```
-splicer <COMP_GRAPH_JSON> <SPLICE_CFG_YAML> [--output <FILE>]
+splicer splice <SPLICE_CFG_YAML> <COMP_WASM> [-o composed.wasm]
 ```
 
 ---
@@ -187,15 +187,12 @@ inject:
 | `name` | string | ✅                   | WAC variable name; must be globally unique across rules. |
 | `path` | string | strongly recommended | Path to the middleware `.wasm`.                          |
 
-**Always pass `path`.** When you do, splicer loads the bytes to verify
-the middleware's type signature is compatible with the target
-interface, and the `wac compose ...` command splicer prints references
-that exact path so you can run it as-is.
-
-If you omit `path`, splicer emits a `/path/to/comp.wasm` placeholder in
-the printed command, the type check is downgraded to a warning (no
-bytes to fingerprint), and you have to substitute the real path
-yourself before running `wac compose`.
+**Always pass `path`.** Splicer loads the bytes to verify the
+middleware's type signature is compatible with the target interface
+before composing. If you omit `path`, the type check is downgraded to
+a warning (no bytes to fingerprint) and the WAC carries a
+`/path/to/comp.wasm` placeholder you'd have to substitute by hand
+before any external `wac compose` run could resolve it.
 
 ### Builtin middleware
 
@@ -326,5 +323,10 @@ Future incompatible changes will increment the version number.
 # CLI Usage Reminder
 
 ```bash
-splicer graph.json splice-config.yaml --output planned.json
+splicer splice splice-config.yaml composition.wasm -o composed.wasm
 ```
+
+See the [README](../README.md#usage) for the full flag list, including
+`--plan` (emit WAC + a `wac compose ...` shell command instead of
+composing in-process) and `--emit-wac` (persist the intermediate WAC
+for auditing).

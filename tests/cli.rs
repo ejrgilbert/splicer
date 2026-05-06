@@ -204,29 +204,6 @@ fn compose_output_path_override() {
     assert!(!dir.path().join("composed.wasm").exists());
 }
 
-/// The deprecated `--output-wac` alias still works (kept for one
-/// release). When the alias is dropped, this test should be removed.
-#[test]
-fn compose_deprecated_output_wac_alias_works() {
-    let dir = tempfile::tempdir().unwrap();
-    let (a, b) = write_compose_components(dir.path());
-
-    let out = splicer_in(dir.path())
-        .arg("compose")
-        .arg(&a)
-        .arg(&b)
-        .arg("--output-wac")
-        .arg("legacy.wac")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "deprecated alias should still parse: stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(dir.path().join("legacy.wac").exists());
-}
-
 // ── Splice subcommand: failure path ────────────────────────────────────────
 //
 // We don't ship a hand-rolled splice-able fixture in the repo (a
@@ -377,25 +354,3 @@ fn splice_plan_works_even_when_compose_would_fail() {
     assert!(!dir.path().join("composed.wasm").exists());
 }
 
-/// Deprecated `--dir-splits` alias still resolves to `--splits-dir`.
-#[test]
-fn splice_deprecated_dir_splits_alias_works() {
-    if !chain1_fixture_present() {
-        eprintln!("skipping: chain1 fixture not checked out");
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    stage_chain1_fixture(dir.path());
-
-    let out = splicer_in(dir.path())
-        .arg("splice")
-        .arg("chain1.yaml")
-        .arg("chain1.wasm")
-        .arg("--dir-splits")
-        .arg("alt-splits")
-        .arg("--plan")
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    assert!(dir.path().join("alt-splits").exists());
-}
