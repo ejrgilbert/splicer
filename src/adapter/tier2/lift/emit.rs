@@ -67,6 +67,10 @@ pub(crate) struct WrapperLocals {
     /// Bump-pointer snapshot at wrapper entry; restored at exit
     /// for stack-reset semantics on per-call `cabi_realloc`.
     pub saved_bump: u32,
+    /// Base address of the active plan's cells slab. Set by the
+    /// wrapper-body emitter before each [`emit_lift_plan`] call;
+    /// reused across plans (each set overwrites the previous).
+    pub cells_base: u32,
 }
 
 /// Per-function emit-time bundle for the result-side lift. Built once
@@ -216,6 +220,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     // (`build_tier2_adapter` bails otherwise), so this is always live.
     let id_local = builder.alloc_local(ValType::I64);
     let saved_bump = builder.alloc_local(ValType::I32);
+    let cells_base = builder.alloc_local(ValType::I32);
 
     let frozen = builder.freeze();
     (
@@ -233,6 +238,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             id_local,
             task_return_loads,
             saved_bump,
+            cells_base,
         },
         result_emit,
         frozen,
@@ -241,15 +247,16 @@ pub(crate) fn alloc_wrapper_locals<'a>(
 
 /// Emit the wasm that lifts one plan into its cells slab. Walks
 /// `plan.cells` in allocation order and, for each cell, sets
-/// `lcl.addr` to that cell's absolute address (`cells_offset + i *
-/// cell_size`) and dispatches on the cell's variant. Cells reference
-/// plan-relative flat slots; `local_base` is added per-cell to
-/// recover the absolute wasm-local index — params pass the cumulative
-/// slot cursor, compound results pass `synth_locals[0]`.
+/// `lcl.addr` to that cell's absolute address (`cells_base + i *
+/// cell_size`, computed at runtime from the `cells_base` local set
+/// by the caller) and dispatches on the cell's variant. Cells
+/// reference plan-relative flat slots; `local_base` is added per-cell
+/// to recover the absolute wasm-local index — params pass the
+/// cumulative slot cursor, compound results pass `synth_locals[0]`.
 pub(crate) fn emit_lift_plan(
     f: &mut Function,
     cell_layout: &CellLayout,
-    cells_offset: u32,
+    cells_base: u32,
     plan: &LiftPlan,
     side_refs: CellSideRefs<'_>,
     local_base: u32,
@@ -261,8 +268,12 @@ pub(crate) fn emit_lift_plan(
         "side-table data (emit input) must have one entry per classify-time plan cell"
     );
     for (cell_idx, op) in plan.cells.iter().enumerate() {
-        let cell_addr = cells_offset + cell_idx as u32 * cell_layout.size;
-        f.instructions().i32_const(cell_addr as i32);
+        f.instructions().local_get(cells_base);
+        if cell_idx > 0 {
+            f.instructions()
+                .i32_const((cell_idx as u32 * cell_layout.size) as i32);
+            f.instructions().i32_add();
+        }
         f.instructions().local_set(lcl.addr);
         emit_cell_op(
             f,

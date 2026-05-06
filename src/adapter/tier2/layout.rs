@@ -193,13 +193,13 @@ impl FieldSideTables {
 }
 
 /// Single-pass build of a `field` record + its embedded
-/// `field-tree` for one (function, param) pair. `cells` points at
-/// the param's contiguous cells slab (`(slab-offset, cell-count)`),
-/// and `root` is the cell-array index the field-tree should walk
-/// from — sourced from the param's [`super::lift::ParamLift::plan`]'s
-/// [`super::lift::plan::LiftPlan::root`]. `side_tables` patches the
-/// field-tree's per-kind-infos lists for any kinds the param's plan
-/// carries.
+/// `field-tree` for one (function, param) pair. `cells` is
+/// `(0, cell-count)` — the wrapper body patches `cells.ptr` per
+/// call after `cabi_realloc`. `root` is the cell-array index the
+/// field-tree should walk from — sourced from the param's
+/// [`super::lift::ParamLift::plan`]'s [`super::lift::plan::LiftPlan::root`].
+/// `side_tables` patches the field-tree's per-kind-infos lists for
+/// any kinds the param's plan carries.
 fn write_field_record(
     blob: &mut Vec<u8>,
     schema: &SchemaLayouts,
@@ -217,29 +217,27 @@ fn write_field_record(
 }
 
 /// Build the contiguous fields blob: one `field` record per
-/// (fn, param). `cells_offsets[fn_idx][param_idx]` is the byte
-/// offset of the param's contiguous cells slab; `param_side_tables`
-/// is parallel and carries the param's per-kind side-table pointers
-/// (or `EMPTY` slots for kinds the param doesn't carry).
+/// (fn, param). `param_side_tables[fn][p]` carries the param's
+/// per-kind side-table pointers (or `EMPTY` slots for kinds the
+/// param doesn't carry). The field-tree's `cells.ptr` is left at
+/// `0` — the wrapper body patches it per call after `cabi_realloc`.
 fn build_fields_blob(
     per_func: &[FuncClassified],
     schema: &SchemaLayouts,
-    cells_offsets: &[Vec<u32>],
     param_side_tables: &[Vec<FieldSideTables>],
 ) -> Vec<u8> {
     let mut blob: Vec<u8> = Vec::new();
     for (fn_idx, fd) in per_func.iter().enumerate() {
         for (i, p) in fd.params.iter().enumerate() {
-            // The field-tree's `cells.ptr` points at the param's
-            // slab; `cells.len = plan.cell_count()`; `root` is the
-            // index recorded by the plan-builder (children-first
-            // ordering means root is the last-pushed cell for
-            // compound shapes, `0` for primitives).
+            // `cells.ptr = 0` placeholder; `cells.len = plan.cell_count()`;
+            // `root` is the index recorded by the plan-builder
+            // (children-first ordering means root is the last-pushed
+            // cell for compound shapes, `0` for primitives).
             write_field_record(
                 &mut blob,
                 schema,
                 BlobSlice {
-                    off: cells_offsets[fn_idx][i],
+                    off: 0,
                     len: p.plan.cell_count(),
                 },
                 p.plan.root(),
@@ -253,15 +251,13 @@ fn build_fields_blob(
 
 /// Build the contiguous on-return params blob: one record per fn,
 /// with `result: option::some(field-tree)` pre-wired for funcs that
-/// have a result lift, `option::none` for the rest.
-/// `result_cells_offsets[fn_idx]` is the byte offset of that fn's
-/// 1-cell (Direct) or N-cell (Compound) result slab;
-/// `None` when the after-hook isn't relevant for this fn.
+/// have a result lift, `option::none` for the rest. The field-tree's
+/// `cells.ptr` is left at `0` — the wrapper body patches it per call
+/// after `cabi_realloc`.
 fn build_after_params_blob(
     per_func: &[FuncClassified],
     schema: &SchemaLayouts,
     iface_name: BlobSlice,
-    result_cells_offsets: &[Option<u32>],
     result_side_tables: &[FieldSideTables],
 ) -> Vec<u8> {
     let Some(after_layout) = schema.after_hook.as_ref().map(|h| &h.params_layout) else {
@@ -279,33 +275,31 @@ fn build_after_params_blob(
                 len: fd.fn_name_len as u32,
             },
         );
-        match result_cells_offsets[fn_idx] {
-            Some(cells_off) => {
-                entry.write_option_some(&mut blob, ON_RET_RESULT);
-                let tree_base =
-                    entry.field_offset(ON_RET_RESULT) + schema.option_payload_off as usize;
-                let tree = RecordWriter::at(&schema.tree_layout, tree_base);
-                // Compound result: cells.len = plan.cell_count (slab
-                // holds the full cell tree) and root = plan.root()
-                // (children-first ordering puts the parent at the
-                // end of the slab). Direct result: len = 1, root = 0.
-                let (cells_len, root) = fd
-                    .result_lift
-                    .as_ref()
-                    .and_then(|rl| rl.compound())
-                    .map_or((1, 0), |c| (c.plan.cell_count(), c.plan.root()));
-                tree.write_slice(
-                    &mut blob,
-                    TREE_CELLS,
-                    BlobSlice {
-                        off: cells_off,
-                        len: cells_len,
-                    },
-                );
-                result_side_tables[fn_idx].write_to_tree(&mut blob, &tree);
-                tree.write_i32(&mut blob, TREE_ROOT, root as i32);
-            }
-            None => entry.write_option_none(&mut blob, ON_RET_RESULT),
+        if fd.result_lift.is_some() {
+            entry.write_option_some(&mut blob, ON_RET_RESULT);
+            let tree_base = entry.field_offset(ON_RET_RESULT) + schema.option_payload_off as usize;
+            let tree = RecordWriter::at(&schema.tree_layout, tree_base);
+            // Compound result: cells.len = plan.cell_count (slab
+            // holds the full cell tree) and root = plan.root()
+            // (children-first ordering puts the parent at the
+            // end of the slab). Direct result: len = 1, root = 0.
+            let (cells_len, root) = fd
+                .result_lift
+                .as_ref()
+                .and_then(|rl| rl.compound())
+                .map_or((1, 0), |c| (c.plan.cell_count(), c.plan.root()));
+            tree.write_slice(
+                &mut blob,
+                TREE_CELLS,
+                BlobSlice {
+                    off: 0,
+                    len: cells_len,
+                },
+            );
+            result_side_tables[fn_idx].write_to_tree(&mut blob, &tree);
+            tree.write_i32(&mut blob, TREE_ROOT, root as i32);
+        } else {
+            entry.write_option_none(&mut blob, ON_RET_RESULT);
         }
     }
     blob
@@ -382,41 +376,6 @@ pub(super) fn lay_out_static_memory(
 
     let name_blob = names.into_bytes();
     let _ = layout.place_data(1, &name_blob);
-
-    // Cells slabs first — fields records embed pointers to these.
-    // Each param contributes `plan.cell_count() * cell_size` bytes;
-    // record params produce >1 cell, so per-param offsets get
-    // recorded individually.
-    let cells_offsets: Vec<Vec<u32>> = per_func
-        .iter()
-        .map(|fd| {
-            fd.params
-                .iter()
-                .map(|p| {
-                    let slab_size = p.plan.cell_count() * schema.cell_layout.size;
-                    layout.reserve_scratch(schema.cell_layout.align, slab_size)
-                })
-                .collect()
-        })
-        .collect();
-    // Per-fn result-cell scratch, when after-hook is wired and the
-    // function has a result to lift. Compound results need
-    // `plan.cell_count() * cell_size` bytes; primitive single-cell
-    // results need just one cell.
-    let result_cells_offsets: Vec<Option<u32>> = if schema.after_hook.is_some() {
-        per_func
-            .iter()
-            .map(|fd| {
-                fd.result_lift.as_ref().map(|rl| {
-                    let cells = rl.compound().map_or(1, |c| c.plan.cell_count());
-                    layout
-                        .reserve_scratch(schema.cell_layout.align, cells * schema.cell_layout.size)
-                })
-            })
-            .collect()
-    } else {
-        vec![None; n_funcs]
-    };
 
     // Reserve per-Cell::Flags scratch *before* building the flags-info
     // entries so each entry's `set-flags.ptr` can land as an absolute
@@ -608,10 +567,9 @@ pub(super) fn lay_out_static_memory(
         })
         .collect();
 
-    // Fields blob (data) — pre-filled with cells.ptr pointing at
-    // each param's reserved slab slot, plus per-kind side-table
-    // pointers patched per-param.
-    let fields_blob = build_fields_blob(&per_func, schema, &cells_offsets, &param_side_tables);
+    // Fields blob (data) — `cells.ptr` left zero (patched at runtime
+    // per call); per-kind side-table pointers baked in per-param.
+    let fields_blob = build_fields_blob(&per_func, schema, &param_side_tables);
     let (fields_base, _) = layout.place_data(schema.field_layout.align, &fields_blob);
     let fields_buf_offsets: Vec<u32> = {
         let mut cursor = fields_base;
@@ -626,13 +584,7 @@ pub(super) fn lay_out_static_memory(
     };
 
     // On-return params blob (data), only when after-hook is wired.
-    let after_blob = build_after_params_blob(
-        &per_func,
-        schema,
-        iface_name,
-        &result_cells_offsets,
-        &result_side_tables,
-    );
+    let after_blob = build_after_params_blob(&per_func, schema, iface_name, &result_side_tables);
     let after_params_offsets: Vec<Option<i32>> =
         match schema.after_hook.as_ref().map(|h| &h.params_layout) {
             Some(al) => {
@@ -695,7 +647,6 @@ pub(super) fn lay_out_static_memory(
         .into_iter()
         .enumerate()
         .map(|(i, fc)| {
-            let fn_cells_offsets = &cells_offsets[i];
             let params: Vec<ParamLayout> = fc
                 .params
                 .into_iter()
@@ -711,16 +662,11 @@ pub(super) fn lay_out_static_memory(
                         handle_fill: handle_per_cell_fill.for_param(i, p_idx),
                     };
                     let cell_side = fold_cell_side_data(&lift.plan, &sources);
-                    ParamLayout {
-                        lift,
-                        cells_offset: fn_cells_offsets[p_idx],
-                        cell_side,
-                    }
+                    ParamLayout { lift, cell_side }
                 })
                 .collect();
 
             let retptr_offset = retptr_offsets[i];
-            let result_cells_offset = result_cells_offsets[i];
             let result_lift = fc.result_lift.map(|rl| {
                 let ResultLift { source, .. } = rl;
                 let layout_source = match source {
@@ -757,10 +703,7 @@ pub(super) fn lay_out_static_memory(
                 }
             });
 
-            let after = after_params_offsets[i].map(|params_offset| AfterSetup {
-                params_offset,
-                result_cells_offset,
-            });
+            let after = after_params_offsets[i].map(|params_offset| AfterSetup { params_offset });
 
             FuncDispatch {
                 shape: fc.shape,
@@ -810,7 +753,6 @@ mod tests {
     //! Failure messages are intentionally absent — `cargo test` prints
     //! the test name + line, which is enough to localize.
     use super::super::build_per_func_classified;
-    use super::super::lift::ParamLayout;
     use super::super::schema::{compute_schema, SchemaLayouts};
     use super::super::synthesize_adapter_world_wit;
     use super::*;
@@ -840,15 +782,6 @@ mod tests {
     }
 
     impl LayoutEnv {
-        /// `(FuncDispatch, ParamLayout)` pairs across every fn —
-        /// the right shape for per-param invariants like alignment
-        /// and overlap checks.
-        fn params(&self) -> impl Iterator<Item = (&FuncDispatch, &ParamLayout)> {
-            self.dispatches
-                .iter()
-                .flat_map(|fd| fd.params.iter().map(move |p| (fd, p)))
-        }
-
         /// Look up a dispatch by export-name substring. Tests use
         /// the WIT function name as the substring (mangling adds
         /// the interface prefix but preserves the name).
@@ -907,30 +840,6 @@ mod tests {
         }
     }
 
-    // ─── Cell-slab placement ──────────────────────────────────────
-
-    #[test]
-    fn param_cells_offsets_aligned_to_cell_align() {
-        let env = env();
-        let align = env.schema.cell_layout.align;
-        assert!(env.params().all(|(_, p)| p.cells_offset % align == 0));
-    }
-
-    #[test]
-    fn param_cells_slabs_dont_overlap() {
-        let env = env();
-        let cell_size = env.schema.cell_layout.size;
-        let mut slabs: Vec<(u32, u32)> = env
-            .params()
-            .map(|(_, p)| {
-                let start = p.cells_offset;
-                (start, start + p.lift.plan.cell_count() * cell_size)
-            })
-            .collect();
-        slabs.sort();
-        assert!(slabs.windows(2).all(|w| w[0].1 <= w[1].0));
-    }
-
     // ─── Fields-blob placement ────────────────────────────────────
 
     #[test]
@@ -958,18 +867,6 @@ mod tests {
             .dispatches
             .iter()
             .all(|fd| fd.after.is_some()));
-    }
-
-    #[test]
-    fn result_cells_offset_set_iff_func_has_result_lift() {
-        let env = env();
-        for fd in &env.dispatches {
-            let after = fd.after.as_ref().unwrap();
-            assert_eq!(
-                after.result_cells_offset.is_some(),
-                fd.result_lift.is_some()
-            );
-        }
     }
 
     // ─── Retptr scratch ───────────────────────────────────────────

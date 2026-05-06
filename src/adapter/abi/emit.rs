@@ -583,6 +583,47 @@ impl BlobSlice {
     pub(crate) const EMPTY: BlobSlice = BlobSlice { off: 0, len: 0 };
 }
 
+/// Call `cabi_realloc(0, 0, align, size)` and store the returned
+/// pointer in `dest_local`. Convenience wrapper for the per-call
+/// fresh-allocation pattern (cells slab, list-of indices buffer, …).
+pub(crate) fn emit_cabi_realloc_call(
+    f: &mut Function,
+    cabi_realloc_idx: u32,
+    align: u32,
+    size: u32,
+    dest_local: u32,
+) {
+    debug_assert!(
+        size <= i32::MAX as u32,
+        "cabi_realloc size {size} doesn't fit in signed i32",
+    );
+    f.instructions().i32_const(0);
+    f.instructions().i32_const(0);
+    f.instructions().i32_const(align as i32);
+    f.instructions().i32_const(size as i32);
+    f.instructions().call(cabi_realloc_idx);
+    f.instructions().local_set(dest_local);
+}
+
+/// Patch a slice's `ptr` field from a runtime wasm local. The slice's
+/// `len` is left untouched — caller statically wrote it (at build
+/// time, via [`emit_store_slice`] or similar) or patches it
+/// separately when runtime-determined.
+pub(crate) fn emit_store_slice_ptr_runtime(
+    f: &mut Function,
+    base_ptr: i32,
+    field_off: u32,
+    ptr_local: u32,
+) {
+    f.instructions().i32_const(base_ptr);
+    f.instructions().local_get(ptr_local);
+    f.instructions().i32_store(MemArg {
+        offset: (field_off + SLICE_PTR_OFFSET) as u64,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    });
+}
+
 /// Store `slice.off` then `slice.len` as the canonical-ABI `(ptr, len)`
 /// pair at `base_ptr + field_off`.
 pub(crate) fn emit_store_slice(f: &mut Function, base_ptr: i32, field_off: u32, slice: BlobSlice) {

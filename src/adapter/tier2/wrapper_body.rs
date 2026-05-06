@@ -47,16 +47,19 @@ use wit_parser::Resolve;
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_handler_call,
-    emit_populate_call_id, emit_store_i64_local, emit_store_slice, emit_wrapper_return, BlobSlice,
-    BumpReset, RecordLayout,
+    emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save,
+    emit_cabi_realloc_call, emit_handler_call, emit_populate_call_id, emit_store_i64_local,
+    emit_store_slice, emit_store_slice_ptr_runtime, emit_wrapper_return, BlobSlice, BumpReset,
+    RecordLayout,
 };
 use super::super::indices::LocalsBuilder;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
     CellSideRefs, ResultEmitPlan, WrapperLocals,
 };
-use super::schema::{SchemaLayouts, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL};
+use super::schema::{
+    SchemaLayouts, FIELD_TREE, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
+};
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
 
@@ -93,10 +96,10 @@ pub(super) struct BeforeHook<'a> {
     pub(super) params_ptr: i32,
 }
 
-/// Per-build static values for the after-hook emit path. Per-fn
-/// offsets (params buffer + result-cell scratch) live on
-/// [`FuncDispatch::after`]; the static parts (import index +
-/// on-return params layout) are shared across all wrappers.
+/// Per-build static values for the after-hook emit path. The per-fn
+/// params-buffer offset lives on [`FuncDispatch::after`]; the static
+/// parts (import index + on-return params layout) are shared across
+/// all wrappers. Result cells are `cabi_realloc`'d per call.
 pub(super) struct AfterHook<'a> {
     pub(super) idx: u32,
     pub(super) layout: &'a RecordLayout,
@@ -109,6 +112,44 @@ struct OnCallCallSite {
     args: BlobSlice,
     /// Local holding this invocation's id (bumped at body top).
     id_local: u32,
+}
+
+/// Allocate `n_cells` cells worth of memory via `cabi_realloc`, store
+/// the result in `cells_base_local`, and patch the field-tree's
+/// `cells.ptr` field (`base_ptr + cells_field_off`) so the hook sees
+/// the freshly-allocated buffer. `cells.len` was baked at build time
+/// from the static plan.
+fn emit_alloc_cells_and_patch(
+    f: &mut Function,
+    cabi_realloc_idx: u32,
+    schema: &SchemaLayouts,
+    n_cells: u32,
+    fields_base_ptr: i32,
+    cells_field_off: u32,
+    cells_base_local: u32,
+) {
+    emit_cabi_realloc_call(
+        f,
+        cabi_realloc_idx,
+        schema.cell_layout.align,
+        n_cells * schema.cell_layout.size,
+        cells_base_local,
+    );
+    emit_store_slice_ptr_runtime(f, fields_base_ptr, cells_field_off, cells_base_local);
+}
+
+/// Byte offset of the `cells: list<cell>` slice within a `field`
+/// record (relative to the field's base).
+fn field_cells_slice_off(schema: &SchemaLayouts) -> u32 {
+    schema.field_layout.offset_of(FIELD_TREE) + schema.tree_layout.offset_of(TREE_CELLS)
+}
+
+/// Byte offset of the `cells: list<cell>` slice within the on-return
+/// params record (relative to the record's base).
+fn after_result_cells_slice_off(schema: &SchemaLayouts, after_layout: &RecordLayout) -> u32 {
+    after_layout.offset_of(ON_RET_RESULT)
+        + schema.option_payload_off
+        + schema.tree_layout.offset_of(TREE_CELLS)
 }
 
 /// Write the call-id record + per-call `list<field>` args pointer/len
@@ -169,11 +210,22 @@ pub(super) fn emit_wrapper_function(
         // cumulative cursor as the per-param `local_base` so cell N
         // resolves to absolute wasm-local `local_base + N`.
         let mut local_base: u32 = 0;
-        for p in fd.params.iter() {
+        let cells_slice_off = field_cells_slice_off(schema);
+        for (i, p) in fd.params.iter().enumerate() {
+            let field_off = i as u32 * schema.field_layout.size;
+            emit_alloc_cells_and_patch(
+                &mut f,
+                func_idx.cabi_realloc_idx,
+                schema,
+                p.lift.plan.cell_count(),
+                fd.fields_buf_offset as i32,
+                field_off + cells_slice_off,
+                lcl.cells_base,
+            );
             emit_lift_plan(
                 &mut f,
                 &schema.cell_layout,
-                p.cells_offset,
+                lcl.cells_base,
                 &p.lift.plan,
                 CellSideRefs {
                     cell_side: &p.cell_side,
@@ -239,7 +291,21 @@ pub(super) fn emit_wrapper_function(
         _ => unreachable!("after-hook ctx and per-fn data are wired in lockstep"),
     };
     if let Some((after_static, after_pf)) = after_zip {
-        if let Some(cells_off) = after_pf.result_cells_offset {
+        let n_cells = match &result_emit {
+            ResultEmitPlan::Compound { plan, .. } => plan.cell_count(),
+            ResultEmitPlan::Direct { .. } => 1,
+            ResultEmitPlan::None => 0,
+        };
+        if n_cells > 0 {
+            emit_alloc_cells_and_patch(
+                &mut f,
+                func_idx.cabi_realloc_idx,
+                schema,
+                n_cells,
+                after_pf.params_offset,
+                after_result_cells_slice_off(schema, after_static.layout),
+                lcl.cells_base,
+            );
             match &result_emit {
                 ResultEmitPlan::Compound {
                     plan,
@@ -263,7 +329,7 @@ pub(super) fn emit_wrapper_function(
                     emit_lift_plan(
                         &mut f,
                         &schema.cell_layout,
-                        cells_off,
+                        lcl.cells_base,
                         plan,
                         *side_refs,
                         synth_locals[0],
@@ -271,7 +337,8 @@ pub(super) fn emit_wrapper_function(
                     );
                 }
                 ResultEmitPlan::Direct { .. } => {
-                    f.instructions().i32_const(cells_off as i32);
+                    // Single-cell direct result: `lcl.addr = cells_base`.
+                    f.instructions().local_get(lcl.cells_base);
                     f.instructions().local_set(lcl.addr);
                     emit_lift_result(&mut f, &schema.cell_layout, &result_emit, &lcl);
                 }

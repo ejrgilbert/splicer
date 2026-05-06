@@ -422,8 +422,9 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
         flags_addr: n + 1,
         flags_count: n + 2,
         char_len: n + 3,
-        ext64: n + 4,
-        ext_f64: n + 5,
+        cells_base: n + 4,
+        ext64: n + 5,
+        ext_f64: n + 6,
         result: None,
         tr_addr: None,
         id_local: 0,
@@ -453,17 +454,21 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
     module.section(&funcs);
     let mut code = CodeSection::new();
     let mut f = Function::new([
-        (4u32, ValType::I32),
+        (5u32, ValType::I32),
         (1u32, ValType::I64),
         (1u32, ValType::F64),
     ]);
     // Wasm function params occupy locals 0..flat_slot_count, so
     // `local_base = 0` aligns the plan's flat slots with the
-    // params declared on the synth wasm fn.
+    // params declared on the synth wasm fn. `cells_base` is a fresh
+    // i32 local set to 0 (treats the cells slab as starting at
+    // address 0 — fine for validation, no actual store happens).
+    f.instructions().i32_const(0);
+    f.instructions().local_set(lcl.cells_base);
     emit_lift_plan(
         &mut f,
         &cell_layout,
-        0,
+        lcl.cells_base,
         plan,
         super::emit::CellSideRefs {
             cell_side: &cell_side,

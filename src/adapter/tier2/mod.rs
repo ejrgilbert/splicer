@@ -341,16 +341,11 @@ impl FuncShape {
 /// Per-function on-return hook offsets, populated only when the
 /// middleware exports `splicer:tier2/after`. Pairs with the per-build
 /// [`wrapper_body::AfterHook`] (import idx + on-return params layout)
-/// at emit time; the two `Option`s are populated together so callers
-/// branch once on `(Some, Some)` rather than threading separate
-/// "is after wired?" / "does this fn have a result?" checks.
+/// at emit time. Result cells are `cabi_realloc`'d per call by the
+/// wrapper body — presence of a result is read from `result_lift`.
 pub(in crate::adapter::tier2) struct AfterSetup {
     /// Byte offset of the pre-built on-return indirect-params buffer.
     pub params_offset: i32,
-    /// Byte offset of the 1-cell result scratch slab. `None` for
-    /// void-returning funcs (still need params_offset, but no result
-    /// to lift).
-    pub result_cells_offset: Option<u32>,
 }
 
 /// Classify-phase per-function output. Holds everything the layout
@@ -411,11 +406,9 @@ pub(in crate::adapter::tier2) struct FuncDispatch {
     /// Byte offset of the function name within the data segment.
     pub fn_name_offset: i32,
     pub fn_name_len: i32,
-    /// Per-param post-layout lift recipe (classify data + offsets).
-    /// Empty for zero-arg functions. Each `ParamLayout::cells_offset`
-    /// holds the offset of its own cells slab — there's no shared
-    /// per-fn slab base, since record params consume more than one
-    /// cell.
+    /// Per-param post-layout lift recipe (classify data + side-table
+    /// bookkeeping). Empty for zero-arg functions. Each param's cells
+    /// slab is `cabi_realloc`'d per call — no static slab base.
     pub params: Vec<lift::ParamLayout>,
     /// Byte offset of this function's pre-built `field` records in
     /// the data segment. Holds `params.len()` consecutive `field`

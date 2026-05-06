@@ -38,8 +38,8 @@ use super::sidetable::CellSideData;
 //   variant) and single-cell-at-retptr kinds (string / `list<u8>`
 //   / async-retptr'd flags / char / handle) share this path.
 //
-// All offsets (retptr_offset + cells_offset + per-cell side-table
-// data for Compound) live on the post-layout [`ResultLayout`] /
+// All offsets (retptr_offset + per-cell side-table data for
+// Compound) live on the post-layout [`ResultLayout`] /
 // [`ResultSourceLayout`]; this classify-time type has no offsets
 // and never gets mutated.
 
@@ -118,13 +118,10 @@ pub(crate) struct ParamLift {
 // structurally impossible with this split.
 
 /// Post-layout per-parameter lift descriptor: the classify-time
-/// data plus its cells-slab offset + per-cell side-table bookkeeping.
+/// data plus per-cell side-table bookkeeping. The cells slab is
+/// `cabi_realloc`'d per-call by the wrapper body (no static offset).
 pub(crate) struct ParamLayout {
     pub lift: ParamLift,
-    /// Byte offset of this param's contiguous cells slab within
-    /// the static data segment; the slab holds `lift.plan.cell_count()`
-    /// cells, each `cell_layout.size` bytes.
-    pub cells_offset: u32,
     /// One [`CellSideData`] entry per `lift.plan.cells` position,
     /// holding the side-table bookkeeping the emit phase needs (idx,
     /// blob slice, runtime-fill, …) for cells whose kind has any.
@@ -149,10 +146,10 @@ pub(crate) enum ResultSourceLayout {
     /// from the source local.
     Direct { cell: Cell, side_data: CellSideData },
     /// Result loaded from retptr scratch: classify-time recipe +
-    /// retptr offset + per-cell side-table data. The cells-slab base
-    /// lives on [`super::super::AfterSetup::result_cells_offset`].
-    /// Both multi-cell compounds and single-cell-at-retptr kinds
-    /// route through here; their plan handles N≥1 cells uniformly.
+    /// retptr offset + per-cell side-table data. The cells slab is
+    /// `cabi_realloc`'d per-call by the wrapper body. Both multi-cell
+    /// compounds and single-cell-at-retptr kinds route through here;
+    /// their plan handles N≥1 cells uniformly.
     Compound {
         compound: CompoundResult,
         retptr_offset: i32,
