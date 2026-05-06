@@ -387,14 +387,16 @@ fn emit_cell_op(
                 lcl.char_len,
             );
         }
-        Cell::Handle { flat_slot, .. } => {
+        Cell::Handle {
+            flat_slot, kind, ..
+        } => {
             let CellSideData::Handle(fill) = side_data else {
                 panic!("Handle cell paired with non-Handle side data {side_data:?}");
             };
             emit_handle_runtime_fill(f, local_base + *flat_slot, fill);
-            cell_layout.emit_resource_handle(f, lcl.addr, fill.side_table_idx);
+            cell_layout.emit_handle_cell(f, lcl.addr, kind.cell_disc_case(), fill.side_table_idx);
         }
-        Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+        Cell::ListOf | Cell::ErrorContext => {
             todo!("emit_cell_op for un-wired Cell variant {op:?}")
         }
     }
@@ -606,12 +608,12 @@ fn emit_lift_kind(
             };
             cell_layout.emit_char(f, addr, source, *scratch_addr, lcl.char_len);
         }
-        Cell::Handle { .. } => {
+        Cell::Handle { kind, .. } => {
             let CellSideData::Handle(fill) = side_data else {
                 panic!("Handle cell paired with non-Handle side data {side_data:?}");
             };
             emit_handle_runtime_fill(f, source, fill);
-            cell_layout.emit_resource_handle(f, addr, fill.side_table_idx);
+            cell_layout.emit_handle_cell(f, addr, kind.cell_disc_case(), fill.side_table_idx);
         }
         // Multi-slot + compound + un-wired kinds always retptr;
         // classify_result_lift routes them through Compound.
@@ -623,8 +625,6 @@ fn emit_lift_kind(
         | Cell::Option { .. }
         | Cell::Result { .. }
         | Cell::Variant { .. }
-        | Cell::Future
-        | Cell::Stream
         | Cell::ErrorContext => unreachable!(
             "emit_lift_kind reached non-Direct Cell {cell:?} — \
              classify_result_lift should have routed it through Compound"

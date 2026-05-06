@@ -313,6 +313,8 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
             wit_parser::TypeDefKind::Enum(_) => true,
             wit_parser::TypeDefKind::Flags(_) => true,
             wit_parser::TypeDefKind::Handle(_) => true,
+            wit_parser::TypeDefKind::Stream(_) => true,
+            wit_parser::TypeDefKind::Future(_) => true,
             wit_parser::TypeDefKind::Type(t) => is_supported_direct_result(t, resolve),
             _ => false,
         },

@@ -554,49 +554,28 @@ impl CellLayout {
         );
     }
 
-    /// `cell::resource-handle(u32)` — build-time-known index into
-    /// `field-tree.handle-infos`. The pointed-at entry's `id` is
-    /// patched at runtime by the wrapper alongside this write.
-    pub(crate) fn emit_resource_handle(
+    /// `cell::{resource,stream,future}-handle(u32)` — build-time-known
+    /// index into `field-tree.handle-infos`. `disc_case` is the WIT
+    /// case-name picking which cell-disc to emit; the runtime-filled
+    /// `id` field on the pointed-at entry is written alongside this
+    /// by the wrapper.
+    pub(crate) fn emit_handle_cell(
         &self,
         f: &mut Function,
         addr_local: u32,
+        disc_case: &str,
         side_table_idx: u32,
     ) {
         self.emit_cell(
             f,
             addr_local,
-            self.disc_of("resource-handle"),
+            self.disc_of(disc_case),
             &[PayloadPart {
                 source: PayloadSource::ConstI32(side_table_idx as i32),
                 kind: StoreKind::I32,
                 offset: 0,
             }],
         );
-    }
-
-    /// `cell::stream-handle(u32)` — index into `field-tree.handle-infos`.
-    #[allow(dead_code)]
-    pub(crate) fn emit_stream_handle(
-        &self,
-        f: &mut Function,
-        addr_local: u32,
-        handle_info_idx: u32,
-    ) {
-        let _ = (f, addr_local, handle_info_idx);
-        todo!("cell::stream-handle — disc 16 + i32 handle-info index");
-    }
-
-    /// `cell::future-handle(u32)` — index into `field-tree.handle-infos`.
-    #[allow(dead_code)]
-    pub(crate) fn emit_future_handle(
-        &self,
-        f: &mut Function,
-        addr_local: u32,
-        handle_info_idx: u32,
-    ) {
-        let _ = (f, addr_local, handle_info_idx);
-        todo!("cell::future-handle — disc 17 + i32 handle-info index");
     }
 }
 
@@ -939,12 +918,15 @@ mod tests {
     }
 
     #[test]
-    fn resource_handle_cell_emits_valid_wasm() {
-        // params: (addr_local: i32). side_table_idx is an i32.const,
-        // no additional locals — the runtime `id` patch lives in the
-        // emit-phase wrapper helper, not in the cell-emit helper.
+    fn handle_cells_emit_valid_wasm() {
+        // params: (addr_local: i32). side_table_idx is an i32.const.
+        // All three handle disc-cases (resource / stream / future)
+        // share the same body — exercise each so a disc-name typo
+        // surfaces here.
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_resource_handle(f, 0, 9));
+        for disc_case in ["resource-handle", "stream-handle", "future-handle"] {
+            build_and_validate(&[ValType::I32], |f| cl.emit_handle_cell(f, 0, disc_case, 9));
+        }
     }
 
     /// Structural fuzz over the primitive cell-emit helpers — for each

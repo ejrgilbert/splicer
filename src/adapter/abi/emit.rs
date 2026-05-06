@@ -13,8 +13,8 @@ use wasm_encoder::{
 };
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
-    Function as WitFunction, Handle, Int, Resolve, ResourceIntrinsic, SizeAlign, Type, TypeDefKind,
-    TypeId, TypeOwner, WasmImport, WorldId, WorldItem, WorldKey,
+    Function as WitFunction, Handle, Int, InterfaceId, Resolve, ResourceIntrinsic, SizeAlign, Type,
+    TypeDefKind, TypeId, TypeOwner, WasmImport, WorldId, WorldItem, WorldKey,
 };
 
 use super::super::indices::LocalsBuilder;
@@ -587,6 +587,40 @@ pub(crate) fn emit_alloc_call_id(f: &mut Function, counter_global: u32, id_local
     f.instructions().i64_add();
     f.instructions().local_tee(id_local);
     f.instructions().global_set(counter_global);
+}
+
+/// Bail if `target_iface` declares a resource inline (the resource's
+/// `owner` is the same interface). Splicer's wrapper pattern routes
+/// the target interface through an adapter component;
+/// `wit_component::ComponentEncoder` synthesizes a fresh resource
+/// type for the export side, diverging from the import side's
+/// identity. The runtime then rejects handles crossing the boundary.
+/// Both tier-1 and tier-2 wrappers hit this, so the check is shared.
+pub(crate) fn require_no_inline_resources(
+    resolve: &Resolve,
+    target_iface: InterfaceId,
+) -> Result<()> {
+    let iface = &resolve.interfaces[target_iface];
+    for (ty_name, &tid) in &iface.types {
+        let td = &resolve.types[tid];
+        if matches!(td.kind, TypeDefKind::Resource)
+            && matches!(td.owner, TypeOwner::Interface(owner) if owner == target_iface)
+        {
+            let iface_name = resolve
+                .id_of(target_iface)
+                .unwrap_or_else(|| iface.name.clone().unwrap_or_default());
+            bail!(
+                "interface `{iface_name}` declares resource `{ty_name}` inline. \
+                 Splicer's wrapper-component pattern can't preserve resource \
+                 type identity for inline resources — runtime handle traffic \
+                 between the import side and export side will be rejected. \
+                 Move `{ty_name}` into a sibling `types` interface and \
+                 reference it via `use types.{{{ty_name}}}` (the wasi-style \
+                 factored-types pattern)."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Top-level `borrow<R>` params of `func`, returned as

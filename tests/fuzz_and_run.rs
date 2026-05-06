@@ -22,6 +22,13 @@
 //! Override the shape list via env var (comma-separated names):
 //!     SPLICER_RUNTIME_SHAPES=u32,string cargo test --test fuzz_and_run \
 //!         -- --ignored --nocapture
+//!
+//! TODO: stream/future shape coverage. Tier-2 lift codegen is in
+//! place (single `Cell::Handle` variant covers own/borrow/stream/
+//! future, picking cell-disc by `HandleKind`). Blocked on async-
+//! runtime + canon-async-stream/future host bindings the harness
+//! doesn't yet have — needs `wasi:io/streams`-style host imports
+//! the consumer can read/write through, plus async fn scaffolds.
 
 use anyhow::Context;
 use arbitrary::Arbitrary;
@@ -2103,15 +2110,19 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
         Cell::OptionNone => "option-none".to_string(),
         Cell::ResultOk(payload) => fmt_result_arm(tree, "result-ok", payload),
         Cell::ResultErr(payload) => fmt_result_arm(tree, "result-err", payload),
-        Cell::ResourceHandle(side_idx) => {
-            let info = tree
-                .handle_infos
-                .get(*side_idx as usize)
-                .expect("handle_infos idx in range");
-            format!("resource-handle({}, id={})", info.type_name, info.id)
-        }
+        Cell::ResourceHandle(side_idx) => fmt_handle(tree, "resource-handle", *side_idx),
+        Cell::StreamHandle(side_idx) => fmt_handle(tree, "stream-handle", *side_idx),
+        Cell::FutureHandle(side_idx) => fmt_handle(tree, "future-handle", *side_idx),
         other => format!("other({other:?})"),
     }
+}
+
+fn fmt_handle(tree: &FieldTree, kind: &str, side_idx: u32) -> String {
+    let info = tree
+        .handle_infos
+        .get(side_idx as usize)
+        .expect("handle_infos idx in range");
+    format!("{kind}({}, id={})", info.type_name, info.id)
 }
 
 fn fmt_result_arm(tree: &FieldTree, arm: &str, payload: &Option<u32>) -> String {

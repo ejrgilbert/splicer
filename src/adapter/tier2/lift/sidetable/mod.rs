@@ -70,8 +70,10 @@ pub(crate) enum CellSideData {
     Char {
         scratch_addr: i32,
     },
-    /// `cell::resource-handle(u32)` payload + the wrapper-patched
-    /// `id` slot address. Boxed for the same reason as Flags/Variant.
+    /// `cell::{resource,stream,future}-handle(u32)` payload + the
+    /// wrapper-patched `id` slot address. The cell's `kind` picks
+    /// the disc; the side-table layout is identical across all
+    /// three. Boxed for the same reason as Flags/Variant.
     Handle(Box<HandleRuntimeFill>),
 }
 
@@ -151,7 +153,7 @@ pub(crate) fn fold_cell_side_data(
             // Un-wired — plan-builder `todo!()`s before constructing
             // these. Reaching this arm means an un-wired variant
             // slipped through the plan-builder's gate.
-            Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+            Cell::ListOf | Cell::ErrorContext => {
                 unreachable!("fold_cell_side_data reached un-wired Cell variant {cell:?}")
             }
         })

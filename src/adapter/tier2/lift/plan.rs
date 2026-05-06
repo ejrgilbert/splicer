@@ -126,13 +126,17 @@ pub(crate) enum Cell {
         info: NamedListInfo,
     },
 
-    /// `own<R>` / `borrow<R>` → `cell::resource-handle(u32)`. Single
-    /// i32 lift slot (canonical-ABI handle); the side-table entry
-    /// carries `(type-name, id)` with `id` = handle bits zero-extended
-    /// per call. `type_name` is interned at plan-build time.
+    /// `own<R>` / `borrow<R>` / `stream<T>` / `future<T>` →
+    /// `cell::{resource,stream,future}-handle(u32)`. Single i32 lift
+    /// slot (canonical-ABI handle); the side-table entry carries
+    /// `(type-name, id)` with `id` = handle bits zero-extended per
+    /// call. `type_name` is interned at plan-build time. `kind`
+    /// picks the cell-disc; the lift codegen and side-table builder
+    /// are otherwise identical across all three.
     Handle {
         flat_slot: u32,
         type_name: BlobSlice,
+        kind: HandleKind,
     },
 
     // ── Un-wired compound (todo!() in `LiftPlanBuilder::push`
@@ -140,15 +144,34 @@ pub(crate) enum Cell {
     /// `list<T>` (non-u8 element) → `cell::list-of`.
     ListOf,
 
-    // ── Un-wired handle ──────────────────────────────────────────
-    /// `future<T>` → `cell::future-handle(u32)`.
-    Future,
-    /// `stream<T>` → `cell::stream-handle(u32)`.
-    Stream,
-
     // ── Future work ──────────────────────────────────────────────
     /// `error-context` — no cell variant yet; design TBD.
     ErrorContext,
+}
+
+/// Which `cell::*-handle` variant a [`Cell::Handle`] should emit.
+/// All three share the canonical-ABI representation (single i32
+/// handle), the `handle-info` side-table layout, and the lift
+/// codegen — only the cell-disc differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandleKind {
+    /// `own<R>` / `borrow<R>` → `cell::resource-handle`.
+    Resource,
+    /// `stream<T>` → `cell::stream-handle`.
+    Stream,
+    /// `future<T>` → `cell::future-handle`.
+    Future,
+}
+
+impl HandleKind {
+    /// WIT case-name for the matching `cell::*-handle` disc.
+    pub(crate) fn cell_disc_case(self) -> &'static str {
+        match self {
+            HandleKind::Resource => "resource-handle",
+            HandleKind::Stream => "stream-handle",
+            HandleKind::Future => "future-handle",
+        }
+    }
 }
 
 /// Plan for lifting one (param | result) into a cell tree. Cells
@@ -329,11 +352,11 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::Option(inner) => self.push_option(inner, resolve, names),
                 wit_parser::TypeDefKind::Result(_) => self.push_result(ty, resolve, names),
                 wit_parser::TypeDefKind::Handle(h) => self.push_handle(h, resolve, names),
-                wit_parser::TypeDefKind::Future(_) => {
-                    todo!("plan-builder for un-wired Cell::Future")
+                wit_parser::TypeDefKind::Stream(elem) => {
+                    self.push_stream_or_future(elem.as_ref(), HandleKind::Stream, resolve, names)
                 }
-                wit_parser::TypeDefKind::Stream(_) => {
-                    todo!("plan-builder for un-wired Cell::Stream")
+                wit_parser::TypeDefKind::Future(elem) => {
+                    self.push_stream_or_future(elem.as_ref(), HandleKind::Future, resolve, names)
                 }
                 wit_parser::TypeDefKind::FixedLengthList(_, _)
                 | wit_parser::TypeDefKind::Map(_, _)
@@ -561,9 +584,8 @@ impl LiftPlanBuilder {
         })
     }
 
-    /// `own<R>` / `borrow<R>` share `Cell::Handle` — both flatten to
-    /// one i32 (the canonical-ABI handle). Anonymous resources fall
-    /// back to "" for type-name (matches `push_record`).
+    /// `own<R>` / `borrow<R>` — single i32 (canonical-ABI handle).
+    /// Anonymous resources fall back to "" for type-name.
     fn push_handle(
         &mut self,
         h: &wit_parser::Handle,
@@ -578,6 +600,54 @@ impl LiftPlanBuilder {
         self.push_cell(Cell::Handle {
             flat_slot,
             type_name,
+            kind: HandleKind::Resource,
+        })
+    }
+
+    /// `stream<T>` / `future<T>` — single i32 (canonical-ABI handle).
+    /// Type-name peels alias + Handle wrappers to find a named
+    /// typedef (wit-parser auto-wraps `stream<my-res>` as
+    /// `stream<own<my-res>>`); "" for primitives or unnamed chains.
+    fn push_stream_or_future(
+        &mut self,
+        elem: Option<&Type>,
+        kind: HandleKind,
+        resolve: &Resolve,
+        names: &mut NameInterner,
+    ) -> u32 {
+        let elem_name = elem
+            .and_then(|t| match t {
+                Type::Id(id) => Some(*id),
+                _ => None,
+            })
+            .map(|id| {
+                // Peel through alias / handle wrappers until a named
+                // typedef appears or the chain dead-ends.
+                // wit-parser implicitly wraps `stream<my-res>` as
+                // `stream<own<my-res>>`, so a Handle hop is expected
+                // when the element is a resource type.
+                let mut tid = id;
+                loop {
+                    let td = &resolve.types[tid];
+                    if let Some(name) = td.name.as_deref() {
+                        return name;
+                    }
+                    match &td.kind {
+                        wit_parser::TypeDefKind::Type(Type::Id(next)) => tid = *next,
+                        wit_parser::TypeDefKind::Handle(
+                            wit_parser::Handle::Own(next) | wit_parser::Handle::Borrow(next),
+                        ) => tid = *next,
+                        _ => return "",
+                    }
+                }
+            })
+            .unwrap_or("");
+        let type_name = names.intern(elem_name);
+        let flat_slot = self.bump_flat_slot();
+        self.push_cell(Cell::Handle {
+            flat_slot,
+            type_name,
+            kind,
         })
     }
 

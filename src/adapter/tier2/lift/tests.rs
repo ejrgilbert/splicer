@@ -15,7 +15,7 @@ use super::super::blob::NameInterner;
 use super::super::cells::CellLayout;
 use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::super::{FuncClassified, FuncShape};
-use super::plan::{Cell, LiftPlan, NamedListInfo};
+use super::plan::{Cell, HandleKind, LiftPlan, NamedListInfo};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
@@ -64,6 +64,11 @@ const TEST_WIT: &str = r#"
         f-handle-own: func(h: own<my-res>);
         f-handle-borrow: func(h: borrow<my-res>);
         f-record-with-handle: func(hp: handle-pair);
+        f-stream-u32: async func(s: stream<u32>);
+        f-future-string: async func(fut: future<string>);
+        f-stream-of-res: async func(s: stream<my-res>);
+        record stream-pair { events: stream<u32>, ack: future<u32> }
+        f-record-with-stream: async func(rs: stream-pair);
     }
 "#;
 
@@ -254,7 +259,7 @@ fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
             Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::Variant { disc_slot, .. } => put(*disc_slot, ValType::I32),
             Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
-            Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+            Cell::ListOf | Cell::ErrorContext => {
                 unreachable!("un-wired Cell variant {op:?} should not appear in test plans")
             }
         }
@@ -393,7 +398,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
             | Cell::EnumCase { .. }
             | Cell::Option { .. }
             | Cell::Result { .. } => CellSideData::None,
-            Cell::ListOf | Cell::Future | Cell::Stream | Cell::ErrorContext => {
+            Cell::ListOf | Cell::ErrorContext => {
                 unreachable!("auto_cell_side_data reached un-wired Cell variant {op:?}")
             }
         })
@@ -637,6 +642,7 @@ fn handle_assigns_one_cell_one_slot() {
         vec![Cell::Handle {
             flat_slot: 0,
             type_name: res_name,
+            kind: HandleKind::Resource,
         }],
     );
     assert_eq!(plan.root(), 0);
@@ -678,16 +684,113 @@ fn record_with_handle_field_recurses_into_handle() {
             Cell::Handle {
                 flat_slot: 0,
                 type_name: res_name,
+                kind: HandleKind::Resource,
             },
             Cell::Handle {
                 flat_slot: 1,
                 type_name: res_name,
+                kind: HandleKind::Resource,
             },
             record_of(
                 &mut names,
                 "handle-pair",
                 &[("primary", 0), ("secondary", 1)],
             ),
+        ],
+    );
+    assert_eq!(plan.root(), 2);
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn stream_handle_assigns_one_cell_one_slot() {
+    // stream<u32>: single i32 (canonical-ABI handle); type-name
+    // empty (anonymous element type for primitives).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(&func_named(&r, "f-stream-u32").params[0].ty, &r, &mut names);
+    let empty = names.intern("");
+    assert_eq!(
+        plan.cells,
+        vec![Cell::Handle {
+            flat_slot: 0,
+            type_name: empty,
+            kind: HandleKind::Stream,
+        }],
+    );
+    assert_eq!(plan.flat_slot_count, 1);
+}
+
+#[test]
+fn future_handle_takes_same_shape_as_stream() {
+    // future<T> and stream<T> share `Cell::Handle` — only the
+    // `kind` differs.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-future-string").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let empty = names.intern("");
+    assert_eq!(
+        plan.cells,
+        vec![Cell::Handle {
+            flat_slot: 0,
+            type_name: empty,
+            kind: HandleKind::Future,
+        }],
+    );
+    assert_eq!(plan.flat_slot_count, 1);
+}
+
+#[test]
+fn stream_with_named_element_carries_element_type_name() {
+    // stream<my-res>: type-name = "my-res" (named element type).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-stream-of-res").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let res_name = names.intern("my-res");
+    assert_eq!(
+        plan.cells,
+        vec![Cell::Handle {
+            flat_slot: 0,
+            type_name: res_name,
+            kind: HandleKind::Stream,
+        }],
+    );
+}
+
+#[test]
+fn record_with_stream_and_future_fields_recurses_into_handle() {
+    // stream-pair { events: stream<u32>, ack: future<u32> }
+    //   events → cell 0 (Handle slot 0, kind=Stream)
+    //   ack    → cell 1 (Handle slot 1, kind=Future)
+    //   sp     → cell 2 (RecordOf events=0, ack=1)
+    // Pins that the same recursion machinery as resource handles
+    // works for stream/future fields, with `kind` plumbed through.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("stream-pair", &r, &mut names);
+    let empty = names.intern("");
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::Handle {
+                flat_slot: 0,
+                type_name: empty,
+                kind: HandleKind::Stream,
+            },
+            Cell::Handle {
+                flat_slot: 1,
+                type_name: empty,
+                kind: HandleKind::Future,
+            },
+            record_of(&mut names, "stream-pair", &[("events", 0), ("ack", 1)],),
         ],
     );
     assert_eq!(plan.root(), 2);
@@ -1334,6 +1437,18 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &mut names,
         ),
         plan_for_named("handle-pair", &r, &mut names),
+        plan_for(&func_named(&r, "f-stream-u32").params[0].ty, &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-future-string").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-stream-of-res").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for_named("stream-pair", &r, &mut names),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan);

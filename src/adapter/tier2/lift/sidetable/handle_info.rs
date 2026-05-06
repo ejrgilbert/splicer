@@ -1,7 +1,8 @@
 //! Handle-info side-table builder. One entry per `Cell::Handle`
-//! appearance (two `own<R>` params need two distinct `id` slots).
-//! `type-name` is baked at plan-build time; only `id: u64` is
-//! runtime-filled (zero-extension of the i32 handle bits).
+//! appearance (own/borrow/stream/future all share this side-table —
+//! only the cell-disc differs). `type-name` is baked at plan-build
+//! time; only `id: u64` is runtime-filled (zero-extension of the
+//! i32 handle bits).
 
 use super::super::super::super::abi::emit::{BlobSlice, RecordLayout};
 use super::super::super::blob::{RecordWriter, Segment, SymRef, SymbolId};
@@ -14,7 +15,9 @@ use super::{walk_per_cell_plans, PerCellIndices, PerCellPlanWalk, INFO_TYPE_NAME
 /// Per-(plan-cell) emit-phase data for one `Cell::Handle`.
 #[derive(Clone, Debug)]
 pub(crate) struct HandleRuntimeFill {
-    /// Range-relative index — the `cell::resource-handle(u32)` payload.
+    /// Range-relative index — the `cell::{resource,stream,future}-handle(u32)`
+    /// payload. Which cell-disc emits is picked from the cell's
+    /// `kind` at emit time.
     pub side_table_idx: u32,
     /// Entry's byte offset within the entries segment. Combined with
     /// `entries_base` by [`back_fill_id_addrs`] (range-relative

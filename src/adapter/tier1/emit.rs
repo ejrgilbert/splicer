@@ -24,8 +24,8 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
 use wit_parser::abi::{AbiVariant, WasmSignature};
 use wit_parser::{
-    Function as WitFunction, InterfaceId, Mangling, Resolve, SizeAlign, Type, TypeDefKind, TypeId,
-    TypeOwner, WasmExport, WasmExportKind, WasmImport, WorldKey,
+    Function as WitFunction, InterfaceId, Mangling, Resolve, SizeAlign, Type, TypeId, WasmExport,
+    WasmExportKind, WasmImport, WorldKey,
 };
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
@@ -33,8 +33,9 @@ use super::super::abi::emit::{
     call_id_layout, collect_borrow_drops, direct_return_type, emit_alloc_call_id,
     emit_borrow_drops, emit_cabi_realloc, emit_data_section, emit_export_section,
     emit_handler_call, emit_memory_and_globals, emit_populate_call_id, emit_resource_drop_imports,
-    emit_wrapper_return, empty_function, find_imported_hook, synthesize_adapter_world_wit,
-    val_types, BlobSlice, CallIdLayout, GlobalIndices, HookImport, WrapperExport,
+    emit_wrapper_return, empty_function, find_imported_hook, require_no_inline_resources,
+    synthesize_adapter_world_wit, val_types, BlobSlice, CallIdLayout, GlobalIndices, HookImport,
+    WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, LocalsBuilder};
@@ -114,31 +115,7 @@ fn require_supported_case(
     if iface.functions.is_empty() {
         bail!("interface has no functions");
     }
-    // Inline-resource interfaces (resources declared in the same
-    // interface that uses them) can't survive splicer's wrapper
-    // pattern: `wit_component::ComponentEncoder` synthesizes a fresh
-    // resource type for the export instance, and runtime handle
-    // identity diverges from the import side. Bail with a clear
-    // error pointing at the factored-types fix.
-    for (ty_name, &tid) in &iface.types {
-        let td = &resolve.types[tid];
-        if matches!(td.kind, TypeDefKind::Resource)
-            && matches!(td.owner, TypeOwner::Interface(owner) if owner == target_iface)
-        {
-            let iface_name = resolve
-                .id_of(target_iface)
-                .unwrap_or_else(|| iface.name.clone().unwrap_or_default());
-            bail!(
-                "interface `{iface_name}` declares resource `{ty_name}` inline. \
-                 Splicer's wrapper-component pattern can't preserve resource \
-                 type identity for inline resources — runtime handle traffic \
-                 between the import side and export side will be rejected. \
-                 Move `{ty_name}` into a sibling `types` interface and \
-                 reference it via `use types.{{{ty_name}}}` (the wasi-style \
-                 factored-types pattern)."
-            );
-        }
-    }
+    require_no_inline_resources(resolve, target_iface)?;
     for (name, func) in &iface.functions {
         if has_blocking && func.result.is_some() {
             bail!(

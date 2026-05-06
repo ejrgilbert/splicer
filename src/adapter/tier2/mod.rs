@@ -5,9 +5,10 @@
 //!
 //! Wired: primitives, `string`, `list<u8>`, `char`, `enum`, `flags`,
 //! `record`, `tuple<...>`, `option<T>`, `result<T, E>`, `variant`,
-//! `own<R>` / `borrow<R>` resource handles (both sides, sync + async).
-//! Un-wired: `list<T>` (non-u8), `stream<T>` / `future<T>`,
-//! `error-context`. Roadmap: `docs/tiers/lift-codegen.md`.
+//! `own<R>` / `borrow<R>` resource handles, `stream<T>` / `future<T>`
+//! (all share `Cell::Handle` — same canonical-ABI shape, different
+//! cell-disc). Un-wired: `list<T>` (non-u8), `error-context`.
+//! Roadmap: `docs/tiers/lift-codegen.md`.
 //!
 //! Pipeline (driven by [`build_dispatch_module`]):
 //! 1. Classify — [`build_per_func_classified`] walks each target
@@ -58,7 +59,7 @@ use wit_parser::{
 
 use super::abi::emit::{
     collect_borrow_drops, emit_data_section, emit_export_section, emit_memory_and_globals,
-    synthesize_adapter_world_wit, BlobSlice,
+    require_no_inline_resources, synthesize_adapter_world_wit, BlobSlice,
 };
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use blob::NameInterner;
@@ -143,6 +144,7 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
     if iface.functions.is_empty() {
         bail!("interface has no functions");
     }
+    require_no_inline_resources(resolve, target_iface)?;
     // Async funcs whose flat params overflow MAX_FLAT_ASYNC_PARAMS need
     // lower-to-memory; not yet implemented. Mirrors tier-1.
     for (name, func) in &iface.functions {
@@ -930,47 +932,116 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
-    /// End-to-end test for `Cell::Handle` as a param. Drives the
-    /// per-cell handle-info entry placement + the runtime
-    /// `i64.extend_i32_u` write into the entry's `id` slot. Resource
-    /// type is exported by the inner component; `own<R>` and
-    /// `borrow<R>` both flatten to a single i32 (the canonical-ABI
-    /// handle), and the lift codegen treats them identically.
+    /// `require_no_inline_resources` rejects inline-resource
+    /// interfaces with a clear factored-types pointer.
     #[test]
-    fn dispatch_module_with_resource_handle_param_roundtrips() {
+    fn dispatch_module_with_inline_resource_bails() {
         let wat = r#"(component
             (component $inner
-                (core module $m
-                    (func (export "consume-own") (param i32))
-                    (func (export "consume-borrow") (param i32))
-                )
+                (core module $m (func (export "consume") (param i32)))
                 (core instance $i (instantiate $m))
-                (alias core export $i "consume-own" (core func $consume-own))
-                (alias core export $i "consume-borrow" (core func $consume-borrow))
+                (alias core export $i "consume" (core func $consume))
                 (type $r (resource (rep i32)))
                 (export $r-export "my-res" (type $r))
                 (type $own-r (own $r-export))
-                (type $borrow-r (borrow $r-export))
-                (type $consume-own-ty (func (param "h" $own-r)))
-                (type $consume-borrow-ty (func (param "h" $borrow-r)))
-                (func $consume-own-lifted (type $consume-own-ty)
-                    (canon lift (core func $consume-own)))
-                (func $consume-borrow-lifted (type $consume-borrow-ty)
-                    (canon lift (core func $consume-borrow)))
+                (type $consume-ty (func (param "h" $own-r)))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
                 (instance $api-inst
                     (export "my-res" (type $r-export))
-                    (export "consume-own" (func $consume-own-lifted))
-                    (export "consume-borrow" (func $consume-borrow-lifted)))
+                    (export "consume" (func $consume-lifted)))
                 (export "my:rh/api@1.0.0" (instance $api-inst))
             )
             (instance $api (instantiate $inner))
             (export "my:rh/api@1.0.0" (instance $api "my:rh/api@1.0.0"))
         )"#;
         let split_bytes = wat::parse_str(wat).expect("WAT must parse");
-
         let common_wit = include_str!("../../../wit/common/world.wit");
         let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let err = build_tier2_adapter(
+            "my:rh/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect_err("inline-resource interface must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("declares resource `my-res` inline"),
+            "bail should call out the inline resource; got: {msg}",
+        );
+        assert!(
+            msg.contains("factored-types pattern"),
+            "bail should point at the factored-types fix; got: {msg}",
+        );
+    }
 
+    /// End-to-end test for `Cell::Handle` as a param using the
+    /// factored-types pattern (resource in `my:rh/types`, the api
+    /// `use`s it). WAT shape mirrors what `wasm-tools component new`
+    /// emits from a real factored WIT — two shim sub-components plus
+    /// the alias chain that pins resource type identity across both
+    /// exported instances.
+    #[test]
+    fn dispatch_module_with_resource_handle_param_roundtrips() {
+        let wat = r#"(component
+  (core module $main
+    (func (export "my:rh/api@1.0.0#consume-own") (param i32))
+    (func (export "my:rh/api@1.0.0#consume-borrow") (param i32))
+    (func (export "my:rh/types@1.0.0#[resource-drop]my-res") (param i32))
+    (memory (export "memory") 1)
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+  )
+  (type $my-res (resource (rep i32)))
+  (core instance $main (instantiate $main))
+  (alias core export $main "memory" (core memory $memory))
+  (component $types-shim
+    (import "import-type-my-res" (type $r (sub resource)))
+    (export "my-res" (type $r))
+  )
+  (instance $types-inst (instantiate $types-shim
+    (with "import-type-my-res" (type $my-res))
+  ))
+  (export $types-export "my:rh/types@1.0.0" (instance $types-inst))
+  (type $own-r (own $my-res))
+  (type $consume-own-ty (func (param "h" $own-r)))
+  (alias core export $main "my:rh/api@1.0.0#consume-own" (core func $consume-own-core))
+  (alias core export $main "cabi_realloc" (core func $cabi_realloc))
+  (func $consume-own (type $consume-own-ty) (canon lift (core func $consume-own-core)))
+  (type $borrow-r (borrow $my-res))
+  (type $consume-borrow-ty (func (param "h" $borrow-r)))
+  (alias core export $main "my:rh/api@1.0.0#consume-borrow" (core func $consume-borrow-core))
+  (func $consume-borrow (type $consume-borrow-ty) (canon lift (core func $consume-borrow-core)))
+  (alias export $types-export "my-res" (type $r-aliased))
+  (component $api-shim
+    (import "import-type-my-res" (type $r (sub resource)))
+    (import "import-type-my-res0" (type $r0 (eq 0)))
+    (type $own-r0 (own 1))
+    (type $f-own (func (param "h" $own-r0)))
+    (import "import-func-consume-own" (func $consume-own (type $f-own)))
+    (type $borrow-r0 (borrow 1))
+    (type $f-borrow (func (param "h" $borrow-r0)))
+    (import "import-func-consume-borrow" (func $consume-borrow (type $f-borrow)))
+    (export $r-export "my-res" (type $r))
+    (type $own-out (own $r-export))
+    (type $f-own-out (func (param "h" $own-out)))
+    (export "consume-own" (func $consume-own) (func (type $f-own-out)))
+    (type $borrow-out (borrow $r-export))
+    (type $f-borrow-out (func (param "h" $borrow-out)))
+    (export "consume-borrow" (func $consume-borrow) (func (type $f-borrow-out)))
+  )
+  (instance $api-inst (instantiate $api-shim
+    (with "import-func-consume-own" (func $consume-own))
+    (with "import-func-consume-borrow" (func $consume-borrow))
+    (with "import-type-my-res" (type $r-aliased))
+    (with "import-type-my-res0" (type $my-res))
+  ))
+  (export "my:rh/api@1.0.0" (instance $api-inst))
+)"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
         let bytes = build_tier2_adapter(
             "my:rh/api@1.0.0",
             true,
@@ -979,45 +1050,64 @@ mod tests {
             common_wit,
             tier2_wit,
         )
-        .expect("tier-2 adapter generation should succeed for resource handle param");
-
+        .expect(
+            "tier-2 adapter generation should succeed for factored-types resource handle param",
+        );
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
             .expect("emitted tier-2 adapter component should validate");
     }
 
-    /// End-to-end test for `Cell::Handle` as a Direct result. Drives
-    /// `is_supported_direct_result(Handle) → Direct` + the per-result
-    /// `handle-info` entry placement + the runtime `i64.extend_i32_u`
-    /// write into the entry's `id` slot on the result side. Sync
-    /// `own<R>` returns flat as i32 (no retptr).
+    /// End-to-end test for `Cell::Handle` as a Direct result, using
+    /// the factored-types pattern (resource in `my:rhret/types`, the
+    /// api `use`s it). Sync `own<R>` returns flat as i32 (no retptr).
     #[test]
     fn dispatch_module_with_resource_handle_result_roundtrips() {
         let wat = r#"(component
-            (component $inner
-                (core module $m
-                    (func (export "make") (result i32) i32.const 0)
-                )
-                (core instance $i (instantiate $m))
-                (alias core export $i "make" (core func $make))
-                (type $r (resource (rep i32)))
-                (export $r-export "my-res" (type $r))
-                (type $own-r (own $r-export))
-                (type $make-ty (func (result $own-r)))
-                (func $make-lifted (type $make-ty) (canon lift (core func $make)))
-                (instance $api-inst
-                    (export "my-res" (type $r-export))
-                    (export "make" (func $make-lifted)))
-                (export "my:rhret/api@1.0.0" (instance $api-inst))
-            )
-            (instance $api (instantiate $inner))
-            (export "my:rhret/api@1.0.0" (instance $api "my:rhret/api@1.0.0"))
-        )"#;
+  (core module $main
+    (func (export "my:rhret/api@1.0.0#make") (result i32) i32.const 0)
+    (func (export "my:rhret/types@1.0.0#[resource-drop]my-res") (param i32))
+    (memory (export "memory") 1)
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+  )
+  (type $my-res (resource (rep i32)))
+  (core instance $main (instantiate $main))
+  (alias core export $main "memory" (core memory $memory))
+  (component $types-shim
+    (import "import-type-my-res" (type $r (sub resource)))
+    (export "my-res" (type $r))
+  )
+  (instance $types-inst (instantiate $types-shim
+    (with "import-type-my-res" (type $my-res))
+  ))
+  (export $types-export "my:rhret/types@1.0.0" (instance $types-inst))
+  (type $own-r (own $my-res))
+  (type $make-ty (func (result $own-r)))
+  (alias core export $main "my:rhret/api@1.0.0#make" (core func $make-core))
+  (alias core export $main "cabi_realloc" (core func $cabi_realloc))
+  (func $make (type $make-ty) (canon lift (core func $make-core)))
+  (alias export $types-export "my-res" (type $r-aliased))
+  (component $api-shim
+    (import "import-type-my-res" (type $r (sub resource)))
+    (import "import-type-my-res0" (type $r0 (eq 0)))
+    (type $own-in (own 1))
+    (type $f-in (func (result $own-in)))
+    (import "import-func-make" (func $make (type $f-in)))
+    (export $r-export "my-res" (type $r))
+    (type $own-out (own $r-export))
+    (type $f-out (func (result $own-out)))
+    (export "make" (func $make) (func (type $f-out)))
+  )
+  (instance $api-inst (instantiate $api-shim
+    (with "import-func-make" (func $make))
+    (with "import-type-my-res" (type $r-aliased))
+    (with "import-type-my-res0" (type $my-res))
+  ))
+  (export "my:rhret/api@1.0.0" (instance $api-inst))
+)"#;
         let split_bytes = wat::parse_str(wat).expect("WAT must parse");
-
         let common_wit = include_str!("../../../wit/common/world.wit");
         let tier2_wit = include_str!("../../../wit/tier2/world.wit");
-
         let bytes = build_tier2_adapter(
             "my:rhret/api@1.0.0",
             true,
@@ -1026,8 +1116,7 @@ mod tests {
             common_wit,
             tier2_wit,
         )
-        .expect("tier-2 adapter generation should succeed for resource handle result");
-
+        .expect("tier-2 adapter generation should succeed for factored-types resource handle result");
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
             .expect("emitted tier-2 adapter component should validate");
