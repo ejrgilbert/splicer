@@ -122,17 +122,48 @@ target/release/splicer
 
 # Usage
 
+Splicer has two subcommands. Both produce a composed `.wasm` directly.
+
+### `splicer splice`: inject middleware into an existing composition
+
 ```bash
-splicer <JSON_GRAPH> <SPLICE_CFG> [--output <FILE>]
+splicer splice <SPLICE_CFG> <COMP_WASM> [-o composed.wasm]
 ```
 
-### Arguments
+Reads splice rules from `SPLICE_CFG` (YAML), splits `COMP_WASM` into
+its sub-components, injects middleware per the rules, and writes the
+result to `composed.wasm`.
 
-| Argument     | Description                                  |
-| ------------ | -------------------------------------------- |
-| `JSON_GRAPH` | Path to the composition graph in JSON format |
-| `SPLICE_CFG` | Path to the splice configuration YAML file   |
-| `--output`   | Optional output file (defaults to stdout)    |
+### `splicer compose`: synthesize a composition from N components
+
+```bash
+splicer compose <COMP_WASM>... [-o composed.wasm]
+```
+
+Discovers the composition graph by matching the components'
+import/export surfaces and writes the composed result.
+
+### Common flags
+
+| flag                  | description                                                                              |
+| --------------------- | ---------------------------------------------------------------------------------------- |
+| `-o, --output <PATH>` | Where to write the composed `.wasm` (default: `composed.wasm`).                          |
+| `--emit-wac [<PATH>]` | Also persist the intermediate WAC source (default: `./output.wac`). Useful for auditing. |
+| `--plan`              | Skip in-process compose; persist WAC + splits and print the `wac compose ...` command.   |
+| `--splits-dir <DIR>`  | (`splice` only) Persist split sub-components on disk instead of in a tempdir.            |
+| `--package <NAME>`    | Package name written to the generated WAC.                                               |
+| `--skip-type-check`   | (`splice` only) Demote contract type-check errors to warnings.                           |
+
+### Library usage
+
+The same pipeline is available as a Rust library:
+
+```rust
+let bundle = splicer::splice(splicer::SpliceRequest { /* ... */ })?;
+let composed: Vec<u8> = bundle.to_wasm()?;
+```
+
+See `examples/wac_compose.rs` for a runnable end-to-end demo.
 
 ---
 

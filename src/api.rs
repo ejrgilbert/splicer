@@ -3,10 +3,13 @@
 //! the full API guide.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cviz::parse::component::parse_component;
+use wac_graph::EncodeOptions;
+use wac_parser::Document;
+use wac_resolver::{packages, FileSystemPackageResolver};
 
 use crate::builtins;
 use crate::compose::{build_graph_from_components, filename_from_path};
@@ -42,54 +45,7 @@ pub struct SpliceRequest {
     pub skip_type_check: bool,
 }
 
-/// Output of [`splice`].
-#[derive(Debug, Clone)]
-pub struct SpliceOutput {
-    /// The generated WAC source as a UTF-8 string. The caller is
-    /// responsible for writing it to disk (or feeding it directly
-    /// into [`wac-parser`](https://docs.rs/wac-parser)).
-    pub wac: String,
-
-    /// Per-dependency `(package_key → wasm_path)` map. The keys are
-    /// fully-qualified WAC package keys (e.g. `"my:srv-a"`) — exactly
-    /// the form you'd hand to
-    /// [`wac_resolver::FileSystemPackageResolver::new`](https://docs.rs/wac-resolver)
-    /// as the `overrides` argument, or to format into a
-    /// `wac compose ... --dep <key>=<path>` shell command via
-    /// [`SpliceOutput::wac_compose_cmd`].
-    pub wac_deps: BTreeMap<String, PathBuf>,
-
-    /// Diagnostics emitted during contract validation. When `splice`
-    /// returns `Ok`, this list contains only `Ok` / `Warn` entries.
-    /// `Error` entries cause `splice` to return `Err` unless
-    /// `skip_type_check` was set on the request.
-    pub diagnostics: Vec<ContractResult>,
-
-    /// Tier-1 adapter components that splicer generated and wrote to
-    /// disk while resolving the splice rules. Empty when no rule
-    /// matched a tier-1 type-erased middleware. Each entry names
-    /// the on-disk path, the wrapped middleware, the target interface,
-    /// and which tier-1 hook interfaces (`splicer:tier1/before`,
-    /// `splicer:tier1/after`, `splicer:tier1/blocking`) the
-    /// middleware exports.
-    ///
-    /// Adapter paths are also present in [`SpliceOutput::wac_deps`]
-    /// under their adapter package key — `generated_adapters` is
-    /// for callers who want richer metadata about which middleware
-    /// got wrapped and why.
-    pub generated_adapters: Vec<GeneratedAdapter>,
-}
-
-impl SpliceOutput {
-    /// Format a `wac compose <wac_path> --dep ...` shell command
-    /// using `wac_path` as the path to the WAC source the caller
-    /// wrote to disk.
-    pub fn wac_compose_cmd(&self, wac_path: &str) -> String {
-        format_wac_compose_cmd(wac_path, &self.wac_deps)
-    }
-}
-
-// ── Compose request / output ───────────────────────────────────────────────
+// ── Compose request ────────────────────────────────────────────────────────
 
 /// One component to feed into [`compose`].
 #[derive(Debug, Clone)]
@@ -116,29 +72,57 @@ pub struct ComposeRequest {
     pub package_name: String,
 }
 
-/// Output of [`compose`].
+// ── Bundle: shared output of splice and compose ────────────────────────────
+
+/// Output of [`splice`] and [`compose`]: the generated WAC source,
+/// the dep map it references, contract diagnostics, and any tier-1
+/// adapter components splicer wrote to disk. Most callers reach for
+/// [`Bundle::to_wasm`] to go straight to a composed component.
 #[derive(Debug, Clone)]
-pub struct ComposeOutput {
-    /// The generated WAC source.
+pub struct Bundle {
+    /// The generated WAC source. Pass to [`Bundle::to_wasm`], or
+    /// write it to disk and run `wac compose` yourself.
     pub wac: String,
-    /// Per-dependency `(package_key → wasm_path)` map. Same shape as
-    /// [`SpliceOutput::wac_deps`] — directly consumable by
-    /// `wac-resolver::FileSystemPackageResolver`.
+
+    /// Per-dependency `package_key → wasm_path` map. Keys are
+    /// fully-qualified WAC package keys (e.g. `"my:srv-a"`); the
+    /// shape matches `wac_resolver::FileSystemPackageResolver::new`'s
+    /// `overrides` argument. Paths are always absolute, so consumers
+    /// are unaffected by changes to the process working directory.
+    /// See [`Bundle::wac_compose_cmd`] for the shell-command form.
     pub wac_deps: BTreeMap<String, PathBuf>,
-    /// Diagnostics from validation. (Compose does not run type
-    /// checks today, so this is currently always empty — exposed
-    /// for forward compatibility.)
+
+    /// Contract validation diagnostics. On `Ok` from `splice`, holds
+    /// only `Ok`/`Warn` entries; `Error` entries fail `splice` unless
+    /// `skip_type_check` was set. `compose` does not run contract
+    /// checks, so its bundles ship empty.
     pub diagnostics: Vec<ContractResult>,
-    /// Tier-1 adapter components generated during composition.
-    /// Compose does not splice middleware, so this is currently
-    /// always empty — exposed for forward compatibility.
+
+    /// Tier-1 adapter components splicer generated. Populated by
+    /// `splice` when a rule wraps a tier-1 type-erased middleware;
+    /// `compose` leaves it empty. Each entry carries the on-disk
+    /// path, the wrapped middleware name, the target interface, and
+    /// which `splicer:tier1/*` hook interfaces it exports.
+    ///
+    /// Adapter paths also appear in [`Bundle::wac_deps`] under their
+    /// adapter package key — this field is for callers who want the
+    /// metadata too.
     pub generated_adapters: Vec<GeneratedAdapter>,
 }
 
-impl ComposeOutput {
-    /// Format a `wac compose <wac_path> --dep ...` shell command.
+impl Bundle {
+    /// Format a `wac compose <wac_path> --dep ...` shell command,
+    /// where `wac_path` is where you wrote [`Bundle::wac`] to disk.
     pub fn wac_compose_cmd(&self, wac_path: &str) -> String {
         format_wac_compose_cmd(wac_path, &self.wac_deps)
+    }
+
+    /// Compose this bundle into a single Wasm component, in-process.
+    /// Equivalent to `wac compose` on [`Bundle::wac`] with every dep
+    /// from [`Bundle::wac_deps`]; the result is wasmparser-validated
+    /// before return.
+    pub fn to_wasm(&self) -> Result<Vec<u8>> {
+        compose_wac(&self.wac, &self.wac_deps)
     }
 }
 
@@ -159,7 +143,7 @@ impl ComposeOutput {
 /// - The splitter fails to write split sub-components.
 /// - Contract validation produces an `Error` diagnostic and
 ///   `req.skip_type_check` is `false`.
-pub fn splice(req: SpliceRequest) -> Result<SpliceOutput> {
+pub fn splice(req: SpliceRequest) -> Result<Bundle> {
     let SpliceRequest {
         composition_wasm,
         rules_yaml,
@@ -212,9 +196,12 @@ pub fn splice(req: SpliceRequest) -> Result<SpliceOutput> {
         }
     }
 
-    Ok(SpliceOutput {
+    let mut wac_deps = out.wac_deps;
+    canonicalize_wac_deps(&mut wac_deps)?;
+
+    Ok(Bundle {
         wac: out.wac,
-        wac_deps: out.wac_deps,
+        wac_deps,
         diagnostics: out.diagnostics,
         generated_adapters: out.generated_adapters,
     })
@@ -230,7 +217,7 @@ pub fn splice(req: SpliceRequest) -> Result<SpliceOutput> {
 /// - Two `ComponentInput`s resolve to the same name.
 /// - A component file cannot be read.
 /// - Graph synthesis fails (e.g. unresolved imports, cycles, etc.).
-pub fn compose(req: ComposeRequest) -> Result<ComposeOutput> {
+pub fn compose(req: ComposeRequest) -> Result<Bundle> {
     let ComposeRequest {
         components,
         package_name,
@@ -279,12 +266,52 @@ pub fn compose(req: ComposeRequest) -> Result<ComposeOutput> {
         &package_name,
     )?;
 
-    Ok(ComposeOutput {
+    let mut wac_deps = out.wac_deps;
+    canonicalize_wac_deps(&mut wac_deps)?;
+
+    Ok(Bundle {
         wac: out.wac,
-        wac_deps: out.wac_deps,
+        wac_deps,
         diagnostics: out.diagnostics,
         generated_adapters: out.generated_adapters,
     })
+}
+
+/// In-process equivalent of `wac compose`: parse `wac`, resolve
+/// every package reference against `wac_deps`, and encode the result
+/// into wasmparser-validated bytes. `wac_deps` must cover every
+/// package the WAC references — the resolver does not fall back to
+/// the filesystem.
+///
+/// Equivalent to [`Bundle::to_wasm`] when called on a splicer-emitted
+/// bundle; expose this directly when you've assembled `wac` and
+/// `wac_deps` from somewhere other than [`splice`] / [`compose`].
+pub fn compose_wac(wac: &str, wac_deps: &BTreeMap<String, PathBuf>) -> Result<Vec<u8>> {
+    let doc = Document::parse(wac).context("Failed to parse generated WAC source")?;
+    let keys = packages(&doc).context("Failed to discover packages from WAC")?;
+
+    // `disable_filesystem: true` means the resolver only consults
+    // `overrides`, so the first arg (the on-disk search base) is
+    // never read. Hardcoding "." just keeps the type happy.
+    let overrides: HashMap<String, PathBuf> = wac_deps.clone().into_iter().collect();
+    let resolver = FileSystemPackageResolver::new(Path::new("."), overrides, true);
+    let pkgs = resolver
+        .resolve(&keys)
+        .context("Failed to resolve WAC packages")?;
+
+    let resolution = doc
+        .resolve(pkgs)
+        .context("Failed to resolve WAC document")?;
+    let composed: Vec<u8> = resolution
+        .encode(EncodeOptions::default())
+        .context("Failed to encode composed component")?;
+
+    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+    validator
+        .validate_all(&composed)
+        .context("Composed component bytes failed wasmparser validation")?;
+
+    Ok(composed)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -314,6 +341,30 @@ fn materialize_builtins(rules: &mut [SpliceRule], splits_dir: &std::path::Path) 
                 .to_string();
             inj.path = Some(path_str);
         }
+    }
+    Ok(())
+}
+
+/// Rewrite every path in `wac_deps` to its canonical absolute form.
+/// Splicer always returns absolute paths in [`Bundle::wac_deps`] so
+/// that downstream consumers (`Bundle::to_wasm`, the printed
+/// `wac compose` shell command, lib callers that change cwd between
+/// calls) stay correct regardless of process working directory.
+///
+/// Each path in the map must already exist on disk — splits,
+/// generated adapters, materialized builtins, and user-supplied
+/// injection wasms are all written or required to exist before this
+/// runs. A missing path here means an upstream pipeline stage
+/// produced a bogus reference; we surface that as a clear error.
+fn canonicalize_wac_deps(deps: &mut BTreeMap<String, PathBuf>) -> Result<()> {
+    for (key, path) in deps.iter_mut() {
+        let canonical = std::fs::canonicalize(&*path).with_context(|| {
+            format!(
+                "Failed to canonicalize wac_deps path for '{key}': {}",
+                path.display()
+            )
+        })?;
+        *path = canonical;
     }
     Ok(())
 }
@@ -453,6 +504,48 @@ rules:
     }
 
     /// Naming a builtin that doesn't exist surfaces a clear error
+    /// `canonicalize_wac_deps` should rewrite each value to its
+    /// absolute, symlink-resolved form so downstream consumers stay
+    /// correct under cwd shifts.
+    #[test]
+    fn canonicalize_wac_deps_makes_paths_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = tmp.path().join("a.wasm");
+        std::fs::write(&abs, b"\0asm\x0d\0\0\0").unwrap();
+
+        // Build a relative path to the same file by cd'ing into the
+        // tempdir for the duration of the test.
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let mut deps: BTreeMap<String, PathBuf> = BTreeMap::new();
+        deps.insert("my:relative".into(), PathBuf::from("a.wasm"));
+        deps.insert("my:absolute".into(), abs.clone());
+
+        canonicalize_wac_deps(&mut deps).unwrap();
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+
+        for (key, p) in &deps {
+            assert!(p.is_absolute(), "{key} -> {} is not absolute", p.display());
+        }
+    }
+
+    /// A wac_deps entry pointing at a non-existent file should
+    /// surface a clear error naming the offending key + path.
+    #[test]
+    fn canonicalize_wac_deps_errors_on_missing_path() {
+        let mut deps: BTreeMap<String, PathBuf> = BTreeMap::new();
+        deps.insert(
+            "my:ghost".into(),
+            PathBuf::from("/definitely/does/not/exist/ghost.wasm"),
+        );
+        let err = canonicalize_wac_deps(&mut deps).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("my:ghost"), "error names key: {msg}");
+        assert!(msg.contains("ghost.wasm"), "error names path: {msg}");
+    }
+
     /// listing what's available.
     #[test]
     fn unknown_builtin_errors_with_available() {

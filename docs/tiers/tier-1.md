@@ -180,5 +180,5 @@ When you run `splicer splice`, it will:
    `splicer:tier1/*` interfaces and `wasi:http/handler@0.3.0`
 4. Substitute the adapter into the composition in place of the middleware
 
-The generated adapter appears in the `SpliceOutput::generated_adapters`
+The generated adapter appears in the `Bundle::generated_adapters`
 list (programmatic API) or as a file in the splits directory (CLI).

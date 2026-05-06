@@ -14,12 +14,12 @@
 //! lower-level building blocks under [`lowlevel`], or import the
 //! shared types from [`types`].
 //!
-//! # Quick start: shell out to `wac compose`
+//! # Quick start
 //!
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
 //! let rules_yaml = std::fs::read_to_string("splice.yaml")?;
-//! let out = splicer::splice(splicer::SpliceRequest {
+//! let bundle = splicer::splice(splicer::SpliceRequest {
 //!     composition_wasm: "composition.wasm".into(),
 //!     rules_yaml,
 //!     package_name: "example:composition".into(),
@@ -27,10 +27,11 @@
 //!     skip_type_check: false,
 //! })?;
 //!
-//! std::fs::write("output.wac", &out.wac)?;
-//! println!("{}", out.wac_compose_cmd("output.wac"));
+//! // Compose to a single Wasm component, in-process — no shelling out.
+//! let composed: Vec<u8> = bundle.to_wasm()?;
+//! std::fs::write("composed.wasm", &composed)?;
 //!
-//! for adapter in &out.generated_adapters {
+//! for adapter in &bundle.generated_adapters {
 //!     println!(
 //!         "generated adapter for middleware '{}' at {}",
 //!         adapter.middleware_name, adapter.adapter_path,
@@ -40,42 +41,19 @@
 //! # }
 //! ```
 //!
-//! # Programmatic compose with the `wac` crates
+//! # Want to drive `wac compose` yourself?
 //!
-//! [`SpliceOutput::wac_deps`] is shaped to plug straight into
-//! [`wac_resolver::FileSystemPackageResolver`](https://docs.rs/wac-resolver/0.9/wac_resolver/struct.FileSystemPackageResolver.html)
-//! — the keys are fully-qualified WAC package keys (e.g. `"my:srv-a"`),
-//! the values are `PathBuf`s. The full programmatic pipeline that
-//! mirrors `wac compose` looks like this:
+//! [`Bundle::wac`] and [`Bundle::wac_deps`] expose the raw inputs.
+//! Write the WAC to disk and call [`Bundle::wac_compose_cmd`] to get
+//! the equivalent `wac compose ... --dep ...` shell command, or feed
+//! `wac_deps` directly into
+//! [`wac_resolver::FileSystemPackageResolver`](https://docs.rs/wac-resolver)
+//! — the keys are fully-qualified WAC package keys, the values are
+//! `PathBuf`s, no translation step required.
 //!
-//! ```ignore
-//! use std::collections::HashMap;
-//! use wac_parser::Document;
-//! use wac_resolver::{packages, FileSystemPackageResolver};
-//! use wac_graph::EncodeOptions;
-//!
-//! # fn run(out: splicer::SpliceOutput) -> anyhow::Result<Vec<u8>> {
-//! // 1. parse the WAC source splicer emitted
-//! let doc = Document::parse(&out.wac)?;
-//!
-//! // 2. discover which package keys the document references
-//! let keys = packages(&doc)?;
-//!
-//! // 3. resolve those keys against splicer's wac_deps map
-//! let overrides: HashMap<String, std::path::PathBuf> =
-//!     out.wac_deps.into_iter().collect();
-//! let resolver = FileSystemPackageResolver::new(".", overrides, true);
-//! let pkgs = resolver.resolve(&keys)?;
-//!
-//! // 4. resolve and encode
-//! let resolution = doc.resolve(pkgs)?;
-//! let composed: Vec<u8> = resolution.encode(EncodeOptions::default())?;
-//! # Ok(composed)
-//! # }
-//! ```
-//!
-//! See `examples/wac_compose.rs` for a fully runnable version of this
-//! pipeline.
+//! For finer control over the in-process path (e.g. a custom
+//! filesystem search base for unresolved package references), reach
+//! for [`compose_wac`].
 //!
 //! # Side effects on disk
 //!
@@ -85,10 +63,10 @@
 //!   `splits_dir` (the splitter pass), and may write
 //!   `splicer_adapter_*.wasm` files alongside them (the adapter
 //!   generator). Adapter paths are surfaced in
-//!   [`SpliceOutput::generated_adapters`] and [`SpliceOutput::wac_deps`].
-//! - Neither function writes the generated WAC source — that's returned
-//!   in [`SpliceOutput::wac`] / [`ComposeOutput::wac`] for the caller
-//!   to write wherever they want.
+//!   [`Bundle::generated_adapters`] and [`Bundle::wac_deps`].
+//! - Neither function writes the generated WAC source — that's
+//!   returned in [`Bundle::wac`] for the caller to use however they
+//!   like (typically by passing the bundle to [`Bundle::to_wasm`]).
 
 mod adapter;
 mod api;
@@ -104,8 +82,8 @@ mod tests;
 
 // ── Top-level entry points ────────────────────────────────────────
 pub use api::{
-    compose, format_wac_compose_cmd, splice, ComponentInput, ComposeOutput, ComposeRequest,
-    SpliceOutput, SpliceRequest,
+    compose, compose_wac, format_wac_compose_cmd, splice, Bundle, ComponentInput, ComposeRequest,
+    SpliceRequest,
 };
 
 /// Re-export so consumers pick up the exact cviz version splicer

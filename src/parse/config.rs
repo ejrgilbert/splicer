@@ -136,7 +136,7 @@ pub struct Injection {
     /// Populated at runtime by `add_to_inject_plan` when this injection
     /// is resolved as a tier-1 adapter. Not part of the YAML config and
     /// not user-settable — use the `generated_adapters` field on
-    /// [`crate::api::SpliceOutput`] for the structured view of which
+    /// [`crate::api::Bundle`] for the structured view of which
     /// adapters splicer wrote.
     #[serde(skip)]
     pub(crate) adapter_info: Option<AdapterInjectionInfo>,
