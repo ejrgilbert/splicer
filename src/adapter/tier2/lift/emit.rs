@@ -710,6 +710,7 @@ pub(crate) fn emit_lift_result(
             len_local,
             side_data,
         } => {
+            // First slot — used by every RetptrPair-eligible kind.
             f.instructions().i32_const(*retptr_offset);
             f.instructions().i32_load(MemArg {
                 offset: SLICE_PTR_OFFSET as u64,
@@ -717,13 +718,23 @@ pub(crate) fn emit_lift_result(
                 memory_index: 0,
             });
             f.instructions().local_set(*ptr_local);
-            f.instructions().i32_const(*retptr_offset);
-            f.instructions().i32_load(MemArg {
-                offset: SLICE_LEN_OFFSET as u64,
-                align: I32_STORE_LOG2_ALIGN,
-                memory_index: 0,
-            });
-            f.instructions().local_set(*len_local);
+            // Second slot — only the `(ptr, len)` kinds (Text/Bytes)
+            // reserve 8 bytes of retptr scratch and use both slots.
+            // Single-slot kinds (Flags/Char/Handle) reserve 4 bytes
+            // only, so loading offset+4 would read past the scratch
+            // into adjacent static data; skip the load. `len_local`
+            // stays at its zero-initialized value (locals are
+            // zeroed on function entry); `emit_lift_kind`'s arms for
+            // the single-slot kinds never read it.
+            if matches!(cell, Cell::Text { .. } | Cell::Bytes { .. }) {
+                f.instructions().i32_const(*retptr_offset);
+                f.instructions().i32_load(MemArg {
+                    offset: SLICE_LEN_OFFSET as u64,
+                    align: I32_STORE_LOG2_ALIGN,
+                    memory_index: 0,
+                });
+                f.instructions().local_set(*len_local);
+            }
             emit_lift_kind(f, cell_layout, cell, side_data, *ptr_local, *len_local, lcl);
         }
         ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
