@@ -245,6 +245,7 @@ fn build_dispatch_module(
         before_hook,
         after_hook,
         call_id_counter_global: globals.call_id_counter,
+        bump_global: globals.bump,
     };
     emit_code_section(&mut module, per_func, &func_idx, &wrapper_ctx, &globals);
     emit_data_section(&mut module, &plan.data_segments);

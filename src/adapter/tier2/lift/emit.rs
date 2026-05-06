@@ -64,6 +64,9 @@ pub(crate) struct WrapperLocals {
     /// every other local. Stored here (not synthesized at emit time) so
     /// every local the bindgen needed is already in [`FrozenLocals`].
     pub task_return_loads: Option<Vec<Instruction<'static>>>,
+    /// Bump-pointer snapshot at wrapper entry; restored at exit
+    /// for stack-reset semantics on per-call `cabi_realloc`.
+    pub saved_bump: u32,
 }
 
 /// Per-function emit-time bundle for the result-side lift. Built once
@@ -212,6 +215,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     // i64 call-id local. Tier-2 generation requires at least one hook
     // (`build_tier2_adapter` bails otherwise), so this is always live.
     let id_local = builder.alloc_local(ValType::I64);
+    let saved_bump = builder.alloc_local(ValType::I32);
 
     let frozen = builder.freeze();
     (
@@ -228,6 +232,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             tr_addr,
             id_local,
             task_return_loads,
+            saved_bump,
         },
         result_emit,
         frozen,

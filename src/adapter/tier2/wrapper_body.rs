@@ -47,8 +47,9 @@ use wit_parser::Resolve;
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    emit_alloc_call_id, emit_borrow_drops, emit_handler_call, emit_populate_call_id,
-    emit_store_i64_local, emit_store_slice, emit_wrapper_return, BlobSlice, RecordLayout,
+    emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_handler_call,
+    emit_populate_call_id, emit_store_i64_local, emit_store_slice, emit_wrapper_return, BlobSlice,
+    BumpReset, RecordLayout,
 };
 use super::super::indices::LocalsBuilder;
 use super::lift::{
@@ -75,6 +76,9 @@ pub(super) struct WrapperCtx<'a> {
     pub(super) after_hook: Option<AfterHook<'a>>,
     /// i64 counter global; bumped once per call to publish `call-id.id`.
     pub(super) call_id_counter_global: u32,
+    /// i32 bump-allocator global. Saved at wrapper entry, restored at
+    /// exit — per-call `cabi_realloc` traffic frees atomically.
+    pub(super) bump_global: u32,
 }
 
 /// Per-build static values for the before-hook emit path. Bundling
@@ -150,6 +154,12 @@ pub(super) fn emit_wrapper_function(
         alloc_wrapper_locals(ctx.resolve, &schema.size_align, builder, fd);
 
     let mut f = Function::new_with_locals_types(frozen.locals);
+
+    let bump_reset = BumpReset {
+        global: ctx.bump_global,
+        saved_local: lcl.saved_bump,
+    };
+    emit_bump_save(&mut f, bump_reset);
 
     emit_alloc_call_id(&mut f, ctx.call_id_counter_global, lcl.id_local);
 
@@ -279,6 +289,8 @@ pub(super) fn emit_wrapper_function(
 
     // Drop borrow handles before tail emit — runtime-required.
     emit_borrow_drops(&mut f, &fd.borrow_drops, &func_idx.resource_drop);
+
+    emit_bump_restore(&mut f, bump_reset);
 
     // ── Phase 4: tail. Async fns publish the result via task.return;
     // sync fns return the direct value (or static retptr).

@@ -31,11 +31,11 @@ use wit_parser::{
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
     call_id_layout, collect_borrow_drops, direct_return_type, emit_alloc_call_id,
-    emit_borrow_drops, emit_cabi_realloc, emit_data_section, emit_export_section,
-    emit_handler_call, emit_memory_and_globals, emit_populate_call_id, emit_resource_drop_imports,
-    emit_wrapper_return, empty_function, find_imported_hook, require_no_inline_resources,
-    synthesize_adapter_world_wit, val_types, BlobSlice, CallIdLayout, GlobalIndices, HookImport,
-    WrapperExport,
+    emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc, emit_data_section,
+    emit_export_section, emit_handler_call, emit_memory_and_globals, emit_populate_call_id,
+    emit_resource_drop_imports, emit_wrapper_return, empty_function, find_imported_hook,
+    require_no_inline_resources, synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset,
+    CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, LocalsBuilder};
@@ -844,6 +844,7 @@ fn emit_code_section(
                     .expect("async runtime imports active when any func is async"),
                 &func_idx.resource_drop,
                 call_id_wiring,
+                globals.bump,
             );
         } else {
             emit_wrapper_body(
@@ -856,6 +857,7 @@ fn emit_code_section(
                 func_idx.async_runtime.as_ref(),
                 &func_idx.resource_drop,
                 call_id_wiring,
+                globals.bump,
             );
         }
     }
@@ -890,9 +892,14 @@ fn emit_wrapper_body(
     async_runtime: Option<&AsyncFuncs>,
     resource_drop: &HashMap<TypeId, u32>,
     call_id_wiring: Option<CallIdWiring<'_>>,
+    bump_global: u32,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = LocalsBuilder::new(nparams);
+    let bump_reset = BumpReset {
+        global: bump_global,
+        saved_local: locals.alloc_local(ValType::I32),
+    };
     let result_local = direct_return_type(&fd.export_sig).map(|t| locals.alloc_local(t));
     // Wait-loop scratch (subtask + waitable-set handles); shared
     // across on-call / on-return / blocking awaits.
@@ -909,6 +916,8 @@ fn emit_wrapper_body(
     });
     let mut f = Function::new_with_locals_types(locals.freeze().locals);
 
+    emit_bump_save(&mut f, bump_reset);
+
     if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
         emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
     }
@@ -923,6 +932,7 @@ fn emit_wrapper_body(
             wait_locals,
             None,
             hook_site.unwrap(),
+            bump_reset,
         );
     }
     emit_handler_call(
@@ -939,6 +949,7 @@ fn emit_wrapper_body(
         emit_hook_call(&mut f, idx, async_runtime, wait_locals, hook_site.unwrap());
     }
     emit_borrow_drops(&mut f, &fd.borrow_drops, resource_drop);
+    emit_bump_restore(&mut f, bump_reset);
     emit_wrapper_return(&mut f, result_local, fd.export_sig.retptr, fd.retptr_offset);
     f.instructions().end();
     code.function(&f);
@@ -964,6 +975,7 @@ fn emit_blocking_phase(
     wait_locals: Option<(u32, u32)>,
     task_return_for_async: Option<u32>,
     site: HookSite<'_>,
+    bump_reset: BumpReset,
 ) {
     populate_hook_call_id(f, &site);
     f.instructions().i32_const(site.buf.offset);
@@ -983,6 +995,7 @@ fn emit_blocking_phase(
     if let Some(tr_fn) = task_return_for_async {
         f.instructions().call(tr_fn);
     }
+    emit_bump_restore(f, bump_reset);
     f.instructions().return_();
     f.instructions().end();
 }
@@ -1004,9 +1017,14 @@ fn emit_async_wrapper_body(
     async_runtime: &AsyncFuncs,
     resource_drop: &HashMap<TypeId, u32>,
     call_id_wiring: Option<CallIdWiring<'_>>,
+    bump_global: u32,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
     let mut locals = LocalsBuilder::new(nparams);
+    let bump_reset = BumpReset {
+        global: bump_global,
+        saved_local: locals.alloc_local(ValType::I32),
+    };
     // Wait-loop scratch, shared across hook awaits + the handler await.
     let st = locals.alloc_local(ValType::I32);
     let ws = locals.alloc_local(ValType::I32);
@@ -1039,6 +1057,8 @@ fn emit_async_wrapper_body(
 
     let mut f = Function::new_with_locals_types(locals.freeze().locals);
 
+    emit_bump_save(&mut f, bump_reset);
+
     if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
         emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
     }
@@ -1062,6 +1082,7 @@ fn emit_async_wrapper_body(
             wait_locals,
             Some(imp_task_return),
             hook_site.unwrap(),
+            bump_reset,
         );
     }
 
@@ -1088,6 +1109,8 @@ fn emit_async_wrapper_body(
     }
 
     emit_borrow_drops(&mut f, &fd.borrow_drops, resource_drop);
+
+    emit_bump_restore(&mut f, bump_reset);
 
     // task.return shape: void (no args), retptr (pass the buffer
     // through — large compound result), or flat (lift each slot via

@@ -171,6 +171,37 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection, bump_global: u32) {
     code.function(&f);
 }
 
+/// Bump-pointer save/restore plumbing for one wrapper. Carries the
+/// per-build global index and the per-fn local that holds the
+/// snapshot — paired so emit helpers can take one ref instead of
+/// two `u32`s.
+#[derive(Clone, Copy)]
+pub(crate) struct BumpReset {
+    pub global: u32,
+    pub saved_local: u32,
+}
+
+/// Snapshot the bump global into [`BumpReset::saved_local`]. Pair
+/// with [`emit_bump_restore`] at every exit path so wrapper-body
+/// `cabi_realloc` allocations (cells, side-buffers, list-of indices,
+/// etc.) free atomically when control returns to the host.
+/// Host-driven arg lowering (canon-lower writing string/list params
+/// into the wrapper's memory before the wrapper body runs) is *not*
+/// covered — those allocations precede the snapshot.
+pub(crate) fn emit_bump_save(f: &mut Function, br: BumpReset) {
+    f.instructions().global_get(br.global);
+    f.instructions().local_set(br.saved_local);
+}
+
+/// Restore bump from the snapshot taken by [`emit_bump_save`]. Run
+/// at every exit path (natural end, async pre-`task.return`, blocking
+/// early `return_()`, etc.) once the last wrapper-body allocation has
+/// been consumed.
+pub(crate) fn emit_bump_restore(f: &mut Function, br: BumpReset) {
+    f.instructions().local_get(br.saved_local);
+    f.instructions().global_set(br.global);
+}
+
 /// One wrapper-shaped export, used by [`emit_export_section`].
 pub(crate) struct WrapperExport<'a> {
     pub export_name: &'a str,
