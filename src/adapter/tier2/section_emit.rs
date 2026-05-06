@@ -3,15 +3,20 @@
 //! per-wrapper body lives in [`super::wrapper_body`]; this file
 //! drives the section-level structure that surrounds it.
 
+use std::collections::HashMap;
+
 use wasm_encoder::{
     CodeSection, EntityType, FunctionSection, ImportSection, Module, TypeSection, ValType,
 };
 use wit_parser::abi::WasmSignature;
+use wit_parser::{Resolve, TypeId};
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    emit_cabi_realloc, empty_function, val_types, GlobalIndices, WrapperExport,
+    emit_cabi_realloc, emit_resource_drop_imports, empty_function, val_types, GlobalIndices,
+    WrapperExport,
 };
+use super::super::indices::DispatchIndices;
 use super::schema::HookImport;
 use super::wrapper_body::{emit_wrapper_function, WrapperCtx};
 use super::FuncDispatch;
@@ -27,6 +32,9 @@ pub(super) struct TypeIndices {
     pub(super) async_types: canon_async::AsyncTypes,
     /// Per-async-func `task.return` type; `Some(idx)` iff `is_async`.
     pub(super) task_return_ty: Vec<Option<u32>>,
+    /// `(func (param i32))` for `[resource-drop]<R>` imports.
+    /// `Some` iff any per-func `borrow_drops` is non-empty.
+    pub(super) resource_drop_ty: Option<u32>,
 }
 
 pub(super) fn emit_type_section(
@@ -102,6 +110,12 @@ pub(super) fn emit_type_section(
         i
     });
 
+    // `[resource-drop]<R>`: `(func (param i32))`. Reuses the canon-
+    // async runtime's `void_i32_ty` slot — same shape, always
+    // allocated since tier-2 always emits the async runtime.
+    let needs_resource_drop = per_func.iter().any(|fd| !fd.borrow_drops.is_empty());
+    let resource_drop_ty = needs_resource_drop.then_some(async_types.void_i32_ty);
+
     module.section(&types);
     TypeIndices {
         handler_ty,
@@ -113,6 +127,7 @@ pub(super) fn emit_type_section(
         cabi_realloc_ty,
         async_types,
         task_return_ty,
+        resource_drop_ty,
     }
 }
 
@@ -126,10 +141,14 @@ pub(super) struct FuncIndices {
     pub(super) wrapper_base: u32,
     pub(super) init_idx: u32,
     pub(super) cabi_realloc_idx: u32,
+    /// Per-resource `[resource-drop]<R>` import index. Empty when no
+    /// borrow params reference any resource.
+    pub(super) resource_drop: HashMap<TypeId, u32>,
 }
 
 pub(super) fn emit_imports_and_funcs(
     module: &mut Module,
+    resolve: &Resolve,
     per_func: &[FuncDispatch],
     ty: &TypeIndices,
     before_hook: Option<&HookImport>,
@@ -137,17 +156,31 @@ pub(super) fn emit_imports_and_funcs(
     event_ptr: i32,
 ) -> FuncIndices {
     let mut imports = ImportSection::new();
-    let mut next_imp: u32 = 0;
+    // `idx` tracks both the import-side func indices and the
+    // wrapper-side ones (imports come first, then defined funcs);
+    // shared across all import-emit paths so each `alloc_func()`
+    // hands back the next contiguous slot.
+    let mut idx = DispatchIndices::new();
 
-    let handler_imp_base = next_imp;
+    let handler_imp_base = idx.func;
     for (fd, &fty) in per_func.iter().zip(&ty.handler_ty) {
         imports.import(
             &fd.import_module,
             &fd.import_field,
             EntityType::Function(fty),
         );
-        next_imp += 1;
+        idx.alloc_func();
     }
+
+    // `[resource-drop]<R>` imports — one per unique borrow resource.
+    let resource_drop = emit_resource_drop_imports(
+        &mut imports,
+        resolve,
+        per_func,
+        |fd| &fd.borrow_drops,
+        ty.resource_drop_ty,
+        || idx.alloc_func(),
+    );
 
     let before_hook_idx = before_hook.map(|h| {
         imports.import(
@@ -155,9 +188,7 @@ pub(super) fn emit_imports_and_funcs(
             &h.name,
             EntityType::Function(ty.before_hook_ty.unwrap()),
         );
-        let idx = next_imp;
-        next_imp += 1;
-        idx
+        idx.alloc_func()
     });
     let after_hook_idx = after_hook.map(|h| {
         imports.import(
@@ -165,16 +196,12 @@ pub(super) fn emit_imports_and_funcs(
             &h.name,
             EntityType::Function(ty.after_hook_ty.unwrap()),
         );
-        let idx = next_imp;
-        next_imp += 1;
-        idx
+        idx.alloc_func()
     });
 
     let async_funcs =
         canon_async::import_intrinsics(&mut imports, &ty.async_types, event_ptr, || {
-            let i = next_imp;
-            next_imp += 1;
-            i
+            idx.alloc_func()
         });
 
     // Per-async-fn `task.return` imports. Mirrors tier-1's order:
@@ -190,14 +217,13 @@ pub(super) fn emit_imports_and_funcs(
                 .flatten()
                 .expect("async func must have task.return type allocated");
             imports.import(&tr.module, &tr.name, EntityType::Function(ty_idx));
-            task_return_idx[i] = Some(next_imp);
-            next_imp += 1;
+            task_return_idx[i] = Some(idx.alloc_func());
         }
     }
 
     module.section(&imports);
 
-    let wrapper_base = next_imp;
+    let wrapper_base = idx.func;
 
     let mut fsec = FunctionSection::new();
     for &fty in &ty.wrapper_ty {
@@ -225,6 +251,7 @@ pub(super) fn emit_imports_and_funcs(
         wrapper_base,
         init_idx,
         cabi_realloc_idx,
+        resource_drop,
     }
 }
 

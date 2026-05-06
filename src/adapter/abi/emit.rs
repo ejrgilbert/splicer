@@ -4,17 +4,21 @@
 //! to provide regardless of which tier of adapter it backs.
 
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
+
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
-    GlobalSection, GlobalType, MemArg, MemorySection, MemoryType, Module, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
+    Function, GlobalSection, GlobalType, ImportSection, MemArg, MemorySection, MemoryType, Module,
+    ValType,
 };
-use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
+use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
-    Int, Resolve, SizeAlign, Type, TypeDefKind, TypeId, WasmImport, WorldId, WorldItem,
+    Function as WitFunction, Handle, Int, Resolve, ResourceIntrinsic, SizeAlign, Type, TypeDefKind,
+    TypeId, TypeOwner, WasmImport, WorldId, WorldItem, WorldKey,
 };
 
 use super::super::indices::LocalsBuilder;
-use super::super::resolve::hook_callback_mangling;
+use super::super::resolve::{hook_callback_mangling, sync_mangling};
 
 // ─── Standard wasm-component-model exports ────────────────────────
 //
@@ -583,6 +587,112 @@ pub(crate) fn emit_alloc_call_id(f: &mut Function, counter_global: u32, id_local
     f.instructions().i64_add();
     f.instructions().local_tee(id_local);
     f.instructions().global_set(counter_global);
+}
+
+/// Top-level `borrow<R>` params of `func`, returned as
+/// `(flat_idx, resource_id)`. The wrapper must call
+/// `[resource-drop]<R>` for each before returning — the canonical-
+/// ABI runtime checks every borrow lifted on entry is dropped on
+/// exit. Top-level only; borrows nested inside compound params
+/// aren't dropped (out of scope until the fuzzer surfaces them).
+pub(crate) fn collect_borrow_drops(resolve: &Resolve, func: &WitFunction) -> Vec<(u32, TypeId)> {
+    let mut out = Vec::new();
+    let mut flat_idx: u32 = 0;
+    for param in &func.params {
+        if let Type::Id(tid) = param.ty {
+            if let TypeDefKind::Handle(Handle::Borrow(rid)) = &resolve.types[tid].kind {
+                out.push((flat_idx, resolve_type_alias(resolve, *rid)));
+                flat_idx += 1;
+                continue;
+            }
+        }
+        let mut storage = vec![WasmType::I32; 32];
+        let mut flat = FlatTypes::new(storage.as_mut_slice());
+        if !resolve.push_flat(&param.ty, &mut flat) {
+            return Vec::new();
+        }
+        flat_idx += flat.to_vec().len() as u32;
+    }
+    out
+}
+
+/// Follow `TypeDefKind::Type` aliases to the underlying definition
+/// (e.g. an `api`-side `use types.{cat}` alias → the `types`-side
+/// `resource cat` definition).
+pub(crate) fn resolve_type_alias(resolve: &Resolve, mut tid: TypeId) -> TypeId {
+    while let TypeDefKind::Type(Type::Id(next)) = &resolve.types[tid].kind {
+        tid = *next;
+    }
+    tid
+}
+
+/// Emit one `[resource-drop]<R>` import per unique borrow resource
+/// across `per_func`. `drops_of` projects each fn's borrow_drops
+/// slice (per-tier `FuncDispatch` is not a shared type, so the
+/// projection is the only kind-specific bit). Each resource is
+/// imported from its owning interface (factored-types pattern).
+/// `alloc_func` allocates each new func-index. `drop_ty` is `Some`
+/// iff the caller pre-allocated a `(func (param i32))` type; `None`
+/// short-circuits.
+///
+/// Panics if a resource's owner isn't an interface — WIT resources
+/// always live in interfaces, so this would mean the dispatch
+/// pipeline produced a borrow whose drop can't be looked up later
+/// in [`emit_borrow_drops`]. Fail loudly here rather than at the
+/// drop-emit's unconditional HashMap lookup.
+pub(crate) fn emit_resource_drop_imports<Fd>(
+    imports: &mut ImportSection,
+    resolve: &Resolve,
+    per_func: &[Fd],
+    drops_of: impl Fn(&Fd) -> &[(u32, TypeId)],
+    drop_ty: Option<u32>,
+    mut alloc_func: impl FnMut() -> u32,
+) -> HashMap<TypeId, u32> {
+    let Some(drop_ty) = drop_ty else {
+        return HashMap::new();
+    };
+    let mut unique: Vec<TypeId> = per_func
+        .iter()
+        .flat_map(|fd| drops_of(fd).iter().map(|(_, rid)| *rid))
+        .collect();
+    unique.sort();
+    unique.dedup();
+    let mut out: HashMap<TypeId, u32> = HashMap::new();
+    for rid in unique {
+        let owner_iface = match resolve.types[rid].owner {
+            TypeOwner::Interface(iid) => iid,
+            other => panic!(
+                "borrow resource {rid:?} has owner {other:?}, expected TypeOwner::Interface — \
+                 emit_borrow_drops's HashMap lookup would panic with no entry",
+            ),
+        };
+        let owner_key = WorldKey::Interface(owner_iface);
+        let imp = WasmImport::ResourceIntrinsic {
+            interface: Some(&owner_key),
+            resource: rid,
+            intrinsic: ResourceIntrinsic::ImportedDrop,
+        };
+        let (module_name, field_name) = resolve.wasm_import_name(sync_mangling(), imp);
+        imports.import(&module_name, &field_name, EntityType::Function(drop_ty));
+        out.insert(rid, alloc_func());
+    }
+    out
+}
+
+/// Emit `[resource-drop]<R>` calls for every borrow this fn lifted
+/// on entry. The canon-ABI runtime requires these dropped before the
+/// wrapper returns, otherwise `borrow handles still remain at the
+/// end of the call`. Call before any return-flavored emit.
+pub(crate) fn emit_borrow_drops(
+    f: &mut Function,
+    borrow_drops: &[(u32, TypeId)],
+    resource_drop: &HashMap<TypeId, u32>,
+) {
+    for (flat_idx, rid) in borrow_drops {
+        let drop_fn = resource_drop[rid];
+        f.instructions().local_get(*flat_idx);
+        f.instructions().call(drop_fn);
+    }
 }
 
 /// Lower a `call-id` record into memory at `base_ptr + call_off`.

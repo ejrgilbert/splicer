@@ -52,13 +52,13 @@ use wasm_encoder::Module;
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
 use wit_parser::abi::{AbiVariant, WasmSignature};
 use wit_parser::{
-    Function as WitFunction, InterfaceId, Mangling, Resolve, Type, WasmExport, WasmExportKind,
-    WasmImport, WorldKey,
+    Function as WitFunction, InterfaceId, Mangling, Resolve, Type, TypeId, WasmExport,
+    WasmExportKind, WasmImport, WorldKey,
 };
 
 use super::abi::emit::{
-    emit_data_section, emit_export_section, emit_memory_and_globals, synthesize_adapter_world_wit,
-    BlobSlice,
+    collect_borrow_drops, emit_data_section, emit_export_section, emit_memory_and_globals,
+    synthesize_adapter_world_wit, BlobSlice,
 };
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use blob::NameInterner;
@@ -193,6 +193,7 @@ fn build_dispatch_module(
     );
     let func_idx = emit_imports_and_funcs(
         &mut module,
+        resolve,
         per_func,
         &type_idx,
         schema.before_hook.as_ref().map(|h| &h.import),
@@ -376,6 +377,11 @@ pub(in crate::adapter::tier2) struct FuncClassified {
     pub params: Vec<ParamLift>,
     /// Classify-time return-value lift recipe (no offsets).
     pub result_lift: Option<ResultLift>,
+    /// Top-level `borrow<R>` params as `(flat_idx, resource_id)`.
+    /// The wrapper must `[resource-drop]<R>` each one before
+    /// returning — the canon-ABI runtime checks every borrow lifted
+    /// on entry is dropped on exit.
+    pub borrow_drops: Vec<(u32, TypeId)>,
 }
 
 /// Layout-phase per-function output: the classify data plus every
@@ -426,6 +432,9 @@ pub(in crate::adapter::tier2) struct FuncDispatch {
     pub result_lift: Option<lift::ResultLayout>,
     /// On-return-hook scaffolding; `Some` iff after-hook is wired.
     pub after: Option<AfterSetup>,
+    /// Top-level `borrow<R>` params as `(flat_idx, resource_id)`.
+    /// See [`FuncClassified::borrow_drops`].
+    pub borrow_drops: Vec<(u32, TypeId)>,
 }
 
 /// Build the per-target-function classify records: classify each
@@ -478,6 +487,8 @@ fn build_per_func_classified(
             names,
         );
 
+        let borrow_drops = collect_borrow_drops(resolve, func);
+
         per_func.push(FuncClassified {
             shape,
             result_ty: func.result,
@@ -491,6 +502,7 @@ fn build_per_func_classified(
             fn_name_len: fn_name_slice.len as i32,
             params: params_lift,
             result_lift,
+            borrow_drops,
         });
     }
     Ok(per_func)

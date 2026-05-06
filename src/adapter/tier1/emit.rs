@@ -22,25 +22,24 @@ use wasm_encoder::{
 };
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
-use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
+use wit_parser::abi::{AbiVariant, WasmSignature};
 use wit_parser::{
-    Function as WitFunction, Handle, InterfaceId, Mangling, Resolve, ResourceIntrinsic, SizeAlign,
-    Type, TypeDefKind, TypeId, TypeOwner, WasmExport, WasmExportKind, WasmImport, WorldKey,
+    Function as WitFunction, InterfaceId, Mangling, Resolve, SizeAlign, Type, TypeDefKind, TypeId,
+    TypeOwner, WasmExport, WasmExportKind, WasmImport, WorldKey,
 };
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
-    call_id_layout, direct_return_type, emit_alloc_call_id, emit_cabi_realloc, emit_data_section,
-    emit_export_section, emit_handler_call, emit_memory_and_globals, emit_populate_call_id,
+    call_id_layout, collect_borrow_drops, direct_return_type, emit_alloc_call_id,
+    emit_borrow_drops, emit_cabi_realloc, emit_data_section, emit_export_section,
+    emit_handler_call, emit_memory_and_globals, emit_populate_call_id, emit_resource_drop_imports,
     emit_wrapper_return, empty_function, find_imported_hook, synthesize_adapter_world_wit,
     val_types, BlobSlice, CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, LocalsBuilder};
 use super::super::mem_layout::MemoryLayoutBuilder;
-use super::super::resolve::{
-    decode_input_resolve, dispatch_mangling, find_target_interface, sync_mangling,
-};
+use super::super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 
 /// Generate the adapter component bytes. `target_interface` is the
 /// fully-qualified interface name (`<ns>:<pkg>/<iface>[@<ver>]`);
@@ -239,40 +238,6 @@ struct FuncDispatch {
     /// `borrow<R>` param. The runtime requires us to drop the borrow
     /// before the wrapper returns; see `emit_wrapper_body`.
     borrow_drops: Vec<(u32, TypeId)>,
-}
-
-/// Top-level `borrow<R>` params, returned as `(flat_idx, resource_id)`.
-/// Top-level only — borrows nested inside compound params aren't yet
-/// dropped (out of scope until the fuzzer surfaces such shapes).
-fn collect_borrow_drops(resolve: &Resolve, func: &WitFunction) -> Vec<(u32, TypeId)> {
-    let mut out = Vec::new();
-    let mut flat_idx: u32 = 0;
-    for param in &func.params {
-        if let Type::Id(tid) = param.ty {
-            if let TypeDefKind::Handle(Handle::Borrow(rid)) = &resolve.types[tid].kind {
-                out.push((flat_idx, resolve_type_alias(resolve, *rid)));
-                flat_idx += 1;
-                continue;
-            }
-        }
-        let mut storage = vec![WasmType::I32; 32];
-        let mut flat = FlatTypes::new(storage.as_mut_slice());
-        if !resolve.push_flat(&param.ty, &mut flat) {
-            return Vec::new();
-        }
-        flat_idx += flat.to_vec().len() as u32;
-    }
-    out
-}
-
-/// Follow `TypeDefKind::Type` aliases to the underlying definition
-/// (e.g. an `api`-side `use types.{cat}` alias → the `types`-side
-/// `resource cat` definition).
-fn resolve_type_alias(resolve: &Resolve, mut tid: TypeId) -> TypeId {
-    while let TypeDefKind::Type(Type::Id(next)) = &resolve.types[tid].kind {
-        tid = *next;
-    }
-    tid
 }
 
 /// Synthesized adapter world's package + world name. The contents
@@ -765,37 +730,15 @@ fn emit_imports_section(
         );
         imp_handler.push(idx.alloc_func());
     }
-    // `[resource-drop]<R>` imports for each unique resource referenced
-    // by a borrow param. Imported from the owning interface (factored
-    // types: resource lives in `<pkg>/types`, not the using interface).
-    let mut resource_drop: HashMap<TypeId, u32> = HashMap::new();
-    if let Some(drop_ty) = type_idx.resource_drop_ty {
-        let mut unique: Vec<TypeId> = per_func
-            .iter()
-            .flat_map(|f| f.borrow_drops.iter().map(|(_, rid)| *rid))
-            .collect();
-        unique.sort();
-        unique.dedup();
-        for rid in unique {
-            // Drop is imported from the resource's owning interface
-            // (e.g. `<pkg>/types`), not from the using interface.
-            // `wasm_import_name` then returns the canonical
-            // `<owner-iface>` / `[resource-drop]<R>` pair.
-            let owner_iface = match resolve.types[rid].owner {
-                TypeOwner::Interface(iid) => iid,
-                _ => continue,
-            };
-            let owner_key = WorldKey::Interface(owner_iface);
-            let imp = WasmImport::ResourceIntrinsic {
-                interface: Some(&owner_key),
-                resource: rid,
-                intrinsic: ResourceIntrinsic::ImportedDrop,
-            };
-            let (module_name, field_name) = resolve.wasm_import_name(sync_mangling(), imp);
-            imports.import(&module_name, &field_name, EntityType::Function(drop_ty));
-            resource_drop.insert(rid, idx.alloc_func());
-        }
-    }
+    // `[resource-drop]<R>` imports — one per unique borrow resource.
+    let resource_drop = emit_resource_drop_imports(
+        &mut imports,
+        resolve,
+        per_func,
+        |f| &f.borrow_drops,
+        type_idx.resource_drop_ty,
+        || idx.alloc_func(),
+    );
     let mut import_hook = |hook: &HookImport| {
         imports.import(
             &hook.module,
@@ -1018,13 +961,7 @@ fn emit_wrapper_body(
     if let Some(idx) = imp_after {
         emit_hook_call(&mut f, idx, async_runtime, wait_locals, hook_site.unwrap());
     }
-    // Drop borrow handles before returning — the runtime requires
-    // every borrow lifted on entry to be dropped before exit.
-    for (flat_idx, rid) in &fd.borrow_drops {
-        let drop_fn = resource_drop[rid];
-        f.instructions().local_get(*flat_idx);
-        f.instructions().call(drop_fn);
-    }
+    emit_borrow_drops(&mut f, &fd.borrow_drops, resource_drop);
     emit_wrapper_return(&mut f, result_local, fd.export_sig.retptr, fd.retptr_offset);
     f.instructions().end();
     code.function(&f);
@@ -1173,12 +1110,7 @@ fn emit_async_wrapper_body(
         );
     }
 
-    // Drop borrow handles before returning.
-    for (flat_idx, rid) in &fd.borrow_drops {
-        let drop_fn = resource_drop[rid];
-        f.instructions().local_get(*flat_idx);
-        f.instructions().call(drop_fn);
-    }
+    emit_borrow_drops(&mut f, &fd.borrow_drops, resource_drop);
 
     // task.return shape: void (no args), retptr (pass the buffer
     // through — large compound result), or flat (lift each slot via

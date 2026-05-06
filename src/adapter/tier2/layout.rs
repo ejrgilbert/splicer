@@ -797,6 +797,7 @@ pub(super) fn lay_out_static_memory(
                 retptr_offset,
                 result_lift,
                 after,
+                borrow_drops: fc.borrow_drops,
             }
         })
         .collect();

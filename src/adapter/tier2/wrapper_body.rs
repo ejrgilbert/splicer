@@ -47,8 +47,8 @@ use wit_parser::Resolve;
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
-    emit_alloc_call_id, emit_handler_call, emit_populate_call_id, emit_store_i64_local,
-    emit_store_slice, emit_wrapper_return, BlobSlice, RecordLayout,
+    emit_alloc_call_id, emit_borrow_drops, emit_handler_call, emit_populate_call_id,
+    emit_store_i64_local, emit_store_slice, emit_wrapper_return, BlobSlice, RecordLayout,
 };
 use super::super::indices::LocalsBuilder;
 use super::lift::{
@@ -276,6 +276,9 @@ pub(super) fn emit_wrapper_function(
         f.instructions().i32_const(after_pf.params_offset);
         canon_async::emit_call_and_wait(&mut f, after_static.idx, lcl.st, lcl.ws, async_funcs);
     }
+
+    // Drop borrow handles before tail emit — runtime-required.
+    emit_borrow_drops(&mut f, &fd.borrow_drops, &func_idx.resource_drop);
 
     // ── Phase 4: tail. Async fns publish the result via task.return;
     // sync fns return the direct value (or static retptr).

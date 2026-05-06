@@ -214,14 +214,13 @@ enum Shape {
         /// Which branch to materialize (`true` = Ok, `false` = Err).
         is_ok: bool,
     },
-    // ResourceOwn and ResourceBorrow are wired through every Shape
-    // method but not yet activated in `tier1_shapes()` or the fuzz
-    // generator — the consumer/provider scaffolds need resource codegen
-    // first. `allow(dead_code)` until that lands.
+    // ResourceOwn / ResourceBorrow are activated in tier-1 + tier-2
+    // shape lists. Resources live in `my:shape/types` (factored from
+    // `my:shape/api`) so wit-component preserves type identity across
+    // the wrapper boundary.
     /// `own<T>` — owning handle to a nullary-constructor resource.
     /// Round-trips through the canonical ABI as an i32 with ownership
     /// transfer semantics.
-    #[allow(dead_code)]
     ResourceOwn {
         /// Resource name in WIT (kebab-safe single word).
         wit_name: &'static str,
@@ -232,7 +231,6 @@ enum Shape {
     /// Cannot appear in a function's return position, so the harness's
     /// echo-`foo(x: T) -> T` signature must specialize when this is the
     /// top-level shape (handled by the scaffold emitters).
-    #[allow(dead_code)]
     ResourceBorrow {
         wit_name: &'static str,
         rust_name: &'static str,
@@ -1493,6 +1491,18 @@ fn tier2_shapes() -> Vec<Shape> {
             })),
             is_ok: false,
         },
+        // `own<cat>` — exercises `Cell::Handle` on both sides; id is
+        // the canonical-ABI handle bits zero-extended.
+        Shape::ResourceOwn {
+            wit_name: "cat",
+            rust_name: "Cat",
+        },
+        // `borrow<cat>` — same lift; borrow can't be returned, so the
+        // after-hook sees `result: option::none`.
+        Shape::ResourceBorrow {
+            wit_name: "cat",
+            rust_name: "Cat",
+        },
     ]
 }
 
@@ -2093,6 +2103,13 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
         Cell::OptionNone => "option-none".to_string(),
         Cell::ResultOk(payload) => fmt_result_arm(tree, "result-ok", payload),
         Cell::ResultErr(payload) => fmt_result_arm(tree, "result-err", payload),
+        Cell::ResourceHandle(side_idx) => {
+            let info = tree
+                .handle_infos
+                .get(*side_idx as usize)
+                .expect("handle_infos idx in range");
+            format!("resource-handle({}, id={})", info.type_name, info.id)
+        }
         other => format!("other({other:?})"),
     }
 }
@@ -2580,8 +2597,9 @@ fn test_tier2_canned() {
             let captured = run_tier2_pipeline_for_shape(&workspace, shape);
             let expected_args = predict_tier2_args_marker(shape)
                 .expect("every tier2_shapes() entry must be renderable by predict_tier2_arg_inner");
+            // `expected_args` already includes the `args=[...]` wrapping.
             let expected_marker =
-                format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo args=[{expected_args}]");
+                format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo {expected_args}");
             assert!(
                 captured.contains(&expected_marker),
                 "tier-2 on-call rendered the wrong cell for `{shape_name}` — \
@@ -2722,25 +2740,34 @@ fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> St
     invoke_run(&bytes).expect("invoke run()")
 }
 
-/// Compute the expected `args=[…]` substring for one shape. Mirrors
-/// the cell-discriminant + payload shape that `LiftKind::classify` +
-/// the `emit_*_cell` helpers produce, in the formatting
-/// `MIDDLEWARE_TIER2_LIB_RS::fmt_cell` emits.
+/// Expected `args=[…]` substring matching `fmt_cell`'s rendering.
+/// Returns `None` for shapes `predict_tier2_arg_inner` doesn't render
+/// yet — callers iterate `tier2_shapes()`, so `None` becomes an
+/// `.expect` panic.
 ///
-/// Returns `None` for shapes the value-rendering helper
-/// (`predict_tier2_arg_inner`) doesn't know how to format yet. Callers
-/// in `test_tier2_canned_primitives` iterate `tier2_shapes()`, so
-/// every entry must be renderable — `None` becomes a panic via
-/// `.expect`.
+/// `args=[...]` lives in the returned string (not the caller) so
+/// handle shapes can omit the closing `]` past the runtime-varying
+/// `id`.
 fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
     let inner = predict_tier2_arg_inner(shape)?;
-    Some(format!("x: {inner}"))
+    let open_ended = matches!(
+        shape,
+        Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. }
+    );
+    if open_ended {
+        Some(format!("args=[x: {inner}"))
+    } else {
+        Some(format!("args=[x: {inner}]"))
+    }
 }
 
-/// Compute the expected `result=…` substring for one shape's
-/// on-return marker. `foo` echoes the value back, so the same
-/// per-shape rendering applies to the return path.
+/// Expected `result=…` substring. `foo` echoes the value, so the
+/// arg rendering applies — except top-level `borrow<T>`, whose
+/// signature drops the result (borrow can't be returned).
 fn predict_tier2_result_marker(shape: &Shape) -> Option<String> {
+    if matches!(shape, Shape::ResourceBorrow { .. }) {
+        return Some("none".to_string());
+    }
     predict_tier2_arg_inner(shape)
 }
 
@@ -2858,8 +2885,13 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
             };
             Some(format!("{arm_name}({payload_render})"))
         }
-        // Other compound shapes (lists, variants, flags) light up here
-        // as their lift codegen lands.
+        // Anchor at the trailing comma; the runtime-varying `id`
+        // past it is matched permissively via `contains`.
+        Shape::ResourceOwn { wit_name, .. } | Shape::ResourceBorrow { wit_name, .. } => {
+            Some(format!("resource-handle({wit_name},"))
+        }
+        // Other shapes (lists, etc.) light up here as their lift
+        // codegen lands.
         _ => None,
     }
 }

@@ -172,6 +172,7 @@ fn func_with_params(
         fn_name_len: 0,
         params,
         result_lift: None,
+        borrow_drops: Vec::new(),
     }
 }
 
