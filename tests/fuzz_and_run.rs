@@ -22,6 +22,17 @@
 //! Override the shape list via env var (comma-separated names):
 //!     SPLICER_RUNTIME_SHAPES=u32,string cargo test --test fuzz_and_run \
 //!         -- --ignored --nocapture
+//!
+//! Limitation — `stream<T>` / `future<T>` are out of scope for this
+//! harness. Tier-2 lift codegen handles them (single `Cell::Handle`
+//! variant covers own/borrow/stream/future, picking cell-disc by
+//! `HandleKind`), but driving them end-to-end here would require
+//! async-runtime + canon-async-stream/future host bindings the
+//! harness doesn't have. Runtime coverage for stream/future lives
+//! in the `component-interposition` submodule's integration tests
+//! instead. A latent drop-intrinsics gap (`[stream-drop-readable]`
+//! / `[future-drop-readable]` — `collect_borrow_drops` only walks
+//! `Handle::Borrow` today) will surface there when exercised.
 
 use anyhow::Context;
 use arbitrary::Arbitrary;
@@ -102,7 +113,7 @@ const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 // output (used only by the pre-splice sanity check).
 //
 // Compounds recurse: Option/List/Tuple wrap another Shape and Record
-// carries a named field list. `canned_shapes()` is the hardcoded
+// carries a named field list. `tier1_shapes()` is the hardcoded
 // deterministic coverage; `gen_shape()` drives the same enum from an
 // `arbitrary::Unstructured` for the fuzz test below.
 
@@ -154,7 +165,14 @@ enum Shape {
         /// How `{value:?}` renders the literal.
         expected_debug: &'static str,
     },
-    Option(Box<Shape>),
+    /// `option<T>` materialized as `Some(...)` when `is_some` is
+    /// true, `None` otherwise. The inner shape is retained either
+    /// way — it drives type metadata (wit_type / rust_ty) and, for
+    /// the some-arm, the runtime literal.
+    Option {
+        inner: Box<Shape>,
+        is_some: bool,
+    },
     List(Box<Shape>),
     Tuple(Vec<Shape>),
     Record {
@@ -207,14 +225,13 @@ enum Shape {
         /// Which branch to materialize (`true` = Ok, `false` = Err).
         is_ok: bool,
     },
-    // ResourceOwn and ResourceBorrow are wired through every Shape
-    // method but not yet activated in `canned_shapes()` or the fuzz
-    // generator — the consumer/provider scaffolds need resource codegen
-    // first. `allow(dead_code)` until that lands.
+    // ResourceOwn / ResourceBorrow are activated in tier-1 + tier-2
+    // shape lists. Resources live in `my:shape/types` (factored from
+    // `my:shape/api`) so wit-component preserves type identity across
+    // the wrapper boundary.
     /// `own<T>` — owning handle to a nullary-constructor resource.
     /// Round-trips through the canonical ABI as an i32 with ownership
     /// transfer semantics.
-    #[allow(dead_code)]
     ResourceOwn {
         /// Resource name in WIT (kebab-safe single word).
         wit_name: &'static str,
@@ -225,7 +242,6 @@ enum Shape {
     /// Cannot appear in a function's return position, so the harness's
     /// echo-`foo(x: T) -> T` signature must specialize when this is the
     /// top-level shape (handled by the scaffold emitters).
-    #[allow(dead_code)]
     ResourceBorrow {
         wit_name: &'static str,
         rust_name: &'static str,
@@ -265,7 +281,10 @@ impl Shape {
     fn name(&self) -> String {
         match self {
             Shape::Primitive { name, .. } => (*name).to_string(),
-            Shape::Option(inner) => format!("option_{}", inner.name()),
+            Shape::Option { inner, is_some } => {
+                let arm = if *is_some { "some" } else { "none" };
+                format!("option_{arm}_{}", inner.name())
+            }
             Shape::List(inner) => format!("list_{}", inner.name()),
             Shape::Tuple(parts) => {
                 let mut s = String::from("tuple");
@@ -276,13 +295,24 @@ impl Shape {
                 s
             }
             Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
-            Shape::Variant { wit_name, .. } => format!("variant_{}", wit_name),
+            Shape::Variant {
+                wit_name,
+                cases,
+                selected,
+                ..
+            } => {
+                let case = cases.get(*selected).map(|c| c.wit_name).unwrap_or("oob");
+                format!("variant_{wit_name}_{case}")
+            }
             Shape::Enum { wit_name, .. } => format!("enum_{}", wit_name),
-            Shape::Flags { wit_name, .. } => format!("flags_{}", wit_name),
-            Shape::Result_ { ok, err, .. } => {
+            Shape::Flags {
+                wit_name, selected, ..
+            } => format!("flags_{wit_name}_0x{selected:x}"),
+            Shape::Result_ { ok, err, is_ok } => {
+                let arm = if *is_ok { "ok" } else { "err" };
                 let ok_s = ok.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
                 let err_s = err.as_ref().map(|s| s.name()).unwrap_or_else(|| "_".into());
-                format!("result_{ok_s}_{err_s}")
+                format!("result_{arm}_{ok_s}_{err_s}")
             }
             Shape::ResourceOwn { wit_name, .. } => format!("own_{wit_name}"),
             Shape::ResourceBorrow { wit_name, .. } => format!("borrow_{wit_name}"),
@@ -292,7 +322,7 @@ impl Shape {
     fn wit_type(&self) -> String {
         match self {
             Shape::Primitive { wit_type, .. } => (*wit_type).to_string(),
-            Shape::Option(inner) => format!("option<{}>", inner.wit_type()),
+            Shape::Option { inner, .. } => format!("option<{}>", inner.wit_type()),
             Shape::List(inner) => format!("list<{}>", inner.wit_type()),
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -331,7 +361,7 @@ impl Shape {
     fn collect_wit_decls(&self, out: &mut String, seen_resources: &mut HashSet<&'static str>) {
         match self {
             Shape::Primitive { .. } => {}
-            Shape::Option(inner) | Shape::List(inner) => {
+            Shape::Option { inner, .. } | Shape::List(inner) => {
                 inner.collect_wit_decls(out, seen_resources)
             }
             Shape::Tuple(parts) => {
@@ -428,7 +458,7 @@ impl Shape {
     fn rust_ty(&self, side: BindingsSide) -> String {
         match self {
             Shape::Primitive { rust_ty, .. } => (*rust_ty).to_string(),
-            Shape::Option(inner) => format!("Option<{}>", inner.rust_ty(side)),
+            Shape::Option { inner, .. } => format!("Option<{}>", inner.rust_ty(side)),
             Shape::List(inner) => format!("Vec<{}>", inner.rust_ty(side)),
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -490,8 +520,20 @@ impl Shape {
                     (*rust_literal).to_string()
                 }
             }
-            Shape::Option(inner) => format!("Some({})", inner.rust_literal(side, mode)),
-            Shape::List(inner) => format!("vec![{}]", inner.rust_literal(side, mode)),
+            Shape::Option { inner, is_some } => {
+                if *is_some {
+                    format!("Some({})", inner.rust_literal(side, mode))
+                } else {
+                    "None".to_string()
+                }
+            }
+            Shape::List(inner) => {
+                // wit-bindgen lowers `list<T>` params as `&[T]` with
+                // `T` owned (e.g. `&[String]`, not `&[&str]`) regardless
+                // of outer mode. Force the element to Async-mode so a
+                // `string` element renders as `String::from(...)`.
+                format!("vec![{}]", inner.rust_literal(side, AsyncMode::Async))
+            }
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -653,7 +695,7 @@ impl Shape {
             Shape::Primitive { rust_ty, .. } => {
                 *rust_ty != "String" || matches!(mode, AsyncMode::Sync)
             }
-            Shape::Option(inner) => inner.is_copy_in(mode),
+            Shape::Option { inner, .. } => inner.is_copy_in(mode),
             Shape::List(_) => false,
             Shape::Tuple(parts) => parts.iter().all(|p| p.is_copy_in(mode)),
             Shape::Record { fields, .. } => {
@@ -682,7 +724,7 @@ impl Shape {
     fn contains_resource(&self) -> bool {
         match self {
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => false,
-            Shape::Option(inner) | Shape::List(inner) => inner.contains_resource(),
+            Shape::Option { inner, .. } | Shape::List(inner) => inner.contains_resource(),
             Shape::Tuple(parts) => parts.iter().any(Shape::contains_resource),
             Shape::Record { fields, .. } => fields.iter().any(|(_, s)| s.contains_resource()),
             Shape::Variant { cases, .. } => cases
@@ -703,7 +745,7 @@ impl Shape {
     fn collect_resources(&self, out: &mut Vec<(&'static str, &'static str)>) {
         match self {
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => {}
-            Shape::Option(inner) | Shape::List(inner) => inner.collect_resources(out),
+            Shape::Option { inner, .. } | Shape::List(inner) => inner.collect_resources(out),
             Shape::Tuple(parts) => {
                 for p in parts {
                     p.collect_resources(out);
@@ -767,7 +809,13 @@ impl Shape {
     fn expected_debug_in(&self, err_enums: &HashSet<&'static str>) -> String {
         match self {
             Shape::Primitive { expected_debug, .. } => (*expected_debug).to_string(),
-            Shape::Option(inner) => format!("Some({})", inner.expected_debug_in(err_enums)),
+            Shape::Option { inner, is_some } => {
+                if *is_some {
+                    format!("Some({})", inner.expected_debug_in(err_enums))
+                } else {
+                    "None".to_string()
+                }
+            }
             Shape::List(inner) => format!("[{}]", inner.expected_debug_in(err_enums)),
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -974,16 +1022,19 @@ fn primitive_atoms() -> Vec<Shape> {
     ]
 }
 
-fn canned_shapes() -> Vec<Shape> {
+fn tier1_shapes() -> Vec<Shape> {
     let mut v = primitive_atoms();
     v.extend(vec![
-        Shape::Option(Box::new(Shape::Primitive {
-            name: "u32",
-            wit_type: "u32",
-            rust_ty: "u32",
-            rust_literal: "7u32",
-            expected_debug: "7",
-        })),
+        Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "7u32",
+                expected_debug: "7",
+            }),
+            is_some: true,
+        },
         Shape::List(Box::new(Shape::Primitive {
             name: "u32",
             wit_type: "u32",
@@ -1133,6 +1184,540 @@ fn canned_shapes() -> Vec<Shape> {
     v
 }
 
+/// Subset of shapes whose tier-2 lift codegen exists today. Explicit
+/// by design — adding a shape here is the deliberate signal that its
+/// `cells.rs` emit + `lift.rs` wiring have landed and the pipeline is
+/// ready to exercise it end-to-end. The list is hand-maintained rather
+/// than derived from `tier1_shapes()` so that adding a tier-1 shape
+/// without landing its tier-2 codegen does not silently expand the
+/// tier-2 sweep. `predict_tier2_arg_inner` (the value-rendering helper)
+/// must return `Some` for every entry; the assertion in
+/// `test_tier2_canned_primitives` enforces that.
+fn tier2_shapes() -> Vec<Shape> {
+    vec![
+        Shape::Primitive {
+            name: "u8",
+            wit_type: "u8",
+            rust_ty: "u8",
+            rust_literal: "7u8",
+            expected_debug: "7",
+        },
+        Shape::Primitive {
+            name: "s8",
+            wit_type: "s8",
+            rust_ty: "i8",
+            rust_literal: "-7i8",
+            expected_debug: "-7",
+        },
+        Shape::Primitive {
+            name: "u16",
+            wit_type: "u16",
+            rust_ty: "u16",
+            rust_literal: "500u16",
+            expected_debug: "500",
+        },
+        Shape::Primitive {
+            name: "s16",
+            wit_type: "s16",
+            rust_ty: "i16",
+            rust_literal: "-500i16",
+            expected_debug: "-500",
+        },
+        Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "42u32",
+            expected_debug: "42",
+        },
+        Shape::Primitive {
+            name: "s32",
+            wit_type: "s32",
+            rust_ty: "i32",
+            rust_literal: "-42i32",
+            expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "u64",
+            wit_type: "u64",
+            rust_ty: "u64",
+            rust_literal: "9000u64",
+            expected_debug: "9000",
+        },
+        Shape::Primitive {
+            name: "s64",
+            wit_type: "s64",
+            rust_ty: "i64",
+            rust_literal: "-42i64",
+            expected_debug: "-42",
+        },
+        Shape::Primitive {
+            name: "f32",
+            wit_type: "f32",
+            rust_ty: "f32",
+            rust_literal: "1.5f32",
+            expected_debug: "1.5",
+        },
+        Shape::Primitive {
+            name: "f64",
+            wit_type: "f64",
+            rust_ty: "f64",
+            rust_literal: "2.5f64",
+            expected_debug: "2.5",
+        },
+        Shape::Primitive {
+            name: "bool",
+            wit_type: "bool",
+            rust_ty: "bool",
+            rust_literal: "true",
+            expected_debug: "true",
+        },
+        Shape::Primitive {
+            name: "string",
+            wit_type: "string",
+            rust_ty: "String",
+            rust_literal: r#"String::from("hello")"#,
+            expected_debug: r#""hello""#,
+        },
+        // ASCII char — utf-8 1-byte branch.
+        Shape::Primitive {
+            name: "char_ascii",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'x'",
+            expected_debug: "'x'",
+        },
+        // BMP char (U+4E2D 中) — utf-8 3-byte branch.
+        Shape::Primitive {
+            name: "char_bmp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'中'",
+            expected_debug: "'中'",
+        },
+        // Supplementary-plane char (U+1F389 🎉) — utf-8 4-byte branch.
+        Shape::Primitive {
+            name: "char_smp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'🎉'",
+            expected_debug: "'🎉'",
+        },
+        Shape::Enum {
+            wit_name: "color",
+            rust_name: "Color",
+            cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+            selected: 1,
+        },
+        // Flags with a mixed bitmask — exercises the bit-walk's
+        // skip-then-set transition (bit 0 set, bit 1 unset, bit 2 set)
+        // so a future "always-write" bug wouldn't pass.
+        Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0b101,
+        },
+        // Empty bitmask — pins the zero-flag edge case (loop body
+        // never enters; set-flags.len patched to 0).
+        Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0,
+        },
+        // Variant with a payload-bearing case active — exercises the
+        // N-way disc dispatch hitting a non-first arm + the case's
+        // payload-lift path.
+        Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 1,
+        },
+        // Same shape, unit case active — pins the dispatch path that
+        // skips the payload write (option-none on the entry's payload).
+        Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 0,
+        },
+        Shape::Record {
+            wit_name: "point",
+            rust_name: "Point",
+            fields: vec![
+                (
+                    "x",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "3u32",
+                        expected_debug: "3",
+                    },
+                ),
+                (
+                    "y",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "5u32",
+                        expected_debug: "5",
+                    },
+                ),
+            ],
+        },
+        // Multi-element so the result side flattens to >1 slot
+        // (retptr) and exercises the Compound `lift_from_memory` path.
+        Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            },
+            Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("hi")"#,
+                expected_debug: r#""hi""#,
+            },
+        ]),
+        // option<u32>: 2 flat slots ([disc, value]) → result side
+        // hits retptr. Run both arms — `some` exercises the disc=1
+        // path of the parent Option cell + the inner cell's lift;
+        // `none` exercises disc=0 and pins the canonical-ABI
+        // zero-fill assumption (the inner cell is still emitted but
+        // never followed).
+        Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: true,
+        },
+        Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: false,
+        },
+        // result<u32, u32>: 2 flat slots (disc + joined value) → result
+        // side hits retptr. Both arms have matching widths so no
+        // joined-flat widening (Phase 1 only handles the no-bitcast
+        // case). Run both arms — `ok` exercises disc=0 + ok-arm child
+        // emit; `err` exercises disc=1.
+        Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: true,
+        },
+        Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: false,
+        },
+        // `own<cat>` — exercises `Cell::Handle` on both sides; id is
+        // the canonical-ABI handle bits zero-extended.
+        Shape::ResourceOwn {
+            wit_name: "cat",
+            rust_name: "Cat",
+        },
+        // `borrow<cat>` — same lift; borrow can't be returned, so the
+        // after-hook sees `result: option::none`.
+        Shape::ResourceBorrow {
+            wit_name: "cat",
+            rust_name: "Cat",
+        },
+        // Single-element list keeps the harness's `expected_debug`
+        // predictable (`Shape::List::rust_literal` produces
+        // `vec![<one literal>]`). Each element type below picks a
+        // distinct lift path: u32 (single i32 slot, zero-extend),
+        // bool (1-byte elem stride, fast path), string (two-slot
+        // element capturing into contiguous elem_flat_locals), enum
+        // (side-table-indexed element).
+        Shape::List(Box::new(Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "42u32",
+            expected_debug: "42",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "bool",
+            wit_type: "bool",
+            rust_ty: "bool",
+            rust_literal: "true",
+            expected_debug: "true",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "string",
+            wit_type: "string",
+            rust_ty: "String",
+            rust_literal: r#"String::from("hi")"#,
+            expected_debug: r#""hi""#,
+        })),
+        Shape::List(Box::new(Shape::Enum {
+            wit_name: "color",
+            rust_name: "Color",
+            cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+            selected: 1,
+        })),
+        // list<char>: per-iteration utf-8 scratch via cabi_realloc'd
+        // buffer + Prestaged CharScratch + per-iter scratch-addr stage.
+        // Three entries to fire each utf-8 branch in the per-iteration
+        // encoder (1B / 3B / 4B), matching the static-char coverage.
+        Shape::List(Box::new(Shape::Primitive {
+            name: "char_ascii",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'x'",
+            expected_debug: "'x'",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "char_bmp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'中'",
+            expected_debug: "'中'",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "char_smp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'🎉'",
+            expected_debug: "'🎉'",
+        })),
+        // list<option<u32>> + list<result<u32, u32>>: multi-cell list
+        // elements. Per-iteration `elem_cell_base` stages runtime
+        // child cell-array indices into the cell payload. Exercises
+        // both `Some(...)` (active-arm child) and `None`/unit-arm
+        // (no-payload) branches via the harness's single-element
+        // list rendering.
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: true,
+        })),
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: false,
+        })),
+        // list<option<string>>: two-flat-slot Text payload inside a
+        // list-element option — exercises `elem_cell_base + 0`
+        // resolution (the `Local(base)` short-circuit in
+        // stage_child_idx_source) AND the option's inner Text read
+        // from list-element flat slots.
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("hi")"#,
+                expected_debug: r#""hi""#,
+            }),
+            is_some: true,
+        })),
+        Shape::List(Box::new(Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: true,
+        })),
+        Shape::List(Box::new(Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: false,
+        })),
+        // list<result<_, string>>: unit ok-arm exercises the
+        // skip-staging path for unit Result arms.
+        Shape::List(Box::new(Shape::Result_ {
+            ok: None,
+            err: Some(Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("oops")"#,
+                expected_debug: r#""oops""#,
+            })),
+            is_ok: false,
+        })),
+        // list<tuple<u32, string>>: multi-cell tuple element.
+        // Per-iteration tuple-idx buffer slot holds the resolved
+        // child cell-array indices; the cell payload reads it back.
+        Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            },
+            Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("hi")"#,
+                expected_debug: r#""hi""#,
+            },
+        ]))),
+        // list<tuple<u32, tuple<s32, s32>>>: nested tuple element —
+        // two TupleOf cells per iteration, distinct offset_in_elem
+        // slots in the per-call tuple-idx buffer. Pins the
+        // multi-TupleOf cursor under wasmtime.
+        Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "7u32",
+                expected_debug: "7",
+            },
+            Shape::Tuple(vec![
+                Shape::Primitive {
+                    name: "s32",
+                    wit_type: "s32",
+                    rust_ty: "i32",
+                    rust_literal: "-3i32",
+                    expected_debug: "-3",
+                },
+                Shape::Primitive {
+                    name: "s32",
+                    wit_type: "s32",
+                    rust_ty: "i32",
+                    rust_literal: "9i32",
+                    expected_debug: "9",
+                },
+            ]),
+        ]))),
+    ]
+}
+
 // ─── Arbitrary-driven generator (used by test_fuzz) ─
 //
 // Generates `Shape` trees from an `arbitrary::Unstructured`. Records
@@ -1200,12 +1785,10 @@ fn gen_shape(
     let kind: u8 = u.int_in_range(0..=max_kind)?;
     match kind {
         0 => pick_primitive(u),
-        1 => Ok(Shape::Option(Box::new(gen_shape(
-            u,
-            max_depth - 1,
-            allow_nominal,
-            counters,
-        )?))),
+        1 => Ok(Shape::Option {
+            inner: Box::new(gen_shape(u, max_depth - 1, allow_nominal, counters)?),
+            is_some: u.arbitrary()?,
+        }),
         2 => Ok(Shape::List(Box::new(gen_shape(
             u,
             max_depth - 1,
@@ -1603,20 +2186,32 @@ const MIDDLEWARE_LIB_RS: &str = r#"mod bindings {
     });
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
 use bindings::splicer::common::types::CallId;
+
+// Per-instance running id. on_call asserts each id is `prev + 1`;
+// on_return asserts it matches the most-recent on_call id. Together
+// these pin the contract: monotonic, +1 per call, paired across the
+// hook boundary.
+static LAST_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Mdl;
 
 impl BeforeGuest for Mdl {
     async fn on_call(call: CallId) {
+        let prev = LAST_ID.swap(call.id, Ordering::SeqCst);
+        assert_eq!(call.id, prev + 1, "call.id should be prev + 1 (got {}, prev {prev})", call.id);
         println!("mdl: before {}#{}", call.interface_name, call.function_name);
     }
 }
 
 impl AfterGuest for Mdl {
     async fn on_return(call: CallId) {
+        let last = LAST_ID.load(Ordering::SeqCst);
+        assert_eq!(call.id, last, "on_return id should match the prior on_call (last={last})");
         println!("mdl: after {}#{}", call.interface_name, call.function_name);
     }
 }
@@ -1634,6 +2229,171 @@ world mdl {
 
 const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
 const MIDDLEWARE_COMMON_DEP_WIT: &str = include_str!("../wit/common/world.wit");
+
+// ─── Tier-2 middleware fixture (used by `test_tier2_smoke`) ───────
+//
+// Same crate skeleton as the tier-1 middleware above, but exports
+// `splicer:tier2/before`. The middleware dumps each `Field` it
+// observes — name + the cell at its tree root, formatted in a
+// stable shape (e.g. `x: integer(42)`) so the test can pin both
+// dispatch and lift correctness with a substring match.
+
+const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
+    wit_bindgen::generate!({
+        world: "tier2-mdl",
+        async: true,
+        generate_all
+    });
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use bindings::exports::splicer::tier2::after::Guest as AfterGuest;
+use bindings::exports::splicer::tier2::before::Guest as BeforeGuest;
+use bindings::splicer::common::types::{CallId, Cell, Field, FieldTree};
+
+// See tier-1 middleware for the invariants this enforces.
+static LAST_ID: AtomicU64 = AtomicU64::new(0);
+
+struct Mdl;
+
+fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
+    let cell = tree.cells.get(idx as usize).expect("cell idx in range");
+    match cell {
+        Cell::Bool(v) => format!("bool({v})"),
+        Cell::Integer(v) => format!("integer({v})"),
+        Cell::Floating(v) => format!("floating({v})"),
+        Cell::Text(s) => format!("text({s:?})"),
+        Cell::Bytes(b) => format!("bytes(len={})", b.len()),
+        Cell::EnumCase(side_idx) => {
+            let info = tree
+                .enum_infos
+                .get(*side_idx as usize)
+                .expect("enum_infos idx in range");
+            format!("enum({}::{})", info.type_name, info.case_name)
+        }
+        Cell::FlagsSet(side_idx) => {
+            let info = tree
+                .flags_infos
+                .get(*side_idx as usize)
+                .expect("flags_infos idx in range");
+            format!("flags({} {{ {} }})", info.type_name, info.set_flags.join(", "))
+        }
+        Cell::VariantCase(side_idx) => {
+            let info = tree
+                .variant_infos
+                .get(*side_idx as usize)
+                .expect("variant_infos idx in range");
+            let payload = match info.payload {
+                Some(child_idx) => format!("some({})", fmt_cell(tree, child_idx)),
+                None => "none".to_string(),
+            };
+            format!("variant-case({}::{}, {})", info.type_name, info.case_name, payload)
+        }
+        Cell::RecordOf(side_idx) => {
+            let info = tree
+                .record_infos
+                .get(*side_idx as usize)
+                .expect("record_infos idx in range");
+            let rendered: Vec<String> = info
+                .fields
+                .iter()
+                .map(|(name, child_idx)| format!("{name}: {}", fmt_cell(tree, *child_idx)))
+                .collect();
+            format!("record({} {{ {} }})", info.type_name, rendered.join(", "))
+        }
+        Cell::TupleOf(child_indices) => {
+            let rendered: Vec<String> = child_indices
+                .iter()
+                .map(|child_idx| fmt_cell(tree, *child_idx))
+                .collect();
+            format!("tuple({})", rendered.join(", "))
+        }
+        Cell::ListOf(child_indices) => {
+            let rendered: Vec<String> = child_indices
+                .iter()
+                .map(|child_idx| fmt_cell(tree, *child_idx))
+                .collect();
+            format!("list({})", rendered.join(", "))
+        }
+        Cell::OptionSome(child_idx) => {
+            format!("option-some({})", fmt_cell(tree, *child_idx))
+        }
+        Cell::OptionNone => "option-none".to_string(),
+        Cell::ResultOk(payload) => fmt_result_arm(tree, "result-ok", payload),
+        Cell::ResultErr(payload) => fmt_result_arm(tree, "result-err", payload),
+        Cell::ResourceHandle(side_idx) => fmt_handle(tree, "resource-handle", *side_idx),
+        Cell::StreamHandle(side_idx) => fmt_handle(tree, "stream-handle", *side_idx),
+        Cell::FutureHandle(side_idx) => fmt_handle(tree, "future-handle", *side_idx),
+        other => format!("other({other:?})"),
+    }
+}
+
+fn fmt_handle(tree: &FieldTree, kind: &str, side_idx: u32) -> String {
+    let info = tree
+        .handle_infos
+        .get(side_idx as usize)
+        .expect("handle_infos idx in range");
+    format!("{kind}({}, id={})", info.type_name, info.id)
+}
+
+fn fmt_result_arm(tree: &FieldTree, arm: &str, payload: &Option<u32>) -> String {
+    match payload {
+        Some(idx) => format!("{arm}(some({}))", fmt_cell(tree, *idx)),
+        None => format!("{arm}(none)"),
+    }
+}
+
+fn fmt_field(f: &Field) -> String {
+    format!("{}: {}", f.name, fmt_cell(&f.tree, f.tree.root))
+}
+
+fn fmt_result(result: &Option<FieldTree>) -> String {
+    match result {
+        None => "none".to_string(),
+        Some(tree) => fmt_cell(tree, tree.root),
+    }
+}
+
+impl BeforeGuest for Mdl {
+    async fn on_call(call: CallId, args: Vec<Field>) {
+        let prev = LAST_ID.swap(call.id, Ordering::SeqCst);
+        assert_eq!(call.id, prev + 1, "call.id should be prev + 1 (got {}, prev {prev})", call.id);
+        let rendered: Vec<String> = args.iter().map(fmt_field).collect();
+        println!(
+            "mdl: tier2-on-call {}#{} args=[{}]",
+            call.interface_name,
+            call.function_name,
+            rendered.join(", "),
+        );
+    }
+}
+
+impl AfterGuest for Mdl {
+    async fn on_return(call: CallId, result: Option<FieldTree>) {
+        let last = LAST_ID.load(Ordering::SeqCst);
+        assert_eq!(call.id, last, "on_return id should match the prior on_call (last={last})");
+        println!(
+            "mdl: tier2-on-return {}#{} result={}",
+            call.interface_name,
+            call.function_name,
+            fmt_result(&result),
+        );
+    }
+}
+
+bindings::export!(Mdl with_types_in bindings);
+"#;
+
+const MIDDLEWARE_TIER2_WORLD_WIT: &str = r#"package my:middleware-tier2@1.0.0;
+
+world tier2-mdl {
+    export splicer:tier2/before@0.1.0;
+    export splicer:tier2/after@0.1.0;
+}
+"#;
+
+const MIDDLEWARE_TIER2_DEP_WIT: &str = include_str!("../wit/tier2/world.wit");
 
 /// Placeholder replaced at call time with the absolute path of the
 /// middleware component. The YAML must reference an absolute path
@@ -1949,11 +2709,11 @@ fn consumer_shape_dep_wit(shape: &Shape, mode: AsyncMode) -> String {
 
 /// Loop the whole pipeline over the canned shape list, reusing the
 /// cargo workspace for incremental compilation. Default set is
-/// everything in `canned_shapes()`; override via
+/// everything in `tier1_shapes()`; override via
 /// `SPLICER_RUNTIME_SHAPES=name1,name2`.
 #[test]
 #[ignore]
-fn test_canned() {
+fn test_tier1_canned() {
     require_splicer_toolchain();
 
     let tmp = tempfile::tempdir().expect("mktempdir");
@@ -1971,7 +2731,7 @@ fn test_canned() {
     assert!(
         !shapes.is_empty(),
         "SPLICER_RUNTIME_SHAPES selected no shapes; known: {}",
-        canned_shapes()
+        tier1_shapes()
             .iter()
             .map(Shape::name)
             .collect::<Vec<_>>()
@@ -2013,6 +2773,352 @@ fn test_canned() {
             eprintln!("  {name}: {msg}");
         }
         panic!("{} of the shape pipelines failed", failures.len());
+    }
+}
+
+/// Tier-2 canned-primitive sweep. For each shape in `tier2_shapes()`,
+/// drive the full pipeline end-to-end and assert the middleware sees
+/// the cell variant + value the lift codegen should produce. Pins both
+/// the discriminant (cell-variant case) and the widened payload
+/// (i64-extend for integers, f64-promote for `f32`, ptr/len readback
+/// for `string`).
+///
+/// Coverage is the explicit `tier2_shapes()` list — grep that function
+/// to see exactly which kinds are exercised. Override the shape list
+/// with `SPLICER_RUNTIME_SHAPES=name1,name2`.
+#[test]
+#[ignore]
+fn test_tier2_canned() {
+    require_splicer_toolchain();
+    let workspace = scaffold_tier2_workspace();
+
+    let shapes = match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
+        None => tier2_shapes(),
+        Some(csv) => {
+            let wanted: Vec<String> = csv.split(',').map(|s| s.trim().to_string()).collect();
+            tier2_shapes()
+                .into_iter()
+                .filter(|s| wanted.iter().any(|w| *w == s.name()))
+                .collect()
+        }
+    };
+    assert!(
+        !shapes.is_empty(),
+        "tier-2 canned: no shapes selected (try SPLICER_RUNTIME_SHAPES=u32,bool,…)"
+    );
+
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for (i, shape) in shapes.iter().enumerate() {
+        let shape_name = shape.name();
+        eprintln!(
+            "\n=== [tier2 {}/{}] shape: {} ===",
+            i + 1,
+            shapes.len(),
+            shape_name
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let captured = run_tier2_pipeline_for_shape(&workspace, shape);
+            let expected_args = predict_tier2_args_marker(shape)
+                .expect("every tier2_shapes() entry must be renderable by predict_tier2_arg_inner");
+            // `expected_args` already includes the `args=[...]` wrapping.
+            let expected_marker =
+                format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo {expected_args}");
+            assert!(
+                captured.contains(&expected_marker),
+                "tier-2 on-call rendered the wrong cell for `{shape_name}` — \
+                 expected substring `{expected_marker}`\n--- trace ---\n{captured}",
+            );
+            // `foo` echoes the value back, so the result side renders
+            // through the same predictor as the args side.
+            let expected_result_inner = predict_tier2_result_marker(shape)
+                .expect("every tier2_shapes() entry must be renderable by predict_tier2_arg_inner");
+            let expected_return_marker = format!(
+                "mdl: tier2-on-return {TARGET_INTERFACE}#foo result={expected_result_inner}"
+            );
+            assert!(
+                captured.contains(&expected_return_marker),
+                "tier-2 on-return rendered the wrong cell for `{shape_name}` — \
+                 expected substring `{expected_return_marker}`\n--- trace ---\n{captured}",
+            );
+            // Sanity: the wrapped call still threads through.
+            let expected_got = format!("consumer: got {}", shape.expected_debug());
+            assert!(
+                captured.contains(&expected_got),
+                "[{shape_name}] consumer didn't see `{expected_got}`\n--- trace ---\n{captured}",
+            );
+        }));
+        if let Err(panic) = result {
+            failures.push((shape_name.to_string(), panic_msg(&*panic)));
+        }
+    }
+    if !failures.is_empty() {
+        eprintln!("\n=== tier-2 canned failures ===");
+        for (name, msg) in &failures {
+            eprintln!("  {name}: {msg}");
+        }
+        panic!("{} of the tier-2 shape pipelines failed", failures.len());
+    }
+}
+
+/// Tier-2 workspace scaffolding shared by `test_tier2_smoke` and
+/// `test_tier2_canned_primitives`. Builds the cargo workspace once;
+/// per-shape calls below reuse the same provider/consumer/middleware
+/// crates and only rewrite the per-shape WIT + lib.rs files.
+struct Tier2Workspace {
+    _tmp: Option<tempfile::TempDir>,
+    root: PathBuf,
+}
+
+fn scaffold_tier2_workspace() -> Tier2Workspace {
+    let tmp = tempfile::tempdir().expect("mktempdir");
+    let root_buf = tmp.path().to_path_buf();
+    let _kept = std::env::var("SPLICER_KEEP_TMPDIR").is_ok();
+    let tmp_to_keep = if _kept {
+        eprintln!("(keeping tmpdir: {})", root_buf.display());
+        None
+    } else {
+        Some(tmp)
+    };
+    let root = root_buf.as_path();
+    eprintln!("tier2: work dir = {}", root.display());
+
+    std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML).expect("workspace toml");
+    write_crate(
+        root,
+        "provider",
+        PROVIDER_CARGO_TOML,
+        "// placeholder\n",
+        &[],
+    )
+    .expect("provider scaffold");
+    write_crate(
+        root,
+        "consumer",
+        CONSUMER_CARGO_TOML,
+        "// placeholder\n",
+        &[],
+    )
+    .expect("consumer scaffold");
+    write_crate(
+        root,
+        "middleware",
+        MIDDLEWARE_CARGO_TOML,
+        MIDDLEWARE_TIER2_LIB_RS,
+        &[
+            ("world.wit", MIDDLEWARE_TIER2_WORLD_WIT),
+            (
+                "deps/splicer-tier2-0.1.0/package.wit",
+                MIDDLEWARE_TIER2_DEP_WIT,
+            ),
+            (
+                "deps/splicer-common-0.1.0/package.wit",
+                MIDDLEWARE_COMMON_DEP_WIT,
+            ),
+        ],
+    )
+    .expect("tier-2 middleware scaffold");
+
+    Tier2Workspace {
+        _tmp: tmp_to_keep,
+        root: root_buf,
+    }
+}
+
+/// Run the full Before-pipeline for one shape under a tier-2
+/// middleware. Returns the captured stdout/stderr trace from
+/// wasmtime so callers can pin whatever markers they need.
+fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> String {
+    let root = workspace.root.as_path();
+    let mode = AsyncMode::Sync;
+    write_per_shape_files(root, shape, mode).expect("write shape files");
+
+    run_quiet(
+        Command::new("cargo")
+            .args(["build", "--target", "wasm32-wasip1", "--workspace"])
+            .current_dir(root),
+        "cargo build",
+    );
+
+    let adapter =
+        repo_root().join("tests/component-interposition/wasi_snapshot_preview1.reactor.wasm");
+    assert!(
+        adapter.exists(),
+        "wasip1 reactor adapter missing at {}",
+        adapter.display()
+    );
+
+    let provider_comp = wrap_component(root, "provider", &adapter);
+    let consumer_comp = wrap_component(root, "consumer", &adapter);
+    let middleware_comp = wrap_component(root, "middleware", &adapter);
+
+    let final_path =
+        splice_before_and_compose(root, &provider_comp, &consumer_comp, &middleware_comp);
+    let bytes = std::fs::read(&final_path).expect("read final.wasm");
+
+    let mut validator = wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all());
+    validator
+        .validate_all(&bytes)
+        .expect("tier-2 spliced component should validate");
+
+    invoke_run(&bytes).expect("invoke run()")
+}
+
+/// Expected `args=[…]` substring matching `fmt_cell`'s rendering.
+/// Returns `None` for shapes `predict_tier2_arg_inner` doesn't render
+/// yet — callers iterate `tier2_shapes()`, so `None` becomes an
+/// `.expect` panic.
+///
+/// `args=[...]` lives in the returned string (not the caller) so
+/// handle shapes can omit the closing `]` past the runtime-varying
+/// `id`.
+fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
+    let inner = predict_tier2_arg_inner(shape)?;
+    let open_ended = matches!(
+        shape,
+        Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. }
+    );
+    if open_ended {
+        Some(format!("args=[x: {inner}"))
+    } else {
+        Some(format!("args=[x: {inner}]"))
+    }
+}
+
+/// Expected `result=…` substring. `foo` echoes the value, so the
+/// arg rendering applies — except top-level `borrow<T>`, whose
+/// signature drops the result (borrow can't be returned).
+fn predict_tier2_result_marker(shape: &Shape) -> Option<String> {
+    if matches!(shape, Shape::ResourceBorrow { .. }) {
+        return Some("none".to_string());
+    }
+    predict_tier2_arg_inner(shape)
+}
+
+/// Predict the substring `fmt_cell` produces for a single shape.
+/// Works recursively so record-field shapes (and, eventually, list
+/// elements / option payloads / variant cases) reuse the same
+/// per-shape mapping. Each primitive's value is derived from the
+/// shape's `expected_debug` so per-instance literal differences
+/// (e.g., a top-level `u32 = 42` vs. a record-field `u32 = 3`)
+/// don't fork the predictor.
+fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
+    match shape {
+        Shape::Primitive {
+            wit_type,
+            rust_literal,
+            expected_debug,
+            ..
+        } => match *wit_type {
+            "bool" => Some(format!("bool({expected_debug})")),
+            "u8" | "s8" | "u16" | "s16" | "u32" | "s32" | "u64" | "s64" => {
+                Some(format!("integer({expected_debug})"))
+            }
+            "f32" | "f64" => Some(format!("floating({expected_debug})")),
+            "string" => Some(format!("text({expected_debug})")),
+            // `char` lifts to `cell::text(<utf-8 bytes>)`. Strip the
+            // surrounding single quotes from the rust char literal
+            // (`'x'` → `x`) and Debug-format as a string to match
+            // `fmt_cell`'s `text({s:?})` rendering.
+            "char" => {
+                let inner = rust_literal.trim_start_matches('\'').trim_end_matches('\'');
+                Some(format!("text({inner:?})"))
+            }
+            _ => None,
+        },
+        Shape::Enum {
+            wit_name,
+            cases,
+            selected,
+            ..
+        } => {
+            let case = cases.get(*selected).map(|(c, _)| *c)?;
+            Some(format!("enum({wit_name}::{case})"))
+        }
+        Shape::Flags {
+            wit_name,
+            flags,
+            selected,
+            ..
+        } => {
+            // Bit-walk in declaration order matches the wrapper's
+            // emit_flags_runtime_fill loop: bits 0..N tested in order,
+            // set bits append to set_flags in that order.
+            let active: Vec<&str> = flags
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| (selected >> i) & 1 == 1)
+                .map(|(_, (wit_flag, _))| *wit_flag)
+                .collect();
+            Some(format!("flags({wit_name} {{ {} }})", active.join(", ")))
+        }
+        Shape::Variant {
+            wit_name,
+            cases,
+            selected,
+            ..
+        } => {
+            let case = cases.get(*selected)?;
+            let payload = match &case.payload {
+                Some(p) => format!("some({})", predict_tier2_arg_inner(p)?),
+                None => "none".to_string(),
+            };
+            Some(format!(
+                "variant-case({wit_name}::{}, {payload})",
+                case.wit_name
+            ))
+        }
+        Shape::Record {
+            wit_name, fields, ..
+        } => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(fname, fshape)| {
+                    let inner = predict_tier2_arg_inner(fshape)?;
+                    Some(format!("{fname}: {inner}"))
+                })
+                .collect::<Option<_>>()?;
+            Some(format!("record({wit_name} {{ {} }})", parts.join(", ")))
+        }
+        Shape::Tuple(elems) => {
+            let parts: Vec<String> = elems
+                .iter()
+                .map(predict_tier2_arg_inner)
+                .collect::<Option<_>>()?;
+            Some(format!("tuple({})", parts.join(", ")))
+        }
+        // Single-element list — `Shape::List::rust_literal` produces
+        // `vec![<one literal>]`, so the cell tree has one child cell.
+        Shape::List(inner) => {
+            let elem = predict_tier2_arg_inner(inner)?;
+            Some(format!("list({elem})"))
+        }
+        Shape::Option { inner, is_some } => {
+            if *is_some {
+                let inner_render = predict_tier2_arg_inner(inner)?;
+                Some(format!("option-some({inner_render})"))
+            } else {
+                Some("option-none".to_string())
+            }
+        }
+        // The active arm's `Some(<predict>)` follows the cell payload's
+        // inline `option<u32>`; an absent (unit) arm renders as `none`.
+        Shape::Result_ { ok, err, is_ok } => {
+            let (arm_name, arm_shape) = if *is_ok {
+                ("result-ok", ok)
+            } else {
+                ("result-err", err)
+            };
+            let payload_render = match arm_shape.as_ref() {
+                Some(s) => format!("some({})", predict_tier2_arg_inner(s)?),
+                None => "none".to_string(),
+            };
+            Some(format!("{arm_name}({payload_render})"))
+        }
+        // Anchor at the trailing comma; the runtime-varying `id`
+        // past it is matched permissively via `contains`.
+        Shape::ResourceOwn { wit_name, .. } | Shape::ResourceBorrow { wit_name, .. } => {
+            Some(format!("resource-handle({wit_name},"))
+        }
     }
 }
 
@@ -2149,10 +3255,10 @@ fn test_fuzz() {
 }
 
 /// Pick which shapes to run. Without the env var, the full
-/// `canned_shapes()`. With it, only shapes whose `name()` matches
+/// `tier1_shapes()`. With it, only shapes whose `name()` matches
 /// one of the comma-separated entries.
 fn select_shapes() -> Vec<Shape> {
-    let all = canned_shapes();
+    let all = tier1_shapes();
     match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
         None => all,
         Some(csv) => {

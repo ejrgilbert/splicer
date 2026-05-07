@@ -17,7 +17,8 @@ use wasmtime::component::Val;
 
 mod common;
 use common::{
-    assert_call_attrs, drive_call_cycle, expect_list, expect_record, expect_string, field, Host,
+    assert_call_attrs, drive_call_cycle, empty_span_context, expect_list, expect_record,
+    expect_string, field, Host,
 };
 
 const OTEL_LOGS: &str = "wasi:otel/logs@0.2.0-rc.2";
@@ -26,20 +27,6 @@ const OTEL_TRACING: &str = "wasi:otel/tracing@0.2.0-rc.2";
 #[derive(Default)]
 struct Capture {
     logs: Vec<Val>,
-}
-
-/// Empty `span-context` — all-zero ids, no flags, no state. Returned
-/// by the fake `outer-span-context` so the builtin sees "no host
-/// parent" and leaves trace-correlation fields unset on the emitted
-/// log record.
-fn empty_span_context() -> Val {
-    Val::Record(vec![
-        ("trace-id".into(), Val::String(String::new())),
-        ("span-id".into(), Val::String(String::new())),
-        ("trace-flags".into(), Val::Flags(vec![])),
-        ("is-remote".into(), Val::Bool(false)),
-        ("trace-state".into(), Val::List(vec![])),
-    ])
 }
 
 fn add_otel_logs_to_linker(linker: &mut wasmtime::component::Linker<Host<Capture>>) -> Result<()> {

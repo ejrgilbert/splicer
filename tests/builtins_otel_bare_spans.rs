@@ -16,8 +16,8 @@ use wasmtime::component::Val;
 
 mod common;
 use common::{
-    assert_call_attrs, drive_call_cycle, expect_list, expect_record, expect_string, expect_u32,
-    expect_u64, field, Host,
+    assert_call_attrs, drive_call_cycle, empty_span_context, expect_list, expect_record,
+    expect_string, expect_u32, expect_u64, field, Host,
 };
 
 const OTEL_TRACING: &str = "wasi:otel/tracing@0.2.0-rc.2";
@@ -26,19 +26,6 @@ const OTEL_TRACING: &str = "wasi:otel/tracing@0.2.0-rc.2";
 struct Capture {
     starts: Vec<Val>,
     ends: Vec<Val>,
-}
-
-/// Empty `span-context` — all-zero ids, no flags, no state. Returned
-/// by the fake `outer-span-context` so the component sees "no host
-/// parent" and mints a fresh trace-id rather than inheriting.
-fn empty_span_context() -> Val {
-    Val::Record(vec![
-        ("trace-id".into(), Val::String(String::new())),
-        ("span-id".into(), Val::String(String::new())),
-        ("trace-flags".into(), Val::Flags(vec![])),
-        ("is-remote".into(), Val::Bool(false)),
-        ("trace-state".into(), Val::List(vec![])),
-    ])
 }
 
 fn add_otel_tracing_to_linker(

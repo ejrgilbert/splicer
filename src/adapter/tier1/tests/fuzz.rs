@@ -31,13 +31,24 @@ const FUZZ_MAX_DEPTH: u32 = 2;
 /// Max failures echoed into the test output before truncating.
 const MAX_FAILURES_SHOWN: usize = 20;
 
-/// Async function whose params flatten to >`MAX_FLAT_ASYNC_PARAMS` (4)
-/// — canon-lower-async uses `indirect_params=true` (single params-ptr)
-/// but the wrapper export's flat shape doesn't, so we'd need
-/// `lower_to_memory` between them. Not yet implemented; assert we
-/// bail with a clear message rather than emit invalid wasm.
+// ── Tier 1: async indirect-params (lower_to_memory) ──────────────────
+//
+// Async funcs whose params flatten past `MAX_FLAT_ASYNC_PARAMS` (4)
+// canon-lower with `indirect_params = true` — the import takes a
+// single params-pointer, so the wrapper must lower its flat function
+// params into a memory-resident params record before the handler call.
+// See `docs/TODO/tier2-async-target-indirect-params.md` for the full
+// rationale; same fix applies to both tiers.
+//
+// Until primitive `lower_to_memory` lands these tests fail with the
+// existing bail. They define the goal: the all-u32 shape pins the
+// minimal indirect-params path; the mixed-primitives shape pins
+// store-width + canonical-ABI inter-field alignment math.
+
+/// Five `u32` params — flattens to 5 i32 slots → `indirect_params=true`
+/// on canon-lower-async. Smallest shape that forces the lowering.
 #[test]
-fn test_adapter_async_indirect_params_bails() {
+fn test_adapter_async_5_u32_params_validates() {
     let mut arena = TypeArena::default();
     let u32_id = arena.intern_val(ValueType::U32);
     let iface = make_iface(vec![(
@@ -49,21 +60,248 @@ fn test_adapter_async_indirect_params_bails() {
             vec![u32_id],
         ),
     )]);
-    let tmp = tempfile::tempdir().unwrap();
-    let split = synth_split("test:pkg/many@1.0.0", &iface, &arena, SplitKind::Consumer);
-    let err = generate_tier1_adapter(
-        "test-mdl",
+    let bytes = gen_adapter(
         "test:pkg/many@1.0.0",
-        &[],
-        tmp.path().to_str().unwrap(),
-        split.path().to_str().unwrap(),
-    )
-    .expect_err("async indirect-params should bail until lower_to_memory lands");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("not yet implemented") && msg.contains("MAX_FLAT_ASYNC_PARAMS"),
-        "bail should mention the limit and not-yet-implemented, got: {msg}"
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
     );
+    validate_component(&bytes);
+}
+
+/// Mixed primitive widths in indirect-params position — exercises
+/// `i32.store` / `i64.store` / `f32.store` / `f64.store` /
+/// `i32.store8` plus inter-field padding (`u32`→`u64` and `bool`→`char`
+/// transitions force alignment bumps).
+#[test]
+fn test_adapter_async_mixed_primitives_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let f32_id = arena.intern_val(ValueType::F32);
+    let f64_id = arena.intern_val(ValueType::F64);
+    let bool_id = arena.intern_val(ValueType::Bool);
+    let char_id = arena.intern_val(ValueType::Char);
+    let iface = make_iface(vec![(
+        "mixed",
+        sig(
+            true,
+            &["a", "b", "c", "d", "e", "f"],
+            vec![u32_id, u64_id, f32_id, f64_id, bool_id, char_id], // 6 slots
+            vec![u32_id],
+        ),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/mixed-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Record param `{ a..e: u32 }` flattens to 5 i32 slots → indirect-
+/// params. Exercises `RecordLower` as a no-op 1→N decomposition;
+/// the inner `u32` lifts drive the cursor.
+#[test]
+fn test_adapter_async_record_param_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let record = arena.intern_val(ValueType::Record(vec![
+        ("a".into(), u32_id),
+        ("b".into(), u32_id),
+        ("c".into(), u32_id),
+        ("d".into(), u32_id),
+        ("e".into(), u32_id),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([(
+            "many".to_string(),
+            sig(true, &["r"], vec![record], vec![u32_id]),
+        )]),
+        type_exports: BTreeMap::from([("rec5".to_string(), record)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/rec5-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Tuple param `tuple<u32, u64, f32, f64, bool>` flattens to 5 mixed
+/// slots → indirect-params. Exercises `TupleLower` plus the inter-
+/// field-alignment math from the mixed-primitive test applied
+/// inside an aggregate.
+#[test]
+fn test_adapter_async_tuple_param_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let f32_id = arena.intern_val(ValueType::F32);
+    let f64_id = arena.intern_val(ValueType::F64);
+    let bool_id = arena.intern_val(ValueType::Bool);
+    let tup = arena.intern_val(ValueType::Tuple(vec![
+        u32_id, u64_id, f32_id, f64_id, bool_id,
+    ]));
+    let iface = make_iface(vec![("many", sig(true, &["t"], vec![tup], vec![u32_id]))]);
+    let bytes = gen_adapter(
+        "test:pkg/tup5-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Enum / flags / record-with-flags-field — aggregates whose leaves
+/// are non-numeric primitives. Pins `EnumLower` and `FlagsLower`
+/// emit shape end-to-end.
+#[test]
+fn test_adapter_async_enum_flags_record_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let color = arena.intern_val(ValueType::Enum(vec![
+        "red".into(),
+        "green".into(),
+        "blue".into(),
+    ]));
+    let perms = arena.intern_val(ValueType::Flags(vec![
+        "read".into(),
+        "write".into(),
+        "exec".into(),
+    ]));
+    // Record with mixed leaf kinds; flat = enum(i32) + flags(i32) +
+    // u32 + u32 + u32 = 5 i32 slots → indirect-params.
+    let record = arena.intern_val(ValueType::Record(vec![
+        ("c".into(), color),
+        ("f".into(), perms),
+        ("a".into(), u32_id),
+        ("b".into(), u32_id),
+        ("d".into(), u32_id),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([(
+            "many".to_string(),
+            sig(true, &["r"], vec![record], vec![u32_id]),
+        )]),
+        type_exports: BTreeMap::from([
+            ("color".to_string(), color),
+            ("perms".to_string(), perms),
+            ("rec5".to_string(), record),
+        ]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/cfr-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// `list<T>` / `string` params in indirect-params position — both
+/// flatten to (ptr, len) pairs; our wrapper passes them through
+/// unchanged into the params record.
+#[test]
+fn test_adapter_async_string_list_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let string_id = arena.intern_val(ValueType::String);
+    let list_u32 = arena.intern_val(ValueType::List(u32_id));
+    // string(2) + list(2) + 3×u32 = 7 flat slots → indirect-params.
+    let iface = make_iface(vec![(
+        "many",
+        sig(
+            true,
+            &["s", "l", "a", "b", "c"],
+            vec![string_id, list_u32, u32_id, u32_id, u32_id],
+            vec![u32_id],
+        ),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/strlst-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// `list<u32, 4>` (fixed-length) flattens to 4 i32 slots inlined.
+/// Exercises `FixedLengthListLowerToMemory`'s per-iter block replay
+/// with cursor-shift rewrite.
+#[test]
+fn test_adapter_async_fixed_list_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let fsl = arena.intern_val(ValueType::FixedSizeList(u32_id, 4));
+    // 4 fixed-list slots + 2 u32 = 6 flat slots → indirect-params.
+    let iface = make_iface(vec![(
+        "many",
+        sig(
+            true,
+            &["fl", "a", "b"],
+            vec![fsl, u32_id, u32_id],
+            vec![u32_id],
+        ),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/fl-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Variant / option / result params — the dispatch path. Each kind
+/// exercises the disc-read + br_table + per-arm cursor rewrite.
+#[test]
+fn test_adapter_async_variant_option_result_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let opt_u32 = arena.intern_val(ValueType::Option(u32_id));
+    let res = arena.intern_val(ValueType::Result {
+        ok: Some(u32_id),
+        err: Some(u64_id),
+    });
+    let either = arena.intern_val(ValueType::Variant(vec![
+        ("left".into(), Some(u32_id)),
+        ("right".into(), Some(u64_id)),
+        ("neither".into(), None),
+    ]));
+    // option(2) + result(2 — 1 disc + 1 i64 joined) + variant(2) +
+    // 2×u32 = 8 flat → indirect-params.
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([(
+            "many".to_string(),
+            sig(
+                true,
+                &["o", "r", "v", "a", "b"],
+                vec![opt_u32, res, either, u32_id, u32_id],
+                vec![u32_id],
+            ),
+        )]),
+        type_exports: BTreeMap::from([("either".to_string(), either)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/disp-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
 }
 
 #[test]

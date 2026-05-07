@@ -8,7 +8,7 @@
 //! (the wasi:http/handler shape), multiple functions per interface,
 //! before-only / after-only / blocking, and no-hooks.
 
-use super::*;
+use crate::adapter::generate_tier1_adapter;
 use cviz::model::{
     FuncSignature, InstanceInterface, InterfaceType, TypeArena, ValueType, ValueTypeId,
 };
@@ -618,6 +618,49 @@ fn sig(
     }
 }
 
+/// The hooks every test would otherwise pass. Spelled out as a constant
+/// so the four tests that exercise other hook arrangements
+/// (before-only, after-only, blocking, no-hooks) read as deliberate.
+const DEFAULT_HOOKS: &[&str] = &["splicer:tier1/before", "splicer:tier1/after"];
+
+/// Generate the adapter and validate the resulting bytes — the pairing
+/// every end-to-end test does. Returns the bytes so callers that need
+/// to do additional binary inspection (e.g. searching for export names)
+/// can keep going.
+fn gen_and_validate(
+    target: &str,
+    iface: &InterfaceType,
+    arena: &TypeArena,
+    kind: SplitKind,
+) -> Vec<u8> {
+    gen_and_validate_with(target, DEFAULT_HOOKS, iface, arena, kind)
+}
+
+/// `gen_and_validate` for the few tests that need a non-default hook
+/// arrangement.
+fn gen_and_validate_with(
+    target: &str,
+    hooks: &[&str],
+    iface: &InterfaceType,
+    arena: &TypeArena,
+    kind: SplitKind,
+) -> Vec<u8> {
+    let bytes = gen_adapter(target, hooks, iface, arena, kind);
+    validate_component(&bytes);
+    bytes
+}
+
+/// An async, no-param `get` function returning `ty`, with `ty` named in
+/// `type_exports` as `export_name`. Mirrors how real WIT surfaces a
+/// named compound: the type appears once in the function signature and
+/// once as a named export of the interface.
+fn named_async_result_iface(export_name: &str, ty: ValueTypeId) -> InterfaceType {
+    InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![ty]))]),
+        type_exports: BTreeMap::from([(export_name.to_string(), ty)]),
+    })
+}
+
 // ── Tier 1: sync primitives ──────────────────────────────────────────
 
 #[test]
@@ -628,14 +671,7 @@ fn test_adapter_sync_primitives() {
         "add",
         sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
     )]);
-    let bytes = gen_adapter(
-        "test:pkg/adder@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/adder@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 // Multi-function sync-primitives interface — exercises the new emit
@@ -651,14 +687,7 @@ fn test_adapter_sync_multi_func_primitives() {
         ("count", sig(false, &[], vec![], vec![u32_])),
         ("noop", sig(false, &["x"], vec![s32], vec![])),
     ]);
-    let bytes = gen_adapter(
-        "test:pkg/multi@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/multi@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 // ── Tier 1: sync string return (retptr pattern) ─────────────────────
@@ -668,14 +697,12 @@ fn test_adapter_sync_string_return() {
     let mut arena = TypeArena::default();
     let string = arena.intern_val(ValueType::String);
     let iface = make_iface(vec![("get-msg", sig(false, &[], vec![], vec![string]))]);
-    let bytes = gen_adapter(
+    gen_and_validate(
         "test:pkg/messenger@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: sync string param + string return ───────────────────────
@@ -688,14 +715,7 @@ fn test_adapter_sync_string_roundtrip() {
         "echo",
         sig(false, &["input"], vec![string], vec![string]),
     )]);
-    let bytes = gen_adapter(
-        "test:pkg/echo@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/echo@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 // ── Tier 1: async string return ──────────────────────────────────────
@@ -705,14 +725,12 @@ fn test_adapter_async_string_return() {
     let mut arena = TypeArena::default();
     let string = arena.intern_val(ValueType::String);
     let iface = make_iface(vec![("get-msg", sig(true, &[], vec![], vec![string]))]);
-    let bytes = gen_adapter(
+    gen_and_validate(
         "test:pkg/messenger@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: async void with string param ─────────────────────────────
@@ -722,14 +740,12 @@ fn test_adapter_async_void_string() {
     let mut arena = TypeArena::default();
     let string = arena.intern_val(ValueType::String);
     let iface = make_iface(vec![("print", sig(true, &["msg"], vec![string], vec![]))]);
-    let bytes = gen_adapter(
+    gen_and_validate(
         "test:pkg/printer@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 /// Build an HTTP-handler-shape interface matching the WAT emitted by
@@ -779,14 +795,12 @@ fn build_http_handler_iface(arena: &mut TypeArena) -> InterfaceType {
 fn test_adapter_resource_handler() {
     let mut arena = TypeArena::default();
     let iface = build_http_handler_iface(&mut arena);
-    let bytes = gen_adapter(
+    gen_and_validate(
         "wasi:http/handler@0.3.0-rc-2026-01-06",
-        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: list<T> (needs_realloc detection) ────────────────────────
@@ -805,14 +819,7 @@ fn test_adapter_list_param_sync() {
         "sum",
         sig(false, &["xs"], vec![list_u32], vec![u32_id]),
     )]);
-    let bytes = gen_adapter(
-        "test:pkg/summer@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/summer@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 /// List-as-result path: the canon lift (export side) needs the
@@ -826,14 +833,7 @@ fn test_adapter_list_result_sync() {
         "range",
         sig(false, &["n"], vec![u32_id], vec![list_u32]),
     )]);
-    let bytes = gen_adapter(
-        "test:pkg/ranger@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/ranger@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 /// Fixed-size-list param — `list<T, N>` must flatten to `N × flat(T)`
@@ -848,14 +848,7 @@ fn test_adapter_fixed_size_list_param_sync() {
     let u32_id = arena.intern_val(ValueType::U32);
     let fsl = arena.intern_val(ValueType::FixedSizeList(u32_id, 4));
     let iface = make_iface(vec![("take", sig(false, &["buf"], vec![fsl], vec![]))]);
-    let bytes = gen_adapter(
-        "test:pkg/taker@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/taker@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 /// Async path with a list parameter — exercises the list-detection
@@ -870,14 +863,12 @@ fn test_adapter_list_param_async() {
         "process",
         sig(true, &["xs"], vec![list_u32], vec![]),
     )]);
-    let bytes = gen_adapter(
+    gen_and_validate(
         "test:pkg/processor@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: subword-aligned shapes (canonical-ABI correctness) ───────
@@ -897,14 +888,7 @@ fn test_adapter_option_u8_async_result() {
     let u8_id = arena.intern_val(ValueType::U8);
     let opt_u8 = arena.intern_val(ValueType::Option(u8_id));
     let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![opt_u8]))]);
-    let bytes = gen_adapter(
-        "test:pkg/get@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/get@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 #[test]
@@ -913,14 +897,7 @@ fn test_adapter_option_u16_async_result() {
     let u16_id = arena.intern_val(ValueType::U16);
     let opt_u16 = arena.intern_val(ValueType::Option(u16_id));
     let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![opt_u16]))]);
-    let bytes = gen_adapter(
-        "test:pkg/get@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/get@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 #[test]
@@ -932,14 +909,7 @@ fn test_adapter_result_u8_u8_async_result() {
         err: Some(u8_id),
     });
     let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![result]))]);
-    let bytes = gen_adapter(
-        "test:pkg/get@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/get@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 /// Record with subword fields as an async result — exercises the
@@ -958,18 +928,8 @@ fn test_adapter_record_with_subword_fields_async_result() {
         ("count".into(), u32_id),
         ("tag".into(), u16_id),
     ]));
-    let iface = InterfaceType::Instance(InstanceInterface {
-        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![record]))]),
-        type_exports: BTreeMap::from([("my-record".to_string(), record)]),
-    });
-    let bytes = gen_adapter(
-        "test:pkg/get@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    let iface = named_async_result_iface("my-record", record);
+    gen_and_validate("test:pkg/get@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 /// Enum as an async result — same pattern: enum is named in
@@ -982,18 +942,8 @@ fn test_adapter_enum_async_result() {
         "green".into(),
         "blue".into(),
     ]));
-    let iface = InterfaceType::Instance(InstanceInterface {
-        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![en]))]),
-        type_exports: BTreeMap::from([("color".to_string(), en)]),
-    });
-    let bytes = gen_adapter(
-        "test:pkg/get@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    let iface = named_async_result_iface("color", en);
+    gen_and_validate("test:pkg/get@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 // ── Tier 1: shape-matrix coverage ────────────────────────────────────
@@ -1022,18 +972,8 @@ fn test_adapter_mixed_alignment_record_async_result() {
         ("c".into(), u16_id),
         ("d".into(), u64_id),
     ]));
-    let iface = InterfaceType::Instance(InstanceInterface {
-        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![record]))]),
-        type_exports: BTreeMap::from([("mixed".to_string(), record)]),
-    });
-    let bytes = gen_adapter(
-        "test:pkg/mixed@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    let iface = named_async_result_iface("mixed", record);
+    gen_and_validate("test:pkg/mixed@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 /// Variant with numerically heterogeneous arms: `u8` / `u64` / `f64`
@@ -1052,18 +992,13 @@ fn test_adapter_heterogeneous_numeric_variant_async_result() {
         ("y".into(), Some(u64_id)),
         ("z".into(), Some(f64_id)),
     ]));
-    let iface = InterfaceType::Instance(InstanceInterface {
-        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![v]))]),
-        type_exports: BTreeMap::from([("mixed-v".to_string(), v)]),
-    });
-    let bytes = gen_adapter(
+    let iface = named_async_result_iface("mixed-v", v);
+    gen_and_validate(
         "test:pkg/mixed-v@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 /// Build, generate, and validate an async-result adapter whose result
@@ -1073,18 +1008,8 @@ fn gen_flags_adapter(n: usize) {
     let mut arena = TypeArena::default();
     let names: Vec<String> = (0..n).map(|i| format!("f{i}")).collect();
     let flags = arena.intern_val(ValueType::Flags(names));
-    let iface = InterfaceType::Instance(InstanceInterface {
-        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![flags]))]),
-        type_exports: BTreeMap::from([("fs".to_string(), flags)]),
-    });
-    let bytes = gen_adapter(
-        "test:pkg/fs@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    let iface = named_async_result_iface("fs", flags);
+    gen_and_validate("test:pkg/fs@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 // Flags storage widths per the canonical ABI:
@@ -1128,18 +1053,8 @@ fn test_adapter_variant_over_256_cases_async_result() {
     let cases: Vec<(String, Option<ValueTypeId>)> =
         (0..300).map(|i| (format!("c{i:03}"), None)).collect();
     let v = arena.intern_val(ValueType::Variant(cases));
-    let iface = InterfaceType::Instance(InstanceInterface {
-        functions: BTreeMap::from([("get".to_string(), sig(true, &[], vec![], vec![v]))]),
-        type_exports: BTreeMap::from([("big-v".to_string(), v)]),
-    });
-    let bytes = gen_adapter(
-        "test:pkg/big-v@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    let iface = named_async_result_iface("big-v", v);
+    gen_and_validate("test:pkg/big-v@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 // ── Tier 1: multiple functions ───────────────────────────────────────
@@ -1154,14 +1069,7 @@ fn test_adapter_multi_func() {
         ("print", sig(true, &["msg"], vec![string], vec![])),
         ("get-value", sig(false, &[], vec![], vec![s32])),
     ]);
-    let bytes = gen_adapter(
-        "test:pkg/mixed@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/mixed@1.0.0", &iface, &arena, SplitKind::Consumer);
 }
 
 // ── Tier 1: real-world multi-function + named-types shape ──────────
@@ -1246,14 +1154,7 @@ fn build_nebula_orders_iface(arena: &mut TypeArena) -> InterfaceType {
 fn test_adapter_nebula_orders_shape() {
     let mut arena = TypeArena::default();
     let iface = build_nebula_orders_iface(&mut arena);
-    let bytes = gen_adapter(
-        "nebula:service/orders",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Consumer,
-    );
-    validate_component(&bytes);
+    let bytes = gen_and_validate("nebula:service/orders", &iface, &arena, SplitKind::Consumer);
 
     // Pin that the generated component actually re-exports all three
     // interface functions — the original bug report had the adapter
@@ -1380,14 +1281,12 @@ fn test_adapter_cross_interface_value_types() {
         );
     }
 
-    let bytes = gen_adapter(
+    gen_and_validate(
         "nebula:service/orders",
-        &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &graph.arena,
         SplitKind::ConsumerSiblingTypes,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: before hook only ─────────────────────────────────────────
@@ -1397,14 +1296,13 @@ fn test_adapter_before_only() {
     let mut arena = TypeArena::default();
     let s32 = arena.intern_val(ValueType::S32);
     let iface = make_iface(vec![("get", sig(false, &[], vec![], vec![s32]))]);
-    let bytes = gen_adapter(
+    gen_and_validate_with(
         "test:pkg/getter@1.0.0",
         &["splicer:tier1/before"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: after hook only ──────────────────────────────────────────
@@ -1414,14 +1312,13 @@ fn test_adapter_after_only() {
     let mut arena = TypeArena::default();
     let s32 = arena.intern_val(ValueType::S32);
     let iface = make_iface(vec![("get", sig(true, &[], vec![], vec![s32]))]);
-    let bytes = gen_adapter(
+    gen_and_validate_with(
         "test:pkg/getter@1.0.0",
         &["splicer:tier1/after"],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: blocking hook (void async only) ──────────────────────────
@@ -1431,7 +1328,7 @@ fn test_adapter_blocking() {
     let mut arena = TypeArena::default();
     let string = arena.intern_val(ValueType::String);
     let iface = make_iface(vec![("fire", sig(true, &["msg"], vec![string], vec![]))]);
-    let bytes = gen_adapter(
+    gen_and_validate_with(
         "test:pkg/fire@1.0.0",
         &[
             "splicer:tier1/before",
@@ -1442,7 +1339,6 @@ fn test_adapter_blocking() {
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: no hooks at all ──────────────────────────────────────────
@@ -1455,14 +1351,13 @@ fn test_adapter_no_hooks() {
         "add",
         sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
     )]);
-    let bytes = gen_adapter(
+    gen_and_validate_with(
         "test:pkg/adder@1.0.0",
         &[],
         &iface,
         &arena,
         SplitKind::Consumer,
     );
-    validate_component(&bytes);
 }
 
 // ── Tier 1: provider split (handler exported, not imported) ──────────
@@ -1483,12 +1378,5 @@ fn test_adapter_provider_split_primitive() {
         "add",
         sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
     )]);
-    let bytes = gen_adapter(
-        "test:pkg/adder@1.0.0",
-        &["splicer:tier1/before", "splicer:tier1/after"],
-        &iface,
-        &arena,
-        SplitKind::Provider,
-    );
-    validate_component(&bytes);
+    gen_and_validate("test:pkg/adder@1.0.0", &iface, &arena, SplitKind::Provider);
 }

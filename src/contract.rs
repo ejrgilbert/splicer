@@ -32,6 +32,11 @@ pub enum ContractResult {
     /// The inner list names the matched interfaces so the adapter generator knows
     /// exactly which hooks to wire up.
     Tier1Compatible(Vec<String>),
+    /// The middleware exports at least one tier-2 interface
+    /// (`splicer:tier2/{before,after,trap}`). The inner list names the
+    /// matched interfaces so the adapter generator knows exactly
+    /// which hooks to wire up.
+    Tier2Compatible(Vec<String>),
 }
 
 /// Check that every middleware in `to_inject` is type-compatible with the
@@ -71,20 +76,67 @@ pub fn validate_contract(
             } else {
                 results.push(ContractResult::Ok);
             }
-        } else if let Some(matched) = is_tier1_compatible(exports, path, interface_name) {
-            results.push(ContractResult::Tier1Compatible(matched));
         } else {
-            results.push(ContractResult::Warn(format!(
-                "Middleware '{}' does not export interface '{}'.\n\
-                 \tIt cannot be spliced on this interface.\n\
-                 \tCheck that the middleware both imports and re-exports '{}',\n\
-                 \tor that the interface name in your config exactly matches\n\
-                 \twhat the middleware binary exports.",
-                name, interface_name, interface_name
-            )));
+            results.push(classify_tier_export(name, exports, path, interface_name));
         }
     }
     results
+}
+
+/// Classify a middleware that doesn't export the target interface
+/// directly: detect which (if any) `splicer:tierN/*` package it
+/// exports, enforce the one-tier-per-middleware rule, and return the
+/// appropriate `ContractResult`.
+fn classify_tier_export(
+    name: &str,
+    exports: &BTreeMap<String, ExportInfo>,
+    path: &Option<String>,
+    interface_name: &str,
+) -> ContractResult {
+    let tier1 = match_tier_interfaces(exports, TIER1_INTERFACES, TIER1_VERSION);
+    let tier2 = match_tier_interfaces(exports, TIER2_INTERFACES, TIER2_VERSION);
+
+    // One-tier-per-middleware: reject any component exporting
+    // interfaces from multiple tier packages. The user-facing rule
+    // lives in `docs/adapter-components.md` ("One tier per middleware").
+    if !tier1.is_empty() && !tier2.is_empty() {
+        return ContractResult::Error(format!(
+            "middleware '{name}' exports interfaces from multiple tiers \
+             (tier 1: {tier1_list}; tier 2: {tier2_list}).\n\n\
+             A middleware must implement exactly one tier. To combine \
+             behaviors, ship them as separate components and chain \
+             them in `inject: [...]`.",
+            tier1_list = tier1.join(", "),
+            tier2_list = tier2.join(", "),
+        ));
+    }
+
+    if !tier1.is_empty() {
+        if !is_adapter_eligible(path, interface_name) {
+            return warn_not_exported(name, interface_name);
+        }
+        return ContractResult::Tier1Compatible(tier1);
+    }
+
+    if !tier2.is_empty() {
+        if !is_adapter_eligible(path, interface_name) {
+            return warn_not_exported(name, interface_name);
+        }
+        return ContractResult::Tier2Compatible(tier2);
+    }
+
+    warn_not_exported(name, interface_name)
+}
+
+fn warn_not_exported(name: &str, interface_name: &str) -> ContractResult {
+    ContractResult::Warn(format!(
+        "Middleware '{}' does not export interface '{}'.\n\
+         \tIt cannot be spliced on this interface.\n\
+         \tCheck that the middleware both imports and re-exports '{}',\n\
+         \tor that the interface name in your config exactly matches\n\
+         \twhat the middleware binary exports.",
+        name, interface_name, interface_name
+    ))
 }
 
 /// Returns `true` when a middleware is a candidate for tier-1 adapter generation.
@@ -129,51 +181,46 @@ fn is_compatible_interface(export_name: &str, iface: &str, expected_version: &st
     req.matches(&export_ver)
 }
 
-/// Returns the subset of [`TIER1_INTERFACES`] that the middleware exports, or
-/// `None` if the middleware is not tier-1 compatible.
+/// Return the subset of `tier_ifaces` that `exports` includes, with
+/// semver-compatible version matching against `tier_version`.
 ///
-/// A middleware is tier-1 compatible when:
-/// 1. It exports **at least one** of the tier-1 interfaces — the positive signal
-///    that it was written as a type-erased middleware.
-/// 2. A path to the binary is provided — the adapter cannot be generated without it.
-/// 3. It does **not** import `target_interface` — confirming it is not a regular
-///    pass-through middleware that simply failed the fingerprint check.
-fn is_tier1_compatible(
+/// Export keys may be versioned (e.g. `"splicer:tier1/before@0.2.0"`)
+/// while the constants are unversioned (`"splicer:tier1/before"`).
+/// Any export with a version semver-compatible with the version
+/// splicer was built against passes (see [`is_compatible_interface`]).
+fn match_tier_interfaces(
     exports: &BTreeMap<String, ExportInfo>,
-    middleware_path: &Option<String>,
-    target_interface: &str,
-) -> Option<Vec<String>> {
-    // Match tier-1 interface names with semver-compatible version
-    // checking. Export keys may be versioned (e.g.
-    // "splicer:tier1/before@0.2.0") while the constants are
-    // unversioned ("splicer:tier1/before"). We accept any version
-    // that is semver-compatible with the version splicer was built
-    // against (TIER1_VERSION, derived from wit/tier1/world.wit).
-    let matched: Vec<String> = TIER1_INTERFACES
+    tier_ifaces: &[&str],
+    tier_version: &str,
+) -> Vec<String> {
+    tier_ifaces
         .iter()
         .filter(|iface| {
             exports
                 .keys()
-                .any(|export_name| is_compatible_interface(export_name, iface, TIER1_VERSION))
+                .any(|export_name| is_compatible_interface(export_name, iface, tier_version))
         })
         .map(|iface| iface.to_string())
-        .collect();
-    if matched.is_empty() {
-        return None;
-    }
+        .collect()
+}
+
+/// Adapter generation is only viable when:
+/// 1. A path to the middleware binary is provided — the adapter
+///    generator needs the bytes.
+/// 2. The middleware does **not** import `target_interface` —
+///    confirming it isn't a regular pass-through middleware that
+///    simply failed the fingerprint check.
+fn is_adapter_eligible(middleware_path: &Option<String>, target_interface: &str) -> bool {
     let Some(path) = middleware_path else {
-        return None;
+        return false;
     };
     let Ok(buff) = fs::read(path) else {
-        return None;
+        return false;
     };
     let Ok(imports) = parse_component_imports(&buff) else {
-        return None;
+        return false;
     };
-    if imports.iter().any(|(name, _)| name == target_interface) {
-        return None;
-    }
-    Some(matched)
+    !imports.iter().any(|(name, _)| name == target_interface)
 }
 
 fn discover_middleware_exports(
@@ -386,6 +433,100 @@ mod tests {
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], ContractResult::Ok);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tier classification (`match_tier_interfaces`, `classify_tier_export`)
+    // -----------------------------------------------------------------------
+
+    /// Build an exports map containing one or more interface keys, each
+    /// associated with a fingerprint-less stub. Useful for tier-detection
+    /// tests that don't care about fingerprints.
+    fn exports_for(ifaces: &[&str]) -> BTreeMap<String, ExportInfo> {
+        let mut out = BTreeMap::new();
+        for iface in ifaces {
+            out.insert(
+                iface.to_string(),
+                ExportInfo {
+                    source_instance: 0,
+                    fingerprint: None,
+                    ty: None,
+                },
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn match_tier_interfaces_picks_up_versioned_exports() {
+        // Versioned export key + unversioned constant → semver-compatible match.
+        let exports = exports_for(&["splicer:tier2/before@0.1.0", "splicer:tier2/after@0.1.7"]);
+        let matched = match_tier_interfaces(&exports, TIER2_INTERFACES, TIER2_VERSION);
+        assert_eq!(matched.len(), 2);
+        assert!(matched.iter().any(|i| i == "splicer:tier2/before"));
+        assert!(matched.iter().any(|i| i == "splicer:tier2/after"));
+    }
+
+    #[test]
+    fn match_tier_interfaces_skips_unrelated_packages() {
+        let exports = exports_for(&["other:pkg/iface", "wasi:http/handler@0.3.0"]);
+        let matched = match_tier_interfaces(&exports, TIER2_INTERFACES, TIER2_VERSION);
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn multi_tier_export_is_rejected_with_clear_error() {
+        // Middleware exports both tier-1 AND tier-2 → multi-tier rejection,
+        // independent of whether the binary path resolves (the rejection
+        // happens before adapter-eligibility checks).
+        let mut cache = HashMap::new();
+        cache.insert(
+            "mw".to_string(),
+            exports_for(&["splicer:tier1/before@0.2.0", "splicer:tier2/after@0.1.0"]),
+        );
+        let results = validate_contract(
+            &[injection("mw")],
+            "wasi:http/handler@0.3.0",
+            &None,
+            &mut cache,
+        );
+        assert_eq!(results.len(), 1);
+        let ContractResult::Error(msg) = &results[0] else {
+            panic!("expected Error, got {:?}", results[0]);
+        };
+        assert!(
+            msg.contains("multiple tiers"),
+            "error message should mention multi-tier rejection: {msg}"
+        );
+        assert!(
+            msg.contains("tier 1") && msg.contains("tier 2"),
+            "error message should name both tiers: {msg}"
+        );
+    }
+
+    #[test]
+    fn tier2_only_without_path_falls_through_to_warn() {
+        // Tier-2 detection succeeds on the export side, but adapter
+        // generation needs the binary path. Without a path we can't
+        // confirm adapter-eligibility, so we surface a Warn rather
+        // than mis-classifying.
+        let mut cache = HashMap::new();
+        cache.insert(
+            "mw".to_string(),
+            exports_for(&["splicer:tier2/before@0.1.0"]),
+        );
+        let results = validate_contract(
+            &[injection("mw")],
+            "wasi:http/handler@0.3.0",
+            &None,
+            &mut cache,
+        );
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0], ContractResult::Warn(_)),
+            "expected Warn (no path), got {:?}",
+            results[0]
+        );
     }
 
     #[test]

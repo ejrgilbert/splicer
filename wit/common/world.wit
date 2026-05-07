@@ -1,17 +1,146 @@
 /// Shared types used across all splicer middleware tiers.
 ///
 /// Tier WIT packages (`splicer:tier1`, `splicer:tier2`, ...) import
-/// types defined here so the call-identity shape stays consistent
-/// across tiers as middleware authors move up.
+/// types defined here so the call-identity and lifted-value shapes
+/// stay consistent across tiers as middleware authors move up.
 package splicer:common@0.1.0;
 
 interface types {
-    /// Identity of the wrapped call: the target interface
-    /// (fully-qualified, e.g. `"wasi:http/handler@0.3.0"`) plus the
-    /// canonical-ABI function name (e.g. `"handle"`,
-    /// `"[method]request.body"`, `"[constructor]request"`).
+    /// Identity of the wrapped call: target interface
+    /// (e.g. `"wasi:http/handler@0.3.0"`), canonical-ABI function
+    /// name (e.g. `"handle"`, `"[method]request.body"`), and a
+    /// monotonic per-instance id for correlating `on-call` /
+    /// `on-return` of the same invocation.
     record call-id {
         interface-name: string,
         function-name: string,
+        id: u64,
+    }
+
+    // ── Lifted-value representation ───────────────────────────────
+    //
+    // Each canonical-ABI value gets lifted into a `field-tree`:
+    // a flat array of cells plus side tables for any nominal-typed
+    // information, plus an index identifying the root.
+    //
+    // Compound cells reference children by `u32` index into the
+    // same cells array. Why index-based recursion instead of a
+    // self-referential variant? WIT does not yet support recursive
+    // types — see
+    // https://github.com/WebAssembly/component-model/issues/56.
+    //
+    // ── Cell sizing ───────────────────────────────────────────────
+    //
+    // Why is every nominal-typed case (record-of, variant-case,
+    // handle, etc.) just a `u32`? Canonical-ABI lays out a list of
+    // variant elements as fixed-stride memory, where the stride
+    // equals the variant's max payload size padded to alignment.
+    // If we kept type-names + field metadata inline in those cases,
+    // every cell — even a `cell::bool(true)` — would pay 24+ bytes
+    // of padding. Pulling the metadata out into per-kind side tables
+    // (record-infos, variant-infos, etc.) caps every cell payload at
+    // 8 bytes (s64), so the cell stride lands at 16 bytes.
+    //
+    // Trade-off: middleware code needs one extra lookup
+    // (`tree.record_infos[idx]`) for nominal cases. Helper libraries
+    // hide this; the wire savings (~50% on cells in primitive-
+    // dominated trees) make it worth the small ergonomic cost.
+
+    /// `record { ... }` payload — type name + named fields, where each
+    /// field references a child cell by index.
+    record record-info {
+        type-name: string,
+        /// `(field-name, cell-index)` per declared field, in WIT order.
+        fields: list<tuple<string, u32>>,
+    }
+
+    /// `flags { ... }` payload — type name + names of set bits.
+    record flags-info {
+        type-name: string,
+        set-flags: list<string>,
+    }
+
+    /// `enum { ... }` payload — type name + the case-name in this value.
+    record enum-info {
+        type-name: string,
+        case-name: string,
+    }
+
+    /// `variant { ... }` payload — type name, case name, optional payload index.
+    record variant-info {
+        type-name: string,
+        case-name: string,
+        /// Index of the payload cell, or `none` for payload-less cases.
+        payload: option<u32>,
+    }
+
+    /// `own<R>` / `borrow<R>` / `stream<T>` / `future<T>` /
+    /// `error-context` payload — resource (or element) type name +
+    /// opaque correlation id. The id is **not** a usable handle;
+    /// the adapter still owns canonical-ABI ownership semantics.
+    /// Useful for correlating the same handle's appearances across
+    /// multiple calls. For `error-context-handle` the `type-name`
+    /// is empty — the cell-disc already names the kind, and there
+    /// is no nested type to surface.
+    record handle-info {
+        type-name: string,
+        id: u64,
+    }
+
+    /// One node in a lifted value tree. Compound cases hold either a
+    /// `u32` cell-index (for structural recursion) or a `u32` side-
+    /// table index (for nominal metadata).
+    variant cell {
+        // ── primitives — payload fits in 8 bytes ──────────────────
+        %bool(bool),
+        integer(s64),                          // s8/s16/s32/s64/u8/u16/u32/u64
+        floating(f64),                         // f32/f64 (widened)
+        text(string),                          // string and char
+        bytes(list<u8>),                       // list<u8> fast-path
+
+        // ── structural / anonymous types — index into cells ───────
+        list-of(list<u32>),                    // child indices, in order
+        tuple-of(list<u32>),                   // child indices, in order
+        option-some(u32),                      // index of inner value
+        option-none,
+        result-ok(option<u32>),                // index, or none for unit ok
+        result-err(option<u32>),               // index, or none for unit err
+
+        // ── nominal types — index into the corresponding side table
+        record-of(u32),                        // → record-infos[idx]
+        flags-set(u32),                        // → flags-infos[idx]
+        enum-case(u32),                        // → enum-infos[idx]
+        variant-case(u32),                     // → variant-infos[idx]
+
+        // ── opaque correlation handles — index into handle-infos ──
+        resource-handle(u32),                  // → handle-infos[idx]
+        stream-handle(u32),                    // → handle-infos[idx]
+        future-handle(u32),                    // → handle-infos[idx]
+        // `error-context` is lifted as just an opaque id — the canonical-ABI
+        // `error-context.debug-message` builtin would let us surface the
+        // string, but cross-component error-context lift is currently broken
+        // in wasmtime (<=44, "very incomplete" per its own config docstring),
+        // so the wrapper never gets to call it. Revisit when host catches up.
+        error-context-handle(u32),             // → handle-infos[idx]
+    }
+
+    /// A lifted value tree: a flat array of cells, side tables for
+    /// nominal-typed information, plus the root cell index. Walk by
+    /// reading `cells[root]` and following child indices for
+    /// compound cases (or side-table indices for nominal cases).
+    record field-tree {
+        cells: list<cell>,
+        record-infos:  list<record-info>,
+        flags-infos:   list<flags-info>,
+        enum-infos:    list<enum-info>,
+        variant-infos: list<variant-info>,
+        handle-infos:  list<handle-info>,
+        root: u32,
+    }
+
+    /// Named slot in a function's argument list.
+    record field {
+        name: string,
+        tree: field-tree,
     }
 }

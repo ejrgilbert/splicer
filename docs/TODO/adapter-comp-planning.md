@@ -68,6 +68,130 @@ itself. The Rust-codegen path is still useful for built-ins that want
 `arbitrary`-style auto-generation, but it's now an implementation
 strategy *for tier 4*, not a separate fourth category.
 
+## Resource-shape adapter-adapter (tier-2 ergonomic shim)
+
+Tier-2's canonical wire format is the cell array
+(`splicer:common/types.field-tree`) — fast, polyglot-neutral, but
+awkward to walk by hand without a helper library.
+
+The plan is to ship a second WIT package `splicer:tier2-resources`
+that exposes the same hooks (`before` / `after` / `trap`) but with
+the lifted value wrapped as a `resource lifted-value` carrying lazy
+accessor methods (`kind()`, `as-integer()`, `as-list()`, etc.). A
+**built-in adapter-adapter component** sits between splicer's
+tier-2 adapter (which emits cells) and the user middleware, doing
+the cells → resource conversion in front of the user code:
+
+```
+caller
+  → splicer's tier-2 adapter   (canonical-ABI → cells)
+      → adapter-adapter         (cells → resource API)
+          → user middleware
+              → downstream
+```
+
+Splicer detects which shape the user middleware exports
+(`splicer:tier2/*` vs `splicer:tier2-resources/*`) and either wires
+direct or inserts the adapter-adapter automatically. Same
+classification logic as the rest of contract.rs — just a third tier
+detection.
+
+**Why this matters:** without the adapter-adapter, polyglot middleware
+authors have to either (a) write their own per-language cell walker
+or (b) tolerate `tree.cells[idx as usize]`-style code. With it, every
+wit-bindgen-targeted language (TS, Python, Go, C, Rust, ...) gets an
+idiomatic resource API for free. No splicer-side per-language work.
+
+**Implementation cost:** the adapter-adapter is a state-bearing
+wasm component — holds the cell array as resource state, dispatches
+accessor methods into the array, returns child `lifted-value`
+resources for compound cases. Roughly 2–3× the adapter code of the
+cells path, but mechanical (no canonical-ABI logic — that's already
+done by the tier-2 adapter upstream).
+
+**Runtime cost (paid by the user middleware that opts in):** every
+accessor method on `lifted-value` is a component-boundary call —
+`val.kind()`, `val.as-integer()`, `val.as-list()`, etc. Walking a
+50-field record means ~150 component calls (kind + as-record +
+50 × kind + 50 × as-* per field). At wasmtime's component-call
+overhead (~tens of ns per call), that's ~5–10μs per traversal of a
+50-field record. Comparison to the direct cells path:
+
+| Path | Component calls per walk | Per-call cost (50-field record) |
+|---------------|--------------------------|--------------------------------:|
+| cells (direct) | 0 (in-process Vec access) | ~250 ns |
+| cells + adapter-adapter | ~150 (per-accessor) | ~5–10 μs |
+
+So the adapter-adapter trades **~30× walk-time slowdown** for
+"works idiomatically in any wit-bindgen language without splicer
+shipping a per-language helper." For light-touch middleware (auth,
+throttle, tracer reading a few fields) the overhead is irrelevant.
+For traversal-heavy middleware (logger, recorder dumping the whole
+tree) it's meaningful — at HTTP scale (~10ms request budget), 10μs
+is ~0.1% added latency, so still acceptable for most workloads but
+worth measuring once we have real users.
+
+A user with measurable perf pressure can drop the adapter-adapter
+and write against `splicer:tier2/*` directly with their own walker
+(or the splicer-provided Rust helper). The cost-vs-ergonomics
+choice is per-middleware, not project-wide.
+
+**When to build:** after tier-2 v1 ships and we have measured demand
+for non-Rust middleware authoring. The cell wire format is forward-
+compatible with this shim landing later — middleware that exports
+`splicer:tier2-resources/*` can be added without breaking
+`splicer:tier2/*` middleware.
+
+Other adapter-adapter shapes that fit the same pattern (worth
+mentioning even though we won't build them):
+
+- **cells → OpenTelemetry spans** — for OTel-shaped tracing
+- **cells → JSON / structured event stream** — for log aggregators
+- **cells → jsonpath-queryable view** — for declarative metric extraction
+
+Each is a separate downstream component; the adapter pipeline stays
+unchanged.
+
+## Auto-instrument resources alongside their target
+
+When a tier-2 (or tier-3) splice rule targets an interface that
+**uses resources from a sibling interface** (very common in WIT — e.g.
+`wasi:http/handler` uses `request` / `response` from
+`wasi:http/types`), the user currently has to write two splice rules
+to observe both the top-level call AND the resource methods that fire
+during it. Verbose and easy to forget.
+
+A reasonable UX addition: a rule modifier like
+`instrument-resources: true` that asks splicer to auto-attach the
+same middleware to every interface that defines resources used by
+the target. The middleware sees the top-level call AND the resource
+methods, correlated naturally by handle id.
+
+```yaml
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+      provider: { name: my-service }
+    instrument-resources: true     # also wire to wasi:http/types automatically
+    inject:
+      - name: my-logger
+        path: ./logger.wasm
+```
+
+Implementation sketch:
+
+- During contract validation, walk the target interface's WIT to
+  collect every resource type referenced.
+- For each resource, identify the interface it's defined in (the
+  resource owner).
+- Generate an additional internal splice rule (the user doesn't see
+  it) for each owner interface, with the same middleware and chain
+  shape.
+- Emit a one-line info log so users know what got auto-wired.
+
+When to build: after tier-2 ships and the first user complains about
+the multi-WIT setup ceremony. Until then it's premature.
+
 ## Span-based recording and record/replay
 
 Tier 2 (record) + tier 4 (replay) is the canonical capture-and-relive

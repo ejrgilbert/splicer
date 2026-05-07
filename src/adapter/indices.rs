@@ -3,10 +3,13 @@
 //!
 //! - [`DispatchIndices`] — type and function indices INSIDE the
 //!   dispatch core module.
-//! - [`FunctionIndices`] — local allocator for a single wasm function
+//! - [`LocalsBuilder`] — local allocator for a single wasm function
 //!   body. The first `alloc_local` returns index `param_count`;
-//!   [`FunctionIndices::into_locals`] hands back the typed local list
-//!   for `wasm_encoder::Function::new_with_locals_types`.
+//!   [`LocalsBuilder::freeze`] hands back a [`FrozenLocals`] whose
+//!   `locals` field feeds `wasm_encoder::Function::new_with_locals_types`.
+//!   The split is a typestate: callers that hold a [`FrozenLocals`]
+//!   can no longer allocate, so "must allocate before locals freeze"
+//!   becomes a compile error.
 
 use wasm_encoder::ValType;
 
@@ -39,15 +42,16 @@ impl DispatchIndices {
     }
 }
 
-/// Local-index allocator for one wasm function. `base` is the first
-/// free slot above the function's parameters; allocated locals count
-/// up from there.
-pub(crate) struct FunctionIndices {
+/// Mutable local-index allocator for one wasm function. `base` is the
+/// first free slot above the function's parameters; allocated locals
+/// count up from there. Consume via [`Self::freeze`] to hand off to
+/// `wasm_encoder::Function::new_with_locals_types`.
+pub(crate) struct LocalsBuilder {
     base: u32,
     locals: Vec<ValType>,
 }
 
-impl FunctionIndices {
+impl LocalsBuilder {
     /// New allocator for a function with `param_count` parameters.
     /// The first `alloc_local` will return index `param_count`.
     pub fn new(param_count: u32) -> Self {
@@ -64,11 +68,22 @@ impl FunctionIndices {
         idx
     }
 
-    /// Consume the allocator and return the locals vec for
-    /// `Function::new_with_locals_types`.
-    pub fn into_locals(self) -> Vec<ValType> {
-        self.locals
+    /// Consume the builder and return a frozen handle for
+    /// `Function::new_with_locals_types`. After this point the locals
+    /// list is closed — there is no way to allocate further indices.
+    pub fn freeze(self) -> FrozenLocals {
+        FrozenLocals {
+            locals: self.locals,
+        }
     }
+}
+
+/// Frozen output of a [`LocalsBuilder`]. Carries the typed local list
+/// in the shape `wasm_encoder::Function::new_with_locals_types` wants.
+/// Distinct from `LocalsBuilder` so the type system rejects "allocate
+/// after freeze."
+pub(crate) struct FrozenLocals {
+    pub locals: Vec<ValType>,
 }
 
 #[cfg(test)]
@@ -76,20 +91,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn function_indices_allocate_contiguous_from_base() {
-        let mut idx = FunctionIndices::new(3);
+    fn locals_builder_allocates_contiguous_from_base() {
+        let mut idx = LocalsBuilder::new(3);
         assert_eq!(idx.alloc_local(ValType::I32), 3);
         assert_eq!(idx.alloc_local(ValType::I64), 4);
         assert_eq!(idx.alloc_local(ValType::I32), 5);
         assert_eq!(
-            idx.into_locals(),
+            idx.freeze().locals,
             vec![ValType::I32, ValType::I64, ValType::I32]
         );
     }
 
     #[test]
-    fn function_indices_zero_params_starts_at_zero() {
-        let mut idx = FunctionIndices::new(0);
+    fn locals_builder_zero_params_starts_at_zero() {
+        let mut idx = LocalsBuilder::new(0);
         assert_eq!(idx.alloc_local(ValType::I32), 0);
         assert_eq!(idx.alloc_local(ValType::F64), 1);
     }
