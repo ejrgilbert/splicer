@@ -311,9 +311,11 @@ pub(crate) fn emit_handler_call(
 }
 
 /// Bail when an indirect-params async fn carries a param shape the
-/// lower-mode bindgen doesn't handle. The only deferred kind today
-/// is `map<K, V>`; everything else in the canonical-ABI value-type
-/// space is supported.
+/// lower-mode bindgen doesn't handle. Today the bindgen covers the
+/// full canonical-ABI value-type space; this gate exists so a future
+/// spec addition (or a `TypeDefKind::Resource` slipping through as a
+/// bare param, which canon-ABI forbids) fails loud rather than
+/// emitting broken wasm.
 pub(crate) fn require_indirect_params_supported_shape(
     resolve: &Resolve,
     fn_name: &str,
@@ -324,8 +326,7 @@ pub(crate) fn require_indirect_params_supported_shape(
             bail!(
                 "async function `{fn_name}` has params that overflow \
                  MAX_FLAT_ASYNC_PARAMS ({}) AND param `{}` carries an \
-                 unsupported type. Currently the only deferred shape \
-                 is `map<K, V>`.",
+                 unsupported type.",
                 Resolve::MAX_FLAT_ASYNC_PARAMS,
                 param.name,
             );
@@ -335,8 +336,7 @@ pub(crate) fn require_indirect_params_supported_shape(
 }
 
 /// Recursively true iff `ty` is a shape the lower-mode bindgen
-/// covers. Aggregates check each contained type; `map<K, V>` is the
-/// only deferred kind today.
+/// covers. Aggregates check each contained type.
 fn is_supported_indirect_params_ty(resolve: &Resolve, ty: &Type) -> bool {
     match ty {
         Type::Bool
@@ -378,14 +378,17 @@ fn is_supported_indirect_params_ty(resolve: &Resolve, ty: &Type) -> bool {
             TypeDefKind::List(t) | TypeDefKind::FixedLengthList(t, _) => {
                 is_supported_indirect_params_ty(resolve, t)
             }
+            TypeDefKind::Map(k, v) => {
+                is_supported_indirect_params_ty(resolve, k)
+                    && is_supported_indirect_params_ty(resolve, v)
+            }
             TypeDefKind::Enum(_)
             | TypeDefKind::Flags(_)
             | TypeDefKind::Handle(_)
             | TypeDefKind::Future(_)
             | TypeDefKind::Stream(_) => true,
             // Resources only show up as Handle, never as bare params.
-            // Maps don't have an emit arm yet.
-            TypeDefKind::Resource | TypeDefKind::Map(_, _) | TypeDefKind::Unknown => false,
+            TypeDefKind::Resource | TypeDefKind::Unknown => false,
         },
     }
 }

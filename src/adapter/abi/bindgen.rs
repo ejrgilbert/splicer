@@ -969,6 +969,23 @@ impl Bindgen for WasmEncoderBindgen<'_> {
                 self.emit_get_flat_slot();
                 produce_n(results, 1);
             }
+            // Map at the wrapper-flat boundary is (ptr, len), same as a
+            // list. Upstream's `lower(map)` wraps a kv-pair-write block
+            // that's meaningless in our pass-through model; discard it
+            // and roll cursor back before reading (ptr, len).
+            AbiInst::MapLower { .. } => {
+                let block = self
+                    .completed_blocks
+                    .pop()
+                    .expect("MapLower without matching block");
+                self.flat_cursor = block.start_cursor;
+                self.emit_get_flat_slot(); // ptr
+                self.emit_get_flat_slot(); // len
+                produce_n(results, 2);
+            }
+            AbiInst::IterMapKey { .. } | AbiInst::IterMapValue { .. } => {
+                produce_n(results, 1);
+            }
 
             // ── Constants / placeholders used by aggregate lowers ──
             // I32Const fires for variant-arm disc constants;

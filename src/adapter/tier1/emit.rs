@@ -1373,10 +1373,10 @@ mod tests {
     }
 
     /// Lists, strings, fixed-length-lists, variants, options, results,
-    /// and handles all accepted in indirect-params position alongside
-    /// scalars and aggregate-of-scalar shapes.
+    /// handles, and maps — every canonical-ABI value-type kind —
+    /// accepted in indirect-params position.
     #[test]
-    fn require_supported_case_accepts_lists_variants_in_indirect_params() {
+    fn require_supported_case_accepts_full_value_type_space_in_indirect_params() {
         let (resolve, iface_id) = iface_from_wit(
             r#"
             package my:shape@1.0.0;
@@ -1389,6 +1389,7 @@ mod tests {
                     o: option<u32>,
                     r: result<u32, string>,
                     v: either,
+                    m: map<string, u32>,
                 ) -> u32;
             }
             "#,
@@ -1396,6 +1397,6 @@ mod tests {
             "api@1.0.0",
         );
         require_supported_case(&resolve, iface_id, false)
-            .expect("string / list / fixed-list / variant / option / result params accepted");
+            .expect("full canonical-ABI value-type space accepted");
     }
 }
