@@ -31,13 +31,24 @@ const FUZZ_MAX_DEPTH: u32 = 2;
 /// Max failures echoed into the test output before truncating.
 const MAX_FAILURES_SHOWN: usize = 20;
 
-/// Async function whose params flatten to >`MAX_FLAT_ASYNC_PARAMS` (4)
-/// — canon-lower-async uses `indirect_params=true` (single params-ptr)
-/// but the wrapper export's flat shape doesn't, so we'd need
-/// `lower_to_memory` between them. Not yet implemented; assert we
-/// bail with a clear message rather than emit invalid wasm.
+// ── Tier 1: async indirect-params (lower_to_memory) ──────────────────
+//
+// Async funcs whose params flatten past `MAX_FLAT_ASYNC_PARAMS` (4)
+// canon-lower with `indirect_params = true` — the import takes a
+// single params-pointer, so the wrapper must lower its flat function
+// params into a memory-resident params record before the handler call.
+// See `docs/TODO/tier2-async-target-indirect-params.md` for the full
+// rationale; same fix applies to both tiers.
+//
+// Until primitive `lower_to_memory` lands these tests fail with the
+// existing bail. They define the goal: the all-u32 shape pins the
+// minimal indirect-params path; the mixed-primitives shape pins
+// store-width + canonical-ABI inter-field alignment math.
+
+/// Five `u32` params — flattens to 5 i32 slots → `indirect_params=true`
+/// on canon-lower-async. Smallest shape that forces the lowering.
 #[test]
-fn test_adapter_async_indirect_params_bails() {
+fn test_adapter_async_5_u32_params_validates() {
     let mut arena = TypeArena::default();
     let u32_id = arena.intern_val(ValueType::U32);
     let iface = make_iface(vec![(
@@ -49,21 +60,46 @@ fn test_adapter_async_indirect_params_bails() {
             vec![u32_id],
         ),
     )]);
-    let tmp = tempfile::tempdir().unwrap();
-    let split = synth_split("test:pkg/many@1.0.0", &iface, &arena, SplitKind::Consumer);
-    let err = generate_tier1_adapter(
-        "test-mdl",
+    let bytes = gen_adapter(
         "test:pkg/many@1.0.0",
-        &[],
-        tmp.path().to_str().unwrap(),
-        split.path().to_str().unwrap(),
-    )
-    .expect_err("async indirect-params should bail until lower_to_memory lands");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("not yet implemented") && msg.contains("MAX_FLAT_ASYNC_PARAMS"),
-        "bail should mention the limit and not-yet-implemented, got: {msg}"
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
     );
+    validate_component(&bytes);
+}
+
+/// Mixed primitive widths in indirect-params position — exercises
+/// `i32.store` / `i64.store` / `f32.store` / `f64.store` /
+/// `i32.store8` plus inter-field padding (`u32`→`u64` and `bool`→`char`
+/// transitions force alignment bumps).
+#[test]
+fn test_adapter_async_mixed_primitives_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let f32_id = arena.intern_val(ValueType::F32);
+    let f64_id = arena.intern_val(ValueType::F64);
+    let bool_id = arena.intern_val(ValueType::Bool);
+    let char_id = arena.intern_val(ValueType::Char);
+    let iface = make_iface(vec![(
+        "mixed",
+        sig(
+            true,
+            &["a", "b", "c", "d", "e", "f"],
+            vec![u32_id, u64_id, f32_id, f64_id, bool_id, char_id], // 6 slots
+            vec![u32_id],
+        ),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/mixed-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
 }
 
 #[test]

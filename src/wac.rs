@@ -988,6 +988,7 @@ fn add_to_inject_plan(
                 resolved.push(Injection {
                     name: injection.name.clone(),
                     path: injection.path.clone(),
+                    builtin: injection.builtin.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         matched_hook_interfaces: matched_interfaces,

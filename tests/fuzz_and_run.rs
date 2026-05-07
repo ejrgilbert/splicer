@@ -23,12 +23,16 @@
 //!     SPLICER_RUNTIME_SHAPES=u32,string cargo test --test fuzz_and_run \
 //!         -- --ignored --nocapture
 //!
-//! TODO: stream/future shape coverage. Tier-2 lift codegen is in
-//! place (single `Cell::Handle` variant covers own/borrow/stream/
-//! future, picking cell-disc by `HandleKind`). Blocked on async-
-//! runtime + canon-async-stream/future host bindings the harness
-//! doesn't yet have — needs `wasi:io/streams`-style host imports
-//! the consumer can read/write through, plus async fn scaffolds.
+//! Limitation — `stream<T>` / `future<T>` are out of scope for this
+//! harness. Tier-2 lift codegen handles them (single `Cell::Handle`
+//! variant covers own/borrow/stream/future, picking cell-disc by
+//! `HandleKind`), but driving them end-to-end here would require
+//! async-runtime + canon-async-stream/future host bindings the
+//! harness doesn't have. Runtime coverage for stream/future lives
+//! in the `component-interposition` submodule's integration tests
+//! instead. A latent drop-intrinsics gap (`[stream-drop-readable]`
+//! / `[future-drop-readable]` — `collect_borrow_drops` only walks
+//! `Handle::Borrow` today) will surface there when exercised.
 
 use anyhow::Context;
 use arbitrary::Arbitrary;
