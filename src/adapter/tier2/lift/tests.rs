@@ -91,6 +91,7 @@ const TEST_WIT: &str = r#"
         record list-char-pair { items: list<char>, scores: list<u32> }
         f-record-with-list-char: func(rcp: list-char-pair);
         f-result-list-u32: func() -> list<u32>;
+        f-result-list-char: func() -> list<char>;
         f-list-of-list: func(xs: list<list<u32>>);
         record list-pair { items: list<string>, scores: list<u32> }
         f-list-of-record: func(xs: list<point>);
@@ -1996,6 +1997,31 @@ fn list_result_classifies_as_compound() {
         "Compound result plan's root cell must be ListOf, got {:?}",
         compound.plan.cells[0],
     );
+}
+
+#[test]
+fn list_char_result_classifies_as_compound() {
+    // `list<char>` results take the same Compound route as `list<u32>`;
+    // the result-side emit shares `emit_list_of_arm` with params, so
+    // per-iteration utf-8 scratch + Prestaged CharScratch wire up
+    // identically. Pin the shape so a future result-side regression
+    // surfaces here.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let func = func_named(&r, "f-result-list-char");
+    let result_lift = classify_result_lift(&r, func, true, &mut names)
+        .expect("list<char> result must classify")
+        .expect("list<char> result must produce a ResultLift");
+    let compound = result_lift
+        .compound()
+        .expect("list<char> result must route through Compound");
+    let Cell::ListOf { element_plan, .. } = &compound.plan.cells[0] else {
+        panic!(
+            "Compound result root must be ListOf, got {:?}",
+            compound.plan.cells[0]
+        );
+    };
+    assert_eq!(element_plan.cells, vec![Cell::Char { flat_slot: 0 }]);
 }
 
 #[test]

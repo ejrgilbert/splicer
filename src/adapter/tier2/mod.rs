@@ -1423,6 +1423,66 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// `list<char>` result — same Compound/retptr path as
+    /// `list<u32>`, but the per-iteration utf-8 scratch + Prestaged
+    /// `CharScratch` ride along on the result side too. The canned
+    /// sweep in `tests/fuzz_and_run.rs` runtime-checks the encoded
+    /// bytes; this is a build-and-validate fast-feedback test.
+    #[test]
+    fn dispatch_module_with_char_list_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (data (i32.const 0x2000) "\78\00\00\00")
+                    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+                        i32.const 0x4000)
+                    (func (export "make") (result i32)
+                        i32.const 0x1000
+                        i32.const 0x2000
+                        i32.store
+                        i32.const 0x1000
+                        i32.const 1
+                        i32.store offset=4
+                        i32.const 0x1000
+                    )
+                    (func (export "cabi_post_make") (param i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "make" (core func $make))
+                (alias core export $i "cabi_post_make" (core func $make_post))
+                (alias core export $i "memory" (core memory $mem))
+                (alias core export $i "cabi_realloc" (core func $realloc))
+                (type $make-ty (func (result (list char))))
+                (func $make-lifted (type $make-ty)
+                    (canon lift (core func $make) (memory $mem) (realloc (func $realloc))
+                        (post-return (func $make_post))))
+                (instance $api-inst (export "make" (func $make-lifted)))
+                (export "my:lcret/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:lcret/api@1.0.0" (instance $api "my:lcret/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:lcret/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for list<char> result");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// Single-flat-slot variant (`variant { only }` → just disc, no
     /// payloads) — comes back flat, not retptr. The
     /// `is_compound_result(Variant) && result_at_retptr` gate falls
