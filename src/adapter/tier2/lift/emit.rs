@@ -293,7 +293,8 @@ fn build_one_list_emit_locals(
     let elem_byte_size = size_align.size(&elem_ty).size_wasm32() as u32;
     let (elem_cell_side, counts) = walk_element_plan(spec.element_plan);
     let char_scratch_base = (counts.chars > 0).then(|| builder.alloc_local(ValType::I32));
-    let tuple_idx_buf_base = (counts.tuple_idx_slots > 0).then(|| builder.alloc_local(ValType::I32));
+    let tuple_idx_buf_base =
+        (counts.tuple_idx_slots > 0).then(|| builder.alloc_local(ValType::I32));
     let chars_per_elem = counts.chars;
     let tuple_idx_count_per_elem = counts.tuple_idx_slots;
     let elem_cell_base = builder.alloc_local(ValType::I32);
@@ -315,8 +316,8 @@ fn build_one_list_emit_locals(
     }
 }
 
-/// Whether any list-element cell across the wrapper's plans (params
-/// + compound result) has the given [`ListElementClass`]. Gates
+/// Whether any list-element cell across the wrapper's plans (
+/// params + compound result) has the given [`ListElementClass`]. Gates
 /// shared wrapper locals (e.g. `list_elem_child_idx`, `tuple_slot_ptr`)
 /// so wrappers without that pattern shed unused locals.
 fn fn_has_list_elem_class(fd: &FuncDispatch, want: ListElementClass) -> bool {
@@ -379,9 +380,7 @@ pub(super) struct ElementCounts {
 /// stale side-data vs. mis-sized buffers. Driven off
 /// [`Cell::list_element_class`] so adding a class forces a fold
 /// arm at compile time.
-pub(super) fn walk_element_plan(
-    element_plan: &LiftPlan,
-) -> (Vec<CellSideData>, ElementCounts) {
+pub(super) fn walk_element_plan(element_plan: &LiftPlan) -> (Vec<CellSideData>, ElementCounts) {
     let mut counts = ElementCounts::default();
     let side: Vec<CellSideData> = element_plan
         .cells
@@ -411,7 +410,9 @@ pub(super) fn walk_element_plan(
                     let off = counts.tuple_idx_slots * 4;
                     counts.tuple_idx_slots += children.len() as u32;
                     CellSideData::Tuple {
-                        source: TupleIdxSource::PerIteration { offset_in_elem: off },
+                        source: TupleIdxSource::PerIteration {
+                            offset_in_elem: off,
+                        },
                     }
                 }
             }
@@ -451,8 +452,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let char_scratch_addr = needs_char_locals.then(|| builder.alloc_local(ValType::I32));
     let list_elem_child_idx =
         fn_has_list_elem_child_idx(fd).then(|| builder.alloc_local(ValType::I32));
-    let tuple_slot_ptr =
-        fn_has_list_elem_tuple(fd).then(|| builder.alloc_local(ValType::I32));
+    let tuple_slot_ptr = fn_has_list_elem_tuple(fd).then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -1100,14 +1100,7 @@ fn emit_list_of_arm(
             .tuple_idx_count_per_elem
             .checked_mul(4)
             .expect("tuple_idx_count_per_elem * 4 overflowed u32");
-        emit_cabi_realloc_call_runtime(
-            f,
-            ctx.cabi_realloc_idx,
-            4,
-            ll.len,
-            elem_bytes,
-            buf_base,
-        );
+        emit_cabi_realloc_call_runtime(f, ctx.cabi_realloc_idx, 4, ll.len, elem_bytes, buf_base);
     }
     cell_layout.emit_list_of(f, lcl.addr, ll.indices_ptr, ll.len);
 

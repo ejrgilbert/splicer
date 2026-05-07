@@ -1095,7 +1095,7 @@ fn list_of_tuple_u32_string_element_plan_shape() {
 
 /// Pull the element_plan out of a top-level `Cell::ListOf`. Helper
 /// for the `walk_element_plan` lockstep tests below.
-fn list_element_plan<'a>(plan: &'a LiftPlan, cell_idx: usize) -> &'a LiftPlan {
+fn list_element_plan(plan: &LiftPlan, cell_idx: usize) -> &LiftPlan {
     match &plan.cells[cell_idx] {
         Cell::ListOf { element_plan, .. } => element_plan,
         other => panic!("expected ListOf at cell {cell_idx}, got {other:?}"),
