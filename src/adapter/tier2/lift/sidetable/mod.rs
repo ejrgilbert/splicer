@@ -327,8 +327,20 @@ pub(super) fn register_side_table_strings(
             }
         }
         if let Some(rl) = &fd.result_lift {
-            if let Some(info) = from_result(&rl.side_table) {
-                ensure_registered(&mut table, names, info);
+            // Compound results: walk the plan (catches infos nested
+            // inside list element plans, etc., symmetric with params).
+            // Direct results: side-table info already carries the cell.
+            match rl.compound() {
+                Some(c) => {
+                    for info in from_plan(&c.plan) {
+                        ensure_registered(&mut table, names, info);
+                    }
+                }
+                None => {
+                    if let Some(info) = from_result(&rl.side_table) {
+                        ensure_registered(&mut table, names, info);
+                    }
+                }
             }
         }
     }
@@ -384,10 +396,13 @@ pub(super) fn build_side_table_blob(
             ));
         }
         per_param.push(params);
-        let result_info = fd
-            .result_lift
-            .as_ref()
-            .and_then(|r| from_result(&r.side_table));
+        // Compound results: derive from the plan (catches infos nested
+        // inside list element plans). Direct results: side-table info
+        // carries the single cell. Mirrors register_side_table_strings.
+        let result_info = fd.result_lift.as_ref().and_then(|r| match r.compound() {
+            Some(c) => from_plan(&c.plan),
+            None => from_result(&r.side_table),
+        });
         per_result.push(append_entries(
             &mut bytes,
             strings,

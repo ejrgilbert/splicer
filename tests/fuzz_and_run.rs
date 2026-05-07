@@ -523,7 +523,13 @@ impl Shape {
                     "None".to_string()
                 }
             }
-            Shape::List(inner) => format!("vec![{}]", inner.rust_literal(side, mode)),
+            Shape::List(inner) => {
+                // wit-bindgen lowers `list<T>` params as `&[T]` with
+                // `T` owned (e.g. `&[String]`, not `&[&str]`) regardless
+                // of outer mode. Force the element to Async-mode so a
+                // `string` element renders as `String::from(...)`.
+                format!("vec![{}]", inner.rust_literal(side, AsyncMode::Async))
+            }
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -1512,13 +1518,37 @@ fn tier2_shapes() -> Vec<Shape> {
         },
         // Single-element list keeps the harness's `expected_debug`
         // predictable (`Shape::List::rust_literal` produces
-        // `vec![<one literal>]`).
+        // `vec![<one literal>]`). Each element type below picks a
+        // distinct lift path: u32 (single i32 slot, zero-extend),
+        // bool (1-byte elem stride, fast path), string (two-slot
+        // element capturing into contiguous elem_flat_locals), enum
+        // (side-table-indexed element).
         Shape::List(Box::new(Shape::Primitive {
             name: "u32",
             wit_type: "u32",
             rust_ty: "u32",
             rust_literal: "42u32",
             expected_debug: "42",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "bool",
+            wit_type: "bool",
+            rust_ty: "bool",
+            rust_literal: "true",
+            expected_debug: "true",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "string",
+            wit_type: "string",
+            rust_ty: "String",
+            rust_literal: r#"String::from("hi")"#,
+            expected_debug: r#""hi""#,
+        })),
+        Shape::List(Box::new(Shape::Enum {
+            wit_name: "color",
+            rust_name: "Color",
+            cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+            selected: 1,
         })),
     ]
 }

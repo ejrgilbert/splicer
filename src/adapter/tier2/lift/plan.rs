@@ -267,32 +267,54 @@ impl LiftPlan {
         self.root
     }
 
-    /// Iterator over every `Cell::EnumCase` in the plan. Used by
-    /// the side-table builder to register enum strings.
-    pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
-        self.cells.iter().filter_map(|op| match op {
-            Cell::EnumCase { info, .. } => Some(info),
-            _ => None,
-        })
+    /// Recursively walk every cell in the plan, including cells nested
+    /// inside `Cell::ListOf::element_plan`. Side-table-info iterators
+    /// build on this so an enum/flags/variant cell that lives in a list
+    /// element still surfaces its info to the builder.
+    fn walk_cells_recursive(&self) -> Vec<&Cell> {
+        let mut out = Vec::with_capacity(self.cells.len());
+        for cell in &self.cells {
+            out.push(cell);
+            if let Cell::ListOf { element_plan, .. } = cell {
+                out.extend(element_plan.walk_cells_recursive());
+            }
+        }
+        out
     }
 
-    /// Iterator over every `Cell::Flags` in the plan. Used by the
+    /// Iterator over every `Cell::EnumCase` in the plan tree
+    /// (including list element plans). Used by the side-table builder
+    /// to register enum strings.
+    pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
+        self.walk_cells_recursive()
+            .into_iter()
+            .filter_map(|op| match op {
+                Cell::EnumCase { info, .. } => Some(info),
+                _ => None,
+            })
+    }
+
+    /// Iterator over every `Cell::Flags` in the plan tree. Used by the
     /// side-table builder to register flag-type and flag-name strings.
     pub(super) fn flags_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
-        self.cells.iter().filter_map(|op| match op {
-            Cell::Flags { info, .. } => Some(info),
-            _ => None,
-        })
+        self.walk_cells_recursive()
+            .into_iter()
+            .filter_map(|op| match op {
+                Cell::Flags { info, .. } => Some(info),
+                _ => None,
+            })
     }
 
-    /// Iterator over every `Cell::Variant` in the plan. Used by the
-    /// side-table builder to register variant-type and case-name
+    /// Iterator over every `Cell::Variant` in the plan tree. Used by
+    /// the side-table builder to register variant-type and case-name
     /// strings.
     pub(super) fn variant_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
-        self.cells.iter().filter_map(|op| match op {
-            Cell::Variant { info, .. } => Some(info),
-            _ => None,
-        })
+        self.walk_cells_recursive()
+            .into_iter()
+            .filter_map(|op| match op {
+                Cell::Variant { info, .. } => Some(info),
+                _ => None,
+            })
     }
 
     /// Placeholder plan after a sub-`for_type` error; never reaches emit.
