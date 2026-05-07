@@ -45,6 +45,7 @@ pub fn call_id_val(iface: &str, func: &str) -> Val {
     Val::Record(vec![
         ("interface-name".into(), Val::String(iface.into())),
         ("function-name".into(), Val::String(func.into())),
+        ("id".into(), Val::U64(0)),
     ])
 }
 
