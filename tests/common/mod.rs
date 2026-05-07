@@ -49,6 +49,20 @@ pub fn call_id_val(iface: &str, func: &str) -> Val {
     ])
 }
 
+/// Empty `span-context` — all-zero ids, no flags, no state. Returned
+/// by fake `outer-span-context` host fns so the builtin sees "no host
+/// parent" and either mints a fresh trace-id (tracing) or leaves
+/// trace-correlation fields unset on emitted records (logs).
+pub fn empty_span_context() -> Val {
+    Val::Record(vec![
+        ("trace-id".into(), Val::String(String::new())),
+        ("span-id".into(), Val::String(String::new())),
+        ("trace-flags".into(), Val::Flags(vec![])),
+        ("is-remote".into(), Val::Bool(false)),
+        ("trace-state".into(), Val::List(vec![])),
+    ])
+}
+
 /// Drive a single `on-call` → `on-return` cycle on the embedded
 /// builtin against a synthetic call-id targeting `TARGET_IFACE` /
 /// `TARGET_FN`.

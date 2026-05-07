@@ -110,6 +110,14 @@ fn test_resolve() -> Resolve {
     r
 }
 
+/// One-shot fixture init — pairs the standard test resolve with a
+/// fresh interner. Tests that thread the interner through both the
+/// plan-builder and a `record_of` assertion fixture rely on dedup
+/// across both sides, so they share one interner per test.
+fn setup() -> (Resolve, NameInterner) {
+    (test_resolve(), NameInterner::new())
+}
+
 fn iface_id(resolve: &Resolve) -> wit_parser::InterfaceId {
     super::super::test_utils::iface_by_unversioned_qname(resolve, "test:lift/t")
 }
@@ -146,6 +154,32 @@ fn plan_for(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan 
 
 fn plan_for_named(name: &str, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
     plan_for(&type_named(resolve, name), resolve, names)
+}
+
+/// Plan for the first param of `func_name` in the fixture WIT — the
+/// shape `plan_for(&func_named(r, name).params[0].ty, r, names)` shows
+/// up everywhere because the fixture funcs are written as
+/// `f-X(p: ty)`, with `p` carrying the type under test.
+fn plan_for_param(func_name: &str, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
+    plan_for(&func_named(resolve, func_name).params[0].ty, resolve, names)
+}
+
+/// Pin a plan's full shape — cells, root, flat-slot count — in one
+/// call. `#[track_caller]` makes the assertion failure point at the
+/// test, not this helper.
+#[track_caller]
+fn assert_plan(plan: &LiftPlan, cells: Vec<Cell>, root: u32, slot_count: u32) {
+    assert_eq!(plan.cells, cells);
+    assert_eq!(plan.root(), root);
+    assert_eq!(plan.flat_slot_count, slot_count);
+}
+
+/// Like [`assert_plan`] for the handful of tests that don't pin
+/// `root` (because the cell layout already determines it implicitly).
+#[track_caller]
+fn assert_plan_no_root(plan: &LiftPlan, cells: Vec<Cell>, slot_count: u32) {
+    assert_eq!(plan.cells, cells);
+    assert_eq!(plan.flat_slot_count, slot_count);
 }
 
 /// `NamedListInfo { type_name, item_names }` shorthand for fixtures.
@@ -569,18 +603,17 @@ fn string_takes_two_flat_slots() {
 
 #[test]
 fn list_u8_classifies_as_bytes_cell() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let bytes_ty = func_named(&r, "f-mixed").params[2].ty;
     let plan = plan_for(&bytes_ty, &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    assert_plan_no_root(
+        &plan,
         vec![Cell::Bytes {
             ptr_slot: 0,
-            len_slot: 1
-        }]
+            len_slot: 1,
+        }],
+        2,
     );
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
@@ -594,8 +627,7 @@ fn char_assigns_one_cell_one_slot() {
 
 #[test]
 fn enum_carries_named_list_info() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     assert_eq!(
         plan_for_named("color", &r, &mut names).cells,
         vec![Cell::EnumCase {
@@ -610,17 +642,16 @@ fn flags_assigns_one_cell_one_slot() {
     // `fperms` has 3 flags; canonical-ABI lowers them all into a
     // single i32 (caps at 32 bits). Plan is one Flags cell at
     // flat_slot 0 carrying the full NamedListInfo.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("fperms", &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    assert_plan_no_root(
+        &plan,
         vec![Cell::Flags {
             flat_slot: 0,
             info: enum_info("fperms", &["read", "write", "exec"]),
         }],
+        1,
     );
-    assert_eq!(plan.flat_slot_count, 1);
 }
 
 #[test]
@@ -630,11 +661,10 @@ fn variant_lays_disc_first_then_arms_share_slots() {
     //   sq's u32   → cell 0 (slot 1)
     //   tri's u32  → cell 1 (slot 1, shares with sq's slot)
     //   Variant    → cell 2 (disc=0, per_case_payload=[None, Some(0), Some(1)])
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("shape", &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::IntegerZeroExt { flat_slot: 1 },
@@ -644,9 +674,9 @@ fn variant_lays_disc_first_then_arms_share_slots() {
                 info: enum_info("shape", &["circle", "sq", "tri"]),
             },
         ],
+        2,
+        2,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
@@ -654,12 +684,11 @@ fn record_with_variant_field_recurses_into_variant() {
     // shape-pair { lhs: shape, rhs: shape }: each variant claims one
     // disc slot + one shared-payload slot; arms share inside each
     // variant but lhs and rhs occupy independent slots.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("shape-pair", &r, &mut names);
     let shape_info = enum_info("shape", &["circle", "sq", "tri"]);
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::IntegerZeroExt { flat_slot: 1 },
@@ -677,9 +706,9 @@ fn record_with_variant_field_recurses_into_variant() {
             },
             record_of(&mut names, "shape-pair", &[("lhs", 2), ("rhs", 5)]),
         ],
+        6,
+        4,
     );
-    assert_eq!(plan.root(), 6);
-    assert_eq!(plan.flat_slot_count, 4);
 }
 
 #[test]
@@ -688,20 +717,19 @@ fn handle_assigns_one_cell_one_slot() {
     // Cell::Handle with the resource's pre-interned type-name. The
     // interner dedupes, so re-interning "my-res" off the same
     // `names` returns the BlobSlice already on the cell.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(&func_named(&r, "f-handle-own").params[0].ty, &r, &mut names);
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-handle-own", &r, &mut names);
     let res_name = names.intern("my-res");
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![Cell::Handle {
             flat_slot: 0,
             type_name: res_name,
             kind: HandleKind::Resource,
         }],
+        0,
+        1,
     );
-    assert_eq!(plan.root(), 0);
-    assert_eq!(plan.flat_slot_count, 1);
 }
 
 #[test]
@@ -709,14 +737,9 @@ fn borrow_handle_takes_same_shape_as_own() {
     // borrow<R> and own<R> both flatten to a single i32 (the canonical-
     // ABI handle); the lift codegen treats them identically. The
     // ownership distinction is the adapter's job, not the lift's.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let own_plan = plan_for(&func_named(&r, "f-handle-own").params[0].ty, &r, &mut names);
-    let borrow_plan = plan_for(
-        &func_named(&r, "f-handle-borrow").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let own_plan = plan_for_param("f-handle-own", &r, &mut names);
+    let borrow_plan = plan_for_param("f-handle-borrow", &r, &mut names);
     assert_eq!(own_plan.cells, borrow_plan.cells);
     assert_eq!(own_plan.flat_slot_count, borrow_plan.flat_slot_count);
 }
@@ -729,12 +752,11 @@ fn record_with_handle_field_recurses_into_handle() {
     //   hp         → cell 2 (RecordOf primary=0, secondary=1)
     // Both fields point at the same `my-res` resource, so the
     // pre-interned type-name BlobSlice is shared (interner dedupes).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("handle-pair", &r, &mut names);
     let res_name = names.intern("my-res");
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::Handle {
                 flat_slot: 0,
@@ -752,63 +774,52 @@ fn record_with_handle_field_recurses_into_handle() {
                 &[("primary", 0), ("secondary", 1)],
             ),
         ],
+        2,
+        2,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
 fn stream_handle_assigns_one_cell_one_slot() {
     // stream<u32>: single i32 (canonical-ABI handle); type-name
     // empty (anonymous element type for primitives).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(&func_named(&r, "f-stream-u32").params[0].ty, &r, &mut names);
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-stream-u32", &r, &mut names);
     let empty = names.intern("");
-    assert_eq!(
-        plan.cells,
+    assert_plan_no_root(
+        &plan,
         vec![Cell::Handle {
             flat_slot: 0,
             type_name: empty,
             kind: HandleKind::Stream,
         }],
+        1,
     );
-    assert_eq!(plan.flat_slot_count, 1);
 }
 
 #[test]
 fn future_handle_takes_same_shape_as_stream() {
     // future<T> and stream<T> share `Cell::Handle` — only the
     // `kind` differs.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-future-string").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-future-string", &r, &mut names);
     let empty = names.intern("");
-    assert_eq!(
-        plan.cells,
+    assert_plan_no_root(
+        &plan,
         vec![Cell::Handle {
             flat_slot: 0,
             type_name: empty,
             kind: HandleKind::Future,
         }],
+        1,
     );
-    assert_eq!(plan.flat_slot_count, 1);
 }
 
 #[test]
 fn stream_with_named_element_carries_element_type_name() {
     // stream<my-res>: type-name = "my-res" (named element type).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-stream-of-res").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-stream-of-res", &r, &mut names);
     let res_name = names.intern("my-res");
     assert_eq!(
         plan.cells,
@@ -828,12 +839,11 @@ fn record_with_stream_and_future_fields_recurses_into_handle() {
     //   sp     → cell 2 (RecordOf events=0, ack=1)
     // Pins that the same recursion machinery as resource handles
     // works for stream/future fields, with `kind` plumbed through.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("stream-pair", &r, &mut names);
     let empty = names.intern("");
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::Handle {
                 flat_slot: 0,
@@ -845,35 +855,30 @@ fn record_with_stream_and_future_fields_recurses_into_handle() {
                 type_name: empty,
                 kind: HandleKind::Future,
             },
-            record_of(&mut names, "stream-pair", &[("events", 0), ("ack", 1)],),
+            record_of(&mut names, "stream-pair", &[("events", 0), ("ack", 1)]),
         ],
+        2,
+        2,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
 fn error_context_assigns_one_cell_one_slot() {
     // `error-context`: a single i32 (canonical-ABI handle); type-name
     // empty (no nested type to surface — the cell-disc names the kind).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-error-context").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-error-context", &r, &mut names);
     let empty = names.intern("");
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![Cell::Handle {
             flat_slot: 0,
             type_name: empty,
             kind: HandleKind::ErrorContext,
         }],
+        0,
+        1,
     );
-    assert_eq!(plan.root(), 0);
-    assert_eq!(plan.flat_slot_count, 1);
 }
 
 #[test]
@@ -885,16 +890,11 @@ fn result_with_error_context_err_arm_recurses_into_handle() {
     //   parent      → cell 2 (Result disc=0, ok=Some(0), err=Some(1))
     // The err-arm Handle cell shares flat slot 1 with the ok-arm
     // payload cell — joined result layout.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-with-err-ctx").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-with-err-ctx", &r, &mut names);
     let empty = names.intern("");
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerSignExt { flat_slot: 1 },
             Cell::Handle {
@@ -908,18 +908,17 @@ fn result_with_error_context_err_arm_recurses_into_handle() {
                 err_idx: Some(1),
             },
         ],
+        2,
+        2,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
 fn list_of_primitive_carries_element_plan() {
     // list<u32>: parent (ptr, len) → 2 i32 slots, 1 cell. Element
     // plan has its own flat slots — independent from the parent.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names);
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-u32", &r, &mut names);
     assert_eq!(plan.cells.len(), 1);
     let Cell::ListOf {
         ptr_slot,
@@ -947,13 +946,8 @@ fn list_of_primitive_carries_element_plan() {
 fn list_of_string_element_plan_uses_two_local_slots() {
     // list<string>: element string is (ptr, len) → 2 flat slots,
     // local to the element plan. Parent still 2 slots + 1 cell.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-list-string").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-string", &r, &mut names);
     assert_eq!(plan.flat_slot_count, 2);
     let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
         panic!("expected Cell::ListOf");
@@ -972,8 +966,7 @@ fn list_of_string_element_plan_uses_two_local_slots() {
 fn nested_list_bails_at_plan_build() {
     // list<list<u32>>: nested lists aren't a supported element shape;
     // plan-build surfaces the inner failure to the outer caller.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let err = LiftPlan::for_type(
         &func_named(&r, "f-list-of-list").params[0].ty,
         &r,
@@ -989,8 +982,7 @@ fn nested_list_bails_at_plan_build() {
 fn list_of_compound_element_bails_at_plan_build() {
     // list<point>: record element types aren't a supported list element
     // shape today (compound element types defer to a later landing).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let err = LiftPlan::for_type(
         &func_named(&r, "f-list-of-record").params[0].ty,
         &r,
@@ -1006,13 +998,8 @@ fn list_of_compound_element_bails_at_plan_build() {
 fn list_inside_result_arm_carries_disc_guards() {
     // result<list<u32>, list<u32>>: each arm's list snapshots the
     // outer disc — ok-arm guard expects 0, err-arm 1.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-list-list").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-list-list", &r, &mut names);
     assert_eq!(plan.cells.len(), 3);
     let Cell::ListOf {
         arm_guards: ok_guards,
@@ -1049,13 +1036,8 @@ fn list_inside_result_arm_carries_disc_guards() {
 fn list_inside_variant_arm_carries_case_disc_guard() {
     // variant list-or-int { with-list(list<u32>), plain(u32) }:
     // case 0 carries a guard expecting disc=0; case 1 has no list.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-variant-list-arm").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-variant-list-arm", &r, &mut names);
     let Cell::ListOf { arm_guards, .. } = &plan.cells[0] else {
         panic!("expected Cell::ListOf at 0");
     };
@@ -1073,13 +1055,8 @@ fn list_inside_nested_arms_stacks_guards_outer_to_inner() {
     // result<variant { with-list(list<u32>), plain(u32) }, u32>:
     // outer disc at slot 0, inner disc inside the ok arm at slot 1,
     // list-of inside `with-list` payload. Stack must be outer→inner.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-of-variant-with-list").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-of-variant-with-list", &r, &mut names);
     let Cell::ListOf { arm_guards, .. } = &plan.cells[0] else {
         panic!("expected Cell::ListOf at 0, got {:?}", plan.cells[0]);
     };
@@ -1170,36 +1147,15 @@ fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
     // somewhere reachable: guard count == joined-arm ancestor count.
     // Catches future regressions in `push_arm` / `push_list_of` /
     // `push_result` / `push_variant`.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plans = [
-        plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-list-string").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-list-u32", &r, &mut names),
+        plan_for_param("f-list-string", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-option-list").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-list-list").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-variant-list-arm").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-of-variant-with-list").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-option-list", &r, &mut names),
+        plan_for_param("f-result-list-list", &r, &mut names),
+        plan_for_param("f-variant-list-arm", &r, &mut names),
+        plan_for_param("f-result-of-variant-with-list", &r, &mut names),
     ];
     for plan in &plans {
         assert_arm_guards_match_joined_ancestry(plan);
@@ -1210,13 +1166,8 @@ fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
 fn list_inside_option_is_allowed() {
     // Option's payload slots are dedicated, not joined — guard must
     // not fire here.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-option-list").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-option-list", &r, &mut names);
     assert_eq!(plan.cells.len(), 2);
     let Cell::ListOf { arm_guards, .. } = &plan.cells[0] else {
         panic!("expected Cell::ListOf at 0");
@@ -1234,15 +1185,14 @@ fn record_with_list_field_recurses_into_list() {
     //   items   → cell 0 (ListOf, slots 0..1)
     //   scores  → cell 1 (ListOf, slots 2..3)
     //   parent  → cell 2 (RecordOf items=0, scores=1)
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("list-pair", &r, &mut names);
     assert_eq!(plan.cells.len(), 3);
     assert!(matches!(plan.cells[0], Cell::ListOf { .. }));
     assert!(matches!(plan.cells[1], Cell::ListOf { .. }));
     assert_eq!(
         plan.cells[2],
-        record_of(&mut names, "list-pair", &[("items", 0), ("scores", 1)],),
+        record_of(&mut names, "list-pair", &[("items", 0), ("scores", 1)]),
     );
     assert_eq!(plan.flat_slot_count, 4);
     assert_eq!(plan.root(), 2);
@@ -1254,11 +1204,10 @@ fn record_with_flags_field_recurses_into_flags() {
     //   primary    → cell 0 (Flags slot 0)
     //   secondary  → cell 1 (Flags slot 1)
     //   pp         → cell 2 (RecordOf primary=0, secondary=1)
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("perms-pair", &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::Flags {
                 flat_slot: 0,
@@ -1274,42 +1223,40 @@ fn record_with_flags_field_recurses_into_flags() {
                 &[("primary", 0), ("secondary", 1)],
             ),
         ],
+        2,
+        2,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
 fn record_lays_children_before_parent() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("point", &r, &mut names);
     // Children-first: u32 + s32 land at indices 0 and 1, the parent
     // RecordOf is appended last and references them. Plan.root
     // points at the parent's cell index (2), not at cells[0].
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
             record_of(&mut names, "point", &[("x", 0), ("y", 1)]),
         ],
+        2,
+        2,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
 fn nested_record_walks_depth_first() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("nested", &r, &mut names);
     // Depth-first, children-before-parent: the inner `point`'s
     // primitive children land at 0/1, then `point`'s parent at 2,
     // then the `color` enum at 3, then the outer `nested` parent at
     // 4. plan.root() is the outer parent.
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
@@ -1320,31 +1267,29 @@ fn nested_record_walks_depth_first() {
             },
             record_of(&mut names, "nested", &[("p", 2), ("c", 3)]),
         ],
+        4,
+        3,
     );
-    assert_eq!(plan.root(), 4);
-    assert_eq!(plan.flat_slot_count, 3);
 }
 
 #[test]
 fn tuple_lays_children_before_parent() {
     // tuple<u8, s32>: u8 → cell 0, s32 → cell 1, TupleOf parent → cell 2.
     // Plan-relative flat slots: u8 slot 0, s32 slot 1, parent consumes none.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let f = func_named(&r, "f-tuple");
-    let plan = plan_for(&f.params[0].ty, &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-tuple", &r, &mut names);
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
             Cell::TupleOf {
-                children: vec![0, 1]
+                children: vec![0, 1],
             },
         ],
+        2,
+        2,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
@@ -1355,26 +1300,24 @@ fn nested_tuple_walks_depth_first() {
     //   s32    → cell 2 (slot 2)
     //   inner  → cell 3 (children=[1, 2])
     //   outer  → cell 4 (children=[0, 3])
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let f = func_named(&r, "f-tuple-of-tuple");
-    let plan = plan_for(&f.params[0].ty, &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-tuple-of-tuple", &r, &mut names);
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
             Cell::IntegerSignExt { flat_slot: 2 },
             Cell::TupleOf {
-                children: vec![1, 2]
+                children: vec![1, 2],
             },
             Cell::TupleOf {
-                children: vec![0, 3]
+                children: vec![0, 3],
             },
         ],
+        4,
+        3,
     );
-    assert_eq!(plan.root(), 4);
-    assert_eq!(plan.flat_slot_count, 3);
 }
 
 #[test]
@@ -1387,11 +1330,10 @@ fn record_with_tuple_field_recurses_into_tuple() {
     //   t.1   → cell 4 (slot 3, s32)
     //   t     → cell 5 (TupleOf children=[3, 4])
     //   pat   → cell 6 (RecordOf p=2, t=5)
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("point-and-tuple", &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
@@ -1399,13 +1341,13 @@ fn record_with_tuple_field_recurses_into_tuple() {
             Cell::IntegerZeroExt { flat_slot: 2 },
             Cell::IntegerSignExt { flat_slot: 3 },
             Cell::TupleOf {
-                children: vec![3, 4]
+                children: vec![3, 4],
             },
             record_of(&mut names, "point-and-tuple", &[("p", 2), ("t", 5)]),
         ],
+        6,
+        4,
     );
-    assert_eq!(plan.root(), 6);
-    assert_eq!(plan.flat_slot_count, 4);
 }
 
 #[test]
@@ -1414,11 +1356,10 @@ fn option_allocates_disc_before_inner() {
     // Cell order is children-before-parent, so the IntegerZeroExt for
     // the inner u32 lands at cell 0 (with flat_slot=1) and the Option
     // parent at cell 1 (with disc_slot=0).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(&func_named(&r, "f-option-u32").params[0].ty, &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-option-u32", &r, &mut names);
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::Option {
@@ -1426,9 +1367,9 @@ fn option_allocates_disc_before_inner() {
                 child_idx: 0,
             },
         ],
+        1,
+        2,
     );
-    assert_eq!(plan.root(), 1);
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
@@ -1436,15 +1377,10 @@ fn option_of_string_keeps_canonical_disc_first() {
     // option<string>: [disc i32, ptr i32, len i32] in canonical-ABI
     // order. Plan-builder bumps disc first (slot 0), then string's
     // (ptr=1, len=2). Cell ordering still places the leaf first.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-option-string").params[0].ty,
-        &r,
-        &mut names,
-    );
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-option-string", &r, &mut names);
+    assert_plan_no_root(
+        &plan,
         vec![
             Cell::Text {
                 ptr_slot: 1,
@@ -1455,8 +1391,8 @@ fn option_of_string_keeps_canonical_disc_first() {
                 child_idx: 0,
             },
         ],
+        3,
     );
-    assert_eq!(plan.flat_slot_count, 3);
 }
 
 #[test]
@@ -1464,15 +1400,10 @@ fn nested_option_walks_disc_per_layer() {
     // option<option<u32>>: outer disc → slot 0, inner disc → slot 1,
     // u32 → slot 2. Cell order: leaf u32 (cell 0), inner Option (cell
     // 1, disc=1, child=0), outer Option (cell 2, disc=0, child=1).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-option-option").params[0].ty,
-        &r,
-        &mut names,
-    );
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-option-option", &r, &mut names);
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 2 },
             Cell::Option {
@@ -1484,9 +1415,9 @@ fn nested_option_walks_disc_per_layer() {
                 child_idx: 1,
             },
         ],
+        2,
+        3,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 3);
 }
 
 #[test]
@@ -1498,11 +1429,10 @@ fn record_with_option_field_recurses_into_option() {
     //   o.inner → cell 3 (slot 3, u32)  -- disc bumped first → slot 2
     //   o    → cell 4 (Option { disc:2, child:3 })
     //   pao  → cell 5 (RecordOf p=2, o=4)
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("point-and-option", &r, &mut names);
-    assert_eq!(
-        plan.cells,
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
@@ -1514,9 +1444,9 @@ fn record_with_option_field_recurses_into_option() {
             },
             record_of(&mut names, "point-and-option", &[("p", 2), ("o", 4)]),
         ],
+        5,
+        4,
     );
-    assert_eq!(plan.root(), 5);
-    assert_eq!(plan.flat_slot_count, 4);
 }
 
 #[test]
@@ -1527,15 +1457,10 @@ fn result_u32_string_shares_arms_flat_slots() {
     //   IntegerZeroExt {flat_slot:1}  // ok arm leaf
     //   Text {ptr:1, len:2}           // err arm leaf
     //   Result { disc:0, ok:Some(0), err:Some(1) }
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-u32-string").params[0].ty,
-        &r,
-        &mut names,
-    );
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-u32-string", &r, &mut names);
+    assert_plan(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::Text {
@@ -1548,9 +1473,9 @@ fn result_u32_string_shares_arms_flat_slots() {
                 err_idx: Some(1),
             },
         ],
+        2,
+        3,
     );
-    assert_eq!(plan.root(), 2);
-    assert_eq!(plan.flat_slot_count, 3);
 }
 
 #[test]
@@ -1559,15 +1484,10 @@ fn result_u32_u64_records_joined_flat_widening() {
     // [I32 disc, I64 (= max width)]. Ok arm's leaf reads slot 1
     // expecting I32 — emit must bitcast I64→I32. Err arm matches
     // joined; no bitcast.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-u32-u64").params[0].ty,
-        &r,
-        &mut names,
-    );
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-u32-u64", &r, &mut names);
+    assert_plan_no_root(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::Integer64 { flat_slot: 1 },
@@ -1577,8 +1497,8 @@ fn result_u32_u64_records_joined_flat_widening() {
                 err_idx: Some(1),
             },
         ],
+        2,
     );
-    assert_eq!(plan.flat_slot_count, 2);
     // Disc never widens (joined position 0 is always I32).
     assert!(plan.widening_for(0).is_none());
     assert_eq!(plan.widening_for(1), Some(WasmType::I64));
@@ -1591,13 +1511,8 @@ fn variant_f32_widen_records_f32_arm_widening() {
     // because there was no F32 scratch local. `lcl.widen_f32` lifts
     // that. variant { a(f32), b(u64) }: joined = [I32 disc, I64];
     // arm a's F32 leaf at slot 1 widens, arm b matches.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-variant-f32-widen").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-variant-f32-widen", &r, &mut names);
     assert_eq!(plan.flat_slot_count, 2);
     assert!(plan.widening_for(0).is_none());
     assert_eq!(plan.widening_for(1), Some(WasmType::I64));
@@ -1612,13 +1527,8 @@ fn variant_tri_arm_records_joined_flat_widening() {
     // (max width across arms)]. a + c widen (I32 / F64 vs I64),
     // b matches — slot_widening[1] is recorded once (idempotent
     // across arms; joined is structural).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-variant-tri-arm").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-variant-tri-arm", &r, &mut names);
     assert_eq!(plan.flat_slot_count, 2);
     assert!(plan.widening_for(0).is_none());
     assert_eq!(plan.widening_for(1), Some(WasmType::I64));
@@ -1629,13 +1539,8 @@ fn result_u32_string_records_no_widening() {
     // result<u32, string>: ok flat = [I32], err flat = [I32, I32];
     // joined = [I32, I32, I32]. Every arm position matches the
     // joined wasm type → no widening recorded.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-u32-string").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-u32-string", &r, &mut names);
     for slot in 0..plan.flat_slot_count {
         assert!(
             plan.widening_for(slot).is_none(),
@@ -1648,15 +1553,10 @@ fn result_u32_string_records_no_widening() {
 fn result_unit_ok_skips_ok_child() {
     // result<_, string>: Ok arm is unit, no child cell. Err=string
     // claims slots 1, 2. ok_idx=None, err_idx=Some(0).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-unit-err").params[0].ty,
-        &r,
-        &mut names,
-    );
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-unit-err", &r, &mut names);
+    assert_plan_no_root(
+        &plan,
         vec![
             Cell::Text {
                 ptr_slot: 1,
@@ -1668,23 +1568,18 @@ fn result_unit_ok_skips_ok_child() {
                 err_idx: Some(0),
             },
         ],
+        3,
     );
-    assert_eq!(plan.flat_slot_count, 3);
 }
 
 #[test]
 fn result_unit_err_skips_err_child() {
     // result<u32>: only Ok arm has a payload. ok_idx=Some(0),
     // err_idx=None. Total 2 slots (disc + u32).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-ok-unit").params[0].ty,
-        &r,
-        &mut names,
-    );
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-ok-unit", &r, &mut names);
+    assert_plan_no_root(
+        &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::Result {
@@ -1693,30 +1588,25 @@ fn result_unit_err_skips_err_child() {
                 err_idx: None,
             },
         ],
+        2,
     );
-    assert_eq!(plan.flat_slot_count, 2);
 }
 
 #[test]
 fn result_both_unit_is_disc_only() {
     // result<_, _>: both arms unit. Just the disc, no children.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-result-both-unit").params[0].ty,
-        &r,
-        &mut names,
-    );
-    assert_eq!(
-        plan.cells,
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-result-both-unit", &r, &mut names);
+    assert_plan(
+        &plan,
         vec![Cell::Result {
             disc_slot: 0,
             ok_idx: None,
             err_idx: None,
         }],
+        0,
+        1,
     );
-    assert_eq!(plan.root(), 0);
-    assert_eq!(plan.flat_slot_count, 1);
 }
 
 #[test]
@@ -1726,8 +1616,7 @@ fn classify_func_params_yields_plan_relative_slots() {
     // cursor. b's bytes cell holds slots (0, 1) regardless of its
     // absolute wasm-local position (3, 4) in the wrapper. Pins
     // the local-base-independence invariant.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names)
         .expect("f-mixed params must classify");
     assert_eq!(
@@ -1752,8 +1641,7 @@ fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
     // per-param `flat_slot_count` into the cumulative `local_base`
     // it passes to `emit_lift_plan`. f-mixed(a: bool, s: string,
     // b: list<u8>, x: s64) → cumulative starts 0, 1, 3, 5; total 6.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names)
         .expect("f-mixed params must classify");
     let starts: Vec<u32> = params
@@ -1777,8 +1665,7 @@ fn char_scratch_sizes_count_single_cell_char_result() {
     // raw `result_ty`), so a `type my-char = char` alias works.
     use super::classify::SideTableInfo;
     use super::sidetable::char_info::char_scratch_sizes;
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let mut fd = func_with_params(&r, &mut names, &[]);
     fd.result_ty = Some(Type::Char);
     fd.result_lift = Some(ResultLift {
@@ -1797,8 +1684,7 @@ fn flags_scratch_sizes_count_both_param_and_result_cells() {
     // crashes the builder's `scratch_addrs.next()` expect.
     use super::classify::{CompoundResult, SideTableInfo};
     use super::sidetable::flags_info::flags_scratch_sizes;
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let fd_param = func_with_params(&r, &mut names, &["fperms"]);
     let mut fd_result = func_with_params(&r, &mut names, &[]);
     fd_result.result_lift = Some(ResultLift {
@@ -1820,8 +1706,7 @@ fn flags_scratch_sizes_count_both_param_and_result_cells() {
 
 #[test]
 fn enum_strings_dedup_across_funcs() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let funcs = vec![
         func_with_params(&r, &mut names, &["color"]),
         func_with_params(&r, &mut names, &["color"]),
@@ -1839,8 +1724,7 @@ fn name_interner_dedupes_record_strings_across_plans() {
     // dedup folds repeats into one copy. Pins the property the old
     // `register_record_strings` test was actually asserting (one
     // string per type-name across the whole interface).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let _ = vec![
         func_with_params(&r, &mut names, &["point"]),
         func_with_params(&r, &mut names, &["point", "nested"]),
@@ -1866,8 +1750,7 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
     // 2 funcs, 3 params total — exactly the audit's request.
     // f-point(p: point):                 1 RecordOf cell
     // f-mix-records(p: point, n: nested): 1 + 2 RecordOf cells
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let funcs = vec![
         func_with_params(&r, &mut names, &["point"]),
         func_with_params(&r, &mut names, &["point", "nested"]),
@@ -1916,9 +1799,8 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
 fn emit_lift_plan_validates_every_classify_built_shape() {
     // Every wired Cell variant: classify a fixture WIT type, emit,
     // validate. Adding a new kind = adding a row.
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let primitive_plans = [
+    let (r, mut names) = setup();
+    let plans = [
         plan_for(&Type::Bool, &r, &mut names),
         plan_for(&Type::S32, &r, &mut names),
         plan_for(&Type::U32, &r, &mut names),
@@ -1935,119 +1817,43 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_named("nested", &r, &mut names),
         plan_for_named("perms-pair", &r, &mut names),
         plan_for_named("shape-pair", &r, &mut names),
-        plan_for(&func_named(&r, "f-tuple").params[0].ty, &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-tuple-of-tuple").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-tuple", &r, &mut names),
+        plan_for_param("f-tuple-of-tuple", &r, &mut names),
         plan_for_named("point-and-tuple", &r, &mut names),
-        plan_for(&func_named(&r, "f-option-u32").params[0].ty, &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-option-string").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-option-option").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-option-u32", &r, &mut names),
+        plan_for_param("f-option-string", &r, &mut names),
+        plan_for_param("f-option-option", &r, &mut names),
         plan_for_named("point-and-option", &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-result-u32-string").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-unit-err").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-ok-unit").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-both-unit").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-u32-u64").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-variant-tri-arm").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-result-u32-string", &r, &mut names),
+        plan_for_param("f-result-unit-err", &r, &mut names),
+        plan_for_param("f-result-ok-unit", &r, &mut names),
+        plan_for_param("f-result-both-unit", &r, &mut names),
+        plan_for_param("f-result-u32-u64", &r, &mut names),
+        plan_for_param("f-variant-tri-arm", &r, &mut names),
         // F32-arm widening: drives `lcl.widen_f32` through emit; a
         // regression that re-introduces the F32 panic surfaces here.
-        plan_for(
-            &func_named(&r, "f-variant-f32-widen").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(&func_named(&r, "f-handle-own").params[0].ty, &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-handle-borrow").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-variant-f32-widen", &r, &mut names),
+        plan_for_param("f-handle-own", &r, &mut names),
+        plan_for_param("f-handle-borrow", &r, &mut names),
         plan_for_named("handle-pair", &r, &mut names),
-        plan_for(&func_named(&r, "f-stream-u32").params[0].ty, &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-future-string").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-stream-of-res").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-stream-u32", &r, &mut names),
+        plan_for_param("f-future-string", &r, &mut names),
+        plan_for_param("f-stream-of-res", &r, &mut names),
         plan_for_named("stream-pair", &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-error-context").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-with-err-ctx").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-error-context", &r, &mut names),
+        plan_for_param("f-result-with-err-ctx", &r, &mut names),
         // Scalar-element lists only (compound elements gated at
         // `push_list_of` via `Cell::allowed_as_list_element`).
-        plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names),
-        plan_for(
-            &func_named(&r, "f-list-string").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-list-u32", &r, &mut names),
+        plan_for_param("f-list-string", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
         // Lists nested in joined arms — guards on the bump pre-pass
         // and on `emit_list_of_arm` body. Last entry stacks to depth 2.
-        plan_for(
-            &func_named(&r, "f-result-list-list").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-variant-list-arm").params[0].ty,
-            &r,
-            &mut names,
-        ),
-        plan_for(
-            &func_named(&r, "f-result-of-variant-with-list").params[0].ty,
-            &r,
-            &mut names,
-        ),
+        plan_for_param("f-result-list-list", &r, &mut names),
+        plan_for_param("f-variant-list-arm", &r, &mut names),
+        plan_for_param("f-result-of-variant-with-list", &r, &mut names),
     ];
-    for plan in &primitive_plans {
+    for plan in &plans {
         validate_emit_lift_plan(plan, &r);
     }
 }
@@ -2056,21 +1862,15 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
 
 #[test]
 fn list_of_u32_emits_valid_wasm() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names);
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-u32", &r, &mut names);
     validate_emit_lift_plan(&plan, &r);
 }
 
 #[test]
 fn list_of_string_emits_valid_wasm() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
-    let plan = plan_for(
-        &func_named(&r, "f-list-string").params[0].ty,
-        &r,
-        &mut names,
-    );
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-string", &r, &mut names);
     validate_emit_lift_plan(&plan, &r);
 }
 
@@ -2111,8 +1911,7 @@ fn list_result_classifies_as_compound() {
     // `list<T>` (non-u8) results route through retptr + Compound; the
     // produced plan has the same structural shape as a param-side
     // `list<T>` plan (validate-emit coverage already pins emit shape).
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let func = func_named(&r, "f-result-list-u32");
     let result_lift = classify_result_lift(&r, func, true, &mut names)
         .expect("list<u32> result must classify")
@@ -2129,8 +1928,7 @@ fn list_result_classifies_as_compound() {
 
 #[test]
 fn record_with_list_field_emits_valid_wasm() {
-    let r = test_resolve();
-    let mut names = NameInterner::new();
+    let (r, mut names) = setup();
     let plan = plan_for_named("list-pair", &r, &mut names);
     validate_emit_lift_plan(&plan, &r);
 }
