@@ -151,11 +151,11 @@ pub(crate) fn emit_cabi_realloc(code: &mut CodeSection, bump_global: u32) {
         f.instructions().i32_const(1);
         f.instructions().i32_add();
         f.instructions().memory_grow(0);
-        // memory.grow returns -1 on failure; trap so the host sees a
-        // recognizable wasm trap instead of a corrupted bump pointer.
         f.instructions().i32_const(-1);
         f.instructions().i32_eq();
         f.instructions().if_(BlockType::Empty);
+        // Trap: memory.grow returned -1 (host OOM); without this the
+        // bump pointer would advance past valid memory.
         f.instructions().unreachable();
         f.instructions().end();
     }
@@ -605,6 +605,38 @@ pub(crate) fn emit_cabi_realloc_call(
     f.instructions().local_set(dest_local);
 }
 
+/// Trap if `next_cell_idx_local + len_local * elem_count` would
+/// exceed `i32::MAX / cell_size`. Guards the caller's subsequent i32
+/// mul + add against silent mod-2^32 wrap that would slip past
+/// [`emit_cabi_realloc_call_runtime`]'s own size check and
+/// under-allocate the cells slab.
+pub(crate) fn emit_trap_if_list_overflows_cell_slab(
+    f: &mut Function,
+    len_local: u32,
+    elem_count: u32,
+    next_cell_idx_local: u32,
+    cell_size: u32,
+) {
+    assert!(elem_count > 0, "element plan must contribute ≥1 cell");
+    assert!(cell_size > 0, "cell_size must be positive");
+    let cell_limit = (i32::MAX as u32) / cell_size;
+    f.instructions().local_get(len_local);
+    f.instructions().i32_const(cell_limit as i32);
+    f.instructions().local_get(next_cell_idx_local);
+    f.instructions().i32_sub();
+    if elem_count != 1 {
+        f.instructions().i32_const(elem_count as i32);
+        f.instructions().i32_div_u();
+    }
+    f.instructions().i32_gt_u();
+    f.instructions().if_(BlockType::Empty);
+    // Trap: appending this list's cells would exceed the i32 byte
+    // budget for the cells slab; letting it through would silently
+    // wrap the subsequent i32 mul + add and under-allocate.
+    f.instructions().unreachable();
+    f.instructions().end();
+}
+
 /// Runtime-sized `cabi_realloc(0, 0, align, count_local * elem_bytes)`
 /// → `dest_local`. Pass `elem_bytes = 1` for byte-counted calls. Traps
 /// on overflow — cabi_realloc takes size as i32, so a wrapped value
@@ -624,6 +656,8 @@ pub(crate) fn emit_cabi_realloc_call_runtime(
     f.instructions().i32_const(max_count as i32);
     f.instructions().i32_gt_u();
     f.instructions().if_(BlockType::Empty);
+    // Trap: count * elem_bytes would overflow i32, which cabi_realloc
+    // takes as a signed size — a wrapped value silently under-allocates.
     f.instructions().unreachable();
     f.instructions().end();
 
@@ -931,6 +965,63 @@ mod tests {
                 count, 1,
                 "elem_bytes={elem_bytes}: expected 1 `unreachable`, found {count}",
             );
+        }
+    }
+
+    /// Build a one-fn module wrapping
+    /// `emit_trap_if_list_overflows_cell_slab`, validate, and count
+    /// `unreachable` ops in the body.
+    fn list_overflow_unreachable_count(elem_count: u32, cell_size: u32) -> usize {
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        // (len: i32, next_cell_idx: i32) -> ()
+        types.ty().function([ValType::I32, ValType::I32], []);
+        module.section(&types);
+
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        module.section(&funcs);
+
+        let mut code = CodeSection::new();
+        let mut f = Function::new([]);
+        emit_trap_if_list_overflows_cell_slab(&mut f, 0, elem_count, 1, cell_size);
+        f.instructions().end();
+        code.function(&f);
+        module.section(&code);
+
+        let bytes = module.finish();
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("emit_trap_if_list_overflows_cell_slab output must validate");
+
+        let parser = wasmparser::Parser::new(0);
+        for payload in parser.parse_all(&bytes) {
+            if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                return body
+                    .get_operators_reader()
+                    .expect("ops reader")
+                    .into_iter()
+                    .filter(|op| matches!(op, Ok(wasmparser::Operator::Unreachable)))
+                    .count();
+            }
+        }
+        panic!("no CodeSectionEntry in module");
+    }
+
+    #[test]
+    fn list_overflow_trap_emits_unreachable_for_every_shape() {
+        // Each (elem_count, cell_size) combination must validate as
+        // wasm and emit exactly one `unreachable` for the trap branch.
+        // elem_count=1 skips the inner `i32.div_u`; elem_count>1 keeps
+        // it. cell_size 8/16 covers the realistic range for `cell`.
+        for &elem_count in &[1u32, 2, 16] {
+            for &cell_size in &[8u32, 16] {
+                let count = list_overflow_unreachable_count(elem_count, cell_size);
+                assert_eq!(
+                    count, 1,
+                    "elem_count={elem_count} cell_size={cell_size}: expected 1 `unreachable`, found {count}",
+                );
+            }
         }
     }
 }
