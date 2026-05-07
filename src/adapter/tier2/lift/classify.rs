@@ -14,6 +14,7 @@
 //! compound results) so the same plan flows unchanged through
 //! side-table builders and codegen.
 
+use anyhow::Result;
 use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
@@ -181,16 +182,16 @@ pub(crate) fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
     names: &mut NameInterner,
-) -> Vec<ParamLift> {
+) -> Result<Vec<ParamLift>> {
     let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
     for param in &func.params {
         let name = names.intern(&param.name);
         params_lift.push(ParamLift {
             name,
-            plan: LiftPlan::for_type(&param.ty, resolve, names),
+            plan: LiftPlan::for_type(&param.ty, resolve, names)?,
         });
     }
-    params_lift
+    Ok(params_lift)
 }
 
 /// Classify the function's return value for on-return lift. Two
@@ -215,8 +216,10 @@ pub(crate) fn classify_result_lift(
     func: &WitFunction,
     result_at_retptr: bool,
     names: &mut NameInterner,
-) -> Option<ResultLift> {
-    let ty = func.result.as_ref()?;
+) -> Result<Option<ResultLift>> {
+    let Some(ty) = func.result.as_ref() else {
+        return Ok(None);
+    };
 
     // Retptr-routed: every wired result type drives a LiftPlan over
     // `lift_from_memory`-loaded slots. Multi-cell compounds AND
@@ -227,23 +230,25 @@ pub(crate) fn classify_result_lift(
     // for `lift_from_memory` to read from, so they fall through to
     // the no-lift path.
     if result_at_retptr && is_supported_result(ty, resolve) {
-        let plan = LiftPlan::for_type(ty, resolve, names);
-        return Some(ResultLift {
+        let plan = LiftPlan::for_type(ty, resolve, names)?;
+        return Ok(Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
             side_table: SideTableInfo::default(),
-        });
+        }));
     }
 
     // Direct (sync flat return): the value sits in `lcl.result`. Only
     // single-flat-slot kinds reach here. Returns None for un-wired
     // result types — wrapper still calls after-hook with
     // `result: option::none`.
-    let cell = single_cell_for_result(ty, resolve, names)?;
+    let Some(cell) = single_cell_for_result(ty, resolve, names)? else {
+        return Ok(None);
+    };
     let side_table = side_table_info_for_cell(&cell);
-    Some(ResultLift {
+    Ok(Some(ResultLift {
         source: ResultSource::Direct(cell),
         side_table,
-    })
+    }))
 }
 
 /// Whether `ty`'s result-side codegen is wired — i.e., we can build
@@ -256,7 +261,8 @@ fn is_supported_result(ty: &Type, resolve: &Resolve) -> bool {
 
 /// Whether `ty` resolves (through type aliases) to a compound kind
 /// whose result-side codegen is wired today: `record`, `tuple<...>`,
-/// `option<T>`, `result<T, E>`, or `variant`.
+/// `option<T>`, `result<T, E>`, `variant`, or `list<T>` (non-u8;
+/// `list<u8>` takes the bytes Direct path).
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
@@ -267,6 +273,7 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
         | wit_parser::TypeDefKind::Option(_)
         | wit_parser::TypeDefKind::Result(_)
         | wit_parser::TypeDefKind::Variant(_) => true,
+        wit_parser::TypeDefKind::List(elem) => !matches!(elem, Type::U8),
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
         _ => false,
     }
@@ -277,12 +284,18 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
 /// tracks the wired arms in [`super::emit::emit_lift_kind`]. Direct
 /// kinds never produce a `RecordOf`, so `names` is just threaded
 /// through for [`LiftPlan::for_type`]'s uniform signature.
-fn single_cell_for_result(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Option<Cell> {
+fn single_cell_for_result(
+    ty: &Type,
+    resolve: &Resolve,
+    names: &mut NameInterner,
+) -> Result<Option<Cell>> {
     if !is_supported_direct_result(ty, resolve) {
-        return None;
+        return Ok(None);
     }
-    let plan = LiftPlan::for_type(ty, resolve, names);
-    Some(plan.cells.into_iter().next().expect("push appended a cell"))
+    let plan = LiftPlan::for_type(ty, resolve, names)?;
+    Ok(Some(
+        plan.cells.into_iter().next().expect("push appended a cell"),
+    ))
 }
 
 /// Whitelist of WIT types whose lift codegen [`super::emit::emit_lift_kind`]

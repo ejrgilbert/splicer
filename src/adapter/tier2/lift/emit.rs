@@ -7,16 +7,17 @@ use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Resolve, SizeAlign};
 
 use super::super::super::abi::emit::{
-    direct_return_type, wasm_type_to_val, I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN,
-    I8_STORE_LOG2_ALIGN, OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
-    STRING_FLAT_BYTES,
+    direct_return_type, emit_cabi_realloc_call_runtime, wasm_type_to_val, I32_STORE_LOG2_ALIGN,
+    I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET,
+    SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
+use super::super::super::abi::flat_types;
 use super::super::super::abi::WasmEncoderBindgen;
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
 use super::super::cells::CellLayout;
 use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
-use super::plan::{Cell, LiftPlan};
+use super::plan::{Cell, LiftPlan, ListSpec};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
@@ -71,6 +72,12 @@ pub(crate) struct WrapperLocals {
     /// wrapper-body emitter before each [`emit_lift_plan`] call;
     /// reused across plans (each set overwrites the previous).
     pub cells_base: u32,
+    /// Running cell-index counter driving the per-plan pre-pass;
+    /// holds `total_cells` after the pass. Reused across plans.
+    pub next_cell_idx: u32,
+    /// Per-param list emit locals. `param_list_locals[i]` is parallel
+    /// to `params[i].lift.plan.list_specs()`; empty for list-free params.
+    pub param_list_locals: Vec<Vec<ListEmitLocals>>,
 }
 
 /// Per-function emit-time bundle for the result-side lift. Built once
@@ -100,6 +107,8 @@ pub(crate) enum ResultEmitPlan<'a> {
         synth_locals: Vec<u32>,
         loads: Vec<Instruction<'static>>,
         side_refs: CellSideRefs<'a>,
+        /// Per-list emit locals, parallel to `plan.list_specs()`.
+        list_locals: Vec<ListEmitLocals>,
     },
 }
 
@@ -110,6 +119,109 @@ pub(crate) enum ResultEmitPlan<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct CellSideRefs<'a> {
     pub cell_side: &'a [CellSideData],
+}
+
+/// Per-build context shared across every lift emit in a wrapper.
+/// Bundles `cell_layout` + `cabi_realloc_idx` so per-call helpers
+/// don't repeat them in every signature.
+#[derive(Clone, Copy)]
+pub(crate) struct LiftEmitCtx<'a> {
+    pub cell_layout: &'a CellLayout,
+    pub cabi_realloc_idx: u32,
+}
+
+/// Per-`Cell::ListOf` emit-time bundle. One entry per list-of cell
+/// in plan order — parallel to [`LiftPlan::list_specs`].
+pub(crate) struct ListEmitLocals {
+    /// Cell-idx where this list's element cells begin (captured
+    /// from the pre-pass running counter).
+    pub start_i: u32,
+    /// Captured source `len` flat slot value.
+    pub len: u32,
+    /// Per-call indices buffer base (`len * 4` bytes).
+    pub indices_ptr: u32,
+    /// Element-loop counter (0..len).
+    pub j: u32,
+    /// Per-iter source element address; drives `elem_loads`.
+    pub elem_addr: u32,
+    /// One local per element-plan flat slot, contiguous so plan
+    /// slot N maps to `elem_flat_locals[0] + N`.
+    pub elem_flat_locals: Vec<u32>,
+    /// Pre-built `lift_from_memory` loads — pushes element flat
+    /// values for capture into `elem_flat_locals` (LIFO).
+    pub elem_loads: Vec<Instruction<'static>>,
+    /// Canonical-ABI byte size of one element.
+    pub elem_byte_size: u32,
+    /// Side-data parallel to `element_plan.cells`; all-`None` while
+    /// only scalar elements are supported.
+    pub elem_cell_side: Vec<CellSideData>,
+}
+
+/// Allocate per-list emit locals + pre-build the `lift_from_memory`
+/// loads for every `Cell::ListOf` in `plan`. Runs while the
+/// [`LocalsBuilder`] is still live since the bindgen may allocate
+/// scratch locals.
+pub(super) fn alloc_list_emit_locals(
+    plan: &LiftPlan,
+    resolve: &Resolve,
+    size_align: &SizeAlign,
+    builder: &mut LocalsBuilder,
+) -> Vec<ListEmitLocals> {
+    plan.list_specs()
+        .map(|spec: ListSpec<'_>| build_one_list_emit_locals(spec, resolve, size_align, builder))
+        .collect()
+}
+
+fn build_one_list_emit_locals(
+    spec: ListSpec<'_>,
+    resolve: &Resolve,
+    size_align: &SizeAlign,
+    builder: &mut LocalsBuilder,
+) -> ListEmitLocals {
+    let start_i = builder.alloc_local(ValType::I32);
+    let len = builder.alloc_local(ValType::I32);
+    let indices_ptr = builder.alloc_local(ValType::I32);
+    let j = builder.alloc_local(ValType::I32);
+    let elem_addr = builder.alloc_local(ValType::I32);
+    // Contiguous element flat-slot locals: plan slot N maps to
+    // `elem_flat_locals[0] + N`.
+    let elem_ty = spec.element_plan.source_ty;
+    let flat = flat_types(resolve, &elem_ty, None)
+        .expect("list element type must flatten within MAX_FLAT_PARAMS");
+    let elem_flat_locals: Vec<u32> = flat
+        .iter()
+        .map(|wt| builder.alloc_local(wasm_type_to_val(*wt)))
+        .collect();
+    debug_assert!(
+        elem_flat_locals.windows(2).all(|w| w[1] == w[0] + 1),
+        "elem_flat_locals must be contiguous (plan slot N = elem_flat_locals[0] + N)",
+    );
+    let mut bindgen = WasmEncoderBindgen::new(size_align, elem_addr, builder);
+    lift_from_memory(resolve, &mut bindgen, (), &elem_ty);
+    let elem_loads = bindgen.into_instructions();
+    let elem_byte_size = size_align.size(&elem_ty).size_wasm32() as u32;
+    // Stub assumes every element cell folds to CellSideData::None.
+    // When compound elements wire up, this fires so the stub gets
+    // replaced with a real walk over `element_plan.cells`.
+    debug_assert!(
+        spec.element_plan
+            .cells
+            .iter()
+            .all(|c| c.allowed_as_list_element()),
+        "elem_cell_side stub assumes no side-data-bearing element cells",
+    );
+    let elem_cell_side = vec![CellSideData::None; spec.element_plan.cell_count() as usize];
+    ListEmitLocals {
+        start_i,
+        len,
+        indices_ptr,
+        j,
+        elem_addr,
+        elem_flat_locals,
+        elem_loads,
+        elem_byte_size,
+        elem_cell_side,
+    }
 }
 
 /// Allocate every local the wrapper body will reference, build the
@@ -167,14 +279,13 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             } => {
                 let side_refs = CellSideRefs { cell_side };
                 let addr_local = builder.alloc_local(ValType::I32);
-                let flat = super::super::super::abi::flat_types(resolve, &compound.ty, None)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Compound result must flatten within MAX_FLAT_PARAMS ({}) — \
+                let flat = flat_types(resolve, &compound.ty, None).unwrap_or_else(|| {
+                    panic!(
+                        "Compound result must flatten within MAX_FLAT_PARAMS ({}) — \
                              classify_result_lift only returns Compound for kinds that do",
-                            Resolve::MAX_FLAT_PARAMS
-                        )
-                    });
+                        Resolve::MAX_FLAT_PARAMS
+                    )
+                });
                 assert_eq!(
                     flat.len(),
                     compound.plan.flat_slot_count as usize,
@@ -188,9 +299,15 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                     .into_iter()
                     .map(|wt| builder.alloc_local(wasm_type_to_val(wt)))
                     .collect();
+                debug_assert!(
+                    synth_locals.windows(2).all(|w| w[1] == w[0] + 1),
+                    "synth_locals must be contiguous (plan slot N = synth_locals[0] + N)",
+                );
                 let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, &mut builder);
                 lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
                 let loads = bindgen.into_instructions();
+                let list_locals =
+                    alloc_list_emit_locals(&compound.plan, resolve, size_align, &mut builder);
                 ResultEmitPlan::Compound {
                     plan: &compound.plan,
                     retptr_offset: *retptr_offset,
@@ -198,10 +315,19 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                     synth_locals,
                     loads,
                     side_refs,
+                    list_locals,
                 }
             }
         },
     };
+
+    // Per-param list-of locals — must allocate before freeze. Empty
+    // inner Vec for params with no list cells.
+    let param_list_locals: Vec<Vec<ListEmitLocals>> = fd
+        .params
+        .iter()
+        .map(|p| alloc_list_emit_locals(&p.lift.plan, resolve, size_align, &mut builder))
+        .collect();
 
     // Async task.return flat-loads run a second `lift_from_memory`
     // pass over `result_ty`; that bindgen may allocate scratch locals
@@ -221,6 +347,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let id_local = builder.alloc_local(ValType::I64);
     let saved_bump = builder.alloc_local(ValType::I32);
     let cells_base = builder.alloc_local(ValType::I32);
+    let next_cell_idx = builder.alloc_local(ValType::I32);
 
     let frozen = builder.freeze();
     (
@@ -239,6 +366,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             task_return_loads,
             saved_bump,
             cells_base,
+            next_cell_idx,
+            param_list_locals,
         },
         result_emit,
         frozen,
@@ -253,59 +382,70 @@ pub(crate) fn alloc_wrapper_locals<'a>(
 /// reference plan-relative flat slots; `local_base` is added per-cell
 /// to recover the absolute wasm-local index — params pass the
 /// cumulative slot cursor, compound results pass `synth_locals[0]`.
+///
+/// `list_locals` is parallel to [`LiftPlan::list_specs`] order; for
+/// each `Cell::ListOf` encountered the matching slot drives the
+/// per-list element loop. Empty for plans without lists.
+/// `cabi_realloc_idx` lets the list-of arm allocate the per-list
+/// indices buffer at runtime.
 pub(crate) fn emit_lift_plan(
     f: &mut Function,
-    cell_layout: &CellLayout,
-    cells_base: u32,
+    ctx: &LiftEmitCtx<'_>,
     plan: &LiftPlan,
     side_refs: CellSideRefs<'_>,
     local_base: u32,
     lcl: &WrapperLocals,
+    list_locals: &[ListEmitLocals],
 ) {
     assert_eq!(
         side_refs.cell_side.len(),
         plan.cells.len(),
         "side-table data (emit input) must have one entry per classify-time plan cell"
     );
+    debug_assert_eq!(
+        list_locals.len(),
+        plan.list_specs().count(),
+        "per-plan list_locals must be parallel to plan.list_specs()",
+    );
     for (cell_idx, op) in plan.cells.iter().enumerate() {
-        f.instructions().local_get(cells_base);
+        f.instructions().local_get(lcl.cells_base);
         if cell_idx > 0 {
             f.instructions()
-                .i32_const((cell_idx as u32 * cell_layout.size) as i32);
+                .i32_const((cell_idx as u32 * ctx.cell_layout.size) as i32);
             f.instructions().i32_add();
         }
         f.instructions().local_set(lcl.addr);
+        let list_slot = match op {
+            Cell::ListOf { list_idx, .. } => Some(&list_locals[*list_idx as usize]),
+            _ => None,
+        };
         emit_cell_op(
             f,
-            cell_layout,
+            ctx,
             op,
             &side_refs.cell_side[cell_idx],
             local_base,
             lcl,
+            list_slot,
         );
     }
 }
 
 /// Emit one cell's worth of wasm at the address held in `lcl.addr`.
-/// `local_base` is added to each cell's plan-relative flat-slot
-/// position to recover its absolute wasm-local index. `side_data`
-/// carries the layout-phase side-table bookkeeping for cells whose
-/// kind needs any (record / tuple / flags); primitives ignore it.
-///
-/// The match is exhaustive without a `_` catchall: adding a new
-/// [`Cell`] variant must add an arm here. Un-wired variants `todo!()`
-/// — they're never produced by [`super::plan::LiftPlanBuilder::push`]
-/// today, but the structural arms force the compiler to flag any new
-/// variant missing codegen.
+/// `local_base` is added to each plan-relative flat-slot. `list_slot`
+/// is `Some` exactly for `Cell::ListOf`. New [`Cell`] variants add an
+/// arm here (no `_` catchall).
 fn emit_cell_op(
     f: &mut Function,
-    cell_layout: &CellLayout,
+    ctx: &LiftEmitCtx<'_>,
     op: &Cell,
     side_data: &CellSideData,
     local_base: u32,
     lcl: &WrapperLocals,
+    list_slot: Option<&ListEmitLocals>,
 ) {
     let addr = lcl.addr;
+    let cell_layout = ctx.cell_layout;
     match op {
         Cell::Bool { flat_slot } => cell_layout.emit_bool(f, addr, local_base + *flat_slot),
         Cell::IntegerSignExt { flat_slot } => {
@@ -355,7 +495,6 @@ fn emit_cell_op(
             disc_slot,
             child_idx,
         } => {
-            // disc=1 (some) → option-some(child_idx); disc=0 (none) → option-none.
             f.instructions().local_get(local_base + *disc_slot);
             f.instructions().if_(BlockType::Empty);
             cell_layout.emit_option_some(f, addr, *child_idx);
@@ -368,8 +507,7 @@ fn emit_cell_op(
             ok_idx,
             err_idx,
         } => {
-            // disc=0 → result-ok; disc=1 → result-err. `wasm if` fires
-            // on non-zero, so the err arm goes in the `if` block.
+            // wasm `if` fires on non-zero, so err goes in the if block.
             f.instructions().local_get(local_base + *disc_slot);
             f.instructions().if_(BlockType::Empty);
             cell_layout.emit_result_err(f, addr, err_idx.is_some(), err_idx.unwrap_or(0));
@@ -412,10 +550,104 @@ fn emit_cell_op(
             emit_handle_runtime_fill(f, local_base + *flat_slot, fill);
             cell_layout.emit_handle_cell(f, lcl.addr, kind.cell_disc_case(), fill.side_table_idx);
         }
-        Cell::ListOf { .. } => {
-            todo!("emit_cell_op for un-wired Cell variant {op:?}")
+        Cell::ListOf {
+            ptr_slot,
+            element_plan,
+            ..
+        } => {
+            let ll =
+                list_slot.expect("ListOf cell must arrive with a matching ListEmitLocals slot");
+            emit_list_of_arm(f, ctx, ll, local_base + *ptr_slot, element_plan, lcl);
         }
     }
+}
+
+/// Emit one `Cell::ListOf` arm: write the list-of cell payload at
+/// `lcl.addr`, allocate the per-call indices buffer, then loop
+/// `j ∈ 0..len` lifting each element.
+fn emit_list_of_arm(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    ll: &ListEmitLocals,
+    list_ptr_local: u32,
+    element_plan: &LiftPlan,
+    lcl: &WrapperLocals,
+) {
+    let elem_cell = &element_plan.cells[0];
+    let cell_layout = ctx.cell_layout;
+    emit_cabi_realloc_call_runtime(f, ctx.cabi_realloc_idx, 4, ll.len, 4, ll.indices_ptr);
+    cell_layout.emit_list_of(f, lcl.addr, ll.indices_ptr, ll.len);
+
+    // for (j = 0; j < len; j++) { ... }
+    f.instructions().i32_const(0);
+    f.instructions().local_set(ll.j);
+    f.instructions().block(BlockType::Empty);
+    f.instructions().loop_(BlockType::Empty);
+    f.instructions().local_get(ll.j);
+    f.instructions().local_get(ll.len);
+    f.instructions().i32_ge_u();
+    f.instructions().br_if(1);
+
+    // elem_addr = list_ptr + j * elem_byte_size
+    f.instructions().local_get(list_ptr_local);
+    f.instructions().local_get(ll.j);
+    if ll.elem_byte_size != 1 {
+        f.instructions().i32_const(ll.elem_byte_size as i32);
+        f.instructions().i32_mul();
+    }
+    f.instructions().i32_add();
+    f.instructions().local_set(ll.elem_addr);
+
+    // Lift element flat values from memory into elem_flat_locals (LIFO capture).
+    for inst in &ll.elem_loads {
+        f.instruction(inst);
+    }
+    for &local in ll.elem_flat_locals.iter().rev() {
+        f.instructions().local_set(local);
+    }
+
+    // lcl.addr = cells_base + (start_i + j) * cell_size
+    f.instructions().local_get(lcl.cells_base);
+    f.instructions().local_get(ll.start_i);
+    f.instructions().local_get(ll.j);
+    f.instructions().i32_add();
+    f.instructions().i32_const(cell_layout.size as i32);
+    f.instructions().i32_mul();
+    f.instructions().i32_add();
+    f.instructions().local_set(lcl.addr);
+
+    emit_cell_op(
+        f,
+        ctx,
+        elem_cell,
+        &ll.elem_cell_side[0],
+        ll.elem_flat_locals[0],
+        lcl,
+        None,
+    );
+
+    // indices_ptr[j*4] = start_i + j
+    f.instructions().local_get(ll.indices_ptr);
+    f.instructions().local_get(ll.j);
+    f.instructions().i32_const(4);
+    f.instructions().i32_mul();
+    f.instructions().i32_add();
+    f.instructions().local_get(ll.start_i);
+    f.instructions().local_get(ll.j);
+    f.instructions().i32_add();
+    f.instructions().i32_store(MemArg {
+        offset: 0,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    });
+
+    f.instructions().local_get(ll.j);
+    f.instructions().i32_const(1);
+    f.instructions().i32_add();
+    f.instructions().local_set(ll.j);
+    f.instructions().br(0);
+    f.instructions().end(); // loop
+    f.instructions().end(); // block
 }
 
 /// Patch one `Cell::Handle`'s `id: u64` slot per call: zero-extend

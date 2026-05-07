@@ -178,6 +178,29 @@ extending `handle-info.type-name` to carry the message); middleware
 that pattern-matches on `error-context-handle` today should be ready
 to switch.
 
+### Oversized lists trap
+
+The lift codegen reserves slabs sized `count * elem_bytes` (cell-tree
+slab) and `len * 4` (per-list child-index buffer). Both go through
+`cabi_realloc`, whose size param is canonical-ABI i32 (signed). When a
+runtime `len` would make the multiplication overflow signed i32 — at
+roughly 134M cells (16-byte cell stride) or 536M list-of indices — the
+wrapper traps via `unreachable` rather than wrapping silently and
+under-allocating.
+
+In practice this fires only on pathological / adversarial inputs. The
+trade-off is **trap (loud, clean abort) vs. clip (truncate the lifted
+view, keep the call running)**: clipping would let observability
+survive larger inputs, but creates a divergence between what the
+handler sees (full list) and what the audit log records (truncated) —
+exactly the property auditors don't want. The wire format is not yet
+designed for a "this list was truncated" marker, so today's behavior
+is trap.
+
+If your deployment surfaces traps from large lists, file a bug with
+the call shape; the policy is revisitable but warrants real call-size
+data before changing.
+
 ### What this means for resource-bearing target interfaces
 
 Tier-2 lifting is bounded by what the canonical ABI exposes. For

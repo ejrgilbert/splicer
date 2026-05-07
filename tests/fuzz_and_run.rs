@@ -1510,6 +1510,16 @@ fn tier2_shapes() -> Vec<Shape> {
             wit_name: "cat",
             rust_name: "Cat",
         },
+        // Single-element list keeps the harness's `expected_debug`
+        // predictable (`Shape::List::rust_literal` produces
+        // `vec![<one literal>]`).
+        Shape::List(Box::new(Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "42u32",
+            expected_debug: "42",
+        })),
     ]
 }
 
@@ -2103,6 +2113,13 @@ fn fmt_cell(tree: &FieldTree, idx: u32) -> String {
                 .map(|child_idx| fmt_cell(tree, *child_idx))
                 .collect();
             format!("tuple({})", rendered.join(", "))
+        }
+        Cell::ListOf(child_indices) => {
+            let rendered: Vec<String> = child_indices
+                .iter()
+                .map(|child_idx| fmt_cell(tree, *child_idx))
+                .collect();
+            format!("list({})", rendered.join(", "))
         }
         Cell::OptionSome(child_idx) => {
             format!("option-some({})", fmt_cell(tree, *child_idx))
@@ -2874,6 +2891,12 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 .collect::<Option<_>>()?;
             Some(format!("tuple({})", parts.join(", ")))
         }
+        // Single-element list — `Shape::List::rust_literal` produces
+        // `vec![<one literal>]`, so the cell tree has one child cell.
+        Shape::List(inner) => {
+            let elem = predict_tier2_arg_inner(inner)?;
+            Some(format!("list({elem})"))
+        }
         Shape::Option { inner, is_some } => {
             if *is_some {
                 let inner_render = predict_tier2_arg_inner(inner)?;
@@ -2901,9 +2924,6 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
         Shape::ResourceOwn { wit_name, .. } | Shape::ResourceBorrow { wit_name, .. } => {
             Some(format!("resource-handle({wit_name},"))
         }
-        // Other shapes (lists, etc.) light up here as their lift
-        // codegen lands.
-        _ => None,
     }
 }
 

@@ -605,6 +605,40 @@ pub(crate) fn emit_cabi_realloc_call(
     f.instructions().local_set(dest_local);
 }
 
+/// Runtime-sized `cabi_realloc(0, 0, align, count_local * elem_bytes)`
+/// → `dest_local`. Pass `elem_bytes = 1` for byte-counted calls. Traps
+/// on overflow — cabi_realloc takes size as i32, so a wrapped value
+/// would silently under-allocate. The trap-vs-clip trade-off is
+/// documented in `docs/tiers/tier-2.md` ("Oversized lists trap").
+pub(crate) fn emit_cabi_realloc_call_runtime(
+    f: &mut Function,
+    cabi_realloc_idx: u32,
+    align: u32,
+    count_local: u32,
+    elem_bytes: u32,
+    dest_local: u32,
+) {
+    assert!(elem_bytes > 0, "elem_bytes must be positive");
+    let max_count = (i32::MAX as u32) / elem_bytes;
+    f.instructions().local_get(count_local);
+    f.instructions().i32_const(max_count as i32);
+    f.instructions().i32_gt_u();
+    f.instructions().if_(BlockType::Empty);
+    f.instructions().unreachable();
+    f.instructions().end();
+
+    f.instructions().i32_const(0);
+    f.instructions().i32_const(0);
+    f.instructions().i32_const(align as i32);
+    f.instructions().local_get(count_local);
+    if elem_bytes != 1 {
+        f.instructions().i32_const(elem_bytes as i32);
+        f.instructions().i32_mul();
+    }
+    f.instructions().call(cabi_realloc_idx);
+    f.instructions().local_set(dest_local);
+}
+
 /// Patch a slice's `ptr` field from a runtime wasm local. The slice's
 /// `len` is left untouched — caller statically wrote it (at build
 /// time, via [`emit_store_slice`] or similar) or patches it
@@ -619,6 +653,24 @@ pub(crate) fn emit_store_slice_ptr_runtime(
     f.instructions().local_get(ptr_local);
     f.instructions().i32_store(MemArg {
         offset: (field_off + SLICE_PTR_OFFSET) as u64,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    });
+}
+
+/// Patch a slice's `len` field from a runtime wasm local; pair
+/// with [`emit_store_slice_ptr_runtime`] when both fields are
+/// runtime-computed.
+pub(crate) fn emit_store_slice_len_runtime(
+    f: &mut Function,
+    base_ptr: i32,
+    field_off: u32,
+    len_local: u32,
+) {
+    f.instructions().i32_const(base_ptr);
+    f.instructions().local_get(len_local);
+    f.instructions().i32_store(MemArg {
+        offset: (field_off + SLICE_LEN_OFFSET) as u64,
         align: I32_STORE_LOG2_ALIGN,
         memory_index: 0,
     });
@@ -818,4 +870,67 @@ pub(crate) fn emit_populate_call_id(
     emit_store_slice(f, base_ptr, iface_off, iface_name);
     emit_store_slice(f, base_ptr, fn_off, fn_name);
     emit_store_i64_local(f, base_ptr, id_off, id_local);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_encoder::{CodeSection, EntityType, FunctionSection, ImportSection, TypeSection};
+
+    /// Build a one-fn module wrapping `emit_cabi_realloc_call_runtime`,
+    /// validate, and count `unreachable` ops in the body.
+    fn unreachable_count_for(elem_bytes: u32) -> usize {
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function(
+            [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            [ValType::I32],
+        );
+        types.ty().function([ValType::I32], []);
+        module.section(&types);
+
+        let mut imports = ImportSection::new();
+        imports.import("env", "cabi_realloc", EntityType::Function(0));
+        module.section(&imports);
+
+        let mut funcs = FunctionSection::new();
+        funcs.function(1);
+        module.section(&funcs);
+
+        let mut code = CodeSection::new();
+        let mut f = Function::new([(1, ValType::I32)]);
+        emit_cabi_realloc_call_runtime(&mut f, 0, 4, 0, elem_bytes, 1);
+        f.instructions().end();
+        code.function(&f);
+        module.section(&code);
+
+        let bytes = module.finish();
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("emit_cabi_realloc_call_runtime output must validate");
+
+        let parser = wasmparser::Parser::new(0);
+        for payload in parser.parse_all(&bytes) {
+            if let Ok(wasmparser::Payload::CodeSectionEntry(body)) = payload {
+                return body
+                    .get_operators_reader()
+                    .expect("ops reader")
+                    .into_iter()
+                    .filter(|op| matches!(op, Ok(wasmparser::Operator::Unreachable)))
+                    .count();
+            }
+        }
+        panic!("no CodeSectionEntry in module");
+    }
+
+    #[test]
+    fn cabi_realloc_runtime_emits_overflow_trap() {
+        for elem_bytes in [1u32, 4, 16] {
+            let count = unreachable_count_for(elem_bytes);
+            assert_eq!(
+                count, 1,
+                "elem_bytes={elem_bytes}: expected 1 `unreachable`, found {count}",
+            );
+        }
+    }
 }

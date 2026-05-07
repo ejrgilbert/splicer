@@ -24,11 +24,14 @@
 //! recorded explicitly on [`LiftPlan::flat_slot_count`]. See
 //! [`docs/tiers/lift-codegen.md`](../../../../docs/tiers/lift-codegen.md).
 
+use anyhow::{anyhow, Result};
 use wit_parser::{Resolve, Type};
 
 use super::super::super::abi::emit::{wasm_type_to_val, BlobSlice};
 use super::super::super::abi::flat_types;
 use super::super::blob::NameInterner;
+
+const ISSUES_URL: &str = "https://github.com/ejrgilbert/splicer/issues";
 
 /// One cell to write at a known cell-array index. Each variant
 /// captures the cell's runtime-disc semantics, its source flat
@@ -37,20 +40,11 @@ use super::super::blob::NameInterner;
 /// side-table info this cell contributes (e.g., enum-info /
 /// record-info entries).
 ///
-/// Wired variants carry full lift payload (flat-slot positions +
-/// per-kind side-table info); un-wired variants carry no payload and
-/// `todo!()` at codegen time. Un-wired variants are placeholder tags
-/// — they're never constructed today (the plan-builder `todo!()`s
-/// before reaching them), but listing them keeps the
-/// [`super::emit::emit_cell_op`] match exhaustive without a `_`
-/// catchall, so adding a new wired type forces the codegen arm to be
-/// filled in. New WIT types: add one variant + one arm in
+/// New WIT types: add one variant + one arm in
 /// [`LiftPlanBuilder::push`] + one arm in
 /// [`super::emit::emit_cell_op`]. Roadmap: `docs/tiers/lift-codegen.md`.
-#[allow(dead_code)] // un-wired variants exist only for exhaustive match
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Cell {
-    // ── Wired ─────────────────────────────────────────────────────
     /// `bool` — 1 i32 slot (0/1) → `cell::bool`.
     Bool { flat_slot: u32 },
     /// `s8`/`s16`/`s32` — 1 i32 slot, sign-extend → `cell::integer`.
@@ -139,12 +133,17 @@ pub(crate) enum Cell {
         kind: HandleKind,
     },
 
-    /// `list<T>` (non-u8 — `list<u8>` fast-paths through `Cell::Bytes`)
-    /// → `cell::list-of`. Flat layout `(i32 ptr, i32 len)`.
-    /// `element_plan` is built recursively in a fresh sub-builder so
-    /// its flat slots and cells are local to one element (re-used per
-    /// iteration at runtime; not counted in [`LiftPlan::cell_count`]).
+    /// `list<T>` (non-u8; `list<u8>` fast-paths through `Cell::Bytes`)
+    /// → `cell::list-of`. Flat `(i32 ptr, i32 len)`. `element_plan`
+    /// is a NESTED [`LiftPlan`] with its own cell-index space —
+    /// distinct from the outer-plan indices used by other variants
+    /// like [`Cell::TupleOf::children`] or [`Cell::Option::child_idx`].
+    /// `element_plan.source_ty` is the WIT element type
+    /// (drives `lift_from_memory` per iteration). `list_idx` keys
+    /// into the parallel `list_locals` array, so per-list emit + alloc
+    /// state is paired structurally rather than by iteration order.
     ListOf {
+        list_idx: u32,
         ptr_slot: u32,
         len_slot: u32,
         element_plan: Box<LiftPlan>,
@@ -184,6 +183,35 @@ impl HandleKind {
     }
 }
 
+impl Cell {
+    /// Whether this cell shape is supported as a `list<T>` element.
+    /// Scalar elements only — compound + scratch-bearing kinds
+    /// (char/flags/handle) need machinery that doesn't exist yet.
+    /// Exhaustive match — new variants force a yes/no decision.
+    pub(crate) fn allowed_as_list_element(&self) -> bool {
+        match self {
+            Cell::Bool { .. }
+            | Cell::IntegerSignExt { .. }
+            | Cell::IntegerZeroExt { .. }
+            | Cell::Integer64 { .. }
+            | Cell::FloatingF32 { .. }
+            | Cell::FloatingF64 { .. }
+            | Cell::Text { .. }
+            | Cell::Bytes { .. }
+            | Cell::EnumCase { .. } => true,
+            Cell::Char { .. }
+            | Cell::Flags { .. }
+            | Cell::Handle { .. }
+            | Cell::RecordOf { .. }
+            | Cell::TupleOf { .. }
+            | Cell::Option { .. }
+            | Cell::Result { .. }
+            | Cell::Variant { .. }
+            | Cell::ListOf { .. } => false,
+        }
+    }
+}
+
 /// Plan for lifting one (param | result) into a cell tree. Cells
 /// are listed in allocation order: children land in `cells` before
 /// their parents, so a record's `fields` list always references
@@ -206,6 +234,9 @@ pub(crate) struct LiftPlan {
     /// pushes children before parents, so for compound shapes this
     /// is the last-appended cell rather than `cells[0]`.
     root: u32,
+    /// WIT type the plan was built from. Drives `lift_from_memory`
+    /// in element-plan + compound-result codegen.
+    pub source_ty: Type,
 }
 
 impl LiftPlan {
@@ -215,10 +246,14 @@ impl LiftPlan {
     /// what the caller wraps it in (`ParamLift` vs `CompoundResult`)
     /// and what `local_base` the emit phase supplies. `names` interns
     /// every record type-name and field-name as the plan is built.
-    pub(super) fn for_type(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Self {
+    /// Errors on shapes the lift codegen doesn't yet support.
+    pub(super) fn for_type(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Result<Self> {
         let mut builder = LiftPlanBuilder::new();
         let root = builder.push(ty, resolve, names);
-        builder.into_plan(root)
+        if let Some(err) = builder.error {
+            return Err(err);
+        }
+        Ok(builder.into_plan(root, *ty))
     }
 
     pub(crate) fn cell_count(&self) -> u32 {
@@ -259,6 +294,46 @@ impl LiftPlan {
             _ => None,
         })
     }
+
+    /// Placeholder plan after a sub-`for_type` error; never reaches emit.
+    pub(super) fn stub_for(source_ty: Type) -> Self {
+        Self {
+            cells: vec![Cell::Bool { flat_slot: 0 }],
+            flat_slot_count: 1,
+            root: 0,
+            source_ty,
+        }
+    }
+
+    /// Iterator over every `Cell::ListOf` in the plan in `plan.cells`
+    /// order. Drives per-list locals allocation, the runtime total-
+    /// cells pre-pass, and the per-list emit arm. The element type
+    /// for `lift_from_memory` is `element_plan.source_ty`.
+    pub(crate) fn list_specs(&self) -> impl Iterator<Item = ListSpec<'_>> + '_ {
+        self.cells.iter().filter_map(|op| match op {
+            Cell::ListOf {
+                list_idx,
+                len_slot,
+                element_plan,
+                ..
+            } => Some(ListSpec {
+                list_idx: *list_idx,
+                len_slot: *len_slot,
+                element_plan,
+            }),
+            _ => None,
+        })
+    }
+}
+
+/// Per-`Cell::ListOf` view used by alloc + emit. Source element type
+/// is `element_plan.source_ty`. `list_idx` matches the cell's field
+/// so callers can index `list_locals` structurally.
+#[derive(Clone, Copy)]
+pub(crate) struct ListSpec<'a> {
+    pub list_idx: u32,
+    pub len_slot: u32,
+    pub element_plan: &'a LiftPlan,
 }
 
 // ─── Lift plan builder ────────────────────────────────────────────
@@ -282,6 +357,14 @@ pub(super) struct LiftPlanBuilder {
     /// Next available plan-relative flat-slot position. Incremented
     /// by `bump_flat_slot` as cells consume flat slots.
     next_flat_slot: u32,
+    /// Running list-of cell counter; assigned to each `Cell::ListOf`
+    /// via `list_idx` so emit + alloc can index `list_locals` directly.
+    next_list_idx: u32,
+    /// Nesting depth inside a joined `result` / `variant` arm.
+    /// `push_list_of` records an error when nonzero — see comment there.
+    joined_arm_depth: u32,
+    /// First error hit during the walk; surfaced by [`LiftPlan::for_type`].
+    error: Option<anyhow::Error>,
 }
 
 impl LiftPlanBuilder {
@@ -289,6 +372,16 @@ impl LiftPlanBuilder {
         Self {
             cells: Vec::new(),
             next_flat_slot: 0,
+            next_list_idx: 0,
+            joined_arm_depth: 0,
+            error: None,
+        }
+    }
+
+    /// First error wins; the walk continues with stub cells.
+    fn record_error(&mut self, err: anyhow::Error) {
+        if self.error.is_none() {
+            self.error = Some(err);
         }
     }
 
@@ -526,12 +619,14 @@ impl LiftPlanBuilder {
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
+        self.joined_arm_depth += 1;
         let ok_idx = r.ok.as_ref().map(|t| self.push(t, resolve, names));
         let after_ok = self.next_flat_slot;
 
         self.next_flat_slot = arms_base;
         let err_idx = r.err.as_ref().map(|t| self.push(t, resolve, names));
         let after_err = self.next_flat_slot;
+        self.joined_arm_depth -= 1;
 
         self.next_flat_slot = after_ok.max(after_err);
         self.push_cell(Cell::Result {
@@ -589,12 +684,14 @@ impl LiftPlanBuilder {
         let arms_base = self.next_flat_slot;
         let mut max_after = arms_base;
         let mut per_case_payload: Vec<Option<u32>> = Vec::with_capacity(v.cases.len());
+        self.joined_arm_depth += 1;
         for case in &v.cases {
             self.next_flat_slot = arms_base;
             let child_idx = case.ty.as_ref().map(|t| self.push(t, resolve, names));
             max_after = max_after.max(self.next_flat_slot);
             per_case_payload.push(child_idx);
         }
+        self.joined_arm_depth -= 1;
         self.next_flat_slot = max_after;
         self.push_cell(Cell::Variant {
             disc_slot,
@@ -670,24 +767,49 @@ impl LiftPlanBuilder {
         })
     }
 
-    /// `list<T>` (non-u8) — `(ptr, len)` flat; element plan built
-    /// in a fresh sub-builder so its slots are local to one element.
+    /// `list<T>` (non-u8) — `(ptr, len)` flat; element plan built in
+    /// a fresh sub-builder so its slots are local to one element.
     fn push_list_of(&mut self, elem: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
-        let element_plan = LiftPlan::for_type(elem, resolve, names);
+        if self.joined_arm_depth > 0 {
+            self.record_error(anyhow!(
+                "`list<T>` inside a `result` / `variant` arm is not yet supported \
+                 (the inactive arm would read garbage as `len` and feed it into \
+                 cabi_realloc). File a request at {ISSUES_URL} to bump priority."
+            ));
+        }
+        let list_idx = self.next_list_idx;
+        self.next_list_idx += 1;
         let ptr_slot = self.bump_flat_slot();
         let len_slot = self.bump_flat_slot();
+        let element_plan = match LiftPlan::for_type(elem, resolve, names) {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.record_error(err);
+                LiftPlan::stub_for(*elem)
+            }
+        };
+        if element_plan.cells.len() != 1 || !element_plan.cells[0].allowed_as_list_element() {
+            self.record_error(anyhow!(
+                "`list<T>` element type {elem:?} is not yet supported \
+                 (only scalar element types are wired today: bool, integers, \
+                 floats, string, list<u8>, enum). File a request at {ISSUES_URL} \
+                 to bump priority."
+            ));
+        }
         self.push_cell(Cell::ListOf {
+            list_idx,
             ptr_slot,
             len_slot,
             element_plan: Box::new(element_plan),
         })
     }
 
-    pub(super) fn into_plan(self, root: u32) -> LiftPlan {
+    pub(super) fn into_plan(self, root: u32, source_ty: Type) -> LiftPlan {
         LiftPlan {
             cells: self.cells,
             flat_slot_count: self.next_flat_slot,
             root,
+            source_ty,
         }
     }
 }

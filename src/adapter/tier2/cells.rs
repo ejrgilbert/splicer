@@ -334,12 +334,9 @@ impl CellLayout {
     // ─── Compound / structural cell emitters ───────────────────────
     //
     // One helper per non-primitive `cell` variant, in WIT-declaration
-    // order. Helpers for kinds whose `emit_cell_op` arm is wired live
-    // alongside `todo!()` stubs for the rest — when a new kind lands,
-    // its stub turns into a real implementation here. Keeping the
-    // contract on `CellLayout` (rather than in the lift codegen)
-    // documents the lowest-level shape: "to lift a record, call
-    // `cell_layout.emit_record_of(addr, side_table_idx)`".
+    // order. Keeping the contract on `CellLayout` (rather than in the
+    // lift codegen) documents the lowest-level shape: "to lift a
+    // record, call `cell_layout.emit_record_of(addr, side_table_idx)`".
 
     /// `cell::text` for a `char` source. UTF-8 encodes the i32 code
     /// point into the per-cell `scratch_addr` (1–4 bytes), sets
@@ -375,9 +372,8 @@ impl CellLayout {
         );
     }
 
-    /// `cell::list-of(list<u32>)` — payload is `(ptr, len)` of a
-    /// child-cell-index array allocated upstream.
-    #[allow(dead_code)]
+    /// `cell::list-of(list<u32>)` — `(ptr, len)` of a runtime
+    /// child-cell-index array.
     pub(crate) fn emit_list_of(
         &self,
         f: &mut Function,
@@ -385,8 +381,12 @@ impl CellLayout {
         idx_array_ptr: u32,
         idx_array_len: u32,
     ) {
-        let _ = (f, addr_local, idx_array_ptr, idx_array_len);
-        todo!("cell::list-of — disc 5 + (ptr, len) at payload");
+        self.emit_cell(
+            f,
+            addr_local,
+            self.disc_of("list-of"),
+            &ptr_len_parts(idx_array_ptr, idx_array_len),
+        );
     }
 
     /// `cell::tuple-of(list<u32>)` — payload `(ptr, len)` of a static

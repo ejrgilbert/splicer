@@ -73,9 +73,14 @@ const TEST_WIT: &str = r#"
         f-result-with-err-ctx: func(r: result<s32, error-context>);
         f-list-u32: func(xs: list<u32>);
         f-list-string: func(xs: list<string>);
+        f-result-list-u32: func() -> list<u32>;
         f-list-of-list: func(xs: list<list<u32>>);
         record list-pair { items: list<string>, scores: list<u32> }
         f-list-of-record: func(xs: list<point>);
+        f-result-list-list: func(r: result<list<u32>, list<u32>>);
+        variant list-or-int { with-list(list<u32>), plain(u32) }
+        f-variant-list-arm: func(v: list-or-int);
+        f-option-list: func(o: option<list<u32>>);
     }
 "#;
 
@@ -114,8 +119,10 @@ fn func_named<'a>(resolve: &'a Resolve, name: &str) -> &'a WitFunction {
 /// fixture pass a fresh interner; tests that do thread the same one
 /// through both the plan-builder and [`record_of`] so the
 /// pre-interned [`BlobSlice`]s match (the interner dedupes).
+/// Unwraps the [`Result`] so positive tests don't have to repeat the
+/// `.expect(...)`. Negative cases call `LiftPlan::for_type` directly.
 fn plan_for(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
-    LiftPlan::for_type(ty, resolve, names)
+    LiftPlan::for_type(ty, resolve, names).expect("test fixture must classify")
 }
 
 fn plan_for_named(name: &str, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
@@ -327,7 +334,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 flags_cursor += U32_BYTES;
                 let fill = FlagsRuntimeFill {
                     side_table_idx: flags_idx,
-                    entry_seg_off: 0, // not exercised by validate_emit_lift_plan
+                    entry_seg_off: 0, // not exercised by the validator fixture
                     set_flags_len_addr: Some(set_flags_len_addr as i32),
                     scratch_addr: scratch_addr as i32,
                     flag_names: info
@@ -388,15 +395,13 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 handle_id_cursor += U64_BYTES;
                 let fill = HandleRuntimeFill {
                     side_table_idx: handle_idx,
-                    entry_seg_off: 0, // not exercised by validate_emit_lift_plan
+                    entry_seg_off: 0, // not exercised by the validator fixture
                     id_addr: Some(id_addr as i32),
                 };
                 handle_idx += 1;
                 CellSideData::Handle(Box::new(fill))
             }
-            // Mirror the production `fold_cell_side_data` exhaustivity
-            // contract — primitives and control-flow cells return
-            // None, un-wired variants `unreachable!()`.
+            // No side-table contribution — flat-only or control-flow.
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -407,41 +412,77 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. }
             | Cell::Option { .. }
-            | Cell::Result { .. } => CellSideData::None,
-            Cell::ListOf { .. } => CellSideData::None,
+            | Cell::Result { .. }
+            | Cell::ListOf { .. } => CellSideData::None,
         })
         .collect()
 }
 
 /// Round-trip a plan through `emit_lift_plan` and validate the
-/// resulting wasm module. Plan flat slots map straight to wasm fn
-/// params; the wrapper-locals extras sit above them.
-fn validate_emit_lift_plan(plan: &LiftPlan) {
+/// resulting wasm module. Allocates per-list emit locals via the
+/// production helper and imports a stub `cabi_realloc` so the
+/// validator can resolve the calls the list-of arm emits. The
+/// function is never invoked, only validated.
+fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
+    use super::super::super::indices::LocalsBuilder;
+    use crate::adapter::indices::FrozenLocals;
+
+    let mut sizes = SizeAlign::default();
+    sizes.fill(resolve);
     let cell_layout = synth_cell_layout();
     let cell_side = auto_cell_side_data(plan);
     let param_types = plan_param_types(plan);
     let n = plan.flat_slot_count;
+
+    // Match alloc_wrapper_locals' allocation order so the indices
+    // line up against the frozen locals list.
+    let mut builder = LocalsBuilder::new(n);
+    let addr = builder.alloc_local(ValType::I32);
+    let st = builder.alloc_local(ValType::I32);
+    let ws = builder.alloc_local(ValType::I32);
+    let ext64 = builder.alloc_local(ValType::I64);
+    let ext_f64 = builder.alloc_local(ValType::F64);
+    let flags_addr = builder.alloc_local(ValType::I32);
+    let flags_count = builder.alloc_local(ValType::I32);
+    let char_len = builder.alloc_local(ValType::I32);
+    let id_local = builder.alloc_local(ValType::I64);
+    let saved_bump = builder.alloc_local(ValType::I32);
+    let cells_base = builder.alloc_local(ValType::I32);
+    let next_cell_idx = builder.alloc_local(ValType::I32);
+    let list_locals = super::emit::alloc_list_emit_locals(plan, resolve, &sizes, &mut builder);
+    let FrozenLocals { locals } = builder.freeze();
+
     let lcl = WrapperLocals {
-        addr: n,
-        st: 0,
-        ws: 0,
-        flags_addr: n + 1,
-        flags_count: n + 2,
-        char_len: n + 3,
-        cells_base: n + 4,
-        ext64: n + 5,
-        ext_f64: n + 6,
+        addr,
+        st,
+        ws,
+        ext64,
+        ext_f64,
+        flags_addr,
+        flags_count,
+        char_len,
+        cells_base,
+        next_cell_idx,
         result: None,
         tr_addr: None,
-        id_local: 0,
+        id_local,
         task_return_loads: None,
-        saved_bump: 0,
+        saved_bump,
+        param_list_locals: Vec::new(),
     };
 
+    // Stub `cabi_realloc` import — signature `(i32, i32, i32, i32)
+    // -> i32`. Index 0 in the func index space (no other imports
+    // ahead of it).
     let mut module = Module::new();
     let mut types = TypeSection::new();
+    types.ty().function(
+        [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+        [ValType::I32],
+    );
     types.ty().function(param_types.iter().copied(), []);
     module.section(&types);
+
     let mut imports = ImportSection::new();
     imports.import(
         "env",
@@ -454,33 +495,31 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
             page_size_log2: None,
         }),
     );
+    imports.import("env", "cabi_realloc", EntityType::Function(0));
     module.section(&imports);
+
     let mut funcs = FunctionSection::new();
-    funcs.function(0);
+    funcs.function(1);
     module.section(&funcs);
+
     let mut code = CodeSection::new();
-    let mut f = Function::new([
-        (5u32, ValType::I32),
-        (1u32, ValType::I64),
-        (1u32, ValType::F64),
-    ]);
-    // Wasm function params occupy locals 0..flat_slot_count, so
-    // `local_base = 0` aligns the plan's flat slots with the
-    // params declared on the synth wasm fn. `cells_base` is a fresh
-    // i32 local set to 0 (treats the cells slab as starting at
-    // address 0 — fine for validation, no actual store happens).
+    let mut f = Function::new_with_locals_types(locals);
     f.instructions().i32_const(0);
     f.instructions().local_set(lcl.cells_base);
+    let lift_ctx = super::emit::LiftEmitCtx {
+        cell_layout: &cell_layout,
+        cabi_realloc_idx: 0,
+    };
     emit_lift_plan(
         &mut f,
-        &cell_layout,
-        lcl.cells_base,
+        &lift_ctx,
         plan,
         super::emit::CellSideRefs {
             cell_side: &cell_side,
         },
         0,
         &lcl,
+        &list_locals,
     );
     f.instructions().end();
     code.function(&f);
@@ -488,7 +527,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan) {
 
     wasmparser::Validator::new()
         .validate_all(&module.finish())
-        .expect("emit_lift_plan output must validate");
+        .expect("emit_lift_plan output must validate (list path)");
 }
 
 // ─── LiftPlanBuilder shape ───────────────────────────────────
@@ -884,6 +923,7 @@ fn list_of_primitive_carries_element_plan() {
         ptr_slot,
         len_slot,
         element_plan,
+        ..
     } = &plan.cells[0]
     else {
         panic!("expected Cell::ListOf, got {:?}", plan.cells[0]);
@@ -927,56 +967,83 @@ fn list_of_string_element_plan_uses_two_local_slots() {
 }
 
 #[test]
-fn list_of_list_nests_element_plans() {
-    // list<list<u32>>: outer parent (ptr, len) holds inner list<u32>
-    // as its element plan, which itself is a (ptr, len) + ListOf.
+fn nested_list_bails_at_plan_build() {
+    // list<list<u32>>: nested lists aren't a supported element shape;
+    // plan-build surfaces the inner failure to the outer caller.
     let r = test_resolve();
     let mut names = NameInterner::new();
-    let plan = plan_for(
+    let err = LiftPlan::for_type(
         &func_named(&r, "f-list-of-list").params[0].ty,
         &r,
         &mut names,
-    );
-    assert_eq!(plan.cells.len(), 1);
-    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
-        panic!("expected outer Cell::ListOf");
-    };
-    assert_eq!(element_plan.cells.len(), 1);
-    let Cell::ListOf {
-        ptr_slot,
-        len_slot,
-        element_plan: inner_inner,
-    } = &element_plan.cells[0]
-    else {
-        panic!("expected inner Cell::ListOf");
-    };
-    assert_eq!(*ptr_slot, 0);
-    assert_eq!(*len_slot, 1);
-    assert_eq!(
-        inner_inner.cells,
-        vec![Cell::IntegerZeroExt { flat_slot: 0 }]
-    );
-    assert_eq!(inner_inner.flat_slot_count, 1);
+    )
+    .expect_err("nested list must bail at plan build");
+    let msg = err.to_string();
+    assert!(msg.contains("`list<T>` element type"));
+    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
 }
 
 #[test]
-fn list_of_record_element_plan_carries_record_cells() {
-    // list<point>: element point is a record with two fields, so the
-    // element plan holds the static record-of cells + parent record.
+fn list_of_compound_element_bails_at_plan_build() {
+    // list<point>: record element types aren't a supported list element
+    // shape today (compound element types defer to a later landing).
     let r = test_resolve();
     let mut names = NameInterner::new();
-    let plan = plan_for(
+    let err = LiftPlan::for_type(
         &func_named(&r, "f-list-of-record").params[0].ty,
         &r,
         &mut names,
+    )
+    .expect_err("list<record> must bail at plan build");
+    let msg = err.to_string();
+    assert!(msg.contains("`list<T>` element type"));
+    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+}
+
+#[test]
+fn list_inside_result_arm_bails_at_plan_build() {
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let err = LiftPlan::for_type(
+        &func_named(&r, "f-result-list-list").params[0].ty,
+        &r,
+        &mut names,
+    )
+    .expect_err("list inside a result arm must bail at plan build");
+    let msg = err.to_string();
+    assert!(msg.contains("`list<T>` inside a `result` / `variant` arm"));
+    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+}
+
+#[test]
+fn list_inside_variant_arm_bails_at_plan_build() {
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let err = LiftPlan::for_type(
+        &func_named(&r, "f-variant-list-arm").params[0].ty,
+        &r,
+        &mut names,
+    )
+    .expect_err("list inside a variant arm must bail at plan build");
+    let msg = err.to_string();
+    assert!(msg.contains("`list<T>` inside a `result` / `variant` arm"));
+    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+}
+
+#[test]
+fn list_inside_option_is_allowed() {
+    // Option's payload slots are dedicated, not joined — guard must
+    // not fire here.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-option-list").params[0].ty,
+        &r,
+        &mut names,
     );
-    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
-        panic!("expected Cell::ListOf");
-    };
-    // point { x: u32, y: s32 } → 2 leaf cells + 1 record-of parent.
-    assert_eq!(element_plan.cells.len(), 3);
-    assert_eq!(element_plan.flat_slot_count, 2);
-    assert_eq!(element_plan.root(), 2);
+    assert_eq!(plan.cells.len(), 2);
+    assert!(matches!(plan.cells[0], Cell::ListOf { .. }));
+    assert!(matches!(plan.cells[1], Cell::Option { .. }));
 }
 
 #[test]
@@ -1388,7 +1455,8 @@ fn classify_func_params_yields_plan_relative_slots() {
     // the local-base-independence invariant.
     let r = test_resolve();
     let mut names = NameInterner::new();
-    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names);
+    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names)
+        .expect("f-mixed params must classify");
     assert_eq!(
         params[2].plan.cells,
         vec![Cell::Bytes {
@@ -1413,7 +1481,8 @@ fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
     // b: list<u8>, x: s64) → cumulative starts 0, 1, 3, 5; total 6.
     let r = test_resolve();
     let mut names = NameInterner::new();
-    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names);
+    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names)
+        .expect("f-mixed params must classify");
     let starts: Vec<u32> = params
         .iter()
         .scan(0u32, |acc, p| {
@@ -1661,8 +1730,100 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &r,
             &mut names,
         ),
+        // Scalar-element lists only (compound elements still todo!()
+        // in `emit_list_of_arm`).
+        plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-list-string").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for_named("list-pair", &r, &mut names),
     ];
     for plan in &primitive_plans {
-        validate_emit_lift_plan(plan);
+        validate_emit_lift_plan(plan, &r);
     }
+}
+
+// ─── List-of emit codegen (scalar elements) ──────────────────
+
+#[test]
+fn list_of_u32_emits_valid_wasm() {
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names);
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_of_string_emits_valid_wasm() {
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-string").params[0].ty,
+        &r,
+        &mut names,
+    );
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_of_enum_emits_valid_wasm() {
+    // Enum elements are scalar — single i32, no per-element scratch.
+    let r = Resolve::new();
+    // Reuse TEST_WIT but with a list<color> shape — already there
+    // implicitly via the lift fixture; we cons up the type here.
+    let mut r = r;
+    r.push_str(
+        "list-of-enum.wit",
+        r#"
+        package test:list-enum@0.0.1;
+        interface t {
+            enum color { red, green, blue }
+            f: func(xs: list<color>);
+        }
+        "#,
+    )
+    .unwrap();
+    let iface = super::super::test_utils::iface_by_unversioned_qname(&r, "test:list-enum/t");
+    let func_id = r.interfaces[iface]
+        .functions
+        .keys()
+        .find(|n| *n == "f")
+        .unwrap()
+        .clone();
+    let func = &r.interfaces[iface].functions[&func_id];
+    let mut names = NameInterner::new();
+    let plan =
+        LiftPlan::for_type(&func.params[0].ty, &r, &mut names).expect("list<color> must classify");
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_result_classifies_as_compound() {
+    // `list<T>` (non-u8) results route through retptr + Compound; the
+    // produced plan has the same structural shape as a param-side
+    // `list<T>` plan (validate-emit coverage already pins emit shape).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let func = func_named(&r, "f-result-list-u32");
+    let result_lift = classify_result_lift(&r, func, true, &mut names)
+        .expect("list<u32> result must classify")
+        .expect("list<u32> result must produce a ResultLift");
+    let compound = result_lift
+        .compound()
+        .expect("list<u32> result must route through Compound");
+    assert!(
+        matches!(compound.plan.cells[0], Cell::ListOf { .. }),
+        "Compound result plan's root cell must be ListOf, got {:?}",
+        compound.plan.cells[0],
+    );
+}
+
+#[test]
+fn record_with_list_field_emits_valid_wasm() {
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("list-pair", &r, &mut names);
+    validate_emit_lift_plan(&plan, &r);
 }

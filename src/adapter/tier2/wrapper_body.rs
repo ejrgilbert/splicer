@@ -1,46 +1,24 @@
 //! Wrapper-body emit: builds the wasm function body for one
-//! exported wrapper. Drives the four-phase shape (build call-id
-//! and on-call → call handler → on-return → tail / `task.return`)
-//! and threads the schema-layout addresses + lift codegen helpers.
+//! exported wrapper.
 //!
-//! Wrapper body shape:
+//! ## Concurrency
 //!
-//! ```text
-//! ;; build call-id flat: (iface_ptr, iface_len, fn_ptr, fn_len)
-//! i32.const iface_offset
-//! i32.const iface_len
-//! i32.const fn_offset
-//! i32.const fn_len
-//! ;; empty list<field> args (ptr=0, len=0)
-//! i32.const 0
-//! i32.const 0
-//! call $on_call               ;; canon-lower-async — returns packed (handle<<4)|status
-//! local.set $st
-//! ;; wait loop (only if subtask didn't return synchronously)
-//! local.get $st
-//! i32.const 4
-//! i32.shr_u
-//! local.set $st               ;; raw subtask handle now
-//! local.get $st
-//! if
-//!     call $waitable_set_new
-//!     local.set $ws
-//!     local.get $st
-//!     local.get $ws
-//!     call $waitable_join
-//!     local.get $ws
-//!     i32.const event_ptr
-//!     call $waitable_set_wait
-//!     drop                     ;; event code (we don't inspect)
-//!     local.get $st
-//!     call $subtask_drop
-//!     local.get $ws
-//!     call $waitable_set_drop
-//! end
-//! ;; pass-through to handler
-//! local.get $param_0 ; ... ; local.get $param_N
-//! call $handler
-//! ```
+//! Wrappers assume one in-flight call per instance. State mutated
+//! in place over a call's lifetime that would corrupt under
+//! reentrancy:
+//!
+//! - Static side-table scratch (`flags-info.set-flags`,
+//!   `variant-info.case-name` + `payload`, `handle-info.id`,
+//!   per-cell char utf-8 scratch) — written per call; the cell
+//!   tree points into them.
+//! - Static field-tree `cells` slice — `ptr` and `len` patched
+//!   per call to point at the freshly-`cabi_realloc`'d slab.
+//! - Per-list indices buffer — `cabi_realloc`'d per call from the
+//!   wrapper's bump allocator, freed at exit via bump save/restore.
+//!
+//! A concurrent second call would see the first's scratch
+//! addresses and slab pointer mid-update. The canon-async runtime
+//! is expected to serialize per instance; revisit if that changes.
 
 use wasm_encoder::{CodeSection, Function};
 use wit_parser::Resolve;
@@ -48,14 +26,15 @@ use wit_parser::Resolve;
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
     emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save,
-    emit_cabi_realloc_call, emit_handler_call, emit_populate_call_id, emit_store_i64_local,
-    emit_store_slice, emit_store_slice_ptr_runtime, emit_wrapper_return, BlobSlice, BumpReset,
-    RecordLayout,
+    emit_cabi_realloc_call, emit_cabi_realloc_call_runtime, emit_handler_call,
+    emit_populate_call_id, emit_store_i64_local, emit_store_slice, emit_store_slice_len_runtime,
+    emit_store_slice_ptr_runtime, emit_wrapper_return, BlobSlice, BumpReset, RecordLayout,
 };
 use super::super::indices::LocalsBuilder;
+use super::lift::plan::LiftPlan;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    CellSideRefs, ResultEmitPlan, WrapperLocals,
+    CellSideRefs, LiftEmitCtx, ListEmitLocals, ResultEmitPlan, WrapperLocals,
 };
 use super::schema::{
     SchemaLayouts, FIELD_TREE, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
@@ -114,28 +93,74 @@ struct OnCallCallSite {
     id_local: u32,
 }
 
-/// Allocate `n_cells` cells worth of memory via `cabi_realloc`, store
-/// the result in `cells_base_local`, and patch the field-tree's
-/// `cells.ptr` field (`base_ptr + cells_field_off`) so the hook sees
-/// the freshly-allocated buffer. `cells.len` was baked at build time
-/// from the static plan.
-fn emit_alloc_cells_and_patch(
-    f: &mut Function,
-    cabi_realloc_idx: u32,
-    schema: &SchemaLayouts,
-    n_cells: u32,
+/// Where the patched `cells: list<cell>` slice lives in linear memory.
+struct CellsTarget {
     fields_base_ptr: i32,
     cells_field_off: u32,
-    cells_base_local: u32,
+}
+
+/// Cells-slab allocation for one (param | result) plan. Pre-pass
+/// captures each list's `start_i` + `len`, accumulates
+/// `total_cells = static + Σ(len_i · elem_count_i)` into
+/// `lcl.next_cell_idx`, then `cabi_realloc`s the slab and patches
+/// both `cells.ptr` and `cells.len`.
+fn emit_alloc_cells_for_plan(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    plan: &LiftPlan,
+    list_locals: &[ListEmitLocals],
+    local_base: u32,
+    lcl: &WrapperLocals,
+    target: CellsTarget,
 ) {
-    emit_cabi_realloc_call(
-        f,
-        cabi_realloc_idx,
-        schema.cell_layout.align,
-        n_cells * schema.cell_layout.size,
-        cells_base_local,
+    debug_assert_eq!(
+        list_locals.len(),
+        plan.list_specs().count(),
+        "per-plan list_locals must be parallel to plan.list_specs()",
     );
-    emit_store_slice_ptr_runtime(f, fields_base_ptr, cells_field_off, cells_base_local);
+    // Pre-pass: next_cell_idx = static_count, then for each list,
+    // capture start_i + len, bump by len * elem_count. `list_idx`
+    // on the spec keys directly into `list_locals` so this is
+    // structural, not positional.
+    f.instructions().i32_const(plan.cell_count() as i32);
+    f.instructions().local_set(lcl.next_cell_idx);
+    for spec in plan.list_specs() {
+        let ll = &list_locals[spec.list_idx as usize];
+        f.instructions().local_get(lcl.next_cell_idx);
+        f.instructions().local_set(ll.start_i);
+        f.instructions().local_get(local_base + spec.len_slot);
+        f.instructions().local_set(ll.len);
+        let elem_count = spec.element_plan.cell_count();
+        f.instructions().local_get(lcl.next_cell_idx);
+        f.instructions().local_get(ll.len);
+        if elem_count != 1 {
+            f.instructions().i32_const(elem_count as i32);
+            f.instructions().i32_mul();
+        }
+        f.instructions().i32_add();
+        f.instructions().local_set(lcl.next_cell_idx);
+    }
+    // Single cabi_realloc(next_cell_idx * cell_size).
+    emit_cabi_realloc_call_runtime(
+        f,
+        ctx.cabi_realloc_idx,
+        ctx.cell_layout.align,
+        lcl.next_cell_idx,
+        ctx.cell_layout.size,
+        lcl.cells_base,
+    );
+    emit_store_slice_ptr_runtime(
+        f,
+        target.fields_base_ptr,
+        target.cells_field_off,
+        lcl.cells_base,
+    );
+    emit_store_slice_len_runtime(
+        f,
+        target.fields_base_ptr,
+        target.cells_field_off,
+        lcl.next_cell_idx,
+    );
 }
 
 /// Byte offset of the `cells: list<cell>` slice within a `field`
@@ -204,6 +229,11 @@ pub(super) fn emit_wrapper_function(
 
     emit_alloc_call_id(&mut f, ctx.call_id_counter_global, lcl.id_local);
 
+    let lift_ctx = LiftEmitCtx {
+        cell_layout: &schema.cell_layout,
+        cabi_realloc_idx: func_idx.cabi_realloc_idx,
+    };
+
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before) = ctx.before_hook.as_ref() {
         // Plan cells reference plan-relative flat slots; thread the
@@ -213,25 +243,29 @@ pub(super) fn emit_wrapper_function(
         let cells_slice_off = field_cells_slice_off(schema);
         for (i, p) in fd.params.iter().enumerate() {
             let field_off = i as u32 * schema.field_layout.size;
-            emit_alloc_cells_and_patch(
+            let list_locals = &lcl.param_list_locals[i];
+            emit_alloc_cells_for_plan(
                 &mut f,
-                func_idx.cabi_realloc_idx,
-                schema,
-                p.lift.plan.cell_count(),
-                fd.fields_buf_offset as i32,
-                field_off + cells_slice_off,
-                lcl.cells_base,
+                &lift_ctx,
+                &p.lift.plan,
+                list_locals,
+                local_base,
+                &lcl,
+                CellsTarget {
+                    fields_base_ptr: fd.fields_buf_offset as i32,
+                    cells_field_off: field_off + cells_slice_off,
+                },
             );
             emit_lift_plan(
                 &mut f,
-                &schema.cell_layout,
-                lcl.cells_base,
+                &lift_ctx,
                 &p.lift.plan,
                 CellSideRefs {
                     cell_side: &p.cell_side,
                 },
                 local_base,
                 &lcl,
+                list_locals,
             );
             local_base += p.lift.plan.flat_slot_count;
         }
@@ -291,59 +325,73 @@ pub(super) fn emit_wrapper_function(
         _ => unreachable!("after-hook ctx and per-fn data are wired in lockstep"),
     };
     if let Some((after_static, after_pf)) = after_zip {
-        let n_cells = match &result_emit {
-            ResultEmitPlan::Compound { plan, .. } => plan.cell_count(),
-            ResultEmitPlan::Direct { .. } => 1,
-            ResultEmitPlan::None => 0,
-        };
-        if n_cells > 0 {
-            emit_alloc_cells_and_patch(
-                &mut f,
-                func_idx.cabi_realloc_idx,
-                schema,
-                n_cells,
-                after_pf.params_offset,
-                after_result_cells_slice_off(schema, after_static.layout),
-                lcl.cells_base,
-            );
-            match &result_emit {
-                ResultEmitPlan::Compound {
-                    plan,
-                    retptr_offset,
-                    addr_local,
-                    synth_locals,
+        let cells_field_off = after_result_cells_slice_off(schema, after_static.layout);
+        match &result_emit {
+            ResultEmitPlan::Compound {
+                plan,
+                retptr_offset,
+                addr_local,
+                synth_locals,
+                loads,
+                side_refs,
+                list_locals,
+            } => {
+                // Memory → flat-on-stack → synthetic locals first,
+                // so the alloc pre-pass can read each list's
+                // `len_slot` from synth_locals.
+                emit_lift_compound_prefix(
+                    &mut f,
+                    plan.flat_slot_count,
+                    *retptr_offset,
                     loads,
-                    side_refs,
-                } => {
-                    // Memory → flat-on-stack → synthetic locals → walk plan.
-                    emit_lift_compound_prefix(
-                        &mut f,
-                        plan.flat_slot_count,
-                        *retptr_offset,
-                        loads,
-                        *addr_local,
-                        synth_locals,
-                    );
-                    // Synth locals are contiguous; `synth_locals[0]`
-                    // is the plan's `local_base`.
-                    emit_lift_plan(
-                        &mut f,
-                        &schema.cell_layout,
-                        lcl.cells_base,
-                        plan,
-                        *side_refs,
-                        synth_locals[0],
-                        &lcl,
-                    );
-                }
-                ResultEmitPlan::Direct { .. } => {
-                    // Single-cell direct result: `lcl.addr = cells_base`.
-                    f.instructions().local_get(lcl.cells_base);
-                    f.instructions().local_set(lcl.addr);
-                    emit_lift_result(&mut f, &schema.cell_layout, &result_emit, &lcl);
-                }
-                ResultEmitPlan::None => {}
+                    *addr_local,
+                    synth_locals,
+                );
+                emit_alloc_cells_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    plan,
+                    list_locals,
+                    synth_locals[0],
+                    &lcl,
+                    CellsTarget {
+                        fields_base_ptr: after_pf.params_offset,
+                        cells_field_off,
+                    },
+                );
+                // Synth locals are contiguous; `synth_locals[0]`
+                // is the plan's `local_base`.
+                emit_lift_plan(
+                    &mut f,
+                    &lift_ctx,
+                    plan,
+                    *side_refs,
+                    synth_locals[0],
+                    &lcl,
+                    list_locals,
+                );
             }
+            ResultEmitPlan::Direct { .. } => {
+                // Single-cell direct result: build-time-sized cells slab,
+                // patch ptr (len is static-filled), `lcl.addr = cells_base`.
+                emit_cabi_realloc_call(
+                    &mut f,
+                    func_idx.cabi_realloc_idx,
+                    schema.cell_layout.align,
+                    schema.cell_layout.size,
+                    lcl.cells_base,
+                );
+                emit_store_slice_ptr_runtime(
+                    &mut f,
+                    after_pf.params_offset,
+                    cells_field_off,
+                    lcl.cells_base,
+                );
+                f.instructions().local_get(lcl.cells_base);
+                f.instructions().local_set(lcl.addr);
+                emit_lift_result(&mut f, &schema.cell_layout, &result_emit, &lcl);
+            }
+            ResultEmitPlan::None => {}
         }
         // iface/fn are prewritten by `build_after_params_blob`;
         // only `call.id` changes per call, so patch it at runtime.

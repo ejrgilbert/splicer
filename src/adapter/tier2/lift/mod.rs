@@ -43,7 +43,7 @@ pub(super) use classify::{
 };
 pub(super) use emit::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    CellSideRefs, ResultEmitPlan, WrapperLocals,
+    CellSideRefs, LiftEmitCtx, ListEmitLocals, ResultEmitPlan, WrapperLocals,
 };
 pub(super) use sidetable::char_info::{
     build_char_scratch_map, char_scratch_sizes, CharScratchMaps,
