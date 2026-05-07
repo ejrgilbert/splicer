@@ -1423,6 +1423,100 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// `list<option<u32>>` param — multi-cell element. Exercises the
+    /// per-iteration `elem_cell_base = start_i + j*elem_count` stage
+    /// + runtime-computed Option child index in
+    ///   `cell::option-some(idx)` payload. Canned-sweep covers runtime
+    ///   value-correctness; this is a build-and-validate fast check.
+    #[test]
+    fn dispatch_module_with_option_list_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+                        i32.const 0x4000)
+                    (func (export "consume") (param i32 i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (alias core export $i "memory" (core memory $mem))
+                (alias core export $i "cabi_realloc" (core func $realloc))
+                (type $consume-ty (func (param "xs" (list (option u32)))))
+                (func $consume-lifted (type $consume-ty)
+                    (canon lift (core func $consume) (memory $mem) (realloc (func $realloc))))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:lo/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:lo/api@1.0.0" (instance $api "my:lo/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:lo/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for list<option<u32>> param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// `list<result<u32, string>>` param — exercises both result arms'
+    /// runtime child indices on the same shared `list_elem_child_idx`
+    /// staging local.
+    #[test]
+    fn dispatch_module_with_result_list_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+                        i32.const 0x4000)
+                    (func (export "consume") (param i32 i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (alias core export $i "memory" (core memory $mem))
+                (alias core export $i "cabi_realloc" (core func $realloc))
+                (type $consume-ty (func (param "xs" (list (result u32 (error string))))))
+                (func $consume-lifted (type $consume-ty)
+                    (canon lift (core func $consume) (memory $mem) (realloc (func $realloc))))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:lr/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:lr/api@1.0.0" (instance $api "my:lr/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:lr/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for list<result<u32, string>> param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// `list<char>` result — same Compound/retptr path as
     /// `list<u32>`, but the per-iteration utf-8 scratch + Prestaged
     /// `CharScratch` ride along on the result side too. The canned

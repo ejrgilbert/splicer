@@ -15,7 +15,7 @@ use super::super::super::abi::emit::{
 use super::super::super::abi::flat_types;
 use super::super::super::abi::WasmEncoderBindgen;
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
-use super::super::cells::CellLayout;
+use super::super::cells::{CellLayout, PayloadSource};
 use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
 use super::plan::{ArmGuard, Cell, LiftPlan, ListElementClass, ListSpec};
@@ -68,6 +68,11 @@ pub(crate) struct WrapperLocals {
     /// otherwise-unused locals.
     pub(super) char_len: Option<u32>,
     pub(super) char_scratch_addr: Option<u32>,
+    /// Shared staging slot for list-element child cell-array indices
+    /// (Option/Result payloads). `Some` iff the wrapper has any
+    /// list-element cell of the [`super::plan::ListElementClass::PrestagedChildIdx`]
+    /// kind; `None` skips the local in wrappers that never need it.
+    pub(super) list_elem_child_idx: Option<u32>,
     /// Direct-return value when the export sig has a single flat
     /// result; `None` otherwise.
     pub result: Option<u32>,
@@ -167,6 +172,12 @@ pub(crate) struct LiftEmitCtx<'a> {
 pub(crate) struct PlanCursor<'a> {
     pub plan: &'a LiftPlan,
     pub local_base: u32,
+    /// Per-iteration cell-array base for list-element bodies — local
+    /// holding `start_i + j*elem_count`. Cells whose payload carries
+    /// a child cell-array index (Option/Result) compute the runtime
+    /// idx as `elem_cell_base + relative_idx` when this is `Some`;
+    /// `None` for top-level walks (build-time-known absolute idx).
+    pub elem_cell_base: Option<u32>,
 }
 
 /// Per-`Cell::ListOf` emit-time bundle. One entry per list-of cell
@@ -204,6 +215,13 @@ pub(crate) struct ListEmitLocals {
     /// scratch-buffer size + per-iteration scratch indexing so
     /// multi-char elements (e.g. `tuple<char, char>`) don't alias.
     pub chars_per_elem: u32,
+    /// Per-iteration cell-array base (`start_i + j*elem_count`),
+    /// staged once at iteration start and reused by
+    /// [`emit_set_elem_cell_addr`], the indices_ptr write, and any
+    /// list-element option/result child-idx resolution. Always
+    /// allocated — saves 1–2 instructions per cell per iteration vs
+    /// recomputing `start_i + j*elem_count` at each use site.
+    pub elem_cell_base: u32,
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
@@ -262,6 +280,7 @@ fn build_one_list_emit_locals(
         .filter(|c| matches!(c, Cell::Char { .. }))
         .count() as u32;
     let char_scratch_base = (chars_per_elem > 0).then(|| builder.alloc_local(ValType::I32));
+    let elem_cell_base = builder.alloc_local(ValType::I32);
     ListEmitLocals {
         start_i,
         len,
@@ -274,6 +293,30 @@ fn build_one_list_emit_locals(
         elem_cell_side,
         char_scratch_base,
         chars_per_elem,
+        elem_cell_base,
+    }
+}
+
+/// Any list-element cell in the wrapper whose payload carries a
+/// child cell-array index ([`ListElementClass::PrestagedChildIdx`]).
+/// Gates `WrapperLocals.list_elem_child_idx`.
+fn fn_has_list_elem_child_idx(fd: &FuncDispatch) -> bool {
+    let plan_has = |plan: &LiftPlan| {
+        plan.list_specs().any(|spec| {
+            spec.element_plan.cells.iter().any(|c| {
+                matches!(
+                    c.list_element_class(),
+                    Some(ListElementClass::PrestagedChildIdx)
+                )
+            })
+        })
+    };
+    if fd.params.iter().any(|p| plan_has(&p.lift.plan)) {
+        return true;
+    }
+    match fd.result_lift.as_ref().map(|rl| &rl.source) {
+        Some(ResultSourceLayout::Compound { compound, .. }) => plan_has(&compound.plan),
+        _ => false,
     }
 }
 
@@ -311,6 +354,9 @@ fn elem_cell_side_data(cell: &Cell) -> CellSideData {
         ListElementClass::PrestagedChar => CellSideData::Char {
             scratch: CharScratch::Prestaged,
         },
+        // Option/Result child indices are computed inline at emit
+        // time via PlanCursor.elem_cell_base — no side-data carrier.
+        ListElementClass::PrestagedChildIdx => CellSideData::None,
     }
 }
 
@@ -343,6 +389,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let needs_char_locals = fn_contains_char(fd);
     let char_len = needs_char_locals.then(|| builder.alloc_local(ValType::I32));
     let char_scratch_addr = needs_char_locals.then(|| builder.alloc_local(ValType::I32));
+    let list_elem_child_idx =
+        fn_has_list_elem_child_idx(fd).then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -478,6 +526,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             flags_count,
             char_len,
             char_scratch_addr,
+            list_elem_child_idx,
             result,
             tr_addr,
             id_local,
@@ -541,7 +590,11 @@ pub(crate) fn emit_lift_plan(
         emit_cell_op(
             f,
             ctx,
-            PlanCursor { plan, local_base },
+            PlanCursor {
+                plan,
+                local_base,
+                elem_cell_base: None,
+            },
             op,
             &side_refs.cell_side[cell_idx],
             lcl,
@@ -739,7 +792,11 @@ fn emit_cell_op(
     lcl: &WrapperLocals,
     list_slot: Option<&ListEmitLocals>,
 ) {
-    let PlanCursor { plan, local_base } = cur;
+    let PlanCursor {
+        plan,
+        local_base,
+        elem_cell_base,
+    } = cur;
     let addr = lcl.addr;
     let cell_layout = ctx.cell_layout;
     match op {
@@ -752,25 +809,25 @@ fn emit_cell_op(
         | Cell::Char { flat_slot }
         | Cell::Handle { flat_slot, .. } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::Integer64 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I64, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::FloatingF32 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::F32, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::FloatingF64 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::F64, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::Option { disc_slot, .. }
         | Cell::Result { disc_slot, .. }
         | Cell::Variant { disc_slot, .. } => {
             let src = pin_leaf_flat(f, plan, local_base, *disc_slot, WasmType::I32, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
         }
         // Two-flat-slot kinds.
         Cell::Text { ptr_slot, len_slot } => {
@@ -815,13 +872,10 @@ fn emit_cell_op(
 
 /// Emit one single-source cell at `lcl.addr`, reading the source value
 /// from local `source`. Shared by [`emit_cell_op`] (params + compound
-/// result; pass `for_direct = false`) and [`emit_lift_result`]'s
-/// Direct branch (sync-flat result, source = `lcl.result`; pass
-/// `for_direct = true`).
+/// result) and [`emit_lift_result`]'s Direct branch.
 ///
-/// Disc-dispatched cells (`Option` / `Result` / `Variant`) are valid
-/// in compound contexts only — classify routes Direct results around
-/// them. `for_direct = true` enforces that one-source-of-truth here.
+/// `elem_cell_base = Some` inside list-element bodies; resolves
+/// Option/Result child indices via `stage_child_idx_source`.
 fn emit_single_slot_cell(
     f: &mut Function,
     cell_layout: &CellLayout,
@@ -829,17 +883,8 @@ fn emit_single_slot_cell(
     side_data: &CellSideData,
     source: u32,
     lcl: &WrapperLocals,
-    for_direct: bool,
+    elem_cell_base: Option<u32>,
 ) {
-    if for_direct {
-        match cell {
-            Cell::Option { .. } | Cell::Result { .. } | Cell::Variant { .. } => unreachable!(
-                "emit_single_slot_cell reached Compound-only Cell {cell:?} as Direct — \
-                 classify_result_lift should have routed it through Compound"
-            ),
-            _ => {}
-        }
-    }
     let addr = lcl.addr;
     match cell {
         Cell::Bool { .. } => cell_layout.emit_bool(f, addr, source),
@@ -900,9 +945,12 @@ fn emit_single_slot_cell(
             cell_layout.emit_handle_cell(f, addr, kind.cell_disc_case(), fill.side_table_idx);
         }
         Cell::Option { child_idx, .. } => {
+            // Stage inside the `some` arm — none-iterations skip it
+            // entirely. Symmetric with `Cell::Result` below.
             f.instructions().local_get(source);
             f.instructions().if_(BlockType::Empty);
-            cell_layout.emit_option_some(f, addr, *child_idx);
+            let child_idx_source = stage_child_idx_source(f, lcl, elem_cell_base, *child_idx);
+            cell_layout.emit_option_some(f, addr, child_idx_source);
             f.instructions().else_();
             cell_layout.emit_option_none(f, addr);
             f.instructions().end();
@@ -910,12 +958,24 @@ fn emit_single_slot_cell(
         Cell::Result {
             ok_idx, err_idx, ..
         } => {
-            // wasm `if` fires on non-zero, so err goes in the if block.
+            // Each arm references its own child idx; staging happens
+            // inside whichever branch runs, and unit arms skip the
+            // staging entirely (emit_result_arm ignores `inner_idx`
+            // when has_payload == false).
             f.instructions().local_get(source);
             f.instructions().if_(BlockType::Empty);
-            cell_layout.emit_result_err(f, addr, err_idx.is_some(), err_idx.unwrap_or(0));
+            // wasm `if` fires on non-zero, so err goes in the if block.
+            let err_source = match err_idx {
+                Some(rel) => stage_child_idx_source(f, lcl, elem_cell_base, *rel),
+                None => PayloadSource::ConstI32(0),
+            };
+            cell_layout.emit_result_err(f, addr, err_idx.is_some(), err_source);
             f.instructions().else_();
-            cell_layout.emit_result_ok(f, addr, ok_idx.is_some(), ok_idx.unwrap_or(0));
+            let ok_source = match ok_idx {
+                Some(rel) => stage_child_idx_source(f, lcl, elem_cell_base, *rel),
+                None => PayloadSource::ConstI32(0),
+            };
+            cell_layout.emit_result_ok(f, addr, ok_idx.is_some(), ok_source);
             f.instructions().end();
         }
         Cell::Variant { .. } => {
@@ -1000,13 +1060,25 @@ fn emit_list_of_arm(
         f.instructions().local_set(local);
     }
 
+    // elem_cell_base = start_i + j*elem_count — staged once,
+    // reused by emit_set_elem_cell_addr, the indices_ptr write, and
+    // any list-element option/result child-idx resolution.
+    f.instructions().local_get(ll.start_i);
+    f.instructions().local_get(ll.j);
+    if elem_count != 1 {
+        f.instructions().i32_const(elem_count as i32);
+        f.instructions().i32_mul();
+    }
+    f.instructions().i32_add();
+    f.instructions().local_set(ll.elem_cell_base);
+
     // Per element-plan cell: stage its absolute address (and any
     // per-iteration scratch), then dispatch to emit_cell_op.
     // `char_idx` counts char-cells in element-plan walk order so
     // multi-char elements get distinct slots in the per-call buffer.
     let mut char_idx: u32 = 0;
     for (cell_pos, elem_cell) in element_plan.cells.iter().enumerate() {
-        emit_set_elem_cell_addr(f, lcl, ll, elem_count, cell_pos as u32, cell_layout.size);
+        emit_set_elem_cell_addr(f, lcl, ll, cell_pos as u32, cell_layout.size);
         if matches!(elem_cell, Cell::Char { .. }) {
             emit_stage_char_scratch_addr(f, lcl, ll, char_idx);
             char_idx += 1;
@@ -1017,6 +1089,7 @@ fn emit_list_of_arm(
             PlanCursor {
                 plan: element_plan,
                 local_base: ll.elem_flat_locals[0],
+                elem_cell_base: Some(ll.elem_cell_base),
             },
             elem_cell,
             &ll.elem_cell_side[cell_pos],
@@ -1031,20 +1104,16 @@ fn emit_list_of_arm(
         ll.chars_per_elem,
     );
 
-    // indices_ptr[j*4] = start_i + j*elem_count + root
-    // (the cell-array index of this element's root cell).
+    // indices_ptr[j*4] = elem_cell_base + root — the cell-array
+    // index of this element's root cell, written through the
+    // already-staged `ll.elem_cell_base` rather than recomputing
+    // `start_i + j*elem_count`.
     f.instructions().local_get(ll.indices_ptr);
     f.instructions().local_get(ll.j);
     f.instructions().i32_const(4);
     f.instructions().i32_mul();
     f.instructions().i32_add();
-    f.instructions().local_get(ll.start_i);
-    f.instructions().local_get(ll.j);
-    if elem_count != 1 {
-        f.instructions().i32_const(elem_count as i32);
-        f.instructions().i32_mul();
-    }
-    f.instructions().i32_add();
+    f.instructions().local_get(ll.elem_cell_base);
     if element_plan.root() != 0 {
         f.instructions().i32_const(element_plan.root() as i32);
         f.instructions().i32_add();
@@ -1065,25 +1134,19 @@ fn emit_list_of_arm(
 }
 
 /// Stage the absolute cell-array address of element-plan position
-/// `cell_pos` for iteration `j` into `lcl.addr`:
-/// `cells_base + (start_i + j*elem_count + cell_pos) * cell_size`.
-/// Constant-folds the `cell_pos == 0` and `elem_count == 1` cases.
+/// `cell_pos` for the current iteration into `lcl.addr`:
+/// `cells_base + (elem_cell_base + cell_pos) * cell_size`. Reads
+/// `ll.elem_cell_base` (staged once at iteration start) instead of
+/// recomputing `start_i + j*elem_count`.
 fn emit_set_elem_cell_addr(
     f: &mut Function,
     lcl: &WrapperLocals,
     ll: &ListEmitLocals,
-    elem_count: u32,
     cell_pos: u32,
     cell_size: u32,
 ) {
     f.instructions().local_get(lcl.cells_base);
-    f.instructions().local_get(ll.start_i);
-    f.instructions().local_get(ll.j);
-    if elem_count != 1 {
-        f.instructions().i32_const(elem_count as i32);
-        f.instructions().i32_mul();
-    }
-    f.instructions().i32_add();
+    f.instructions().local_get(ll.elem_cell_base);
     if cell_pos != 0 {
         f.instructions().i32_const(cell_pos as i32);
         f.instructions().i32_add();
@@ -1092,6 +1155,35 @@ fn emit_set_elem_cell_addr(
     f.instructions().i32_mul();
     f.instructions().i32_add();
     f.instructions().local_set(lcl.addr);
+}
+
+/// Resolve a cell-payload child cell-array index to a [`PayloadSource`].
+/// Static (top-level) cells get a build-time `ConstI32`. List-element
+/// cells stage `elem_cell_base + relative_idx` into
+/// `lcl.list_elem_child_idx` and return `Local` — except when
+/// `relative_idx == 0`, in which case `base` already holds the
+/// answer and the staging copy is skipped.
+fn stage_child_idx_source(
+    f: &mut Function,
+    lcl: &WrapperLocals,
+    elem_cell_base: Option<u32>,
+    relative_idx: u32,
+) -> PayloadSource {
+    let Some(base) = elem_cell_base else {
+        return PayloadSource::ConstI32(relative_idx as i32);
+    };
+    if relative_idx == 0 {
+        return PayloadSource::Local(base);
+    }
+    let dest = lcl.list_elem_child_idx.expect(
+        "list_elem_child_idx unset — fn_has_list_elem_child_idx must agree \
+         with the cells reaching emit_single_slot_cell",
+    );
+    f.instructions().local_get(base);
+    f.instructions().i32_const(relative_idx as i32);
+    f.instructions().i32_add();
+    f.instructions().local_set(dest);
+    PayloadSource::Local(dest)
 }
 
 /// Stage the per-iteration utf-8 scratch address for the
@@ -1311,7 +1403,16 @@ pub(crate) fn emit_lift_result(
             source_local,
             side_data,
         } => {
-            emit_single_slot_cell(f, cell_layout, cell, side_data, *source_local, lcl, true);
+            // classify_result_lift routes Compound-only kinds away
+            // from Direct, so a Direct cell here is always single-source.
+            debug_assert!(
+                !matches!(
+                    cell,
+                    Cell::Option { .. } | Cell::Result { .. } | Cell::Variant { .. }
+                ),
+                "Direct result reached emit_lift_result with Compound-only cell {cell:?}",
+            );
+            emit_single_slot_cell(f, cell_layout, cell, side_data, *source_local, lcl, None);
         }
         ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
             "Compound is emitted via emit_lift_compound_prefix + emit_lift_plan; \

@@ -198,8 +198,13 @@ impl StoreKind {
 /// side-table index is computed at adapter-build time — source from
 /// an `i32.const` (`ConstI32`); pre-materializing the constant into
 /// a wasm local first would just be wasted instructions.
+///
+/// Public to the adapter crate so list-element emit can pass a
+/// runtime-staged local (option/result child indices computed as
+/// `elem_cell_base + relative_idx` per iteration) through the same
+/// helper that static cells call with `ConstI32`.
 #[derive(Clone, Copy)]
-enum PayloadSource {
+pub(crate) enum PayloadSource {
     Local(u32),
     ConstI32(i32),
 }
@@ -421,15 +426,22 @@ impl CellLayout {
         );
     }
 
-    /// `cell::option-some(u32)` — inner cell index. Build-time const,
-    /// same shape as `record-of`'s side-table-index payload.
-    pub(crate) fn emit_option_some(&self, f: &mut Function, addr_local: u32, inner_idx: u32) {
+    /// `cell::option-some(u32)` — inner cell-array index.
+    /// `inner_idx_source` is `ConstI32` for static cells (the cell
+    /// idx is build-time-known) and `Local` for list-element cells
+    /// (per-iteration runtime idx = `elem_cell_base + relative_idx`).
+    pub(crate) fn emit_option_some(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        inner_idx_source: PayloadSource,
+    ) {
         self.emit_cell(
             f,
             addr_local,
             self.disc_of("option-some"),
             &[PayloadPart {
-                source: PayloadSource::ConstI32(inner_idx as i32),
+                source: inner_idx_source,
                 kind: StoreKind::I32,
                 offset: 0,
             }],
@@ -441,26 +453,28 @@ impl CellLayout {
         self.emit_cell(f, addr_local, self.disc_of("option-none"), &[]);
     }
 
-    /// `cell::result-ok(option<u32>)`.
+    /// `cell::result-ok(option<u32>)`. `inner_idx_source` follows the
+    /// same `ConstI32` (static) vs `Local` (list-element) split as
+    /// [`Self::emit_option_some`]; ignored when `has_payload` is false.
     pub(crate) fn emit_result_ok(
         &self,
         f: &mut Function,
         addr_local: u32,
         has_payload: bool,
-        inner_idx: u32,
+        inner_idx_source: PayloadSource,
     ) {
-        self.emit_result_arm(f, addr_local, "result-ok", has_payload, inner_idx);
+        self.emit_result_arm(f, addr_local, "result-ok", has_payload, inner_idx_source);
     }
 
-    /// `cell::result-err(option<u32>)`.
+    /// `cell::result-err(option<u32>)`. See [`Self::emit_result_ok`].
     pub(crate) fn emit_result_err(
         &self,
         f: &mut Function,
         addr_local: u32,
         has_payload: bool,
-        inner_idx: u32,
+        inner_idx_source: PayloadSource,
     ) {
-        self.emit_result_arm(f, addr_local, "result-err", has_payload, inner_idx);
+        self.emit_result_arm(f, addr_local, "result-err", has_payload, inner_idx_source);
     }
 
     /// Shared body for both result arms: cell disc + an inline
@@ -474,7 +488,7 @@ impl CellLayout {
         addr_local: u32,
         case: &str,
         has_payload: bool,
-        inner_idx: u32,
+        inner_idx_source: PayloadSource,
     ) {
         let mut parts = vec![PayloadPart {
             source: PayloadSource::ConstI32(if has_payload { 1 } else { 0 }),
@@ -483,7 +497,7 @@ impl CellLayout {
         }];
         if has_payload {
             parts.push(PayloadPart {
-                source: PayloadSource::ConstI32(inner_idx as i32),
+                source: inner_idx_source,
                 kind: StoreKind::I32,
                 offset: 4,
             });
@@ -867,7 +881,19 @@ mod tests {
     fn option_some_cell_emits_valid_wasm() {
         // params: (addr_local: i32). inner_idx is an i32.const.
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_option_some(f, 0, 7));
+        build_and_validate(&[ValType::I32], |f| {
+            cl.emit_option_some(f, 0, PayloadSource::ConstI32(7))
+        });
+    }
+
+    #[test]
+    fn option_some_cell_with_local_idx_emits_valid_wasm() {
+        // List-element shape: caller stages runtime idx into a local
+        // and passes PayloadSource::Local.
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32, ValType::I32], |f| {
+            cl.emit_option_some(f, 0, PayloadSource::Local(1))
+        });
     }
 
     #[test]
@@ -881,26 +907,34 @@ mod tests {
     fn result_ok_with_payload_emits_valid_wasm() {
         // params: (addr_local: i32). option<u32> payload (disc=1, idx).
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_result_ok(f, 0, true, 5));
+        build_and_validate(&[ValType::I32], |f| {
+            cl.emit_result_ok(f, 0, true, PayloadSource::ConstI32(5))
+        });
     }
 
     #[test]
     fn result_ok_unit_emits_valid_wasm() {
         // params: (addr_local: i32). option<u32> payload (disc=0).
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_result_ok(f, 0, false, 0));
+        build_and_validate(&[ValType::I32], |f| {
+            cl.emit_result_ok(f, 0, false, PayloadSource::ConstI32(0))
+        });
     }
 
     #[test]
     fn result_err_with_payload_emits_valid_wasm() {
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_result_err(f, 0, true, 7));
+        build_and_validate(&[ValType::I32], |f| {
+            cl.emit_result_err(f, 0, true, PayloadSource::ConstI32(7))
+        });
     }
 
     #[test]
     fn result_err_unit_emits_valid_wasm() {
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_result_err(f, 0, false, 0));
+        build_and_validate(&[ValType::I32], |f| {
+            cl.emit_result_err(f, 0, false, PayloadSource::ConstI32(0))
+        });
     }
 
     #[test]

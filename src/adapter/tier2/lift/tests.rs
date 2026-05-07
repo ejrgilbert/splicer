@@ -88,6 +88,11 @@ const TEST_WIT: &str = r#"
         f-list-u32: func(xs: list<u32>);
         f-list-string: func(xs: list<string>);
         f-list-char: func(xs: list<char>);
+        f-list-option-u32: func(xs: list<option<u32>>);
+        f-list-option-string: func(xs: list<option<string>>);
+        f-list-option-option-u32: func(xs: list<option<option<u32>>>);
+        f-list-result-u32-string: func(xs: list<result<u32, string>>);
+        f-list-result-unit-string: func(xs: list<result<_, string>>);
         record list-char-pair { items: list<char>, scores: list<u32> }
         f-record-with-list-char: func(rcp: list-char-pair);
         f-result-list-u32: func() -> list<u32>;
@@ -485,6 +490,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let flags_count = builder.alloc_local(ValType::I32);
     let char_len = builder.alloc_local(ValType::I32);
     let char_scratch_addr = builder.alloc_local(ValType::I32);
+    let list_elem_child_idx = builder.alloc_local(ValType::I32);
     let id_local = builder.alloc_local(ValType::I64);
     let saved_bump = builder.alloc_local(ValType::I32);
     let cells_base = builder.alloc_local(ValType::I32);
@@ -505,6 +511,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         flags_count,
         char_len: Some(char_len),
         char_scratch_addr: Some(char_scratch_addr),
+        list_elem_child_idx: Some(list_elem_child_idx),
         cells_base,
         next_cell_idx,
         result: None,
@@ -998,6 +1005,68 @@ fn list_of_char_element_plan_uses_one_local_slot() {
 }
 
 #[test]
+fn list_of_option_u32_element_plan_is_two_cells() {
+    // option<u32>: [IntegerZeroExt(slot 1), Option(disc=0, child_idx=0)].
+    // Multi-cell list element — exercises the lifted gate +
+    // PrestagedChildIdx class.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-option-u32").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(
+        element_plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::Option {
+                disc_slot: 0,
+                child_idx: 0,
+            },
+        ],
+    );
+    assert_eq!(element_plan.flat_slot_count, 2);
+    assert_eq!(element_plan.root(), 1);
+}
+
+#[test]
+fn list_of_result_u32_string_element_plan_shape() {
+    // result<u32, string>: [Int(u32 arm), Text(err arm joined slots),
+    //   Result(disc=0, ok_idx=0, err_idx=1)].
+    // Each arm reads its own joined slot range; the result cell
+    // carries both ok and err relative indices into the element plan.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-result-u32-string").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(element_plan.cells.len(), 3);
+    let Cell::Result {
+        disc_slot,
+        ok_idx,
+        err_idx,
+    } = element_plan.cells[2]
+    else {
+        panic!(
+            "expected Result at element-plan cell 2, got {:?}",
+            element_plan.cells[2]
+        );
+    };
+    assert_eq!(disc_slot, 0);
+    assert_eq!(ok_idx, Some(0));
+    assert_eq!(err_idx, Some(1));
+}
+
+#[test]
 fn record_with_list_char_field_recurses_into_list() {
     // list-char-pair { items: list<char>, scores: list<u32> }
     //   items   → cell 0 (ListOf, slots 0..1, char element)
@@ -1210,6 +1279,8 @@ fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
         plan_for_param("f-list-u32", &r, &mut names),
         plan_for_param("f-list-string", &r, &mut names),
         plan_for_param("f-list-char", &r, &mut names),
+        plan_for_param("f-list-option-u32", &r, &mut names),
+        plan_for_param("f-list-result-u32-string", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
         plan_for_param("f-option-list", &r, &mut names),
@@ -1902,12 +1973,19 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_named("stream-pair", &r, &mut names),
         plan_for_param("f-error-context", &r, &mut names),
         plan_for_param("f-result-with-err-ctx", &r, &mut names),
-        // Scalar-element lists + char (per-iteration utf-8 scratch).
-        // Other compound element kinds remain gated at `push_list_of`
-        // via `Cell::allowed_as_list_element`.
+        // Scalar-element lists + char (per-iteration utf-8 scratch) +
+        // option/result (cell-payload runtime child idx). Compound
+        // element kinds with static-side-table indices remain gated.
         plan_for_param("f-list-u32", &r, &mut names),
         plan_for_param("f-list-string", &r, &mut names),
         plan_for_param("f-list-char", &r, &mut names),
+        plan_for_param("f-list-option-u32", &r, &mut names),
+        plan_for_param("f-list-option-string", &r, &mut names),
+        // Nested option in a list element: two cells reuse the
+        // shared `list_elem_child_idx` staging local sequentially.
+        plan_for_param("f-list-option-option-u32", &r, &mut names),
+        plan_for_param("f-list-result-u32-string", &r, &mut names),
+        plan_for_param("f-list-result-unit-string", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
         // Lists nested in joined arms — guards on the bump pre-pass
@@ -1934,6 +2012,30 @@ fn list_of_u32_emits_valid_wasm() {
 fn list_of_string_emits_valid_wasm() {
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-string", &r, &mut names);
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_of_option_u32_emits_valid_wasm() {
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-option-u32").params[0].ty,
+        &r,
+        &mut names,
+    );
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_of_result_u32_string_emits_valid_wasm() {
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-list-result-u32-string").params[0].ty,
+        &r,
+        &mut names,
+    );
     validate_emit_lift_plan(&plan, &r);
 }
 

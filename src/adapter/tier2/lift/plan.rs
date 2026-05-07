@@ -103,6 +103,10 @@ pub(crate) enum Cell {
     /// Flat layout: `[i32 disc, ...flat(T)]`. The child cell is
     /// always emitted; canonical-ABI lower zeroes T's slots on `none`
     /// and readers gate on the parent's disc.
+    ///
+    /// `child_idx` is absolute at top level; inside an `element_plan`
+    /// it's plan-relative — emit resolves it as
+    /// `PlanCursor::elem_cell_base + child_idx` per iteration.
     Option { disc_slot: u32, child_idx: u32 },
     /// `result<T, E>` → `cell::result-ok(option<u32>)` /
     /// `cell::result-err(option<u32>)`. Flat layout:
@@ -120,6 +124,10 @@ pub(crate) enum Cell {
     /// disc-gated [`Cell::ListOf`] — bytes from raw `cabi_realloc`
     /// memory (no zero-init guarantee). See the joined-arm rule on
     /// the [`Cell`] enum doc.
+    ///
+    /// `ok_idx` / `err_idx` are absolute at top level and
+    /// plan-relative inside an `element_plan` — same convention as
+    /// [`Cell::Option::child_idx`].
     Result {
         disc_slot: u32,
         ok_idx: Option<u32>,
@@ -233,16 +241,23 @@ pub(crate) enum ListElementClass {
     /// in [`super::emit::emit_list_of_arm`]. Folds to a
     /// `Prestaged` `CellSideData::Char`.
     PrestagedChar,
+    /// Cell payload carries a build-time-relative child cell-array
+    /// index (Option, Result). For list elements the runtime index
+    /// is `elem_cell_base + relative_idx`; emit dispatches on
+    /// `PlanCursor.elem_cell_base` rather than via side-data.
+    PrestagedChildIdx,
 }
 
 impl Cell {
     /// Classify a cell shape as a `list<T>` element. `None` for kinds
-    /// the lift codegen can't yet emit per-element (compound shapes,
-    /// remaining scratch-bearing kinds, nested lists). Exhaustive
-    /// match — adding a `Cell` variant forces a yes/no decision here.
+    /// the lift codegen can't yet emit per-element (remaining
+    /// scratch-bearing kinds, side-table-indexed compounds, nested
+    /// lists). Exhaustive match — adding a `Cell` variant forces a
+    /// yes/no decision here.
     pub(crate) fn list_element_class(&self) -> Option<ListElementClass> {
         match self {
             Cell::Char { .. } => Some(ListElementClass::PrestagedChar),
+            Cell::Option { .. } | Cell::Result { .. } => Some(ListElementClass::PrestagedChildIdx),
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -256,8 +271,6 @@ impl Cell {
             | Cell::Handle { .. }
             | Cell::RecordOf { .. }
             | Cell::TupleOf { .. }
-            | Cell::Option { .. }
-            | Cell::Result { .. }
             | Cell::Variant { .. }
             | Cell::ListOf { .. } => None,
         }
@@ -946,11 +959,16 @@ impl LiftPlanBuilder {
                 LiftPlan::stub_for(*elem)
             }
         };
-        if element_plan.cells.len() != 1 || !element_plan.cells[0].allowed_as_list_element() {
+        if !element_plan
+            .cells
+            .iter()
+            .all(|c| c.allowed_as_list_element())
+        {
             self.record_error(anyhow!(
-                "`list<T>` element type {elem:?} is not yet supported \
-                 (only scalar element types are wired today: bool, integers, \
-                 floats, string, list<u8>, enum). File a request at {ISSUES_URL} \
+                "`list<T>` element type {elem:?} contains a cell shape that \
+                 isn't yet supported as a list element (allowed today: bool, \
+                 integers, floats, string, list<u8>, enum, char, option, \
+                 result with allowed inner cells). File a request at {ISSUES_URL} \
                  to bump priority."
             ));
         }

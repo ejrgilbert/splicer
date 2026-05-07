@@ -1579,6 +1579,94 @@ fn tier2_shapes() -> Vec<Shape> {
             rust_literal: "'🎉'",
             expected_debug: "'🎉'",
         })),
+        // list<option<u32>> + list<result<u32, u32>>: multi-cell list
+        // elements. Per-iteration `elem_cell_base` stages runtime
+        // child cell-array indices into the cell payload. Exercises
+        // both `Some(...)` (active-arm child) and `None`/unit-arm
+        // (no-payload) branches via the harness's single-element
+        // list rendering.
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: true,
+        })),
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            is_some: false,
+        })),
+        // list<option<string>>: two-flat-slot Text payload inside a
+        // list-element option — exercises `elem_cell_base + 0`
+        // resolution (the `Local(base)` short-circuit in
+        // stage_child_idx_source) AND the option's inner Text read
+        // from list-element flat slots.
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("hi")"#,
+                expected_debug: r#""hi""#,
+            }),
+            is_some: true,
+        })),
+        Shape::List(Box::new(Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: true,
+        })),
+        Shape::List(Box::new(Shape::Result_ {
+            ok: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            })),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: false,
+        })),
+        // list<result<_, string>>: unit ok-arm exercises the
+        // skip-staging path for unit Result arms.
+        Shape::List(Box::new(Shape::Result_ {
+            ok: None,
+            err: Some(Box::new(Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("oops")"#,
+                expected_debug: r#""oops""#,
+            })),
+            is_ok: false,
+        })),
     ]
 }
 
