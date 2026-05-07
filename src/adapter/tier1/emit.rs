@@ -1345,30 +1345,52 @@ mod tests {
             .expect("primitive alias in indirect-params position should be accepted");
     }
 
-    /// Indirect-params async fn with a non-scalar param (here a record)
-    /// bails with the phase-1 message naming the offending param. Pins
-    /// the wording so a future widening of `is_primitive_param_ty`
-    /// updates this test deliberately.
+    /// Phase-2 widening: aggregates of supported leaves accepted in
+    /// indirect-params position. Records, tuples, enums, flags — and
+    /// nested combinations — all pass `is_supported_indirect_params_ty`.
     #[test]
-    fn require_supported_case_bails_on_compound_in_indirect_params() {
+    fn require_supported_case_accepts_record_tuple_enum_flags_in_indirect_params() {
         let (resolve, iface_id) = iface_from_wit(
             r#"
             package my:shape@1.0.0;
             interface api {
                 record point { x: u32, y: u32 }
-                many: async func(a: point, b: u32, c: u32, d: u32, e: u32) -> u32;
+                enum color { red, green, blue }
+                flags perms { read, write, exec }
+                many: async func(
+                    p: point,
+                    t: tuple<u32, u64>,
+                    c: color,
+                    f: perms,
+                    nested: tuple<point, color>
+                ) -> u32;
+            }
+            "#,
+            "my:shape",
+            "api@1.0.0",
+        );
+        require_supported_case(&resolve, iface_id, false)
+            .expect("record / tuple / enum / flags in indirect-params should be accepted");
+    }
+
+    /// Indirect-params async fn with a phase-3 shape (here a `list<u32>`)
+    /// bails with the new wording. Pins the deferred-shapes contract so
+    /// a future phase-3 landing updates this test deliberately.
+    #[test]
+    fn require_supported_case_bails_on_phase3_shape_in_indirect_params() {
+        let (resolve, iface_id) = iface_from_wit(
+            r#"
+            package my:shape@1.0.0;
+            interface api {
+                many: async func(a: list<u32>, b: u32, c: u32, d: u32, e: u32) -> u32;
             }
             "#,
             "my:shape",
             "api@1.0.0",
         );
         let err = require_supported_case(&resolve, iface_id, false)
-            .expect_err("non-scalar param in indirect-params should bail");
+            .expect_err("list param in indirect-params should bail until phase 3");
         let msg = err.to_string();
-        assert!(
-            msg.contains("non-scalar"),
-            "error should classify the param as non-scalar; got: {msg}"
-        );
         assert!(
             msg.contains("`a`"),
             "error should name the offending param; got: {msg}"
@@ -1376,6 +1398,10 @@ mod tests {
         assert!(
             msg.contains("MAX_FLAT_ASYNC_PARAMS"),
             "error should still mention the limit; got: {msg}"
+        );
+        assert!(
+            msg.contains("follow-up") || msg.contains("phase"),
+            "error should signal the deferred-to-later-phase contract; got: {msg}"
         );
     }
 }

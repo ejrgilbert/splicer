@@ -102,6 +102,110 @@ fn test_adapter_async_mixed_primitives_indirect_params_validates() {
     validate_component(&bytes);
 }
 
+/// Phase-2 record param — `record { a..e: u32 }` flattens to 5 i32
+/// slots → indirect-params. Exercises `RecordLower` as a no-op
+/// 1→N decomposition; the inner `u32` lifts then drive the cursor.
+#[test]
+fn test_adapter_async_record_param_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let record = arena.intern_val(ValueType::Record(vec![
+        ("a".into(), u32_id),
+        ("b".into(), u32_id),
+        ("c".into(), u32_id),
+        ("d".into(), u32_id),
+        ("e".into(), u32_id),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([(
+            "many".to_string(),
+            sig(true, &["r"], vec![record], vec![u32_id]),
+        )]),
+        type_exports: BTreeMap::from([("rec5".to_string(), record)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/rec5-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Phase-2 tuple param — `tuple<u32, u64, f32, f64, bool>` flattens
+/// to 5 mixed slots → indirect-params. Exercises `TupleLower` plus
+/// the inter-field-alignment math from the mixed-primitive test
+/// applied inside an aggregate.
+#[test]
+fn test_adapter_async_tuple_param_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let f32_id = arena.intern_val(ValueType::F32);
+    let f64_id = arena.intern_val(ValueType::F64);
+    let bool_id = arena.intern_val(ValueType::Bool);
+    let tup = arena.intern_val(ValueType::Tuple(vec![
+        u32_id, u64_id, f32_id, f64_id, bool_id,
+    ]));
+    let iface = make_iface(vec![("many", sig(true, &["t"], vec![tup], vec![u32_id]))]);
+    let bytes = gen_adapter(
+        "test:pkg/tup5-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Phase-2 enum / flags / record-with-flags-field — aggregates whose
+/// leaves are non-numeric primitives. Pins `EnumLower` and
+/// `FlagsLower` emit shape end-to-end.
+#[test]
+fn test_adapter_async_enum_flags_record_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let color = arena.intern_val(ValueType::Enum(vec![
+        "red".into(),
+        "green".into(),
+        "blue".into(),
+    ]));
+    let perms = arena.intern_val(ValueType::Flags(vec![
+        "read".into(),
+        "write".into(),
+        "exec".into(),
+    ]));
+    // Record with mixed leaf kinds; flat = enum(i32) + flags(i32) +
+    // u32 + u32 + u32 = 5 i32 slots → indirect-params.
+    let record = arena.intern_val(ValueType::Record(vec![
+        ("c".into(), color),
+        ("f".into(), perms),
+        ("a".into(), u32_id),
+        ("b".into(), u32_id),
+        ("d".into(), u32_id),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([(
+            "many".to_string(),
+            sig(true, &["r"], vec![record], vec![u32_id]),
+        )]),
+        type_exports: BTreeMap::from([
+            ("color".to_string(), color),
+            ("perms".to_string(), perms),
+            ("rec5".to_string(), record),
+        ]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/cfr-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
 #[test]
 fn test_adapter_record_with_list_field_repro() {
     let mut arena = TypeArena::default();

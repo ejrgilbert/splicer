@@ -311,12 +311,12 @@ pub(crate) fn emit_handler_call(
 }
 
 /// Bail when an indirect-params async fn carries a param shape the
-/// lower-mode bindgen doesn't yet handle. Today's coverage is scalar
-/// primitives only — every WIT type that flattens to a single
-/// `i32` / `i64` / `f32` / `f64` slot via the canonical-ABI's
-/// primitive lowering. Anything non-scalar (string, list, record,
-/// tuple, variant, option, result, enum, flags, fixed-length-list,
-/// handle, future, stream, error-context) lands in phases 2/3.
+/// lower-mode bindgen doesn't yet handle. Phase 2 coverage:
+/// - Scalar primitives (bool / s8..s64 / u8..u64 / f32 / f64 / char).
+/// - Aggregate-of-supported: record, tuple, enum, flags (recursive).
+///
+/// Still deferred (phase 3): string, list, fixed-length-list, variant,
+/// option, result, handle, future, stream, error-context.
 /// Called from each tier's `require_supported_case` after the
 /// `indirect_params` check fires.
 pub(crate) fn require_indirect_params_supported_shape(
@@ -325,16 +325,16 @@ pub(crate) fn require_indirect_params_supported_shape(
     func: &WitFunction,
 ) -> Result<()> {
     for param in &func.params {
-        if !is_primitive_param_ty(resolve, &param.ty) {
+        if !is_supported_indirect_params_ty(resolve, &param.ty) {
             bail!(
                 "async function `{fn_name}` has params that overflow \
-                 MAX_FLAT_ASYNC_PARAMS ({}) AND param `{}` is non-scalar. \
-                 Indirect-params lower-to-memory currently supports \
-                 scalar primitives only (bool / s8..s64 / u8..u64 / \
-                 f32 / f64 / char). Strings, lists, records, tuples, \
-                 variants, options, results, enums, flags, fixed-length-\
-                 lists, handles, futures, streams, and error-context land \
-                 in a follow-up.",
+                 MAX_FLAT_ASYNC_PARAMS ({}) AND param `{}` carries a \
+                 type the indirect-params lowering doesn't yet support. \
+                 Phase-2 coverage: scalar primitives, plus records / \
+                 tuples / enums / flags built recursively from those. \
+                 Variants, options, results, fixed-length-lists, dynamic \
+                 lists, strings, handles, futures, streams, and \
+                 error-context land in a follow-up.",
                 Resolve::MAX_FLAT_ASYNC_PARAMS,
                 param.name,
             );
@@ -343,11 +343,12 @@ pub(crate) fn require_indirect_params_supported_shape(
     Ok(())
 }
 
-/// True iff `ty` is one of the canonical-ABI scalar primitives the
-/// lower-mode bindgen's emit arms cover today. Aliases (`type foo =
-/// u32;`) are followed; anything that bottoms out in a `TypeDefKind`
-/// other than `Type` is treated as compound.
-fn is_primitive_param_ty(resolve: &Resolve, ty: &Type) -> bool {
+/// Recursively true iff `ty` is a shape the lower-mode bindgen's
+/// emit arms cover. Aliases (`type foo = u32;`) are followed.
+/// Aggregates (record / tuple / enum / flags) check each contained
+/// type. See [`require_indirect_params_supported_shape`] for the
+/// phase boundaries and what's still deferred.
+fn is_supported_indirect_params_ty(resolve: &Resolve, ty: &Type) -> bool {
     match ty {
         Type::Bool
         | Type::S8
@@ -363,8 +364,31 @@ fn is_primitive_param_ty(resolve: &Resolve, ty: &Type) -> bool {
         | Type::Char => true,
         Type::String | Type::ErrorContext => false,
         Type::Id(id) => match &resolve.types[*id].kind {
-            TypeDefKind::Type(inner) => is_primitive_param_ty(resolve, inner),
-            _ => false,
+            TypeDefKind::Type(inner) => is_supported_indirect_params_ty(resolve, inner),
+            // Aggregates: the leaves are the gating constraint.
+            TypeDefKind::Record(r) => r
+                .fields
+                .iter()
+                .all(|f| is_supported_indirect_params_ty(resolve, &f.ty)),
+            TypeDefKind::Tuple(t) => t
+                .types
+                .iter()
+                .all(|t| is_supported_indirect_params_ty(resolve, t)),
+            // Enums and flags lower as plain integers — no inner types.
+            TypeDefKind::Enum(_) | TypeDefKind::Flags(_) => true,
+            // Phase 3: variants need block-capture dispatch; lists /
+            // strings need the `Realloc::None` driver work-around.
+            TypeDefKind::Variant(_)
+            | TypeDefKind::Option(_)
+            | TypeDefKind::Result(_)
+            | TypeDefKind::List(_)
+            | TypeDefKind::FixedLengthList(_, _)
+            | TypeDefKind::Map(_, _)
+            | TypeDefKind::Handle(_)
+            | TypeDefKind::Resource
+            | TypeDefKind::Future(_)
+            | TypeDefKind::Stream(_)
+            | TypeDefKind::Unknown => false,
         },
     }
 }
@@ -1348,6 +1372,125 @@ mod tests {
             assert_eq!(
                 actual_offset, 0,
                 "param {param_i}: store offset should be 0 (field offset goes in addr_local)",
+            );
+        }
+    }
+
+    /// Phase-2 snapshot for a single record param `{a: u32, b: u64,
+    /// c: f32, d: f64, e: bool, f: char}` — same widths as the mixed-
+    /// primitives test but nested inside a record. The bindgen must
+    /// stage the addr local *once* (one top-level param), advance
+    /// cursor through all 6 fields, and emit each store with the
+    /// field's canonical in-record offset baked into `MemArg.offset`
+    /// (not into `addr_local`). This is the case validation can't
+    /// pin — a record-layout regression in `field_offsets` would
+    /// silently produce miswired wasm that still validates.
+    #[test]
+    fn build_lower_params_to_memory_pins_record_field_offsets() {
+        const BASE: i32 = 2048;
+        // Record with one field per primitive width — same layout as
+        // the standalone mixed-primitives test, just inside a record.
+        let wit = r#"
+            package my:shape@1.0.0;
+            interface api {
+                record mixed-rec {
+                    a: u32, b: u64, c: f32, d: f64, e: bool, f: char,
+                }
+                only-rec: async func(r: mixed-rec) -> u32;
+            }
+        "#;
+        let (sizes, insts) = run_lower_params(wit, "my:shape/api@1.0.0", BASE, 6);
+
+        // The record's in-memory layout matches the standalone
+        // mixed-primitives record (sourced live from `field_offsets`
+        // so a wit-parser layout regression desyncs both at once).
+        let field_tys = [
+            Type::U32,
+            Type::U64,
+            Type::F32,
+            Type::F64,
+            Type::Bool,
+            Type::Char,
+        ];
+        let field_offs = sizes.field_offsets(&field_tys);
+        let expected: Vec<(u64, StoreSig)> = field_offs
+            .iter()
+            .zip([
+                StoreSig::I32,
+                StoreSig::I64,
+                StoreSig::F32,
+                StoreSig::F64,
+                StoreSig::I32_8,
+                StoreSig::I32,
+            ])
+            .map(|((off, _size), sig)| (off.size_wasm32() as u64, sig))
+            .collect();
+
+        // One top-level param → one `i32.const BASE; local.set $addr`
+        // setup at the head, then 6 × 5-instruction field blocks
+        // (local.get $param; local.set $tmp; local.get $addr;
+        //  local.get $tmp; <store> offset=<field>).
+        const HEAD_LEN: usize = 2;
+        const FIELD_LEN: usize = 5;
+        assert_eq!(
+            insts.len(),
+            HEAD_LEN + FIELD_LEN * expected.len(),
+            "expected {HEAD_LEN} setup + {FIELD_LEN} per field, got {} total",
+            insts.len(),
+        );
+
+        // Head: i32.const BASE; local.set $addr_local. addr_local
+        // index = nparams_flat (allocated first inside
+        // build_lower_params_to_memory).
+        const ADDR_LOCAL: u32 = 6;
+        match &insts[0] {
+            Instruction::I32Const(v) => {
+                assert_eq!(*v, BASE, "head: i32.const should stage params record base")
+            }
+            other => panic!("head[0] expected I32Const, got {other:?}"),
+        }
+        assert!(
+            matches!(&insts[1], Instruction::LocalSet(idx) if *idx == ADDR_LOCAL),
+            "head[1] expected LocalSet({ADDR_LOCAL}), got {:?}",
+            &insts[1],
+        );
+
+        // Per-field block at indices [HEAD_LEN + i*FIELD_LEN ..]:
+        for (field_i, (expected_off, sig)) in expected.iter().enumerate() {
+            let block = &insts[HEAD_LEN + field_i * FIELD_LEN..][..FIELD_LEN];
+            // [0] local.get $param_flat (cursor advances 1 per primitive field)
+            assert!(
+                matches!(&block[0], Instruction::LocalGet(idx) if *idx == field_i as u32),
+                "field {field_i}: block[0] expected LocalGet({field_i}), got {:?}",
+                &block[0],
+            );
+            // [1] local.set $tmp
+            let tmp = match &block[1] {
+                Instruction::LocalSet(idx) => *idx,
+                other => panic!("field {field_i}: block[1] expected LocalSet, got {other:?}"),
+            };
+            // [2] local.get $addr_local
+            assert!(
+                matches!(&block[2], Instruction::LocalGet(idx) if *idx == ADDR_LOCAL),
+                "field {field_i}: block[2] expected LocalGet({ADDR_LOCAL}), got {:?}",
+                &block[2],
+            );
+            // [3] local.get $tmp (same as [1])
+            assert!(
+                matches!(&block[3], Instruction::LocalGet(idx) if *idx == tmp),
+                "field {field_i}: block[3] should reload tmp ({tmp}), got {:?}",
+                &block[3],
+            );
+            // [4] <store> with the field's in-record offset baked into MemArg.
+            let actual_offset = sig.match_offset(&block[4]).unwrap_or_else(|| {
+                panic!(
+                    "field {field_i}: block[4] expected {sig:?} store, got {:?}",
+                    &block[4],
+                )
+            });
+            assert_eq!(
+                actual_offset, *expected_off,
+                "field {field_i}: store offset should match canonical record layout",
             );
         }
     }

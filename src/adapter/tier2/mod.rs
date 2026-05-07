@@ -1686,4 +1686,50 @@ mod tests {
             .validate_all(&bytes)
             .expect("emitted tier-2 adapter component should validate");
     }
+
+    /// Phase-2: record + tuple + enum + flags in indirect-params
+    /// position. The WIT-level interface declares each as a named
+    /// type the function references; the adapter must walk each
+    /// aggregate via the corresponding `*Lower` arm and emit the
+    /// inner stores at canonical record offsets.
+    #[test]
+    fn async_aggregates_indirect_params_validates() {
+        // 5×u32 record alone hits indirect-params (5 > 4 = MAX_FLAT_ASYNC_PARAMS).
+        let wat = r#"(component
+            (type (;0;) (instance
+                (type (;0;) (record
+                    (field "a" u32) (field "b" u32) (field "c" u32)
+                    (field "d" u32) (field "e" u32)))
+                (export "rec5" (type (eq 0)))
+                (type (;2;) (tuple u32 u64 f32 f64 bool))
+                (type (;3;) (enum "red" "green" "blue"))
+                (export "color" (type (eq 3)))
+                (type (;5;) (flags "read" "write" "exec"))
+                (export "perms" (type (eq 5)))
+                (type (;7;) (func async
+                    (param "r" 1) (param "t" 2) (param "c" 4) (param "f" 6)
+                    (result u32)))
+                (export "many" (func (type 7)))
+            ))
+            (import "test:pkg/agg-async@1.0.0" (instance (type 0)))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "test:pkg/agg-async@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for aggregate async params");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
 }

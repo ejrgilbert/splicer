@@ -59,7 +59,7 @@ use std::collections::HashMap;
 
 use wasm_encoder::{BlockType, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::{Bindgen, Bitcast, Instruction as AbiInst, WasmType};
-use wit_parser::{Alignment, ArchitectureSize, Resolve, SizeAlign, Type};
+use wit_parser::{Alignment, ArchitectureSize, FlagsRepr, Resolve, SizeAlign, Type};
 
 use super::super::indices::LocalsBuilder;
 use super::compat::{cast, flat_types};
@@ -750,6 +750,39 @@ impl Bindgen for WasmEncoderBindgen<'_> {
             }
             AbiInst::F64Store { offset } => {
                 self.emit_store(*offset, StoreKind::F64Store);
+            }
+
+            // ── Aggregate lowers (lower direction) ──────────────
+            // Records and tuples decompose 1 abstract value into N
+            // abstract fields/elements; the fields are then lowered
+            // individually, each firing its own scalar lift-to-flat
+            // (`local.get $cursor++`). Enum / flags lowering yields
+            // the integer discriminant directly: same shape as a
+            // scalar lift, just typed as an interface enum / flags
+            // value at the source-language layer.
+            AbiInst::RecordLower { record, .. } => {
+                produce_n(results, record.fields.len());
+            }
+            AbiInst::TupleLower { tuple, .. } => {
+                produce_n(results, tuple.types.len());
+            }
+            AbiInst::EnumLower { .. } => {
+                self.emit_get_flat_slot();
+                produce_n(results, 1);
+            }
+            AbiInst::FlagsLower { flags, .. } => {
+                // Component Model caps `flags` at 32 members → repr
+                // is always 1 wasm slot today. The U32(n>1) branch is
+                // defensive against a future spec relaxation; mirrors
+                // wit-parser's instruction arity contract.
+                let n = match flags.repr() {
+                    FlagsRepr::U8 | FlagsRepr::U16 => 1usize,
+                    FlagsRepr::U32(n) => n,
+                };
+                for _ in 0..n {
+                    self.emit_get_flat_slot();
+                }
+                produce_n(results, n);
             }
 
             // ── Bitcasts ───────────────────────────────────────
