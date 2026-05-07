@@ -28,14 +28,13 @@ use super::super::abi::emit::{
     emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save,
     emit_cabi_realloc_call, emit_cabi_realloc_call_runtime, emit_handler_call,
     emit_populate_call_id, emit_store_i64_local, emit_store_slice, emit_store_slice_len_runtime,
-    emit_store_slice_ptr_runtime, emit_trap_if_list_overflows_cell_slab, emit_wrapper_return,
-    BlobSlice, BumpReset, RecordLayout,
+    emit_store_slice_ptr_runtime, emit_wrapper_return, BlobSlice, BumpReset, RecordLayout,
 };
 use super::super::indices::LocalsBuilder;
 use super::lift::plan::LiftPlan;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    CellSideRefs, LiftEmitCtx, ListEmitLocals, ResultEmitPlan, WrapperLocals,
+    emit_list_pre_pass, CellSideRefs, LiftEmitCtx, ListEmitLocals, ResultEmitPlan, WrapperLocals,
 };
 use super::schema::{
     SchemaLayouts, FIELD_TREE, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
@@ -100,11 +99,10 @@ struct CellsTarget {
     cells_field_off: u32,
 }
 
-/// Cells-slab allocation for one (param | result) plan. Pre-pass
-/// captures each list's `start_i` + `len`, accumulates
-/// `total_cells = static + Σ(len_i · elem_count_i)` into
-/// `lcl.next_cell_idx`, then `cabi_realloc`s the slab and patches
-/// both `cells.ptr` and `cells.len`.
+/// Cells-slab allocation for one (param | result) plan. Runs the
+/// per-list pre-pass (disc-gated for joined-arm lists; see
+/// [`emit_list_pre_pass`]), then `cabi_realloc`s the slab and
+/// patches `cells.ptr` + `cells.len`.
 fn emit_alloc_cells_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -114,43 +112,7 @@ fn emit_alloc_cells_for_plan(
     lcl: &WrapperLocals,
     target: CellsTarget,
 ) {
-    debug_assert_eq!(
-        list_locals.len(),
-        plan.list_specs().count(),
-        "per-plan list_locals must be parallel to plan.list_specs()",
-    );
-    // Pre-pass: next_cell_idx = static_count, then for each list,
-    // capture start_i + len, bump by len * elem_count. `list_idx`
-    // on the spec keys directly into `list_locals` so this is
-    // structural, not positional. Per-list trap guards the i32
-    // mul + add against silent wrap; see
-    // `emit_trap_if_list_overflows_cell_slab`.
-    f.instructions().i32_const(plan.cell_count() as i32);
-    f.instructions().local_set(lcl.next_cell_idx);
-    for spec in plan.list_specs() {
-        let ll = &list_locals[spec.list_idx as usize];
-        f.instructions().local_get(lcl.next_cell_idx);
-        f.instructions().local_set(ll.start_i);
-        f.instructions().local_get(local_base + spec.len_slot);
-        f.instructions().local_set(ll.len);
-        let elem_count = spec.element_plan.cell_count();
-        emit_trap_if_list_overflows_cell_slab(
-            f,
-            ll.len,
-            elem_count,
-            lcl.next_cell_idx,
-            ctx.cell_layout.size,
-        );
-        f.instructions().local_get(lcl.next_cell_idx);
-        f.instructions().local_get(ll.len);
-        if elem_count != 1 {
-            f.instructions().i32_const(elem_count as i32);
-            f.instructions().i32_mul();
-        }
-        f.instructions().i32_add();
-        f.instructions().local_set(lcl.next_cell_idx);
-    }
-    // Single cabi_realloc(next_cell_idx * cell_size).
+    emit_list_pre_pass(f, ctx, plan, list_locals, local_base, lcl);
     emit_cabi_realloc_call_runtime(
         f,
         ctx.cabi_realloc_idx,

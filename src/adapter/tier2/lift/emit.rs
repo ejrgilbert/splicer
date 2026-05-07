@@ -18,7 +18,7 @@ use super::super::super::indices::{FrozenLocals, LocalsBuilder};
 use super::super::cells::CellLayout;
 use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
-use super::plan::{Cell, LiftPlan, ListSpec};
+use super::plan::{ArmGuard, Cell, LiftPlan, ListSpec};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
@@ -579,6 +579,76 @@ fn push_widened_get(
     }
 }
 
+/// Open one `if disc == expected` per guard. Body lands inside the
+/// innermost block; pair with [`emit_close_arm_guards`].
+fn emit_open_arm_guards(f: &mut Function, plan: &LiftPlan, local_base: u32, guards: &[ArmGuard]) {
+    for guard in guards {
+        push_widened_get(f, plan, local_base, guard.disc_slot, WasmType::I32);
+        f.instructions().i32_const(guard.expected_disc as i32);
+        f.instructions().i32_eq();
+        f.instructions().if_(BlockType::Empty);
+    }
+}
+
+/// Close `n` `if` blocks opened by [`emit_open_arm_guards`]. `n`
+/// must equal the guard count passed at open or wasm validation
+/// will reject the function.
+fn emit_close_arm_guards(f: &mut Function, n: usize) {
+    for _ in 0..n {
+        f.instructions().end();
+    }
+}
+
+/// Pre-pass that initializes `lcl.next_cell_idx` to the plan's
+/// static cell count, then bumps it by `len · elem_count` per list
+/// (capturing each list's `start_i` and `len` along the way).
+/// Lists nested in joined arms disc-gate the bump so the inactive
+/// arm's bytes can't bloat the slab — locals zero-init keeps
+/// `ll.len` / `ll.start_i` defined on the inactive path. Per-list
+/// trap guards the `i32` mul + add against silent wrap; see
+/// `emit_trap_if_list_overflows_cell_slab`.
+pub(crate) fn emit_list_pre_pass(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    plan: &LiftPlan,
+    list_locals: &[ListEmitLocals],
+    local_base: u32,
+    lcl: &WrapperLocals,
+) {
+    debug_assert_eq!(
+        list_locals.len(),
+        plan.list_specs().count(),
+        "per-plan list_locals must be parallel to plan.list_specs()",
+    );
+    f.instructions().i32_const(plan.cell_count() as i32);
+    f.instructions().local_set(lcl.next_cell_idx);
+    for spec in plan.list_specs() {
+        let ll = &list_locals[spec.list_idx as usize];
+        emit_open_arm_guards(f, plan, local_base, spec.arm_guards);
+        f.instructions().local_get(lcl.next_cell_idx);
+        f.instructions().local_set(ll.start_i);
+        push_widened_get(f, plan, local_base, spec.len_slot, WasmType::I32);
+        f.instructions().local_set(ll.len);
+        let elem_count = spec.element_plan.cell_count();
+        super::super::super::abi::emit::emit_trap_if_list_overflows_cell_slab(
+            f,
+            ll.len,
+            elem_count,
+            lcl.next_cell_idx,
+            ctx.cell_layout.size,
+        );
+        f.instructions().local_get(lcl.next_cell_idx);
+        f.instructions().local_get(ll.len);
+        if elem_count != 1 {
+            f.instructions().i32_const(elem_count as i32);
+            f.instructions().i32_mul();
+        }
+        f.instructions().i32_add();
+        f.instructions().local_set(lcl.next_cell_idx);
+        emit_close_arm_guards(f, spec.arm_guards.len());
+    }
+}
+
 /// Emit one cell's worth of wasm at the address held in `lcl.addr`.
 /// `local_base` is added to each plan-relative flat-slot. `list_slot`
 /// is `Some` exactly for `Cell::ListOf`. New [`Cell`] variants add an
@@ -711,12 +781,17 @@ fn emit_cell_op(
         Cell::ListOf {
             ptr_slot,
             element_plan,
+            arm_guards,
             ..
         } => {
             let ll =
                 list_slot.expect("ListOf cell must arrive with a matching ListEmitLocals slot");
+            // Disc-gate cabi_realloc + the element loop so an inactive
+            // sibling arm's bytes don't surface as `len`.
+            emit_open_arm_guards(f, plan, local_base, arm_guards);
             let ptr = pin_leaf_flat(f, plan, local_base, *ptr_slot, WasmType::I32, lcl);
             emit_list_of_arm(f, ctx, ll, ptr, element_plan, lcl);
+            emit_close_arm_guards(f, arm_guards.len());
         }
     }
 }

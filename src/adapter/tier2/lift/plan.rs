@@ -41,6 +41,17 @@ const ISSUES_URL: &str = "https://github.com/ejrgilbert/splicer/issues";
 /// side-table info this cell contributes (e.g., enum-info /
 /// record-info entries).
 ///
+/// **Joined-arm rule.** Cells inside a `result` / `variant` arm read
+/// flat slots shared with sibling arms. Pure flat-slot writers
+/// (`Text`, `Bytes`, `Char`, `Flags`, `Variant`, `Handle`,
+/// `Integer*`, `Float*`, `Bool`, `EnumCase`) emit unconditionally —
+/// inactive-arm payloads land in cells the runtime never reads, so
+/// the bytes are inert. Cells with side effects beyond their own
+/// payload — today only [`Cell::ListOf`], whose `(ptr, len)` feed
+/// `cabi_realloc` and an unbounded loop — must disc-gate via
+/// `arm_guards`. Adding a side-effecting variant (allocator, host
+/// call, scratch grow) means adding the same gate.
+///
 /// New WIT types: add one variant + one arm in
 /// [`LiftPlanBuilder::push`] + one arm in
 /// [`super::emit::emit_cell_op`]. Roadmap: `docs/tiers/lift-codegen.md`.
@@ -100,6 +111,15 @@ pub(crate) enum Cell {
     /// and produce harmless garbage on inactive disc. `ok_idx` /
     /// `err_idx` are `None` for unit arms (`result<_, E>` /
     /// `result<T, _>`).
+    ///
+    /// **Load-bearing invariant.** `ok_idx` / `err_idx` are emitted
+    /// into the cell payload but the runtime gates on disc and
+    /// **must not** follow the inactive index. The inactive cell
+    /// holds either bytes from the active arm's flat slots
+    /// (Text/Bytes/Char/etc., harmless once skipped) or — for
+    /// disc-gated [`Cell::ListOf`] — bytes from raw `cabi_realloc`
+    /// memory (no zero-init guarantee). See the joined-arm rule on
+    /// the [`Cell`] enum doc.
     Result {
         disc_slot: u32,
         ok_idx: Option<u32>,
@@ -115,6 +135,9 @@ pub(crate) enum Cell {
     /// Inactive arms' children get garbage from joined slots; the
     /// runtime patches `case-name` + `payload` per call so readers
     /// gate on disc and never follow them.
+    ///
+    /// Same load-bearing invariant as [`Cell::Result`]: the runtime
+    /// **must not** follow `per_case_payload[i]` for `i ≠ disc`.
     Variant {
         disc_slot: u32,
         per_case_payload: Vec<Option<u32>>,
@@ -143,12 +166,27 @@ pub(crate) enum Cell {
     /// (drives `lift_from_memory` per iteration). `list_idx` keys
     /// into the parallel `list_locals` array, so per-list emit + alloc
     /// state is paired structurally rather than by iteration order.
+    ///
+    /// `arm_guards` is non-empty when the list lives inside joined
+    /// `result` / `variant` arm(s) — outer→inner order. The alloc
+    /// pre-pass and the per-list emit body AND-stack the predicates
+    /// so an inactive arm's bytes can't surface as `len` (see
+    /// [`ArmGuard`] and the joined-arm rule on the [`Cell`] doc).
     ListOf {
         list_idx: u32,
         ptr_slot: u32,
         len_slot: u32,
         element_plan: Box<LiftPlan>,
+        arm_guards: Vec<ArmGuard>,
     },
+}
+
+/// Disc-equality predicate guarding a [`Cell::ListOf`]'s side
+/// effects. Result ok = 0, err = 1; variant uses case index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArmGuard {
+    pub(crate) disc_slot: u32,
+    pub(crate) expected_disc: u32,
 }
 
 /// Which `cell::*-handle` variant a [`Cell::Handle`] should emit.
@@ -357,11 +395,13 @@ impl LiftPlan {
                 list_idx,
                 len_slot,
                 element_plan,
+                arm_guards,
                 ..
             } => Some(ListSpec {
                 list_idx: *list_idx,
                 len_slot: *len_slot,
                 element_plan,
+                arm_guards,
             }),
             _ => None,
         })
@@ -376,6 +416,8 @@ pub(crate) struct ListSpec<'a> {
     pub list_idx: u32,
     pub len_slot: u32,
     pub element_plan: &'a LiftPlan,
+    /// Empty unless the list lives inside joined `result` / `variant` arm(s).
+    pub arm_guards: &'a [ArmGuard],
 }
 
 // ─── Lift plan builder ────────────────────────────────────────────
@@ -408,9 +450,10 @@ pub(super) struct LiftPlanBuilder {
     /// Running list-of cell counter; assigned to each `Cell::ListOf`
     /// via `list_idx` so emit + alloc can index `list_locals` directly.
     next_list_idx: u32,
-    /// Nesting depth inside a joined `result` / `variant` arm.
-    /// `push_list_of` records an error when nonzero — see comment there.
-    joined_arm_depth: u32,
+    /// Active arm guards while walking joined `result` / `variant`
+    /// arms. Outer→inner. `Cell::ListOf` clones this snapshot so
+    /// emit can disc-gate `cabi_realloc` + the element loop.
+    arm_guard_stack: Vec<ArmGuard>,
     /// First error hit during the walk; surfaced by [`LiftPlan::for_type`].
     error: Option<anyhow::Error>,
 }
@@ -422,7 +465,7 @@ impl LiftPlanBuilder {
             slot_widening: Vec::new(),
             next_flat_slot: 0,
             next_list_idx: 0,
-            joined_arm_depth: 0,
+            arm_guard_stack: Vec::new(),
             error: None,
         }
     }
@@ -632,6 +675,11 @@ impl LiftPlanBuilder {
 
     /// Allocate the disc slot first, then recurse into the inner
     /// type — matches the canonical-ABI `[disc, ...flat(T)]` order.
+    /// **No `push_arm` here**: option's payload slots are dedicated
+    /// (not joined), and canonical-ABI lower zeroes them on `none`,
+    /// so `option<list<T>>` runs `cabi_realloc(0)` + an empty loop
+    /// — wasteful but correct. A guard would be load-bearing iff
+    /// the slots were joined, which they aren't.
     fn push_option(&mut self, inner: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
         let disc_slot = self.bump_flat_slot();
         let child_idx = self.push(inner, resolve, names);
@@ -676,16 +724,18 @@ impl LiftPlanBuilder {
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
-        self.joined_arm_depth += 1;
-        let ok_idx = r.ok.as_ref().map(|t| self.push(t, resolve, names));
+        let ok_idx = self.push_arm(disc_slot, 0, |b| {
+            r.ok.as_ref().map(|t| b.push(t, resolve, names))
+        });
         let after_ok = self.next_flat_slot;
         self.record_arm_widening(r.ok.as_ref(), arms_base, &joined, resolve);
 
         self.next_flat_slot = arms_base;
-        let err_idx = r.err.as_ref().map(|t| self.push(t, resolve, names));
+        let err_idx = self.push_arm(disc_slot, 1, |b| {
+            r.err.as_ref().map(|t| b.push(t, resolve, names))
+        });
         let after_err = self.next_flat_slot;
         self.record_arm_widening(r.err.as_ref(), arms_base, &joined, resolve);
-        self.joined_arm_depth -= 1;
 
         self.next_flat_slot = after_ok.max(after_err);
         self.push_cell(Cell::Result {
@@ -693,6 +743,23 @@ impl LiftPlanBuilder {
             ok_idx,
             err_idx,
         })
+    }
+
+    /// Push an `ArmGuard` for the duration of `walk` so any
+    /// `Cell::ListOf` pushed inside inherits the predicate.
+    fn push_arm<R>(
+        &mut self,
+        disc_slot: u32,
+        expected_disc: u32,
+        walk: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.arm_guard_stack.push(ArmGuard {
+            disc_slot,
+            expected_disc,
+        });
+        let r = walk(self);
+        self.arm_guard_stack.pop();
+        r
     }
 
     /// Walk one variant / result arm's flat positions and stamp the
@@ -747,15 +814,15 @@ impl LiftPlanBuilder {
         let arms_base = self.next_flat_slot;
         let mut max_after = arms_base;
         let mut per_case_payload: Vec<Option<u32>> = Vec::with_capacity(v.cases.len());
-        self.joined_arm_depth += 1;
-        for case in &v.cases {
+        for (case_idx, case) in v.cases.iter().enumerate() {
             self.next_flat_slot = arms_base;
-            let child_idx = case.ty.as_ref().map(|t| self.push(t, resolve, names));
+            let child_idx = self.push_arm(disc_slot, case_idx as u32, |b| {
+                case.ty.as_ref().map(|t| b.push(t, resolve, names))
+            });
             max_after = max_after.max(self.next_flat_slot);
             self.record_arm_widening(case.ty.as_ref(), arms_base, &joined, resolve);
             per_case_payload.push(child_idx);
         }
-        self.joined_arm_depth -= 1;
         self.next_flat_slot = max_after;
         self.push_cell(Cell::Variant {
             disc_slot,
@@ -833,14 +900,9 @@ impl LiftPlanBuilder {
 
     /// `list<T>` (non-u8) — `(ptr, len)` flat; element plan built in
     /// a fresh sub-builder so its slots are local to one element.
+    /// Snapshots `arm_guard_stack` so emit can disc-gate the cell
+    /// when the list lives inside a joined arm.
     fn push_list_of(&mut self, elem: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
-        if self.joined_arm_depth > 0 {
-            self.record_error(anyhow!(
-                "`list<T>` inside a `result` / `variant` arm is not yet supported \
-                 (the inactive arm would read garbage as `len` and feed it into \
-                 cabi_realloc). File a request at {ISSUES_URL} to bump priority."
-            ));
-        }
         let list_idx = self.next_list_idx;
         self.next_list_idx += 1;
         let ptr_slot = self.bump_flat_slot();
@@ -860,11 +922,13 @@ impl LiftPlanBuilder {
                  to bump priority."
             ));
         }
+        let arm_guards = self.arm_guard_stack.clone();
         self.push_cell(Cell::ListOf {
             list_idx,
             ptr_slot,
             len_slot,
             element_plan: Box::new(element_plan),
+            arm_guards,
         })
     }
 

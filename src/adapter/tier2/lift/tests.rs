@@ -15,7 +15,7 @@ use super::super::blob::NameInterner;
 use super::super::cells::CellLayout;
 use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::super::{FuncClassified, FuncShape};
-use super::plan::{Cell, HandleKind, LiftPlan, NamedListInfo};
+use super::plan::{ArmGuard, Cell, HandleKind, LiftPlan, NamedListInfo};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
@@ -90,6 +90,11 @@ const TEST_WIT: &str = r#"
         variant list-or-int { with-list(list<u32>), plain(u32) }
         f-variant-list-arm: func(v: list-or-int);
         f-option-list: func(o: option<list<u32>>);
+        // Depth-2 nesting: outer result, inner variant, list in
+        // case 0 of the inner variant. The list-of cell must carry
+        // both `(outer disc, ok=0)` and `(inner disc, case=0)`.
+        f-result-of-variant-with-list:
+            func(v: result<list-or-int, u32>);
     }
 "#;
 
@@ -991,33 +996,207 @@ fn list_of_compound_element_bails_at_plan_build() {
 }
 
 #[test]
-fn list_inside_result_arm_bails_at_plan_build() {
+fn list_inside_result_arm_carries_disc_guards() {
+    // result<list<u32>, list<u32>>: each arm's list snapshots the
+    // outer disc — ok-arm guard expects 0, err-arm 1.
     let r = test_resolve();
     let mut names = NameInterner::new();
-    let err = LiftPlan::for_type(
+    let plan = plan_for(
         &func_named(&r, "f-result-list-list").params[0].ty,
         &r,
         &mut names,
-    )
-    .expect_err("list inside a result arm must bail at plan build");
-    let msg = err.to_string();
-    assert!(msg.contains("`list<T>` inside a `result` / `variant` arm"));
-    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+    );
+    assert_eq!(plan.cells.len(), 3);
+    let Cell::ListOf {
+        arm_guards: ok_guards,
+        ..
+    } = &plan.cells[0]
+    else {
+        panic!("expected ok arm Cell::ListOf at 0");
+    };
+    let Cell::ListOf {
+        arm_guards: err_guards,
+        ..
+    } = &plan.cells[1]
+    else {
+        panic!("expected err arm Cell::ListOf at 1");
+    };
+    assert!(matches!(plan.cells[2], Cell::Result { .. }));
+    assert_eq!(
+        ok_guards.as_slice(),
+        &[ArmGuard {
+            disc_slot: 0,
+            expected_disc: 0,
+        }]
+    );
+    assert_eq!(
+        err_guards.as_slice(),
+        &[ArmGuard {
+            disc_slot: 0,
+            expected_disc: 1,
+        }]
+    );
 }
 
 #[test]
-fn list_inside_variant_arm_bails_at_plan_build() {
+fn list_inside_variant_arm_carries_case_disc_guard() {
+    // variant list-or-int { with-list(list<u32>), plain(u32) }:
+    // case 0 carries a guard expecting disc=0; case 1 has no list.
     let r = test_resolve();
     let mut names = NameInterner::new();
-    let err = LiftPlan::for_type(
+    let plan = plan_for(
         &func_named(&r, "f-variant-list-arm").params[0].ty,
         &r,
         &mut names,
-    )
-    .expect_err("list inside a variant arm must bail at plan build");
-    let msg = err.to_string();
-    assert!(msg.contains("`list<T>` inside a `result` / `variant` arm"));
-    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+    );
+    let Cell::ListOf { arm_guards, .. } = &plan.cells[0] else {
+        panic!("expected Cell::ListOf at 0");
+    };
+    assert_eq!(
+        arm_guards.as_slice(),
+        &[ArmGuard {
+            disc_slot: 0,
+            expected_disc: 0,
+        }]
+    );
+}
+
+#[test]
+fn list_inside_nested_arms_stacks_guards_outer_to_inner() {
+    // result<variant { with-list(list<u32>), plain(u32) }, u32>:
+    // outer disc at slot 0, inner disc inside the ok arm at slot 1,
+    // list-of inside `with-list` payload. Stack must be outer→inner.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-of-variant-with-list").params[0].ty,
+        &r,
+        &mut names,
+    );
+    let Cell::ListOf { arm_guards, .. } = &plan.cells[0] else {
+        panic!("expected Cell::ListOf at 0, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(
+        arm_guards.as_slice(),
+        &[
+            ArmGuard {
+                disc_slot: 0,
+                expected_disc: 0,
+            },
+            ArmGuard {
+                disc_slot: 1,
+                expected_disc: 0,
+            },
+        ],
+    );
+}
+
+/// Walk `plan` from the root and assert each `Cell::ListOf` carries
+/// exactly one [`ArmGuard`] per `Result` / `Variant` ancestor on the
+/// path (option / record / tuple don't count — their slots aren't
+/// joined). Pins the joined-arm rule documented on [`Cell`]:
+/// side-effecting cells must disc-gate when nested in joined arms.
+fn assert_arm_guards_match_joined_ancestry(plan: &LiftPlan) {
+    fn walk(plan: &LiftPlan, idx: u32, depth: usize) {
+        match &plan.cells[idx as usize] {
+            Cell::Result {
+                ok_idx, err_idx, ..
+            } => {
+                if let Some(i) = ok_idx {
+                    walk(plan, *i, depth + 1);
+                }
+                if let Some(i) = err_idx {
+                    walk(plan, *i, depth + 1);
+                }
+            }
+            Cell::Variant {
+                per_case_payload, ..
+            } => {
+                for slot in per_case_payload.iter().flatten() {
+                    walk(plan, *slot, depth + 1);
+                }
+            }
+            Cell::Option { child_idx, .. } => walk(plan, *child_idx, depth),
+            Cell::RecordOf { fields, .. } => {
+                for (_, i) in fields {
+                    walk(plan, *i, depth);
+                }
+            }
+            Cell::TupleOf { children } => {
+                for i in children {
+                    walk(plan, *i, depth);
+                }
+            }
+            Cell::ListOf {
+                arm_guards,
+                element_plan,
+                ..
+            } => {
+                assert_eq!(
+                    arm_guards.len(),
+                    depth,
+                    "ListOf at cell {idx} has {} guards, expected {depth} for joined-arm ancestry",
+                    arm_guards.len(),
+                );
+                assert_arm_guards_match_joined_ancestry(element_plan);
+            }
+            Cell::Bool { .. }
+            | Cell::IntegerSignExt { .. }
+            | Cell::IntegerZeroExt { .. }
+            | Cell::Integer64 { .. }
+            | Cell::FloatingF32 { .. }
+            | Cell::FloatingF64 { .. }
+            | Cell::Text { .. }
+            | Cell::Bytes { .. }
+            | Cell::Char { .. }
+            | Cell::EnumCase { .. }
+            | Cell::Flags { .. }
+            | Cell::Handle { .. } => {}
+        }
+    }
+    walk(plan, plan.root(), 0);
+}
+
+#[test]
+fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
+    // Structural invariant on every fixture that puts a `list<T>`
+    // somewhere reachable: guard count == joined-arm ancestor count.
+    // Catches future regressions in `push_arm` / `push_list_of` /
+    // `push_result` / `push_variant`.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plans = [
+        plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-list-string").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for_named("list-pair", &r, &mut names),
+        plan_for(
+            &func_named(&r, "f-option-list").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-list-list").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-variant-list-arm").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-of-variant-with-list").params[0].ty,
+            &r,
+            &mut names,
+        ),
+    ];
+    for plan in &plans {
+        assert_arm_guards_match_joined_ancestry(plan);
+    }
 }
 
 #[test]
@@ -1032,7 +1211,13 @@ fn list_inside_option_is_allowed() {
         &mut names,
     );
     assert_eq!(plan.cells.len(), 2);
-    assert!(matches!(plan.cells[0], Cell::ListOf { .. }));
+    let Cell::ListOf { arm_guards, .. } = &plan.cells[0] else {
+        panic!("expected Cell::ListOf at 0");
+    };
+    assert!(
+        arm_guards.is_empty(),
+        "option's payload slots aren't joined; ListOf should carry no guards"
+    );
     assert!(matches!(plan.cells[1], Cell::Option { .. }));
 }
 
@@ -1800,8 +1985,8 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &r,
             &mut names,
         ),
-        // Scalar-element lists only (compound elements still todo!()
-        // in `emit_list_of_arm`).
+        // Scalar-element lists only (compound elements gated at
+        // `push_list_of` via `Cell::allowed_as_list_element`).
         plan_for(&func_named(&r, "f-list-u32").params[0].ty, &r, &mut names),
         plan_for(
             &func_named(&r, "f-list-string").params[0].ty,
@@ -1809,6 +1994,23 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
             &mut names,
         ),
         plan_for_named("list-pair", &r, &mut names),
+        // Lists nested in joined arms — guards on the bump pre-pass
+        // and on `emit_list_of_arm` body. Last entry stacks to depth 2.
+        plan_for(
+            &func_named(&r, "f-result-list-list").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-variant-list-arm").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-of-variant-with-list").params[0].ty,
+            &r,
+            &mut names,
+        ),
     ];
     for plan in &primitive_plans {
         validate_emit_lift_plan(plan, &r);
