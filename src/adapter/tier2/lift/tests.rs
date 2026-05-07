@@ -19,7 +19,7 @@ use super::plan::{ArmGuard, Cell, HandleKind, LiftPlan, NamedListInfo};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
-use super::sidetable::CellSideData;
+use super::sidetable::{CellSideData, CharScratch};
 use super::*;
 
 // ─── Fixture WIT + Resolve helpers ────────────────────────────
@@ -87,6 +87,9 @@ const TEST_WIT: &str = r#"
         f-result-with-err-ctx: func(r: result<s32, error-context>);
         f-list-u32: func(xs: list<u32>);
         f-list-string: func(xs: list<string>);
+        f-list-char: func(xs: list<char>);
+        record list-char-pair { items: list<char>, scores: list<u32> }
+        f-record-with-list-char: func(rcp: list-char-pair);
         f-result-list-u32: func() -> list<u32>;
         f-list-of-list: func(xs: list<list<u32>>);
         record list-pair { items: list<string>, scores: list<u32> }
@@ -320,6 +323,7 @@ fn plan_param_types(plan: &LiftPlan, resolve: &Resolve) -> Vec<ValType> {
 /// would attach to `plan.cells` — record/tuple/flags entries get
 /// stub addresses (just need to be in-memory for wasm validation);
 /// runtime value-correctness is the canned-shape harness's job.
+/// Outer plan only, mirroring [`super::sidetable::fold_cell_side_data`].
 fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
     /// Bytes per child-index in `tuple-indices` (canonical-ABI u32).
     const U32_BYTES: u32 = 4;
@@ -414,7 +418,9 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 let scratch_addr = char_cursor;
                 char_cursor += MAX_UTF8_LEN;
                 CellSideData::Char {
-                    scratch_addr: scratch_addr as i32,
+                    scratch: CharScratch::Static {
+                        scratch_addr: scratch_addr as i32,
+                    },
                 }
             }
             Cell::Handle { .. } => {
@@ -477,6 +483,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let flags_addr = builder.alloc_local(ValType::I32);
     let flags_count = builder.alloc_local(ValType::I32);
     let char_len = builder.alloc_local(ValType::I32);
+    let char_scratch_addr = builder.alloc_local(ValType::I32);
     let id_local = builder.alloc_local(ValType::I64);
     let saved_bump = builder.alloc_local(ValType::I32);
     let cells_base = builder.alloc_local(ValType::I32);
@@ -495,7 +502,8 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         widen_f32,
         flags_addr,
         flags_count,
-        char_len,
+        char_len: Some(char_len),
+        char_scratch_addr: Some(char_scratch_addr),
         cells_base,
         next_cell_idx,
         result: None,
@@ -963,6 +971,55 @@ fn list_of_string_element_plan_uses_two_local_slots() {
 }
 
 #[test]
+fn list_of_char_element_plan_uses_one_local_slot() {
+    // list<char>: element is a single i32 code point. The per-call
+    // utf-8 scratch buffer lives on `ListEmitLocals.char_scratch_base`
+    // (cabi_realloc'd at emit time), not in the plan's flat slots.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(&func_named(&r, "f-list-char").params[0].ty, &r, &mut names);
+    assert_eq!(plan.flat_slot_count, 2);
+    let Cell::ListOf {
+        ptr_slot,
+        len_slot,
+        element_plan,
+        ..
+    } = &plan.cells[0]
+    else {
+        panic!("expected Cell::ListOf, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(*ptr_slot, 0);
+    assert_eq!(*len_slot, 1);
+    assert_eq!(plan.root(), 0);
+    assert_eq!(element_plan.cells, vec![Cell::Char { flat_slot: 0 }]);
+    assert_eq!(element_plan.flat_slot_count, 1);
+    assert_eq!(element_plan.root(), 0);
+}
+
+#[test]
+fn record_with_list_char_field_recurses_into_list() {
+    // list-char-pair { items: list<char>, scores: list<u32> }
+    //   items   → cell 0 (ListOf, slots 0..1, char element)
+    //   scores  → cell 1 (ListOf, slots 2..3, u32 element)
+    //   parent  → cell 2 (RecordOf items=0, scores=1)
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for_named("list-char-pair", &r, &mut names);
+    assert_eq!(plan.cells.len(), 3);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf at cell 0, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(element_plan.cells, vec![Cell::Char { flat_slot: 0 }]);
+    assert!(matches!(plan.cells[1], Cell::ListOf { .. }));
+    assert_eq!(
+        plan.cells[2],
+        record_of(&mut names, "list-char-pair", &[("items", 0), ("scores", 1)],),
+    );
+    assert_eq!(plan.flat_slot_count, 4);
+    assert_eq!(plan.root(), 2);
+}
+
+#[test]
 fn nested_list_bails_at_plan_build() {
     // list<list<u32>>: nested lists aren't a supported element shape;
     // plan-build surfaces the inner failure to the outer caller.
@@ -1151,7 +1208,9 @@ fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
     let plans = [
         plan_for_param("f-list-u32", &r, &mut names),
         plan_for_param("f-list-string", &r, &mut names),
+        plan_for_param("f-list-char", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
+        plan_for_named("list-char-pair", &r, &mut names),
         plan_for_param("f-option-list", &r, &mut names),
         plan_for_param("f-result-list-list", &r, &mut names),
         plan_for_param("f-variant-list-arm", &r, &mut names),
@@ -1842,11 +1901,14 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_named("stream-pair", &r, &mut names),
         plan_for_param("f-error-context", &r, &mut names),
         plan_for_param("f-result-with-err-ctx", &r, &mut names),
-        // Scalar-element lists only (compound elements gated at
-        // `push_list_of` via `Cell::allowed_as_list_element`).
+        // Scalar-element lists + char (per-iteration utf-8 scratch).
+        // Other compound element kinds remain gated at `push_list_of`
+        // via `Cell::allowed_as_list_element`.
         plan_for_param("f-list-u32", &r, &mut names),
         plan_for_param("f-list-string", &r, &mut names),
+        plan_for_param("f-list-char", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
+        plan_for_named("list-char-pair", &r, &mut names),
         // Lists nested in joined arms — guards on the bump pre-pass
         // and on `emit_list_of_arm` body. Last entry stacks to depth 2.
         plan_for_param("f-result-list-list", &r, &mut names),
@@ -1871,6 +1933,16 @@ fn list_of_u32_emits_valid_wasm() {
 fn list_of_string_emits_valid_wasm() {
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-string", &r, &mut names);
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_of_char_emits_valid_wasm() {
+    // Single-cell `Cell::Char` element — exercises the per-list
+    // utf-8 scratch realloc, the per-iteration scratch-addr stage,
+    // and the `Prestaged` CellSideData::Char branch.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-char", &r, &mut names);
     validate_emit_lift_plan(&plan, &r);
 }
 

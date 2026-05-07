@@ -1554,6 +1554,31 @@ fn tier2_shapes() -> Vec<Shape> {
             cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
             selected: 1,
         })),
+        // list<char>: per-iteration utf-8 scratch via cabi_realloc'd
+        // buffer + Prestaged CharScratch + per-iter scratch-addr stage.
+        // Three entries to fire each utf-8 branch in the per-iteration
+        // encoder (1B / 3B / 4B), matching the static-char coverage.
+        Shape::List(Box::new(Shape::Primitive {
+            name: "char_ascii",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'x'",
+            expected_debug: "'x'",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "char_bmp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'中'",
+            expected_debug: "'中'",
+        })),
+        Shape::List(Box::new(Shape::Primitive {
+            name: "char_smp",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'🎉'",
+            expected_debug: "'🎉'",
+        })),
     ]
 }
 

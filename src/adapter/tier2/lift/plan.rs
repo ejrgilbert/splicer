@@ -222,13 +222,27 @@ impl HandleKind {
     }
 }
 
+/// How an `allowed_as_list_element` cell flows through the list-emit
+/// body. New variants force a side-data decision in
+/// [`super::emit::elem_cell_side_data`] at compile time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListElementClass {
+    /// Reads only flat slots; folds to `CellSideData::None`.
+    Scalar,
+    /// Per-iteration utf-8 scratch from the per-list `cabi_realloc`
+    /// in [`super::emit::emit_list_of_arm`]. Folds to a
+    /// `Prestaged` `CellSideData::Char`.
+    PrestagedChar,
+}
+
 impl Cell {
-    /// Whether this cell shape is supported as a `list<T>` element.
-    /// Scalar elements only — compound + scratch-bearing kinds
-    /// (char/flags/handle) need machinery that doesn't exist yet.
-    /// Exhaustive match — new variants force a yes/no decision.
-    pub(crate) fn allowed_as_list_element(&self) -> bool {
+    /// Classify a cell shape as a `list<T>` element. `None` for kinds
+    /// the lift codegen can't yet emit per-element (compound shapes,
+    /// remaining scratch-bearing kinds, nested lists). Exhaustive
+    /// match — adding a `Cell` variant forces a yes/no decision here.
+    pub(crate) fn list_element_class(&self) -> Option<ListElementClass> {
         match self {
+            Cell::Char { .. } => Some(ListElementClass::PrestagedChar),
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -237,17 +251,21 @@ impl Cell {
             | Cell::FloatingF64 { .. }
             | Cell::Text { .. }
             | Cell::Bytes { .. }
-            | Cell::EnumCase { .. } => true,
-            Cell::Char { .. }
-            | Cell::Flags { .. }
+            | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
+            Cell::Flags { .. }
             | Cell::Handle { .. }
             | Cell::RecordOf { .. }
             | Cell::TupleOf { .. }
             | Cell::Option { .. }
             | Cell::Result { .. }
             | Cell::Variant { .. }
-            | Cell::ListOf { .. } => false,
+            | Cell::ListOf { .. } => None,
         }
+    }
+
+    /// Whether this cell shape is supported as a `list<T>` element.
+    pub(crate) fn allowed_as_list_element(&self) -> bool {
+        self.list_element_class().is_some()
     }
 }
 
@@ -337,6 +355,17 @@ impl LiftPlan {
             }
         }
         out
+    }
+
+    /// Whether any cell in the plan tree is a `Cell::Char` — top-level
+    /// or nested inside a `Cell::ListOf::element_plan`. Drives the
+    /// wrapper-level decision to allocate `lcl.char_scratch_addr`,
+    /// the shared staging local that both static and list-element
+    /// char-cell emit reads from.
+    pub(crate) fn contains_char(&self) -> bool {
+        self.walk_cells_recursive()
+            .iter()
+            .any(|c| matches!(c, Cell::Char { .. }))
     }
 
     /// Iterator over every `Cell::EnumCase` in the plan tree

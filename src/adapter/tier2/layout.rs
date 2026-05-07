@@ -21,10 +21,10 @@ use super::lift::{
     build_char_scratch_map, build_enum_info_blob, build_flags_info_blob, build_handle_info_blob,
     build_record_info_blob, build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes,
     flags_scratch_sizes, fold_cell_side_data, register_enum_strings, register_flags_strings,
-    register_variant_strings, CellFillSources, CellSideData, CharScratchMaps, FlagsInfoBlobs,
-    FlagsRuntimeFill, HandleInfoBlobs, HandleRuntimeFill, ParamLayout, RecordInfoBlobs,
-    ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob,
-    VariantInfoBlobs,
+    register_variant_strings, CellFillSources, CellSideData, CharScratch, CharScratchMaps,
+    FlagsInfoBlobs, FlagsRuntimeFill, HandleInfoBlobs, HandleRuntimeFill, ParamLayout,
+    RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
+    TupleIndicesBlob, VariantInfoBlobs,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -124,9 +124,11 @@ fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideDa
             )))
         }
         Cell::Char { .. } => CellSideData::Char {
-            scratch_addr: fills
-                .char_scratch
-                .expect("char single-cell result → char-info builder must produce a scratch addr"),
+            scratch: CharScratch::Static {
+                scratch_addr: fills.char_scratch.expect(
+                    "char single-cell result → char-info builder must produce a scratch addr",
+                ),
+            },
         },
         Cell::Handle { .. } => {
             CellSideData::Handle(Box::new(fills.handle_fill.clone().expect(

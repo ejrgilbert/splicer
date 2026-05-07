@@ -9,6 +9,10 @@
 //! (when present) OR Direct char-result entry (when present).
 //! [`char_scratch_sizes`] and [`build_char_scratch_map`] must walk in
 //! lockstep; a divergence crashes the builder's `scratch_addrs.next()`.
+//!
+//! Outer plan only — list-element chars use per-call scratch from
+//! [`super::super::emit::emit_list_of_arm`]; see
+//! [`super::fold_cell_side_data`] for the lockstep rule.
 
 use super::super::super::super::abi::emit::MAX_UTF8_LEN;
 use super::super::super::FuncClassified;

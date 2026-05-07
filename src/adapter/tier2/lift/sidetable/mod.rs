@@ -64,17 +64,35 @@ pub(crate) enum CellSideData {
     /// `cell::variant-case(u32)` payload + the addresses the wrapper
     /// disc-dispatch patches at runtime (case-name + payload option).
     Variant(Box<VariantRuntimeFill>),
-    /// Per-cell utf-8 scratch buffer base for `Cell::Char`. The
-    /// wrapper utf-8-encodes the i32 code point into this buffer
-    /// (1–4 bytes) and emits `cell::text(scratch_addr, len)`.
+    /// Scratch-buffer source for `Cell::Char`'s utf-8 encoder. The
+    /// wrapper writes 1–4 bytes into the buffer and emits
+    /// `cell::text(scratch, len)`. See [`CharScratch`] for which kind
+    /// of buffer this points at.
     Char {
-        scratch_addr: i32,
+        scratch: CharScratch,
     },
     /// `cell::{resource,stream,future}-handle(u32)` payload + the
     /// wrapper-patched `id` slot address. The cell's `kind` picks
     /// the disc; the side-table layout is identical across all
     /// three. Boxed for the same reason as Flags/Variant.
     Handle(Box<HandleRuntimeFill>),
+}
+
+/// Where a `Cell::Char`'s utf-8 scratch buffer lives. Two cases
+/// because the buffer base reaches the encoder differently:
+///
+/// - `Static`: a 4-byte slab the layout phase reserved for this
+///   plan-cell. The emit phase stages the const into the wrapper's
+///   shared scratch-addr local before each char-cell write.
+/// - `Prestaged`: the cell sits inside a `list<char>` element body;
+///   the per-iteration emit code has already computed
+///   `list_scratch_base + j*4` into the same shared local before
+///   calling [`super::emit::emit_cell_op`]. Static slabs aren't
+///   reserved for these cells — list length is runtime-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CharScratch {
+    Static { scratch_addr: i32 },
+    Prestaged,
 }
 
 /// Per-cell fill maps for one (fn, param | result), each parallel to
@@ -94,6 +112,12 @@ pub(crate) struct CellFillSources<'a> {
 /// Fold the per-builder per-cell maps into one [`Vec<CellSideData>`]
 /// parallel to `plan.cells`. Single match-on-`Cell` is the only place
 /// that decides "this cell wants that kind's bookkeeping."
+///
+/// **Outer plan only.** Element-plan side data is produced by
+/// [`super::emit::elem_cell_side_data`] (Prestaged scratch); recursing
+/// here would double-fold list-element chars with stale `Static`
+/// addresses. `char_scratch_sizes` / `build_char_scratch_map` follow
+/// the same rule.
 pub(crate) fn fold_cell_side_data(
     plan: &LiftPlan,
     sources: &CellFillSources<'_>,
@@ -127,7 +151,9 @@ pub(crate) fn fold_cell_side_data(
                     .expect("Variant cell missing runtime-fill bundle"),
             )),
             Cell::Char { .. } => CellSideData::Char {
-                scratch_addr: sources.char_scratch[i].expect("Char cell missing scratch addr"),
+                scratch: CharScratch::Static {
+                    scratch_addr: sources.char_scratch[i].expect("Char cell missing scratch addr"),
+                },
             },
             Cell::Handle { .. } => CellSideData::Handle(Box::new(
                 sources.handle_fill[i]

@@ -339,27 +339,30 @@ impl CellLayout {
     // record, call `cell_layout.emit_record_of(addr, side_table_idx)`".
 
     /// `cell::text` for a `char` source. UTF-8 encodes the i32 code
-    /// point into the per-cell `scratch_addr` (1–4 bytes), sets
-    /// `len_local` to the byte count, then writes `cell::text(scratch,
-    /// len)` at `addr_local`. Per-cell scratch is sized at 4 bytes
-    /// (the max utf-8 sequence) by the layout phase.
+    /// point into the scratch buffer pointed at by `scratch_addr_local`
+    /// (1–4 bytes), sets `len_local` to the byte count, then writes
+    /// `cell::text(scratch, len)` at `addr_local`. The caller stages
+    /// the scratch base into `scratch_addr_local`: a 4-byte slab
+    /// reserved at adapter-build time for top-level char cells, or
+    /// a per-iteration offset into a `cabi_realloc`'d list buffer for
+    /// `Cell::Char` element cells.
     pub(crate) fn emit_char(
         &self,
         f: &mut Function,
         addr_local: u32,
         code_point_local: u32,
-        scratch_addr: i32,
+        scratch_addr_local: u32,
         len_local: u32,
     ) {
-        emit_utf8_encode(f, code_point_local, scratch_addr, len_local);
-        // cell::text payload: (ptr=scratch_addr const, len=len_local).
+        emit_utf8_encode(f, code_point_local, scratch_addr_local, len_local);
+        // cell::text payload: (ptr=scratch_addr_local, len=len_local).
         self.emit_cell(
             f,
             addr_local,
             self.disc_of("text"),
             &[
                 PayloadPart {
-                    source: PayloadSource::ConstI32(scratch_addr),
+                    source: PayloadSource::Local(scratch_addr_local),
                     kind: StoreKind::I32,
                     offset: SLICE_PTR_OFFSET,
                 },
@@ -598,11 +601,19 @@ fn ptr_len_parts(ptr_local: u32, len_local: u32) -> [PayloadPart; 2] {
 }
 
 /// At runtime, look at the code point in `code_point_local` and
-/// write its 1–4 UTF-8 bytes to `scratch_addr`, storing the byte
-/// count in `len_local`. Four branches by code-point range pick
-/// the right sequence length + bit pattern. Caller reserves 4
-/// bytes of scratch (max sequence length).
-fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, len_local: u32) {
+/// write its 1–4 UTF-8 bytes to the scratch buffer whose base address
+/// lives in `scratch_addr_local`, storing the byte count in
+/// `len_local`. Four branches by code-point range pick the right
+/// sequence length + bit pattern. Caller reserves 4 bytes of scratch
+/// (max sequence length); reading the base from a local lets static
+/// per-cell scratch and per-iteration list-element scratch share one
+/// codegen path.
+fn emit_utf8_encode(
+    f: &mut Function,
+    code_point_local: u32,
+    scratch_addr_local: u32,
+    len_local: u32,
+) {
     use wasm_encoder::BlockType;
     let store_i8 = |off: u32| MemArg {
         offset: off as u64,
@@ -615,7 +626,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_const(0x80);
     f.instructions().i32_lt_u();
     f.instructions().if_(BlockType::Empty);
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_store8(store_i8(0));
     f.instructions().i32_const(1);
@@ -628,7 +639,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_lt_u();
     f.instructions().if_(BlockType::Empty);
     // buf[0] = 0xC0 | (cp >> 6)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(6);
     f.instructions().i32_shr_u();
@@ -636,7 +647,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_or();
     f.instructions().i32_store8(store_i8(0));
     // buf[1] = 0x80 | (cp & 0x3F)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(0x3F);
     f.instructions().i32_and();
@@ -653,7 +664,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_lt_u();
     f.instructions().if_(BlockType::Empty);
     // buf[0] = 0xE0 | (cp >> 12)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(12);
     f.instructions().i32_shr_u();
@@ -661,7 +672,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_or();
     f.instructions().i32_store8(store_i8(0));
     // buf[1] = 0x80 | ((cp >> 6) & 0x3F)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(6);
     f.instructions().i32_shr_u();
@@ -671,7 +682,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_or();
     f.instructions().i32_store8(store_i8(1));
     // buf[2] = 0x80 | (cp & 0x3F)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(0x3F);
     f.instructions().i32_and();
@@ -685,7 +696,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     // 4B branch: cp ∈ 0x10000..=0x10FFFF (canonical-ABI guarantees
     // valid scalar, so no surrogate / out-of-range handling).
     // buf[0] = 0xF0 | (cp >> 18)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(18);
     f.instructions().i32_shr_u();
@@ -693,7 +704,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_or();
     f.instructions().i32_store8(store_i8(0));
     // buf[1] = 0x80 | ((cp >> 12) & 0x3F)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(12);
     f.instructions().i32_shr_u();
@@ -703,7 +714,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_or();
     f.instructions().i32_store8(store_i8(1));
     // buf[2] = 0x80 | ((cp >> 6) & 0x3F)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(6);
     f.instructions().i32_shr_u();
@@ -713,7 +724,7 @@ fn emit_utf8_encode(f: &mut Function, code_point_local: u32, scratch_addr: i32, 
     f.instructions().i32_or();
     f.instructions().i32_store8(store_i8(2));
     // buf[3] = 0x80 | (cp & 0x3F)
-    f.instructions().i32_const(scratch_addr);
+    f.instructions().local_get(scratch_addr_local);
     f.instructions().local_get(code_point_local);
     f.instructions().i32_const(0x3F);
     f.instructions().i32_and();
@@ -909,13 +920,19 @@ mod tests {
 
     #[test]
     fn char_cell_emits_valid_wasm() {
-        // params: (addr_local: i32, code_point: i32, len_local: i32).
-        // scratch_addr is an i32.const (mid-page so the utf-8 stores
-        // land in valid memory).
+        // params: (addr_local: i32, code_point: i32, len_local: i32,
+        // scratch_addr_local: i32). Caller seeds the scratch local
+        // with a mid-page constant before the helper runs so the utf-8
+        // stores land in valid memory.
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32, ValType::I32, ValType::I32], |f| {
-            cl.emit_char(f, 0, 1, 0x1000, 2)
-        });
+        build_and_validate(
+            &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            |f| {
+                f.instructions().i32_const(0x1000);
+                f.instructions().local_set(3);
+                cl.emit_char(f, 0, 1, 3, 2)
+            },
+        );
     }
 
     #[test]

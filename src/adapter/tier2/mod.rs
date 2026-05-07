@@ -893,6 +893,55 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// End-to-end test for `list<char>` as a param. Drives the
+    /// per-list utf-8 scratch realloc + per-iteration scratch-addr
+    /// staging + the `Prestaged` `CellSideData::Char` branch in
+    /// `emit_single_slot_cell`. `list<char>` flattens to a `(ptr,
+    /// len)` pair on the wire — the lift needs canonical-option
+    /// `memory` to read the list payload.
+    #[test]
+    fn dispatch_module_with_char_list_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+                        i32.const 0x4000)
+                    (func (export "consume") (param i32 i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (alias core export $i "memory" (core memory $mem))
+                (alias core export $i "cabi_realloc" (core func $realloc))
+                (type $consume-ty (func (param "xs" (list char))))
+                (func $consume-lifted (type $consume-ty)
+                    (canon lift (core func $consume) (memory $mem) (realloc (func $realloc))))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:lc/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:lc/api@1.0.0" (instance $api "my:lc/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:lc/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for list<char> param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// End-to-end test for `Cell::Variant` as a param. Drives the
     /// N-way disc dispatch + per-arm case-name + payload writes,
     /// plus the per-cell variant-info side-table entry placement.

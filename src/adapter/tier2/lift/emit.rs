@@ -9,8 +9,8 @@ use wit_parser::{Resolve, SizeAlign};
 use super::super::super::abi::cast;
 use super::super::super::abi::emit::{
     direct_return_type, emit_bitcast, emit_cabi_realloc_call_runtime, wasm_type_to_val,
-    I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, OPTION_NONE, OPTION_SOME,
-    SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
+    I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, MAX_UTF8_LEN, OPTION_NONE,
+    OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
 use super::super::super::abi::flat_types;
 use super::super::super::abi::WasmEncoderBindgen;
@@ -18,11 +18,11 @@ use super::super::super::indices::{FrozenLocals, LocalsBuilder};
 use super::super::cells::CellLayout;
 use super::super::FuncDispatch;
 use super::classify::ResultSourceLayout;
-use super::plan::{ArmGuard, Cell, LiftPlan, ListSpec};
+use super::plan::{ArmGuard, Cell, LiftPlan, ListElementClass, ListSpec};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
-use super::sidetable::CellSideData;
+use super::sidetable::{CellSideData, CharScratch};
 use wit_parser::abi::WasmType;
 
 /// Locals + pre-built load sequences used by the wrapper body.
@@ -60,9 +60,14 @@ pub(crate) struct WrapperLocals {
     /// (re-used across every flags cell in a sequential wrapper body).
     pub(super) flags_addr: u32,
     pub(super) flags_count: u32,
-    /// Length local for the `Cell::Char` utf-8 encoder; staged into
-    /// `cell::text(ptr, len)`. Re-used across every char cell.
-    pub(super) char_len: u32,
+    /// `Cell::Char` utf-8 encoder locals: byte length + scratch-buffer
+    /// base. The base is a shared staging slot — caller writes either
+    /// a static slab address or a per-iteration list-element offset
+    /// before each char-cell emit. Both `Some` iff the wrapper has any
+    /// `Cell::Char` (top-level or list-element); `None` skips the
+    /// otherwise-unused locals.
+    pub(super) char_len: Option<u32>,
+    pub(super) char_scratch_addr: Option<u32>,
     /// Direct-return value when the export sig has a single flat
     /// result; `None` otherwise.
     pub result: Option<u32>,
@@ -186,9 +191,19 @@ pub(crate) struct ListEmitLocals {
     pub elem_loads: Vec<Instruction<'static>>,
     /// Canonical-ABI byte size of one element.
     pub elem_byte_size: u32,
-    /// Side-data parallel to `element_plan.cells`; all-`None` while
-    /// only scalar elements are supported.
+    /// Side-data parallel to `element_plan.cells`. Built by
+    /// [`elem_cell_side_data`]; scratch-bearing kinds fold to a
+    /// `Prestaged` marker that the per-iteration emit body fills in.
     pub elem_cell_side: Vec<CellSideData>,
+    /// Per-call utf-8 scratch buffer for `Cell::Char` element cells.
+    /// `Some` iff `chars_per_elem > 0`. The k-th char (0..chars_per_elem)
+    /// in iteration j consumes the slot at
+    /// `(j * chars_per_elem + k) * MAX_UTF8_LEN`.
+    pub char_scratch_base: Option<u32>,
+    /// `Cell::Char` count in `element_plan`. Drives the per-call
+    /// scratch-buffer size + per-iteration scratch indexing so
+    /// multi-char elements (e.g. `tuple<char, char>`) don't alias.
+    pub chars_per_elem: u32,
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
@@ -234,17 +249,19 @@ fn build_one_list_emit_locals(
     lift_from_memory(resolve, &mut bindgen, (), &elem_ty);
     let elem_loads = bindgen.into_instructions();
     let elem_byte_size = size_align.size(&elem_ty).size_wasm32() as u32;
-    // Stub assumes every element cell folds to CellSideData::None.
-    // When compound elements wire up, this fires so the stub gets
-    // replaced with a real walk over `element_plan.cells`.
-    debug_assert!(
-        spec.element_plan
-            .cells
-            .iter()
-            .all(|c| c.allowed_as_list_element()),
-        "elem_cell_side stub assumes no side-data-bearing element cells",
-    );
-    let elem_cell_side = vec![CellSideData::None; spec.element_plan.cell_count() as usize];
+    let elem_cell_side: Vec<CellSideData> = spec
+        .element_plan
+        .cells
+        .iter()
+        .map(elem_cell_side_data)
+        .collect();
+    let chars_per_elem = spec
+        .element_plan
+        .cells
+        .iter()
+        .filter(|c| matches!(c, Cell::Char { .. }))
+        .count() as u32;
+    let char_scratch_base = (chars_per_elem > 0).then(|| builder.alloc_local(ValType::I32));
     ListEmitLocals {
         start_i,
         len,
@@ -255,6 +272,45 @@ fn build_one_list_emit_locals(
         elem_loads,
         elem_byte_size,
         elem_cell_side,
+        char_scratch_base,
+        chars_per_elem,
+    }
+}
+
+/// Any `Cell::Char` in the wrapper (params or result, including
+/// list-element plans). Gates `char_len` + `char_scratch_addr`.
+fn fn_contains_char(fd: &FuncDispatch) -> bool {
+    if fd.params.iter().any(|p| p.lift.plan.contains_char()) {
+        return true;
+    }
+    if let Some(rl) = fd.result_lift.as_ref() {
+        match &rl.source {
+            ResultSourceLayout::Direct { cell, .. } => matches!(cell, Cell::Char { .. }),
+            ResultSourceLayout::Compound { compound, .. } => compound.plan.contains_char(),
+        }
+    } else {
+        false
+    }
+}
+
+/// Side-data for one element-plan cell. Driven off
+/// [`Cell::list_element_class`] so the gate in plan.rs and the fold
+/// here can't drift. New `ListElementClass` variants force a match
+/// arm at compile time.
+fn elem_cell_side_data(cell: &Cell) -> CellSideData {
+    let class = cell.list_element_class().unwrap_or_else(|| {
+        unreachable!(
+            "Cell {cell:?} reached elem_cell_side_data despite \
+             Cell::list_element_class() rejecting it"
+        )
+    });
+    match class {
+        ListElementClass::Scalar => CellSideData::None,
+        // Per-iteration scratch addr staged into `lcl.char_scratch_addr`
+        // by `emit_stage_char_scratch_addr` before each emit fires.
+        ListElementClass::PrestagedChar => CellSideData::Char {
+            scratch: CharScratch::Prestaged,
+        },
     }
 }
 
@@ -284,7 +340,9 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let widen_f32 = builder.alloc_local(ValType::F32);
     let flags_addr = builder.alloc_local(ValType::I32);
     let flags_count = builder.alloc_local(ValType::I32);
-    let char_len = builder.alloc_local(ValType::I32);
+    let needs_char_locals = fn_contains_char(fd);
+    let char_len = needs_char_locals.then(|| builder.alloc_local(ValType::I32));
+    let char_scratch_addr = needs_char_locals.then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -419,6 +477,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             flags_addr,
             flags_count,
             char_len,
+            char_scratch_addr,
             result,
             tr_addr,
             id_local,
@@ -813,10 +872,25 @@ fn emit_single_slot_cell(
             cell_layout.emit_flags_set(f, addr, fill.side_table_idx);
         }
         Cell::Char { .. } => {
-            let CellSideData::Char { scratch_addr } = side_data else {
+            let CellSideData::Char { scratch } = side_data else {
                 panic!("Char cell paired with non-Char side data {side_data:?}");
             };
-            cell_layout.emit_char(f, addr, source, *scratch_addr, lcl.char_len);
+            let scratch_addr_local = lcl.char_scratch_addr.expect(
+                "char_scratch_addr unset — fn_contains_char predicate \
+                 must agree with the cells reaching emit_single_slot_cell",
+            );
+            let len_local = lcl
+                .char_len
+                .expect("char_len unset — same gate as char_scratch_addr");
+            match scratch {
+                CharScratch::Static { scratch_addr } => {
+                    f.instructions().i32_const(*scratch_addr);
+                    f.instructions().local_set(scratch_addr_local);
+                }
+                // Caller (emit_list_of_arm) wrote `scratch_addr_local`.
+                CharScratch::Prestaged => {}
+            }
+            cell_layout.emit_char(f, addr, source, scratch_addr_local, len_local);
         }
         Cell::Handle { kind, .. } => {
             let CellSideData::Handle(fill) = side_data else {
@@ -863,8 +937,14 @@ fn emit_single_slot_cell(
 }
 
 /// Emit one `Cell::ListOf` arm: write the list-of cell payload at
-/// `lcl.addr`, allocate the per-call indices buffer, then loop
-/// `j ∈ 0..len` lifting each element.
+/// `lcl.addr`, allocate the per-call buffers (indices + any per-iter
+/// scratch), then loop `j ∈ 0..len` lifting each element.
+///
+/// Element-plan cells are walked in plan order. For each iteration j
+/// every element cell `k ∈ 0..elem_count` lands at runtime cell-array
+/// index `start_i + j*elem_count + k`. Today β is single-cell elements
+/// (`elem_count == 1`), but the loop is structured for the future
+/// multi-cell case so growing the allow-list doesn't reshape it.
 fn emit_list_of_arm(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -873,9 +953,23 @@ fn emit_list_of_arm(
     element_plan: &LiftPlan,
     lcl: &WrapperLocals,
 ) {
-    let elem_cell = &element_plan.cells[0];
     let cell_layout = ctx.cell_layout;
+    let elem_count = element_plan.cell_count();
     emit_cabi_realloc_call_runtime(f, ctx.cabi_realloc_idx, 4, ll.len, 4, ll.indices_ptr);
+    // Per-element utf-8 scratch sized at `chars_per_elem * MAX_UTF8_LEN`
+    // bytes. Multi-Char-per-element shapes (future, e.g. `tuple<char,
+    // char>`) get one slot per char per iteration; single-Char today
+    // degenerates to `MAX_UTF8_LEN` bytes per iteration.
+    if let Some(scratch_base) = ll.char_scratch_base {
+        emit_cabi_realloc_call_runtime(
+            f,
+            ctx.cabi_realloc_idx,
+            1,
+            ll.len,
+            ll.chars_per_elem * MAX_UTF8_LEN,
+            scratch_base,
+        );
+    }
     cell_layout.emit_list_of(f, lcl.addr, ll.indices_ptr, ll.len);
 
     // for (j = 0; j < len; j++) { ... }
@@ -906,30 +1000,39 @@ fn emit_list_of_arm(
         f.instructions().local_set(local);
     }
 
-    // lcl.addr = cells_base + (start_i + j) * cell_size
-    f.instructions().local_get(lcl.cells_base);
-    f.instructions().local_get(ll.start_i);
-    f.instructions().local_get(ll.j);
-    f.instructions().i32_add();
-    f.instructions().i32_const(cell_layout.size as i32);
-    f.instructions().i32_mul();
-    f.instructions().i32_add();
-    f.instructions().local_set(lcl.addr);
-
-    emit_cell_op(
-        f,
-        ctx,
-        PlanCursor {
-            plan: element_plan,
-            local_base: ll.elem_flat_locals[0],
-        },
-        elem_cell,
-        &ll.elem_cell_side[0],
-        lcl,
-        None,
+    // Per element-plan cell: stage its absolute address (and any
+    // per-iteration scratch), then dispatch to emit_cell_op.
+    // `char_idx` counts char-cells in element-plan walk order so
+    // multi-char elements get distinct slots in the per-call buffer.
+    let mut char_idx: u32 = 0;
+    for (cell_pos, elem_cell) in element_plan.cells.iter().enumerate() {
+        emit_set_elem_cell_addr(f, lcl, ll, elem_count, cell_pos as u32, cell_layout.size);
+        if matches!(elem_cell, Cell::Char { .. }) {
+            emit_stage_char_scratch_addr(f, lcl, ll, char_idx);
+            char_idx += 1;
+        }
+        emit_cell_op(
+            f,
+            ctx,
+            PlanCursor {
+                plan: element_plan,
+                local_base: ll.elem_flat_locals[0],
+            },
+            elem_cell,
+            &ll.elem_cell_side[cell_pos],
+            lcl,
+            None,
+        );
+    }
+    debug_assert_eq!(
+        char_idx, ll.chars_per_elem,
+        "emit walk visited {char_idx} Cell::Char element cells; \
+         build_one_list_emit_locals counted {}",
+        ll.chars_per_elem,
     );
 
-    // indices_ptr[j*4] = start_i + j
+    // indices_ptr[j*4] = start_i + j*elem_count + root
+    // (the cell-array index of this element's root cell).
     f.instructions().local_get(ll.indices_ptr);
     f.instructions().local_get(ll.j);
     f.instructions().i32_const(4);
@@ -937,7 +1040,15 @@ fn emit_list_of_arm(
     f.instructions().i32_add();
     f.instructions().local_get(ll.start_i);
     f.instructions().local_get(ll.j);
+    if elem_count != 1 {
+        f.instructions().i32_const(elem_count as i32);
+        f.instructions().i32_mul();
+    }
     f.instructions().i32_add();
+    if element_plan.root() != 0 {
+        f.instructions().i32_const(element_plan.root() as i32);
+        f.instructions().i32_add();
+    }
     f.instructions().i32_store(MemArg {
         offset: 0,
         align: I32_STORE_LOG2_ALIGN,
@@ -951,6 +1062,75 @@ fn emit_list_of_arm(
     f.instructions().br(0);
     f.instructions().end(); // loop
     f.instructions().end(); // block
+}
+
+/// Stage the absolute cell-array address of element-plan position
+/// `cell_pos` for iteration `j` into `lcl.addr`:
+/// `cells_base + (start_i + j*elem_count + cell_pos) * cell_size`.
+/// Constant-folds the `cell_pos == 0` and `elem_count == 1` cases.
+fn emit_set_elem_cell_addr(
+    f: &mut Function,
+    lcl: &WrapperLocals,
+    ll: &ListEmitLocals,
+    elem_count: u32,
+    cell_pos: u32,
+    cell_size: u32,
+) {
+    f.instructions().local_get(lcl.cells_base);
+    f.instructions().local_get(ll.start_i);
+    f.instructions().local_get(ll.j);
+    if elem_count != 1 {
+        f.instructions().i32_const(elem_count as i32);
+        f.instructions().i32_mul();
+    }
+    f.instructions().i32_add();
+    if cell_pos != 0 {
+        f.instructions().i32_const(cell_pos as i32);
+        f.instructions().i32_add();
+    }
+    f.instructions().i32_const(cell_size as i32);
+    f.instructions().i32_mul();
+    f.instructions().i32_add();
+    f.instructions().local_set(lcl.addr);
+}
+
+/// Stage the per-iteration utf-8 scratch address for the
+/// `char_idx`-th `Cell::Char` of element_plan into
+/// `lcl.char_scratch_addr`:
+/// `base + (j * chars_per_elem + char_idx) * MAX_UTF8_LEN`. Pairs
+/// with `CharScratch::Prestaged` in [`emit_single_slot_cell`].
+fn emit_stage_char_scratch_addr(
+    f: &mut Function,
+    lcl: &WrapperLocals,
+    ll: &ListEmitLocals,
+    char_idx: u32,
+) {
+    let scratch_base = ll.char_scratch_base.expect(
+        "Cell::Char element requires char_scratch_base — \
+         build_one_list_emit_locals must have allocated it",
+    );
+    let scratch_addr_local = lcl.char_scratch_addr.expect(
+        "char_scratch_addr unset for a list with Cell::Char elements — \
+         fn_contains_char must include element-plan chars",
+    );
+    debug_assert!(char_idx < ll.chars_per_elem);
+    // base + (j * chars_per_elem + char_idx) * MAX_UTF8_LEN
+    f.instructions().local_get(scratch_base);
+    f.instructions().local_get(ll.j);
+    if ll.chars_per_elem != 1 {
+        f.instructions().i32_const(ll.chars_per_elem as i32);
+        f.instructions().i32_mul();
+    }
+    if char_idx != 0 {
+        f.instructions().i32_const(char_idx as i32);
+        f.instructions().i32_add();
+    }
+    if MAX_UTF8_LEN != 1 {
+        f.instructions().i32_const(MAX_UTF8_LEN as i32);
+        f.instructions().i32_mul();
+    }
+    f.instructions().i32_add();
+    f.instructions().local_set(scratch_addr_local);
 }
 
 /// Patch one `Cell::Handle`'s `id: u64` slot per call: zero-extend
