@@ -7,7 +7,7 @@ use wasm_encoder::{
     CodeSection, EntityType, Function, FunctionSection, ImportSection, MemoryType, Module,
     TypeSection, ValType,
 };
-use wit_parser::abi::WasmSignature;
+use wit_parser::abi::{WasmSignature, WasmType};
 use wit_parser::{Function as WitFunction, Resolve, SizeAlign, Type};
 
 use super::super::super::abi::emit::{BlobSlice, RecordLayout, MAX_UTF8_LEN, STRING_FLAT_BYTES};
@@ -59,6 +59,15 @@ const TEST_WIT: &str = r#"
         f-result-unit-err: func(r: result<_, string>);
         f-result-ok-unit: func(r: result<u32>);
         f-result-both-unit: func(r: result);
+        // Joined-flat widening: ok=u32 → [I32], err=u64 → [I64];
+        // joined slot 1 = I64. Ok arm's Cell::IntegerZeroExt reads
+        // slot 1 as I32 → emit bitcast I64→I32.
+        f-result-u32-u64: func(r: result<u32, u64>);
+        // Three-arm widening: a(u32) → [I32], b(u64) → [I64],
+        // c(f64) → [F64]; joined slot 1 = I64. a + c arms widen,
+        // b matches.
+        variant tri-arm { a(u32), b(u64), c(f64) }
+        f-variant-tri-arm: func(v: tri-arm);
         resource my-res;
         record handle-pair { primary: own<my-res>, secondary: borrow<my-res> }
         f-handle-own: func(h: own<my-res>);
@@ -245,45 +254,21 @@ fn synth_cell_layout() -> CellLayout {
     CellLayout::from_resolve(&sizes, &resolve, cell_id)
 }
 
-/// Wasm `ValType` for each flat slot consumed by `plan.cells`, in
-/// flat-slot order. RecordOf / TupleOf cells contribute no slots.
-/// Indexed by `flat_slot` rather than cell order — `Cell::Option`
-/// allocates the disc before recursing into the child, so flat-slot
-/// order can diverge from cell order.
-fn plan_param_types(plan: &LiftPlan) -> Vec<ValType> {
-    let mut by_slot: Vec<Option<ValType>> = vec![None; plan.flat_slot_count as usize];
-    let mut put = |slot: u32, ty: ValType| by_slot[slot as usize] = Some(ty);
-    for op in &plan.cells {
-        match op {
-            Cell::Bool { flat_slot }
-            | Cell::IntegerSignExt { flat_slot }
-            | Cell::IntegerZeroExt { flat_slot }
-            | Cell::EnumCase { flat_slot, .. }
-            | Cell::Flags { flat_slot, .. }
-            | Cell::Char { flat_slot }
-            | Cell::Handle { flat_slot, .. } => put(*flat_slot, ValType::I32),
-            Cell::Integer64 { flat_slot } => put(*flat_slot, ValType::I64),
-            Cell::FloatingF32 { flat_slot } => put(*flat_slot, ValType::F32),
-            Cell::FloatingF64 { flat_slot } => put(*flat_slot, ValType::F64),
-            Cell::Text { ptr_slot, len_slot } | Cell::Bytes { ptr_slot, len_slot } => {
-                put(*ptr_slot, ValType::I32);
-                put(*len_slot, ValType::I32);
-            }
-            Cell::Option { disc_slot, .. } => put(*disc_slot, ValType::I32),
-            Cell::Result { disc_slot, .. } => put(*disc_slot, ValType::I32),
-            Cell::Variant { disc_slot, .. } => put(*disc_slot, ValType::I32),
-            Cell::RecordOf { .. } | Cell::TupleOf { .. } => {}
-            Cell::ListOf {
-                ptr_slot, len_slot, ..
-            } => {
-                put(*ptr_slot, ValType::I32);
-                put(*len_slot, ValType::I32);
-            }
-        }
-    }
-    by_slot
+/// Wasm `ValType` per flat slot — sourced from the canonical-ABI
+/// `flat_types(plan.source_ty)`, the same computation canon-lower runs
+/// to produce the wrapper's flat-param signature. Joined-flat widening
+/// (from `result` / `variant` arms) falls out naturally — `flat_types`
+/// returns the joined types for those slots. Pinning the test's
+/// declared params to this single source means a drift between
+/// emit_cell_op and the cell's expected wasm type surfaces as a
+/// validation error rather than two-wrongs-cancel.
+fn plan_param_types(plan: &LiftPlan, resolve: &Resolve) -> Vec<ValType> {
+    use super::super::super::abi::emit::wasm_type_to_val;
+    use super::super::super::abi::flat_types;
+    flat_types(resolve, &plan.source_ty, None)
+        .expect("plan source_ty must flatten within MAX_FLAT_PARAMS")
         .into_iter()
-        .map(|t| t.expect("every flat slot must be claimed by some cell"))
+        .map(wasm_type_to_val)
         .collect()
 }
 
@@ -431,7 +416,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     sizes.fill(resolve);
     let cell_layout = synth_cell_layout();
     let cell_side = auto_cell_side_data(plan);
-    let param_types = plan_param_types(plan);
+    let param_types = plan_param_types(plan, resolve);
     let n = plan.flat_slot_count;
 
     // Match alloc_wrapper_locals' allocation order so the indices
@@ -442,6 +427,8 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let ws = builder.alloc_local(ValType::I32);
     let ext64 = builder.alloc_local(ValType::I64);
     let ext_f64 = builder.alloc_local(ValType::F64);
+    let widen_i32_a = builder.alloc_local(ValType::I32);
+    let widen_i32_b = builder.alloc_local(ValType::I32);
     let flags_addr = builder.alloc_local(ValType::I32);
     let flags_count = builder.alloc_local(ValType::I32);
     let char_len = builder.alloc_local(ValType::I32);
@@ -458,6 +445,8 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         ws,
         ext64,
         ext_f64,
+        widen_i32_a,
+        widen_i32_b,
         flags_addr,
         flags_count,
         char_len,
@@ -1373,6 +1362,76 @@ fn result_u32_string_shares_arms_flat_slots() {
 }
 
 #[test]
+fn result_u32_u64_records_joined_flat_widening() {
+    // result<u32, u64>: ok flat = [I32], err flat = [I64]; joined =
+    // [I32 disc, I64 (= max width)]. Ok arm's leaf reads slot 1
+    // expecting I32 — emit must bitcast I64→I32. Err arm matches
+    // joined; no bitcast.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-u32-u64").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(
+        plan.cells,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::Integer64 { flat_slot: 1 },
+            Cell::Result {
+                disc_slot: 0,
+                ok_idx: Some(0),
+                err_idx: Some(1),
+            },
+        ],
+    );
+    assert_eq!(plan.flat_slot_count, 2);
+    // Disc never widens (joined position 0 is always I32).
+    assert!(plan.widening_for(0).is_none());
+    assert_eq!(plan.widening_for(1), Some(WasmType::I64));
+}
+
+#[test]
+fn variant_tri_arm_records_joined_flat_widening() {
+    // variant tri-arm { a(u32), b(u64), c(f64) }:
+    // a → [I32], b → [I64], c → [F64]; joined = [I32 disc, I64
+    // (max width across arms)]. a + c widen (I32 / F64 vs I64),
+    // b matches — slot_widening[1] is recorded once (idempotent
+    // across arms; joined is structural).
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-variant-tri-arm").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(plan.flat_slot_count, 2);
+    assert!(plan.widening_for(0).is_none());
+    assert_eq!(plan.widening_for(1), Some(WasmType::I64));
+}
+
+#[test]
+fn result_u32_string_records_no_widening() {
+    // result<u32, string>: ok flat = [I32], err flat = [I32, I32];
+    // joined = [I32, I32, I32]. Every arm position matches the
+    // joined wasm type → no widening recorded.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-result-u32-string").params[0].ty,
+        &r,
+        &mut names,
+    );
+    for slot in 0..plan.flat_slot_count {
+        assert!(
+            plan.widening_for(slot).is_none(),
+            "result<u32, string> slot {slot} should not widen",
+        );
+    }
+}
+
+#[test]
 fn result_unit_ok_skips_ok_child() {
     // result<_, string>: Ok arm is unit, no child cell. Err=string
     // claims slots 1, 2. ok_idx=None, err_idx=Some(0).
@@ -1699,6 +1758,16 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         ),
         plan_for(
             &func_named(&r, "f-result-both-unit").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-result-u32-u64").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        plan_for(
+            &func_named(&r, "f-variant-tri-arm").params[0].ty,
             &r,
             &mut names,
         ),

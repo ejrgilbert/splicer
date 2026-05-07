@@ -6,10 +6,11 @@ use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_parser::{Resolve, SizeAlign};
 
+use super::super::super::abi::cast;
 use super::super::super::abi::emit::{
-    direct_return_type, emit_cabi_realloc_call_runtime, wasm_type_to_val, I32_STORE_LOG2_ALIGN,
-    I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET,
-    SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
+    direct_return_type, emit_bitcast, emit_cabi_realloc_call_runtime, wasm_type_to_val,
+    I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, OPTION_NONE, OPTION_SOME,
+    SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
 use super::super::super::abi::flat_types;
 use super::super::super::abi::WasmEncoderBindgen;
@@ -22,6 +23,7 @@ use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::CellSideData;
+use wit_parser::abi::WasmType;
 
 /// Locals + pre-built load sequences used by the wrapper body.
 /// Allocated once up front so all downstream emit phases (param lift,
@@ -42,6 +44,13 @@ pub(crate) struct WrapperLocals {
     pub(super) ext64: u32,
     /// f64 promoted source for FloatingF32.
     pub(super) ext_f64: u32,
+    /// Scratch i32 locals for joined-flat widening reads. `_a` lands
+    /// the bitcast for any i32-arm leaf; `_b` is reserved for the
+    /// second slot of a `Cell::Text` / `Cell::Bytes` so the ptr
+    /// scratch survives the len read. Both unconditional — wasm
+    /// liveness analysis drops them when unused.
+    pub(super) widen_i32_a: u32,
+    pub(super) widen_i32_b: u32,
     /// Cursor + count locals for the `Cell::Flags` bit-walk
     /// (re-used across every flags cell in a sequential wrapper body).
     pub(super) flags_addr: u32,
@@ -137,6 +146,17 @@ pub(crate) struct CellSideRefs<'a> {
 pub(crate) struct LiftEmitCtx<'a> {
     pub cell_layout: &'a CellLayout,
     pub cabi_realloc_idx: u32,
+}
+
+/// Per-plan-walk cursor: the plan being emitted and the wrapper-local
+/// offset added to every cell's plan-relative flat slot. Both travel
+/// together — the plan is consulted for `widening_for(slot)` while
+/// `local_base` resolves slots to absolute wrapper-local indices —
+/// so they're bundled at every plan-walk boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct PlanCursor<'a> {
+    pub plan: &'a LiftPlan,
+    pub local_base: u32,
 }
 
 /// Per-`Cell::ListOf` emit-time bundle. One entry per list-of cell
@@ -254,6 +274,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let ws = builder.alloc_local(ValType::I32);
     let ext64 = builder.alloc_local(ValType::I64);
     let ext_f64 = builder.alloc_local(ValType::F64);
+    let widen_i32_a = builder.alloc_local(ValType::I32);
+    let widen_i32_b = builder.alloc_local(ValType::I32);
     let flags_addr = builder.alloc_local(ValType::I32);
     let flags_count = builder.alloc_local(ValType::I32);
     let char_len = builder.alloc_local(ValType::I32);
@@ -385,6 +407,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             ws,
             ext64,
             ext_f64,
+            widen_i32_a,
+            widen_i32_b,
             flags_addr,
             flags_count,
             char_len,
@@ -451,62 +475,169 @@ pub(crate) fn emit_lift_plan(
         emit_cell_op(
             f,
             ctx,
+            PlanCursor { plan, local_base },
             op,
             &side_refs.cell_side[cell_idx],
-            local_base,
             lcl,
             list_slot,
         );
     }
 }
 
+/// Resolve a leaf-level flat-slot read, applying any joined-flat
+/// widening bitcast recorded in `plan`. The returned `u32` is always
+/// an absolute wrapper-local index — either the wrapper's flat-param
+/// slot (`local_base + flat_slot`) when no bitcast is needed, or one
+/// of the typed scratches (`lcl.widen_i32_a` / `lcl.ext64` /
+/// `lcl.ext_f64`) materialized via `local.get + bitcast + local.set`.
+/// F32-arm leaves use `push_widened_get` inline (no helper takes an
+/// f32 local idx).
+fn pin_leaf_flat(
+    f: &mut Function,
+    plan: &LiftPlan,
+    local_base: u32,
+    flat_slot: u32,
+    arm: WasmType,
+    lcl: &WrapperLocals,
+) -> u32 {
+    pin_leaf_flat_with_i32_scratch(f, plan, local_base, flat_slot, arm, lcl.widen_i32_a, lcl)
+}
+
+/// Inner form of [`pin_leaf_flat`] that lets the caller name the i32
+/// scratch — only `Cell::Text` / `Cell::Bytes` need this (their two
+/// i32 slots can both widen in the same cell). Other arm types ignore
+/// `scratch_i32` and pick `lcl.ext64` / `lcl.ext_f64` by `arm`.
+fn pin_leaf_flat_with_i32_scratch(
+    f: &mut Function,
+    plan: &LiftPlan,
+    local_base: u32,
+    flat_slot: u32,
+    arm: WasmType,
+    scratch_i32: u32,
+    lcl: &WrapperLocals,
+) -> u32 {
+    let Some(joined) = plan.widening_for(flat_slot) else {
+        return local_base + flat_slot;
+    };
+    let bc = cast(joined, arm);
+    if matches!(bc, wit_bindgen_core::abi::Bitcast::None) {
+        // Joined matches this arm's per-position type — another arm
+        // widened the slot, but we don't need to.
+        return local_base + flat_slot;
+    }
+    f.instructions().local_get(local_base + flat_slot);
+    emit_bitcast(f, &bc);
+    let scratch = match arm {
+        WasmType::I32 | WasmType::Pointer | WasmType::Length => scratch_i32,
+        WasmType::I64 | WasmType::PointerOrI64 => lcl.ext64,
+        WasmType::F64 => lcl.ext_f64,
+        WasmType::F32 => panic!("F32 widening must use push_widened_get inline"),
+    };
+    f.instructions().local_set(scratch);
+    scratch
+}
+
+/// Pin both i32 slots of a `Text` / `Bytes` cell into distinct
+/// scratches (`widen_i32_a` for ptr, `widen_i32_b` for len) so the
+/// ptr value survives the len read. Returns `(ptr_local, len_local)`
+/// for the cell-layout helper.
+fn pin_text_bytes_slots(
+    f: &mut Function,
+    plan: &LiftPlan,
+    local_base: u32,
+    ptr_slot: u32,
+    len_slot: u32,
+    lcl: &WrapperLocals,
+) -> (u32, u32) {
+    let ptr = pin_leaf_flat(f, plan, local_base, ptr_slot, WasmType::I32, lcl);
+    let len = pin_leaf_flat_with_i32_scratch(
+        f,
+        plan,
+        local_base,
+        len_slot,
+        WasmType::I32,
+        lcl.widen_i32_b,
+        lcl,
+    );
+    (ptr, len)
+}
+
+/// `local.get` then (when widening is recorded for `flat_slot`) the
+/// joined→arm bitcast — leaves the arm-typed value on the wasm stack.
+/// Used for cells that do their own follow-up (extend / promote /
+/// `if_`) rather than handing a local index to a helper.
+fn push_widened_get(
+    f: &mut Function,
+    plan: &LiftPlan,
+    local_base: u32,
+    flat_slot: u32,
+    arm: WasmType,
+) {
+    f.instructions().local_get(local_base + flat_slot);
+    if let Some(joined) = plan.widening_for(flat_slot) {
+        emit_bitcast(f, &cast(joined, arm));
+    }
+}
+
 /// Emit one cell's worth of wasm at the address held in `lcl.addr`.
 /// `local_base` is added to each plan-relative flat-slot. `list_slot`
 /// is `Some` exactly for `Cell::ListOf`. New [`Cell`] variants add an
-/// arm here (no `_` catchall).
+/// arm here (no `_` catchall). `plan` carries the joined-flat widening
+/// table consulted at every leaf flat-slot read.
 fn emit_cell_op(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
+    cur: PlanCursor<'_>,
     op: &Cell,
     side_data: &CellSideData,
-    local_base: u32,
     lcl: &WrapperLocals,
     list_slot: Option<&ListEmitLocals>,
 ) {
+    let PlanCursor { plan, local_base } = cur;
     let addr = lcl.addr;
     let cell_layout = ctx.cell_layout;
     match op {
-        Cell::Bool { flat_slot } => cell_layout.emit_bool(f, addr, local_base + *flat_slot),
+        Cell::Bool { flat_slot } => {
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
+            cell_layout.emit_bool(f, addr, src);
+        }
         Cell::IntegerSignExt { flat_slot } => {
-            f.instructions().local_get(local_base + *flat_slot);
+            push_widened_get(f, plan, local_base, *flat_slot, WasmType::I32);
             f.instructions().i64_extend_i32_s();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
         Cell::IntegerZeroExt { flat_slot } => {
-            f.instructions().local_get(local_base + *flat_slot);
+            push_widened_get(f, plan, local_base, *flat_slot, WasmType::I32);
             f.instructions().i64_extend_i32_u();
             f.instructions().local_set(lcl.ext64);
             cell_layout.emit_integer(f, addr, lcl.ext64);
         }
-        Cell::Integer64 { flat_slot } => cell_layout.emit_integer(f, addr, local_base + *flat_slot),
+        Cell::Integer64 { flat_slot } => {
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I64, lcl);
+            cell_layout.emit_integer(f, addr, src);
+        }
         Cell::FloatingF32 { flat_slot } => {
-            f.instructions().local_get(local_base + *flat_slot);
+            push_widened_get(f, plan, local_base, *flat_slot, WasmType::F32);
             f.instructions().f64_promote_f32();
             f.instructions().local_set(lcl.ext_f64);
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
         Cell::FloatingF64 { flat_slot } => {
-            cell_layout.emit_floating(f, addr, local_base + *flat_slot)
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::F64, lcl);
+            cell_layout.emit_floating(f, addr, src);
         }
         Cell::Text { ptr_slot, len_slot } => {
-            cell_layout.emit_text(f, addr, local_base + *ptr_slot, local_base + *len_slot);
+            let (ptr, len) = pin_text_bytes_slots(f, plan, local_base, *ptr_slot, *len_slot, lcl);
+            cell_layout.emit_text(f, addr, ptr, len);
         }
         Cell::Bytes { ptr_slot, len_slot } => {
-            cell_layout.emit_bytes(f, addr, local_base + *ptr_slot, local_base + *len_slot);
+            let (ptr, len) = pin_text_bytes_slots(f, plan, local_base, *ptr_slot, *len_slot, lcl);
+            cell_layout.emit_bytes(f, addr, ptr, len);
         }
         Cell::EnumCase { flat_slot, .. } => {
-            cell_layout.emit_enum_case(f, addr, local_base + *flat_slot);
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
+            cell_layout.emit_enum_case(f, addr, src);
         }
         Cell::RecordOf { .. } => {
             let CellSideData::Record { idx } = side_data else {
@@ -524,7 +655,7 @@ fn emit_cell_op(
             disc_slot,
             child_idx,
         } => {
-            f.instructions().local_get(local_base + *disc_slot);
+            push_widened_get(f, plan, local_base, *disc_slot, WasmType::I32);
             f.instructions().if_(BlockType::Empty);
             cell_layout.emit_option_some(f, addr, *child_idx);
             f.instructions().else_();
@@ -537,7 +668,7 @@ fn emit_cell_op(
             err_idx,
         } => {
             // wasm `if` fires on non-zero, so err goes in the if block.
-            f.instructions().local_get(local_base + *disc_slot);
+            push_widened_get(f, plan, local_base, *disc_slot, WasmType::I32);
             f.instructions().if_(BlockType::Empty);
             cell_layout.emit_result_err(f, addr, err_idx.is_some(), err_idx.unwrap_or(0));
             f.instructions().else_();
@@ -548,27 +679,24 @@ fn emit_cell_op(
             let CellSideData::Flags(fill) = side_data else {
                 panic!("Flags cell paired with non-Flags side data {side_data:?}");
             };
-            emit_flags_runtime_fill(f, local_base + *flat_slot, fill, lcl);
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
+            emit_flags_runtime_fill(f, src, fill, lcl);
             cell_layout.emit_flags_set(f, lcl.addr, fill.side_table_idx);
         }
         Cell::Variant { disc_slot, .. } => {
             let CellSideData::Variant(fill) = side_data else {
                 panic!("Variant cell paired with non-Variant side data {side_data:?}");
             };
-            emit_variant_runtime_fill(f, local_base + *disc_slot, fill);
+            let src = pin_leaf_flat(f, plan, local_base, *disc_slot, WasmType::I32, lcl);
+            emit_variant_runtime_fill(f, src, fill);
             cell_layout.emit_variant_case(f, lcl.addr, fill.side_table_idx);
         }
         Cell::Char { flat_slot } => {
             let CellSideData::Char { scratch_addr } = side_data else {
                 panic!("Char cell paired with non-Char side data {side_data:?}");
             };
-            cell_layout.emit_char(
-                f,
-                lcl.addr,
-                local_base + *flat_slot,
-                *scratch_addr,
-                lcl.char_len,
-            );
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
+            cell_layout.emit_char(f, lcl.addr, src, *scratch_addr, lcl.char_len);
         }
         Cell::Handle {
             flat_slot, kind, ..
@@ -576,7 +704,8 @@ fn emit_cell_op(
             let CellSideData::Handle(fill) = side_data else {
                 panic!("Handle cell paired with non-Handle side data {side_data:?}");
             };
-            emit_handle_runtime_fill(f, local_base + *flat_slot, fill);
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
+            emit_handle_runtime_fill(f, src, fill);
             cell_layout.emit_handle_cell(f, lcl.addr, kind.cell_disc_case(), fill.side_table_idx);
         }
         Cell::ListOf {
@@ -586,7 +715,8 @@ fn emit_cell_op(
         } => {
             let ll =
                 list_slot.expect("ListOf cell must arrive with a matching ListEmitLocals slot");
-            emit_list_of_arm(f, ctx, ll, local_base + *ptr_slot, element_plan, lcl);
+            let ptr = pin_leaf_flat(f, plan, local_base, *ptr_slot, WasmType::I32, lcl);
+            emit_list_of_arm(f, ctx, ll, ptr, element_plan, lcl);
         }
     }
 }
@@ -648,9 +778,12 @@ fn emit_list_of_arm(
     emit_cell_op(
         f,
         ctx,
+        PlanCursor {
+            plan: element_plan,
+            local_base: ll.elem_flat_locals[0],
+        },
         elem_cell,
         &ll.elem_cell_side[0],
-        ll.elem_flat_locals[0],
         lcl,
         None,
     );

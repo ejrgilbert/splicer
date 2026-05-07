@@ -11,6 +11,7 @@ use wasm_encoder::{
     Function, GlobalSection, GlobalType, ImportSection, MemArg, MemorySection, MemoryType, Module,
     ValType,
 };
+use wit_bindgen_core::abi::Bitcast;
 use wit_parser::abi::{AbiVariant, FlatTypes, WasmSignature, WasmType};
 use wit_parser::{
     Function as WitFunction, Handle, Int, InterfaceId, Resolve, ResourceIntrinsic, SizeAlign, Type,
@@ -288,6 +289,59 @@ pub(crate) fn direct_return_type(export_sig: &WasmSignature) -> Option<ValType> 
         Some(wasm_type_to_val(export_sig.results[0]))
     } else {
         None
+    }
+}
+
+/// Emit the wasm sequence for a canonical-ABI [`Bitcast`] —
+/// converts the top-of-stack value's wasm type. Decomposes
+/// `Bitcast::Sequence` recursively. `Bitcast::None` is a no-op.
+/// Pointer / Length / PointerOrI64 → underlying i32/i64 mappings
+/// follow wasm32: `Pointer`/`Length` are i32, `PointerOrI64` is i64.
+pub(crate) fn emit_bitcast(f: &mut Function, bc: &Bitcast) {
+    use Bitcast::*;
+    match bc {
+        None => {}
+        I32ToI64 => {
+            f.instructions().i64_extend_i32_u();
+        }
+        I64ToI32 => {
+            f.instructions().i32_wrap_i64();
+        }
+        F32ToI32 => {
+            f.instructions().i32_reinterpret_f32();
+        }
+        I32ToF32 => {
+            f.instructions().f32_reinterpret_i32();
+        }
+        F64ToI64 => {
+            f.instructions().i64_reinterpret_f64();
+        }
+        I64ToF64 => {
+            f.instructions().f64_reinterpret_i64();
+        }
+        F32ToI64 => {
+            f.instructions().i32_reinterpret_f32();
+            f.instructions().i64_extend_i32_u();
+        }
+        I64ToF32 => {
+            f.instructions().i32_wrap_i64();
+            f.instructions().f32_reinterpret_i32();
+        }
+        // Wasm32 pointer/length collapse to i32; PointerOrI64 to i64.
+        // No-op when both sides collapse to the same wasm type.
+        PToI32 | I32ToP | I32ToL | LToI32 | PToL | LToP => {}
+        I64ToP64 | P64ToI64 => {}
+        PToP64 | LToI64 => {
+            f.instructions().i64_extend_i32_u();
+        }
+        P64ToP | I64ToL => {
+            f.instructions().i32_wrap_i64();
+        }
+        Sequence(pair) => {
+            let [a, b] = pair.as_ref();
+            emit_bitcast(f, a);
+            emit_bitcast(f, b);
+        }
     }
 }
 

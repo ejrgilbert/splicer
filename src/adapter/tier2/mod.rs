@@ -1509,6 +1509,95 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// `result<u32, u64>` as a param exercises joined-flat widening:
+    /// joined = [i32 disc, i64 (max width)]. The wrapper's flat
+    /// fn-param at slot 1 is i64; the ok arm's `Cell::IntegerZeroExt`
+    /// (u32) reads slot 1 expecting i32 — emit must bitcast i64→i32
+    /// before the i64.extend, otherwise wasm validation rejects the
+    /// i32-typed instruction taking an i64 stack value.
+    #[test]
+    fn dispatch_module_with_widening_result_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume") (param i32 i64))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (type $consume-ty (func (param "r" (result u32 (error u64)))))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:res/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:res/api@1.0.0" (instance $api "my:res/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:res/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation must succeed for widening result param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted adapter must validate (joined-flat bitcast on ok-arm read)");
+    }
+
+    /// `variant { a(u32), b(u64), c(f64) }` mixed-width param —
+    /// joined slot 1 = i64. Arms `a` (i32) and `c` (f64) widen, arm
+    /// `b` matches. Pins that the bitcast emitter handles each arm's
+    /// distinct cast independently and that f64-arm leaves use the
+    /// f64 scratch path through `pin_leaf_flat`.
+    #[test]
+    fn dispatch_module_with_widening_variant_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "consume") (param i32 i64))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (type $tri (variant (case "a" u32) (case "b" u64) (case "c" f64)))
+                (export $tri-export "tri" (type $tri))
+                (type $consume-ty (func (param "v" $tri-export)))
+                (func $consume-lifted (type $consume-ty) (canon lift (core func $consume)))
+                (instance $api-inst
+                    (export "tri" (type $tri-export))
+                    (export "consume" (func $consume-lifted)))
+                (export "my:vt/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:vt/api@1.0.0" (instance $api "my:vt/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:vt/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation must succeed for mixed-width variant param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted adapter must validate (per-arm bitcasts on a/c arms)");
+    }
+
     /// End-to-end test for `result<T, E>` as a compound result.
     /// Drives `is_compound_result(Result) → Compound → lift_from_memory`
     /// and the if/else branching emit at the parent Result cell.

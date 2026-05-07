@@ -25,6 +25,7 @@
 //! [`docs/tiers/lift-codegen.md`](../../../../docs/tiers/lift-codegen.md).
 
 use anyhow::{anyhow, Result};
+use wit_parser::abi::WasmType;
 use wit_parser::{Resolve, Type};
 
 use super::super::super::abi::emit::{wasm_type_to_val, BlobSlice};
@@ -230,6 +231,13 @@ pub(crate) struct LiftPlan {
     /// caller-supplied `local_base` to recover absolute wasm-local
     /// indices.
     pub flat_slot_count: u32,
+    /// Per-flat-slot joined wasm type, recorded only when the joined
+    /// differs from at least one arm's per-position wasm type — i.e.
+    /// the slot lives inside a widening `result` / `variant`. The emit
+    /// phase derives the per-leaf bitcast as `cast(joined, leaf_arm_ty)`
+    /// where `leaf_arm_ty` is implied by the cell's variant.
+    /// Indexed by plan-relative flat slot. Length = `flat_slot_count`.
+    slot_widening: Vec<Option<WasmType>>,
     /// Index of the root cell within `cells`. The plan-builder
     /// pushes children before parents, so for compound shapes this
     /// is the last-appended cell rather than `cells[0]`.
@@ -265,6 +273,17 @@ impl LiftPlan {
     /// returned from the top-level [`LiftPlanBuilder::push`].
     pub(crate) fn root(&self) -> u32 {
         self.root
+    }
+
+    /// Joined wasm type at `flat_slot` when the slot is inside a
+    /// widening `result` / `variant` arm — `None` for the common
+    /// matching case. The emit phase pairs this with the leaf cell's
+    /// implied arm type to compute `cast(joined, arm)`.
+    pub(crate) fn widening_for(&self, flat_slot: u32) -> Option<WasmType> {
+        self.slot_widening
+            .get(flat_slot as usize)
+            .copied()
+            .flatten()
     }
 
     /// Recursively walk every cell in the plan, including cells nested
@@ -322,6 +341,7 @@ impl LiftPlan {
         Self {
             cells: vec![Cell::Bool { flat_slot: 0 }],
             flat_slot_count: 1,
+            slot_widening: vec![None],
             root: 0,
             source_ty,
         }
@@ -379,6 +399,12 @@ pub(super) struct LiftPlanBuilder {
     /// Next available plan-relative flat-slot position. Incremented
     /// by `bump_flat_slot` as cells consume flat slots.
     next_flat_slot: u32,
+    /// Per-flat-slot joined wasm type for widening inside
+    /// variant / result arms. Grows lazily — `bump_flat_slot` only
+    /// appends `None` when extending past the current max, so arms
+    /// rewinding `next_flat_slot` don't double-grow the table.
+    /// Arms with widening write entries via [`Self::set_widening`].
+    slot_widening: Vec<Option<WasmType>>,
     /// Running list-of cell counter; assigned to each `Cell::ListOf`
     /// via `list_idx` so emit + alloc can index `list_locals` directly.
     next_list_idx: u32,
@@ -393,6 +419,7 @@ impl LiftPlanBuilder {
     pub(super) fn new() -> Self {
         Self {
             cells: Vec::new(),
+            slot_widening: Vec::new(),
             next_flat_slot: 0,
             next_list_idx: 0,
             joined_arm_depth: 0,
@@ -512,7 +539,39 @@ impl LiftPlanBuilder {
             .checked_add(1)
             // Tripwire; realistic blow-ups are caught by `check_layout_budget`.
             .expect("LiftPlanBuilder flat-slot counter overflowed u32");
+        // Variant / result arms rewind `next_flat_slot` to share slots;
+        // only extend the widening table when reaching a new high-water
+        // mark (preserves entries set by an earlier arm at this slot).
+        if self.slot_widening.len() < self.next_flat_slot as usize {
+            self.slot_widening.push(None);
+        }
         r
+    }
+
+    /// Record the joined-flat type at `flat_slot`. Called by
+    /// `push_result` / `push_variant` for slots whose joined type
+    /// differs from at least one arm's per-position type. Idempotent
+    /// when arms agree on the joined (they always do — joined is
+    /// structural over the parent type).
+    fn set_widening(&mut self, flat_slot: u32, joined_ty: WasmType) {
+        debug_assert!(
+            (flat_slot as usize) < self.slot_widening.len(),
+            "set_widening called for flat_slot {flat_slot} before bump_flat_slot reached it \
+             (slot_widening len = {})",
+            self.slot_widening.len(),
+        );
+        // Multi-arm overwrites are expected (each arm records its
+        // own widening at shared slots); pin that they agree on the
+        // joined wasm type — same parent type → same joined.
+        if let Some(prev) = self.slot_widening[flat_slot as usize] {
+            debug_assert_eq!(
+                wasm_type_to_val(prev),
+                wasm_type_to_val(joined_ty),
+                "set_widening overwriting slot {flat_slot} with a different joined type \
+                 ({prev:?} vs {joined_ty:?}) — joined should be structural"
+            );
+        }
+        self.slot_widening[flat_slot as usize] = Some(joined_ty);
     }
 
     /// Append `cell` and return the index it landed at.
@@ -608,46 +667,24 @@ impl LiftPlanBuilder {
         let r = r.clone();
 
         // Joined flat (= [I32 disc, ...join(flat(ok), flat(err))]).
-        // Each populated arm's per-position flat must equal the
-        // joined per-position; otherwise leaf cells would need
-        // bitcasts that Phase 1 doesn't yet emit.
+        // When an arm's per-position wasm type differs from the
+        // joined, leaf cells inside that arm read a wider source slot
+        // than they expect — `slot_widening` records the bitcast the
+        // emit phase inserts at the leaf-cell read site.
         let joined = flat_types(resolve, ty, None)
             .expect("result<T, E> must flatten within MAX_FLAT_PARAMS");
-        // Compare at wasm-level: `Pointer`/`Length` compare equal to
-        // `I32`, `PointerOrI64` to `I64`. The per-slot wasm type is
-        // what determines whether leaf cells can read the slot
-        // without a bitcast.
-        let check_arm = |arm: &Option<Type>, label: &str| {
-            if let Some(t) = arm {
-                let arm_flat =
-                    flat_types(resolve, t, None).expect("arm flat fits — joined fit, so arm fits");
-                for (i, &arm_ty) in arm_flat.iter().enumerate() {
-                    let arm_val = wasm_type_to_val(arm_ty);
-                    let joined_val = wasm_type_to_val(joined[1 + i]);
-                    if arm_val != joined_val {
-                        todo!(
-                            "result<T, E> with joined-flat widening on the {label} arm \
-                             (slot {} arm-val {:?} vs joined-val {:?}) is not yet supported",
-                            1 + i,
-                            arm_val,
-                            joined_val,
-                        );
-                    }
-                }
-            }
-        };
-        check_arm(&r.ok, "ok");
-        check_arm(&r.err, "err");
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
         self.joined_arm_depth += 1;
         let ok_idx = r.ok.as_ref().map(|t| self.push(t, resolve, names));
         let after_ok = self.next_flat_slot;
+        self.record_arm_widening(r.ok.as_ref(), arms_base, &joined, resolve);
 
         self.next_flat_slot = arms_base;
         let err_idx = r.err.as_ref().map(|t| self.push(t, resolve, names));
         let after_err = self.next_flat_slot;
+        self.record_arm_widening(r.err.as_ref(), arms_base, &joined, resolve);
         self.joined_arm_depth -= 1;
 
         self.next_flat_slot = after_ok.max(after_err);
@@ -656,6 +693,31 @@ impl LiftPlanBuilder {
             ok_idx,
             err_idx,
         })
+    }
+
+    /// Walk one variant / result arm's flat positions and stamp the
+    /// joined wasm type onto any slot the arm widens. `arms_base` is
+    /// the first arm-payload slot (joined position 1). No-op for
+    /// empty / unit arms.
+    fn record_arm_widening(
+        &mut self,
+        arm: Option<&Type>,
+        arms_base: u32,
+        joined: &[WasmType],
+        resolve: &Resolve,
+    ) {
+        let Some(t) = arm else { return };
+        let arm_flat =
+            flat_types(resolve, t, None).expect("arm flat fits — joined fit, so arm fits");
+        for (i, &arm_ty) in arm_flat.iter().enumerate() {
+            let joined_ty = joined[1 + i];
+            // Compare at wasm-level: `Pointer`/`Length` collapse to
+            // I32, `PointerOrI64` to I64 — only the wasm type matters
+            // for whether the leaf cell can read the slot directly.
+            if wasm_type_to_val(arm_ty) != wasm_type_to_val(joined_ty) {
+                self.set_widening(arms_base + i as u32, joined_ty);
+            }
+        }
     }
 
     /// `variant { ... }`: bump disc, walk each case's payload (if
@@ -675,32 +737,11 @@ impl LiftPlanBuilder {
             .expect("Variant kind implies variant-info available");
 
         // Joined flat (= [I32 disc, ...join(flat of each case)]).
-        // Each populated case's per-position flat must equal the
-        // joined per-position; otherwise leaf cells would need
-        // bitcasts that Phase 1 doesn't yet emit.
+        // Per-arm widening — leaf cells inside a case read the
+        // joined slot type and bitcast at read time (recorded by
+        // `record_arm_widening`).
         let joined =
             flat_types(resolve, ty, None).expect("variant must flatten within MAX_FLAT_PARAMS");
-        for case in &v.cases {
-            let Some(t) = case.ty.as_ref() else {
-                continue;
-            };
-            let arm_flat =
-                flat_types(resolve, t, None).expect("case flat fits — joined fit, so case fits");
-            for (i, &arm_ty) in arm_flat.iter().enumerate() {
-                let arm_val = wasm_type_to_val(arm_ty);
-                let joined_val = wasm_type_to_val(joined[1 + i]);
-                if arm_val != joined_val {
-                    todo!(
-                        "variant with joined-flat widening on case `{}` \
-                         (slot {} arm-val {:?} vs joined-val {:?}) is not yet supported",
-                        case.name,
-                        1 + i,
-                        arm_val,
-                        joined_val,
-                    );
-                }
-            }
-        }
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
@@ -711,6 +752,7 @@ impl LiftPlanBuilder {
             self.next_flat_slot = arms_base;
             let child_idx = case.ty.as_ref().map(|t| self.push(t, resolve, names));
             max_after = max_after.max(self.next_flat_slot);
+            self.record_arm_widening(case.ty.as_ref(), arms_base, &joined, resolve);
             per_case_payload.push(child_idx);
         }
         self.joined_arm_depth -= 1;
@@ -827,9 +869,15 @@ impl LiftPlanBuilder {
     }
 
     pub(super) fn into_plan(self, root: u32, source_ty: Type) -> LiftPlan {
+        debug_assert_eq!(
+            self.slot_widening.len() as u32,
+            self.next_flat_slot,
+            "slot_widening must mirror flat_slot_count (one entry per bump_flat_slot)",
+        );
         LiftPlan {
             cells: self.cells,
             flat_slot_count: self.next_flat_slot,
+            slot_widening: self.slot_widening,
             root,
             source_ty,
         }

@@ -22,4 +22,4 @@ mod compat;
 pub(super) mod emit;
 
 pub(super) use bindgen::WasmEncoderBindgen;
-pub(super) use compat::flat_types;
+pub(super) use compat::{cast, flat_types};
