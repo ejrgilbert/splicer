@@ -13,7 +13,10 @@ use super::super::super::blob::{NameInterner, RecordWriter, Segment, SymRef, Sym
 use super::super::super::schema::FLAGS_INFO_SET_FLAGS;
 use super::super::super::FuncClassified;
 use super::super::plan::{Cell, LiftPlan, NamedListInfo};
-use super::{ensure_registered, PerCellIndices, StringTable, INFO_TYPE_NAME};
+use super::{
+    back_fill_per_cell, build_per_cell_side_table, register_side_table_strings, CellEntryWriter,
+    PerCellIndices, PerCellSideTableBlob, StringTable, INFO_TYPE_NAME,
+};
 
 /// Per-(plan-cell) emit-phase data for one `Cell::Flags`.
 #[derive(Clone, Debug)]
@@ -39,21 +42,20 @@ pub(crate) struct FlagsRuntimeFill {
     pub flag_names: Vec<BlobSlice>,
 }
 
-/// Output of [`build_flags_info_blob`]. Mirrors
-/// [`super::record_info::RecordInfoBlobs`] plus per-cell
-/// [`FlagsRuntimeFill`] data the emit phase consumes.
+/// Re-export of the framework output under the kind's name; the layout
+/// phase destructures by these field names.
 pub(crate) struct FlagsInfoBlobs {
-    /// `flags-info` entries (one per `Cell::Flags`). `type-name` and
-    /// `set-flags.ptr` are baked at build time; `set-flags.len` is
-    /// patched at runtime by the wrapper bit-walk.
+    /// `flags-info` entries: `type-name` + `set-flags.ptr` baked at
+    /// build time; `set-flags.len` patched per call by the bit-walk.
     pub entries: Segment,
+    /// Per-(fn, param) entry range; `None` for params with no flags.
     pub per_param_range: Vec<Vec<Option<SymRef>>>,
+    /// Per-fn Compound result range; `None` otherwise.
     pub per_result_range: Vec<Option<SymRef>>,
+    /// Per-cell runtime-fill (patched addresses) parallel to plan.cells.
     pub per_cell_fill: PerCellIndices<FlagsRuntimeFill>,
-    /// Per-fn fill for a Direct (sync flat) `Cell::Flags` result —
-    /// no plan to attach it to since `lcl.result` is the source.
-    /// Retptr-loaded flags results route through Compound and
-    /// register via `per_cell_fill`.
+    /// Per-fn Direct (sync flat) flags result fill. Retptr-loaded
+    /// results go via `per_cell_fill` instead.
     pub per_result_single_fill: Vec<Option<FlagsRuntimeFill>>,
 }
 
@@ -63,27 +65,12 @@ pub(crate) fn register_flags_strings(
     per_func: &[FuncClassified],
     names: &mut NameInterner,
 ) -> StringTable {
-    let mut table = StringTable::new();
-    for fd in per_func {
-        for p in &fd.params {
-            for info in p.plan.flags_infos() {
-                ensure_registered(&mut table, names, info);
-            }
-        }
-        if let Some(rl) = &fd.result_lift {
-            // Compound + single-cell are mutually exclusive (compound
-            // path leaves SideTableInfo empty); `else if` makes that
-            // explicit.
-            if let Some(c) = rl.compound() {
-                for info in c.plan.flags_infos() {
-                    ensure_registered(&mut table, names, info);
-                }
-            } else if let Some(info) = &rl.side_table.flags_info {
-                ensure_registered(&mut table, names, info);
-            }
-        }
-    }
-    table
+    register_side_table_strings(
+        per_func,
+        names,
+        |plan, visit| plan.flags_infos().for_each(visit),
+        |st| st.flags_info.as_ref(),
+    )
 }
 
 /// Lay out the flags-info entries (one per `Cell::Flags`, whether
@@ -99,171 +86,95 @@ pub(crate) fn build_flags_info_blob(
     entries_id: SymbolId,
     scratch_addrs: &mut impl Iterator<Item = u32>,
 ) -> FlagsInfoBlobs {
-    let mut builder = FlagsInfoBuilder::new(entry_layout, entries_id);
-    let mut per_param_range: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
-    let mut per_param_fill: Vec<Vec<Vec<Option<FlagsRuntimeFill>>>> =
-        Vec::with_capacity(per_func.len());
-    let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
-    let mut per_result_fill: Vec<Vec<Option<FlagsRuntimeFill>>> =
-        Vec::with_capacity(per_func.len());
-    let mut per_result_single_fill: Vec<Option<FlagsRuntimeFill>> =
-        Vec::with_capacity(per_func.len());
-
-    for fd in per_func {
-        let mut params_ranges = Vec::with_capacity(fd.params.len());
-        let mut params_fill = Vec::with_capacity(fd.params.len());
-        for p in &fd.params {
-            let (range, fill_map) = builder.append_plan(&p.plan, strings, scratch_addrs);
-            params_ranges.push(range);
-            params_fill.push(fill_map);
-        }
-        per_param_range.push(params_ranges);
-        per_param_fill.push(params_fill);
-
-        // Result side: Compound (multi-cell + retptr-loaded single-
-        // cell) walks the plan; Direct (sync flat) appends one
-        // entry inline.
-        let (result_range, result_fill_map, single_fill) = match fd.result_lift.as_ref() {
-            Some(rl) => match (rl.compound(), rl.side_table.flags_info.as_ref()) {
-                (Some(c), None) => {
-                    let (range, fill) = builder.append_plan(&c.plan, strings, scratch_addrs);
-                    (range, fill, None)
-                }
-                (None, Some(info)) => {
-                    let (range, fill) = builder.append_direct(info, strings, scratch_addrs);
-                    (range, Vec::new(), Some(fill))
-                }
-                (None, None) => (None, Vec::new(), None),
-                // classify_result_lift leaves SideTableInfo empty
-                // when returning Compound; if both fire, the invariant
-                // is broken and entries would double-allocate.
-                (Some(_), Some(_)) => unreachable!(
-                    "Compound result has populated SideTableInfo — classify invariant broken",
-                ),
-            },
-            None => (None, Vec::new(), None),
-        };
-        per_result_range.push(result_range);
-        per_result_fill.push(result_fill_map);
-        per_result_single_fill.push(single_fill);
-    }
-
-    FlagsInfoBlobs {
-        entries: builder.finish(),
+    let mut writer = FlagsEntryWriter {
+        entry_layout,
+        strings,
+        scratch_addrs,
+    };
+    let PerCellSideTableBlob {
+        entries,
         per_param_range,
         per_result_range,
-        per_cell_fill: PerCellIndices {
-            per_param: per_param_fill,
-            per_result: per_result_fill,
-        },
+        per_cell_fill,
+        per_result_single_fill,
+    } = build_per_cell_side_table(per_func, entry_layout, entries_id, &mut writer);
+    FlagsInfoBlobs {
+        entries,
+        per_param_range,
+        per_result_range,
+        per_cell_fill,
         per_result_single_fill,
     }
 }
 
-struct FlagsInfoBuilder<'a> {
-    entries: Vec<u8>,
+struct FlagsEntryWriter<'a, I> {
     entry_layout: &'a RecordLayout,
-    entries_id: SymbolId,
+    strings: &'a StringTable,
+    scratch_addrs: &'a mut I,
 }
 
-impl<'a> FlagsInfoBuilder<'a> {
-    fn new(entry_layout: &'a RecordLayout, entries_id: SymbolId) -> Self {
-        Self {
-            entries: Vec::new(),
-            entry_layout,
-            entries_id,
-        }
-    }
-
-    fn append_plan(
-        &mut self,
-        plan: &LiftPlan,
-        strings: &StringTable,
-        scratch_addrs: &mut impl Iterator<Item = u32>,
-    ) -> (Option<SymRef>, Vec<Option<FlagsRuntimeFill>>) {
-        let range_start = self.entries.len() as u32;
-        let mut count: u32 = 0;
-        let mut fill_map: Vec<Option<FlagsRuntimeFill>> = vec![None; plan.cells.len()];
-        for (cell_pos, op) in plan.cells.iter().enumerate() {
-            let Cell::Flags { info, .. } = op else {
-                continue;
-            };
-            let fill = self.append_one(info, strings, scratch_addrs, count);
-            count += 1;
-            fill_map[cell_pos] = Some(fill);
-        }
-        let range = (count > 0).then_some(SymRef {
-            target: self.entries_id,
-            off: range_start,
-            len: count,
-        });
-        (range, fill_map)
-    }
-
-    /// Append one entry for a Direct (sync flat) flags result.
-    /// Mirrors [`Self::append_plan`] for the no-plan case.
-    fn append_direct(
-        &mut self,
-        info: &NamedListInfo,
-        strings: &StringTable,
-        scratch_addrs: &mut impl Iterator<Item = u32>,
-    ) -> (Option<SymRef>, FlagsRuntimeFill) {
-        let range_start = self.entries.len() as u32;
-        let fill = self.append_one(info, strings, scratch_addrs, 0);
-        let range = Some(SymRef {
-            target: self.entries_id,
-            off: range_start,
-            len: 1,
-        });
-        (range, fill)
-    }
-
-    /// Shared body: write one zeroed entry, fill type-name +
-    /// set-flags.ptr, return the matching [`FlagsRuntimeFill`].
+impl<'a, I: Iterator<Item = u32>> FlagsEntryWriter<'a, I> {
+    /// Write one zeroed entry: `type-name` + `set-flags.ptr` baked,
+    /// `set-flags.len` patched per call. Returns the matching
+    /// [`FlagsRuntimeFill`].
     fn append_one(
         &mut self,
+        entries: &mut Vec<u8>,
         info: &NamedListInfo,
-        strings: &StringTable,
-        scratch_addrs: &mut impl Iterator<Item = u32>,
-        side_table_idx: u32,
+        idx: u32,
     ) -> FlagsRuntimeFill {
-        let s = strings
+        let s = self
+            .strings
             .get(&info.type_name)
             .expect("register_flags_strings ran for every info");
-        let scratch_addr = scratch_addrs
+        let scratch_addr = self
+            .scratch_addrs
             .next()
             .expect("layout phase must reserve one scratch slot per Cell::Flags cell");
-
-        let entry_seg_off = self.entries.len() as u32;
-        // `set-flags.len` stays zero — the wrapper patches it per call.
-        let entry = RecordWriter::extend_zero(&mut self.entries, self.entry_layout);
-        entry.write_slice(&mut self.entries, INFO_TYPE_NAME, s.type_name);
+        let entry_seg_off = entries.len() as u32;
+        let entry = RecordWriter::extend_zero(entries, self.entry_layout);
+        entry.write_slice(entries, INFO_TYPE_NAME, s.type_name);
         entry.write_slice(
-            &mut self.entries,
+            entries,
             FLAGS_INFO_SET_FLAGS,
             BlobSlice {
                 off: scratch_addr,
                 len: 0,
             },
         );
-
         debug_assert_eq!(info.item_names.len(), s.items.len());
         FlagsRuntimeFill {
-            side_table_idx,
+            side_table_idx: idx,
             entry_seg_off,
             set_flags_len_addr: None,
             scratch_addr: scratch_addr as i32,
             flag_names: s.items.clone(),
         }
     }
+}
 
-    fn finish(self) -> Segment {
-        Segment {
-            id: self.entries_id,
-            align: self.entry_layout.align,
-            bytes: self.entries,
-            relocs: Vec::new(),
-        }
+impl<'a, I: Iterator<Item = u32>> CellEntryWriter for FlagsEntryWriter<'a, I> {
+    type Fill = FlagsRuntimeFill;
+
+    fn step_cell(
+        &mut self,
+        entries: &mut Vec<u8>,
+        cell: &Cell,
+        side_table_idx: u32,
+    ) -> Option<FlagsRuntimeFill> {
+        let Cell::Flags { info, .. } = cell else {
+            return None;
+        };
+        Some(self.append_one(entries, info, side_table_idx))
+    }
+
+    fn direct_for(
+        &mut self,
+        entries: &mut Vec<u8>,
+        fd: &FuncClassified,
+    ) -> Option<FlagsRuntimeFill> {
+        let info = fd.result_lift.as_ref()?.side_table.flags_info.as_ref()?;
+        Some(self.append_one(entries, info, 0))
     }
 }
 
@@ -279,30 +190,17 @@ pub(crate) fn back_fill_len_addrs(
     entry_layout: &RecordLayout,
 ) {
     let set_flags_field_off = entry_layout.offset_of(FLAGS_INFO_SET_FLAGS);
-    let patch_one = |f: &mut FlagsRuntimeFill| {
-        debug_assert!(
+    back_fill_per_cell(fill, single_fill, |f| {
+        // Always-on (not debug_assert) — the framework collects every
+        // back-fill caller, so a double-call would otherwise silently
+        // re-overwrite addrs in release.
+        assert!(
             f.set_flags_len_addr.is_none(),
             "back_fill_len_addrs called twice on the same FlagsRuntimeFill",
         );
         f.set_flags_len_addr =
             Some((entries_base + f.entry_seg_off + set_flags_field_off + SLICE_LEN_OFFSET) as i32);
-    };
-    let patch_row = |row: &mut [Option<FlagsRuntimeFill>]| {
-        for slot in row.iter_mut() {
-            if let Some(f) = slot.as_mut() {
-                patch_one(f);
-            }
-        }
-    };
-    for fn_row in fill.per_param.iter_mut() {
-        for param_row in fn_row.iter_mut() {
-            patch_row(param_row);
-        }
-    }
-    for fn_row in fill.per_result.iter_mut() {
-        patch_row(fn_row);
-    }
-    patch_row(single_fill);
+    });
 }
 
 /// Per-`Cell::Flags` scratch byte count, in the same plan-walk order

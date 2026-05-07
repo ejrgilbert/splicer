@@ -691,20 +691,11 @@ impl LiftPlanBuilder {
 
     /// `result<T, E>`: bump disc, then walk both arms while sharing
     /// the same flat-slot range (the canonical-ABI joined layout has
-    /// each post-disc slot serving both arms). Saving + restoring
-    /// `next_flat_slot` between arms is the trick: T claims slots
-    /// `[base..base+|flat(T)|)`, E claims `[base..base+|flat(E)|)`,
-    /// and the cursor advances to `max(after_t, after_e)`.
+    /// each post-disc slot serving both arms). The shared
+    /// rewind/widening logic lives in [`Self::push_disc_arms`].
     ///
-    /// Bails for arms whose flat type widens under the canonical-ABI
-    /// join — e.g. `result<u32, f64>` widens slot 1 to I64,
-    /// `result<u32, u64>` widens slot 1 to I64. Phase 1 only handles
-    /// the no-widening case: every populated arm's per-slot wasm
-    /// type must equal the joined type. Equivalently, T and E must
-    /// produce identical widths at every flat position
-    /// (typically when both flatten to i32 only — common with
-    /// `result<i32-flat, string>`). Bitcast-on-leaf-read is a
-    /// follow-up.
+    /// Per-arm wasm-type mismatches against the joined are stamped
+    /// into `slot_widening`; the emit phase bitcasts at leaf read.
     fn push_result(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
         let Type::Id(id) = ty else {
             unreachable!("Result kind came from non-Id type")
@@ -713,31 +704,17 @@ impl LiftPlanBuilder {
             unreachable!("Result kind came from non-Result TypeDefKind")
         };
         let r = r.clone();
-
-        // Joined flat (= [I32 disc, ...join(flat(ok), flat(err))]).
-        // When an arm's per-position wasm type differs from the
-        // joined, leaf cells inside that arm read a wider source slot
-        // than they expect — `slot_widening` records the bitcast the
-        // emit phase inserts at the leaf-cell read site.
         let joined = flat_types(resolve, ty, None)
             .expect("result<T, E> must flatten within MAX_FLAT_PARAMS");
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
-        let ok_idx = self.push_arm(disc_slot, 0, |b| {
-            r.ok.as_ref().map(|t| b.push(t, resolve, names))
-        });
-        let after_ok = self.next_flat_slot;
-        self.record_arm_widening(r.ok.as_ref(), arms_base, &joined, resolve);
-
-        self.next_flat_slot = arms_base;
-        let err_idx = self.push_arm(disc_slot, 1, |b| {
-            r.err.as_ref().map(|t| b.push(t, resolve, names))
-        });
-        let after_err = self.next_flat_slot;
-        self.record_arm_widening(r.err.as_ref(), arms_base, &joined, resolve);
-
-        self.next_flat_slot = after_ok.max(after_err);
+        // Fixed arity: result has exactly 2 arms; force a release-mode
+        // length check via try_into rather than blind indexing.
+        let [ok_idx, err_idx]: [Option<u32>; 2] = self
+            .push_disc_arms(disc_slot, arms_base, &joined, [r.ok, r.err], resolve, names)
+            .try_into()
+            .expect("push_disc_arms with 2-element input returns 2-element output");
         self.push_cell(Cell::Result {
             disc_slot,
             ok_idx,
@@ -789,8 +766,8 @@ impl LiftPlanBuilder {
 
     /// `variant { ... }`: bump disc, walk each case's payload (if
     /// any) sharing the same flat-slot range — generalizes
-    /// [`Self::push_result`] to N arms. Bails on joined-flat
-    /// widening, same as result.
+    /// [`Self::push_result`] to N arms. Per-arm rewind/widening lives
+    /// in [`Self::push_disc_arms`].
     fn push_variant(&mut self, ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> u32 {
         let Type::Id(id) = ty else {
             unreachable!("Variant kind came from non-Id type")
@@ -802,33 +779,59 @@ impl LiftPlanBuilder {
         let v = v.clone();
         let info = variant_lift_info_for_type(ty, resolve)
             .expect("Variant kind implies variant-info available");
-
-        // Joined flat (= [I32 disc, ...join(flat of each case)]).
-        // Per-arm widening — leaf cells inside a case read the
-        // joined slot type and bitcast at read time (recorded by
-        // `record_arm_widening`).
         let joined =
             flat_types(resolve, ty, None).expect("variant must flatten within MAX_FLAT_PARAMS");
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
-        let mut max_after = arms_base;
-        let mut per_case_payload: Vec<Option<u32>> = Vec::with_capacity(v.cases.len());
-        for (case_idx, case) in v.cases.iter().enumerate() {
-            self.next_flat_slot = arms_base;
-            let child_idx = self.push_arm(disc_slot, case_idx as u32, |b| {
-                case.ty.as_ref().map(|t| b.push(t, resolve, names))
-            });
-            max_after = max_after.max(self.next_flat_slot);
-            self.record_arm_widening(case.ty.as_ref(), arms_base, &joined, resolve);
-            per_case_payload.push(child_idx);
-        }
-        self.next_flat_slot = max_after;
+        let per_case_payload = self.push_disc_arms(
+            disc_slot,
+            arms_base,
+            &joined,
+            v.cases.iter().map(|c| c.ty),
+            resolve,
+            names,
+        );
         self.push_cell(Cell::Variant {
             disc_slot,
             per_case_payload,
             info,
         })
+    }
+
+    /// Walk N disc arms over a shared flat-slot range. Returns each
+    /// arm's pushed cell index in disc order — `None` for unit arms.
+    /// Updates `next_flat_slot` to the max-after-walking-any-arm so
+    /// the parent's flat-slot count covers every arm.
+    ///
+    /// Per arm: rewind cursor to `arms_base`, walk under an
+    /// [`ArmGuard`], stamp arm-vs-joined widening for any slot whose
+    /// per-arm wasm type differs from the joined.
+    fn push_disc_arms<I>(
+        &mut self,
+        disc_slot: u32,
+        arms_base: u32,
+        joined: &[WasmType],
+        arms: I,
+        resolve: &Resolve,
+        names: &mut NameInterner,
+    ) -> Vec<Option<u32>>
+    where
+        I: IntoIterator<Item = Option<Type>>,
+    {
+        let mut max_after = arms_base;
+        let mut indices: Vec<Option<u32>> = Vec::new();
+        for (disc, arm) in arms.into_iter().enumerate() {
+            self.next_flat_slot = arms_base;
+            let child_idx = self.push_arm(disc_slot, disc as u32, |b| {
+                arm.map(|t| b.push(&t, resolve, names))
+            });
+            max_after = max_after.max(self.next_flat_slot);
+            self.record_arm_widening(arm.as_ref(), arms_base, joined, resolve);
+            indices.push(child_idx);
+        }
+        self.next_flat_slot = max_after;
+        indices
     }
 
     /// `own<R>` / `borrow<R>` — single i32 (canonical-ABI handle).
@@ -962,60 +965,50 @@ pub(crate) struct NamedListInfo {
     pub(super) item_names: Vec<String>,
 }
 
-/// Extract `(type-name, case-names)` from an enum-typed `Type::Id`.
-/// Returns `None` if the type isn't an enum or lacks a name (the
-/// canonical-ABI lower has the disc but the cell can't render
-/// without case-names).
+/// Extract `(type-name, item-names)` from a named TypeDef matching
+/// `kind_extract`. The closure picks the per-item identifier list
+/// off the `TypeDefKind` (case-names for enum / variant, flag-names
+/// for flags). Returns `None` when the type isn't an `Id`, doesn't
+/// match `kind_extract`, or lacks a name — in any of those cases the
+/// runtime payload is meaningless without identifiers a reader would
+/// render.
+fn lift_info_for_type<F>(ty: &Type, resolve: &Resolve, kind_extract: F) -> Option<NamedListInfo>
+where
+    F: FnOnce(&wit_parser::TypeDefKind) -> Option<Vec<String>>,
+{
+    let Type::Id(id) = ty else {
+        return None;
+    };
+    let typedef = &resolve.types[*id];
+    let item_names = kind_extract(&typedef.kind)?;
+    let type_name = typedef.name.as_ref()?.clone();
+    Some(NamedListInfo {
+        type_name,
+        item_names,
+    })
+}
+
 fn enum_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo> {
-    let Type::Id(id) = ty else {
-        return None;
-    };
-    let typedef = &resolve.types[*id];
-    let wit_parser::TypeDefKind::Enum(e) = &typedef.kind else {
-        return None;
-    };
-    let type_name = typedef.name.as_ref()?.clone();
-    let item_names: Vec<String> = e.cases.iter().map(|c| c.name.clone()).collect();
-    Some(NamedListInfo {
-        type_name,
-        item_names,
+    lift_info_for_type(ty, resolve, |k| match k {
+        wit_parser::TypeDefKind::Enum(e) => Some(e.cases.iter().map(|c| c.name.clone()).collect()),
+        _ => None,
     })
 }
 
-/// Extract `(type-name, case-names)` from a variant-typed `Type::Id`.
-/// Returns `None` if the type isn't a variant or lacks a name.
 fn variant_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo> {
-    let Type::Id(id) = ty else {
-        return None;
-    };
-    let typedef = &resolve.types[*id];
-    let wit_parser::TypeDefKind::Variant(v) = &typedef.kind else {
-        return None;
-    };
-    let type_name = typedef.name.as_ref()?.clone();
-    let item_names: Vec<String> = v.cases.iter().map(|c| c.name.clone()).collect();
-    Some(NamedListInfo {
-        type_name,
-        item_names,
+    lift_info_for_type(ty, resolve, |k| match k {
+        wit_parser::TypeDefKind::Variant(v) => {
+            Some(v.cases.iter().map(|c| c.name.clone()).collect())
+        }
+        _ => None,
     })
 }
 
-/// Extract `(type-name, flag-names)` from a flags-typed `Type::Id`.
-/// Returns `None` if the type isn't a flags type or lacks a name —
-/// the runtime bitmask is meaningless without the flag names a reader
-/// would render.
 fn flags_lift_info_for_type(ty: &Type, resolve: &Resolve) -> Option<NamedListInfo> {
-    let Type::Id(id) = ty else {
-        return None;
-    };
-    let typedef = &resolve.types[*id];
-    let wit_parser::TypeDefKind::Flags(fl) = &typedef.kind else {
-        return None;
-    };
-    let type_name = typedef.name.as_ref()?.clone();
-    let item_names: Vec<String> = fl.flags.iter().map(|f| f.name.clone()).collect();
-    Some(NamedListInfo {
-        type_name,
-        item_names,
+    lift_info_for_type(ty, resolve, |k| match k {
+        wit_parser::TypeDefKind::Flags(fl) => {
+            Some(fl.flags.iter().map(|f| f.name.clone()).collect())
+        }
+        _ => None,
     })
 }

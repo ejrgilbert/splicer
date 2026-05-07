@@ -68,6 +68,11 @@ const TEST_WIT: &str = r#"
         // b matches.
         variant tri-arm { a(u32), b(u64), c(f64) }
         f-variant-tri-arm: func(v: tri-arm);
+        // F32 leaf in a widened slot: a(f32) → [F32], b(u64) → [I64];
+        // joined slot 1 = I64. a's f32 leaf reads slot 1 expecting
+        // F32 → emit bitcast I64→F32 via `lcl.widen_f32`.
+        variant f32-widen { a(f32), b(u64) }
+        f-variant-f32-widen: func(v: f32-widen);
         resource my-res;
         record handle-pair { primary: own<my-res>, secondary: borrow<my-res> }
         f-handle-own: func(h: own<my-res>);
@@ -434,6 +439,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let ext_f64 = builder.alloc_local(ValType::F64);
     let widen_i32_a = builder.alloc_local(ValType::I32);
     let widen_i32_b = builder.alloc_local(ValType::I32);
+    let widen_f32 = builder.alloc_local(ValType::F32);
     let flags_addr = builder.alloc_local(ValType::I32);
     let flags_count = builder.alloc_local(ValType::I32);
     let char_len = builder.alloc_local(ValType::I32);
@@ -452,6 +458,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         ext_f64,
         widen_i32_a,
         widen_i32_b,
+        widen_f32,
         flags_addr,
         flags_count,
         char_len,
@@ -1578,6 +1585,27 @@ fn result_u32_u64_records_joined_flat_widening() {
 }
 
 #[test]
+fn variant_f32_widen_records_f32_arm_widening() {
+    // Regression: pre-refactor, F32-arm widening panicked in
+    // pin_leaf_flat ("F32 widening must use push_widened_get inline")
+    // because there was no F32 scratch local. `lcl.widen_f32` lifts
+    // that. variant { a(f32), b(u64) }: joined = [I32 disc, I64];
+    // arm a's F32 leaf at slot 1 widens, arm b matches.
+    let r = test_resolve();
+    let mut names = NameInterner::new();
+    let plan = plan_for(
+        &func_named(&r, "f-variant-f32-widen").params[0].ty,
+        &r,
+        &mut names,
+    );
+    assert_eq!(plan.flat_slot_count, 2);
+    assert!(plan.widening_for(0).is_none());
+    assert_eq!(plan.widening_for(1), Some(WasmType::I64));
+    // Emit must not panic — exercised by
+    // `emit_lift_plan_validates_every_classify_built_shape`.
+}
+
+#[test]
 fn variant_tri_arm_records_joined_flat_widening() {
     // variant tri-arm { a(u32), b(u64), c(f64) }:
     // a → [I32], b → [I64], c → [F64]; joined = [I32 disc, I64
@@ -1953,6 +1981,13 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         ),
         plan_for(
             &func_named(&r, "f-variant-tri-arm").params[0].ty,
+            &r,
+            &mut names,
+        ),
+        // F32-arm widening: drives `lcl.widen_f32` through emit; a
+        // regression that re-introduces the F32 panic surfaces here.
+        plan_for(
+            &func_named(&r, "f-variant-f32-widen").params[0].ty,
             &r,
             &mut names,
         ),

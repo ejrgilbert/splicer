@@ -22,7 +22,7 @@ pub(crate) fn register_enum_strings(
     register_side_table_strings(
         per_func,
         names,
-        |plan| plan.enum_infos().collect(),
+        |plan, visit| plan.enum_infos().for_each(visit),
         |st| st.enum_info.as_ref(),
     )
 }

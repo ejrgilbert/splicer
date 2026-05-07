@@ -10,10 +10,10 @@ use super::super::super::super::abi::emit::{BlobSlice, RecordLayout};
 use super::super::super::blob::{NameInterner, RecordWriter, Segment, SymRef, SymbolId};
 use super::super::super::schema::{VARIANT_INFO_CASE_NAME, VARIANT_INFO_PAYLOAD};
 use super::super::super::FuncClassified;
-use super::super::plan::{Cell, LiftPlan};
+use super::super::plan::Cell;
 use super::{
-    ensure_registered, walk_per_cell_plans, PerCellIndices, PerCellPlanWalk, StringTable,
-    INFO_TYPE_NAME,
+    back_fill_per_cell, build_per_cell_side_table, register_side_table_strings, CellEntryWriter,
+    PerCellIndices, PerCellSideTableBlob, StringTable, INFO_TYPE_NAME,
 };
 
 /// Per-(plan-cell) emit-phase data for one `Cell::Variant`.
@@ -41,10 +41,6 @@ pub(crate) struct VariantRuntimeFill {
     pub per_case_payload: Vec<Option<u32>>,
 }
 
-/// Output of [`build_variant_info_blob`]. Mirrors
-/// [`super::flags_info::FlagsInfoBlobs`] minus the scratch field
-/// (variant case-names live in the shared name blob, not per-cell
-/// scratch).
 pub(crate) struct VariantInfoBlobs {
     pub entries: Segment,
     pub per_param_range: Vec<Vec<Option<SymRef>>>,
@@ -59,22 +55,14 @@ pub(crate) fn register_variant_strings(
     per_func: &[FuncClassified],
     names: &mut NameInterner,
 ) -> StringTable {
-    let mut table = StringTable::new();
-    for fd in per_func {
-        for p in &fd.params {
-            for info in p.plan.variant_infos() {
-                ensure_registered(&mut table, names, info);
-            }
-        }
-        if let Some(rl) = &fd.result_lift {
-            if let Some(c) = rl.compound() {
-                for info in c.plan.variant_infos() {
-                    ensure_registered(&mut table, names, info);
-                }
-            }
-        }
-    }
-    table
+    register_side_table_strings(
+        per_func,
+        names,
+        |plan, visit| plan.variant_infos().for_each(visit),
+        // No Direct variant result today — compound walk catches every
+        // info via the plan.
+        |_| None,
+    )
 }
 
 /// One variant-info entry per `Cell::Variant`. Runtime-filled
@@ -86,93 +74,72 @@ pub(crate) fn build_variant_info_blob(
     entry_layout: &RecordLayout,
     entries_id: SymbolId,
 ) -> VariantInfoBlobs {
-    let mut builder = VariantInfoBuilder::new(entry_layout, entries_id);
-    let PerCellPlanWalk {
+    let mut writer = VariantEntryWriter {
+        entry_layout,
+        strings,
+    };
+    let PerCellSideTableBlob {
+        entries,
         per_param_range,
-        per_param_fill,
         per_result_range,
-        per_result_fill,
-    } = walk_per_cell_plans(per_func, |plan| builder.append_plan(plan, strings));
+        per_cell_fill,
+        per_result_single_fill,
+    } = build_per_cell_side_table(per_func, entry_layout, entries_id, &mut writer);
+    // `HAS_DIRECT = false` ⇒ framework never produces single fills.
+    debug_assert!(per_result_single_fill.is_empty());
     VariantInfoBlobs {
-        entries: builder.finish(),
+        entries,
         per_param_range,
         per_result_range,
-        per_cell_fill: PerCellIndices {
-            per_param: per_param_fill,
-            per_result: per_result_fill,
-        },
+        per_cell_fill,
     }
 }
 
-struct VariantInfoBuilder<'a> {
-    entries: Vec<u8>,
+struct VariantEntryWriter<'a> {
     entry_layout: &'a RecordLayout,
-    entries_id: SymbolId,
+    strings: &'a StringTable,
 }
 
-impl<'a> VariantInfoBuilder<'a> {
-    fn new(entry_layout: &'a RecordLayout, entries_id: SymbolId) -> Self {
-        Self {
-            entries: Vec::new(),
-            entry_layout,
-            entries_id,
-        }
-    }
+impl<'a> CellEntryWriter for VariantEntryWriter<'a> {
+    type Fill = VariantRuntimeFill;
+    // Variant always retptrs — classify never produces a Direct.
+    const HAS_DIRECT: bool = false;
 
-    fn append_plan(
+    fn step_cell(
         &mut self,
-        plan: &LiftPlan,
-        strings: &StringTable,
-    ) -> (Option<SymRef>, Vec<Option<VariantRuntimeFill>>) {
-        let range_start = self.entries.len() as u32;
-        let mut count: u32 = 0;
-        let mut fill_map: Vec<Option<VariantRuntimeFill>> = vec![None; plan.cells.len()];
-        for (cell_pos, op) in plan.cells.iter().enumerate() {
-            let Cell::Variant {
-                info,
-                per_case_payload,
-                ..
-            } = op
-            else {
-                continue;
-            };
-            let s = strings
-                .get(&info.type_name)
-                .expect("register_variant_strings ran for every info");
-            debug_assert_eq!(info.item_names.len(), s.items.len());
+        entries: &mut Vec<u8>,
+        cell: &Cell,
+        side_table_idx: u32,
+    ) -> Option<VariantRuntimeFill> {
+        let Cell::Variant {
+            info,
+            per_case_payload,
+            ..
+        } = cell
+        else {
+            return None;
+        };
+        let s = self
+            .strings
+            .get(&info.type_name)
+            .expect("register_variant_strings ran for every info");
+        debug_assert_eq!(info.item_names.len(), s.items.len());
 
-            let entry_seg_off = self.entries.len() as u32;
-            // `case-name.*` and `payload.*` stay zero — the wrapper
-            // patches them per call.
-            let entry = RecordWriter::extend_zero(&mut self.entries, self.entry_layout);
-            entry.write_slice(&mut self.entries, INFO_TYPE_NAME, s.type_name);
+        let entry_seg_off = entries.len() as u32;
+        // `case-name.*` and `payload.*` stay zero — the wrapper
+        // patches them per call.
+        let entry = RecordWriter::extend_zero(entries, self.entry_layout);
+        entry.write_slice(entries, INFO_TYPE_NAME, s.type_name);
 
-            fill_map[cell_pos] = Some(VariantRuntimeFill {
-                side_table_idx: count,
-                entry_seg_off,
-                case_name_addr: None,
-                payload_disc_addr: None,
-                payload_value_addr: None,
-                case_names: s.items.clone(),
-                per_case_payload: per_case_payload.clone(),
-            });
-            count += 1;
-        }
-        let range = (count > 0).then_some(SymRef {
-            target: self.entries_id,
-            off: range_start,
-            len: count,
-        });
-        (range, fill_map)
-    }
-
-    fn finish(self) -> Segment {
-        Segment {
-            id: self.entries_id,
-            align: self.entry_layout.align,
-            bytes: self.entries,
-            relocs: Vec::new(),
-        }
+        Some(VariantRuntimeFill {
+            side_table_idx,
+            entry_seg_off,
+            case_name_addr: None,
+            payload_disc_addr: None,
+            payload_value_addr: None,
+            case_names: s.items.clone(),
+            per_case_payload: per_case_payload.clone(),
+        })
     }
 }
 
@@ -189,8 +156,9 @@ pub(crate) fn back_fill_entry_addrs(
 ) {
     let case_name_off = entry_layout.offset_of(VARIANT_INFO_CASE_NAME);
     let payload_off = entry_layout.offset_of(VARIANT_INFO_PAYLOAD);
-    let patch_one = |f: &mut VariantRuntimeFill| {
-        debug_assert!(
+    back_fill_per_cell(fill, &mut [], |f| {
+        // Always-on — see flags_info::back_fill_len_addrs.
+        assert!(
             f.case_name_addr.is_none()
                 && f.payload_disc_addr.is_none()
                 && f.payload_value_addr.is_none(),
@@ -200,20 +168,5 @@ pub(crate) fn back_fill_entry_addrs(
         f.case_name_addr = Some((entry_off + case_name_off) as i32);
         f.payload_disc_addr = Some((entry_off + payload_off) as i32);
         f.payload_value_addr = Some((entry_off + payload_off + payload_value_off) as i32);
-    };
-    let patch_row = |row: &mut [Option<VariantRuntimeFill>]| {
-        for slot in row.iter_mut() {
-            if let Some(f) = slot.as_mut() {
-                patch_one(f);
-            }
-        }
-    };
-    for fn_row in fill.per_param.iter_mut() {
-        for param_row in fn_row.iter_mut() {
-            patch_row(param_row);
-        }
-    }
-    for fn_row in fill.per_result.iter_mut() {
-        patch_row(fn_row);
-    }
+    });
 }

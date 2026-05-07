@@ -51,6 +51,11 @@ pub(crate) struct WrapperLocals {
     /// liveness analysis drops them when unused.
     pub(super) widen_i32_a: u32,
     pub(super) widen_i32_b: u32,
+    /// Scratch f32 local for joined-flat F32 widening. Lets
+    /// [`pin_leaf_flat`] handle `Cell::FloatingF32` uniformly with the
+    /// other single-slot kinds; rare in practice (only fires when an
+    /// F32 leaf shares a joined slot with a wider arm).
+    pub(super) widen_f32: u32,
     /// Cursor + count locals for the `Cell::Flags` bit-walk
     /// (re-used across every flags cell in a sequential wrapper body).
     pub(super) flags_addr: u32,
@@ -276,6 +281,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let ext_f64 = builder.alloc_local(ValType::F64);
     let widen_i32_a = builder.alloc_local(ValType::I32);
     let widen_i32_b = builder.alloc_local(ValType::I32);
+    let widen_f32 = builder.alloc_local(ValType::F32);
     let flags_addr = builder.alloc_local(ValType::I32);
     let flags_count = builder.alloc_local(ValType::I32);
     let char_len = builder.alloc_local(ValType::I32);
@@ -409,6 +415,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             ext_f64,
             widen_i32_a,
             widen_i32_b,
+            widen_f32,
             flags_addr,
             flags_count,
             char_len,
@@ -489,9 +496,13 @@ pub(crate) fn emit_lift_plan(
 /// an absolute wrapper-local index — either the wrapper's flat-param
 /// slot (`local_base + flat_slot`) when no bitcast is needed, or one
 /// of the typed scratches (`lcl.widen_i32_a` / `lcl.ext64` /
-/// `lcl.ext_f64`) materialized via `local.get + bitcast + local.set`.
-/// F32-arm leaves use `push_widened_get` inline (no helper takes an
-/// f32 local idx).
+/// `lcl.ext_f64` / `lcl.widen_f32`) materialized via
+/// `local.get + bitcast + local.set`.
+///
+/// Widened single-source cells routed through
+/// [`emit_single_slot_cell`]'s extend/promote bodies pay one extra
+/// `local.set + local.get` pair vs the pre-refactor inline path —
+/// only fires on slots the joined-flat layout actually widens.
 fn pin_leaf_flat(
     f: &mut Function,
     plan: &LiftPlan,
@@ -530,8 +541,8 @@ fn pin_leaf_flat_with_i32_scratch(
     let scratch = match arm {
         WasmType::I32 | WasmType::Pointer | WasmType::Length => scratch_i32,
         WasmType::I64 | WasmType::PointerOrI64 => lcl.ext64,
+        WasmType::F32 => lcl.widen_f32,
         WasmType::F64 => lcl.ext_f64,
-        WasmType::F32 => panic!("F32 widening must use push_widened_get inline"),
     };
     f.instructions().local_set(scratch);
     scratch
@@ -654,6 +665,12 @@ pub(crate) fn emit_list_pre_pass(
 /// is `Some` exactly for `Cell::ListOf`. New [`Cell`] variants add an
 /// arm here (no `_` catchall). `plan` carries the joined-flat widening
 /// table consulted at every leaf flat-slot read.
+///
+/// Single-source kinds (one flat or disc slot drives the cell write)
+/// pin the slot via [`pin_leaf_flat`] and delegate to
+/// [`emit_single_slot_cell`]; multi-slot, side-table-only, and list
+/// kinds stay inline. [`emit_lift_result`]'s Direct branch reuses the
+/// same dispatch with `source = lcl.result` + `for_direct = true`.
 fn emit_cell_op(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -667,36 +684,36 @@ fn emit_cell_op(
     let addr = lcl.addr;
     let cell_layout = ctx.cell_layout;
     match op {
-        Cell::Bool { flat_slot } => {
+        // Single-source variants — pin the source slot, delegate.
+        Cell::Bool { flat_slot }
+        | Cell::IntegerSignExt { flat_slot }
+        | Cell::IntegerZeroExt { flat_slot }
+        | Cell::EnumCase { flat_slot, .. }
+        | Cell::Flags { flat_slot, .. }
+        | Cell::Char { flat_slot }
+        | Cell::Handle { flat_slot, .. } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
-            cell_layout.emit_bool(f, addr, src);
-        }
-        Cell::IntegerSignExt { flat_slot } => {
-            push_widened_get(f, plan, local_base, *flat_slot, WasmType::I32);
-            f.instructions().i64_extend_i32_s();
-            f.instructions().local_set(lcl.ext64);
-            cell_layout.emit_integer(f, addr, lcl.ext64);
-        }
-        Cell::IntegerZeroExt { flat_slot } => {
-            push_widened_get(f, plan, local_base, *flat_slot, WasmType::I32);
-            f.instructions().i64_extend_i32_u();
-            f.instructions().local_set(lcl.ext64);
-            cell_layout.emit_integer(f, addr, lcl.ext64);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
         }
         Cell::Integer64 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I64, lcl);
-            cell_layout.emit_integer(f, addr, src);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
         }
         Cell::FloatingF32 { flat_slot } => {
-            push_widened_get(f, plan, local_base, *flat_slot, WasmType::F32);
-            f.instructions().f64_promote_f32();
-            f.instructions().local_set(lcl.ext_f64);
-            cell_layout.emit_floating(f, addr, lcl.ext_f64);
+            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::F32, lcl);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
         }
         Cell::FloatingF64 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::F64, lcl);
-            cell_layout.emit_floating(f, addr, src);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
         }
+        Cell::Option { disc_slot, .. }
+        | Cell::Result { disc_slot, .. }
+        | Cell::Variant { disc_slot, .. } => {
+            let src = pin_leaf_flat(f, plan, local_base, *disc_slot, WasmType::I32, lcl);
+            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, false);
+        }
+        // Two-flat-slot kinds.
         Cell::Text { ptr_slot, len_slot } => {
             let (ptr, len) = pin_text_bytes_slots(f, plan, local_base, *ptr_slot, *len_slot, lcl);
             cell_layout.emit_text(f, addr, ptr, len);
@@ -705,10 +722,7 @@ fn emit_cell_op(
             let (ptr, len) = pin_text_bytes_slots(f, plan, local_base, *ptr_slot, *len_slot, lcl);
             cell_layout.emit_bytes(f, addr, ptr, len);
         }
-        Cell::EnumCase { flat_slot, .. } => {
-            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
-            cell_layout.emit_enum_case(f, addr, src);
-        }
+        // Pure side-table reads.
         Cell::RecordOf { .. } => {
             let CellSideData::Record { idx } = side_data else {
                 panic!("RecordOf cell paired with non-Record side data {side_data:?}");
@@ -721,63 +735,7 @@ fn emit_cell_op(
             };
             cell_layout.emit_tuple_of(f, addr, slice.off, slice.len);
         }
-        Cell::Option {
-            disc_slot,
-            child_idx,
-        } => {
-            push_widened_get(f, plan, local_base, *disc_slot, WasmType::I32);
-            f.instructions().if_(BlockType::Empty);
-            cell_layout.emit_option_some(f, addr, *child_idx);
-            f.instructions().else_();
-            cell_layout.emit_option_none(f, addr);
-            f.instructions().end();
-        }
-        Cell::Result {
-            disc_slot,
-            ok_idx,
-            err_idx,
-        } => {
-            // wasm `if` fires on non-zero, so err goes in the if block.
-            push_widened_get(f, plan, local_base, *disc_slot, WasmType::I32);
-            f.instructions().if_(BlockType::Empty);
-            cell_layout.emit_result_err(f, addr, err_idx.is_some(), err_idx.unwrap_or(0));
-            f.instructions().else_();
-            cell_layout.emit_result_ok(f, addr, ok_idx.is_some(), ok_idx.unwrap_or(0));
-            f.instructions().end();
-        }
-        Cell::Flags { flat_slot, .. } => {
-            let CellSideData::Flags(fill) = side_data else {
-                panic!("Flags cell paired with non-Flags side data {side_data:?}");
-            };
-            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
-            emit_flags_runtime_fill(f, src, fill, lcl);
-            cell_layout.emit_flags_set(f, lcl.addr, fill.side_table_idx);
-        }
-        Cell::Variant { disc_slot, .. } => {
-            let CellSideData::Variant(fill) = side_data else {
-                panic!("Variant cell paired with non-Variant side data {side_data:?}");
-            };
-            let src = pin_leaf_flat(f, plan, local_base, *disc_slot, WasmType::I32, lcl);
-            emit_variant_runtime_fill(f, src, fill);
-            cell_layout.emit_variant_case(f, lcl.addr, fill.side_table_idx);
-        }
-        Cell::Char { flat_slot } => {
-            let CellSideData::Char { scratch_addr } = side_data else {
-                panic!("Char cell paired with non-Char side data {side_data:?}");
-            };
-            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
-            cell_layout.emit_char(f, lcl.addr, src, *scratch_addr, lcl.char_len);
-        }
-        Cell::Handle {
-            flat_slot, kind, ..
-        } => {
-            let CellSideData::Handle(fill) = side_data else {
-                panic!("Handle cell paired with non-Handle side data {side_data:?}");
-            };
-            let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
-            emit_handle_runtime_fill(f, src, fill);
-            cell_layout.emit_handle_cell(f, lcl.addr, kind.cell_disc_case(), fill.side_table_idx);
-        }
+        // List arm — own special-cased loop.
         Cell::ListOf {
             ptr_slot,
             element_plan,
@@ -792,6 +750,114 @@ fn emit_cell_op(
             let ptr = pin_leaf_flat(f, plan, local_base, *ptr_slot, WasmType::I32, lcl);
             emit_list_of_arm(f, ctx, ll, ptr, element_plan, lcl);
             emit_close_arm_guards(f, arm_guards.len());
+        }
+    }
+}
+
+/// Emit one single-source cell at `lcl.addr`, reading the source value
+/// from local `source`. Shared by [`emit_cell_op`] (params + compound
+/// result; pass `for_direct = false`) and [`emit_lift_result`]'s
+/// Direct branch (sync-flat result, source = `lcl.result`; pass
+/// `for_direct = true`).
+///
+/// Disc-dispatched cells (`Option` / `Result` / `Variant`) are valid
+/// in compound contexts only — classify routes Direct results around
+/// them. `for_direct = true` enforces that one-source-of-truth here.
+fn emit_single_slot_cell(
+    f: &mut Function,
+    cell_layout: &CellLayout,
+    cell: &Cell,
+    side_data: &CellSideData,
+    source: u32,
+    lcl: &WrapperLocals,
+    for_direct: bool,
+) {
+    if for_direct {
+        match cell {
+            Cell::Option { .. } | Cell::Result { .. } | Cell::Variant { .. } => unreachable!(
+                "emit_single_slot_cell reached Compound-only Cell {cell:?} as Direct — \
+                 classify_result_lift should have routed it through Compound"
+            ),
+            _ => {}
+        }
+    }
+    let addr = lcl.addr;
+    match cell {
+        Cell::Bool { .. } => cell_layout.emit_bool(f, addr, source),
+        Cell::IntegerSignExt { .. } => {
+            f.instructions().local_get(source);
+            f.instructions().i64_extend_i32_s();
+            f.instructions().local_set(lcl.ext64);
+            cell_layout.emit_integer(f, addr, lcl.ext64);
+        }
+        Cell::IntegerZeroExt { .. } => {
+            f.instructions().local_get(source);
+            f.instructions().i64_extend_i32_u();
+            f.instructions().local_set(lcl.ext64);
+            cell_layout.emit_integer(f, addr, lcl.ext64);
+        }
+        Cell::Integer64 { .. } => cell_layout.emit_integer(f, addr, source),
+        Cell::FloatingF32 { .. } => {
+            f.instructions().local_get(source);
+            f.instructions().f64_promote_f32();
+            f.instructions().local_set(lcl.ext_f64);
+            cell_layout.emit_floating(f, addr, lcl.ext_f64);
+        }
+        Cell::FloatingF64 { .. } => cell_layout.emit_floating(f, addr, source),
+        Cell::EnumCase { .. } => cell_layout.emit_enum_case(f, addr, source),
+        Cell::Flags { .. } => {
+            let CellSideData::Flags(fill) = side_data else {
+                panic!("Flags cell paired with non-Flags side data {side_data:?}");
+            };
+            emit_flags_runtime_fill(f, source, fill, lcl);
+            cell_layout.emit_flags_set(f, addr, fill.side_table_idx);
+        }
+        Cell::Char { .. } => {
+            let CellSideData::Char { scratch_addr } = side_data else {
+                panic!("Char cell paired with non-Char side data {side_data:?}");
+            };
+            cell_layout.emit_char(f, addr, source, *scratch_addr, lcl.char_len);
+        }
+        Cell::Handle { kind, .. } => {
+            let CellSideData::Handle(fill) = side_data else {
+                panic!("Handle cell paired with non-Handle side data {side_data:?}");
+            };
+            emit_handle_runtime_fill(f, source, fill);
+            cell_layout.emit_handle_cell(f, addr, kind.cell_disc_case(), fill.side_table_idx);
+        }
+        Cell::Option { child_idx, .. } => {
+            f.instructions().local_get(source);
+            f.instructions().if_(BlockType::Empty);
+            cell_layout.emit_option_some(f, addr, *child_idx);
+            f.instructions().else_();
+            cell_layout.emit_option_none(f, addr);
+            f.instructions().end();
+        }
+        Cell::Result {
+            ok_idx, err_idx, ..
+        } => {
+            // wasm `if` fires on non-zero, so err goes in the if block.
+            f.instructions().local_get(source);
+            f.instructions().if_(BlockType::Empty);
+            cell_layout.emit_result_err(f, addr, err_idx.is_some(), err_idx.unwrap_or(0));
+            f.instructions().else_();
+            cell_layout.emit_result_ok(f, addr, ok_idx.is_some(), ok_idx.unwrap_or(0));
+            f.instructions().end();
+        }
+        Cell::Variant { .. } => {
+            let CellSideData::Variant(fill) = side_data else {
+                panic!("Variant cell paired with non-Variant side data {side_data:?}");
+            };
+            emit_variant_runtime_fill(f, source, fill);
+            cell_layout.emit_variant_case(f, addr, fill.side_table_idx);
+        }
+        // Multi-slot + side-table-only + list — caller's responsibility.
+        Cell::Text { .. }
+        | Cell::Bytes { .. }
+        | Cell::RecordOf { .. }
+        | Cell::TupleOf { .. }
+        | Cell::ListOf { .. } => {
+            unreachable!("emit_single_slot_cell reached non-single-source Cell {cell:?}")
         }
     }
 }
@@ -1044,78 +1110,6 @@ fn emit_variant_runtime_fill(f: &mut Function, disc_local: u32, fill: &VariantRu
     }
 }
 
-/// Lift a Direct (sync flat return) result. Only single-flat-slot
-/// kinds reach here — multi-slot kinds (Text/Bytes) and compound
-/// shapes always retptr and route through Compound. The cell's
-/// `flat_slot` field is ignored — `source` is `lcl.result` directly.
-fn emit_lift_kind(
-    f: &mut Function,
-    cell_layout: &CellLayout,
-    cell: &Cell,
-    side_data: &CellSideData,
-    source: u32,
-    lcl: &WrapperLocals,
-) {
-    let addr = lcl.addr;
-    match cell {
-        Cell::Bool { .. } => cell_layout.emit_bool(f, addr, source),
-        Cell::IntegerSignExt { .. } => {
-            f.instructions().local_get(source);
-            f.instructions().i64_extend_i32_s();
-            f.instructions().local_set(lcl.ext64);
-            cell_layout.emit_integer(f, addr, lcl.ext64);
-        }
-        Cell::IntegerZeroExt { .. } => {
-            f.instructions().local_get(source);
-            f.instructions().i64_extend_i32_u();
-            f.instructions().local_set(lcl.ext64);
-            cell_layout.emit_integer(f, addr, lcl.ext64);
-        }
-        Cell::Integer64 { .. } => cell_layout.emit_integer(f, addr, source),
-        Cell::FloatingF32 { .. } => {
-            f.instructions().local_get(source);
-            f.instructions().f64_promote_f32();
-            f.instructions().local_set(lcl.ext_f64);
-            cell_layout.emit_floating(f, addr, lcl.ext_f64);
-        }
-        Cell::FloatingF64 { .. } => cell_layout.emit_floating(f, addr, source),
-        Cell::EnumCase { .. } => cell_layout.emit_enum_case(f, addr, source),
-        Cell::Flags { .. } => {
-            let CellSideData::Flags(fill) = side_data else {
-                panic!("Flags cell paired with non-Flags side data {side_data:?}");
-            };
-            emit_flags_runtime_fill(f, source, fill, lcl);
-            cell_layout.emit_flags_set(f, addr, fill.side_table_idx);
-        }
-        Cell::Char { .. } => {
-            let CellSideData::Char { scratch_addr } = side_data else {
-                panic!("Char cell paired with non-Char side data {side_data:?}");
-            };
-            cell_layout.emit_char(f, addr, source, *scratch_addr, lcl.char_len);
-        }
-        Cell::Handle { kind, .. } => {
-            let CellSideData::Handle(fill) = side_data else {
-                panic!("Handle cell paired with non-Handle side data {side_data:?}");
-            };
-            emit_handle_runtime_fill(f, source, fill);
-            cell_layout.emit_handle_cell(f, addr, kind.cell_disc_case(), fill.side_table_idx);
-        }
-        // Multi-slot + compound + un-wired kinds always retptr;
-        // classify_result_lift routes them through Compound.
-        Cell::Text { .. }
-        | Cell::Bytes { .. }
-        | Cell::RecordOf { .. }
-        | Cell::TupleOf { .. }
-        | Cell::ListOf { .. }
-        | Cell::Option { .. }
-        | Cell::Result { .. }
-        | Cell::Variant { .. } => unreachable!(
-            "emit_lift_kind reached non-Direct Cell {cell:?} — \
-             classify_result_lift should have routed it through Compound"
-        ),
-    }
-}
-
 /// Emit the wasm to lift a single-cell result value into the cell at
 /// `lcl.addr`. Direct primitive returns read from `lcl.result`;
 /// Text/Bytes returns load `(ptr, len)` from retptr scratch into
@@ -1137,7 +1131,7 @@ pub(crate) fn emit_lift_result(
             source_local,
             side_data,
         } => {
-            emit_lift_kind(f, cell_layout, cell, side_data, *source_local, lcl);
+            emit_single_slot_cell(f, cell_layout, cell, side_data, *source_local, lcl, true);
         }
         ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
             "Compound is emitted via emit_lift_compound_prefix + emit_lift_plan; \

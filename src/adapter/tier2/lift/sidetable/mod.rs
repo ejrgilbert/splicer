@@ -155,54 +155,188 @@ pub(crate) fn fold_cell_side_data(
         .collect()
 }
 
-// ─── Per-cell-fill plan walk (record / variant / handle) ─────────
+// ─── Generic per-cell side-table builder ─────────────────────────
 //
-// Shared outer loop: walk every (fn, param) plan + the compound-
-// result plan (if any), collecting `(range, per-cell-fill)` from
-// each `append_plan` call. Flags has its own loop because of the
-// single-cell-result branch; tuple-indices has no range concept.
+// Flags / handle / variant share one shape: per-(plan-cell) entries in
+// a contiguous segment, an optional Direct (sync-flat) result entry
+// per fn, plus a per-cell `Fill` carrying the runtime-patched slot
+// addresses. Each kind plugs in via [`CellEntryWriter`]; the framework
+// owns the loop, the bytes vec, and the SymRef bookkeeping.
 
-pub(super) struct PerCellPlanWalk<T> {
-    pub per_param_range: Vec<Vec<Option<SymRef>>>,
-    pub per_param_fill: Vec<Vec<Vec<Option<T>>>>,
-    pub per_result_range: Vec<Option<SymRef>>,
-    pub per_result_fill: Vec<Vec<Option<T>>>,
+/// Per-kind entry writer. Plug in `step_cell` (match this kind's
+/// `Cell` variant, write one entry, return the fill) and, for kinds
+/// with a sync-flat Direct path, set `HAS_DIRECT = true` and provide
+/// `direct_for`.
+pub(super) trait CellEntryWriter {
+    type Fill;
+
+    /// Whether this kind ever produces a Direct (sync flat) result.
+    /// `false` (variant) skips the per-fn `single_fill` allocation
+    /// and `direct_for` calls entirely.
+    const HAS_DIRECT: bool = true;
+
+    fn step_cell(
+        &mut self,
+        entries: &mut Vec<u8>,
+        cell: &Cell,
+        side_table_idx: u32,
+    ) -> Option<Self::Fill>;
+
+    fn direct_for(&mut self, _entries: &mut Vec<u8>, _fd: &FuncClassified) -> Option<Self::Fill> {
+        None
+    }
 }
 
-pub(super) fn walk_per_cell_plans<T>(
+/// Output of [`build_per_cell_side_table`]. Each kind re-exports it
+/// under its own alias if any callers care about the name.
+pub(crate) struct PerCellSideTableBlob<F> {
+    pub entries: Segment,
+    pub per_param_range: Vec<Vec<Option<SymRef>>>,
+    pub per_result_range: Vec<Option<SymRef>>,
+    pub per_cell_fill: PerCellIndices<F>,
+    /// Per-fn Direct (sync flat) fill. Length `per_func.len()` for
+    /// kinds with `HAS_DIRECT`; empty `Vec` otherwise.
+    pub per_result_single_fill: Vec<Option<F>>,
+}
+
+/// Build one per-cell side-table segment. Per fn: walk param plans
+/// then the compound-result plan (if any) OR call `direct_for` (sync-
+/// flat result of this kind). The two result-side branches are
+/// mutually exclusive — `classify_result_lift` routes Compound and
+/// Direct apart.
+pub(super) fn build_per_cell_side_table<W: CellEntryWriter>(
     per_func: &[FuncClassified],
-    mut append_plan: impl FnMut(&LiftPlan) -> (Option<SymRef>, Vec<Option<T>>),
-) -> PerCellPlanWalk<T> {
+    entry_layout: &RecordLayout,
+    entries_id: SymbolId,
+    writer: &mut W,
+) -> PerCellSideTableBlob<W::Fill> {
+    let mut entries: Vec<u8> = Vec::new();
     let mut per_param_range: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
-    let mut per_param_fill: Vec<Vec<Vec<Option<T>>>> = Vec::with_capacity(per_func.len());
+    let mut per_param_fill: Vec<Vec<Vec<Option<W::Fill>>>> = Vec::with_capacity(per_func.len());
     let mut per_result_range: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
-    let mut per_result_fill: Vec<Vec<Option<T>>> = Vec::with_capacity(per_func.len());
+    let mut per_result_fill: Vec<Vec<Option<W::Fill>>> = Vec::with_capacity(per_func.len());
+    // Skip the per-fn single-fill allocation entirely for kinds
+    // without a Direct path.
+    let mut per_result_single_fill: Vec<Option<W::Fill>> = if W::HAS_DIRECT {
+        Vec::with_capacity(per_func.len())
+    } else {
+        Vec::new()
+    };
 
     for fd in per_func {
         let mut params_ranges = Vec::with_capacity(fd.params.len());
         let mut params_fill = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
-            let (range, fill_map) = append_plan(&p.plan);
+            let (range, fill_map) = scan_plan(&mut entries, entries_id, &p.plan, writer);
             params_ranges.push(range);
             params_fill.push(fill_map);
         }
         per_param_range.push(params_ranges);
         per_param_fill.push(params_fill);
 
-        let (result_range, result_fill_map) =
-            match fd.result_lift.as_ref().and_then(|rl| rl.compound()) {
-                Some(c) => append_plan(&c.plan),
-                None => (None, Vec::new()),
-            };
+        let compound_plan = fd.result_lift.as_ref().and_then(|rl| rl.compound());
+        let (result_range, result_fill, single) = match compound_plan {
+            Some(c) => {
+                let (range, fill) = scan_plan(&mut entries, entries_id, &c.plan, writer);
+                (range, fill, None)
+            }
+            None if W::HAS_DIRECT => {
+                let range_start = entries.len() as u32;
+                match writer.direct_for(&mut entries, fd) {
+                    Some(fill) => (
+                        Some(SymRef {
+                            target: entries_id,
+                            off: range_start,
+                            len: 1,
+                        }),
+                        Vec::new(),
+                        Some(fill),
+                    ),
+                    None => (None, Vec::new(), None),
+                }
+            }
+            None => (None, Vec::new(), None),
+        };
         per_result_range.push(result_range);
-        per_result_fill.push(result_fill_map);
+        per_result_fill.push(result_fill);
+        if W::HAS_DIRECT {
+            per_result_single_fill.push(single);
+        } else {
+            debug_assert!(single.is_none());
+        }
     }
 
-    PerCellPlanWalk {
+    PerCellSideTableBlob {
+        entries: Segment {
+            id: entries_id,
+            align: entry_layout.align,
+            bytes: entries,
+            relocs: Vec::new(),
+        },
         per_param_range,
-        per_param_fill,
         per_result_range,
-        per_result_fill,
+        per_cell_fill: PerCellIndices {
+            per_param: per_param_fill,
+            per_result: per_result_fill,
+        },
+        per_result_single_fill,
+    }
+}
+
+/// Walk one plan's cells, asking the writer to handle each, accumulating
+/// `Some` fills into a contiguous range. Returns `(range, fill_map)`;
+/// `range` is `None` when no cell of this kind appeared.
+fn scan_plan<W: CellEntryWriter>(
+    entries: &mut Vec<u8>,
+    entries_id: SymbolId,
+    plan: &LiftPlan,
+    writer: &mut W,
+) -> (Option<SymRef>, Vec<Option<W::Fill>>) {
+    let range_start = entries.len() as u32;
+    let mut count: u32 = 0;
+    let mut fill_map: Vec<Option<W::Fill>> = (0..plan.cells.len()).map(|_| None).collect();
+    for (cell_pos, cell) in plan.cells.iter().enumerate() {
+        if let Some(fill) = writer.step_cell(entries, cell, count) {
+            count += 1;
+            fill_map[cell_pos] = Some(fill);
+        }
+    }
+    let range = (count > 0).then_some(SymRef {
+        target: entries_id,
+        off: range_start,
+        len: count,
+    });
+    (range, fill_map)
+}
+
+/// Apply `patch` to every `Some` fill across the per-cell grid + the
+/// per-fn `single_fill` overlay. Pass `&mut []` for `single_fill` for
+/// kinds without a Direct path (variant).
+pub(super) fn back_fill_per_cell<F>(
+    fill: &mut PerCellIndices<F>,
+    single_fill: &mut [Option<F>],
+    mut patch: impl FnMut(&mut F),
+) {
+    for fn_row in fill.per_param.iter_mut() {
+        for param_row in fn_row.iter_mut() {
+            for slot in param_row.iter_mut() {
+                if let Some(f) = slot.as_mut() {
+                    patch(f);
+                }
+            }
+        }
+    }
+    for fn_row in fill.per_result.iter_mut() {
+        for slot in fn_row.iter_mut() {
+            if let Some(f) = slot.as_mut() {
+                patch(f);
+            }
+        }
+    }
+    for slot in single_fill.iter_mut() {
+        if let Some(f) = slot.as_mut() {
+            patch(f);
+        }
     }
 }
 
@@ -301,41 +435,36 @@ pub(crate) struct SideTableBlob {
     pub per_result: Vec<Option<SymRef>>,
 }
 
-/// Walk every param / result; for each lift that surfaces a
-/// [`NamedListInfo`] of this kind, intern its strings into `names`
-/// (the interner already dedupes, so type-name + item-names that
-/// recur across functions share one copy in the blob). Returns the
-/// per-type string offsets so the side-table builder can stitch
-/// entries together without re-scanning the blob.
+/// Intern this kind's `NamedListInfo` strings (the interner dedupes
+/// across funcs / params / results). Returns the per-type string
+/// offsets so the side-table builder can stitch entries without
+/// re-scanning the blob.
 ///
-/// `from_plan` extracts the kind's infos from a per-param
-/// [`LiftPlan`] (multiple infos possible if the plan has multiple
-/// nominal cells of this kind). `from_result` reads the kind's
-/// info off the result's [`SideTableInfo`] (single info, since
-/// results today are single-cell).
+/// `visit_plan_infos` calls its callback per info in the plan —
+/// visitor lets callers pipe `plan.flags_infos()` etc. through
+/// without an interim `Vec`. `from_result` covers sync-flat Direct
+/// results whose cell never made it into a plan.
 pub(super) fn register_side_table_strings(
     per_func: &[FuncClassified],
     names: &mut NameInterner,
-    from_plan: impl Fn(&LiftPlan) -> Vec<&NamedListInfo>,
+    visit_plan_infos: impl Fn(&LiftPlan, &mut dyn FnMut(&NamedListInfo)),
     from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
 ) -> StringTable {
     let mut table = StringTable::new();
     for fd in per_func {
         for p in &fd.params {
-            for info in from_plan(&p.plan) {
-                ensure_registered(&mut table, names, info);
-            }
+            visit_plan_infos(&p.plan, &mut |info| {
+                ensure_registered(&mut table, names, info)
+            });
         }
         if let Some(rl) = &fd.result_lift {
             // Compound results: walk the plan (catches infos nested
             // inside list element plans, etc., symmetric with params).
             // Direct results: side-table info already carries the cell.
             match rl.compound() {
-                Some(c) => {
-                    for info in from_plan(&c.plan) {
-                        ensure_registered(&mut table, names, info);
-                    }
-                }
+                Some(c) => visit_plan_infos(&c.plan, &mut |info| {
+                    ensure_registered(&mut table, names, info)
+                }),
                 None => {
                     if let Some(info) = from_result(&rl.side_table) {
                         ensure_registered(&mut table, names, info);
