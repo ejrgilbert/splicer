@@ -311,14 +311,9 @@ pub(crate) fn emit_handler_call(
 }
 
 /// Bail when an indirect-params async fn carries a param shape the
-/// lower-mode bindgen doesn't yet handle. Phase 2 coverage:
-/// - Scalar primitives (bool / s8..s64 / u8..u64 / f32 / f64 / char).
-/// - Aggregate-of-supported: record, tuple, enum, flags (recursive).
-///
-/// Still deferred (phase 3): string, list, fixed-length-list, variant,
-/// option, result, handle, future, stream, error-context.
-/// Called from each tier's `require_supported_case` after the
-/// `indirect_params` check fires.
+/// lower-mode bindgen doesn't handle. The only deferred kind today
+/// is `map<K, V>`; everything else in the canonical-ABI value-type
+/// space is supported.
 pub(crate) fn require_indirect_params_supported_shape(
     resolve: &Resolve,
     fn_name: &str,
@@ -328,13 +323,9 @@ pub(crate) fn require_indirect_params_supported_shape(
         if !is_supported_indirect_params_ty(resolve, &param.ty) {
             bail!(
                 "async function `{fn_name}` has params that overflow \
-                 MAX_FLAT_ASYNC_PARAMS ({}) AND param `{}` carries a \
-                 type the indirect-params lowering doesn't yet support. \
-                 Phase-2 coverage: scalar primitives, plus records / \
-                 tuples / enums / flags built recursively from those. \
-                 Variants, options, results, fixed-length-lists, dynamic \
-                 lists, strings, handles, futures, streams, and \
-                 error-context land in a follow-up.",
+                 MAX_FLAT_ASYNC_PARAMS ({}) AND param `{}` carries an \
+                 unsupported type. Currently the only deferred shape \
+                 is `map<K, V>`.",
                 Resolve::MAX_FLAT_ASYNC_PARAMS,
                 param.name,
             );
@@ -343,11 +334,9 @@ pub(crate) fn require_indirect_params_supported_shape(
     Ok(())
 }
 
-/// Recursively true iff `ty` is a shape the lower-mode bindgen's
-/// emit arms cover. Aliases (`type foo = u32;`) are followed.
-/// Aggregates (record / tuple / enum / flags) check each contained
-/// type. See [`require_indirect_params_supported_shape`] for the
-/// phase boundaries and what's still deferred.
+/// Recursively true iff `ty` is a shape the lower-mode bindgen
+/// covers. Aggregates check each contained type; `map<K, V>` is the
+/// only deferred kind today.
 fn is_supported_indirect_params_ty(resolve: &Resolve, ty: &Type) -> bool {
     match ty {
         Type::Bool
@@ -361,11 +350,11 @@ fn is_supported_indirect_params_ty(resolve: &Resolve, ty: &Type) -> bool {
         | Type::U64
         | Type::F32
         | Type::F64
-        | Type::Char => true,
-        Type::String | Type::ErrorContext => false,
+        | Type::Char
+        | Type::String
+        | Type::ErrorContext => true,
         Type::Id(id) => match &resolve.types[*id].kind {
             TypeDefKind::Type(inner) => is_supported_indirect_params_ty(resolve, inner),
-            // Aggregates: the leaves are the gating constraint.
             TypeDefKind::Record(r) => r
                 .fields
                 .iter()
@@ -374,21 +363,29 @@ fn is_supported_indirect_params_ty(resolve: &Resolve, ty: &Type) -> bool {
                 .types
                 .iter()
                 .all(|t| is_supported_indirect_params_ty(resolve, t)),
-            // Enums and flags lower as plain integers — no inner types.
-            TypeDefKind::Enum(_) | TypeDefKind::Flags(_) => true,
-            // Phase 3: variants need block-capture dispatch; lists /
-            // strings need the `Realloc::None` driver work-around.
-            TypeDefKind::Variant(_)
-            | TypeDefKind::Option(_)
-            | TypeDefKind::Result(_)
-            | TypeDefKind::List(_)
-            | TypeDefKind::FixedLengthList(_, _)
-            | TypeDefKind::Map(_, _)
+            TypeDefKind::Variant(v) => v.cases.iter().all(|c| match &c.ty {
+                Some(t) => is_supported_indirect_params_ty(resolve, t),
+                None => true,
+            }),
+            TypeDefKind::Option(t) => is_supported_indirect_params_ty(resolve, t),
+            TypeDefKind::Result(r) => {
+                r.ok.as_ref()
+                    .is_none_or(|t| is_supported_indirect_params_ty(resolve, t))
+                    && r.err
+                        .as_ref()
+                        .is_none_or(|t| is_supported_indirect_params_ty(resolve, t))
+            }
+            TypeDefKind::List(t) | TypeDefKind::FixedLengthList(t, _) => {
+                is_supported_indirect_params_ty(resolve, t)
+            }
+            TypeDefKind::Enum(_)
+            | TypeDefKind::Flags(_)
             | TypeDefKind::Handle(_)
-            | TypeDefKind::Resource
             | TypeDefKind::Future(_)
-            | TypeDefKind::Stream(_)
-            | TypeDefKind::Unknown => false,
+            | TypeDefKind::Stream(_) => true,
+            // Resources only show up as Handle, never as bare params.
+            // Maps don't have an emit arm yet.
+            TypeDefKind::Resource | TypeDefKind::Map(_, _) | TypeDefKind::Unknown => false,
         },
     }
 }
@@ -422,17 +419,12 @@ fn is_supported_indirect_params_ty(resolve: &Resolve, ty: &Type) -> bool {
 /// (≤4 total: one each of i32/i64/f32/f64) — instead of allocating a
 /// fresh set per param.
 ///
-/// **Phase 2/3 footgun:** wit-bindgen-core 0.57.1's `lower_to_memory`
-/// hardcodes `Realloc::Export("cabi_realloc")`. Today's primitive-
-/// only path never hits the realloc-driven instructions
-/// (`StringLower` / `ListCanonLower` / etc.), so the constant is
-/// dead. When phase 2/3 widens [`is_primitive_param_ty`] to cover
-/// strings / lists, this driver must NOT keep using upstream's
-/// `lower_to_memory` as-is — strings/lists in our static params
-/// record need `Realloc::None` (the host's canon-lower already put
-/// the payload bytes in our memory; we just store the slice). Either
-/// land the upstream PR making realloc configurable, or replicate the
-/// `lower_to_memory` body locally.
+/// **Realloc handling:** wit-bindgen-core 0.57.1's `lower_to_memory`
+/// hardcodes `Realloc::Export("cabi_realloc")`. Our `StringLower` /
+/// `ListCanonLower` emit arms intentionally ignore that flag and
+/// emit pass-through `local.get`s — the host's canon-lower already
+/// deposited the payload into our linear memory, and the receiving
+/// import does its own canon-lift on its end of the wire.
 pub(crate) fn build_lower_params_to_memory(
     resolve: &Resolve,
     sizes: &SizeAlign,
@@ -1376,15 +1368,14 @@ mod tests {
         }
     }
 
-    /// Phase-2 snapshot for a single record param `{a: u32, b: u64,
-    /// c: f32, d: f64, e: bool, f: char}` — same widths as the mixed-
-    /// primitives test but nested inside a record. The bindgen must
-    /// stage the addr local *once* (one top-level param), advance
-    /// cursor through all 6 fields, and emit each store with the
-    /// field's canonical in-record offset baked into `MemArg.offset`
-    /// (not into `addr_local`). This is the case validation can't
-    /// pin — a record-layout regression in `field_offsets` would
-    /// silently produce miswired wasm that still validates.
+    /// Single record param `{a: u32, b: u64, c: f32, d: f64, e: bool,
+    /// f: char}` — same widths as the mixed-primitives test but nested
+    /// inside a record. The bindgen must stage the addr local *once*
+    /// (one top-level param), advance cursor through all 6 fields, and
+    /// emit each store with the field's canonical in-record offset
+    /// baked into `MemArg.offset` (not into `addr_local`). A record-
+    /// layout regression in `field_offsets` would silently produce
+    /// miswired wasm that still validates.
     #[test]
     fn build_lower_params_to_memory_pins_record_field_offsets() {
         const BASE: i32 = 2048;

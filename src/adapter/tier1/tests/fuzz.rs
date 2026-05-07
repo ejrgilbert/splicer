@@ -102,9 +102,9 @@ fn test_adapter_async_mixed_primitives_indirect_params_validates() {
     validate_component(&bytes);
 }
 
-/// Phase-2 record param — `record { a..e: u32 }` flattens to 5 i32
-/// slots → indirect-params. Exercises `RecordLower` as a no-op
-/// 1→N decomposition; the inner `u32` lifts then drive the cursor.
+/// Record param `{ a..e: u32 }` flattens to 5 i32 slots → indirect-
+/// params. Exercises `RecordLower` as a no-op 1→N decomposition;
+/// the inner `u32` lifts drive the cursor.
 #[test]
 fn test_adapter_async_record_param_indirect_params_validates() {
     let mut arena = TypeArena::default();
@@ -133,10 +133,10 @@ fn test_adapter_async_record_param_indirect_params_validates() {
     validate_component(&bytes);
 }
 
-/// Phase-2 tuple param — `tuple<u32, u64, f32, f64, bool>` flattens
-/// to 5 mixed slots → indirect-params. Exercises `TupleLower` plus
-/// the inter-field-alignment math from the mixed-primitive test
-/// applied inside an aggregate.
+/// Tuple param `tuple<u32, u64, f32, f64, bool>` flattens to 5 mixed
+/// slots → indirect-params. Exercises `TupleLower` plus the inter-
+/// field-alignment math from the mixed-primitive test applied
+/// inside an aggregate.
 #[test]
 fn test_adapter_async_tuple_param_indirect_params_validates() {
     let mut arena = TypeArena::default();
@@ -159,9 +159,9 @@ fn test_adapter_async_tuple_param_indirect_params_validates() {
     validate_component(&bytes);
 }
 
-/// Phase-2 enum / flags / record-with-flags-field — aggregates whose
-/// leaves are non-numeric primitives. Pins `EnumLower` and
-/// `FlagsLower` emit shape end-to-end.
+/// Enum / flags / record-with-flags-field — aggregates whose leaves
+/// are non-numeric primitives. Pins `EnumLower` and `FlagsLower`
+/// emit shape end-to-end.
 #[test]
 fn test_adapter_async_enum_flags_record_indirect_params_validates() {
     let mut arena = TypeArena::default();
@@ -198,6 +198,104 @@ fn test_adapter_async_enum_flags_record_indirect_params_validates() {
     });
     let bytes = gen_adapter(
         "test:pkg/cfr-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// `list<T>` / `string` params in indirect-params position — both
+/// flatten to (ptr, len) pairs; our wrapper passes them through
+/// unchanged into the params record.
+#[test]
+fn test_adapter_async_string_list_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let string_id = arena.intern_val(ValueType::String);
+    let list_u32 = arena.intern_val(ValueType::List(u32_id));
+    // string(2) + list(2) + 3×u32 = 7 flat slots → indirect-params.
+    let iface = make_iface(vec![(
+        "many",
+        sig(
+            true,
+            &["s", "l", "a", "b", "c"],
+            vec![string_id, list_u32, u32_id, u32_id, u32_id],
+            vec![u32_id],
+        ),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/strlst-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// `list<u32, 4>` (fixed-length) flattens to 4 i32 slots inlined.
+/// Exercises `FixedLengthListLowerToMemory`'s per-iter block replay
+/// with cursor-shift rewrite.
+#[test]
+fn test_adapter_async_fixed_list_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let fsl = arena.intern_val(ValueType::FixedSizeList(u32_id, 4));
+    // 4 fixed-list slots + 2 u32 = 6 flat slots → indirect-params.
+    let iface = make_iface(vec![(
+        "many",
+        sig(
+            true,
+            &["fl", "a", "b"],
+            vec![fsl, u32_id, u32_id],
+            vec![u32_id],
+        ),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/fl-async@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Variant / option / result params — the dispatch path. Each kind
+/// exercises the disc-read + br_table + per-arm cursor rewrite.
+#[test]
+fn test_adapter_async_variant_option_result_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let opt_u32 = arena.intern_val(ValueType::Option(u32_id));
+    let res = arena.intern_val(ValueType::Result {
+        ok: Some(u32_id),
+        err: Some(u64_id),
+    });
+    let either = arena.intern_val(ValueType::Variant(vec![
+        ("left".into(), Some(u32_id)),
+        ("right".into(), Some(u64_id)),
+        ("neither".into(), None),
+    ]));
+    // option(2) + result(2 — 1 disc + 1 i64 joined) + variant(2) +
+    // 2×u32 = 8 flat → indirect-params.
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([(
+            "many".to_string(),
+            sig(
+                true,
+                &["o", "r", "v", "a", "b"],
+                vec![opt_u32, res, either, u32_id, u32_id],
+                vec![u32_id],
+            ),
+        )]),
+        type_exports: BTreeMap::from([("either".to_string(), either)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/disp-async@1.0.0",
         &["splicer:tier1/before", "splicer:tier1/after"],
         &iface,
         &arena,

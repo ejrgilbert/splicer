@@ -131,10 +131,9 @@ fn require_supported_case(
         // single params-pointer instead of flat values. The wrapper export
         // (`GuestExportAsyncStackful`, capped at `Resolve::MAX_FLAT_PARAMS`)
         // still receives flat, so [`build_lower_params_to_memory`] writes
-        // them into a static params record before the handler call. Today
-        // the lower-mode bindgen only covers scalar primitives + their
-        // store widths; compound params (records, variants, lists, …) in
-        // an indirect-params position still bail until phases 2/3 land.
+        // them into a static params record before the handler call.
+        // `require_indirect_params_supported_shape` rejects param shapes
+        // the lower-mode bindgen doesn't cover (today: just `map<K, V>`).
         if func.kind.is_async() {
             let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
             if import_sig.indirect_params {
@@ -1345,9 +1344,9 @@ mod tests {
             .expect("primitive alias in indirect-params position should be accepted");
     }
 
-    /// Phase-2 widening: aggregates of supported leaves accepted in
-    /// indirect-params position. Records, tuples, enums, flags — and
-    /// nested combinations — all pass `is_supported_indirect_params_ty`.
+    /// Records / tuples / enums / flags — and nested combinations —
+    /// all pass `is_supported_indirect_params_ty` in indirect-params
+    /// position.
     #[test]
     fn require_supported_case_accepts_record_tuple_enum_flags_in_indirect_params() {
         let (resolve, iface_id) = iface_from_wit(
@@ -1373,35 +1372,30 @@ mod tests {
             .expect("record / tuple / enum / flags in indirect-params should be accepted");
     }
 
-    /// Indirect-params async fn with a phase-3 shape (here a `list<u32>`)
-    /// bails with the new wording. Pins the deferred-shapes contract so
-    /// a future phase-3 landing updates this test deliberately.
+    /// Lists, strings, fixed-length-lists, variants, options, results,
+    /// and handles all accepted in indirect-params position alongside
+    /// scalars and aggregate-of-scalar shapes.
     #[test]
-    fn require_supported_case_bails_on_phase3_shape_in_indirect_params() {
+    fn require_supported_case_accepts_lists_variants_in_indirect_params() {
         let (resolve, iface_id) = iface_from_wit(
             r#"
             package my:shape@1.0.0;
             interface api {
-                many: async func(a: list<u32>, b: u32, c: u32, d: u32, e: u32) -> u32;
+                variant either { left(u32), right(u64), neither }
+                many: async func(
+                    s: string,
+                    l: list<u32>,
+                    fl: list<u32, 4>,
+                    o: option<u32>,
+                    r: result<u32, string>,
+                    v: either,
+                ) -> u32;
             }
             "#,
             "my:shape",
             "api@1.0.0",
         );
-        let err = require_supported_case(&resolve, iface_id, false)
-            .expect_err("list param in indirect-params should bail until phase 3");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("`a`"),
-            "error should name the offending param; got: {msg}"
-        );
-        assert!(
-            msg.contains("MAX_FLAT_ASYNC_PARAMS"),
-            "error should still mention the limit; got: {msg}"
-        );
-        assert!(
-            msg.contains("follow-up") || msg.contains("phase"),
-            "error should signal the deferred-to-later-phase contract; got: {msg}"
-        );
+        require_supported_case(&resolve, iface_id, false)
+            .expect("string / list / fixed-list / variant / option / result params accepted");
     }
 }

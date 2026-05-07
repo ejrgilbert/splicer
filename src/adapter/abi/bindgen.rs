@@ -132,6 +132,13 @@ struct ActiveBlock {
     /// this block. `None` for blocks that aren't iteration bodies
     /// (e.g. variant arm blocks).
     iter_addr_local: Option<u32>,
+    /// `flat_cursor` value at the moment this block was opened.
+    /// Lower-mode emit arms (variant dispatch, fixed-list iter)
+    /// snapshot this so they can rewrite the captured `LocalGet`
+    /// indices to map per-arm / per-iter cursor reads onto the
+    /// actual canonical-ABI flat-slot positions at replay time.
+    /// Unused on the lift side (lifts don't read flat slots).
+    start_cursor: u32,
 }
 
 /// A captured block body — the wasm instructions emitted between a
@@ -151,6 +158,13 @@ struct CompletedBlock {
     /// The iteration local the body's loads read from, if this was
     /// an iteration block. `None` for variant-arm blocks.
     iter_addr_local: Option<u32>,
+    /// Cursor at the moment this block was opened (lower-mode only).
+    /// Together with `end_cursor`, gives the [start, end) range of
+    /// `param_flat_locals` indices the body's `LocalGet`s reference.
+    start_cursor: u32,
+    /// Cursor at the moment this block was closed. `end - start` is
+    /// the number of flat slots this block consumed.
+    end_cursor: u32,
 }
 
 impl<'a> WasmEncoderBindgen<'a> {
@@ -364,6 +378,7 @@ impl<'a> WasmEncoderBindgen<'a> {
         self.block_buffers.push(ActiveBlock {
             buffer: Vec::new(),
             iter_addr_local: None,
+            start_cursor: self.flat_cursor,
         });
     }
 
@@ -373,10 +388,159 @@ impl<'a> WasmEncoderBindgen<'a> {
             .block_buffers
             .pop()
             .expect("finish_block without matching push_block");
+        let end_cursor = self.flat_cursor;
         self.completed_blocks.push(CompletedBlock {
             body: active.buffer,
             iter_addr_local: active.iter_addr_local,
+            start_cursor: active.start_cursor,
+            end_cursor,
         });
+    }
+
+    /// Variant dispatch for write_to_memory (results=&[]): read disc,
+    /// br_table per arm, pre-load arm-typed locals from joined-flat
+    /// slots with joined→arm bitcasts so each arm sees its arm-flat
+    /// types (the wrapper params are in joined-flat). Cursor lands at
+    /// `variant_start + joined_flat.len()`.
+    fn emit_variant_dispatch_for_lower(
+        &mut self,
+        resolve: &Resolve,
+        variant_type: &Type,
+        arm_types: &[Option<Type>],
+    ) {
+        let n_arms = arm_types.len();
+        let joined = flat_types(resolve, variant_type, None).unwrap_or_else(|| {
+            panic!(
+                "variant flat must fit in MAX_FLAT_PARAMS ({}) — larger variants are invalid",
+                Resolve::MAX_FLAT_PARAMS,
+            )
+        });
+        let joined_total = joined.len() as u32;
+
+        let start = self.completed_blocks.len() - n_arms;
+        let arms: Vec<CompletedBlock> = self.completed_blocks.drain(start..).collect();
+        let variant_start = arms[0].start_cursor;
+
+        // Pre-compute each arm's flat shape — drives the per-arm
+        // local allocation + the bitcast sequence joined→arm.
+        let arm_flats: Vec<Vec<WasmType>> = arm_types
+            .iter()
+            .map(|at| match at {
+                None => Vec::new(),
+                Some(ty) => flat_types(resolve, ty, None).unwrap_or_else(|| {
+                    panic!(
+                        "variant arm flat must fit in MAX_FLAT_PARAMS ({}) — larger arms invalid",
+                        Resolve::MAX_FLAT_PARAMS,
+                    )
+                }),
+            })
+            .collect();
+
+        // Disc lives at the variant's first flat slot.
+        let disc_param_local = *self
+            .param_flat_locals
+            .get(variant_start as usize)
+            .expect("variant disc cursor in range");
+        let disc_local = self.alloc_local(ValType::I32);
+        self.emit_one(Instruction::LocalGet(disc_param_local));
+        self.emit_one(Instruction::LocalSet(disc_local));
+
+        // Nested blocks: $end / $default / $case_{n-1} … $case_0.
+        self.emit_one(Instruction::Block(BlockType::Empty)); // $end
+        self.emit_one(Instruction::Block(BlockType::Empty)); // $default
+        for _ in 0..n_arms {
+            self.emit_one(Instruction::Block(BlockType::Empty)); // $case_i
+        }
+        self.emit_one(Instruction::LocalGet(disc_local));
+        let table: Cow<'static, [u32]> = Cow::Owned((0..n_arms as u32).collect());
+        self.emit_one(Instruction::BrTable(table, n_arms as u32));
+        self.emit_one(Instruction::End); // close $case_0
+
+        for (i, (arm, arm_flat)) in arms.iter().zip(&arm_flats).enumerate() {
+            // Pre-load arm-typed locals from the joined slots with
+            // joined→arm bitcasts. The arm body's `LocalGet`s then
+            // read directly from these locals, sidestepping the
+            // type mismatch the wrapper's joined-flat sig would
+            // otherwise produce at validation.
+            let arm_locals: Vec<u32> = arm_flat
+                .iter()
+                .map(|wt| self.alloc_local(wasm_type_to_val(*wt)))
+                .collect();
+            for (m, &arm_wt) in arm_flat.iter().enumerate() {
+                let joined_idx = (variant_start as usize) + 1 + m;
+                let joined_local = *self
+                    .param_flat_locals
+                    .get(joined_idx)
+                    .expect("variant payload cursor in range");
+                self.emit_one(Instruction::LocalGet(joined_local));
+                self.emit_bitcast(&cast(joined[m + 1], arm_wt));
+                self.emit_one(Instruction::LocalSet(arm_locals[m]));
+            }
+            // Replay arm body, mapping its in-block `LocalGet(k)`s
+            // (where k = block_start + position) to the matching
+            // arm_locals[position].
+            let block_range = (arm.start_cursor, arm.end_cursor);
+            self.replay_block_with_arm_locals(&arm.body, block_range, &arm_locals);
+            // br $end. Depth from inside case_i:
+            // (n_arms-1-i) sibling cases + default + end → n_arms - i.
+            let depth = (n_arms - i) as u32;
+            self.emit_one(Instruction::Br(depth));
+            self.emit_one(Instruction::End); // close this case
+        }
+
+        // After all case Ends control falls into $default's body
+        // (out-of-range disc). Trap, then close $end.
+        self.emit_one(Instruction::Unreachable);
+        self.emit_one(Instruction::End); // close $end
+
+        self.flat_cursor = variant_start + joined_total;
+    }
+
+    /// Replay a captured block, mapping `LocalGet(k)` for `k ∈
+    /// [block_start, block_end)` to `LocalGet(arm_locals[k -
+    /// block_start])`. Variant-arm sister to [`Self::replay_block_remapped`]:
+    /// reads route through bitcast-ready arm locals instead of
+    /// wrapper params directly.
+    fn replay_block_with_arm_locals(
+        &mut self,
+        body: &[Instruction<'static>],
+        block_range: (u32, u32),
+        arm_locals: &[u32],
+    ) {
+        let (block_start, _) = block_range;
+        for inst in body {
+            let mapped = match inst {
+                Instruction::LocalGet(k) if *k >= block_range.0 && *k < block_range.1 => {
+                    let pos = (*k - block_start) as usize;
+                    Instruction::LocalGet(arm_locals[pos])
+                }
+                other => other.clone(),
+            };
+            self.emit_one(mapped);
+        }
+    }
+
+    /// Replay a captured block, rewriting `LocalGet(k)` for `k ∈
+    /// [block_start, block_end)` to `LocalGet(new_base + (k -
+    /// block_start))`. Other LocalGets (addr / tmp scratch) are
+    /// outside the cursor range and pass through. Used by fixed-list
+    /// iter (per-iter shift = i × elem_flat_width).
+    fn replay_block_remapped(
+        &mut self,
+        body: &[Instruction<'static>],
+        block_range: (u32, u32),
+        new_base: u32,
+    ) {
+        let (block_start, block_end) = block_range;
+        for inst in body {
+            let mapped = match inst {
+                Instruction::LocalGet(k) if *k >= block_start && *k < block_end => {
+                    Instruction::LocalGet(new_base + (*k - block_start))
+                }
+                other => other.clone(),
+            };
+            self.emit_one(mapped);
+        }
     }
 
     /// Emit a zero constant for the given flat wasm type — used to
@@ -751,6 +915,10 @@ impl Bindgen for WasmEncoderBindgen<'_> {
             AbiInst::F64Store { offset } => {
                 self.emit_store(*offset, StoreKind::F64Store);
             }
+            // Pointer / Length lower as i32 on wasm32.
+            AbiInst::PointerStore { offset } | AbiInst::LengthStore { offset } => {
+                self.emit_store(*offset, StoreKind::I32Store);
+            }
 
             // ── Aggregate lowers (lower direction) ──────────────
             // Records and tuples decompose 1 abstract value into N
@@ -783,6 +951,82 @@ impl Bindgen for WasmEncoderBindgen<'_> {
                     self.emit_get_flat_slot();
                 }
                 produce_n(results, n);
+            }
+
+            // ── Pass-through lowers (lower direction) ──────────
+            // Host's canon-lower already deposited backing data; we
+            // just thread (ptr, len) / i32 through. `realloc` field
+            // intentionally ignored — see `build_lower_params_to_memory`.
+            AbiInst::StringLower { .. } | AbiInst::ListCanonLower { .. } => {
+                self.emit_get_flat_slot(); // ptr
+                self.emit_get_flat_slot(); // len
+                produce_n(results, 2);
+            }
+            AbiInst::HandleLower { .. }
+            | AbiInst::ErrorContextLower
+            | AbiInst::FutureLower { .. }
+            | AbiInst::StreamLower { .. } => {
+                self.emit_get_flat_slot();
+                produce_n(results, 1);
+            }
+
+            // ── Constants / placeholders used by aggregate lowers ──
+            // I32Const fires for variant-arm disc constants;
+            // IterElem / VariantPayloadName push abstract-operand
+            // placeholders that the cursor model doesn't materialize.
+            AbiInst::I32Const { val } => {
+                self.emit_one(Instruction::I32Const(*val));
+                produce_n(results, 1);
+            }
+            AbiInst::IterElem { .. } | AbiInst::VariantPayloadName => {
+                produce_n(results, 1);
+            }
+
+            // ── Fixed-list lower decomposition ────────────────
+            // 1 → size abstract decomposition; the per-element
+            // `lower(elem_ty)` calls that follow advance the cursor.
+            AbiInst::FixedLengthListLower { size, .. } => {
+                produce_n(results, *size as usize);
+            }
+
+            // ── Variant / option / result lowers (write_to_memory ctx) ──
+            // `results` is empty in the write_to_memory path — arms
+            // store directly to memory. The dispatch reads disc from
+            // `param_flat_locals[variant_start]` and `br_table`s over
+            // per-arm captured blocks.
+            AbiInst::VariantLower {
+                variant,
+                ty,
+                results: r,
+                ..
+            } => {
+                debug_assert!(
+                    r.is_empty(),
+                    "VariantLower in lower-flat (non-empty results) context not yet supported",
+                );
+                let arms: Vec<Option<Type>> = variant.cases.iter().map(|c| c.ty).collect();
+                self.emit_variant_dispatch_for_lower(_resolve, &Type::Id(*ty), &arms);
+                produce_n(results, r.len());
+            }
+            AbiInst::OptionLower {
+                payload,
+                ty,
+                results: r,
+            } => {
+                debug_assert!(r.is_empty());
+                let arms = vec![None, Some(**payload)];
+                self.emit_variant_dispatch_for_lower(_resolve, &Type::Id(*ty), &arms);
+                produce_n(results, r.len());
+            }
+            AbiInst::ResultLower {
+                result,
+                ty,
+                results: r,
+            } => {
+                debug_assert!(r.is_empty());
+                let arms = vec![result.ok, result.err];
+                self.emit_variant_dispatch_for_lower(_resolve, &Type::Id(*ty), &arms);
+                produce_n(results, r.len());
             }
 
             // ── Bitcasts ───────────────────────────────────────
@@ -890,6 +1134,40 @@ impl Bindgen for WasmEncoderBindgen<'_> {
                         .iter_addr_local = Some(idx);
                 }
                 produce_n(results, 1);
+            }
+            // Mirror of FixedLengthListLiftFromMemory for lowering:
+            // replay the captured per-element write N times, shifting
+            // the body's cursor reads by `i * elem_flat_width` per iter.
+            AbiInst::FixedLengthListLowerToMemory { element, size, .. } => {
+                let elem_size = self.sizes.size(element).size_wasm32() as u32;
+                let block = self
+                    .completed_blocks
+                    .pop()
+                    .expect("FixedLengthListLowerToMemory without a matching block");
+                let iter_addr = block.iter_addr_local.expect(
+                    "fixed-size-list block must have allocated an iter_addr_local via \
+                     IterBasePointer",
+                );
+                let parent_addr = self.current_addr_local();
+                self.emit_one(Instruction::LocalGet(parent_addr));
+                self.emit_one(Instruction::LocalSet(iter_addr));
+                let elem_flat = block.end_cursor - block.start_cursor;
+                let block_range = (block.start_cursor, block.end_cursor);
+                for i in 0..*size {
+                    if i > 0 {
+                        self.emit_one(Instruction::LocalGet(iter_addr));
+                        self.emit_one(Instruction::I32Const(elem_size as i32));
+                        self.emit_one(Instruction::I32Add);
+                        self.emit_one(Instruction::LocalSet(iter_addr));
+                    }
+                    let new_base = block.start_cursor + i * elem_flat;
+                    self.replay_block_remapped(&block.body, block_range, new_base);
+                }
+                // Cursor was already advanced once during capture
+                // (to end_cursor); ensure it reflects the full size *
+                // elem_flat advance for any code that follows.
+                self.flat_cursor = block.start_cursor + *size * elem_flat;
+                produce_n(results, 0);
             }
             AbiInst::FixedLengthListLiftFromMemory { element, size, .. } => {
                 let elem_size = self.sizes.size(element).size_wasm32() as u32;

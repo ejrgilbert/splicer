@@ -1687,11 +1687,11 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
-    /// Phase-2: record + tuple + enum + flags in indirect-params
-    /// position. The WIT-level interface declares each as a named
-    /// type the function references; the adapter must walk each
-    /// aggregate via the corresponding `*Lower` arm and emit the
-    /// inner stores at canonical record offsets.
+    /// Aggregate params (record + tuple + enum + flags) in indirect-
+    /// params position. The WIT-level interface declares each as a
+    /// named type the function references; the adapter must walk
+    /// each aggregate via the corresponding `*Lower` arm and emit
+    /// the inner stores at canonical record offsets.
     #[test]
     fn async_aggregates_indirect_params_validates() {
         // 5×u32 record alone hits indirect-params (5 > 4 = MAX_FLAT_ASYNC_PARAMS).
@@ -1727,6 +1727,52 @@ mod tests {
             tier2_wit,
         )
         .expect("tier-2 adapter generation should succeed for aggregate async params");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
+    /// String / list / option / result params in indirect-params
+    /// position. Fixed-list is omitted (tier-2's hook-side lift
+    /// codegen doesn't yet handle it; tier-1 covers it separately).
+    /// Result arms share i32 flat → no joined-flat widening on hook
+    /// lift, sidestepping a separate pre-existing limit.
+    #[test]
+    fn async_dispatch_shapes_indirect_params_validates() {
+        // string(2) + list(2) + option<u32>(2) + result<u32,u32>(2) +
+        // 2×u32 = 10 flat → indirect.
+        let wat = r#"(component
+            (type (;0;) (instance
+                (type (;0;) (list u32))
+                (type (;1;) (option u32))
+                (type (;2;) (result u32 (error u32)))
+                (type (;3;) (func async
+                    (param "s" string)
+                    (param "l" 0)
+                    (param "o" 1)
+                    (param "r" 2)
+                    (param "a" u32)
+                    (param "b" u32)
+                    (result u32)))
+                (export "many" (func (type 3)))
+            ))
+            (import "test:pkg/disp-async@1.0.0" (instance (type 0)))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "test:pkg/disp-async@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for dispatch shapes");
 
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
