@@ -55,6 +55,7 @@
 //! when the mapping isn't obvious from the Instruction name.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use wasm_encoder::{BlockType, Instruction, MemArg, ValType};
 use wit_bindgen_core::abi::{Bindgen, Bitcast, Instruction as AbiInst, WasmType};
@@ -66,6 +67,17 @@ use super::emit::wasm_type_to_val;
 
 /// Bindgen that accumulates `wasm_encoder::Instruction`s into buffers,
 /// ready to be flushed into a `Function` by [`WasmEncoderBindgen::drain_into`].
+///
+/// ## Lift vs. lower
+///
+/// The same bindgen drives both `lift_from_memory` (memory → flat
+/// values on the wasm stack) and `lower_to_memory` (flat values from
+/// wasm function params → memory). Lift uses [`Self::addr_local`] +
+/// the load arms; lower additionally uses
+/// [`Self::param_flat_locals`] / [`Self::flat_cursor`] to feed the
+/// scalar lift-to-flat arms (`I32FromU32`, etc.) plus the store arms.
+/// A bindgen built without param-flat-locals only handles lift; to
+/// drive lower, callers chain [`Self::with_param_flat_locals`].
 pub(crate) struct WasmEncoderBindgen<'a> {
     /// Top-level instruction buffer — the final output that goes into
     /// the target Function. Emits land here when no block is active.
@@ -80,15 +92,33 @@ pub(crate) struct WasmEncoderBindgen<'a> {
     completed_blocks: Vec<CompletedBlock>,
     /// Canonical-ABI sizes, required by `Bindgen::sizes`.
     sizes: &'a SizeAlign,
-    /// Local index holding the base address for all loads at the
-    /// outermost scope. Iteration blocks override this via their own
-    /// `iter_addr_local`; see [`WasmEncoderBindgen::current_addr_local`].
+    /// Local index holding the base address for all loads/stores at
+    /// the outermost scope. Iteration blocks override this via their
+    /// own `iter_addr_local`; see [`WasmEncoderBindgen::current_addr_local`].
+    /// For lower-mode the caller writes the per-param effective
+    /// address into this local before each `lower_to_memory` invocation.
     addr_local: u32,
     /// Shared local allocator — the bindgen routes its dynamic
     /// allocations through the same [`LocalsBuilder`] the caller
     /// uses for its own locals, so all of the function's locals land
     /// in one contiguous, correctly-indexed block.
     indices: &'a mut LocalsBuilder,
+    /// Flat wasm-locals that scalar lift-to-flat arms (`I32FromU32`,
+    /// `I64FromU64`, `CoreF32FromF32`, …) read from in canonical
+    /// left-to-right order. Empty for pure-lift use; populated via
+    /// [`Self::with_param_flat_locals`] to enable lower.
+    param_flat_locals: Vec<u32>,
+    /// Cursor into [`Self::param_flat_locals`] — bumped one slot per
+    /// scalar lift-to-flat emit. The cursor is global across the whole
+    /// lower sequence (not reset per param), so callers concatenate
+    /// per-param flat-locals in canonical order before constructing
+    /// the bindgen.
+    flat_cursor: u32,
+    /// Lazy per-`ValType` scratch local for the value-shuffle template
+    /// stores need (`local.set $tmp; local.get $addr; local.get $tmp;
+    /// <store>`). Allocated through [`Self::indices`] on first use,
+    /// reused across stores that share a wasm value type.
+    store_tmp_by_valtype: HashMap<ValType, u32>,
 }
 
 /// An active block being captured. Tracks its instruction buffer and
@@ -136,7 +166,29 @@ impl<'a> WasmEncoderBindgen<'a> {
             sizes,
             addr_local,
             indices,
+            param_flat_locals: Vec::new(),
+            flat_cursor: 0,
+            store_tmp_by_valtype: HashMap::new(),
         }
+    }
+
+    /// Enable lower-mode: scalar lift-to-flat arms emit `local.get`s
+    /// that read sequentially from `locals`. Pass the concatenation of
+    /// each param's flat wasm-locals in canonical (param-declaration)
+    /// order. Pure lift contexts can skip this builder.
+    pub fn with_param_flat_locals(mut self, locals: Vec<u32>) -> Self {
+        self.param_flat_locals = locals;
+        self
+    }
+
+    /// Emit `i32.const value; local.set $addr_local` into the active
+    /// buffer. Lower-mode helper for staging the per-param effective
+    /// address between `lower_to_memory` calls — keeps one bindgen
+    /// (and one `store_tmp_by_valtype` cache) live across all params.
+    pub fn emit_set_addr_const(&mut self, value: i32) {
+        let addr_local = self.addr_local;
+        self.emit_one(Instruction::I32Const(value));
+        self.emit_one(Instruction::LocalSet(addr_local));
     }
 
     /// Consume the bindgen and return the accumulated wasm
@@ -204,6 +256,67 @@ impl<'a> WasmEncoderBindgen<'a> {
         let addr_local = self.current_addr_local();
         self.emit_one(Instruction::LocalGet(addr_local));
         self.emit_one(load.to_instruction(mem_arg));
+    }
+
+    /// Emit a value-shuffle store at the given byte offset. The wasm
+    /// stack on entry has `[..., value]`; on exit, `[...]`. Wasm's
+    /// store opcodes need `[addr, value]` with addr deeper, but the
+    /// canonical-ABI emit order pushes value first then addr-as-an-
+    /// abstract-operand (which our `Operand = ()` doesn't materialize
+    /// onto the wasm stack). To bridge: stash value into a per-ValType
+    /// scratch, push the address, push the value back, then store.
+    /// All scalar store emits funnel through here.
+    fn emit_store(&mut self, offset: ArchitectureSize, store: StoreKind) {
+        let off = offset.size_wasm32() as u64;
+        let mem_arg = MemArg {
+            offset: off,
+            align: store.natural_align_log2(),
+            memory_index: 0,
+        };
+        let value_vt = store.value_valtype();
+        let tmp = self.alloc_store_tmp(value_vt);
+        let addr_local = self.current_addr_local();
+        self.emit_one(Instruction::LocalSet(tmp));
+        self.emit_one(Instruction::LocalGet(addr_local));
+        self.emit_one(Instruction::LocalGet(tmp));
+        self.emit_one(store.to_instruction(mem_arg));
+    }
+
+    /// Lazy-allocated per-`ValType` scratch local used by [`Self::emit_store`].
+    /// Reused across all stores of the same wasm value type (e.g.
+    /// every i32 store shares one i32 tmp), so the per-fn local count
+    /// scales with the number of distinct flat types in the params,
+    /// not the number of stores.
+    fn alloc_store_tmp(&mut self, vt: ValType) -> u32 {
+        if let Some(&idx) = self.store_tmp_by_valtype.get(&vt) {
+            return idx;
+        }
+        let idx = self.indices.alloc_local(vt);
+        self.store_tmp_by_valtype.insert(vt, idx);
+        idx
+    }
+
+    /// Emit `local.get $param_flat_locals[cursor]; cursor += 1` —
+    /// reads the next flat slot the canonical-ABI lower expects from
+    /// the wrapper export's wasm function params. Used by the scalar
+    /// lift-to-flat arms (`I32FromU32`, `I64FromU64`, etc.), which
+    /// are no-ops at the wasm layer but consume one flat slot.
+    fn emit_get_flat_slot(&mut self) {
+        let local = *self
+            .param_flat_locals
+            .get(self.flat_cursor as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "lift-to-flat past end of param_flat_locals \
+                     (cursor={}, len={}). Did the caller forget \
+                     `with_param_flat_locals`, or feed the wrong \
+                     param flat width?",
+                    self.flat_cursor,
+                    self.param_flat_locals.len(),
+                )
+            });
+        self.emit_one(Instruction::LocalGet(local));
+        self.flat_cursor += 1;
     }
 
     /// Emit a bitcast sequence to convert the top-of-stack value's
@@ -469,6 +582,55 @@ impl LoadKind {
     }
 }
 
+/// The six store-instruction shapes the canonical ABI writes to
+/// memory for scalar values. Mirror of [`LoadKind`].
+#[derive(Clone, Copy)]
+enum StoreKind {
+    I32Store,
+    I32Store8,
+    I32Store16,
+    I64Store,
+    F32Store,
+    F64Store,
+}
+
+impl StoreKind {
+    fn to_instruction(self, mem_arg: MemArg) -> Instruction<'static> {
+        match self {
+            StoreKind::I32Store => Instruction::I32Store(mem_arg),
+            StoreKind::I32Store8 => Instruction::I32Store8(mem_arg),
+            StoreKind::I32Store16 => Instruction::I32Store16(mem_arg),
+            StoreKind::I64Store => Instruction::I64Store(mem_arg),
+            StoreKind::F32Store => Instruction::F32Store(mem_arg),
+            StoreKind::F64Store => Instruction::F64Store(mem_arg),
+        }
+    }
+
+    /// Natural alignment in log2 bytes, per the canonical ABI's
+    /// memory-alignment rules for each store width.
+    fn natural_align_log2(self) -> u32 {
+        match self {
+            StoreKind::I32Store8 => 0,
+            StoreKind::I32Store16 => 1,
+            StoreKind::I32Store | StoreKind::F32Store => 2,
+            StoreKind::I64Store | StoreKind::F64Store => 3,
+        }
+    }
+
+    /// Wasm value-stack type the store consumes — drives the
+    /// [`WasmEncoderBindgen::store_tmp_by_valtype`] scratch lookup.
+    /// The narrow `i32.store{8,16}` variants still consume an `i32`
+    /// from the stack; the truncation happens in the store opcode.
+    fn value_valtype(self) -> ValType {
+        match self {
+            StoreKind::I32Store | StoreKind::I32Store8 | StoreKind::I32Store16 => ValType::I32,
+            StoreKind::I64Store => ValType::I64,
+            StoreKind::F32Store => ValType::F32,
+            StoreKind::F64Store => ValType::F64,
+        }
+    }
+}
+
 impl Bindgen for WasmEncoderBindgen<'_> {
     type Operand = ();
 
@@ -544,6 +706,50 @@ impl Bindgen for WasmEncoderBindgen<'_> {
             | AbiInst::F32FromCoreF32
             | AbiInst::F64FromCoreF64 => {
                 produce_n(results, 1);
+            }
+
+            // ── Scalar lift-to-flat (lower direction) ───────────
+            // Pulls the next flat slot off the wrapper export's wasm
+            // function params via `param_flat_locals`. The interface-
+            // type → wasm-type "From" arms are no-ops at the wasm
+            // layer (sign/width narrowing is a source-language
+            // concept; `i32.store8` etc. handles the actual
+            // truncation downstream), so each just emits one
+            // `local.get`.
+            AbiInst::I32FromBool
+            | AbiInst::I32FromS8
+            | AbiInst::I32FromU8
+            | AbiInst::I32FromS16
+            | AbiInst::I32FromU16
+            | AbiInst::I32FromS32
+            | AbiInst::I32FromU32
+            | AbiInst::I64FromS64
+            | AbiInst::I64FromU64
+            | AbiInst::I32FromChar
+            | AbiInst::CoreF32FromF32
+            | AbiInst::CoreF64FromF64 => {
+                self.emit_get_flat_slot();
+                produce_n(results, 1);
+            }
+
+            // ── Memory stores ───────────────────────────────────
+            AbiInst::I32Store { offset } => {
+                self.emit_store(*offset, StoreKind::I32Store);
+            }
+            AbiInst::I32Store8 { offset } => {
+                self.emit_store(*offset, StoreKind::I32Store8);
+            }
+            AbiInst::I32Store16 { offset } => {
+                self.emit_store(*offset, StoreKind::I32Store16);
+            }
+            AbiInst::I64Store { offset } => {
+                self.emit_store(*offset, StoreKind::I64Store);
+            }
+            AbiInst::F32Store { offset } => {
+                self.emit_store(*offset, StoreKind::F32Store);
+            }
+            AbiInst::F64Store { offset } => {
+                self.emit_store(*offset, StoreKind::F64Store);
             }
 
             // ── Bitcasts ───────────────────────────────────────

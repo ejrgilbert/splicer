@@ -59,7 +59,8 @@ use wit_parser::{
 
 use super::abi::emit::{
     collect_borrow_drops, emit_data_section, emit_export_section, emit_memory_and_globals,
-    require_no_inline_resources, synthesize_adapter_world_wit, BlobSlice,
+    require_indirect_params_supported_shape, require_no_inline_resources,
+    synthesize_adapter_world_wit, BlobSlice,
 };
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use blob::NameInterner;
@@ -126,7 +127,8 @@ pub(super) fn build_tier2_adapter(
 
     let (per_func, plan) = lay_out_static_memory(classified, &funcs, &schema, names, iface_name)?;
 
-    let mut core_module = build_dispatch_module(&resolve, &schema, &per_func, plan, iface_name);
+    let mut core_module =
+        build_dispatch_module(&resolve, &schema, &per_func, &funcs, plan, iface_name);
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
         .context("embed_component_metadata")?;
 
@@ -145,18 +147,14 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
         bail!("interface has no functions");
     }
     require_no_inline_resources(resolve, target_iface)?;
-    // Async funcs whose flat params overflow MAX_FLAT_ASYNC_PARAMS need
-    // lower-to-memory; not yet implemented. Mirrors tier-1.
+    // Async funcs whose flat params overflow MAX_FLAT_ASYNC_PARAMS go
+    // through `build_lower_params_to_memory` — currently scoped to
+    // scalar primitives. Mirrors tier-1.
     for (name, func) in &iface.functions {
         if func.kind.is_async() {
             let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
             if import_sig.indirect_params {
-                bail!(
-                    "async function `{name}` has params that overflow \
-                     MAX_FLAT_ASYNC_PARAMS ({}) and require lower-to-memory; \
-                     not yet implemented",
-                    Resolve::MAX_FLAT_ASYNC_PARAMS
-                );
+                require_indirect_params_supported_shape(resolve, name, func)?;
             }
         }
     }
@@ -183,6 +181,7 @@ fn build_dispatch_module(
     resolve: &Resolve,
     schema: &schema::SchemaLayouts,
     per_func: &[FuncDispatch],
+    funcs: &[&WitFunction],
     plan: layout::StaticDataPlan,
     iface_name: BlobSlice,
 ) -> Vec<u8> {
@@ -247,7 +246,14 @@ fn build_dispatch_module(
         call_id_counter_global: globals.call_id_counter,
         bump_global: globals.bump,
     };
-    emit_code_section(&mut module, per_func, &func_idx, &wrapper_ctx, &globals);
+    emit_code_section(
+        &mut module,
+        per_func,
+        funcs,
+        &func_idx,
+        &wrapper_ctx,
+        &globals,
+    );
     emit_data_section(&mut module, &plan.data_segments);
     module.finish()
 }
@@ -422,6 +428,14 @@ pub(in crate::adapter::tier2) struct FuncDispatch {
     /// extra trailing arg when calling the import, then loads from it
     /// to produce its own return value.
     pub retptr_offset: Option<i32>,
+    /// Byte offset of the indirect-params record buffer; `Some` iff
+    /// async + `import_sig.indirect_params` (canon-lower-async
+    /// overflowed `Resolve::MAX_FLAT_ASYNC_PARAMS = 4` and switched to
+    /// pass-by-record). The wrapper lowers its flat function params
+    /// into this slot and passes the slot's pointer to the handler.
+    /// Inherits `retptr_offset` / bump's single-active-call assumption:
+    /// two concurrent invocations of the same wrapper would clobber it.
+    pub params_record_offset: Option<i32>,
     /// How to lift the function's return value into a `cell` for the
     /// on-return hook. `None` for void or compound returns we don't
     /// yet lift.

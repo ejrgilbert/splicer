@@ -21,7 +21,7 @@
 //! is expected to serialize per instance; revisit if that changes.
 
 use wasm_encoder::{CodeSection, Function};
-use wit_parser::Resolve;
+use wit_parser::{Function as WitFunction, Resolve};
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
@@ -215,6 +215,7 @@ pub(super) fn emit_wrapper_function(
     ctx: &WrapperCtx<'_>,
     i: usize,
     fd: &FuncDispatch,
+    func: &WitFunction,
 ) {
     let async_funcs = &func_idx.async_funcs;
     let schema = ctx.schema;
@@ -227,7 +228,7 @@ pub(super) fn emit_wrapper_function(
     // is no `LocalsBuilder` in scope, so additional `alloc_local` calls
     // are a compile error.
     let (lcl, result_emit, frozen) =
-        alloc_wrapper_locals(ctx.resolve, &schema.size_align, builder, fd);
+        alloc_wrapper_locals(ctx.resolve, &schema.size_align, builder, fd, func);
 
     let mut f = Function::new_with_locals_types(frozen.locals);
 
@@ -305,14 +306,35 @@ pub(super) fn emit_wrapper_function(
     // ── Phase 2: forward to handler. Bridges callee-returns ↔
     // caller-allocates for compound results via the shared
     // abi/emit helpers. For async, the import returns a packed
-    // canon-lower-async status that we wait on.
-    emit_handler_call(
-        &mut f,
-        nparams,
-        fd.import_sig.retptr,
-        fd.retptr_offset,
-        func_idx.handler_imp_base + i as u32,
-    );
+    // canon-lower-async status that we wait on. Two arg shapes per
+    // canon-lower-async:
+    //   - direct: `emit_handler_call` pushes each flat function param.
+    //   - indirect: replay the pre-built lower-to-memory sequence,
+    //     then push the params-record pointer (capped at retptr if
+    //     the import also caller-allocates a result buffer).
+    let handler_imp_idx = func_idx.handler_imp_base + i as u32;
+    if let Some(seq) = lcl.params_lower_seq.as_ref() {
+        for inst in seq {
+            f.instruction(inst);
+        }
+        f.instructions().i32_const(
+            fd.params_record_offset
+                .expect("indirect_params → params_record_offset"),
+        );
+        if fd.import_sig.retptr {
+            f.instructions()
+                .i32_const(fd.retptr_offset.expect("import_retptr → retptr_offset"));
+        }
+        f.instructions().call(handler_imp_idx);
+    } else {
+        emit_handler_call(
+            &mut f,
+            nparams,
+            fd.import_sig.retptr,
+            fd.retptr_offset,
+            handler_imp_idx,
+        );
+    }
     match &fd.shape {
         FuncShape::Async(_) => {
             f.instructions().local_set(lcl.st);

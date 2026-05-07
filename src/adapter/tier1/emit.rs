@@ -30,12 +30,13 @@ use wit_parser::{
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
-    call_id_layout, collect_borrow_drops, direct_return_type, emit_alloc_call_id,
-    emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc, emit_data_section,
-    emit_export_section, emit_handler_call, emit_memory_and_globals, emit_populate_call_id,
-    emit_resource_drop_imports, emit_wrapper_return, empty_function, find_imported_hook,
-    require_no_inline_resources, synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset,
-    CallIdLayout, GlobalIndices, HookImport, WrapperExport,
+    build_lower_params_to_memory, call_id_layout, collect_borrow_drops, direct_return_type,
+    emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc,
+    emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
+    emit_populate_call_id, emit_resource_drop_imports, emit_wrapper_return, empty_function,
+    find_imported_hook, require_indirect_params_supported_shape, require_no_inline_resources,
+    synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset, CallIdLayout, GlobalIndices,
+    HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, LocalsBuilder};
@@ -129,19 +130,15 @@ fn require_supported_case(
         // canon-lower with `indirect_params = true` — the handler takes a
         // single params-pointer instead of flat values. The wrapper export
         // (`GuestExportAsyncStackful`, capped at `Resolve::MAX_FLAT_PARAMS`)
-        // still receives flat, so we'd need to lower-to-memory before the
-        // handler call. Driving `wit_bindgen_core::abi::lower_to_memory`
-        // requires extending `WasmEncoderBindgen` with the store-side
-        // `AbiInst` variants. Not yet implemented.
+        // still receives flat, so [`build_lower_params_to_memory`] writes
+        // them into a static params record before the handler call. Today
+        // the lower-mode bindgen only covers scalar primitives + their
+        // store widths; compound params (records, variants, lists, …) in
+        // an indirect-params position still bail until phases 2/3 land.
         if func.kind.is_async() {
             let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
             if import_sig.indirect_params {
-                bail!(
-                    "async function `{name}` has params that overflow \
-                     MAX_FLAT_ASYNC_PARAMS ({}) and require lower-to-memory; \
-                     not yet implemented",
-                    Resolve::MAX_FLAT_ASYNC_PARAMS
-                );
+                require_indirect_params_supported_shape(resolve, name, func)?;
             }
         }
     }
@@ -211,6 +208,14 @@ struct FuncDispatch {
     fn_name_len: i32,
     /// Offset of the retptr scratch buffer; set iff `import_sig.retptr`.
     retptr_offset: Option<i32>,
+    /// Offset of the indirect-params record buffer; set iff async +
+    /// `import_sig.indirect_params` (canon-lower-async overflowed
+    /// `Resolve::MAX_FLAT_ASYNC_PARAMS = 4` and switched to pass-by-
+    /// record). The wrapper lowers its flat function params into this
+    /// slot and passes the slot's pointer to the handler. Inherits
+    /// `retptr_offset` / bump's single-active-call assumption: two
+    /// concurrent invocations of the same wrapper would clobber it.
+    params_record_offset: Option<i32>,
     /// `(flat_param_idx, resource_type_id)` for each top-level
     /// `borrow<R>` param. The runtime requires us to drop the borrow
     /// before the wrapper returns; see `emit_wrapper_body`.
@@ -321,7 +326,7 @@ fn build_dispatch_module(
             has_blocking,
             callid_layout,
         },
-    );
+    )?;
     let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after, has_blocking);
     let mut idx = DispatchIndices::new();
 
@@ -367,6 +372,7 @@ fn build_dispatch_module(
         resolve,
         &sizes,
         &plan.per_func,
+        &funcs,
         &func_idx,
         &globals,
         call_id_wiring,
@@ -410,6 +416,12 @@ struct SlotReservations {
     callid_layout: Option<CallIdLayout>,
 }
 
+/// Final layout end (data + scratch + bump-allocator base) must fit
+/// in a signed i32 — every offset stored in `DispatchPlan` is `i32`,
+/// and the bump global is initialized via `i32.const`. Mirrors tier-2's
+/// `LAYOUT_SIZE_BUDGET`.
+const LAYOUT_SIZE_BUDGET: u32 = i32::MAX as u32;
+
 /// Phase 1 — per-func dispatch shapes, name bytes, and memory-slot
 /// reservations (retptr scratch, event record, call-id buffer).
 /// Iface name lives once at the head of memory; each fn name follows.
@@ -420,7 +432,7 @@ fn compute_func_dispatches(
     target_interface_name: &str,
     funcs: &[&WitFunction],
     slots: SlotReservations,
-) -> DispatchPlan {
+) -> Result<DispatchPlan> {
     let iface_name_bytes = target_interface_name.len() as u32;
     let total_fn_name_bytes: u32 = funcs.iter().map(|f| f.name.len() as u32).sum();
     let total_name_bytes = iface_name_bytes + total_fn_name_bytes;
@@ -487,6 +499,17 @@ fn compute_func_dispatches(
             let align = sizes.align(result_ty).align_wasm32() as u32;
             layout.alloc_aligned(size, align) as i32
         });
+        // Async indirect-params: reserve the canonical-ABI params
+        // record. Size + align come from `SizeAlign::record` over the
+        // param type list — same shape canon-lower-async expects to
+        // read on the import side.
+        let params_record_offset = (is_async && import_sig.indirect_params).then(|| {
+            let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
+            let info = sizes.record(&param_types);
+            let size = info.size.size_wasm32() as u32;
+            let align = info.align.align_wasm32() as u32;
+            layout.alloc_aligned(size, align) as i32
+        });
         let task_return = is_async.then(|| {
             let (module, name, sig) =
                 func.task_return_import(resolve, Some(&target_world_key), Mangling::Legacy);
@@ -507,6 +530,7 @@ fn compute_func_dispatches(
             fn_name_offset,
             fn_name_len: func.name.len() as i32,
             retptr_offset,
+            params_record_offset,
             borrow_drops,
         });
     }
@@ -527,14 +551,17 @@ fn compute_func_dispatches(
         }
     });
     let bump_start = layout.finish_as_bump_start();
-    DispatchPlan {
+    if bump_start > LAYOUT_SIZE_BUDGET {
+        bail!("static-data layout end {bump_start} exceeds i32 budget {LAYOUT_SIZE_BUDGET}");
+    }
+    Ok(DispatchPlan {
         per_func,
         name_blob,
         event_ptr,
         block_result_ptr,
         call_id_buf,
         bump_start,
-    }
+    })
 }
 
 /// Active tier-1 hook imports. `before` / `after` share a common sig
@@ -813,10 +840,16 @@ fn emit_code_section(
     resolve: &Resolve,
     sizes: &SizeAlign,
     per_func: &[FuncDispatch],
+    funcs: &[&WitFunction],
     func_idx: &FuncIndices,
     globals: &GlobalIndices,
     call_id_wiring: Option<CallIdWiring<'_>>,
 ) {
+    debug_assert_eq!(
+        per_func.len(),
+        funcs.len(),
+        "FuncDispatch list and WitFunction list must be index-aligned",
+    );
     let blocking =
         func_idx
             .imp_block
@@ -833,6 +866,7 @@ fn emit_code_section(
                 resolve,
                 sizes,
                 fd,
+                funcs[i],
                 func_idx.imp_handler[i],
                 func_idx.imp_before,
                 func_idx.imp_after,
@@ -1009,6 +1043,7 @@ fn emit_async_wrapper_body(
     resolve: &Resolve,
     sizes: &SizeAlign,
     fd: &FuncDispatch,
+    func: &WitFunction,
     imp_handler: u32,
     imp_before: Option<u32>,
     imp_after: Option<u32>,
@@ -1047,6 +1082,18 @@ fn emit_async_wrapper_body(
             let mut bindgen = WasmEncoderBindgen::new(sizes, addr_local, &mut locals);
             lift_from_memory(resolve, &mut bindgen, (), result_ty);
             bindgen.into_instructions()
+        });
+    // Build the params lower-to-memory sequence BEFORE freezing locals,
+    // for the same reason as task_return_loads — the bindgen allocates
+    // an addr local + per-ValType store scratch through `locals`. Only
+    // populated when canon-lower-async expects a single params-pointer
+    // (`indirect_params = true`).
+    let params_lower_seq: Option<Vec<wasm_encoder::Instruction<'static>>> =
+        fd.import_sig.indirect_params.then(|| {
+            let base = fd
+                .params_record_offset
+                .expect("indirect_params → params_record_offset reserved");
+            build_lower_params_to_memory(resolve, sizes, &mut locals, func, base)
         });
     // i64 call-id local + per-callsite bundle; both gated on hook wired.
     let hook_site = call_id_wiring.map(|w| HookSite {
@@ -1087,8 +1134,25 @@ fn emit_async_wrapper_body(
     }
 
     // Handler call → packed status → wait.
-    for p in 0..nparams {
-        f.instructions().local_get(p);
+    //
+    // Two arg shapes per canon-lower-async:
+    //   - direct: push each flat function param.
+    //   - indirect: replay the pre-built lower-to-memory sequence,
+    //     then push the params record's pointer. The wrapper's flat
+    //     function params have already been written into the static
+    //     params slot at this point.
+    if let Some(seq) = params_lower_seq.as_ref() {
+        for inst in seq {
+            f.instruction(inst);
+        }
+        f.instructions().i32_const(
+            fd.params_record_offset
+                .expect("indirect_params → params_record_offset"),
+        );
+    } else {
+        for p in 0..nparams {
+            f.instructions().local_get(p);
+        }
     }
     if fd.import_sig.retptr {
         f.instructions()
@@ -1259,5 +1323,59 @@ mod tests {
         );
         require_supported_case(&resolve, iface_id, false)
             .expect("value-type interfaces should be accepted");
+    }
+
+    /// Indirect-params async fn with a primitive *alias* (`type my-id =
+    /// u32`) — `is_primitive_param_ty` follows `TypeDefKind::Type` so
+    /// `my-id` is treated as scalar. Pins the alias-following branch.
+    #[test]
+    fn require_supported_case_accepts_primitive_alias_in_indirect_params() {
+        let (resolve, iface_id) = iface_from_wit(
+            r#"
+            package my:shape@1.0.0;
+            interface api {
+                type my-id = u32;
+                many: async func(a: my-id, b: my-id, c: my-id, d: my-id, e: my-id) -> u32;
+            }
+            "#,
+            "my:shape",
+            "api@1.0.0",
+        );
+        require_supported_case(&resolve, iface_id, false)
+            .expect("primitive alias in indirect-params position should be accepted");
+    }
+
+    /// Indirect-params async fn with a non-scalar param (here a record)
+    /// bails with the phase-1 message naming the offending param. Pins
+    /// the wording so a future widening of `is_primitive_param_ty`
+    /// updates this test deliberately.
+    #[test]
+    fn require_supported_case_bails_on_compound_in_indirect_params() {
+        let (resolve, iface_id) = iface_from_wit(
+            r#"
+            package my:shape@1.0.0;
+            interface api {
+                record point { x: u32, y: u32 }
+                many: async func(a: point, b: u32, c: u32, d: u32, e: u32) -> u32;
+            }
+            "#,
+            "my:shape",
+            "api@1.0.0",
+        );
+        let err = require_supported_case(&resolve, iface_id, false)
+            .expect_err("non-scalar param in indirect-params should bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-scalar"),
+            "error should classify the param as non-scalar; got: {msg}"
+        );
+        assert!(
+            msg.contains("`a`"),
+            "error should name the offending param; got: {msg}"
+        );
+        assert!(
+            msg.contains("MAX_FLAT_ASYNC_PARAMS"),
+            "error should still mention the limit; got: {msg}"
+        );
     }
 }

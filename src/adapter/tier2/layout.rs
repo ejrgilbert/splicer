@@ -10,7 +10,7 @@
 //! placeholders waiting for a later phase to back-fill them.
 
 use anyhow::{bail, Result};
-use wit_parser::Function as WitFunction;
+use wit_parser::{Function as WitFunction, Type};
 
 use super::super::abi::emit::BlobSlice;
 use super::super::mem_layout::StaticLayout;
@@ -30,7 +30,7 @@ use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
     TREE_FLAGS_INFOS, TREE_HANDLE_INFOS, TREE_RECORD_INFOS, TREE_ROOT, TREE_VARIANT_INFOS,
 };
-use super::{AfterSetup, FuncClassified, FuncDispatch};
+use super::{AfterSetup, FuncClassified, FuncDispatch, FuncShape};
 
 // ─── ABI-anchored constants (not WIT-schema-derivable) ────────────
 
@@ -358,6 +358,11 @@ pub(super) fn lay_out_static_memory(
     iface_name: BlobSlice,
 ) -> Result<(Vec<FuncDispatch>, StaticDataPlan)> {
     let n_funcs = per_func.len();
+    debug_assert_eq!(
+        per_func.len(),
+        funcs.len(),
+        "FuncClassified list and WitFunction list must be index-aligned",
+    );
 
     check_layout_budget(&per_func)?;
 
@@ -627,6 +632,25 @@ pub(super) fn lay_out_static_memory(
         })
         .collect();
 
+    // Per-fn indirect-params record scratch — only for async funcs
+    // whose flat params overflowed `MAX_FLAT_ASYNC_PARAMS`, switching
+    // canon-lower-async to pass-by-record. Size + align come from
+    // `SizeAlign::record` over the WIT param list.
+    let params_record_offsets: Vec<Option<i32>> = per_func
+        .iter()
+        .zip(funcs.iter())
+        .map(|(fd, func)| {
+            if !(matches!(fd.shape, FuncShape::Async(_)) && fd.import_sig.indirect_params) {
+                return None;
+            }
+            let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
+            let info = schema.size_align.record(&param_types);
+            let size = info.size.size_wasm32() as u32;
+            let align = info.align.align_wasm32() as u32;
+            Some(layout.reserve_scratch(align, size) as i32)
+        })
+        .collect();
+
     // Align the bump-allocator start past the largest alignment we
     // placed; today that's `cell` (8) but pulling from `cell_layout`
     // keeps it tied to the schema instead of a literal.
@@ -719,6 +743,7 @@ pub(super) fn lay_out_static_memory(
                 params,
                 fields_buf_offset: fields_buf_offsets[i],
                 retptr_offset,
+                params_record_offset: params_record_offsets[i],
                 result_lift,
                 after,
                 borrow_drops: fc.borrow_drops,

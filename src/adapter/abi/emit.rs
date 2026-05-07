@@ -310,6 +310,148 @@ pub(crate) fn emit_handler_call(
     f.instructions().call(handler_idx);
 }
 
+/// Bail when an indirect-params async fn carries a param shape the
+/// lower-mode bindgen doesn't yet handle. Today's coverage is scalar
+/// primitives only — every WIT type that flattens to a single
+/// `i32` / `i64` / `f32` / `f64` slot via the canonical-ABI's
+/// primitive lowering. Anything non-scalar (string, list, record,
+/// tuple, variant, option, result, enum, flags, fixed-length-list,
+/// handle, future, stream, error-context) lands in phases 2/3.
+/// Called from each tier's `require_supported_case` after the
+/// `indirect_params` check fires.
+pub(crate) fn require_indirect_params_supported_shape(
+    resolve: &Resolve,
+    fn_name: &str,
+    func: &WitFunction,
+) -> Result<()> {
+    for param in &func.params {
+        if !is_primitive_param_ty(resolve, &param.ty) {
+            bail!(
+                "async function `{fn_name}` has params that overflow \
+                 MAX_FLAT_ASYNC_PARAMS ({}) AND param `{}` is non-scalar. \
+                 Indirect-params lower-to-memory currently supports \
+                 scalar primitives only (bool / s8..s64 / u8..u64 / \
+                 f32 / f64 / char). Strings, lists, records, tuples, \
+                 variants, options, results, enums, flags, fixed-length-\
+                 lists, handles, futures, streams, and error-context land \
+                 in a follow-up.",
+                Resolve::MAX_FLAT_ASYNC_PARAMS,
+                param.name,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// True iff `ty` is one of the canonical-ABI scalar primitives the
+/// lower-mode bindgen's emit arms cover today. Aliases (`type foo =
+/// u32;`) are followed; anything that bottoms out in a `TypeDefKind`
+/// other than `Type` is treated as compound.
+fn is_primitive_param_ty(resolve: &Resolve, ty: &Type) -> bool {
+    match ty {
+        Type::Bool
+        | Type::S8
+        | Type::U8
+        | Type::S16
+        | Type::U16
+        | Type::S32
+        | Type::U32
+        | Type::S64
+        | Type::U64
+        | Type::F32
+        | Type::F64
+        | Type::Char => true,
+        Type::String | Type::ErrorContext => false,
+        Type::Id(id) => match &resolve.types[*id].kind {
+            TypeDefKind::Type(inner) => is_primitive_param_ty(resolve, inner),
+            _ => false,
+        },
+    }
+}
+
+/// Build the wasm sequence that lowers the wrapper's flat function
+/// params into a memory-resident canonical-ABI params record at
+/// `params_record_base`, ready to be passed by pointer to an
+/// `indirect_params = true` import. Used by async target functions
+/// whose flat params overflow `Resolve::MAX_FLAT_ASYNC_PARAMS`.
+///
+/// Pre-built (returns a `Vec<Instruction>` rather than emitting into
+/// a `Function`) so callers can allocate all of their locals — incl.
+/// the bindgen's address + tmp scratch — before freezing the
+/// [`LocalsBuilder`]. Caller plays the sequence back into the wrapper
+/// body at the appropriate point.
+///
+/// The wrapper's wasm function takes the flat params as locals
+/// `0 .. nparams_flat`. For each WIT param, the sequence:
+///
+/// 1. Stages `params_record_base + field_off` into a per-call addr
+///    local via `i32.const` + `local.set` — the bindgen reads this
+///    on every store emit.
+/// 2. Drives `wit_bindgen_core::abi::lower_to_memory` through a
+///    [`WasmEncoderBindgen`] in lower-mode whose `param_flat_locals`
+///    is sliced to this param's flat wasm-locals.
+///
+/// One bindgen across all params: its `param_flat_locals` is the
+/// concatenation of every param's flat slots in canonical order, and
+/// its `flat_cursor` advances naturally. The shared
+/// `store_tmp_by_valtype` cache reuses scratch locals across params
+/// (≤4 total: one each of i32/i64/f32/f64) — instead of allocating a
+/// fresh set per param.
+///
+/// **Phase 2/3 footgun:** wit-bindgen-core 0.57.1's `lower_to_memory`
+/// hardcodes `Realloc::Export("cabi_realloc")`. Today's primitive-
+/// only path never hits the realloc-driven instructions
+/// (`StringLower` / `ListCanonLower` / etc.), so the constant is
+/// dead. When phase 2/3 widens [`is_primitive_param_ty`] to cover
+/// strings / lists, this driver must NOT keep using upstream's
+/// `lower_to_memory` as-is — strings/lists in our static params
+/// record need `Realloc::None` (the host's canon-lower already put
+/// the payload bytes in our memory; we just store the slice). Either
+/// land the upstream PR making realloc configurable, or replicate the
+/// `lower_to_memory` body locally.
+pub(crate) fn build_lower_params_to_memory(
+    resolve: &Resolve,
+    sizes: &SizeAlign,
+    indices: &mut super::super::indices::LocalsBuilder,
+    func: &WitFunction,
+    params_record_base: i32,
+) -> Vec<wasm_encoder::Instruction<'static>> {
+    use super::compat::flat_types;
+    use wit_bindgen_core::abi::lower_to_memory;
+
+    let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
+    let field_offsets = sizes.field_offsets(&param_types);
+
+    // Concatenate every param's flat wasm-locals in canonical order.
+    // `flat_types(...)` panic only fires if `is_primitive_param_ty` is
+    // widened without re-bounding flat width; primitives flatten to
+    // one slot each, far below `MAX_FLAT_PARAMS`.
+    let total_flat_count: u32 = param_types
+        .iter()
+        .map(|ty| {
+            flat_types(resolve, ty, None)
+                .unwrap_or_else(|| panic!("param flat width exceeds MAX_FLAT_PARAMS"))
+                .len() as u32
+        })
+        .sum();
+    let all_flat_locals: Vec<u32> = (0..total_flat_count).collect();
+
+    let addr_local = indices.alloc_local(wasm_encoder::ValType::I32);
+    let mut bg = super::WasmEncoderBindgen::new(sizes, addr_local, indices)
+        .with_param_flat_locals(all_flat_locals);
+
+    for ((field_off, _field_size), ty) in field_offsets.iter().zip(&param_types) {
+        // Both addends are bounded by each tier's LAYOUT_SIZE_BUDGET
+        // (i32::MAX) — params_record_base sits inside the layout and
+        // field_off is ≤ record_size ≤ layout end, so the sum stays
+        // ≤ i32::MAX.
+        let effective_addr = params_record_base + field_off.size_wasm32() as i32;
+        bg.emit_set_addr_const(effective_addr);
+        lower_to_memory(resolve, &mut bg, (), (), ty);
+    }
+    bg.into_instructions()
+}
+
 /// Push either the direct-return local, or the static retptr (when
 /// the export sig is callee-returns). No-op for void.
 pub(crate) fn emit_wrapper_return(
@@ -908,7 +1050,9 @@ pub(crate) fn emit_populate_call_id(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::indices::LocalsBuilder;
     use super::*;
+    use wasm_encoder::Instruction;
     use wasm_encoder::{CodeSection, EntityType, FunctionSection, ImportSection, TypeSection};
 
     /// Build a one-fn module wrapping `emit_cabi_realloc_call_runtime`,
@@ -1022,6 +1166,224 @@ mod tests {
                     "elem_count={elem_count} cell_size={cell_size}: expected 1 `unreachable`, found {count}",
                 );
             }
+        }
+    }
+
+    /// One slot of `build_lower_params_to_memory` output: the canonical
+    /// store width the test expects to see for a single param.
+    /// Stripping `MemArg` keeps the matcher offset-agnostic; the
+    /// per-block assertions below pin the offset separately.
+    #[derive(Debug, Eq, PartialEq)]
+    enum StoreSig {
+        I32,
+        I64,
+        F32,
+        F64,
+        I32_8,
+    }
+
+    impl StoreSig {
+        /// Match an `Instruction` against this kind, returning its
+        /// `MemArg.offset` on hit. `None` on width mismatch — caller
+        /// turns that into a panic with the surrounding context.
+        fn match_offset(&self, inst: &Instruction<'_>) -> Option<u64> {
+            match (self, inst) {
+                (StoreSig::I32, Instruction::I32Store(ma)) => Some(ma.offset),
+                (StoreSig::I64, Instruction::I64Store(ma)) => Some(ma.offset),
+                (StoreSig::F32, Instruction::F32Store(ma)) => Some(ma.offset),
+                (StoreSig::F64, Instruction::F64Store(ma)) => Some(ma.offset),
+                (StoreSig::I32_8, Instruction::I32Store8(ma)) => Some(ma.offset),
+                _ => None,
+            }
+        }
+    }
+
+    /// Parse `wit`, find the single function in `pkg/iface`, and run
+    /// it through `build_lower_params_to_memory` with the given
+    /// `params_record_base`. Returns the resolved size_align for
+    /// downstream offset assertions plus the emitted instructions.
+    fn run_lower_params(
+        wit: &str,
+        pkg_iface: &str,
+        params_record_base: i32,
+        nparams_flat: u32,
+    ) -> (SizeAlign, Vec<Instruction<'static>>) {
+        let mut resolve = Resolve::default();
+        resolve.push_str("test.wit", wit).expect("parse test WIT");
+        let (_, iface) = resolve
+            .interfaces
+            .iter()
+            .find(|(id, _)| resolve.id_of(*id).as_deref() == Some(pkg_iface))
+            .expect("target interface present");
+        let func = iface
+            .functions
+            .values()
+            .next()
+            .expect("interface must have one fn")
+            .clone();
+
+        let mut sizes = SizeAlign::default();
+        sizes.fill(&resolve);
+        let mut indices = LocalsBuilder::new(nparams_flat);
+        let insts =
+            build_lower_params_to_memory(&resolve, &sizes, &mut indices, &func, params_record_base);
+        (sizes, insts)
+    }
+
+    /// Snapshot test pinning the byte-level layout produced by
+    /// `build_lower_params_to_memory` for a 6-primitive-mixed async
+    /// fn. Catches the bugs validation can't: wrong store width
+    /// (`i32.store8` vs `i32.store16`), swapped field offsets, off-by-
+    /// one in `field_offsets`. The expected offsets fall out of the
+    /// canonical ABI's record-of-primitives layout — pinning them
+    /// here means a future `SizeAlign` regression fails this test
+    /// instead of silently producing miswired wasm that still validates.
+    #[test]
+    fn build_lower_params_to_memory_pins_mixed_primitive_layout() {
+        const BASE: i32 = 1024;
+        // Six distinct flat widths + one repeated (u32 / char both i32)
+        // — covers every store width the lower-mode bindgen emits today.
+        let wit = r#"
+            package my:shape@1.0.0;
+            interface api {
+                mixed: async func(
+                    a: u32, b: u64, c: f32, d: f64, e: bool, f: char
+                ) -> u32;
+            }
+        "#;
+        let (sizes, insts) = run_lower_params(wit, "my:shape/api@1.0.0", BASE, 6);
+
+        // Canonical-ABI record layout for `(u32, u64, f32, f64, bool, char)`:
+        // u32@0, u64@8, f32@16, f64@24, bool@32, char@36 (size 40, align 8).
+        // Pull live values from `SizeAlign::field_offsets` so a wit-parser
+        // upgrade that changes the spec doesn't silently desync the test.
+        let param_types = [
+            Type::U32,
+            Type::U64,
+            Type::F32,
+            Type::F64,
+            Type::Bool,
+            Type::Char,
+        ];
+        let field_offs = sizes.field_offsets(&param_types);
+        let expected: Vec<(i64, StoreSig)> = field_offs
+            .iter()
+            .zip([
+                StoreSig::I32,   // u32
+                StoreSig::I64,   // u64
+                StoreSig::F32,   // f32
+                StoreSig::F64,   // f64
+                StoreSig::I32_8, // bool — 1 byte store
+                StoreSig::I32,   // char — full i32 store
+            ])
+            .map(|((off, _size), sig)| (BASE as i64 + off.size_wasm32() as i64, sig))
+            .collect();
+
+        // Each primitive lowers to a fixed 7-instruction block:
+        //   i32.const <effective_addr>; local.set $addr_local;
+        //   local.get $param_flat;
+        //   local.set $tmp_<vt>; local.get $addr_local; local.get $tmp_<vt>;
+        //   <store> offset=0
+        // The addr_local was allocated first inside
+        // `build_lower_params_to_memory`, so its index is `nparams_flat`.
+        const ADDR_LOCAL: u32 = 6;
+        const BLOCK_LEN: usize = 7;
+        assert_eq!(
+            insts.len(),
+            BLOCK_LEN * expected.len(),
+            "expected {} instructions per param, got {} total",
+            BLOCK_LEN,
+            insts.len(),
+        );
+
+        for (param_i, (eff_addr, sig)) in expected.iter().enumerate() {
+            let block = &insts[param_i * BLOCK_LEN..(param_i + 1) * BLOCK_LEN];
+
+            // [0] i32.const <effective_addr>
+            match &block[0] {
+                Instruction::I32Const(v) => assert_eq!(
+                    *v as i64, *eff_addr,
+                    "param {param_i}: i32.const should stage effective addr",
+                ),
+                other => panic!("param {param_i}: block[0] expected I32Const, got {other:?}"),
+            }
+            // [1] local.set $addr_local
+            assert!(
+                matches!(&block[1], Instruction::LocalSet(idx) if *idx == ADDR_LOCAL),
+                "param {param_i}: block[1] expected LocalSet({ADDR_LOCAL}), got {:?}",
+                &block[1],
+            );
+            // [2] local.get $param_flat (cursor advances 1 per primitive)
+            assert!(
+                matches!(&block[2], Instruction::LocalGet(idx) if *idx == param_i as u32),
+                "param {param_i}: block[2] expected LocalGet({param_i}), got {:?}",
+                &block[2],
+            );
+            // [3] local.set $tmp — captured for [5]'s reload check
+            let tmp = match &block[3] {
+                Instruction::LocalSet(idx) => *idx,
+                other => panic!("param {param_i}: block[3] expected LocalSet, got {other:?}"),
+            };
+            // [4] local.get $addr_local
+            assert!(
+                matches!(&block[4], Instruction::LocalGet(idx) if *idx == ADDR_LOCAL),
+                "param {param_i}: block[4] expected LocalGet({ADDR_LOCAL}), got {:?}",
+                &block[4],
+            );
+            // [5] local.get $tmp — must be the same local stored at [3]
+            assert!(
+                matches!(&block[5], Instruction::LocalGet(idx) if *idx == tmp),
+                "param {param_i}: block[5] should reload the same tmp ({tmp}) stored at [3], got {:?}",
+                &block[5],
+            );
+            // [6] <store> offset=0 — the field offset is in addr_local,
+            // not in MemArg.offset. A non-zero offset would mean the
+            // bindgen mistakenly fused the addr stage and the store.
+            let actual_offset = sig.match_offset(&block[6]).unwrap_or_else(|| {
+                panic!(
+                    "param {param_i}: block[6] expected {sig:?} store, got {:?}",
+                    &block[6],
+                )
+            });
+            assert_eq!(
+                actual_offset, 0,
+                "param {param_i}: store offset should be 0 (field offset goes in addr_local)",
+            );
+        }
+    }
+
+    /// Sister snapshot for the all-`u32` case — verifies cursor
+    /// advances per param and that all stores share the *same* tmp
+    /// (`store_tmp_by_valtype` reuses across same-ValType params).
+    #[test]
+    fn build_lower_params_to_memory_reuses_tmp_across_same_valtype() {
+        const BASE: i32 = 64;
+        let wit = r#"
+            package my:shape@1.0.0;
+            interface api {
+                many: async func(
+                    a: u32, b: u32, c: u32, d: u32, e: u32
+                ) -> u32;
+            }
+        "#;
+        let (_sizes, insts) = run_lower_params(wit, "my:shape/api@1.0.0", BASE, 5);
+
+        const BLOCK_LEN: usize = 7;
+        assert_eq!(insts.len(), BLOCK_LEN * 5);
+
+        // All 5 stores are i32 — the bindgen should allocate exactly
+        // one i32 tmp and reuse it. Pull the tmp from block 0 and
+        // assert every other block uses the same one.
+        let first_tmp = match &insts[3] {
+            Instruction::LocalSet(idx) => *idx,
+            other => panic!("block[0]'s [3] expected LocalSet, got {other:?}"),
+        };
+        for i in 1..5 {
+            let block = &insts[i * BLOCK_LEN..(i + 1) * BLOCK_LEN];
+            assert!(
+                matches!(&block[3], Instruction::LocalSet(idx) if *idx == first_tmp),
+                "param {i}: tmp local should match first param's tmp ({first_tmp})",
+            );
         }
     }
 }

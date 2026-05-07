@@ -9,7 +9,7 @@ use wasm_encoder::{
     CodeSection, EntityType, FunctionSection, ImportSection, Module, TypeSection, ValType,
 };
 use wit_parser::abi::WasmSignature;
-use wit_parser::{Resolve, TypeId};
+use wit_parser::{Function as WitFunction, Resolve, TypeId};
 
 use super::super::abi::canon_async;
 use super::super::abi::emit::{
@@ -283,13 +283,19 @@ pub(super) fn wrapper_exports<'a>(
 pub(super) fn emit_code_section(
     module: &mut Module,
     per_func: &[FuncDispatch],
+    funcs: &[&WitFunction],
     func_idx: &FuncIndices,
     ctx: &WrapperCtx<'_>,
     globals: &GlobalIndices,
 ) {
+    debug_assert_eq!(
+        per_func.len(),
+        funcs.len(),
+        "FuncDispatch list and WitFunction list must be index-aligned",
+    );
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
-        emit_wrapper_function(&mut code, func_idx, ctx, i, fd);
+        emit_wrapper_function(&mut code, func_idx, ctx, i, fd, funcs[i]);
     }
     code.function(&empty_function());
     for fd in per_func {

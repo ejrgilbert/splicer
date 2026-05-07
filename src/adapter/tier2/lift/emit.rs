@@ -65,6 +65,15 @@ pub(crate) struct WrapperLocals {
     /// every other local. Stored here (not synthesized at emit time) so
     /// every local the bindgen needed is already in [`FrozenLocals`].
     pub task_return_loads: Option<Vec<Instruction<'static>>>,
+    /// Pre-built bindgen lower sequence that writes the wrapper's
+    /// flat function params into the canonical params record. `Some`
+    /// iff the async target uses `indirect_params` (canon-lower-async
+    /// switched to pass-by-record); replayed at the handler-call site
+    /// before the record's pointer is pushed. Sourced from
+    /// `wit_bindgen_core::abi::lower_to_memory` driven by the same
+    /// builder that allocated every other local — same rationale as
+    /// [`Self::task_return_loads`].
+    pub params_lower_seq: Option<Vec<Instruction<'static>>>,
     /// Bump-pointer snapshot at wrapper entry; restored at exit
     /// for stack-reset semantics on per-call `cabi_realloc`.
     pub saved_bump: u32,
@@ -238,6 +247,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     size_align: &SizeAlign,
     mut builder: LocalsBuilder,
     fd: &'a FuncDispatch,
+    func: &wit_parser::Function,
 ) -> (WrapperLocals, ResultEmitPlan<'a>, FrozenLocals) {
     let addr = builder.alloc_local(ValType::I32);
     let st = builder.alloc_local(ValType::I32);
@@ -342,6 +352,24 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         bindgen.into_instructions()
     });
 
+    // Indirect-params lower-to-memory sequence for async fns whose
+    // flat params overflowed `MAX_FLAT_ASYNC_PARAMS`. Driven by
+    // `wit_bindgen_core::abi::lower_to_memory` through the same
+    // builder, so any addr / store-tmp scratch lands in `frozen`.
+    let params_lower_seq: Option<Vec<Instruction<'static>>> =
+        fd.import_sig.indirect_params.then(|| {
+            let base = fd
+                .params_record_offset
+                .expect("indirect_params → params_record_offset reserved");
+            super::super::super::abi::emit::build_lower_params_to_memory(
+                resolve,
+                size_align,
+                &mut builder,
+                func,
+                base,
+            )
+        });
+
     // i64 call-id local. Tier-2 generation requires at least one hook
     // (`build_tier2_adapter` bails otherwise), so this is always live.
     let id_local = builder.alloc_local(ValType::I64);
@@ -364,6 +392,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             tr_addr,
             id_local,
             task_return_loads,
+            params_lower_seq,
             saved_bump,
             cells_base,
             next_cell_idx,
