@@ -1667,6 +1667,54 @@ fn tier2_shapes() -> Vec<Shape> {
             })),
             is_ok: false,
         })),
+        // list<tuple<u32, string>>: multi-cell tuple element.
+        // Per-iteration tuple-idx buffer slot holds the resolved
+        // child cell-array indices; the cell payload reads it back.
+        Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            },
+            Shape::Primitive {
+                name: "string",
+                wit_type: "string",
+                rust_ty: "String",
+                rust_literal: r#"String::from("hi")"#,
+                expected_debug: r#""hi""#,
+            },
+        ]))),
+        // list<tuple<u32, tuple<s32, s32>>>: nested tuple element —
+        // two TupleOf cells per iteration, distinct offset_in_elem
+        // slots in the per-call tuple-idx buffer. Pins the
+        // multi-TupleOf cursor under wasmtime.
+        Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "7u32",
+                expected_debug: "7",
+            },
+            Shape::Tuple(vec![
+                Shape::Primitive {
+                    name: "s32",
+                    wit_type: "s32",
+                    rust_ty: "i32",
+                    rust_literal: "-3i32",
+                    expected_debug: "-3",
+                },
+                Shape::Primitive {
+                    name: "s32",
+                    wit_type: "s32",
+                    rust_ty: "i32",
+                    rust_literal: "9i32",
+                    expected_debug: "9",
+                },
+            ]),
+        ]))),
     ]
 }
 

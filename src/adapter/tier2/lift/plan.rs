@@ -246,6 +246,12 @@ pub(crate) enum ListElementClass {
     /// is `elem_cell_base + relative_idx`; emit dispatches on
     /// `PlanCursor.elem_cell_base` rather than via side-data.
     PrestagedChildIdx,
+    /// Cell payload references an array of child cell-array indices
+    /// in a build-time-static blob (TupleOf). For list elements the
+    /// indices array is per-call: each iteration writes
+    /// `[elem_cell_base + child_pos[i]]` into a slot of a
+    /// `cabi_realloc`'d tuple-indices buffer.
+    PrestagedTupleIndices,
 }
 
 impl Cell {
@@ -258,6 +264,7 @@ impl Cell {
         match self {
             Cell::Char { .. } => Some(ListElementClass::PrestagedChar),
             Cell::Option { .. } | Cell::Result { .. } => Some(ListElementClass::PrestagedChildIdx),
+            Cell::TupleOf { .. } => Some(ListElementClass::PrestagedTupleIndices),
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -270,7 +277,6 @@ impl Cell {
             Cell::Flags { .. }
             | Cell::Handle { .. }
             | Cell::RecordOf { .. }
-            | Cell::TupleOf { .. }
             | Cell::Variant { .. }
             | Cell::ListOf { .. } => None,
         }
@@ -712,6 +718,13 @@ impl LiftPlanBuilder {
         for elem_ty in &t.types {
             children.push(self.push(elem_ty, resolve, names));
         }
+        // WIT grammar forbids 0-tuples; pin it here so the
+        // list-element tuple-idx-buffer codegen (which divides by
+        // children-count) can't fire opaquely on a malformed plan.
+        debug_assert!(
+            !children.is_empty(),
+            "Cell::TupleOf must have ≥1 child — WIT forbids 0-tuples",
+        );
         self.push_cell(Cell::TupleOf { children })
     }
 

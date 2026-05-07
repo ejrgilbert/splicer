@@ -53,10 +53,10 @@ pub(crate) enum CellSideData {
     Record {
         idx: u32,
     },
-    /// `cell::tuple-of(list<u32>)` payload — `(off, len)` of the
-    /// child-index array in the tuple-indices segment.
+    /// `cell::tuple-of(list<u32>)` payload source. See
+    /// [`TupleIdxSource`] for which buffer the `(ptr, len)` points at.
     Tuple {
-        slice: BlobSlice,
+        source: TupleIdxSource,
     },
     /// `cell::flags-set(u32)` payload + the addresses the wrapper
     /// bit-walk patches at runtime.
@@ -93,6 +93,22 @@ pub(crate) enum CellSideData {
 pub(crate) enum CharScratch {
     Static { scratch_addr: i32 },
     Prestaged,
+}
+
+/// Where a `Cell::TupleOf`'s child-index array lives.
+///
+/// - `Static`: indices baked into the per-build `tuple-indices`
+///   segment by the layout phase; cell payload reads `(slice.off,
+///   slice.len)` as build-time consts.
+/// - `PerIteration`: the cell sits inside a `list<tuple<...>>`
+///   element body; each iteration writes `[elem_cell_base + child_pos[i]]`
+///   into a per-call `cabi_realloc`'d buffer. `offset_in_elem` is
+///   the byte offset of this cell's slot within the per-iteration
+///   sub-region of the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TupleIdxSource {
+    Static(BlobSlice),
+    PerIteration { offset_in_elem: u32 },
 }
 
 /// Per-cell fill maps for one (fn, param | result), each parallel to
@@ -138,7 +154,9 @@ pub(crate) fn fold_cell_side_data(
                 idx: sources.record_info[i].expect("RecordOf cell missing record-info idx"),
             },
             Cell::TupleOf { .. } => CellSideData::Tuple {
-                slice: sources.tuple_indices[i].expect("TupleOf cell missing tuple-indices slice"),
+                source: TupleIdxSource::Static(
+                    sources.tuple_indices[i].expect("TupleOf cell missing tuple-indices slice"),
+                ),
             },
             Cell::Flags { .. } => CellSideData::Flags(Box::new(
                 sources.flags_fill[i]

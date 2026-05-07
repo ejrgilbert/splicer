@@ -19,7 +19,7 @@ use super::plan::{ArmGuard, Cell, HandleKind, LiftPlan, NamedListInfo};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
-use super::sidetable::{CellSideData, CharScratch};
+use super::sidetable::{CellSideData, CharScratch, TupleIdxSource};
 use super::*;
 
 // ─── Fixture WIT + Resolve helpers ────────────────────────────
@@ -93,6 +93,9 @@ const TEST_WIT: &str = r#"
         f-list-option-option-u32: func(xs: list<option<option<u32>>>);
         f-list-result-u32-string: func(xs: list<result<u32, string>>);
         f-list-result-unit-string: func(xs: list<result<_, string>>);
+        f-list-tuple-u32-u32: func(xs: list<tuple<u32, u32>>);
+        f-list-tuple-u32-string: func(xs: list<tuple<u32, string>>);
+        f-list-tuple-of-tuple: func(xs: list<tuple<u32, tuple<s32, s32>>>);
         record list-char-pair { items: list<char>, scores: list<u32> }
         f-record-with-list-char: func(rcp: list-char-pair);
         f-result-list-u32: func() -> list<u32>;
@@ -363,7 +366,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 let len = children.len() as u32;
                 tuple_cursor += len * U32_BYTES;
                 CellSideData::Tuple {
-                    slice: BlobSlice { off, len },
+                    source: TupleIdxSource::Static(BlobSlice { off, len }),
                 }
             }
             Cell::Flags { info, .. } => {
@@ -491,6 +494,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let char_len = builder.alloc_local(ValType::I32);
     let char_scratch_addr = builder.alloc_local(ValType::I32);
     let list_elem_child_idx = builder.alloc_local(ValType::I32);
+    let tuple_slot_ptr = builder.alloc_local(ValType::I32);
     let id_local = builder.alloc_local(ValType::I64);
     let saved_bump = builder.alloc_local(ValType::I32);
     let cells_base = builder.alloc_local(ValType::I32);
@@ -512,6 +516,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         char_len: Some(char_len),
         char_scratch_addr: Some(char_scratch_addr),
         list_elem_child_idx: Some(list_elem_child_idx),
+        tuple_slot_ptr: Some(tuple_slot_ptr),
         cells_base,
         next_cell_idx,
         result: None,
@@ -1067,6 +1072,108 @@ fn list_of_result_u32_string_element_plan_shape() {
 }
 
 #[test]
+fn list_of_tuple_u32_string_element_plan_shape() {
+    // tuple<u32, string>: [Int(slot 0), Text(slots 1..2),
+    //   TupleOf(children=[0, 1])]. Each iteration writes the
+    //   resolved cell-array indices into the per-call tuple-idx
+    //   buffer slot; the cell payload reads back the staged ptr.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-tuple-u32-string", &r, &mut names);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(element_plan.cells.len(), 3);
+    let Cell::TupleOf { children } = &element_plan.cells[2] else {
+        panic!(
+            "expected TupleOf at element-plan cell 2, got {:?}",
+            element_plan.cells[2]
+        );
+    };
+    assert_eq!(children.as_slice(), &[0, 1]);
+    assert_eq!(element_plan.root(), 2);
+}
+
+/// Pull the element_plan out of a top-level `Cell::ListOf`. Helper
+/// for the `walk_element_plan` lockstep tests below.
+fn list_element_plan<'a>(plan: &'a LiftPlan, cell_idx: usize) -> &'a LiftPlan {
+    match &plan.cells[cell_idx] {
+        Cell::ListOf { element_plan, .. } => element_plan,
+        other => panic!("expected ListOf at cell {cell_idx}, got {other:?}"),
+    }
+}
+
+#[test]
+fn walk_element_plan_counts_match_side_data_lockstep() {
+    // Drift between counts (which size the per-list buffers) and
+    // side-data offsets (which index into them) is the failure mode
+    // #5 flagged. Pin: counts.tuple_idx_slots == Σ(children.len())
+    // over PerIteration TupleOf cells, and offset_in_elem values
+    // are the cumulative byte prefix.
+    let (r, mut names) = setup();
+    for fn_name in [
+        "f-list-tuple-u32-string",
+        "f-list-tuple-of-tuple",
+        "f-list-tuple-u32-u32",
+    ] {
+        let plan = plan_for_param(fn_name, &r, &mut names);
+        let elem_plan = list_element_plan(&plan, 0);
+        let (side, counts) = super::emit::walk_element_plan(elem_plan);
+        assert_eq!(side.len(), elem_plan.cells.len());
+        let mut expected_chars = 0u32;
+        let mut expected_tuple_slots = 0u32;
+        let mut running_tuple_off = 0u32;
+        for (cell, sd) in elem_plan.cells.iter().zip(side.iter()) {
+            match cell {
+                Cell::Char { .. } => {
+                    assert!(matches!(sd, CellSideData::Char { .. }));
+                    expected_chars += 1;
+                }
+                Cell::TupleOf { children } => {
+                    let CellSideData::Tuple {
+                        source: TupleIdxSource::PerIteration { offset_in_elem },
+                    } = sd
+                    else {
+                        panic!("expected PerIteration TupleOf side data, got {sd:?}");
+                    };
+                    assert_eq!(
+                        *offset_in_elem, running_tuple_off,
+                        "TupleOf offsets must be cumulative across element_plan",
+                    );
+                    running_tuple_off += children.len() as u32 * 4;
+                    expected_tuple_slots += children.len() as u32;
+                }
+                _ => assert!(matches!(sd, CellSideData::None)),
+            }
+        }
+        assert_eq!(
+            counts.chars, expected_chars,
+            "counts.chars drift in {fn_name}",
+        );
+        assert_eq!(
+            counts.tuple_idx_slots, expected_tuple_slots,
+            "counts.tuple_idx_slots drift in {fn_name}",
+        );
+    }
+}
+
+#[test]
+fn walk_element_plan_zero_counts_for_scalar_only() {
+    // Scalar-only element plans must produce zero-counts so the
+    // per-list buffer allocations stay gated off.
+    let (r, mut names) = setup();
+    for fn_name in ["f-list-u32", "f-list-string"] {
+        let plan = plan_for_param(fn_name, &r, &mut names);
+        let elem_plan = list_element_plan(&plan, 0);
+        let (_, counts) = super::emit::walk_element_plan(elem_plan);
+        assert_eq!(counts.chars, 0, "{fn_name} should have no char cells");
+        assert_eq!(
+            counts.tuple_idx_slots, 0,
+            "{fn_name} should have no tuple-idx slots",
+        );
+    }
+}
+
+#[test]
 fn record_with_list_char_field_recurses_into_list() {
     // list-char-pair { items: list<char>, scores: list<u32> }
     //   items   → cell 0 (ListOf, slots 0..1, char element)
@@ -1281,6 +1388,8 @@ fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
         plan_for_param("f-list-char", &r, &mut names),
         plan_for_param("f-list-option-u32", &r, &mut names),
         plan_for_param("f-list-result-u32-string", &r, &mut names),
+        plan_for_param("f-list-tuple-u32-string", &r, &mut names),
+        plan_for_param("f-list-tuple-of-tuple", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
         plan_for_param("f-option-list", &r, &mut names),
@@ -1974,8 +2083,9 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-error-context", &r, &mut names),
         plan_for_param("f-result-with-err-ctx", &r, &mut names),
         // Scalar-element lists + char (per-iteration utf-8 scratch) +
-        // option/result (cell-payload runtime child idx). Compound
-        // element kinds with static-side-table indices remain gated.
+        // option/result (cell-payload runtime child idx) + tuple
+        // (per-iteration tuple-idx buffer). Element kinds with
+        // static side-table records still gated.
         plan_for_param("f-list-u32", &r, &mut names),
         plan_for_param("f-list-string", &r, &mut names),
         plan_for_param("f-list-char", &r, &mut names),
@@ -1986,6 +2096,12 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-list-option-option-u32", &r, &mut names),
         plan_for_param("f-list-result-u32-string", &r, &mut names),
         plan_for_param("f-list-result-unit-string", &r, &mut names),
+        plan_for_param("f-list-tuple-u32-u32", &r, &mut names),
+        plan_for_param("f-list-tuple-u32-string", &r, &mut names),
+        // Nested tuple element: two TupleOf cells in element_plan,
+        // their per-iteration slots living adjacent in the per-call
+        // tuple-idx buffer. Pins multi-tuple per-element offset math.
+        plan_for_param("f-list-tuple-of-tuple", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
         // Lists nested in joined arms — guards on the bump pre-pass
@@ -2036,6 +2152,26 @@ fn list_of_result_u32_string_emits_valid_wasm() {
         &r,
         &mut names,
     );
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_of_tuple_u32_string_emits_valid_wasm() {
+    // Multi-cell tuple element with mixed flat shapes (Int + Text).
+    // Exercises the per-list tuple-idx buffer realloc + per-iter
+    // slot staging + the `PerIteration` tuple-of branch.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-tuple-u32-string", &r, &mut names);
+    validate_emit_lift_plan(&plan, &r);
+}
+
+#[test]
+fn list_of_tuple_of_tuple_emits_valid_wasm() {
+    // Nested tuple in a list element: two TupleOf cells per
+    // iteration, distinct `offset_in_elem` slots in the per-call
+    // tuple-idx buffer. Pins the multi-tuple offset accounting.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-tuple-of-tuple", &r, &mut names);
     validate_emit_lift_plan(&plan, &r);
 }
 

@@ -1517,6 +1517,53 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// `list<tuple<u32, string>>` param — multi-cell tuple element.
+    /// Exercises the per-list tuple-indices `cabi_realloc`'d buffer,
+    /// the per-iteration slot staging, and the `PerIteration`
+    /// `TupleIdxSource` branch in `emit_tuple_of_cell`.
+    #[test]
+    fn dispatch_module_with_tuple_list_param_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (memory (export "memory") 1)
+                    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+                        i32.const 0x4000)
+                    (func (export "consume") (param i32 i32))
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "consume" (core func $consume))
+                (alias core export $i "memory" (core memory $mem))
+                (alias core export $i "cabi_realloc" (core func $realloc))
+                (type $consume-ty (func (param "xs" (list (tuple u32 string)))))
+                (func $consume-lifted (type $consume-ty)
+                    (canon lift (core func $consume) (memory $mem) (realloc (func $realloc))))
+                (instance $api-inst (export "consume" (func $consume-lifted)))
+                (export "my:lt/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:lt/api@1.0.0" (instance $api "my:lt/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+
+        let bytes = build_tier2_adapter(
+            "my:lt/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect("tier-2 adapter generation should succeed for list<tuple<u32, string>> param");
+
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// `list<char>` result — same Compound/retptr path as
     /// `list<u32>`, but the per-iteration utf-8 scratch + Prestaged
     /// `CharScratch` ride along on the result side too. The canned

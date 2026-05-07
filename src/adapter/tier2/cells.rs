@@ -397,14 +397,17 @@ impl CellLayout {
         );
     }
 
-    /// `cell::tuple-of(list<u32>)` — payload `(ptr, len)` of a static
-    /// child-index array. Both values are build-time constants
-    /// (segment base + per-cell offset, and the child count).
+    /// `cell::tuple-of(list<u32>)` — payload `(ptr, len)` of a
+    /// child-index array. `indices_off_source` is `ConstI32` for
+    /// static cells (build-time-known offset into the `tuple-indices`
+    /// segment) and `Local` for list-element cells (per-iteration
+    /// slot ptr in a `cabi_realloc`'d buffer). `indices_len` is
+    /// always build-time-known per type.
     pub(crate) fn emit_tuple_of(
         &self,
         f: &mut Function,
         addr_local: u32,
-        indices_off: u32,
+        indices_off_source: PayloadSource,
         indices_len: u32,
     ) {
         self.emit_cell(
@@ -413,7 +416,7 @@ impl CellLayout {
             self.disc_of("tuple-of"),
             &[
                 PayloadPart {
-                    source: PayloadSource::ConstI32(indices_off as i32),
+                    source: indices_off_source,
                     kind: StoreKind::I32,
                     offset: 0,
                 },
@@ -872,9 +875,21 @@ mod tests {
 
     #[test]
     fn tuple_of_cell_emits_valid_wasm() {
-        // params: (addr_local: i32). off/len are i32.const, no locals.
+        // Static path: indices off is an i32.const, no locals beyond addr.
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_tuple_of(f, 0, 0x100, 3));
+        build_and_validate(&[ValType::I32], |f| {
+            cl.emit_tuple_of(f, 0, PayloadSource::ConstI32(0x100), 3)
+        });
+    }
+
+    #[test]
+    fn tuple_of_cell_with_local_off_emits_valid_wasm() {
+        // List-element path: caller stages per-iteration slot ptr into
+        // a local and passes PayloadSource::Local.
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32, ValType::I32], |f| {
+            cl.emit_tuple_of(f, 0, PayloadSource::Local(1), 3)
+        });
     }
 
     #[test]

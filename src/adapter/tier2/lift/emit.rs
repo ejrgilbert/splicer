@@ -22,7 +22,7 @@ use super::plan::{ArmGuard, Cell, LiftPlan, ListElementClass, ListSpec};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
-use super::sidetable::{CellSideData, CharScratch};
+use super::sidetable::{CellSideData, CharScratch, TupleIdxSource};
 use wit_parser::abi::WasmType;
 
 /// Locals + pre-built load sequences used by the wrapper body.
@@ -73,6 +73,20 @@ pub(crate) struct WrapperLocals {
     /// list-element cell of the [`super::plan::ListElementClass::PrestagedChildIdx`]
     /// kind; `None` skips the local in wrappers that never need it.
     pub(super) list_elem_child_idx: Option<u32>,
+    /// Shared staging slot for list-element TupleOf cells' per-call
+    /// indices-buffer slot ptr. `Some` iff the wrapper has any
+    /// list-element [`super::plan::ListElementClass::PrestagedTupleIndices`]
+    /// cell.
+    ///
+    /// **Stage-then-consume invariant.** Single shared local re-staged
+    /// per TupleOf cell. Correct only because [`emit_list_of_arm`]
+    /// stages it via [`emit_stage_tuple_slot`] *immediately* before
+    /// invoking [`emit_cell_op`] for the matching TupleOf cell.
+    /// Interleaving any emit between stage and consume silently
+    /// clobbers it. Future refactors that reorder the per-cell loop
+    /// must keep stage→emit_cell_op contiguous (or split into one
+    /// local per TupleOf cell in element_plan).
+    pub(super) tuple_slot_ptr: Option<u32>,
     /// Direct-return value when the export sig has a single flat
     /// result; `None` otherwise.
     pub result: Option<u32>,
@@ -215,6 +229,16 @@ pub(crate) struct ListEmitLocals {
     /// scratch-buffer size + per-iteration scratch indexing so
     /// multi-char elements (e.g. `tuple<char, char>`) don't alias.
     pub chars_per_elem: u32,
+    /// Per-call buffer for `Cell::TupleOf` element cells —
+    /// `len * tuple_idx_count_per_elem * 4` bytes. Each iteration
+    /// writes runtime-resolved child cell-array indices into
+    /// per-cell sub-slots; the cell payload `(ptr, len)` reads back
+    /// the same slot. `Some` iff `tuple_idx_count_per_elem > 0`.
+    pub tuple_idx_buf_base: Option<u32>,
+    /// Total `Cell::TupleOf` child-index slots across all TupleOf
+    /// cells in `element_plan` (`Σ children.len()`). 0 when there
+    /// are no list-element TupleOf cells.
+    pub tuple_idx_count_per_elem: u32,
     /// Per-iteration cell-array base (`start_i + j*elem_count`),
     /// staged once at iteration start and reused by
     /// [`emit_set_elem_cell_addr`], the indices_ptr write, and any
@@ -267,19 +291,11 @@ fn build_one_list_emit_locals(
     lift_from_memory(resolve, &mut bindgen, (), &elem_ty);
     let elem_loads = bindgen.into_instructions();
     let elem_byte_size = size_align.size(&elem_ty).size_wasm32() as u32;
-    let elem_cell_side: Vec<CellSideData> = spec
-        .element_plan
-        .cells
-        .iter()
-        .map(elem_cell_side_data)
-        .collect();
-    let chars_per_elem = spec
-        .element_plan
-        .cells
-        .iter()
-        .filter(|c| matches!(c, Cell::Char { .. }))
-        .count() as u32;
-    let char_scratch_base = (chars_per_elem > 0).then(|| builder.alloc_local(ValType::I32));
+    let (elem_cell_side, counts) = walk_element_plan(spec.element_plan);
+    let char_scratch_base = (counts.chars > 0).then(|| builder.alloc_local(ValType::I32));
+    let tuple_idx_buf_base = (counts.tuple_idx_slots > 0).then(|| builder.alloc_local(ValType::I32));
+    let chars_per_elem = counts.chars;
+    let tuple_idx_count_per_elem = counts.tuple_idx_slots;
     let elem_cell_base = builder.alloc_local(ValType::I32);
     ListEmitLocals {
         start_i,
@@ -293,22 +309,23 @@ fn build_one_list_emit_locals(
         elem_cell_side,
         char_scratch_base,
         chars_per_elem,
+        tuple_idx_buf_base,
+        tuple_idx_count_per_elem,
         elem_cell_base,
     }
 }
 
-/// Any list-element cell in the wrapper whose payload carries a
-/// child cell-array index ([`ListElementClass::PrestagedChildIdx`]).
-/// Gates `WrapperLocals.list_elem_child_idx`.
-fn fn_has_list_elem_child_idx(fd: &FuncDispatch) -> bool {
+/// Whether any list-element cell across the wrapper's plans (params
+/// + compound result) has the given [`ListElementClass`]. Gates
+/// shared wrapper locals (e.g. `list_elem_child_idx`, `tuple_slot_ptr`)
+/// so wrappers without that pattern shed unused locals.
+fn fn_has_list_elem_class(fd: &FuncDispatch, want: ListElementClass) -> bool {
     let plan_has = |plan: &LiftPlan| {
         plan.list_specs().any(|spec| {
-            spec.element_plan.cells.iter().any(|c| {
-                matches!(
-                    c.list_element_class(),
-                    Some(ListElementClass::PrestagedChildIdx)
-                )
-            })
+            spec.element_plan
+                .cells
+                .iter()
+                .any(|c| c.list_element_class() == Some(want))
         })
     };
     if fd.params.iter().any(|p| plan_has(&p.lift.plan)) {
@@ -318,6 +335,14 @@ fn fn_has_list_elem_child_idx(fd: &FuncDispatch) -> bool {
         Some(ResultSourceLayout::Compound { compound, .. }) => plan_has(&compound.plan),
         _ => false,
     }
+}
+
+fn fn_has_list_elem_child_idx(fd: &FuncDispatch) -> bool {
+    fn_has_list_elem_class(fd, ListElementClass::PrestagedChildIdx)
+}
+
+fn fn_has_list_elem_tuple(fd: &FuncDispatch) -> bool {
+    fn_has_list_elem_class(fd, ListElementClass::PrestagedTupleIndices)
 }
 
 /// Any `Cell::Char` in the wrapper (params or result, including
@@ -336,28 +361,63 @@ fn fn_contains_char(fd: &FuncDispatch) -> bool {
     }
 }
 
-/// Side-data for one element-plan cell. Driven off
-/// [`Cell::list_element_class`] so the gate in plan.rs and the fold
-/// here can't drift. New `ListElementClass` variants force a match
+/// Per-class counts collected by [`walk_element_plan`]. Drives the
+/// per-list shared-buffer / shared-local allocation decisions.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ElementCounts {
+    /// Count of `Cell::Char` cells in `element_plan` (sized via
+    /// `len * chars * MAX_UTF8_LEN`).
+    pub chars: u32,
+    /// Sum of `children.len()` across `Cell::TupleOf` cells (sized
+    /// via `len * tuple_idx_slots * 4`).
+    pub tuple_idx_slots: u32,
+}
+
+/// Single walk over `element_plan.cells` producing both the
+/// per-cell side data and the per-class counts. Replaces three
+/// independent iterations whose drift would silently produce
+/// stale side-data vs. mis-sized buffers. Driven off
+/// [`Cell::list_element_class`] so adding a class forces a fold
 /// arm at compile time.
-fn elem_cell_side_data(cell: &Cell) -> CellSideData {
-    let class = cell.list_element_class().unwrap_or_else(|| {
-        unreachable!(
-            "Cell {cell:?} reached elem_cell_side_data despite \
-             Cell::list_element_class() rejecting it"
-        )
-    });
-    match class {
-        ListElementClass::Scalar => CellSideData::None,
-        // Per-iteration scratch addr staged into `lcl.char_scratch_addr`
-        // by `emit_stage_char_scratch_addr` before each emit fires.
-        ListElementClass::PrestagedChar => CellSideData::Char {
-            scratch: CharScratch::Prestaged,
-        },
-        // Option/Result child indices are computed inline at emit
-        // time via PlanCursor.elem_cell_base — no side-data carrier.
-        ListElementClass::PrestagedChildIdx => CellSideData::None,
-    }
+pub(super) fn walk_element_plan(
+    element_plan: &LiftPlan,
+) -> (Vec<CellSideData>, ElementCounts) {
+    let mut counts = ElementCounts::default();
+    let side: Vec<CellSideData> = element_plan
+        .cells
+        .iter()
+        .map(|cell| {
+            let class = cell.list_element_class().unwrap_or_else(|| {
+                unreachable!(
+                    "Cell {cell:?} reached walk_element_plan despite \
+                     Cell::list_element_class() rejecting it"
+                )
+            });
+            match class {
+                ListElementClass::Scalar => CellSideData::None,
+                ListElementClass::PrestagedChar => {
+                    counts.chars += 1;
+                    CellSideData::Char {
+                        scratch: CharScratch::Prestaged,
+                    }
+                }
+                // Option/Result resolve their child idx inline at
+                // emit time via PlanCursor.elem_cell_base.
+                ListElementClass::PrestagedChildIdx => CellSideData::None,
+                ListElementClass::PrestagedTupleIndices => {
+                    let Cell::TupleOf { children } = cell else {
+                        unreachable!("PrestagedTupleIndices class on non-TupleOf {cell:?}")
+                    };
+                    let off = counts.tuple_idx_slots * 4;
+                    counts.tuple_idx_slots += children.len() as u32;
+                    CellSideData::Tuple {
+                        source: TupleIdxSource::PerIteration { offset_in_elem: off },
+                    }
+                }
+            }
+        })
+        .collect();
+    (side, counts)
 }
 
 /// Allocate every local the wrapper body will reference, build the
@@ -391,6 +451,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let char_scratch_addr = needs_char_locals.then(|| builder.alloc_local(ValType::I32));
     let list_elem_child_idx =
         fn_has_list_elem_child_idx(fd).then(|| builder.alloc_local(ValType::I32));
+    let tuple_slot_ptr =
+        fn_has_list_elem_tuple(fd).then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -527,6 +589,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             char_len,
             char_scratch_addr,
             list_elem_child_idx,
+            tuple_slot_ptr,
             result,
             tr_addr,
             id_local,
@@ -845,11 +908,11 @@ fn emit_cell_op(
             };
             cell_layout.emit_record_of(f, addr, *idx);
         }
-        Cell::TupleOf { .. } => {
-            let CellSideData::Tuple { slice } = side_data else {
+        Cell::TupleOf { children } => {
+            let CellSideData::Tuple { source: src_kind } = side_data else {
                 panic!("TupleOf cell paired with non-Tuple side data {side_data:?}");
             };
-            cell_layout.emit_tuple_of(f, addr, slice.off, slice.len);
+            emit_tuple_of_cell(f, cell_layout, addr, children, src_kind, lcl);
         }
         // List arm — own special-cased loop.
         Cell::ListOf {
@@ -1030,6 +1093,22 @@ fn emit_list_of_arm(
             scratch_base,
         );
     }
+    // Per-element tuple-indices buffer: `tuple_idx_count_per_elem`
+    // u32 slots per iteration, each holding one resolved child idx.
+    if let Some(buf_base) = ll.tuple_idx_buf_base {
+        let elem_bytes = ll
+            .tuple_idx_count_per_elem
+            .checked_mul(4)
+            .expect("tuple_idx_count_per_elem * 4 overflowed u32");
+        emit_cabi_realloc_call_runtime(
+            f,
+            ctx.cabi_realloc_idx,
+            4,
+            ll.len,
+            elem_bytes,
+            buf_base,
+        );
+    }
     cell_layout.emit_list_of(f, lcl.addr, ll.indices_ptr, ll.len);
 
     // for (j = 0; j < len; j++) { ... }
@@ -1079,9 +1158,28 @@ fn emit_list_of_arm(
     let mut char_idx: u32 = 0;
     for (cell_pos, elem_cell) in element_plan.cells.iter().enumerate() {
         emit_set_elem_cell_addr(f, lcl, ll, cell_pos as u32, cell_layout.size);
-        if matches!(elem_cell, Cell::Char { .. }) {
-            emit_stage_char_scratch_addr(f, lcl, ll, char_idx);
-            char_idx += 1;
+        match elem_cell {
+            Cell::Char { .. } => {
+                emit_stage_char_scratch_addr(f, lcl, ll, char_idx);
+                char_idx += 1;
+            }
+            Cell::TupleOf { children } => {
+                // Resolve the element_plan-relative child indices to
+                // runtime cell-array indices and stash them in the
+                // per-iteration tuple-idx buffer slot.
+                let CellSideData::Tuple {
+                    source: TupleIdxSource::PerIteration { offset_in_elem },
+                } = ll.elem_cell_side[cell_pos]
+                else {
+                    unreachable!(
+                        "list-element TupleOf at {cell_pos} must carry PerIteration side data, \
+                         got {:?}",
+                        ll.elem_cell_side[cell_pos]
+                    );
+                };
+                emit_stage_tuple_slot(f, lcl, ll, offset_in_elem, children);
+            }
+            _ => {}
         }
         emit_cell_op(
             f,
@@ -1184,6 +1282,88 @@ fn stage_child_idx_source(
     f.instructions().i32_add();
     f.instructions().local_set(dest);
     PayloadSource::Local(dest)
+}
+
+/// Emit one `Cell::TupleOf` cell. Dispatches on the side-data
+/// `TupleIdxSource`: static cells point at the build-time blob;
+/// list-element cells consume `lcl.tuple_slot_ptr`, which the caller
+/// (emit_list_of_arm) has already staged for this iteration plus
+/// written each child's runtime cell-array index into
+/// `mem[slot_ptr + i*4]`.
+fn emit_tuple_of_cell(
+    f: &mut Function,
+    cell_layout: &CellLayout,
+    addr: u32,
+    children: &[u32],
+    src_kind: &TupleIdxSource,
+    lcl: &WrapperLocals,
+) {
+    let len = children.len() as u32;
+    match src_kind {
+        TupleIdxSource::Static(slice) => {
+            debug_assert_eq!(slice.len, len);
+            cell_layout.emit_tuple_of(f, addr, PayloadSource::ConstI32(slice.off as i32), len);
+        }
+        TupleIdxSource::PerIteration { .. } => {
+            let slot_ptr_local = lcl.tuple_slot_ptr.expect(
+                "tuple_slot_ptr unset — fn_has_list_elem_tuple must agree with \
+                 PerIteration cells reaching emit_tuple_of_cell",
+            );
+            cell_layout.emit_tuple_of(f, addr, PayloadSource::Local(slot_ptr_local), len);
+        }
+    }
+}
+
+/// Stage `lcl.tuple_slot_ptr = ll.tuple_idx_buf_base + j *
+/// tuple_idx_count_per_elem * 4 + offset_in_elem`, then write each
+/// child's runtime cell-array index (`elem_cell_base + relative`)
+/// into `mem[slot_ptr + i*4]`. Called once per iteration before the
+/// matching `Cell::TupleOf` element-plan cell's emit fires.
+fn emit_stage_tuple_slot(
+    f: &mut Function,
+    lcl: &WrapperLocals,
+    ll: &ListEmitLocals,
+    offset_in_elem: u32,
+    children: &[u32],
+) {
+    let buf_base = ll.tuple_idx_buf_base.expect(
+        "Cell::TupleOf element requires tuple_idx_buf_base — \
+         build_one_list_emit_locals must have allocated it",
+    );
+    let dest = lcl.tuple_slot_ptr.expect(
+        "tuple_slot_ptr unset for list with TupleOf elements — \
+         fn_has_list_elem_tuple must include element-plan TupleOf cells",
+    );
+    // slot_ptr = buf_base + j*stride + offset_in_elem. Stride is
+    // always ≥4 (one u32 per child × ≥1 child per TupleOf).
+    let stride_bytes = ll
+        .tuple_idx_count_per_elem
+        .checked_mul(4)
+        .expect("tuple_idx_count_per_elem * 4 overflowed u32");
+    f.instructions().local_get(buf_base);
+    f.instructions().local_get(ll.j);
+    f.instructions().i32_const(stride_bytes as i32);
+    f.instructions().i32_mul();
+    f.instructions().i32_add();
+    if offset_in_elem != 0 {
+        f.instructions().i32_const(offset_in_elem as i32);
+        f.instructions().i32_add();
+    }
+    f.instructions().local_set(dest);
+    // mem[slot_ptr + i*4] = elem_cell_base + child[i]
+    for (i, child) in children.iter().enumerate() {
+        f.instructions().local_get(dest);
+        f.instructions().local_get(ll.elem_cell_base);
+        if *child != 0 {
+            f.instructions().i32_const(*child as i32);
+            f.instructions().i32_add();
+        }
+        f.instructions().i32_store(MemArg {
+            offset: ((i as u32) * 4) as u64,
+            align: I32_STORE_LOG2_ALIGN,
+            memory_index: 0,
+        });
+    }
 }
 
 /// Stage the per-iteration utf-8 scratch address for the
