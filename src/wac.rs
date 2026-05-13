@@ -1408,7 +1408,10 @@ fn target_interface_has_sync_func(target_interface: &str, target_split_path: &st
             continue;
         };
         if qname.split('@').next().unwrap_or(&qname)
-            != target_interface.split('@').next().unwrap_or(target_interface)
+            != target_interface
+                .split('@')
+                .next()
+                .unwrap_or(target_interface)
         {
             continue;
         }
