@@ -12,9 +12,16 @@
 //! silently (tier-1 has no logging surface).
 
 mod bindings {
+    // Per-export async filter (NOT `async: true`). Every import is
+    // sync-WIT and MUST lower as plain `canon lower` (no async); see
+    // `docs/TODO/sync-wit-suspend-limit.md` and hello-tier1 for the
+    // rationale (sync-WIT-rooted task cannot block on canon-async wait).
     wit_bindgen::generate!({
         world: "otel-bare-spans-mdl",
-        async: true,
+        async: [
+            "export:splicer:tier1/before@0.3.0#on-call",
+            "export:splicer:tier1/after@0.3.0#on-return",
+        ],
         generate_all,
     });
 }
@@ -50,12 +57,12 @@ struct Config {
     span_kind: SpanKind,
 }
 
-async fn config() -> &'static Config {
+fn config() -> &'static Config {
     static C: OnceLock<Config> = OnceLock::new();
     if let Some(c) = C.get() {
         return c;
     }
-    let span_kind = match get_config("span_kind".to_string()).await {
+    let span_kind = match get_config("span_kind") {
         Some(s) => parse_span_kind(&s).unwrap_or(SpanKind::Internal),
         None => SpanKind::Internal,
     };
@@ -105,9 +112,8 @@ fn empty_id(s: &str) -> bool {
 /// as a lowercase hex string. Used for minting fresh OTel trace-ids
 /// and span-ids, which the spec defines as raw byte widths but the
 /// wire / `wasi:otel` types carry as hex.
-async fn random_hex(byte_len: u64) -> String {
+fn random_hex(byte_len: u64) -> String {
     get_random_bytes(byte_len)
-        .await
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -153,9 +159,9 @@ pub struct OtelBareSpans;
 
 impl BeforeGuest for OtelBareSpans {
     async fn on_call(call: CallId) {
-        let parent = outer_span_context().await;
+        let parent = outer_span_context();
         let trace_id = if empty_id(&parent.trace_id) {
-            random_hex(TRACE_ID_BYTE_LEN).await
+            random_hex(TRACE_ID_BYTE_LEN)
         } else {
             parent.trace_id.clone()
         };
@@ -166,13 +172,13 @@ impl BeforeGuest for OtelBareSpans {
         };
         let context = SpanContext {
             trace_id,
-            span_id: random_hex(SPAN_ID_BYTE_LEN).await,
+            span_id: random_hex(SPAN_ID_BYTE_LEN),
             trace_flags: TraceFlags::SAMPLED,
             is_remote: false,
             trace_state: vec![],
         };
-        let start_time = now().await;
-        on_start(context.clone()).await;
+        let start_time = now();
+        on_start(&context);
         pending()
             .lock()
             .unwrap()
@@ -199,10 +205,10 @@ impl AfterGuest for OtelBareSpans {
         let span = SpanData {
             span_context: p.context,
             parent_span_id: p.parent_span_id,
-            span_kind: config().await.span_kind,
+            span_kind: config().span_kind,
             name: format!("{}::{}", call.interface_name, call.function_name),
             start_time: p.start_time,
-            end_time: now().await,
+            end_time: now(),
             attributes: vec![
                 kv("code.namespace", &call.interface_name),
                 kv("code.function", &call.function_name),
@@ -215,7 +221,7 @@ impl AfterGuest for OtelBareSpans {
             dropped_events: 0,
             dropped_links: 0,
         };
-        on_end(span).await;
+        on_end(&span);
     }
 }
 

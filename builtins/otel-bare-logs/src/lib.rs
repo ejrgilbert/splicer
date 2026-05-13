@@ -17,9 +17,15 @@
 //! (tier-1 has no logging surface).
 
 mod bindings {
+    // Per-export async filter (NOT `async: true`). Every import is
+    // sync-WIT and MUST lower as plain `canon lower` (no async); see
+    // `docs/TODO/sync-wit-suspend-limit.md` and hello-tier1 for the
+    // rationale (sync-WIT-rooted task cannot block on canon-async wait).
     wit_bindgen::generate!({
         world: "otel-bare-logs-mdl",
-        async: true,
+        async: [
+            "export:splicer:tier1/after@0.3.0#on-return",
+        ],
         generate_all,
     });
 }
@@ -63,12 +69,12 @@ struct Config {
     severity: Severity,
 }
 
-async fn config() -> &'static Config {
+fn config() -> &'static Config {
     static C: OnceLock<Config> = OnceLock::new();
     if let Some(c) = C.get() {
         return c;
     }
-    let severity = match get_config("severity".to_string()).await {
+    let severity = match get_config("severity") {
         Some(s) => parse_severity(&s).unwrap_or(SEVERITY_INFO),
         None => SEVERITY_INFO,
     };
@@ -135,7 +141,7 @@ pub struct OtelBareLogs;
 
 impl AfterGuest for OtelBareLogs {
     async fn on_return(call: CallId) {
-        let parent = outer_span_context().await;
+        let parent = outer_span_context();
         let (trace_id, span_id, trace_flags) = if empty_id(&parent.trace_id) {
             (None, None, None)
         } else {
@@ -146,11 +152,11 @@ impl AfterGuest for OtelBareLogs {
             )
         };
 
-        let cfg = config().await;
+        let cfg = config();
         let body = format!("{}::{}", call.interface_name, call.function_name);
         let record = LogRecord {
             timestamp: None,
-            observed_timestamp: Some(now().await),
+            observed_timestamp: Some(now()),
             severity_text: Some(cfg.severity.text.into()),
             severity_number: Some(cfg.severity.number),
             body: Some(encode_json_string(&body)),
@@ -165,7 +171,7 @@ impl AfterGuest for OtelBareLogs {
             span_id,
             trace_flags,
         };
-        on_emit(record).await;
+        on_emit(&record);
     }
 }
 

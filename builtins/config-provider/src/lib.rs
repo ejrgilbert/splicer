@@ -8,6 +8,11 @@
 //! defaults. Wire format details: see `wire_format.rs`.
 
 mod bindings {
+    // NO `async: true`. `get` is sync at WIT and must lift as plain
+    // `canon lift` (sync). Substrate consumers (hello-tier1 etc.)
+    // canon-lower this import synchronously to avoid wedging when
+    // spliced on a sync-WIT target — see
+    // `docs/TODO/sync-wit-suspend-limit.md`.
     wit_bindgen::generate!({
         world: "config-provider-mdl",
         generate_all,

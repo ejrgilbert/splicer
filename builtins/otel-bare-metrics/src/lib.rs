@@ -16,9 +16,16 @@
 //! silently (tier-1 has no logging surface).
 
 mod bindings {
+    // Per-export async filter (NOT `async: true`). Every import is
+    // sync-WIT and MUST lower as plain `canon lower` (no async); see
+    // `docs/TODO/sync-wit-suspend-limit.md` and hello-tier1 for the
+    // rationale (sync-WIT-rooted task cannot block on canon-async wait).
     wit_bindgen::generate!({
         world: "otel-bare-metrics-mdl",
-        async: true,
+        async: [
+            "export:splicer:tier1/before@0.3.0#on-call",
+            "export:splicer:tier1/after@0.3.0#on-return",
+        ],
         generate_all,
     });
 }
@@ -94,24 +101,21 @@ struct Config {
 const DEFAULT_BUFFER: u32 = 1;
 const DEFAULT_FLUSH_AFTER_SECONDS: f64 = 10.0;
 
-async fn config() -> &'static Config {
+fn config() -> &'static Config {
     static C: OnceLock<Config> = OnceLock::new();
     if let Some(c) = C.get() {
         return c;
     }
-    let buffer = read_typed("buffer", DEFAULT_BUFFER).await.max(1);
-    let flush_after_seconds = read_typed("flush_after_seconds", DEFAULT_FLUSH_AFTER_SECONDS).await;
+    let buffer = read_typed("buffer", DEFAULT_BUFFER).max(1);
+    let flush_after_seconds = read_typed("flush_after_seconds", DEFAULT_FLUSH_AFTER_SECONDS);
     C.get_or_init(|| Config {
         buffer,
         flush_after_seconds,
     })
 }
 
-/// Look up `key`, parse to `T`, fall back to `default` on missing or
-/// malformed value. Parse errors are intentionally silent — tier-1
-/// has no logging, and a hard fail would trap on every call.
-async fn read_typed<T: FromStr>(key: &str, default: T) -> T {
-    match get_config(key.to_string()).await {
+fn read_typed<T: FromStr>(key: &str, default: T) -> T {
+    match get_config(key) {
         Some(s) => s.parse().unwrap_or(default),
         None => default,
     }
@@ -267,7 +271,7 @@ pub struct OtelBareMetrics;
 
 impl BeforeGuest for OtelBareMetrics {
     async fn on_call(call: CallId) {
-        let start_time = now().await;
+        let start_time = now();
         pending()
             .lock()
             .unwrap()
@@ -281,9 +285,9 @@ impl AfterGuest for OtelBareMetrics {
         let Some(p) = popped else {
             return;
         };
-        let end_time = now().await;
+        let end_time = now();
         let duration_s = duration_seconds(&p.start_time, &end_time);
-        let cfg = config().await;
+        let cfg = config();
 
         // Accumulate into the per-(iface, fn) window; capture whether
         // this measurement closes the window so we can flush after
@@ -319,7 +323,7 @@ impl AfterGuest for OtelBareMetrics {
             let payload = build_resource_metrics(&call, &agg, end_time);
             // The host's `export` returns a `result<_, error>` — best effort
             // here; nothing to do at the call site if the host can't ship.
-            let _ = export(payload).await;
+            let _ = export(&payload);
         }
     }
 }

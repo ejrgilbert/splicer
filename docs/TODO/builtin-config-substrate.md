@@ -13,15 +13,21 @@
 > User-facing YAML reference lives in
 > [`docs/splice-config.md`](../splice-config.md); the worked example
 > is `--hello-builtin-config` in
-> `tests/component-interposition/run.sh`. The first non-trivial
-> consumer — the `otel-bare-metrics` aggregation rework — has now
-> landed: see
-> [`builtins/otel-bare-metrics/README.md`](../../builtins/otel-bare-metrics/README.md)
-> for the `buffer` + `flush_after_seconds` keys it now reads. The rest
-> of this file is preserved as the design rationale — particularly the
-> "Why string-based (not typed records)" and "Path 1 vs path 2 vs path
-> 3" tradeoffs — so future contributors can reason about boundary
-> cases without re-litigating them.
+> `tests/component-interposition/run.sh`. Active consumers as of
+> this writing:
+>
+> - [`otel-bare-metrics`](../../builtins/otel-bare-metrics/README.md) —
+>   `buffer` + `flush_after_seconds` (delta-window aggregation).
+> - [`otel-bare-spans`](../../builtins/otel-bare-spans/README.md) —
+>   `span_kind` (OTel kind override; useful for HTTP-server wrappers).
+> - [`otel-bare-logs`](../../builtins/otel-bare-logs/README.md) —
+>   `severity` (level name; sets both `severity-text` and the spec
+>   base `severity-number`).
+>
+> The rest of this file is preserved as the design rationale —
+> particularly the "Why string-based (not typed records)" and "Path 1
+> vs path 2 vs path 3" tradeoffs — so future contributors can reason
+> about boundary cases without re-litigating them.
 
 ## Motivation
 
@@ -279,12 +285,25 @@ original scalar type for error messages).
    identical to the prior always-flush mode. See
    [`builtins/otel-bare-metrics/README.md`](../../builtins/otel-bare-metrics/README.md).
 
+8. ✅ **Spans / logs config follow-on**: `otel-bare-spans` reads
+   `span_kind` (default `internal`) so HTTP-server wrappers can mark
+   their spans as `server`; `otel-bare-logs` reads `severity`
+   (default `INFO`, accepts the six spec-level names) so operators
+   can emit at the level their pipeline filters expect. Same
+   string-config + `OnceLock`-cached-parse pattern as metrics. See
+   [`builtins/otel-bare-spans/README.md`](../../builtins/otel-bare-spans/README.md)
+   and [`builtins/otel-bare-logs/README.md`](../../builtins/otel-bare-logs/README.md).
+
 ## Sequencing
 
 Substrate landed off main with the tier-2 work already in place, so
 there were no merge-conflict surprises versus the original sequencing
 plan. The `otel-bare-metrics` aggregation rework followed as the
-first non-trivial consumer (item 7).
+first non-trivial consumer (item 7); `otel-bare-spans` +
+`otel-bare-logs` then picked up small string-config keys for OTel
+correctness / pipeline ergonomics (item 8). All three builtins use
+the same `OnceLock<Config>` + per-key parse-with-default pattern, so
+adding a new consumer is mostly mechanical.
 
 ## Defaults / missing-key semantics
 
