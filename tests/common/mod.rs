@@ -22,6 +22,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub const SPLICER_BEFORE: &str = "splicer:tier1/before@0.3.0";
 pub const SPLICER_AFTER: &str = "splicer:tier1/after@0.3.0";
+pub const SPLICER_BUILTIN_CONFIG_GET: &str = "splicer:builtin-config/get@0.1.0";
 
 pub const TARGET_IFACE: &str = "wasi:http/handler@0.3.0";
 pub const TARGET_FN: &str = "handle";
@@ -138,6 +139,19 @@ where
     })?;
 
     Ok(capture)
+}
+
+/// Register a no-op stub for `splicer:builtin-config/get`: every key
+/// returns `none`, so the builtin falls back to its hardcoded defaults
+/// across the test cycle. Tests that want non-default config should
+/// register their own `get` function instead.
+pub fn add_builtin_config_stub<C: Send + 'static>(linker: &mut Linker<Host<C>>) -> Result<()> {
+    let mut iface = linker.instance(SPLICER_BUILTIN_CONFIG_GET)?;
+    iface.func_new("get", |_store, _ty, _params, results| {
+        results[0] = Val::Option(None);
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Assert an attribute list carries `code.namespace` / `code.function`

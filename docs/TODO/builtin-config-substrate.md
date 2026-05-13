@@ -14,13 +14,14 @@
 > [`docs/splice-config.md`](../splice-config.md); the worked example
 > is `--hello-builtin-config` in
 > `tests/component-interposition/run.sh`. The first non-trivial
-> consumer (the `otel-bare-metrics` aggregation rework noted at the
-> bottom of this doc) is still pending; until that lands,
-> `otel-bare-metrics` runs in always-flush mode with hardcoded
-> defaults. The rest of this file is preserved as the design rationale
-> — particularly the "Why string-based (not typed records)" and "Path
-> 1 vs path 2 vs path 3" tradeoffs — so future contributors can reason
-> about boundary cases without re-litigating them.
+> consumer — the `otel-bare-metrics` aggregation rework — has now
+> landed: see
+> [`builtins/otel-bare-metrics/README.md`](../../builtins/otel-bare-metrics/README.md)
+> for the `buffer` + `flush_after_seconds` keys it now reads. The rest
+> of this file is preserved as the design rationale — particularly the
+> "Why string-based (not typed records)" and "Path 1 vs path 2 vs path
+> 3" tradeoffs — so future contributors can reason about boundary
+> cases without re-litigating them.
 
 ## Motivation
 
@@ -269,22 +270,21 @@ original scalar type for error messages).
    `expected-output/hello-builtin-config.txt`, which is the
    load-bearing end-to-end check.
 
-7. ⏳ **First consumer**: `otel-bare-metrics` aggregation rework — see the
-   `TODO(aggregation)` block in `builtins/otel-bare-metrics/src/lib.rs`
-   and [`builtins/otel-bare-metrics/README.md`](../../builtins/otel-bare-metrics/README.md).
-   Substrate is ready; this is the natural next PR.
+7. ✅ **First consumer**: `otel-bare-metrics` aggregation rework — the
+   builtin now imports `splicer:builtin-config/get` and reads
+   `buffer` (u32, default 1) + `flush_after_seconds` (f64, default
+   10.0) at first observation, accumulating count + histogram
+   (sum/min/max/buckets) per `(iface, fn)` and flushing when either
+   threshold trips. With the default `buffer = 1` the behavior is
+   identical to the prior always-flush mode. See
+   [`builtins/otel-bare-metrics/README.md`](../../builtins/otel-bare-metrics/README.md).
 
 ## Sequencing
 
 Substrate landed off main with the tier-2 work already in place, so
 there were no merge-conflict surprises versus the original sequencing
-plan.
-
-`otel-bare-metrics` still runs in always-flush (`buffer = 1`) mode
-with hardcoded defaults pending the consumer rework. The
-`TODO(aggregation)` block in its `lib.rs` lists the config keys and
-semantics so the rework is mechanical now that the substrate is in
-place.
+plan. The `otel-bare-metrics` aggregation rework followed as the
+first non-trivial consumer (item 7).
 
 ## Defaults / missing-key semantics
 
