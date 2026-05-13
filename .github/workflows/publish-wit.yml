@@ -8,6 +8,7 @@ on:
         required: true
         type: choice
         options:
+          - builtin-config
           - common
           - tier1
           - tier2
