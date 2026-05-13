@@ -30,10 +30,13 @@ mod bindings {
     });
 }
 
+// Codegenned from manifest.toml: manifest custom section + typed
+// accessors in `mod config`. Defaults live only in `manifest.toml`.
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 use std::sync::OnceLock;
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
-use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::now;
 use bindings::wasi::otel::logs::{on_emit, LogRecord};
@@ -64,21 +67,20 @@ const SEVERITY_WARN: Severity = Severity { text: "WARN", number: 13 };
 const SEVERITY_ERROR: Severity = Severity { text: "ERROR", number: 17 };
 const SEVERITY_FATAL: Severity = Severity { text: "FATAL", number: 21 };
 
-/// Parsed config, materialized once on first observation.
+/// Parsed config, materialized once on first observation. Splice-time
+/// validation pins `severity` to one of the values declared in
+/// `manifest.toml`, so `parse_severity` can't fail here — an
+/// `expect` panic would mean splicer let an out-of-set value through.
 struct Config {
     severity: Severity,
 }
 
-fn config() -> &'static Config {
+fn cached_config() -> &'static Config {
     static C: OnceLock<Config> = OnceLock::new();
-    if let Some(c) = C.get() {
-        return c;
-    }
-    let severity = match get_config("severity") {
-        Some(s) => parse_severity(&s).unwrap_or(SEVERITY_INFO),
-        None => SEVERITY_INFO,
-    };
-    C.get_or_init(|| Config { severity })
+    C.get_or_init(|| Config {
+        severity: parse_severity(config::severity())
+            .expect("splice-time validation guarantees a known severity"),
+    })
 }
 
 /// Case-insensitive match against the OTel spec-defined level names.
@@ -152,7 +154,7 @@ impl AfterGuest for OtelBareLogs {
             )
         };
 
-        let cfg = config();
+        let cfg = cached_config();
         let body = format!("{}::{}", call.interface_name, call.function_name);
         let record = LogRecord {
             timestamp: None,

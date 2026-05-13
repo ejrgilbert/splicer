@@ -1,0 +1,10 @@
+[builtin]
+description = "Emit an OpenTelemetry log record on each wrapped call's return."
+
+[[key]]
+name = "severity"
+type = "string"
+values = ["TRACE", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL"]
+case_insensitive = true
+default = "INFO"
+doc = "Severity level applied to emitted log records."

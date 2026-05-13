@@ -30,14 +30,16 @@ mod bindings {
     });
 }
 
+// Codegenned from manifest.toml: manifest custom section + typed
+// accessors in `mod config`. Defaults live only in `manifest.toml`.
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
-use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::{now, Datetime};
 use bindings::wasi::otel::metrics::{
@@ -92,33 +94,22 @@ struct Agg {
     window_start: Datetime,
 }
 
-/// Parsed config, materialized once on first observation.
+/// Parsed config, materialized once on first observation. Pulls
+/// values via the codegen'd typed accessors, which read the manifest-
+/// declared defaults when the user didn't set anything in YAML.
+/// `buffer` is clamped to `>= 1` so `buffer = 0` doesn't lock the
+/// window open forever.
 struct Config {
     buffer: u32,
     flush_after_seconds: f64,
 }
 
-const DEFAULT_BUFFER: u32 = 1;
-const DEFAULT_FLUSH_AFTER_SECONDS: f64 = 10.0;
-
-fn config() -> &'static Config {
+fn cached_config() -> &'static Config {
     static C: OnceLock<Config> = OnceLock::new();
-    if let Some(c) = C.get() {
-        return c;
-    }
-    let buffer = read_typed("buffer", DEFAULT_BUFFER).max(1);
-    let flush_after_seconds = read_typed("flush_after_seconds", DEFAULT_FLUSH_AFTER_SECONDS);
     C.get_or_init(|| Config {
-        buffer,
-        flush_after_seconds,
+        buffer: config::buffer().max(1),
+        flush_after_seconds: config::flush_after_seconds(),
     })
-}
-
-fn read_typed<T: FromStr>(key: &str, default: T) -> T {
-    match get_config(key) {
-        Some(s) => s.parse().unwrap_or(default),
-        None => default,
-    }
 }
 
 /// `(interface, function)` is the metric attribute set; one
@@ -287,7 +278,7 @@ impl AfterGuest for OtelBareMetrics {
         };
         let end_time = now();
         let duration_s = duration_seconds(&p.start_time, &end_time);
-        let cfg = config();
+        let cfg = cached_config();
 
         // Accumulate into the per-(iface, fn) window; capture whether
         // this measurement closes the window so we can flush after

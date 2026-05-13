@@ -26,12 +26,15 @@ mod bindings {
     });
 }
 
+// Codegenned from manifest.toml: manifest custom section + typed
+// accessors in `mod config`. Defaults live only in `manifest.toml`.
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
-use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::{now, Datetime};
 use bindings::wasi::otel::tracing::{
@@ -52,21 +55,20 @@ struct Pending {
     start_time: Datetime,
 }
 
-/// Parsed config, materialized once on first observation.
+/// Parsed config, materialized once on first observation. Splice-time
+/// validation pins `span_kind` to one of the values declared in
+/// `manifest.toml`, so `parse_span_kind` can't fail here — an
+/// `unreachable!` would mean splicer let an out-of-set value through.
 struct Config {
     span_kind: SpanKind,
 }
 
-fn config() -> &'static Config {
+fn cached_config() -> &'static Config {
     static C: OnceLock<Config> = OnceLock::new();
-    if let Some(c) = C.get() {
-        return c;
-    }
-    let span_kind = match get_config("span_kind") {
-        Some(s) => parse_span_kind(&s).unwrap_or(SpanKind::Internal),
-        None => SpanKind::Internal,
-    };
-    C.get_or_init(|| Config { span_kind })
+    C.get_or_init(|| Config {
+        span_kind: parse_span_kind(config::span_kind())
+            .expect("splice-time validation guarantees a known span_kind"),
+    })
 }
 
 /// Case-insensitive match against the OTel `SpanKind` variants. `None`
@@ -205,7 +207,7 @@ impl AfterGuest for OtelBareSpans {
         let span = SpanData {
             span_context: p.context,
             parent_span_id: p.parent_span_id,
-            span_kind: config().span_kind,
+            span_kind: cached_config().span_kind,
             name: format!("{}::{}", call.interface_name, call.function_name),
             start_time: p.start_time,
             end_time: now(),

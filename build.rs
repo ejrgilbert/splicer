@@ -220,6 +220,13 @@ fn generate_builtin_manifest(out_dir: &str) {
             if !cargo_toml.exists() {
                 continue;
             }
+            // Host-side helper crates (e.g. builtin-manifest) live in
+            // `builtins/` for path-dep convenience but aren't user-
+            // facing wasm builtins — they lack a `wit/` directory. Skip
+            // them so they don't pollute BUILTIN_VERSIONS.
+            if !entry.path().join("wit").is_dir() {
+                continue;
+            }
             println!("cargo::rerun-if-changed={}", cargo_toml.display());
             let src = fs::read_to_string(&cargo_toml).unwrap_or_else(|e| {
                 panic!("Failed to read {}: {e}", cargo_toml.display());

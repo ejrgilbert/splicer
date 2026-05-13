@@ -69,6 +69,7 @@ pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Resu
         }
         return Ok(());
     }
+    validate_against_manifest(injection, &bytes)?;
     let provider_bytes = build_provider(&injection.builtin_config).with_context(|| {
         format!(
             "Failed to build config provider for injection '{}'",
@@ -96,6 +97,99 @@ pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Resu
         .to_string();
     injection.config_provider_path = Some(out_str);
     Ok(())
+}
+
+/// Reject YAML `config:` keys that aren't declared in the builtin's
+/// embedded manifest, or whose values won't parse as the declared
+/// type. Splice-time hard error — the silent-fallback-to-default
+/// behavior that catches typos at runtime is exactly what this
+/// substitutes for.
+///
+/// For shipped builtins (`injection.builtin == Some(name)`) the
+/// section name in the wasm must match `name` — that catches OCI
+/// misrouting (e.g. the `otel-bare-metrics` tag accidentally pointing
+/// at `hello-tier1`'s bytes) the same way it catches typos. Manifest
+/// absence on a shipped builtin is only an error when the user
+/// actually set `config:` keys.
+///
+/// For user-supplied middleware (`injection.builtin == None`) we
+/// validate against whichever single manifest the bytes carry, or
+/// skip validation if none is present (third-party authors aren't
+/// required to ship one).
+fn validate_against_manifest(injection: &Injection, bytes: &[u8]) -> Result<()> {
+    let all = builtin_manifest::extract_all(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "injection '{name}': embedded manifest is malformed: {e}",
+            name = injection.name,
+        )
+    })?;
+    let manifest = match injection.builtin.as_deref() {
+        Some(expected) => match all.into_iter().find(|(n, _)| n == expected) {
+            Some((_, m)) => Some(m),
+            None if injection.builtin_config.is_empty() => None,
+            None => {
+                anyhow::bail!(
+                    "injection '{name}': shipped builtin '{expected}' is missing its \
+                     embedded manifest (or the wasm shipped under that name carries a \
+                     manifest for a different builtin). Rebuild against the current \
+                     builtin-manifest crate.",
+                    name = injection.name,
+                );
+            }
+        },
+        None => match all.len() {
+            0 => None,
+            1 => Some(all.into_iter().next().unwrap().1),
+            _ => {
+                let names: Vec<String> = all.into_iter().map(|(n, _)| n).collect();
+                anyhow::bail!(
+                    "injection '{name}': bytes carry manifests for multiple builtins \
+                     [{}] but the YAML didn't declare which one applies. Use \
+                     `builtin: <name>` instead of `name: ...` + `path: ...` to disambiguate.",
+                    names.join(", "),
+                    name = injection.name,
+                );
+            }
+        },
+    };
+    let Some(manifest) = manifest else {
+        return Ok(());
+    };
+    let mut unknown: Vec<&str> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for (key, value) in &injection.builtin_config {
+        match manifest.validate_value(key, value) {
+            Ok(Some(())) => {}
+            Ok(None) => unknown.push(key.as_str()),
+            Err(msg) => bad.push(msg),
+        }
+    }
+    if unknown.is_empty() && bad.is_empty() {
+        return Ok(());
+    }
+    let known_keys: Vec<&str> = manifest.keys.iter().map(|k| k.name.as_str()).collect();
+    let mut msg = format!(
+        "injection '{name}' has invalid `config:` against its declared manifest. \
+         Run `splicer builtin {bn}` to see accepted keys.",
+        name = injection.name,
+        bn = injection
+            .builtin
+            .as_deref()
+            .unwrap_or(injection.name.as_str()),
+    );
+    if !unknown.is_empty() {
+        unknown.sort();
+        msg.push_str(&format!(
+            "\n  unknown keys: [{}]; known keys: [{}]",
+            unknown.join(", "),
+            known_keys.join(", "),
+        ));
+    }
+    for b in &bad {
+        msg.push_str("\n  ");
+        msg.push_str(b);
+    }
+    anyhow::bail!(msg);
 }
 
 /// True iff the component imports any interface in the
@@ -507,6 +601,211 @@ mod tests {
         // Keys are listed sorted for a deterministic error message.
         assert!(msg.contains("buffer, flush_after_seconds"), "{msg}");
         assert!(msg.contains("doesn't import"), "{msg}");
+    }
+
+    // ── manifest validation ─────────────────────────────────────────
+
+    /// A substrate-importing component with the manifest baked in as
+    /// a component-level custom section named for `builtin_name`.
+    /// `wat` emits the section in-place so the resulting bytes are a
+    /// single valid component (appending sections post-hoc trips
+    /// `wit_component::decode`).
+    fn consumer_bytes_with_manifest(builtin_name: &str, manifest_toml: &str) -> Vec<u8> {
+        let escaped = escape_wat_string(manifest_toml);
+        let wat = format!(
+            r#"(component
+                (import "splicer:builtin-config/get@0.1.0" (instance
+                    (export "get" (func (param "key" string) (result (option string))))
+                ))
+                (@custom "{section}" "{escaped}")
+            )"#,
+            section = builtin_manifest::section_name_for(builtin_name),
+        );
+        wat::parse_str(&wat).expect("wat with embedded manifest section")
+    }
+
+    /// Escape a TOML payload for use inside a wat string literal.
+    /// Wat string literals accept arbitrary bytes via `\xx` hex
+    /// escapes, which sidesteps every other character's quoting rules.
+    fn escape_wat_string(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 4);
+        for b in s.as_bytes() {
+            out.push_str(&format!("\\{b:02x}"));
+        }
+        out
+    }
+
+    fn write_provider_template_to(dir: &Path) {
+        let mut template = Vec::new();
+        template.extend_from_slice(b"\0asm\x01\x00\x00\x00fake-prefix-");
+        template.extend_from_slice(&MAGIC_BYTES);
+        template.extend_from_slice(&0u32.to_le_bytes());
+        template.extend(std::iter::repeat_n(
+            0xAA,
+            CAPACITY - MAGIC_LEN - LEN_PREFIX_BYTES,
+        ));
+        std::fs::write(dir.join("config-provider.wasm"), &template).unwrap();
+    }
+
+    const SAMPLE_MANIFEST_TOML: &str = r#"
+[builtin]
+description = "test"
+
+[[key]]
+name = "buffer"
+type = "u32"
+default = 1
+doc = "doc"
+
+[[key]]
+name = "greeting"
+type = "string"
+default = "hi"
+doc = "doc"
+"#;
+
+    #[test]
+    fn manifest_validation_rejects_unknown_key() {
+        let consumer_bytes = consumer_bytes_with_manifest("metrics", SAMPLE_MANIFEST_TOML);
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("metrics.wasm");
+        std::fs::write(&builtin_path, &consumer_bytes).unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        write_provider_template_to(override_dir.path());
+        let _guard = EnvGuard::set("SPLICER_BUILTINS_DIR", override_dir.path());
+
+        let mut inj = Injection::from_builtin("metrics");
+        inj.path = Some(builtin_path.to_str().unwrap().to_string());
+        inj.builtin_config
+            .insert("bufer".into(), "100".into()); // typo
+
+        let err = ensure_provider_for(&mut inj, splits.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown keys"), "{msg}");
+        assert!(msg.contains("bufer"), "{msg}");
+        assert!(msg.contains("buffer"), "{msg}");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_type_mismatch() {
+        let consumer_bytes = consumer_bytes_with_manifest("metrics", SAMPLE_MANIFEST_TOML);
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("metrics.wasm");
+        std::fs::write(&builtin_path, &consumer_bytes).unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        write_provider_template_to(override_dir.path());
+        let _guard = EnvGuard::set("SPLICER_BUILTINS_DIR", override_dir.path());
+
+        let mut inj = Injection::from_builtin("metrics");
+        inj.path = Some(builtin_path.to_str().unwrap().to_string());
+        inj.builtin_config
+            .insert("buffer".into(), "ten".into()); // bad u32
+
+        let err = ensure_provider_for(&mut inj, splits.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("does not parse as u32"), "{msg}");
+    }
+
+    #[test]
+    fn manifest_validation_accepts_valid_keys() {
+        let consumer_bytes = consumer_bytes_with_manifest("metrics", SAMPLE_MANIFEST_TOML);
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("metrics.wasm");
+        std::fs::write(&builtin_path, &consumer_bytes).unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        write_provider_template_to(override_dir.path());
+        let _guard = EnvGuard::set("SPLICER_BUILTINS_DIR", override_dir.path());
+
+        let mut inj = Injection::from_builtin("metrics");
+        inj.path = Some(builtin_path.to_str().unwrap().to_string());
+        inj.builtin_config.insert("buffer".into(), "100".into());
+        inj.builtin_config
+            .insert("greeting".into(), "hi there".into());
+
+        ensure_provider_for(&mut inj, splits.path()).expect("valid config passes");
+        assert!(inj.config_provider_path.is_some());
+    }
+
+    #[test]
+    fn manifest_validation_requires_manifest_for_shipped_builtin_with_config() {
+        // Consumer wasm without a manifest blob attached.
+        let consumer_bytes = wat::parse_str(CONSUMER_WAT).expect("wat");
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("legacy.wasm");
+        std::fs::write(&builtin_path, &consumer_bytes).unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        write_provider_template_to(override_dir.path());
+        let _guard = EnvGuard::set("SPLICER_BUILTINS_DIR", override_dir.path());
+
+        let mut inj = Injection::from_builtin("legacy");
+        inj.path = Some(builtin_path.to_str().unwrap().to_string());
+        inj.builtin_config.insert("anything".into(), "1".into());
+
+        let err = ensure_provider_for(&mut inj, splits.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing its embedded manifest"), "{msg}");
+    }
+
+    #[test]
+    fn manifest_validation_rejects_mismatched_builtin_name() {
+        // The wasm carries a manifest section named for 'hello-tier1'
+        // but the YAML references it as builtin 'metrics' — that's an
+        // OCI misrouting (or build-tag mismatch) and should fail loud,
+        // not silently apply the wrong manifest.
+        let consumer_bytes = consumer_bytes_with_manifest("hello-tier1", SAMPLE_MANIFEST_TOML);
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("metrics.wasm");
+        std::fs::write(&builtin_path, &consumer_bytes).unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        write_provider_template_to(override_dir.path());
+        let _guard = EnvGuard::set("SPLICER_BUILTINS_DIR", override_dir.path());
+
+        let mut inj = Injection::from_builtin("metrics");
+        inj.path = Some(builtin_path.to_str().unwrap().to_string());
+        inj.builtin_config.insert("buffer".into(), "100".into());
+
+        let err = ensure_provider_for(&mut inj, splits.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing its embedded manifest"), "{msg}");
+    }
+
+    #[test]
+    fn manifest_validation_lenient_for_user_middleware() {
+        // No manifest blob, but it's a user-supplied substrate consumer
+        // (no `injection.builtin` set), so we let it through with the
+        // old silent-fallback behavior rather than forcing third-party
+        // middleware authors to ship a manifest.
+        let consumer_bytes = wat::parse_str(CONSUMER_WAT).expect("wat");
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("user-mw.wasm");
+        std::fs::write(&builtin_path, &consumer_bytes).unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        write_provider_template_to(override_dir.path());
+        let _guard = EnvGuard::set("SPLICER_BUILTINS_DIR", override_dir.path());
+
+        let mut inj = Injection::from_path("user-mw", builtin_path.to_str().unwrap());
+        inj.builtin_config.insert("anything".into(), "1".into());
+
+        ensure_provider_for(&mut inj, splits.path()).expect("user mw without manifest passes");
+        assert!(inj.config_provider_path.is_some());
     }
 
     /// Lock + restore an env var on drop so parallel tests can't

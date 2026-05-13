@@ -1,0 +1,10 @@
+[builtin]
+description = "Emit OpenTelemetry spans around wrapped calls."
+
+[[key]]
+name = "span_kind"
+type = "string"
+values = ["internal", "server", "client", "producer", "consumer"]
+case_insensitive = true
+default = "internal"
+doc = "OTel span kind applied to emitted spans."
