@@ -939,6 +939,14 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
+                if let Some(mw_path) = injection.path.as_deref() {
+                    preflight_sync_target_async_middleware(
+                        &injection.name,
+                        mw_path,
+                        interface_name,
+                        consumer_split_path,
+                    )?;
+                }
                 let adapter_path = generate_tier1_adapter(
                     &injection.name,
                     interface_name,
@@ -974,6 +982,14 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
+                if let Some(mw_path) = injection.path.as_deref() {
+                    preflight_sync_target_async_middleware(
+                        &injection.name,
+                        mw_path,
+                        interface_name,
+                        consumer_split_path,
+                    )?;
+                }
                 let adapter_path = generate_tier2_adapter(
                     &injection.name,
                     interface_name,
@@ -1321,6 +1337,128 @@ fn factored_types_to_wire(
         out.push(extra.clone());
     }
     Ok(out)
+}
+
+/// Preflight: refuse to splice a middleware that imports any
+/// `async func` peer-component interface (non-`wasi:*`) onto a target
+/// interface that has any `func` (sync at WIT) function. The runtime
+/// wedge that combination produces is documented in
+/// `docs/TODO/sync-wit-suspend-limit.md`: a sync-WIT-rooted wasm task
+/// cannot suspend, so any canon-async wait inside the middleware's
+/// hook body — driving an async peer-component import — traps with
+/// `cannot block a synchronous task before returning`.
+///
+/// This is a conservative check: it only catches imports that are
+/// `async func` at the middleware's WIT level. A middleware that
+/// declares a sync-WIT import but still ends up canon-lower-async'ing
+/// it (e.g. via `wit_bindgen::generate!({ async: true })` without
+/// per-import filtering) would slip through, but those cases tend to
+/// be authored by builtin maintainers who follow the documented
+/// pattern. Wasm-bytecode-level scan would be more complete; deferred.
+fn preflight_sync_target_async_middleware(
+    middleware_name: &str,
+    middleware_path: &str,
+    target_interface: &str,
+    target_split_path: &str,
+) -> anyhow::Result<()> {
+    if !target_interface_has_sync_func(target_interface, target_split_path) {
+        return Ok(());
+    }
+    let Some(offender) = first_async_peer_import(middleware_path) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "Cannot splice middleware '{middleware_name}' onto SYNC-WIT target \
+         interface '{target_interface}': the middleware imports '{offender}', \
+         which is `async func` from a peer component. Awaiting a peer-component \
+         async call inside a hook body wedges the wasm task at runtime — splicer's \
+         generated adapter has to lift `{target_interface}` as sync-WIT (matching \
+         the target's contract), and sync-WIT-rooted tasks cannot suspend. \
+         Splice this middleware on an `async func` target interface, or rewrite \
+         the middleware to read its substrate inline (no `.await`). \
+         See docs/TODO/sync-wit-suspend-limit.md.",
+    );
+}
+
+/// True iff `target_interface` (resolved via the component at
+/// `target_split_path`, which imports or exports it) has at least one
+/// function declared as `func` (sync) at WIT — i.e. splicer's adapter
+/// would be forced to lift that signature as sync.
+fn target_interface_has_sync_func(target_interface: &str, target_split_path: &str) -> bool {
+    let Ok(bytes) = std::fs::read(target_split_path) else {
+        return false;
+    };
+    let Ok(decoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wit_component::decode(&bytes)
+    })) else {
+        return false;
+    };
+    let Ok(wit_component::DecodedWasm::Component(resolve, world_id)) = decoded else {
+        return false;
+    };
+    let world = &resolve.worlds[world_id];
+    // Look across both imports and exports of the split — splicer
+    // calls into either side, depending on direction.
+    let surfaces = world.imports.values().chain(world.exports.values());
+    for item in surfaces {
+        let wit_parser::WorldItem::Interface { id, .. } = item else {
+            continue;
+        };
+        let Some(qname) = resolve.id_of(*id) else {
+            continue;
+        };
+        if qname.split('@').next().unwrap_or(&qname)
+            != target_interface
+                .split('@')
+                .next()
+                .unwrap_or(target_interface)
+        {
+            continue;
+        }
+        let iface = &resolve.interfaces[*id];
+        if iface.functions.values().any(|f| !f.kind.is_async()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return the qualified name of the first import in the middleware's
+/// world that is `async func` and belongs to a non-`wasi:*` package
+/// (so it's a peer component, not a host import). `None` if no such
+/// import exists.
+fn first_async_peer_import(middleware_path: &str) -> Option<String> {
+    let bytes = std::fs::read(middleware_path).ok()?;
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wit_component::decode(&bytes)
+    }))
+    .ok()?
+    .ok()?;
+    let wit_component::DecodedWasm::Component(resolve, world_id) = decoded else {
+        return None;
+    };
+    let world = &resolve.worlds[world_id];
+    for (_key, item) in &world.imports {
+        let wit_parser::WorldItem::Interface { id, .. } = item else {
+            continue;
+        };
+        let Some(qname) = resolve.id_of(*id) else {
+            continue;
+        };
+        // wasi:* is host-provided; the wasmtime runtime drives those
+        // suspends correctly even from a sync-rooted task because the
+        // host owns the scheduler. Peer components don't.
+        if qname.starts_with("wasi:") {
+            continue;
+        }
+        let iface = &resolve.interfaces[*id];
+        for (fn_name, func) in &iface.functions {
+            if func.kind.is_async() {
+                return Some(format!("{qname}#{fn_name}"));
+            }
+        }
+    }
+    None
 }
 
 /// Qualified names of the component's interface imports whose

@@ -10,6 +10,7 @@ on:
         options:
           - config-provider
           - hello-tier1
+          - hello-tier2
           - otel-bare-logs
           - otel-bare-metrics
           - otel-bare-spans

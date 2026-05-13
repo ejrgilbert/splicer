@@ -1,60 +1,43 @@
-//! Builtin: emit `wasi:otel` metrics around every wrapped call.
+//! Builtin: emit `wasi:otel` metrics around wrapped calls.
 //!
-//! `on-call` records the start time. `on-return` ships a fresh
-//! delta-temporality `resource-metrics` payload with one data point
-//! per metric (count + duration), then drains the pending entry.
-//! No in-component aggregation: a production OTel SDK would batch
-//! many measurements into one export, but this builtin doesn't yet.
-//! The downstream collector re-aggregates the deltas.
+//! `on-call` records the start time. `on-return` folds the duration
+//! into a per-(iface, fn) delta-window accumulator and ships a
+//! `resource-metrics` payload (count + duration histogram) via
+//! `wasi:otel/metrics.export` once the window closes: either `buffer`
+//! samples have been seen or `flush_after_seconds` of wall-clock have
+//! elapsed since the window opened. Staleness is checked on every
+//! `on-return`, so a window that goes quiet sits unflushed until the
+//! next call — tier-1 has no shutdown hook, and the unflushed tail
+//! (<= one window per `(iface, fn)`) is dropped at process exit.
 //!
-//! Cheap to implement; trades host-call frequency for simplicity.
-//! Aggregation with a traffic-driven flush is a planned follow-up
-//! gated on a builtin-config substrate (`buffer` + per-call flush
-//! threshold).
-
-// TODO(aggregation): once the splice-time `splicer:builtin-config`
-// substrate lands (post-tier2), wire this builtin to read config at
-// init and aggregate measurements rather than exporting per-call.
-//
-// Config keys, parsed at init via `splicer:builtin-config/get` into
-// a `OnceLock<Config>` (string-typed at the WIT boundary; parsed
-// here):
-//
-//   * `buffer`              u32, default 1. Accumulate N measurements
-//                           per (iface, fn) before flushing. `1` is
-//                           the current per-call behavior.
-//   * `flush_after_seconds` f64, default 10.0. Staleness flush
-//                           trigger; ignored when `buffer == 1`.
-//
-// State: per-(iface, fn) accumulator for the `Sum` count + the
-// `Histogram` (bucket counts, sum, min, max). Allocated lazily on
-// first observation for that attribute set; resides alongside the
-// existing `pending()` map but with persistent (not drained-per-call)
-// semantics.
-//
-// Flush trigger checked on every `on-return`: flush a given
-// attribute set when its buffered count >= `buffer` OR wall-clock
-// since its last flush > `flush_after_seconds`, whichever first.
-// Bounded data loss at process exit — tier-1 has no shutdown hook,
-// so the unflushed tail (<= one flush window) is dropped.
-//
-// Until the substrate lands, this builtin runs in always-flush mode
-// (effectively `buffer = 1`).
+//! Config keys are read once at first observation via
+//! `splicer:builtin-config/get` and cached for the instance's
+//! lifetime. Unset keys + parse failures fall back to defaults
+//! silently (tier-1 has no logging surface).
 
 mod bindings {
+    // Per-export async filter (NOT `async: true`). Every import is
+    // sync-WIT and MUST lower as plain `canon lower` (no async); see
+    // `docs/TODO/sync-wit-suspend-limit.md` and hello-tier1 for the
+    // rationale (sync-WIT-rooted task cannot block on canon-async wait).
     wit_bindgen::generate!({
         world: "otel-bare-metrics-mdl",
-        async: true,
+        async: [
+            "export:splicer:tier1/before@0.3.0#on-call",
+            "export:splicer:tier1/after@0.3.0#on-return",
+        ],
         generate_all,
     });
 }
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
+use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::{now, Datetime};
 use bindings::wasi::otel::metrics::{
@@ -68,22 +51,99 @@ struct Pending {
     start_time: Datetime,
 }
 
-/// Stack per `(interface, function)` so concurrent or recursive
-/// invocations of the same name don't clobber each other's start
-/// times.
+/// Delta-window accumulator for a single OTel attribute set —
+/// one `(interface, function)` pair. Each `on-return` against that
+/// attribute set folds its measurement into the same `Agg`; the
+/// `Agg` is drained and rebuilt on the next sample when a flush
+/// closes the window (count threshold or wall-clock staleness).
 ///
-/// TODO(call-id correlation): switch the key to `call.id` once the
-/// per-invocation `u64` field on `splicer:common/types::call-id`
-/// lands. Today's name-only key still mis-pairs concurrent
-/// invocations of the same function — `on-return` can pop a
-/// sibling's start time. The stack just keeps the failure mode
-/// bounded (LIFO swap) instead of unbounded growth.
-fn pending() -> &'static Mutex<HashMap<(String, String), Vec<Pending>>> {
-    static M: OnceLock<Mutex<HashMap<(String, String), Vec<Pending>>>> = OnceLock::new();
+/// Distinct from [`Pending`] (one-per-invocation, keyed by
+/// `call.id`): `Pending` tracks the in-flight start time of a
+/// single call, `Agg` aggregates *across many calls* sharing the
+/// same emitted-metric attributes.
+struct Agg {
+    /// Number of samples folded into this window. Emitted as the
+    /// Sum data point's value and as the Histogram's `count`.
+    count: u64,
+    /// Sum of duration samples, in seconds. Emitted as the
+    /// Histogram's `sum`.
+    duration_sum: f64,
+    /// Minimum duration sample, in seconds. Emitted
+    /// as the Histogram's `min`.
+    duration_min: f64,
+    /// Maximum duration sample, in seconds. Emitted as the
+    /// Histogram's `max`.
+    duration_max: f64,
+    /// OTel explicit-bucket histogram counts, in the order the
+    /// bounds appear in [`HISTOGRAM_BOUNDS_S`]. `bucket_counts[i]`
+    /// is the number of samples that landed in bucket `i` — i.e.
+    /// where the sample is ≤ `HISTOGRAM_BOUNDS_S[i]` and (for
+    /// `i > 0`) greater than `HISTOGRAM_BOUNDS_S[i - 1]`. The
+    /// trailing slot (index `HISTOGRAM_BOUNDS_S.len()`) is the
+    /// `+Inf` overflow: samples larger than the last bound. Total
+    /// length is therefore `HISTOGRAM_BOUNDS_S.len() + 1`, and
+    /// the slot indices sum to `count`. See [`bucket_index`] for
+    /// how each sample is placed.
+    bucket_counts: Vec<u64>,
+    /// Wall-clock time of the first sample's `on-call` for this
+    /// window. Becomes the `start_time` of both the Sum and the
+    /// Histogram data points; the staleness check uses
+    /// `now - window_start` to decide when to flush.
+    window_start: Datetime,
+}
+
+/// Parsed config, materialized once on first observation.
+struct Config {
+    buffer: u32,
+    flush_after_seconds: f64,
+}
+
+const DEFAULT_BUFFER: u32 = 1;
+const DEFAULT_FLUSH_AFTER_SECONDS: f64 = 10.0;
+
+fn config() -> &'static Config {
+    static C: OnceLock<Config> = OnceLock::new();
+    if let Some(c) = C.get() {
+        return c;
+    }
+    let buffer = read_typed("buffer", DEFAULT_BUFFER).max(1);
+    let flush_after_seconds = read_typed("flush_after_seconds", DEFAULT_FLUSH_AFTER_SECONDS);
+    C.get_or_init(|| Config {
+        buffer,
+        flush_after_seconds,
+    })
+}
+
+fn read_typed<T: FromStr>(key: &str, default: T) -> T {
+    match get_config(key) {
+        Some(s) => s.parse().unwrap_or(default),
+        None => default,
+    }
+}
+
+/// `(interface, function)` is the metric attribute set; one
+/// accumulator per attribute set.
+type CallKey = (String, String);
+
+/// In-flight calls keyed by `call.id`. The host stamps each
+/// invocation with a monotonic-per-instance id, so `on-return` pops
+/// the matching `on-call` exactly even under concurrent or recursive
+/// invocations of the same function.
+fn pending() -> &'static Mutex<HashMap<u64, Pending>> {
+    static M: OnceLock<Mutex<HashMap<u64, Pending>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn key(call: &CallId) -> (String, String) {
+/// Open delta windows, one per `(interface, function)` attribute
+/// set. Each `Agg` accumulates many invocations sharing that
+/// attribute set; entries are removed on flush and lazily
+/// recreated by the next sample.
+fn aggregators() -> &'static Mutex<HashMap<CallKey, Agg>> {
+    static M: OnceLock<Mutex<HashMap<CallKey, Agg>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn key(call: &CallId) -> CallKey {
     (call.interface_name.clone(), call.function_name.clone())
 }
 
@@ -136,17 +196,11 @@ const HISTOGRAM_BOUNDS_S: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
 ];
 
-/// Index `bucket_counts` by where `value` falls in `bounds`. The
-/// returned vec has `bounds.len() + 1` slots — the trailing slot is
-/// the +Inf overflow bucket — and exactly one slot is set to 1.
-fn single_sample_buckets(value: f64, bounds: &[f64]) -> Vec<u64> {
-    let mut counts = vec![0u64; bounds.len() + 1];
-    let idx = bounds
+fn bucket_index(value: f64, bounds: &[f64]) -> usize {
+    bounds
         .iter()
         .position(|b| value <= *b)
-        .unwrap_or(bounds.len());
-    counts[idx] = 1;
-    counts
+        .unwrap_or(bounds.len())
 }
 
 /// Difference between two `wasi:clocks` datetimes, in seconds.
@@ -157,12 +211,7 @@ fn duration_seconds(start: &Datetime, end: &Datetime) -> f64 {
     to_dur(end).saturating_sub(to_dur(start)).as_secs_f64()
 }
 
-fn build_resource_metrics(
-    call: &CallId,
-    start: Datetime,
-    end: Datetime,
-    duration_s: f64,
-) -> ResourceMetrics {
+fn build_resource_metrics(call: &CallId, agg: &Agg, end: Datetime) -> ResourceMetrics {
     let attributes = vec![
         kv("code.namespace", &call.interface_name),
         kv("code.function", &call.function_name),
@@ -175,18 +224,16 @@ fn build_resource_metrics(
         data: MetricData::U64Sum(Sum {
             data_points: vec![SumDataPoint {
                 attributes: attributes.clone(),
-                value: MetricNumber::U64(1),
+                value: MetricNumber::U64(agg.count),
                 exemplars: vec![],
             }],
-            start_time: start,
+            start_time: agg.window_start,
             time: end,
             temporality: Temporality::Delta,
             is_monotonic: true,
         }),
     };
 
-    let bounds = HISTOGRAM_BOUNDS_S.to_vec();
-    let bucket_counts = single_sample_buckets(duration_s, HISTOGRAM_BOUNDS_S);
     let duration_metric = Metric {
         name: "component.call.duration".into(),
         description: "Duration of wrapped calls.".into(),
@@ -194,15 +241,15 @@ fn build_resource_metrics(
         data: MetricData::F64Histogram(Histogram {
             data_points: vec![HistogramDataPoint {
                 attributes,
-                count: 1,
-                bounds,
-                bucket_counts,
-                min: Some(MetricNumber::F64(duration_s)),
-                max: Some(MetricNumber::F64(duration_s)),
-                sum: MetricNumber::F64(duration_s),
+                count: agg.count,
+                bounds: HISTOGRAM_BOUNDS_S.to_vec(),
+                bucket_counts: agg.bucket_counts.clone(),
+                min: Some(MetricNumber::F64(agg.duration_min)),
+                max: Some(MetricNumber::F64(agg.duration_max)),
+                sum: MetricNumber::F64(agg.duration_sum),
                 exemplars: vec![],
             }],
-            start_time: start,
+            start_time: agg.window_start,
             time: end,
             temporality: Temporality::Delta,
         }),
@@ -224,32 +271,60 @@ pub struct OtelBareMetrics;
 
 impl BeforeGuest for OtelBareMetrics {
     async fn on_call(call: CallId) {
-        let start_time = now().await;
+        let start_time = now();
         pending()
             .lock()
             .unwrap()
-            .entry(key(&call))
-            .or_default()
-            .push(Pending { start_time });
+            .insert(call.id, Pending { start_time });
     }
 }
 
 impl AfterGuest for OtelBareMetrics {
     async fn on_return(call: CallId) {
-        let popped = pending()
-            .lock()
-            .unwrap()
-            .get_mut(&key(&call))
-            .and_then(|v| v.pop());
+        let popped = pending().lock().unwrap().remove(&call.id);
         let Some(p) = popped else {
             return;
         };
-        let end_time = now().await;
+        let end_time = now();
         let duration_s = duration_seconds(&p.start_time, &end_time);
-        let payload = build_resource_metrics(&call, p.start_time, end_time, duration_s);
-        // The host's `export` returns a `result<_, error>` — best effort
-        // here; nothing to do at the call site if the host can't ship.
-        let _ = export(payload).await;
+        let cfg = config();
+
+        // Accumulate into the per-(iface, fn) window; capture whether
+        // this measurement closes the window so we can flush after
+        // dropping the lock.
+        let flushed = {
+            let mut map = aggregators().lock().unwrap();
+            let k = key(&call);
+            let agg = map.entry(k.clone()).or_insert_with(|| Agg {
+                count: 0,
+                duration_sum: 0.0,
+                duration_min: f64::INFINITY,
+                duration_max: f64::NEG_INFINITY,
+                bucket_counts: vec![0u64; HISTOGRAM_BOUNDS_S.len() + 1],
+                window_start: p.start_time,
+            });
+            agg.count += 1;
+            agg.duration_sum += duration_s;
+            if duration_s < agg.duration_min {
+                agg.duration_min = duration_s;
+            }
+            if duration_s > agg.duration_max {
+                agg.duration_max = duration_s;
+            }
+            agg.bucket_counts[bucket_index(duration_s, HISTOGRAM_BOUNDS_S)] += 1;
+
+            let elapsed = duration_seconds(&agg.window_start, &end_time);
+            let should_flush =
+                u64::from(cfg.buffer) <= agg.count || elapsed >= cfg.flush_after_seconds;
+            should_flush.then(|| map.remove(&k).expect("entry just inserted"))
+        };
+
+        if let Some(agg) = flushed {
+            let payload = build_resource_metrics(&call, &agg, end_time);
+            // The host's `export` returns a `result<_, error>` — best effort
+            // here; nothing to do at the call site if the host can't ship.
+            let _ = export(&payload);
+        }
     }
 }
 

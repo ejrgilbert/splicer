@@ -241,6 +241,18 @@ fn integration_tier2_all() {
 
 #[test]
 #[ignore]
-fn integration_hello_builtin_config() {
-    run_config("hello-builtin-config");
+fn integration_builtin_hello_tier1() {
+    run_config("builtin-hello-tier1");
+}
+
+#[test]
+#[ignore]
+fn integration_builtin_hello_tier2() {
+    run_config("builtin-hello-tier2");
+}
+
+#[test]
+#[ignore]
+fn integration_builtin_otel() {
+    run_config("builtin-otel");
 }

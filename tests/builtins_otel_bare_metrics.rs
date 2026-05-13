@@ -20,8 +20,8 @@ use wasmtime::component::Val;
 
 mod common;
 use common::{
-    assert_call_attrs, drive_call_cycle, expect_bool, expect_enum, expect_list, expect_record,
-    expect_string, expect_u64, expect_variant, field, Host,
+    add_builtin_config_stub, assert_call_attrs, drive_call_cycle, expect_bool, expect_enum,
+    expect_list, expect_record, expect_string, expect_u64, expect_variant, field, Host,
 };
 
 const OTEL_METRICS: &str = "wasi:otel/metrics@0.2.0-rc.2";
@@ -34,6 +34,7 @@ struct Capture {
 fn add_otel_metrics_to_linker(
     linker: &mut wasmtime::component::Linker<Host<Capture>>,
 ) -> Result<()> {
+    add_builtin_config_stub(linker)?;
     let mut otel = linker.instance(OTEL_METRICS)?;
 
     otel.func_new("export", |store, _ty, params, results| {

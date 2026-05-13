@@ -14,10 +14,26 @@ same name don't clobber each other.
 
 ## Config keys
 
-None — this builtin reads no values from `splicer:builtin-config`.
-Reference it in YAML as a short-form builtin:
+Read at first call via `splicer:builtin-config/get` and cached for
+the rest of the wasm-instance lifetime. Unrecognized values fall back
+to the default silently (tier-1 has no logging surface).
+
+| Key         | Type   | Default    | Description       |
+|-------------|--------|------------|-------------------|
+| `span_kind` | string | `internal` | OTel span kind.   |
+
+**`span_kind`** accepts `internal` / `server` / `client` /
+`producer` / `consumer` (case-insensitive). Set it to `server` when
+wrapping incoming-request handlers (e.g. `wasi:http/handler@0.3.0`)
+so trace UIs render the spans as server-side request handling
+instead of an internal hop.
+
+Example splice config:
 
 ```yaml
 inject:
-  - builtin: otel-bare-spans
+  - builtin:
+      name: otel-bare-spans
+      config:
+        span_kind: server
 ```

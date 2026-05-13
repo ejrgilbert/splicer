@@ -16,8 +16,8 @@ use wasmtime::component::Val;
 
 mod common;
 use common::{
-    assert_call_attrs, drive_call_cycle, empty_span_context, expect_list, expect_record,
-    expect_string, expect_u32, expect_u64, field, Host,
+    add_builtin_config_stub, assert_call_attrs, drive_call_cycle, empty_span_context, expect_list,
+    expect_record, expect_string, expect_u32, expect_u64, field, Host,
 };
 
 const OTEL_TRACING: &str = "wasi:otel/tracing@0.2.0-rc.2";
@@ -31,6 +31,7 @@ struct Capture {
 fn add_otel_tracing_to_linker(
     linker: &mut wasmtime::component::Linker<Host<Capture>>,
 ) -> Result<()> {
+    add_builtin_config_stub(linker)?;
     let mut otel = linker.instance(OTEL_TRACING)?;
 
     otel.func_new("on-start", |store, _ty, params, _results| {
