@@ -112,7 +112,7 @@ jobs:
          tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }},cviz@${{ env.CVIZ_VERSION }},wkg@${{ env.WKG_VERSION }}
      # Build builtins from the PR tree and point splicer at them via
      # SPLICER_BUILTINS_DIR so scenarios that inject builtins (e.g.
-     # --hello-builtin-config) use the bytes under test rather than
+     # --builtin-hello-tier1) use the bytes under test rather than
      # whatever's published to OCI today.
      - name: Build builtins
        run: make build-builtins
