@@ -17,8 +17,8 @@ use wasmtime::component::Val;
 
 mod common;
 use common::{
-    assert_call_attrs, drive_call_cycle, empty_span_context, expect_list, expect_record,
-    expect_string, field, Host,
+    add_builtin_config_stub, assert_call_attrs, drive_call_cycle, empty_span_context, expect_list,
+    expect_record, expect_string, field, Host,
 };
 
 const OTEL_LOGS: &str = "wasi:otel/logs@0.2.0-rc.2";
@@ -30,6 +30,7 @@ struct Capture {
 }
 
 fn add_otel_logs_to_linker(linker: &mut wasmtime::component::Linker<Host<Capture>>) -> Result<()> {
+    add_builtin_config_stub(linker)?;
     let mut logs = linker.instance(OTEL_LOGS)?;
     logs.func_new("on-emit", |store, _ty, params, _results| {
         store

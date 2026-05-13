@@ -75,6 +75,8 @@ fn parse_span_kind(s: &str) -> Option<SpanKind> {
     }
 }
 
+type CallKey = (String, String);
+
 /// Stack per `(interface, function)` so concurrent or recursive
 /// invocations of the same name don't clobber each other's contexts.
 ///
@@ -84,12 +86,12 @@ fn parse_span_kind(s: &str) -> Option<SpanKind> {
 /// mis-pairs concurrent invocations of the same function — `on-return`
 /// can pop a sibling invocation's pending span. The stack just keeps
 /// the failure mode bounded (LIFO swap) instead of unbounded growth.
-fn pending() -> &'static Mutex<HashMap<(String, String), Vec<Pending>>> {
-    static M: OnceLock<Mutex<HashMap<(String, String), Vec<Pending>>>> = OnceLock::new();
+fn pending() -> &'static Mutex<HashMap<CallKey, Vec<Pending>>> {
+    static M: OnceLock<Mutex<HashMap<CallKey, Vec<Pending>>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn key(call: &CallId) -> (String, String) {
+fn key(call: &CallId) -> CallKey {
     (call.interface_name.clone(), call.function_name.clone())
 }
 

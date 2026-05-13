@@ -18,13 +18,15 @@ Read at first call via `splicer:builtin-config/get` and cached for
 the rest of the wasm-instance lifetime. Unrecognized values fall back
 to the default silently (tier-1 has no logging surface).
 
-| Key         | Type   | Default    | Description                                                                                          |
-|-------------|--------|------------|------------------------------------------------------------------------------------------------------|
-| `span_kind` | string | `internal` | OTel span kind. Accepts `internal` / `server` / `client` / `producer` / `consumer` (case-insensitive). |
+| Key         | Type   | Default    | Description       |
+|-------------|--------|------------|-------------------|
+| `span_kind` | string | `internal` | OTel span kind.   |
 
-Set `span_kind: server` when wrapping incoming-request handlers
-(e.g. `wasi:http/handler@0.3.0`) so trace UIs render the spans as
-server-side request handling instead of an internal hop.
+**`span_kind`** accepts `internal` / `server` / `client` /
+`producer` / `consumer` (case-insensitive). Set it to `server` when
+wrapping incoming-request handlers (e.g. `wasi:http/handler@0.3.0`)
+so trace UIs render the spans as server-side request handling
+instead of an internal hop.
 
 Example splice config:
 

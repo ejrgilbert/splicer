@@ -22,10 +22,18 @@ Read at first call via `splicer:builtin-config/get` and cached for
 the rest of the wasm-instance lifetime. Parse failures fall back to
 the default silently (tier-1 has no logging surface).
 
-| Key                   | Type | Default | Description                                                                                                                       |
-|-----------------------|------|---------|-----------------------------------------------------------------------------------------------------------------------------------|
-| `buffer`              | u32  | 1       | Accumulate N samples per `(iface, fn)` before flushing. `1` reproduces always-export-per-call. Clamped to a minimum of 1.        |
-| `flush_after_seconds` | f64  | 10.0    | Wall-clock staleness trigger: flush when `now - window_start >= flush_after_seconds`. Effectively moot when `buffer == 1`.       |
+| Key                   | Type | Default | Description                              |
+|-----------------------|------|---------|------------------------------------------|
+| `buffer`              | u32  | 1       | Samples per window before flushing.      |
+| `flush_after_seconds` | f64  | 10.0    | Wall-clock staleness flush trigger.      |
+
+**`buffer`** accumulates that many samples per `(iface, fn)` before
+flushing. `1` reproduces always-export-per-call. Clamped to a minimum
+of 1.
+
+**`flush_after_seconds`** triggers a flush when
+`now - window_start >= flush_after_seconds`. Effectively moot when
+`buffer == 1`.
 
 Example splice config:
 
