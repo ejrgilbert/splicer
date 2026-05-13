@@ -1,14 +1,33 @@
 # Builtin config substrate — `splicer:builtin-config`
 
-> **Status:** landed. The substrate ships as designed below, with one
-> deviation: the body talks about builtins (including the provider
-> template) being **embedded in the splicer binary**, but builtins now
-> ship as OCI artifacts under
-> `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>` and are
-> resolved at splice time via local override → on-disk cache → OCI
-> pull (see [`src/builtins.rs`](../../src/builtins.rs) for the
-> resolver). The patching mechanism is the same; only the bytes'
-> origin changed.
+> **Status:** landed. The substrate ships as designed below, with two
+> deviations:
+>
+> 1. The body talks about builtins (including the provider template)
+>    being **embedded in the splicer binary**, but builtins now ship
+>    as OCI artifacts under
+>    `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>` and are
+>    resolved at splice time via local override → on-disk cache →
+>    OCI pull (see [`src/builtins.rs`](../../src/builtins.rs) for the
+>    resolver). The patching mechanism is the same; only the bytes'
+>    origin changed.
+>
+> 2. The substrate's WIT (`get: func(...)`) is now **load-bearing
+>    sync** — not just an implementation convenience. Substrate
+>    consumers (builtins like `hello-tier1`, `otel-bare-*`) must
+>    lower this import as plain `canon lower` (no async) AND call it
+>    without `.await`. The detailed root cause and rationale live in
+>    [`docs/TODO/sync-wit-suspend-limit.md`](sync-wit-suspend-limit.md);
+>    short version: a sync-WIT-rooted wasm task (which is what
+>    splicer's adapter is whenever it wraps a sync-WIT target) cannot
+>    block on a canon-async wait, so any substrate call that goes
+>    through canon-async machinery wedges with `wasm trap: cannot
+>    block a synchronous task before returning`. The "Consumer
+>    pattern" section below shows the required `wit_bindgen::generate!`
+>    shape. Splicer's [preflight check](../../src/wac.rs)
+>    (`preflight_sync_target_async_middleware`) rejects user-authored
+>    middlewares that try to async-lower a peer-component import
+>    against a sync-WIT splice target.
 >
 > User-facing YAML reference lives in
 > [`docs/splice-config.md`](../splice-config.md); the worked example
@@ -23,6 +42,8 @@
 > - [`otel-bare-logs`](../../builtins/otel-bare-logs/README.md) —
 >   `severity` (level name; sets both `severity-text` and the spec
 >   base `severity-number`).
+> - [`hello-tier2`](../../builtins/hello-tier2/README.md) — `greeting`
+>   (typed-args sibling of `hello-tier1`; same single string key).
 >
 > The rest of this file is preserved as the design rationale —
 > particularly the "Why string-based (not typed records)" and "Path 1
@@ -132,8 +153,62 @@ world provider {
 }
 ```
 
+`get` is `func` (sync), not `async func`. **Load-bearing** — see
+[`docs/TODO/sync-wit-suspend-limit.md`](sync-wit-suspend-limit.md).
+The substrate is consumed from middleware hook bodies that may run
+inside an adapter task rooted in a sync-WIT export, and a sync-rooted
+wasm task cannot block on a canon-async wait. Bumping this to `async
+func` would re-introduce the deadlock; any future migration target
+(e.g. `wasi:config/runtime`) must keep this same shape.
+
 Mirrors the shape of `wasi:config/runtime` so a future migration is a
-package rename.
+package rename, *modulo* the caveat above on async-ness.
+
+## Consumer pattern
+
+Substrate consumers must:
+
+1. Declare the import as sync at WIT (the vendored copy of
+   `splicer:builtin-config@0.1.0` already does this — don't override).
+2. Use a per-export async filter in `wit_bindgen::generate!`, NOT
+   `async: true`. Mark only the hook exports async; let the
+   substrate import default to sync canon-lower:
+
+   ```rust
+   wit_bindgen::generate!({
+       world: "...-mdl",
+       async: [
+           "export:splicer:tier1/before@0.3.0#on-call",
+           "export:splicer:tier1/after@0.3.0#on-return",
+           // …or tier2 equivalents
+       ],
+       generate_all,
+   });
+   ```
+
+3. Call `get_config` synchronously — `get_config(key)`, no `.await`,
+   from a `fn` (not `async fn`) helper:
+
+   ```rust
+   fn greeting() -> &'static str {
+       static G: OnceLock<String> = OnceLock::new();
+       if let Some(g) = G.get() { return g.as_str(); }
+       let val = get_config("greeting")
+           .unwrap_or_else(|| "<default>".to_string());
+       G.get_or_init(|| val).as_str()
+   }
+   ```
+
+`async: true` on the world *will* compile and *will* boot, but the
+substrate call becomes `canon lower ... async`, which traps the first
+time the builtin is spliced on a sync-WIT target interface. The
+trap is loud (clear wasmtime error) under the simple `call_async`
+host but silently hangs under `wasmtime-wasi-http`'s
+`run_concurrent + try_join!` wrapper, so it's worth getting right at
+authoring time. The shipped builtins (`hello-tier1`, `hello-tier2`,
+`otel-bare-{spans,logs,metrics}`) all follow this pattern and have
+load-bearing comments in their `wit_bindgen::generate!` blocks
+pointing back at this doc.
 
 ## Architecture
 
@@ -294,6 +369,24 @@ original scalar type for error messages).
    [`builtins/otel-bare-spans/README.md`](../../builtins/otel-bare-spans/README.md)
    and [`builtins/otel-bare-logs/README.md`](../../builtins/otel-bare-logs/README.md).
 
+9. ✅ **Sync-WIT-suspend deadlock + consumer pattern lockdown**: the
+   substrate was originally shipped with consumers using
+   `async: true` and `.await` on the substrate call. That works
+   when spliced on async-WIT entrypoints (e.g. `wasi:http/handler`),
+   but deadlocks at runtime when spliced on a sync-WIT target —
+   canon-async wait inside a sync-WIT-rooted task. Diagnosed and
+   fixed in 2026-05: substrate WIT pinned sync, `config-provider`
+   rebuilt without `async: true`, every shipped consumer switched
+   to the per-export async filter (see "Consumer pattern" above),
+   and a splice-time preflight check
+   ([`src/wac.rs::preflight_sync_target_async_middleware`](../../src/wac.rs))
+   refuses any future user-authored middleware that would re-introduce
+   the pattern (async-WIT peer-component import + sync-WIT splice
+   target → splice fails with a clear error pointing at
+   `docs/TODO/sync-wit-suspend-limit.md`). The substrate itself is
+   not what's special — any peer-component async-WIT import from
+   a hook body has the same constraint; this fix covers all of them.
+
 ## Sequencing
 
 Substrate landed off main with the tier-2 work already in place, so
@@ -301,9 +394,14 @@ there were no merge-conflict surprises versus the original sequencing
 plan. The `otel-bare-metrics` aggregation rework followed as the
 first non-trivial consumer (item 7); `otel-bare-spans` +
 `otel-bare-logs` then picked up small string-config keys for OTel
-correctness / pipeline ergonomics (item 8). All three builtins use
-the same `OnceLock<Config>` + per-key parse-with-default pattern, so
-adding a new consumer is mostly mechanical.
+correctness / pipeline ergonomics (item 8). The sync-WIT-suspend
+deadlock surfaced when `hello-tier2` was spliced on the sync-WIT
+`my:service/adder` (item 9) — fixing it tightened the consumer
+contract (sync-WIT import, per-export async filter) and added the
+preflight check. All shipped builtins use the same `OnceLock<Config>`
++ per-key parse-with-default pattern, so adding a new consumer is
+mostly mechanical; follow the "Consumer pattern" section's
+`wit_bindgen::generate!` shape exactly.
 
 ## Defaults / missing-key semantics
 
@@ -334,7 +432,16 @@ If the WASI proposal stabilizes and we want to switch:
    compose graphs, not on the interface name
 
 The user-facing YAML and the architecture are identical. This is a
-WIT-level rename, not a redesign.
+WIT-level rename, not a redesign — **provided** `wasi:config/runtime`'s
+`get` signature stays `func` (sync). If the proposal lands as `async
+func`, migration is blocked by the constraint in
+[`sync-wit-suspend-limit.md`](sync-wit-suspend-limit.md): consumers
+running inside a sync-WIT-rooted adapter task can't canon-async-wait,
+and an async-WIT `get` forces them to. The mitigation in that case
+would be option 2 from that doc (auto-insert a sync→async bridge
+component around sync-WIT splice targets), which un-blocks all peer-
+component async imports including this one. Not a redesign of the
+substrate, but adds complexity in splicer's compose pipeline.
 
 ## Open questions
 
