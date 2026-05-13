@@ -5,6 +5,11 @@
 //! trace-id when one is active), notifies the host via
 //! `tracing::on-start`, and pushes a pending entry. `on-return` pops
 //! the entry and emits `tracing::on-end` with the captured timestamps.
+//!
+//! Config keys are read once at first observation via
+//! `splicer:builtin-config/get` and cached for the instance's
+//! lifetime. Unset keys + parse failures fall back to defaults
+//! silently (tier-1 has no logging surface).
 
 mod bindings {
     wit_bindgen::generate!({
@@ -19,6 +24,7 @@ use std::sync::{Mutex, OnceLock};
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
+use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::{now, Datetime};
 use bindings::wasi::otel::tracing::{
@@ -37,6 +43,36 @@ struct Pending {
     context: SpanContext,
     parent_span_id: String,
     start_time: Datetime,
+}
+
+/// Parsed config, materialized once on first observation.
+struct Config {
+    span_kind: SpanKind,
+}
+
+async fn config() -> &'static Config {
+    static C: OnceLock<Config> = OnceLock::new();
+    if let Some(c) = C.get() {
+        return c;
+    }
+    let span_kind = match get_config("span_kind".to_string()).await {
+        Some(s) => parse_span_kind(&s).unwrap_or(SpanKind::Internal),
+        None => SpanKind::Internal,
+    };
+    C.get_or_init(|| Config { span_kind })
+}
+
+/// Case-insensitive match against the OTel `SpanKind` variants. `None`
+/// on unknown input — caller falls back to the default.
+fn parse_span_kind(s: &str) -> Option<SpanKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "internal" => Some(SpanKind::Internal),
+        "server" => Some(SpanKind::Server),
+        "client" => Some(SpanKind::Client),
+        "producer" => Some(SpanKind::Producer),
+        "consumer" => Some(SpanKind::Consumer),
+        _ => None,
+    }
 }
 
 /// Stack per `(interface, function)` so concurrent or recursive
@@ -161,7 +197,7 @@ impl AfterGuest for OtelBareSpans {
         let span = SpanData {
             span_context: p.context,
             parent_span_id: p.parent_span_id,
-            span_kind: SpanKind::Internal,
+            span_kind: config().await.span_kind,
             name: format!("{}::{}", call.interface_name, call.function_name),
             start_time: p.start_time,
             end_time: now().await,
