@@ -369,6 +369,23 @@ pub(crate) struct ListEmitLocals {
     pub record_tuples_bytes_per_elem: u32,
     pub variant_slot_base: Option<u32>,
     pub variants_per_elem: u32,
+    /// `Some` iff this list's element plan is exactly `[Cell::ListOf]`
+    /// — enforced by `push_list_of`'s depth-2 cap. Inner's `start_i`
+    /// is *written once per outer iter* from
+    /// [`Self::nested_inner_cursor`] before inner emit runs (same
+    /// "base, not cursor" role as a top-level list's `start_i`).
+    /// `inner.len` is set from outer's loaded elem-flats per outer iter.
+    pub nested_inner: Option<Box<ListEmitLocals>>,
+    /// Running cell-array cursor for the nested-list emit: pre-pass
+    /// seeds `outer.start_i + outer.len`; outer loop body advances
+    /// by `inner.len * inner_elem_count` at the end of each iter.
+    /// Kept separate from [`Self::nested_inner`]'s `start_i` so the
+    /// inner's `start_i` keeps its single base-pointer meaning.
+    /// `Some` iff `nested_inner` is `Some`.
+    pub nested_inner_cursor: Option<u32>,
+    /// Outer-ptr scratch for the nested-list pre-pass memory walk.
+    /// `Some` iff `nested_inner` is `Some`.
+    pub nested_outer_ptr_scratch: Option<u32>,
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
@@ -383,13 +400,22 @@ pub(super) fn alloc_list_emit_locals(
 ) -> Vec<ListEmitLocals> {
     plan.list_specs()
         .map(|spec: ListSpec<'_>| {
-            build_one_list_emit_locals(spec, resolve, size_align, record_tuple_size, builder)
+            build_list_emit_locals_for_plan(
+                spec.element_plan,
+                resolve,
+                size_align,
+                record_tuple_size,
+                builder,
+            )
         })
         .collect()
 }
 
-fn build_one_list_emit_locals(
-    spec: ListSpec<'_>,
+/// Build locals for one list with `element_plan` as the per-element
+/// lift plan. Reentrant: the nested-list arm recurses on the inner
+/// list's own element plan to allocate its `ListEmitLocals`.
+fn build_list_emit_locals_for_plan(
+    element_plan: &LiftPlan,
     resolve: &Resolve,
     size_align: &SizeAlign,
     record_tuple_size: u32,
@@ -401,7 +427,7 @@ fn build_one_list_emit_locals(
     let j = builder.alloc_local(ValType::I32);
     let elem_addr = builder.alloc_local(ValType::I32);
     // Contiguous flat-slot locals: plan slot N → elem_flat_locals[0] + N.
-    let elem_ty = spec.element_plan.source_ty;
+    let elem_ty = element_plan.source_ty;
     let flat = flat_types(resolve, &elem_ty, None)
         .expect("list element type must flatten within MAX_FLAT_PARAMS");
     let elem_flat_locals: Vec<u32> = flat
@@ -416,7 +442,7 @@ fn build_one_list_emit_locals(
     lift_from_memory(resolve, &mut bindgen, (), &elem_ty);
     let elem_loads = bindgen.into_instructions();
     let elem_byte_size = size_align.size(&elem_ty).size_wasm32() as u32;
-    let (elem_cell_side, counts) = walk_element_plan(spec.element_plan, record_tuple_size);
+    let (elem_cell_side, counts) = walk_element_plan(element_plan, record_tuple_size);
     let char_scratch_base = (counts.chars > 0).then(|| builder.alloc_local(ValType::I32));
     let tuple_idx_buf_base =
         (counts.tuple_idx_slots > 0).then(|| builder.alloc_local(ValType::I32));
@@ -437,6 +463,28 @@ fn build_one_list_emit_locals(
     let variant_slot_base = (counts.variants > 0).then(|| builder.alloc_local(ValType::I32));
     let variants_per_elem = counts.variants;
     let elem_cell_base = builder.alloc_local(ValType::I32);
+    // Nested-list recursion: element plan is exactly one `Cell::ListOf`.
+    // Enforced by `push_list_of`'s depth-2 cap, so any other shape
+    // means a plan-build bug.
+    let (nested_inner, nested_inner_cursor, nested_outer_ptr_scratch) =
+        match element_plan.cells.as_slice() {
+            [Cell::ListOf {
+                element_plan: inner_plan,
+                ..
+            }] => {
+                let inner = build_list_emit_locals_for_plan(
+                    inner_plan,
+                    resolve,
+                    size_align,
+                    record_tuple_size,
+                    builder,
+                );
+                let cursor = builder.alloc_local(ValType::I32);
+                let ptr_scratch = builder.alloc_local(ValType::I32);
+                (Some(Box::new(inner)), Some(cursor), Some(ptr_scratch))
+            }
+            _ => (None, None, None),
+        };
     ListEmitLocals {
         start_i,
         len,
@@ -464,20 +512,17 @@ fn build_one_list_emit_locals(
         record_tuples_bytes_per_elem,
         variant_slot_base,
         variants_per_elem,
+        nested_inner,
+        nested_inner_cursor,
+        nested_outer_ptr_scratch,
     }
 }
 
 /// Whether any list-element cell across the wrapper's plans has the
-/// given [`ListElementClass`]. Gates shared wrapper locals.
+/// given [`ListElementClass`]. Recurses through nested lists' inner
+/// element plans so their per-class wrapper locals also get gated on.
 fn fn_has_list_elem_class(fd: &FuncDispatch, want: ListElementClass) -> bool {
-    let plan_has = |plan: &LiftPlan| {
-        plan.list_specs().any(|spec| {
-            spec.element_plan
-                .cells
-                .iter()
-                .any(|c| c.list_element_class() == Some(want))
-        })
-    };
+    let plan_has = |plan: &LiftPlan| plan.any_list_element_has_class(want);
     if fd.params.iter().any(|p| plan_has(&p.lift.plan)) {
         return true;
     }
@@ -694,6 +739,10 @@ pub(super) fn walk_element_plan(
                         },
                     ))
                 }
+                // Nested list: per-iter state lives on outer's
+                // `ListEmitLocals.nested_inner`; no per-elem counter
+                // contribution (inner kinds gated to non-per-call-buf).
+                ListElementClass::PrestagedNestedList => CellSideData::None,
             }
         })
         .collect();
@@ -1205,8 +1254,118 @@ pub(crate) fn emit_list_pre_pass(
             f.instructions().i32_add();
             f.instructions().local_set(next_variant_idx);
         }
+        if ll.nested_inner.is_some() {
+            emit_nested_list_pre_pass(f, ctx, plan, &spec, ll, local_base, lcl);
+        }
         emit_close_arm_guards(f, spec.arm_guards.len());
     }
+}
+
+/// Outer's inner-list locals + cursor. Panics on stale callers that
+/// reach a non-nested list with a `Cell::ListOf` element — guarded
+/// by `push_list_of`'s depth-2 cap (`lift/plan.rs`).
+fn nested_inner_of(outer_ll: &ListEmitLocals) -> (&ListEmitLocals, u32) {
+    let inner = outer_ll
+        .nested_inner
+        .as_deref()
+        .expect("Cell::ListOf element ⇒ nested_inner allocated");
+    let cursor = outer_ll
+        .nested_inner_cursor
+        .expect("nested_inner ⇔ nested_inner_cursor");
+    (inner, cursor)
+}
+
+/// Nested-list pre-pass: walk outer's data and bump `next_cell_idx`
+/// by `inner_len_j * inner_elem_count` per element. Seeds the cursor
+/// to `outer.start_i + outer.len`. Runs inside the outer's arm-guard
+/// block. Guarded by `outer.len > 0` so the empty-outer path skips
+/// the loop preamble.
+fn emit_nested_list_pre_pass(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    plan: &LiftPlan,
+    outer_spec: &ListSpec<'_>,
+    outer_ll: &ListEmitLocals,
+    local_base: u32,
+    lcl: &WrapperLocals,
+) {
+    let (inner_ll, cursor) = nested_inner_of(outer_ll);
+    let outer_ptr_scratch = outer_ll
+        .nested_outer_ptr_scratch
+        .expect("nested_inner ⇔ nested_outer_ptr_scratch");
+    // `walk_element_plan` produced one side-data entry per inner-plan
+    // cell, so the count matches `inner_element_plan.cell_count()`.
+    let inner_elem_count = inner_ll.elem_cell_side.len() as u32;
+    // Outer element type is `list<T>` (depth-2 cap) → flat layout is
+    // (i32 ptr, i32 len) = 8 bytes, len at offset 4. The pre-pass
+    // load math below hard-codes that; pin it here so a layout drift
+    // in the canon-ABI list lower would surface as a debug-build
+    // panic rather than silent misread.
+    debug_assert_eq!(
+        outer_ll.elem_byte_size, 8,
+        "nested-list outer element must be canon-ABI list = (ptr, len) 8 bytes",
+    );
+    // cursor = outer.start_i + outer.len  (initial position of the
+    // first inner-cell slot; advanced per outer iter by emit).
+    f.instructions().local_get(outer_ll.start_i);
+    f.instructions().local_get(outer_ll.len);
+    f.instructions().i32_add();
+    f.instructions().local_set(cursor);
+    // Skip the entire walk when outer is empty — saves the
+    // loop preamble + branch on hot empty-outer paths. `if_` fires
+    // on non-zero, so `local_get(outer.len)` is the natural guard.
+    f.instructions().local_get(outer_ll.len);
+    f.instructions().if_(BlockType::Empty);
+    // Load outer.ptr into scratch for the walk.
+    push_widened_get(f, plan, local_base, outer_spec.ptr_slot, WasmType::I32);
+    f.instructions().local_set(outer_ptr_scratch);
+    // for (j = 0; j < outer.len; j++) {
+    //     inner.len = mem[outer_ptr + j*8 + 4];
+    //     trap_check; next_cell_idx += inner.len * inner_elem_count;
+    // }
+    f.instructions().i32_const(0);
+    f.instructions().local_set(outer_ll.j);
+    f.instructions().block(BlockType::Empty);
+    f.instructions().loop_(BlockType::Empty);
+    f.instructions().local_get(outer_ll.j);
+    f.instructions().local_get(outer_ll.len);
+    f.instructions().i32_ge_u();
+    f.instructions().br_if(1);
+    // inner.len = i32_load (outer_ptr + j*8 + 4)
+    f.instructions().local_get(outer_ptr_scratch);
+    f.instructions().local_get(outer_ll.j);
+    f.instructions().i32_const(8);
+    f.instructions().i32_mul();
+    f.instructions().i32_add();
+    f.instructions().i32_load(MemArg {
+        offset: 4,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    });
+    f.instructions().local_set(inner_ll.len);
+    super::super::super::abi::emit::emit_trap_if_list_overflows_cell_slab(
+        f,
+        inner_ll.len,
+        inner_elem_count,
+        lcl.next_cell_idx,
+        ctx.cell_layout.size,
+    );
+    f.instructions().local_get(lcl.next_cell_idx);
+    f.instructions().local_get(inner_ll.len);
+    if inner_elem_count != 1 {
+        f.instructions().i32_const(inner_elem_count as i32);
+        f.instructions().i32_mul();
+    }
+    f.instructions().i32_add();
+    f.instructions().local_set(lcl.next_cell_idx);
+    f.instructions().local_get(outer_ll.j);
+    f.instructions().i32_const(1);
+    f.instructions().i32_add();
+    f.instructions().local_set(outer_ll.j);
+    f.instructions().br(0);
+    f.instructions().end(); // loop
+    f.instructions().end(); // block
+    f.instructions().end(); // if outer.len > 0
 }
 
 /// Emit one cell at `lcl.addr`. `list_slot` is `Some` exactly for
@@ -1627,8 +1786,24 @@ fn emit_list_of_arm(
                 };
                 emit_stage_tuple_slot(f, lcl, ll, offset_in_elem, children);
             }
+            // Nested list: copy inner.len from outer's elem-flats and
+            // snap inner.start_i to the running cursor (pre-pass seeded
+            // it; iter-end advances it). After this, `emit_list_of_arm`
+            // for the inner reads inner.start_i as a plain base.
+            Cell::ListOf { len_slot, .. } => {
+                let (inner_ll, cursor) = nested_inner_of(ll);
+                f.instructions()
+                    .local_get(ll.elem_flat_locals[0] + *len_slot);
+                f.instructions().local_set(inner_ll.len);
+                f.instructions().local_get(cursor);
+                f.instructions().local_set(inner_ll.start_i);
+            }
             _ => {}
         }
+        let list_slot_for_cell = match elem_cell {
+            Cell::ListOf { .. } => Some(nested_inner_of(ll).0),
+            _ => None,
+        };
         emit_cell_op(
             f,
             ctx,
@@ -1640,8 +1815,28 @@ fn emit_list_of_arm(
             elem_cell,
             &ll.elem_cell_side[cell_pos],
             lcl,
-            None,
+            list_slot_for_cell,
         );
+        // Advance running cursor: cursor += inner.len * inner_elem_count.
+        // The cursor (not inner.start_i) carries the running state
+        // across outer iters; inner.start_i was snapped to the cursor's
+        // value at iter-start and stays as a base.
+        if let Cell::ListOf {
+            element_plan: inner_plan,
+            ..
+        } = elem_cell
+        {
+            let (inner_ll, cursor) = nested_inner_of(ll);
+            let inner_elem_count = inner_plan.cell_count();
+            f.instructions().local_get(cursor);
+            f.instructions().local_get(inner_ll.len);
+            if inner_elem_count != 1 {
+                f.instructions().i32_const(inner_elem_count as i32);
+                f.instructions().i32_mul();
+            }
+            f.instructions().i32_add();
+            f.instructions().local_set(cursor);
+        }
     }
     debug_assert_eq!(
         char_idx, ll.chars_per_elem,

@@ -204,6 +204,12 @@ pub(crate) enum ListElementClass {
     /// `Cell::Variant`. Per-arm payload child indices resolve to
     /// `elem_cell_base + child_pos_in_elem` at the dispatch site.
     PrestagedVariant,
+    /// `Cell::ListOf` — `list<list<T>>` with inner cells limited to
+    /// the per-call-buffer-free subset (Scalar / PrestagedChar /
+    /// PrestagedChildIdx / PrestagedTupleIndices) and no further
+    /// nesting. Inner emit runs per outer iter; inner `start_i` is
+    /// a running cursor staged off `outer.start_i + outer.len`.
+    PrestagedNestedList,
 }
 
 impl Cell {
@@ -227,7 +233,23 @@ impl Cell {
             | Cell::Text { .. }
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
-            Cell::ListOf { .. } => None,
+            // Gate inner cells to the per-call-buffer-free subset so
+            // outer `push_list_of`'s `allowed_as_list_element` rejects
+            // record / variant / flags / handle / further nesting in
+            // the inner element.
+            Cell::ListOf { element_plan, .. } => element_plan
+                .cells
+                .iter()
+                .all(|c| {
+                    matches!(
+                        c.list_element_class(),
+                        Some(ListElementClass::Scalar)
+                            | Some(ListElementClass::PrestagedChar)
+                            | Some(ListElementClass::PrestagedChildIdx)
+                            | Some(ListElementClass::PrestagedTupleIndices)
+                    )
+                })
+                .then_some(ListElementClass::PrestagedNestedList),
         }
     }
 
@@ -352,6 +374,23 @@ impl LiftPlan {
         })
     }
 
+    /// Whether any list (top-level or nested-list inner) has a
+    /// list-element cell of class `want`. Nested-list inner element
+    /// cells contribute too — their per-call wrapper-locals are
+    /// shared with top-level uses.
+    pub(crate) fn any_list_element_has_class(&self, want: ListElementClass) -> bool {
+        self.cells.iter().any(|c| {
+            let Cell::ListOf { element_plan, .. } = c else {
+                return false;
+            };
+            element_plan
+                .cells
+                .iter()
+                .any(|inner| inner.list_element_class() == Some(want))
+                || element_plan.any_list_element_has_class(want)
+        })
+    }
+
     /// Placeholder plan after a sub-`for_type` error; never reaches emit.
     pub(super) fn stub_for(source_ty: Type) -> Self {
         Self {
@@ -368,12 +407,13 @@ impl LiftPlan {
         self.cells.iter().filter_map(|op| match op {
             Cell::ListOf {
                 list_idx,
+                ptr_slot,
                 len_slot,
                 element_plan,
                 arm_guards,
-                ..
             } => Some(ListSpec {
                 list_idx: *list_idx,
+                ptr_slot: *ptr_slot,
                 len_slot: *len_slot,
                 element_plan,
                 arm_guards,
@@ -383,10 +423,13 @@ impl LiftPlan {
     }
 }
 
-/// Per-`Cell::ListOf` view used by alloc + emit.
+/// Per-`Cell::ListOf` view used by alloc + emit. `ptr_slot` is read
+/// by the nested-list pre-pass to walk outer's data in memory; other
+/// callers ignore it.
 #[derive(Clone, Copy)]
 pub(crate) struct ListSpec<'a> {
     pub list_idx: u32,
+    pub ptr_slot: u32,
     pub len_slot: u32,
     pub element_plan: &'a LiftPlan,
     /// Empty unless the list lives inside joined `result` / `variant` arm(s).
@@ -983,19 +1026,36 @@ impl<'a> LiftPlanBuilder<'a> {
                 LiftPlan::stub_for(*elem)
             }
         };
-        if !element_plan
+        let per_cell_ok = element_plan
             .cells
             .iter()
-            .all(|c| c.allowed_as_list_element())
-        {
+            .all(|c| c.allowed_as_list_element());
+        // Depth-2 cap: a `Cell::ListOf` may only appear as a list-element
+        // when it's the *sole* cell of the parent list's element plan
+        // (i.e. outer element type is itself a `list<T>`). Wrapping a
+        // `list<T>` in option / tuple / record / variant / result inside
+        // another list violates the cap — emit's `nested_inner` lives on
+        // a single element-plan position and would panic without this
+        // gate. Tested by `nested_list_under_wrapper_bails_at_plan_build`.
+        let nested_position_ok = !element_plan
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::ListOf { .. }))
+            || matches!(element_plan.cells.as_slice(), [Cell::ListOf { .. }]);
+        if !(per_cell_ok && nested_position_ok) {
             self.record_error(anyhow!(
                 "`list<T>` element type {elem:?} contains a cell shape that \
                  isn't yet supported as a list element (allowed today: bool, \
                  integers, floats, string, list<u8>, enum, char, option, \
                  result, tuple, flags, record, variant, \
-                 own/borrow/stream/future/error-context handles — with \
-                 allowed inner cells throughout). Still gated: nested list. \
-                 File a request at {ISSUES_URL} to bump priority."
+                 own/borrow/stream/future/error-context handles, plus \
+                 `list<list<T>>` where the inner `T` stays on scalars / \
+                 char / option / result / tuple / enum — with allowed inner \
+                 cells throughout). Still gated: `list<list<T>>` whose \
+                 inner element needs a per-call info buffer (record / \
+                 variant / flags / handle), further nesting, or a \
+                 nested-list wrapped in option / tuple / record / variant / \
+                 result. File a request at {ISSUES_URL} to bump priority."
             ));
         }
         let arm_guards = self.arm_guard_stack.clone();
