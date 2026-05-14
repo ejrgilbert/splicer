@@ -52,6 +52,8 @@ wac-parser = "0.10"
 wac-resolver = "0.10"
 wac-graph = "0.10"
 tempfile = "3"
+builtin-manifest = { path = "builtins/builtin-manifest" }
+toml = "0.8"
 
 [dev-dependencies]
 wat = "1"

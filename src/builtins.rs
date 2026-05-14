@@ -123,6 +123,40 @@ pub fn known_names() -> Vec<&'static str> {
     names
 }
 
+/// Resolve every user-facing builtin's bytes, extract its manifest
+/// (when present), and return the pairs in `known_names()` order.
+/// Resolution errors land as `Err(...)` rather than panicking so the
+/// caller can render partial output — `splicer builtin` shouldn't
+/// crash when one OCI pull misbehaves.
+pub fn list_with_manifests() -> Vec<(&'static str, Result<Option<builtin_manifest::Manifest>>)> {
+    let mut out = Vec::new();
+    for name in known_names() {
+        let entry = (|| -> Result<Option<builtin_manifest::Manifest>> {
+            let bytes = load_resolved_bytes(name)?;
+            builtin_manifest::extract_for_builtin(&bytes, name)
+                .map_err(|e| anyhow::anyhow!("manifest extraction failed: {e}"))
+        })();
+        out.push((name, entry));
+    }
+    out
+}
+
+/// Resolve a single builtin's bytes and extract its embedded manifest.
+/// Errors when the builtin name is unknown, the bytes can't be
+/// fetched, or no matching manifest section is present.
+pub fn resolve_manifest(name: &str) -> Result<builtin_manifest::Manifest> {
+    let bytes = load_resolved_bytes(name)?;
+    builtin_manifest::extract_for_builtin(&bytes, name)
+        .map_err(|e| anyhow::anyhow!("manifest extraction failed: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "builtin '{name}' carries no embedded `splicer-builtin-manifest/{name}` \
+                 section. The builtin pre-dates manifests, or was built without \
+                 builtin-manifest in its build.rs."
+            )
+        })
+}
+
 /// Resolve the named builtin's bytes (override → cache → OCI pull).
 /// Used both by [`materialize_into`] (which writes them to disk) and
 /// by the config-provider patcher (which patches them in memory before

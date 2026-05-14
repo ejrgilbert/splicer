@@ -406,6 +406,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "builtin-manifest"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "toml 0.8.23",
+ "wasmparser 0.247.0",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4202,6 +4213,7 @@ version = "2.4.0"
 dependencies = [
  "anyhow",
  "arbitrary",
+ "builtin-manifest",
  "clap",
  "colored",
  "cviz",
@@ -4211,6 +4223,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "wac-graph",

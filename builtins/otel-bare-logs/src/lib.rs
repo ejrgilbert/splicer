@@ -30,10 +30,12 @@ mod bindings {
     });
 }
 
-use std::sync::OnceLock;
+// Codegenned from manifest.toml: manifest custom section + typed
+// accessors in `mod config`. Defaults live only in `manifest.toml`.
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
-use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::now;
 use bindings::wasi::otel::logs::{on_emit, LogRecord};
@@ -63,37 +65,6 @@ const SEVERITY_INFO: Severity = Severity { text: "INFO", number: 9 };
 const SEVERITY_WARN: Severity = Severity { text: "WARN", number: 13 };
 const SEVERITY_ERROR: Severity = Severity { text: "ERROR", number: 17 };
 const SEVERITY_FATAL: Severity = Severity { text: "FATAL", number: 21 };
-
-/// Parsed config, materialized once on first observation.
-struct Config {
-    severity: Severity,
-}
-
-fn config() -> &'static Config {
-    static C: OnceLock<Config> = OnceLock::new();
-    if let Some(c) = C.get() {
-        return c;
-    }
-    let severity = match get_config("severity") {
-        Some(s) => parse_severity(&s).unwrap_or(SEVERITY_INFO),
-        None => SEVERITY_INFO,
-    };
-    C.get_or_init(|| Config { severity })
-}
-
-/// Case-insensitive match against the OTel spec-defined level names.
-/// `None` on unknown input — caller falls back to the default.
-fn parse_severity(s: &str) -> Option<Severity> {
-    match s.trim().to_ascii_uppercase().as_str() {
-        "TRACE" => Some(SEVERITY_TRACE),
-        "DEBUG" => Some(SEVERITY_DEBUG),
-        "INFO" => Some(SEVERITY_INFO),
-        "WARN" | "WARNING" => Some(SEVERITY_WARN),
-        "ERROR" => Some(SEVERITY_ERROR),
-        "FATAL" => Some(SEVERITY_FATAL),
-        _ => None,
-    }
-}
 
 /// OTel encodes "no parent" as the all-zero id. Treat empty strings
 /// the same way for resilience against hosts that report them.
@@ -152,13 +123,22 @@ impl AfterGuest for OtelBareLogs {
             )
         };
 
-        let cfg = config();
+        // Codegen-emitted typed enum → exhaustive match. Adding a
+        // case to the manifest fails the build here until handled.
+        let severity = match config::severity() {
+            config::Severity::Trace => SEVERITY_TRACE,
+            config::Severity::Debug => SEVERITY_DEBUG,
+            config::Severity::Info => SEVERITY_INFO,
+            config::Severity::Warn | config::Severity::Warning => SEVERITY_WARN,
+            config::Severity::Error => SEVERITY_ERROR,
+            config::Severity::Fatal => SEVERITY_FATAL,
+        };
         let body = format!("{}::{}", call.interface_name, call.function_name);
         let record = LogRecord {
             timestamp: None,
             observed_timestamp: Some(now()),
-            severity_text: Some(cfg.severity.text.into()),
-            severity_number: Some(cfg.severity.number),
+            severity_text: Some(severity.text.into()),
+            severity_number: Some(severity.number),
             body: Some(encode_json_string(&body)),
             attributes: Some(vec![
                 kv("code.namespace", &call.interface_name),

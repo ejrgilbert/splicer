@@ -1,6 +1,6 @@
 [package]
 name = "hello-tier1"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 publish = false
 
@@ -14,3 +14,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = { version = "0.51.0", features = ["default", "async-spawn", "inter-task-wakeup", "async"] }
+
+[build-dependencies]
+builtin-manifest = { path = "../builtin-manifest" }

@@ -23,32 +23,19 @@ mod bindings {
     });
 }
 
-use std::sync::OnceLock;
-use crate::bindings::splicer::builtin_config::get::get as get_config;
+// Codegenned from manifest.toml: manifest custom section + typed
+// accessors in `mod config`. Defaults live only in `manifest.toml`.
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
 
 use crate::bindings::exports::splicer::tier2::after::Guest as AfterGuest;
 use crate::bindings::exports::splicer::tier2::before::Guest as BeforeGuest;
 use crate::bindings::splicer::common::types::{CallId, Cell, Field, FieldTree};
 
-/// Print prefix. Read from the `greeting` config key on first call
-/// (defaults to `"hello-tier2"`) and cached for the rest of the
-/// instance's lifetime. Sync — substrate import is per-import sync
-/// (see `bindings`).
-fn greeting() -> &'static str {
-    static G: OnceLock<String> = OnceLock::new();
-    if let Some(g) = G.get() {
-        return g.as_str();
-    }
-    let val = get_config("greeting")
-        .unwrap_or_else(|| "hello-tier2".to_string());
-    G.get_or_init(|| val).as_str()
-}
-
 pub struct HelloTier2;
 
 impl BeforeGuest for HelloTier2 {
     async fn on_call(call: CallId, args: Vec<Field>) {
-        let g = greeting();
+        let g = config::greeting();
         let rendered: Vec<String> = args.iter().map(fmt_arg).collect();
         let payload = if rendered.is_empty() {
             "()".to_string()
@@ -64,7 +51,7 @@ impl BeforeGuest for HelloTier2 {
 
 impl AfterGuest for HelloTier2 {
     async fn on_return(call: CallId, result: Option<FieldTree>) {
-        let g = greeting();
+        let g = config::greeting();
         let payload = match &result {
             Some(tree) => fmt_res(tree),
             None => "()".to_string(),

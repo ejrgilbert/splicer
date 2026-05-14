@@ -57,8 +57,10 @@ pub enum BuiltinSpec {
         /// `name` when omitted.
         alias: Option<String>,
         /// Sealed into the `splicer:builtin-config` provider at
-        /// splice time. Scalars only — lists/maps are rejected;
-        /// encode structure inside a single string value.
+        /// splice time. Structure (scalars, sequences, maps) is
+        /// preserved through to `ensure_provider_for`, which
+        /// type-checks against the builtin's declared WIT types and
+        /// re-emits as canonical WAVE text.
         #[serde(default)]
         config: BTreeMap<String, serde_yaml::Value>,
     },
@@ -77,10 +79,12 @@ impl BuiltinSpec {
             BuiltinSpec::Detailed { alias, .. } => alias.as_deref(),
         }
     }
-    fn config(&self) -> Option<&BTreeMap<String, serde_yaml::Value>> {
+    /// Empty for the short-form `builtin: <name>` shape.
+    fn config(&self) -> &BTreeMap<String, serde_yaml::Value> {
+        static EMPTY: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
         match self {
-            BuiltinSpec::Name(_) => None,
-            BuiltinSpec::Detailed { config, .. } => Some(config),
+            BuiltinSpec::Name(_) => &EMPTY,
+            BuiltinSpec::Detailed { config, .. } => config,
         }
     }
 }
@@ -132,7 +136,14 @@ pub struct AdapterInjectionInfo {
 /// A middleware to inject at a splice point. Constructed from the YAML
 /// config `inject` list or programmatically via [`Injection::from_path`]
 /// / [`Injection::from_name`].
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+///
+/// `Eq`/`Hash`/`Ord` are implemented manually to skip the transient
+/// `builtin_config` / `adapter_info` fields, both because `toml::Value`
+/// isn't `Hash` (floats) and because identity for the deduplicating
+/// `IndexSet<Injection>` is semantically the (name, path, builtin)
+/// triple — config values are derived from the YAML and don't
+/// distinguish injections at WAC-emit time.
+#[derive(Clone, Debug, Deserialize)]
 pub struct Injection {
     /// The middleware's logical name (used as the WAC variable).
     pub name: String,
@@ -148,11 +159,14 @@ pub struct Injection {
     /// need to know about builtins.
     #[serde(skip)]
     pub builtin: Option<String>,
-    /// YAML `builtin.config:` values, stringified at parse time so
-    /// the splice pipeline can hand them verbatim to the provider
-    /// patcher. `BTreeMap` for deterministic patched-provider bytes.
+    /// YAML `builtin.config:` values, preserved with their structural
+    /// shape (scalars stay scalar, sequences stay sequence, maps stay
+    /// map) so the splice-time validator can type-check against the
+    /// builtin's declared WIT types. The final WAVE-encoded strings
+    /// are produced inside `ensure_provider_for` once the manifest
+    /// is loaded. `BTreeMap` keeps validation deterministic.
     #[serde(skip)]
-    pub builtin_config: BTreeMap<String, String>,
+    pub builtin_config: BTreeMap<String, toml::Value>,
     /// Stamped by `ensure_provider_for` when the builtin imports
     /// `splicer:builtin-config/get` — points at the patched provider
     /// alongside the materialized builtin. Not user-settable; callers
@@ -167,6 +181,34 @@ pub struct Injection {
     /// adapters splicer wrote.
     #[serde(skip)]
     pub(crate) adapter_info: Option<AdapterInjectionInfo>,
+}
+
+impl PartialEq for Injection {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.path == other.path && self.builtin == other.builtin
+    }
+}
+
+impl Eq for Injection {}
+
+impl std::hash::Hash for Injection {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.name.hash(h);
+        self.path.hash(h);
+        self.builtin.hash(h);
+    }
+}
+
+impl PartialOrd for Injection {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Injection {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (&self.name, &self.path, &self.builtin).cmp(&(&other.name, &other.path, &other.builtin))
+    }
 }
 
 impl Injection {
@@ -408,12 +450,12 @@ impl ConfigFile {
                              empty if specified (omit the key to leave it unset)"
                         );
                     }
-                    if let Some(cfg) = spec.config() {
-                        // Surface bad config shapes at parse time, not
-                        // splice time. The into_injection path expects
-                        // this to have run.
-                        stringify_config(rule_num, inj_num, cfg)?;
-                    }
+                    // Surface bad config shapes at parse time, not
+                    // splice time. The into_injection path expects
+                    // this to have run. Empty maps are fine.
+                    yaml_config_to_toml(spec.config()).map_err(|e| {
+                        anyhow::anyhow!("rule {rule_num}, injection {inj_num}: {e}")
+                    })?;
                 }
 
                 // Effective WAC-var name for uniqueness: builtin form
@@ -505,10 +547,7 @@ fn into_injection(yaml: YamlInjection) -> Injection {
             // `validate()` ran first, so stringification can't fail
             // here — expect on the result rather than threading
             // Result through the rule-construction path.
-            let cfg = match spec.config() {
-                Some(c) => stringify_config(0, 0, c).expect("validated"),
-                None => BTreeMap::new(),
-            };
+            let cfg = yaml_config_to_toml(spec.config()).expect("validate() ran");
             (alias.unwrap_or_else(|| bname.clone()), Some(bname), cfg)
         }
         None => (name.expect("validated"), None, BTreeMap::new()),
@@ -523,38 +562,69 @@ fn into_injection(yaml: YamlInjection) -> Injection {
     }
 }
 
-/// Convert a YAML config map to the string-keyed/string-valued
-/// shape the provider patcher consumes. Scalars stringify
-/// naturally; null/sequence/mapping/tagged values are rejected so
-/// silently dropping structured config can't happen.
-fn stringify_config(
-    rule_num: usize,
-    inj_num: usize,
+/// Convert a YAML config map to a TOML-valued map. Splicer carries
+/// the YAML structure forward (scalars, arrays, tables) so
+/// splice-time validation can type-check against the builtin's
+/// manifest-declared WIT types. Canonical WAVE encoding happens
+/// inside `ensure_provider_for`, once the manifest is in hand.
+///
+/// Nulls + YAML tags are still rejected — both flatten ambiguously
+/// and the substrate has no representation for them. The TOML
+/// translation is faithful enough that `toml::Value` distinguishes
+/// integers from floats, which is what the manifest-side validator
+/// needs to disambiguate `1` (u32) from `1.0` (f64).
+///
+/// Index-free by design: callers that want rule/injection context in
+/// the error wrap the result with their own `.map_err(...)`. The
+/// `into_injection` path runs this again after `validate()` already
+/// accepted it and `.expect()`s success.
+fn yaml_config_to_toml(
     values: &BTreeMap<String, serde_yaml::Value>,
-) -> anyhow::Result<BTreeMap<String, String>> {
+) -> anyhow::Result<BTreeMap<String, toml::Value>> {
     let mut out = BTreeMap::new();
     for (key, val) in values {
-        let s = match val {
-            serde_yaml::Value::String(s) => s.clone(),
-            serde_yaml::Value::Bool(b) => b.to_string(),
-            serde_yaml::Value::Number(n) => n.to_string(),
-            serde_yaml::Value::Null => bail!(
-                "rule {rule_num}, injection {inj_num}: config key '{key}' is null; \
-                 omit the key or use an empty string scalar instead"
-            ),
-            serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_) => bail!(
-                "rule {rule_num}, injection {inj_num}: config key '{key}' must be a scalar \
-                 (string, number, or bool); lists and maps must be encoded inside a single \
-                 string value (JSON, newline-separated, etc.) and parsed by the builtin"
-            ),
-            serde_yaml::Value::Tagged(_) => bail!(
-                "rule {rule_num}, injection {inj_num}: config key '{key}' carries a YAML tag, \
-                 which the substrate doesn't support"
-            ),
-        };
-        out.insert(key.clone(), s);
+        let v = yaml_to_toml(val).map_err(|e| anyhow::anyhow!("config key '{key}': {e}"))?;
+        out.insert(key.clone(), v);
     }
     Ok(out)
+}
+
+/// Recursive YAML → TOML value translation. Diverging types are
+/// surfaced as user-facing errors. Mapping keys must be strings —
+/// YAML allows non-string mapping keys but the substrate's WIT only
+/// understands record/table with string field names.
+fn yaml_to_toml(v: &serde_yaml::Value) -> anyhow::Result<toml::Value> {
+    use serde_yaml::Value as Y;
+    Ok(match v {
+        Y::String(s) => toml::Value::String(s.clone()),
+        Y::Bool(b) => toml::Value::Boolean(*b),
+        Y::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                toml::Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                toml::Value::Float(f)
+            } else {
+                bail!("number {n} could not be represented as i64 or f64");
+            }
+        }
+        Y::Null => bail!("value is null; omit the key or use an empty string scalar instead"),
+        Y::Sequence(items) => {
+            let parts: anyhow::Result<Vec<_>> = items.iter().map(yaml_to_toml).collect();
+            toml::Value::Array(parts?)
+        }
+        Y::Mapping(m) => {
+            let mut table = toml::map::Map::new();
+            for (k, v) in m {
+                let key = match k {
+                    Y::String(s) => s.clone(),
+                    other => bail!("table key must be a string, got {other:?}",),
+                };
+                table.insert(key, yaml_to_toml(v)?);
+            }
+            toml::Value::Table(table)
+        }
+        Y::Tagged(_) => bail!("YAML-tagged value isn't supported by the substrate"),
+    })
 }
 
 #[cfg(test)]
@@ -1105,13 +1175,16 @@ rules:
             panic!("expected Before");
         };
         let cfg = &inject[0].builtin_config;
-        assert_eq!(cfg.get("buffer").map(String::as_str), Some("100"));
+        assert_eq!(cfg.get("buffer"), Some(&toml::Value::Integer(100)));
         assert_eq!(
-            cfg.get("flush_after_seconds").map(String::as_str),
-            Some("10.0")
+            cfg.get("flush_after_seconds"),
+            Some(&toml::Value::Float(10.0))
         );
-        assert_eq!(cfg.get("note").map(String::as_str), Some("hi there"));
-        assert_eq!(cfg.get("enable").map(String::as_str), Some("true"));
+        assert_eq!(
+            cfg.get("note"),
+            Some(&toml::Value::String("hi there".into()))
+        );
+        assert_eq!(cfg.get("enable"), Some(&toml::Value::Boolean(true)));
     }
 
     #[test]
@@ -1152,11 +1225,12 @@ rules:
     }
 
     #[test]
-    fn validate_builtin_config_rejects_list() {
-        // Lists must be encoded inside a string value the builtin
-        // parses on its end — the substrate is intentionally scalar-only.
-        assert_err(
-            r#"
+    fn parse_builtin_config_block_preserves_list() {
+        // YAML sequences round-trip as toml::Value::Array — splice-
+        // time type-checking against the builtin's WIT type happens
+        // later in `ensure_provider_for`. The parser only has to keep
+        // structural fidelity.
+        let yaml = r#"
 version: 1
 rules:
   - before:
@@ -1168,15 +1242,20 @@ rules:
             rules:
               - "1.2.3.4/32"
               - "5.6.7.8/32"
-"#,
-            "must be a scalar",
-        );
+"#;
+        let rules = parse_yaml(yaml).expect("parse");
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        let toml::Value::Array(xs) = inject[0].builtin_config.get("rules").unwrap() else {
+            panic!("expected array");
+        };
+        assert_eq!(xs.len(), 2);
     }
 
     #[test]
-    fn validate_builtin_config_rejects_map() {
-        assert_err(
-            r#"
+    fn parse_builtin_config_block_preserves_map() {
+        let yaml = r#"
 version: 1
 rules:
   - before:
@@ -1188,9 +1267,16 @@ rules:
             limits:
               max: 100
               min: 0
-"#,
-            "must be a scalar",
-        );
+"#;
+        let rules = parse_yaml(yaml).expect("parse");
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        let toml::Value::Table(t) = inject[0].builtin_config.get("limits").unwrap() else {
+            panic!("expected table");
+        };
+        assert_eq!(t.get("max"), Some(&toml::Value::Integer(100)));
+        assert_eq!(t.get("min"), Some(&toml::Value::Integer(0)));
     }
 
     #[test]

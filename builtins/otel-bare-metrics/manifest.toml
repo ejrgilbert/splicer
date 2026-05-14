@@ -1,0 +1,14 @@
+[builtin]
+description = "Emit OpenTelemetry call-count + duration-histogram metrics with delta-window aggregation."
+
+[[key]]
+name = "buffer"
+type = "u32"
+default = 1
+doc = "Number of observations to fold into a window before flushing. 1 means flush every sample (no aggregation)."
+
+[[key]]
+name = "flush_after_seconds"
+type = "f64"
+default = 10.0
+doc = "Wall-clock seconds before an open delta window is force-flushed, regardless of sample count."

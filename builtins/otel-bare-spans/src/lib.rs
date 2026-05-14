@@ -26,12 +26,15 @@ mod bindings {
     });
 }
 
+// Codegenned from manifest.toml: manifest custom section + typed
+// accessors in `mod config`. Defaults live only in `manifest.toml`.
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
-use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::{now, Datetime};
 use bindings::wasi::otel::tracing::{
@@ -50,36 +53,6 @@ struct Pending {
     context: SpanContext,
     parent_span_id: String,
     start_time: Datetime,
-}
-
-/// Parsed config, materialized once on first observation.
-struct Config {
-    span_kind: SpanKind,
-}
-
-fn config() -> &'static Config {
-    static C: OnceLock<Config> = OnceLock::new();
-    if let Some(c) = C.get() {
-        return c;
-    }
-    let span_kind = match get_config("span_kind") {
-        Some(s) => parse_span_kind(&s).unwrap_or(SpanKind::Internal),
-        None => SpanKind::Internal,
-    };
-    C.get_or_init(|| Config { span_kind })
-}
-
-/// Case-insensitive match against the OTel `SpanKind` variants. `None`
-/// on unknown input — caller falls back to the default.
-fn parse_span_kind(s: &str) -> Option<SpanKind> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "internal" => Some(SpanKind::Internal),
-        "server" => Some(SpanKind::Server),
-        "client" => Some(SpanKind::Client),
-        "producer" => Some(SpanKind::Producer),
-        "consumer" => Some(SpanKind::Consumer),
-        _ => None,
-    }
 }
 
 type CallKey = (String, String);
@@ -205,7 +178,15 @@ impl AfterGuest for OtelBareSpans {
         let span = SpanData {
             span_context: p.context,
             parent_span_id: p.parent_span_id,
-            span_kind: config().span_kind,
+            // Codegen-emitted typed enum → exhaustive match. Adding a
+            // case to the manifest fails the build here until handled.
+            span_kind: match config::span_kind() {
+                config::SpanKind::Internal => SpanKind::Internal,
+                config::SpanKind::Server => SpanKind::Server,
+                config::SpanKind::Client => SpanKind::Client,
+                config::SpanKind::Producer => SpanKind::Producer,
+                config::SpanKind::Consumer => SpanKind::Consumer,
+            },
             name: format!("{}::{}", call.interface_name, call.function_name),
             start_time: p.start_time,
             end_time: now(),

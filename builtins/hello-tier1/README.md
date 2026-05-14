@@ -10,21 +10,11 @@ Output format:
 [<greeting>] after  <iface>#<fn>
 ```
 
-## Config keys
+Configurable keys, defaults, and the in-YAML scalar form live in the
+embedded `manifest.toml`. Run:
 
-Read at first call via `splicer:builtin-config/get` and cached for
-the rest of the wasm-instance lifetime.
-
-| Key        | Type   | Default       | Description                                  |
-|------------|--------|---------------|----------------------------------------------|
-| `greeting` | string | `hello-tier1` | Replaces the bracketed prefix in each line.  |
-
-Example splice config:
-
-```yaml
-inject:
-  - builtin:
-      name: hello-tier1
-      config:
-        greeting: "wired-up-greeting"
+```sh
+splicer builtin hello-tier1
 ```
+
+to see them.

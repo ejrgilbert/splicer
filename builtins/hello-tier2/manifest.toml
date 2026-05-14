@@ -1,0 +1,8 @@
+[builtin]
+description = "Smoke-test tier-2 builtin: prints a greeting plus typed argument cells around each wrapped call."
+
+[[key]]
+name = "greeting"
+type = "string"
+default = "hello-tier2"
+doc = "Prefix printed before the wrapped call's interface#function name."

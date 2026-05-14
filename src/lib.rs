@@ -71,6 +71,15 @@
 mod adapter;
 mod api;
 mod builtins;
+/// Introspection helpers for the builtins shipped with this splicer.
+/// Reads the embedded manifests so callers (CLI, custom tooling) can
+/// render the same key/default/doc surface that splice-time validation
+/// enforces. Bulk of the module stays private — these are the only
+/// pieces that make sense to expose.
+pub mod builtin_info {
+    pub use crate::builtins::{known_names, list_with_manifests, resolve_manifest};
+    pub use ::builtin_manifest::{BuiltinMeta, ConfigKey, Manifest, TypeAst};
+}
 mod compose;
 mod config_provider;
 mod contract;

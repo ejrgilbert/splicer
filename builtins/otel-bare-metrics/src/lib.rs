@@ -30,14 +30,16 @@ mod bindings {
     });
 }
 
+// Codegenned from manifest.toml: manifest custom section + typed
+// accessors in `mod config`. Defaults live only in `manifest.toml`.
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
-use bindings::splicer::builtin_config::get::get as get_config;
 use bindings::splicer::common::types::CallId;
 use bindings::wasi::clocks::wall_clock::{now, Datetime};
 use bindings::wasi::otel::metrics::{
@@ -90,35 +92,6 @@ struct Agg {
     /// Histogram data points; the staleness check uses
     /// `now - window_start` to decide when to flush.
     window_start: Datetime,
-}
-
-/// Parsed config, materialized once on first observation.
-struct Config {
-    buffer: u32,
-    flush_after_seconds: f64,
-}
-
-const DEFAULT_BUFFER: u32 = 1;
-const DEFAULT_FLUSH_AFTER_SECONDS: f64 = 10.0;
-
-fn config() -> &'static Config {
-    static C: OnceLock<Config> = OnceLock::new();
-    if let Some(c) = C.get() {
-        return c;
-    }
-    let buffer = read_typed("buffer", DEFAULT_BUFFER).max(1);
-    let flush_after_seconds = read_typed("flush_after_seconds", DEFAULT_FLUSH_AFTER_SECONDS);
-    C.get_or_init(|| Config {
-        buffer,
-        flush_after_seconds,
-    })
-}
-
-fn read_typed<T: FromStr>(key: &str, default: T) -> T {
-    match get_config(key) {
-        Some(s) => s.parse().unwrap_or(default),
-        None => default,
-    }
 }
 
 /// `(interface, function)` is the metric attribute set; one
@@ -287,7 +260,10 @@ impl AfterGuest for OtelBareMetrics {
         };
         let end_time = now();
         let duration_s = duration_seconds(&p.start_time, &end_time);
-        let cfg = config();
+        // `buffer` clamped to `>= 1` so `buffer = 0` can't lock the
+        // window open forever.
+        let buffer = config::buffer().max(1);
+        let flush_after_seconds = config::flush_after_seconds();
 
         // Accumulate into the per-(iface, fn) window; capture whether
         // this measurement closes the window so we can flush after
@@ -315,7 +291,7 @@ impl AfterGuest for OtelBareMetrics {
 
             let elapsed = duration_seconds(&agg.window_start, &end_time);
             let should_flush =
-                u64::from(cfg.buffer) <= agg.count || elapsed >= cfg.flush_after_seconds;
+                u64::from(buffer) <= agg.count || elapsed >= flush_after_seconds;
             should_flush.then(|| map.remove(&k).expect("entry just inserted"))
         };
 

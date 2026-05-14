@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use splicer::types::ContractResult;
-use splicer::{compose, splice, Bundle, ComponentInput, ComposeRequest, SpliceRequest};
+use splicer::{
+    builtin_info, compose, splice, Bundle, ComponentInput, ComposeRequest, SpliceRequest,
+};
 
 const DEFAULT_PKG: &str = "example:composition";
 const DEFAULT_OUTPUT_WASM: &str = "composed.wasm";
@@ -116,6 +118,21 @@ enum Command {
         #[arg(long, default_value = DEFAULT_PKG)]
         package: String,
     },
+
+    /// Inspect builtin middleware shipped with this splicer.
+    ///
+    /// With no argument, lists every builtin and its one-line
+    /// description. With a builtin name, prints the description and
+    /// the table of configurable keys (name, type, default, doc) —
+    /// the same keys accepted in YAML under `inject.builtin.config`.
+    /// Resolves builtin bytes via the same override → cache → OCI
+    /// pipeline as `splice`, so the first run for a given builtin
+    /// may incur an OCI pull.
+    Builtin {
+        /// Builtin name to describe. Omit to list every builtin.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -159,7 +176,124 @@ fn main() -> Result<()> {
             plan,
             package,
         } => run_compose(wasms, output, emit_wac, plan, package),
+
+        Command::Builtin { name } => run_builtin(name),
     }
+}
+
+fn run_builtin(name: Option<String>) -> Result<()> {
+    match name {
+        None => print_builtin_list(),
+        Some(n) => print_builtin_details(&n),
+    }
+}
+
+/// `splicer builtin` (no arg). Renders every shipped builtin's
+/// description in two columns. A builtin whose manifest can't be
+/// resolved (network error, missing section) prints a placeholder
+/// rather than aborting the whole listing.
+fn print_builtin_list() -> Result<()> {
+    let entries = builtin_info::list_with_manifests();
+    let width = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    for (name, result) in entries {
+        let desc = match result {
+            Ok(Some(m)) => m.builtin.description,
+            Ok(None) => "(no embedded manifest)".to_string(),
+            Err(e) => format!("(manifest unavailable: {e})"),
+        };
+        println!("  {:<width$}  {}", name, desc, width = width);
+    }
+    Ok(())
+}
+
+/// `splicer builtin <name>`. Resolves the named builtin, extracts its
+/// manifest, and renders the description + accepted config keys.
+fn print_builtin_details(name: &str) -> Result<()> {
+    let manifest = builtin_info::resolve_manifest(name).with_context(|| {
+        let known = builtin_info::known_names();
+        format!(
+            "could not load manifest for builtin '{name}'. \
+             Known builtins: [{}]",
+            known.join(", ")
+        )
+    })?;
+    println!("{}", name.bold().bright_white());
+    println!("  {}", manifest.builtin.description.italic().white());
+    if manifest.keys.is_empty() {
+        println!();
+        println!("This builtin accepts no config keys.");
+        return Ok(());
+    }
+    println!();
+    println!(
+        "{}",
+        "Config keys and in-YAML defaults (overridable via `inject.builtin.config:`):\n"
+            .bold()
+            .bright_white()
+    );
+    for key in &manifest.keys {
+        for wrapped in wrap_doc(&key.doc, doc_wrap_width()) {
+            println!("  /// {}", wrapped.italic().white());
+        }
+        if key.case_insensitive {
+            println!("  /// {}", "(matched case-insensitively)".italic().white());
+        }
+        println!(
+            "  {}: {} = {};",
+            key.name.cyan(),
+            key.wit_type.yellow(),
+            key.default_display().green(),
+        );
+        println!();
+    }
+    Ok(())
+}
+
+/// Available columns for the wrapped doc body, accounting for the
+/// `  /// ` (6-char) leading prefix. Reads `$COLUMNS` (set by most
+/// shells) and falls back to 80. Clamps to a sane minimum so a tiny
+/// terminal still produces something rather than one-word-per-line.
+fn doc_wrap_width() -> usize {
+    let cols: usize = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(80);
+    cols.saturating_sub(6).max(40)
+}
+
+/// Split a doc into whitespace-collapsed paragraphs (blank line
+/// breaks) and word-wrap each paragraph at `width`. Empty docs
+/// produce no lines; multi-paragraph docs are separated by an
+/// empty rendered line.
+fn wrap_doc(doc: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut first_para = true;
+    for paragraph in doc.split("\n\n") {
+        let collapsed: String = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            continue;
+        }
+        if !first_para {
+            out.push(String::new());
+        }
+        first_para = false;
+        let mut line = String::new();
+        for word in collapsed.split_whitespace() {
+            if line.is_empty() {
+                line.push_str(word);
+            } else if line.len() + 1 + word.len() > width {
+                out.push(std::mem::take(&mut line));
+                line.push_str(word);
+            } else {
+                line.push(' ');
+                line.push_str(word);
+            }
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
