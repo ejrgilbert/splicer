@@ -3,8 +3,8 @@
 Every other type lifts today (primitives, `string`, `list<u8>`,
 `enum`, `record`, `tuple`, `option`, `result`, `flags`, `variant`,
 `char`, `own<R>` / `borrow<R>`, `stream<T>` / `future<T>`,
-`error-context`, and `list<T>` over every kind except nested
-lists).
+`error-context`, `list<T, N>`, and `list<T>` over every kind
+except nested lists).
 
 ## What's left
 
@@ -21,18 +21,30 @@ dynamic side-table growth (the route in use for `list<own<R>>` /
 or a schema-level "template + per-instance base." Multi-day
 recursive-design pass — settle the design before promoting.
 
-### `FixedLengthList` typedef
-
-Guarded by `todo!()` in `lift/plan.rs`'s payload-type match
-(below the `Resource` / `Unknown` `unreachable!()`s).
-
-- `FixedLengthList(elem, N)` — list with a build-time-known
-  length. Smallest remaining gap: no `len` operand, no per-call
-  buffer dance. Likely reusable through `push_list_of` with a
-  synthetic constant `len`, or a new `Cell::FixedLengthListOf`
-  iterating over a static stride.
-
 ## Recently landed
+
+- `FixedLengthList(elem, N)` — canon-ABI flattens to `N × flat(T)`
+  inlined, structurally identical to `tuple<T;N>`. Desugared at
+  plan-build by `push_fixed_length_list` (`lift/plan.rs`), which
+  walks the element N times and wraps in `Cell::TupleOf` — no
+  new cell variant, no new emit, no new side-table, reuses every
+  TupleOf code path (static cell-index array at top level,
+  `PrestagedTupleIndices` as a list element).
+  `is_compound_result` accepts the FixedLengthList kind so
+  retptr'd results route through `lift_from_memory`, which natively
+  emits `FixedLengthListLiftFromMemory` for the per-element loads.
+  Pre-bails on `N == 0` (parseable in WIT, no canonical-ABI
+  meaning) and `N > MAX_FLAT_SLOTS_PER_FN` / `MAX_CELLS_PER_PARAM`
+  (single integer literal would otherwise overflow
+  `bump_flat_slot`'s u32 counter).
+
+  `Shape::FixedLengthList { inner, n }` lives in
+  `tests/fuzz_and_run.rs` with match arms wired through. The
+  predict-side renders as `tuple(<elem>, …, <elem>)` — matches
+  `Cell::TupleOf`'s `fmt_cell` output character-for-character.
+  `wasm_component_model_fixed_length_lists(true)` on the wasmtime
+  `Config` is required for the engine to parse `list<T, N>`
+  typedefs at all.
 
 - `Map(K, V)` — canon-ABI ≡ `list<tuple<K, V>>`. Desugared at
   build time via `desugar_map_aliases` (`lift/plan.rs`), which

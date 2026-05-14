@@ -121,6 +121,32 @@ const TEST_WIT: &str = r#"
         f-list-of-list: func(xs: list<list<u32>>);
         record list-pair { items: list<string>, scores: list<u32> }
         f-list-of-record: func(xs: list<point>);
+        // `list<T, N>` (canon-ABI fixed-length list) flattens to
+        // `N × flat(T)` inlined — same shape as `tuple<T;N>`. Lift
+        // desugars at plan-build into `Cell::TupleOf` with N children.
+        f-fixed-list-u32: func(xs: list<u32, 3>);
+        // N=1: WIT forbids 1-tuples, so single-child TupleOf is only
+        // reachable via FixedLengthList.
+        f-fixed-list-u32-one: func(xs: list<u32, 1>);
+        // N=0: WIT grammar parses it, plan-build bails with a clear
+        // error rather than constructing an empty TupleOf.
+        f-fixed-list-u32-zero: func(xs: list<u32, 0>);
+        // N over the layout budget — pre-bail at plan-build so we
+        // can't overflow `bump_flat_slot`'s u32 counter.
+        f-fixed-list-u32-huge: func(xs: list<u32, 17>);
+        record point-and-fixed-list { p: point, xs: list<u32, 3> }
+        f-record-with-fixed-list: func(rwf: point-and-fixed-list);
+        // `list<list<u32, 3>>`: outer dynamic list, each element is a
+        // 3-wide TupleOf — exercises `Cell::TupleOf` as a list element
+        // via `PrestagedTupleIndices`.
+        f-list-of-fixed-list: func(xs: list<list<u32, 3>>);
+        // FixedLengthList nested in FixedLengthList — outer TupleOf
+        // wraps inner TupleOf children. Mirrors `nested_tuple_…` but
+        // through the desugar path.
+        f-fixed-list-of-fixed-list: func(xs: list<list<u32, 2>, 3>);
+        // Result-side coverage: `is_compound_result` must accept
+        // FixedLengthList so the wrapper retptr-loads it correctly.
+        f-result-fixed-list-u32: func() -> list<u32, 3>;
         // `map<K, V>` is canonical-ABI shorthand for `list<tuple<K, V>>`.
         // Lift desugars via a synthetic tuple typedef, then reuses the
         // existing `Cell::ListOf` + `Cell::TupleOf` path.
@@ -2111,6 +2137,177 @@ fn record_with_tuple_field_recurses_into_tuple() {
 }
 
 #[test]
+fn fixed_length_list_desugars_to_tuple_of() {
+    // list<u32, 3>: three u32 leaves at slots 0..3, TupleOf parent at
+    // cell 3. Same plan shape as `tuple<u32, u32, u32>`.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-fixed-list-u32", &r, &mut names);
+    assert_plan(
+        &plan,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::IntegerZeroExt { flat_slot: 2 },
+            Cell::TupleOf {
+                children: vec![0, 1, 2],
+            },
+        ],
+        3,
+        3,
+    );
+}
+
+#[test]
+fn record_with_fixed_length_list_field_recurses_into_tuple() {
+    // point-and-fixed-list { p: point, xs: list<u32, 3> }
+    //   p.x → cell 0 (slot 0), p.y → cell 1 (slot 1), point → cell 2
+    //   xs.0 → cell 3 (slot 2), xs.1 → cell 4 (slot 3),
+    //   xs.2 → cell 5 (slot 4), xs (TupleOf) → cell 6
+    //   record-of → cell 7
+    let (r, mut names) = setup();
+    let plan = plan_for_named("point-and-fixed-list", &r, &mut names);
+    assert_plan(
+        &plan,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerSignExt { flat_slot: 1 },
+            record_of(&mut names, "point", &[("x", 0), ("y", 1)]),
+            Cell::IntegerZeroExt { flat_slot: 2 },
+            Cell::IntegerZeroExt { flat_slot: 3 },
+            Cell::IntegerZeroExt { flat_slot: 4 },
+            Cell::TupleOf {
+                children: vec![3, 4, 5],
+            },
+            record_of(&mut names, "point-and-fixed-list", &[("p", 2), ("xs", 6)]),
+        ],
+        7,
+        5,
+    );
+}
+
+#[test]
+fn list_of_fixed_length_list_routes_through_list_element_tuple() {
+    // list<list<u32, 3>>: outer ListOf with element_plan = [u32, u32,
+    // u32, TupleOf]. The element-plan TupleOf is allowed_as_list_element
+    // via the existing `PrestagedTupleIndices` class — no new arm
+    // needed.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-of-fixed-list", &r, &mut names);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf at cell 0, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(element_plan.cells.len(), 4);
+    assert!(matches!(
+        element_plan.cells[0..3],
+        [
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::IntegerZeroExt { flat_slot: 2 },
+        ],
+    ));
+    let Cell::TupleOf { children } = &element_plan.cells[3] else {
+        panic!(
+            "expected TupleOf at element-plan cell 3, got {:?}",
+            element_plan.cells[3]
+        );
+    };
+    assert_eq!(children.as_slice(), &[0, 1, 2]);
+    // Outer flat: (ptr, len) — same as `list<T>`.
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn fixed_length_list_n_one_builds_single_child_tuple_of() {
+    // list<u32, 1>: WIT forbids tuple<T> (1-tuples), so a single-child
+    // TupleOf is unique to FixedLengthList. Pins that the desugar path
+    // doesn't accidentally peel through the parent when N==1.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-fixed-list-u32-one", &r, &mut names);
+    assert_plan(
+        &plan,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::TupleOf { children: vec![0] },
+        ],
+        1,
+        1,
+    );
+}
+
+#[test]
+fn fixed_length_list_n_zero_bails_at_plan_build() {
+    // WIT grammar parses `list<u32, 0>`; canon-ABI gives it no meaning.
+    // Plan-builder bails rather than building an empty `Cell::TupleOf`
+    // that the existing `push_tuple` invariant would reject.
+    let (r, mut names) = setup();
+    let err = LiftPlan::for_type(
+        &func_named(&r, "f-fixed-list-u32-zero").params[0].ty,
+        r.resolve(),
+        &mut names,
+        r.aliases(),
+    )
+    .expect_err("N == 0 must bail");
+    let msg = err.to_string();
+    assert!(msg.contains("requires N >= 1"), "got: {msg}");
+    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+}
+
+#[test]
+fn fixed_length_list_n_over_budget_bails_at_plan_build() {
+    // Pre-bail catches N over `MAX_FLAT_SLOTS_PER_FN` / `MAX_CELLS_PER_PARAM`
+    // before `bump_flat_slot`'s checked_add can overflow. Test fixture
+    // uses N=17 which exceeds the cfg(test) budget of 16.
+    let (r, mut names) = setup();
+    let err = LiftPlan::for_type(
+        &func_named(&r, "f-fixed-list-u32-huge").params[0].ty,
+        r.resolve(),
+        &mut names,
+        r.aliases(),
+    )
+    .expect_err("N over budget must bail");
+    let msg = err.to_string();
+    assert!(msg.contains("exceeds tier-2 layout budget"), "got: {msg}");
+    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+}
+
+#[test]
+fn fixed_length_list_of_fixed_length_list_walks_depth_first() {
+    // list<list<u32, 2>, 3>: inner list<u32, 2> → 2 u32 + TupleOf
+    // (3 cells, 2 flat slots). Outer wraps 3 inners + parent TupleOf:
+    //   inner[0] children → cells 0..2, TupleOf → cell 2
+    //   inner[1] children → cells 3..5, TupleOf → cell 5
+    //   inner[2] children → cells 6..8, TupleOf → cell 8
+    //   outer TupleOf      → cell 9 (children=[2, 5, 8])
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-fixed-list-of-fixed-list", &r, &mut names);
+    assert_plan(
+        &plan,
+        vec![
+            Cell::IntegerZeroExt { flat_slot: 0 },
+            Cell::IntegerZeroExt { flat_slot: 1 },
+            Cell::TupleOf {
+                children: vec![0, 1],
+            },
+            Cell::IntegerZeroExt { flat_slot: 2 },
+            Cell::IntegerZeroExt { flat_slot: 3 },
+            Cell::TupleOf {
+                children: vec![3, 4],
+            },
+            Cell::IntegerZeroExt { flat_slot: 4 },
+            Cell::IntegerZeroExt { flat_slot: 5 },
+            Cell::TupleOf {
+                children: vec![6, 7],
+            },
+            Cell::TupleOf {
+                children: vec![2, 5, 8],
+            },
+        ],
+        9,
+        6,
+    );
+}
+
+#[test]
 fn option_allocates_disc_before_inner() {
     // option<u32>: disc i32 → slot 0, inner u32 → slot 1.
     // Cell order is children-before-parent, so the IntegerZeroExt for
@@ -2885,6 +3082,29 @@ fn map_result_classifies_as_compound() {
         element_plan.cells.last(),
         Some(Cell::TupleOf { .. })
     ));
+}
+
+#[test]
+fn fixed_length_list_result_classifies_as_compound() {
+    // `list<T, N>` results route through retptr + Compound; the
+    // desugared plan exposes a `Cell::TupleOf` root. Pins that
+    // `is_compound_result` accepts the FixedLengthList kind — without
+    // this arm the wrapper would silently drop the result.
+    let (r, mut names) = setup();
+    let func = func_named(&r, "f-result-fixed-list-u32");
+    let result_lift = classify_result_lift(r.resolve(), func, true, &mut names, r.aliases())
+        .expect("list<u32, 3> result must classify")
+        .expect("list<u32, 3> result must produce a ResultLift");
+    let compound = result_lift
+        .compound()
+        .expect("list<u32, 3> result must route through Compound");
+    let Cell::TupleOf { children } = compound.plan.cells.last().expect("non-empty plan") else {
+        panic!(
+            "Compound fixed-list-result root must be TupleOf, got {:?}",
+            compound.plan.cells.last()
+        );
+    };
+    assert_eq!(children.as_slice(), &[0, 1, 2]);
 }
 
 #[test]
