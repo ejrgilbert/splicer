@@ -5,7 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use splicer::types::ContractResult;
-use splicer::{builtin_info, compose, splice, Bundle, ComponentInput, ComposeRequest, SpliceRequest};
+use splicer::{
+    builtin_info, compose, splice, Bundle, ComponentInput, ComposeRequest, SpliceRequest,
+};
 
 const DEFAULT_PKG: &str = "example:composition";
 const DEFAULT_OUTPUT_WASM: &str = "composed.wasm";

@@ -703,6 +703,34 @@ mod tests {
     }
 
     #[test]
+    fn option_of_u32_validate_value() {
+        let src = r#"
+            [builtin]
+            description = "x"
+
+            [[key]]
+            name = "limit"
+            type = "option<u32>"
+            default = 1
+            doc = ""
+        "#;
+        let m = Manifest::from_toml(src).unwrap();
+        // A user-set integer round-trips through validation as
+        // `some(...)`.
+        let wave = m
+            .validate_value("limit", &toml::Value::Integer(100))
+            .unwrap()
+            .unwrap();
+        assert_eq!(wave, "some(100)");
+        // A string value where a u32 is required still rejects under
+        // the option wrapper.
+        let err = m
+            .validate_value("limit", &toml::Value::String("nope".into()))
+            .unwrap_err();
+        assert!(err.contains("type mismatch"), "{err}");
+    }
+
+    #[test]
     fn rejects_oob_u32() {
         let src = r#"
             [builtin]

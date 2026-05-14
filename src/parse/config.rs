@@ -79,10 +79,12 @@ impl BuiltinSpec {
             BuiltinSpec::Detailed { alias, .. } => alias.as_deref(),
         }
     }
-    fn config(&self) -> Option<&BTreeMap<String, serde_yaml::Value>> {
+    /// Empty for the short-form `builtin: <name>` shape.
+    fn config(&self) -> &BTreeMap<String, serde_yaml::Value> {
+        static EMPTY: BTreeMap<String, serde_yaml::Value> = BTreeMap::new();
         match self {
-            BuiltinSpec::Name(_) => None,
-            BuiltinSpec::Detailed { config, .. } => Some(config),
+            BuiltinSpec::Name(_) => &EMPTY,
+            BuiltinSpec::Detailed { config, .. } => config,
         }
     }
 }
@@ -448,16 +450,12 @@ impl ConfigFile {
                              empty if specified (omit the key to leave it unset)"
                         );
                     }
-                    if let Some(cfg) = spec.config() {
-                        // Surface bad config shapes at parse time, not
-                        // splice time. The into_injection path expects
-                        // this to have run.
-                        yaml_config_to_toml(cfg).map_err(|e| {
-                            anyhow::anyhow!(
-                                "rule {rule_num}, injection {inj_num}: {e}"
-                            )
-                        })?;
-                    }
+                    // Surface bad config shapes at parse time, not
+                    // splice time. The into_injection path expects
+                    // this to have run. Empty maps are fine.
+                    yaml_config_to_toml(spec.config()).map_err(|e| {
+                        anyhow::anyhow!("rule {rule_num}, injection {inj_num}: {e}")
+                    })?;
                 }
 
                 // Effective WAC-var name for uniqueness: builtin form
@@ -549,10 +547,7 @@ fn into_injection(yaml: YamlInjection) -> Injection {
             // `validate()` ran first, so stringification can't fail
             // here — expect on the result rather than threading
             // Result through the rule-construction path.
-            let cfg = match spec.config() {
-                Some(c) => yaml_config_to_toml(c).expect("validate() ran"),
-                None => BTreeMap::new(),
-            };
+            let cfg = yaml_config_to_toml(spec.config()).expect("validate() ran");
             (alias.unwrap_or_else(|| bname.clone()), Some(bname), cfg)
         }
         None => (name.expect("validated"), None, BTreeMap::new()),
@@ -588,8 +583,7 @@ fn yaml_config_to_toml(
 ) -> anyhow::Result<BTreeMap<String, toml::Value>> {
     let mut out = BTreeMap::new();
     for (key, val) in values {
-        let v = yaml_to_toml(val)
-            .map_err(|e| anyhow::anyhow!("config key '{key}': {e}"))?;
+        let v = yaml_to_toml(val).map_err(|e| anyhow::anyhow!("config key '{key}': {e}"))?;
         out.insert(key.clone(), v);
     }
     Ok(out)
@@ -623,9 +617,7 @@ fn yaml_to_toml(v: &serde_yaml::Value) -> anyhow::Result<toml::Value> {
             for (k, v) in m {
                 let key = match k {
                     Y::String(s) => s.clone(),
-                    other => bail!(
-                        "table key must be a string, got {other:?}",
-                    ),
+                    other => bail!("table key must be a string, got {other:?}",),
                 };
                 table.insert(key, yaml_to_toml(v)?);
             }
