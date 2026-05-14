@@ -16,6 +16,7 @@ pub(super) use emit::{
     emit_list_pre_pass, CellSideRefs, FlagsInfoOffsets, HandleInfoOffsets, LiftEmitCtx,
     ListEmitLocals, RecordInfoOffsets, ResultEmitPlan, VariantInfoOffsets, WrapperLocals,
 };
+pub(super) use plan::{desugar_map_aliases, MapAliases};
 pub(super) use sidetable::char_info::{
     build_char_scratch_map, char_scratch_sizes, CharScratchMaps,
 };

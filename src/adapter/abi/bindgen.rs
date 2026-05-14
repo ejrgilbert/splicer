@@ -1073,6 +1073,16 @@ impl Bindgen for WasmEncoderBindgen<'_> {
             | AbiInst::ListLift { .. } => {
                 produce_n(results, 1);
             }
+            // `is_list_canonical = true` short-circuits the list lift,
+            // but `lift(Map)` unconditionally pushes a per-entry block
+            // and emits `MapLift`. Drop the block (we have our own
+            // per-element loop) and collapse operands.
+            AbiInst::MapLift { .. } => {
+                self.completed_blocks
+                    .pop()
+                    .expect("MapLift without matching block");
+                produce_n(results, 1);
+            }
 
             // ── Variant / option / result lifts ────────────────
             AbiInst::VariantLift { variant, ty, .. } => {

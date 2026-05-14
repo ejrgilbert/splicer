@@ -7,7 +7,7 @@ use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
 use super::super::blob::NameInterner;
-use super::plan::{Cell, LiftPlan};
+use super::plan::{Cell, LiftPlan, MapAliases};
 use super::sidetable::CellSideData;
 
 // ─── Result-lift descriptors (classify-time, immutable) ───────────
@@ -100,13 +100,14 @@ pub(crate) fn classify_func_params(
     resolve: &Resolve,
     func: &WitFunction,
     names: &mut NameInterner,
+    map_aliases: &MapAliases,
 ) -> Result<Vec<ParamLift>> {
     let mut params_lift: Vec<ParamLift> = Vec::with_capacity(func.params.len());
     for param in &func.params {
         let name = names.intern(&param.name);
         params_lift.push(ParamLift {
             name,
-            plan: LiftPlan::for_type(&param.ty, resolve, names)?,
+            plan: LiftPlan::for_type(&param.ty, resolve, names, map_aliases)?,
         });
     }
     Ok(params_lift)
@@ -120,6 +121,7 @@ pub(crate) fn classify_result_lift(
     func: &WitFunction,
     result_at_retptr: bool,
     names: &mut NameInterner,
+    map_aliases: &MapAliases,
 ) -> Result<Option<ResultLift>> {
     let Some(ty) = func.result.as_ref() else {
         return Ok(None);
@@ -128,13 +130,13 @@ pub(crate) fn classify_result_lift(
     // Retptr gate skips single-flat-slot compounds (e.g. `tuple<u32>`):
     // they return flat with no retptr scratch and fall through.
     if result_at_retptr && is_supported_result(ty, resolve) {
-        let plan = LiftPlan::for_type(ty, resolve, names)?;
+        let plan = LiftPlan::for_type(ty, resolve, names, map_aliases)?;
         return Ok(Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
         }));
     }
 
-    let Some(cell) = single_cell_for_result(ty, resolve, names)? else {
+    let Some(cell) = single_cell_for_result(ty, resolve, names, map_aliases)? else {
         return Ok(None);
     };
     Ok(Some(ResultLift {
@@ -148,7 +150,8 @@ fn is_supported_result(ty: &Type, resolve: &Resolve) -> bool {
 }
 
 /// Compound kinds wired today: `record`, `tuple`, `option`, `result`,
-/// `variant`, `list<T>` non-u8 (`list<u8>` takes the bytes Direct path).
+/// `variant`, `list<T>` non-u8 (`list<u8>` takes the bytes Direct path),
+/// `map<K, V>` (lift desugars to `list<tuple<K, V>>`).
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
@@ -158,7 +161,8 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
         | wit_parser::TypeDefKind::Tuple(_)
         | wit_parser::TypeDefKind::Option(_)
         | wit_parser::TypeDefKind::Result(_)
-        | wit_parser::TypeDefKind::Variant(_) => true,
+        | wit_parser::TypeDefKind::Variant(_)
+        | wit_parser::TypeDefKind::Map(_, _) => true,
         wit_parser::TypeDefKind::List(elem) => !matches!(elem, Type::U8),
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
         _ => false,
@@ -170,11 +174,12 @@ fn single_cell_for_result(
     ty: &Type,
     resolve: &Resolve,
     names: &mut NameInterner,
+    map_aliases: &MapAliases,
 ) -> Result<Option<Cell>> {
     if !is_supported_direct_result(ty, resolve) {
         return Ok(None);
     }
-    let plan = LiftPlan::for_type(ty, resolve, names)?;
+    let plan = LiftPlan::for_type(ty, resolve, names, map_aliases)?;
     Ok(Some(
         plan.cells.into_iter().next().expect("push appended a cell"),
     ))

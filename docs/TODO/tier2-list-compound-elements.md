@@ -21,7 +21,7 @@ dynamic side-table growth (the route in use for `list<own<R>>` /
 or a schema-level "template + per-instance base." Multi-day
 recursive-design pass — settle the design before promoting.
 
-### `FixedLengthList` / `Map` typedefs
+### `FixedLengthList` typedef
 
 Guarded by `todo!()` in `lift/plan.rs`'s payload-type match
 (below the `Resource` / `Unknown` `unreachable!()`s).
@@ -31,8 +31,29 @@ Guarded by `todo!()` in `lift/plan.rs`'s payload-type match
   buffer dance. Likely reusable through `push_list_of` with a
   synthetic constant `len`, or a new `Cell::FixedLengthListOf`
   iterating over a static stride.
-- `Map(K, V)` — defer until something in the wild needs it; the
-  lower side has stubs but the lift design isn't pinned.
+
+## Recently landed
+
+- `Map(K, V)` — canon-ABI ≡ `list<tuple<K, V>>`. Desugared at
+  build time via `desugar_map_aliases` (`lift/plan.rs`), which
+  allocs a synthetic `tuple<K, V>` typedef per Map and threads
+  a `MapAliases` table into the plan builder. The plan-builder
+  Map arm forwards to `push_list_of` with the synthetic tuple
+  as element type — no new cell variant, no WIT changes, no
+  runtime/middleware changes. `is_compound_result` accepts the
+  Map kind. Synthetic tuples are unowned + unreferenced from
+  any world, so `LiveTypes` keeps them out of embedded
+  component metadata.
+
+  `Shape::Map` + match arms are wired in `tests/fuzz_and_run.rs`,
+  along with a `MapLift` no-op arm in `WasmEncoderBindgen`
+  (`abi/bindgen.rs`) and a bump of the scaffold-side
+  `wit-bindgen` to 0.57.1. End-to-end is currently blocked at
+  `wac compose` — `wac-types 0.10.0` (latest) rejects
+  `ComponentDefinedType::Map`. `test_tier2_map_blocked_on_wac`
+  pins the failure mode; the day `wac` ships Map support, that
+  test breaks (success becomes the new failure) and
+  `Shape::Map { … }` moves into `tier2_shapes()`.
 
 ## Per-type workflow (for future kinds)
 

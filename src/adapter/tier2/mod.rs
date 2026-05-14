@@ -31,7 +31,10 @@ use super::abi::emit::{
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use blob::NameInterner;
 use layout::lay_out_static_memory;
-use lift::{classify_func_params, classify_result_lift, ParamLift, ResultLift};
+use lift::{
+    classify_func_params, classify_result_lift, desugar_map_aliases, MapAliases, ParamLift,
+    ResultLift,
+};
 use schema::compute_schema;
 use section_emit::{emit_code_section, emit_imports_and_funcs, emit_type_section, wrapper_exports};
 use wrapper_body::{AfterHook, BeforeHook, WrapperCtx};
@@ -81,6 +84,11 @@ pub(super) fn build_tier2_adapter(
         .select_world(&[world_pkg], Some(TIER2_ADAPTER_WORLD_NAME))
         .context("select tier-2 adapter world")?;
 
+    // Map(K,V) lift desugars to list<tuple<K,V>>; allocate the
+    // synthetic tuple typedefs once, before classify takes any
+    // immutable borrows of `resolve`.
+    let map_aliases = desugar_map_aliases(&mut resolve);
+
     let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
         .functions
         .values()
@@ -89,7 +97,8 @@ pub(super) fn build_tier2_adapter(
 
     let mut names = NameInterner::new();
     let iface_name = names.intern(target_interface);
-    let classified = build_per_func_classified(&resolve, target_iface, &funcs, &mut names)?;
+    let classified =
+        build_per_func_classified(&resolve, target_iface, &funcs, &mut names, &map_aliases)?;
 
     let (per_func, plan) = lay_out_static_memory(classified, &funcs, &schema, names, iface_name)?;
 
@@ -368,6 +377,7 @@ fn build_per_func_classified(
     target_iface: InterfaceId,
     funcs: &[&WitFunction],
     names: &mut NameInterner,
+    map_aliases: &MapAliases,
 ) -> Result<Vec<FuncClassified>> {
     let target_world_key = WorldKey::Interface(target_iface);
     let mut per_func: Vec<FuncClassified> = Vec::with_capacity(funcs.len());
@@ -375,7 +385,7 @@ fn build_per_func_classified(
     for func in funcs {
         let fn_name_slice = names.intern(&func.name);
 
-        let params_lift = classify_func_params(resolve, func, names)?;
+        let params_lift = classify_func_params(resolve, func, names, map_aliases)?;
         let shape = FuncShape::classify(resolve, &target_world_key, func);
         let (import_variant, export_variant) = shape.abi_variants();
         let mangling = dispatch_mangling(shape.is_async());
@@ -403,6 +413,7 @@ fn build_per_func_classified(
             func,
             shape.result_at_retptr(&export_sig, &import_sig),
             names,
+            map_aliases,
         )?;
 
         let borrow_drops = collect_borrow_drops(resolve, func);

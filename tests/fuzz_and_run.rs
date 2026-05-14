@@ -185,6 +185,14 @@ enum Shape {
     /// with count == static_count + 0.
     ListEmpty(Box<Shape>),
     Tuple(Vec<Shape>),
+    /// `map<K, V>` materialized as a single-entry `BTreeMap` at
+    /// runtime. wit-bindgen renders as `wit_bindgen::rt::Map` (a
+    /// `BTreeMap` alias); the lift codegen desugars to
+    /// `list<tuple<K, V>>` and the predictor renders accordingly.
+    Map {
+        key: Box<Shape>,
+        value: Box<Shape>,
+    },
     Record {
         /// Record name in WIT. Keep single-word to dodge kebab→snake
         /// casing rules in wit-bindgen-generated field access.
@@ -305,6 +313,7 @@ impl Shape {
                 }
                 s
             }
+            Shape::Map { key, value } => format!("map_{}_{}", key.name(), value.name()),
             Shape::Record { wit_name, .. } => format!("record_{}", wit_name),
             Shape::Variant {
                 wit_name,
@@ -343,6 +352,7 @@ impl Shape {
                     .join(", ");
                 format!("tuple<{inside}>")
             }
+            Shape::Map { key, value } => format!("map<{}, {}>", key.wit_type(), value.wit_type()),
             Shape::Record { wit_name, .. } => (*wit_name).to_string(),
             Shape::Variant { wit_name, .. } => (*wit_name).to_string(),
             Shape::Enum { wit_name, .. } => (*wit_name).to_string(),
@@ -379,6 +389,10 @@ impl Shape {
                 for p in parts {
                     p.collect_wit_decls(out, seen);
                 }
+            }
+            Shape::Map { key, value } => {
+                key.collect_wit_decls(out, seen);
+                value.collect_wit_decls(out, seen);
             }
             Shape::Record {
                 wit_name, fields, ..
@@ -491,6 +505,12 @@ impl Shape {
                     .join(", ");
                 format!("({inside})")
             }
+            // wit-bindgen's `rt::Map` is a `BTreeMap` alias.
+            Shape::Map { key, value } => format!(
+                "std::collections::BTreeMap<{}, {}>",
+                key.rust_ty(side),
+                value.rust_ty(side),
+            ),
             Shape::Record { rust_name, .. }
             | Shape::Variant { rust_name, .. }
             | Shape::Enum { rust_name, .. }
@@ -577,6 +597,17 @@ impl Shape {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({inside})")
+            }
+            // Single-entry `BTreeMap`. Force owned `K`/`V` via Async-mode
+            // (same trick as `Shape::List` — wit-bindgen's `Map` always
+            // takes owned key/value).
+            Shape::Map { key, value } => {
+                let elem_mode = AsyncMode::Async;
+                format!(
+                    "std::collections::BTreeMap::from([({}, {})])",
+                    key.rust_literal(side, elem_mode),
+                    value.rust_literal(side, elem_mode),
+                )
             }
             Shape::Record {
                 rust_name, fields, ..
@@ -741,7 +772,7 @@ impl Shape {
                 *rust_ty != "String" || matches!(mode, AsyncMode::Sync)
             }
             Shape::Option { inner, .. } => inner.is_copy_in(mode),
-            Shape::List(_) | Shape::ListEmpty(_) => false,
+            Shape::List(_) | Shape::ListEmpty(_) | Shape::Map { .. } => false,
             Shape::Tuple(parts) => parts.iter().all(|p| p.is_copy_in(mode)),
             Shape::Record { fields, .. } => {
                 fields.iter().all(|(_, s)| s.is_copy_in(AsyncMode::Async))
@@ -773,6 +804,7 @@ impl Shape {
                 inner.contains_resource()
             }
             Shape::Tuple(parts) => parts.iter().any(Shape::contains_resource),
+            Shape::Map { key, value } => key.contains_resource() || value.contains_resource(),
             Shape::Record { fields, .. } => fields.iter().any(|(_, s)| s.contains_resource()),
             Shape::Variant { cases, .. } => cases
                 .iter()
@@ -799,6 +831,10 @@ impl Shape {
                 for p in parts {
                     p.collect_resources(out);
                 }
+            }
+            Shape::Map { key, value } => {
+                key.collect_resources(out);
+                value.collect_resources(out);
             }
             Shape::Record { fields, .. } => {
                 for (_, s) in fields {
@@ -875,6 +911,12 @@ impl Shape {
                     .join(", ");
                 format!("({inside})")
             }
+            // `BTreeMap`'s Debug: `{k: v}` for one entry.
+            Shape::Map { key, value } => format!(
+                "{{{}: {}}}",
+                key.expected_debug_in(err_enums),
+                value.expected_debug_in(err_enums),
+            ),
             Shape::Record {
                 rust_name, fields, ..
             } => {
@@ -1765,6 +1807,12 @@ fn tier2_shapes() -> Vec<Shape> {
                 },
             ]),
         ]))),
+        // map<string, u32>: end-to-end blocked on `wac-types` Map
+        // support (latest 0.10.0 errors `ComponentDefinedType::Map
+        // is not yet supported`). Adapter + lift codegen + wit-bindgen
+        // 0.57.1 binding all work; flip a `Shape::Map` entry in here
+        // and delete `test_tier2_map_blocked_on_wac` below the day
+        // wac catches up.
         // list<own<R>>: per-call handle-info buffer grown at runtime
         // (size = len * sizeof(handle_info)); per-iteration
         // `list_elem_handle_base` resolves the slot index. End-to-end
@@ -2268,7 +2316,7 @@ resolver = "2"
 members = ["provider", "consumer", "middleware"]
 
 [workspace.dependencies]
-wit-bindgen = { version = "0.51.0", features = ["default", "async-spawn", "inter-task-wakeup", "async"] }
+wit-bindgen = { version = "0.57.1", features = ["default", "async-spawn", "inter-task-wakeup", "async"] }
 "#;
 
 const PROVIDER_CARGO_TOML: &str = r#"[package]
@@ -3145,6 +3193,50 @@ fn test_tier2_canned() {
     }
 }
 
+/// Tracks upstream `wac` Map support. Today (`wac-types 0.10.0`)
+/// rejects `map<K, V>` at parse time. Splicer's adapter + lift codegen +
+/// wit-bindgen 0.57.1 scaffold binding are all Map-ready; this test
+/// asserts the failure mode so the day `wac` lands Map support, this
+/// test breaks (the pipeline starts succeeding) and prompts moving
+/// `Shape::Map` into [`tier2_shapes`] alongside the canned set.
+#[test]
+#[ignore]
+fn test_tier2_map_blocked_on_wac() {
+    require_splicer_toolchain();
+    let workspace = scaffold_tier2_workspace();
+
+    let shape = Shape::Map {
+        key: Box::new(Shape::Primitive {
+            name: "string",
+            wit_type: "string",
+            rust_ty: "String",
+            rust_literal: r#"String::from("k")"#,
+            expected_debug: r#""k""#,
+        }),
+        value: Box::new(Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "42u32",
+            expected_debug: "42",
+        }),
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_tier2_pipeline_for_shape(&workspace, &shape);
+    }));
+    let panic = result.expect_err(
+        "tier-2 Map pipeline unexpectedly succeeded — `wac` may have shipped Map support; \
+         move `Shape::Map { ... }` into `tier2_shapes()` and delete this test",
+    );
+    let msg = panic_msg(&*panic);
+    assert!(
+        msg.contains("ComponentDefinedType::Map is not yet supported"),
+        "Map pipeline failed with an unexpected error; expected the wac `ComponentDefinedType::Map` \
+         message, got:\n{msg}",
+    );
+}
+
 /// Tier-2 workspace scaffolding shared by `test_tier2_smoke` and
 /// `test_tier2_canned_primitives`. Builds the cargo workspace once;
 /// per-shape calls below reuse the same provider/consumer/middleware
@@ -3370,6 +3462,12 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 .map(predict_tier2_arg_inner)
                 .collect::<Option<_>>()?;
             Some(format!("tuple({})", parts.join(", ")))
+        }
+        // Map desugars to list-of-tuple in the cell tree.
+        Shape::Map { key, value } => {
+            let k = predict_tier2_arg_inner(key)?;
+            let v = predict_tier2_arg_inner(value)?;
+            Some(format!("list(tuple({k}, {v}))"))
         }
         // Single-element list — `Shape::List::rust_literal` produces
         // `vec![<one literal>]`, so the cell tree has one child cell.
