@@ -43,8 +43,17 @@ Guarded by `todo!()` in `lift/plan.rs`'s payload-type match
   runtime/middleware changes. `is_compound_result` accepts the
   Map kind. Synthetic tuples are unowned + unreferenced from
   any world, so `LiveTypes` keeps them out of embedded
-  component metadata. Phase 5 (canned shape in `fuzz_and_run.rs`)
-  is deferred until end-to-end runtime validation is needed.
+  component metadata.
+
+  `Shape::Map` + match arms are wired in `tests/fuzz_and_run.rs`,
+  along with a `MapLift` no-op arm in `WasmEncoderBindgen`
+  (`abi/bindgen.rs`) and a bump of the scaffold-side
+  `wit-bindgen` to 0.57.1. End-to-end is currently blocked at
+  `wac compose` — `wac-types 0.10.0` (latest) rejects
+  `ComponentDefinedType::Map`. `test_tier2_map_blocked_on_wac`
+  pins the failure mode; the day `wac` ships Map support, that
+  test breaks (success becomes the new failure) and
+  `Shape::Map { … }` moves into `tier2_shapes()`.
 
 ## Per-type workflow (for future kinds)
 
