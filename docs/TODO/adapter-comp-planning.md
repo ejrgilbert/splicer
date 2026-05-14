@@ -435,10 +435,6 @@ interesting entries cover different mechanisms:
 - **`fuzz` / `mock`** — one-per-sig. Generated via the Rust-codegen
   path described in the "one-per-signature" section above.
 
-Config plumbing for built-ins (typed-vs-free-form, where config
-reaches the component, etc.) is tracked separately in
-[`builtin-config-substrate.md`](./builtin-config-substrate.md).
-
 ### Open design questions for when we revisit
 
 - **Where do built-in components live?** Embedded in the splicer

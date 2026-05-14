@@ -124,11 +124,9 @@ const WAVE_STRING_DECODER: &str = r#"    /// Decoder for the WAVE-text subset ou
     /// `wasm-wave` crate (~300 KB on wasm32) out of every builtin.
     ///
     /// FUTURE: if/when the manifest schema grows to support compound
-    /// types (records, variants, nested lists), this fallback will
-    /// get unwieldy and the right answer is to swap the codegen back
-    /// to `wasm_wave::from_str` and accept the dep cost. See the
-    /// "Future: WAVE for compound types" notes in
-    /// docs/TODO/builtin-config-substrate.md for the migration path.
+    /// types (records, variants, nested lists), this fallback gets
+    /// unwieldy and the right move is to swap the codegen back to
+    /// `wasm_wave::from_str` and accept the dep cost.
     fn decode_wave_string(raw: &str) -> String {
         let inner = raw
             .strip_prefix('"')
