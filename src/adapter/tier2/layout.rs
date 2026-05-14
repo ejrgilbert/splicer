@@ -40,17 +40,21 @@ const EVENT_SLOT_ALIGN: u32 = 4;
 const LAYOUT_SIZE_BUDGET: u32 = i32::MAX as u32;
 
 /// Per-fn flat-slot count cap. Reduced under `cfg(test)` to exercise
-/// the bail without a WIT at the production limit.
+/// the bail without a WIT at the production limit. Plan-builder
+/// pre-bails on `list<T, N>` with `N` over this cap so a hostile
+/// integer literal can't overflow `bump_flat_slot`'s u32 counter
+/// before layout's post-build check fires.
 #[cfg(not(test))]
-const MAX_FLAT_SLOTS_PER_FN: u32 = 1 << 16;
+pub(in crate::adapter::tier2) const MAX_FLAT_SLOTS_PER_FN: u32 = 1 << 16;
 #[cfg(test)]
-const MAX_FLAT_SLOTS_PER_FN: u32 = 16;
+pub(in crate::adapter::tier2) const MAX_FLAT_SLOTS_PER_FN: u32 = 16;
 
-/// Per-param (and per-result) cell-tree cap.
+/// Per-param (and per-result) cell-tree cap. Plan-builder pre-bails
+/// on oversized `list<T, N>` for the same reason as above.
 #[cfg(not(test))]
-const MAX_CELLS_PER_PARAM: u32 = 1 << 20;
+pub(in crate::adapter::tier2) const MAX_CELLS_PER_PARAM: u32 = 1 << 20;
 #[cfg(test)]
-const MAX_CELLS_PER_PARAM: u32 = 8;
+pub(in crate::adapter::tier2) const MAX_CELLS_PER_PARAM: u32 = 8;
 
 /// Bound per-fn / per-param counts so downstream `u32` arithmetic fits.
 fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {

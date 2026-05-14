@@ -151,7 +151,8 @@ fn is_supported_result(ty: &Type, resolve: &Resolve) -> bool {
 
 /// Compound kinds wired today: `record`, `tuple`, `option`, `result`,
 /// `variant`, `list<T>` non-u8 (`list<u8>` takes the bytes Direct path),
-/// `map<K, V>` (lift desugars to `list<tuple<K, V>>`).
+/// `map<K, V>` (lift desugars to `list<tuple<K, V>>`),
+/// `list<T, N>` (lift desugars to `Cell::TupleOf` with N children).
 fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
     let Type::Id(id) = ty else {
         return false;
@@ -162,7 +163,8 @@ fn is_compound_result(ty: &Type, resolve: &Resolve) -> bool {
         | wit_parser::TypeDefKind::Option(_)
         | wit_parser::TypeDefKind::Result(_)
         | wit_parser::TypeDefKind::Variant(_)
-        | wit_parser::TypeDefKind::Map(_, _) => true,
+        | wit_parser::TypeDefKind::Map(_, _)
+        | wit_parser::TypeDefKind::FixedLengthList(_, _) => true,
         wit_parser::TypeDefKind::List(elem) => !matches!(elem, Type::U8),
         wit_parser::TypeDefKind::Type(t) => is_compound_result(t, resolve),
         _ => false,

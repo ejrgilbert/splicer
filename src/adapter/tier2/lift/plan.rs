@@ -610,11 +610,16 @@ impl<'a> LiftPlanBuilder<'a> {
                     let tuple_id = self.map_aliases.tuple_for(*id);
                     self.push_list_of(&Type::Id(tuple_id), resolve, names)
                 }
-                wit_parser::TypeDefKind::FixedLengthList(_, _) => {
-                    todo!(
-                        "tier-2 lift: unsupported TypeDefKind {:?}",
-                        &resolve.types[*id].kind
-                    )
+                wit_parser::TypeDefKind::FixedLengthList(elem, n) => {
+                    // Canon-ABI: `list<T, N>` flattens to `N × flat(T)`
+                    // inlined — same flat shape as `tuple<T, T, …, T>`.
+                    // Desugar at plan-build: walk the element N times,
+                    // wrap in `Cell::TupleOf`. Reuses every TupleOf code
+                    // path (static cell-index array at top level,
+                    // `PrestagedTupleIndices` as a list element).
+                    let elem = *elem;
+                    let n = *n;
+                    self.push_fixed_length_list(&elem, n, resolve, names)
                 }
             },
         }
@@ -698,11 +703,66 @@ impl<'a> LiftPlanBuilder<'a> {
         // WIT grammar forbids 0-tuples; pin it here so the
         // list-element tuple-idx-buffer codegen (which divides by
         // children-count) can't fire opaquely on a malformed plan.
+        // Same invariant guards `push_fixed_length_list`'s `N >= 1`
+        // bail — both arms terminate in this constructor.
         debug_assert!(
             !children.is_empty(),
             "Cell::TupleOf must have ≥1 child — WIT forbids 0-tuples",
         );
         self.push_cell(Cell::TupleOf { children })
+    }
+
+    /// `list<T, N>` desugar: walk `T` N times, wrap in `Cell::TupleOf`.
+    /// Canon-ABI gives `list<T, N>` the same flat shape as `tuple<T;N>`
+    /// (N copies of `flat(T)` inlined), so emit / layout / classify all
+    /// reuse the tuple path. Pre-bails on `N == 0` (parseable in WIT
+    /// grammar, no canonical-ABI meaning) and `N` above the layout
+    /// budget (would overflow `bump_flat_slot`'s u32 counter for a
+    /// single integer literal). The stub plan is never observed —
+    /// `for_type` returns `Err` whenever `record_error` fires.
+    fn push_fixed_length_list(
+        &mut self,
+        elem: &Type,
+        n: u32,
+        resolve: &Resolve,
+        names: &mut NameInterner,
+    ) -> u32 {
+        if n == 0 {
+            self.record_error(anyhow!(
+                "`list<T, N>` requires N >= 1; got N = 0. File a request at \
+                 {ISSUES_URL} if a zero-length fixed list is intentional."
+            ));
+            return self.stub_fixed_length_list();
+        }
+        if n > super::super::layout::MAX_FLAT_SLOTS_PER_FN
+            || n > super::super::layout::MAX_CELLS_PER_PARAM
+        {
+            self.record_error(anyhow!(
+                "`list<T, N>` with N = {n} exceeds tier-2 layout budget \
+                 (MAX_FLAT_SLOTS_PER_FN = {}, MAX_CELLS_PER_PARAM = {}). \
+                 File a request at {ISSUES_URL} if this size is intentional.",
+                super::super::layout::MAX_FLAT_SLOTS_PER_FN,
+                super::super::layout::MAX_CELLS_PER_PARAM,
+            ));
+            return self.stub_fixed_length_list();
+        }
+        let mut children = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            children.push(self.push(elem, resolve, names));
+        }
+        self.push_cell(Cell::TupleOf { children })
+    }
+
+    /// Placeholder TupleOf for the `record_error`-then-stub paths in
+    /// [`Self::push_fixed_length_list`]. Pushes a `Cell::Bool` leaf
+    /// referencing slot 0 (which always exists) so the returned cell
+    /// index is a valid TupleOf, even though `for_type` bails before
+    /// any caller reads it.
+    fn stub_fixed_length_list(&mut self) -> u32 {
+        let stub = self.push_cell(Cell::Bool { flat_slot: 0 });
+        self.push_cell(Cell::TupleOf {
+            children: vec![stub],
+        })
     }
 
     /// Disc slot then inner type — canonical-ABI `[disc, ...flat(T)]`.
