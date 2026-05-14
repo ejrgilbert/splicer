@@ -184,6 +184,15 @@ enum Shape {
     /// and (for compound kinds) the per-list info-buffer realloc
     /// with count == static_count + 0.
     ListEmpty(Box<Shape>),
+    /// `list<T, N>` — fixed-length list. wit-bindgen renders it as
+    /// the Rust array `[T; N]`, canon-ABI flattens it to `N × flat(T)`
+    /// inlined, and tier-2 lift desugars it to `Cell::TupleOf` with N
+    /// homogeneous children. The harness fixes N at the test fixture;
+    /// the inner shape is repeated to fill the array literal.
+    FixedLengthList {
+        inner: Box<Shape>,
+        n: u32,
+    },
     Tuple(Vec<Shape>),
     /// `map<K, V>` materialized as a single-entry `BTreeMap` at
     /// runtime. wit-bindgen renders as `wit_bindgen::rt::Map` (a
@@ -305,6 +314,7 @@ impl Shape {
             }
             Shape::List(inner) => format!("list_{}", inner.name()),
             Shape::ListEmpty(inner) => format!("empty_list_{}", inner.name()),
+            Shape::FixedLengthList { inner, n } => format!("fixed_list_{}_{n}", inner.name()),
             Shape::Tuple(parts) => {
                 let mut s = String::from("tuple");
                 for p in parts {
@@ -344,6 +354,7 @@ impl Shape {
             Shape::Primitive { wit_type, .. } => (*wit_type).to_string(),
             Shape::Option { inner, .. } => format!("option<{}>", inner.wit_type()),
             Shape::List(inner) | Shape::ListEmpty(inner) => format!("list<{}>", inner.wit_type()),
+            Shape::FixedLengthList { inner, n } => format!("list<{}, {n}>", inner.wit_type()),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -385,6 +396,7 @@ impl Shape {
             Shape::Option { inner, .. } | Shape::List(inner) | Shape::ListEmpty(inner) => {
                 inner.collect_wit_decls(out, seen)
             }
+            Shape::FixedLengthList { inner, .. } => inner.collect_wit_decls(out, seen),
             Shape::Tuple(parts) => {
                 for p in parts {
                     p.collect_wit_decls(out, seen);
@@ -497,6 +509,7 @@ impl Shape {
             Shape::Primitive { rust_ty, .. } => (*rust_ty).to_string(),
             Shape::Option { inner, .. } => format!("Option<{}>", inner.rust_ty(side)),
             Shape::List(inner) | Shape::ListEmpty(inner) => format!("Vec<{}>", inner.rust_ty(side)),
+            Shape::FixedLengthList { inner, n } => format!("[{}; {n}]", inner.rust_ty(side)),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -589,6 +602,19 @@ impl Shape {
                 // Empty literal — type is inferred from the
                 // wit-bindgen-generated param signature (`&[T]`).
                 "vec![]".to_string()
+            }
+            Shape::FixedLengthList { inner, n } => {
+                // wit-bindgen renders `list<T, N>` as `[T; N]` (Rust
+                // array). Same owned-element rule as `List`: force
+                // Async-mode on the inner literal so a `string` element
+                // becomes `String::from(...)` regardless of outer mode.
+                let elem_mode = match inner.as_ref() {
+                    Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => mode,
+                    _ => AsyncMode::Async,
+                };
+                let lit = inner.rust_literal(side, elem_mode);
+                let parts: Vec<String> = (0..*n as usize).map(|_| lit.clone()).collect();
+                format!("[{}]", parts.join(", "))
             }
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -773,6 +799,8 @@ impl Shape {
             }
             Shape::Option { inner, .. } => inner.is_copy_in(mode),
             Shape::List(_) | Shape::ListEmpty(_) | Shape::Map { .. } => false,
+            // `[T; N]` impls `Copy` whenever `T: Copy` — independent of N.
+            Shape::FixedLengthList { inner, .. } => inner.is_copy_in(mode),
             Shape::Tuple(parts) => parts.iter().all(|p| p.is_copy_in(mode)),
             Shape::Record { fields, .. } => {
                 fields.iter().all(|(_, s)| s.is_copy_in(AsyncMode::Async))
@@ -803,6 +831,7 @@ impl Shape {
             Shape::Option { inner, .. } | Shape::List(inner) | Shape::ListEmpty(inner) => {
                 inner.contains_resource()
             }
+            Shape::FixedLengthList { inner, .. } => inner.contains_resource(),
             Shape::Tuple(parts) => parts.iter().any(Shape::contains_resource),
             Shape::Map { key, value } => key.contains_resource() || value.contains_resource(),
             Shape::Record { fields, .. } => fields.iter().any(|(_, s)| s.contains_resource()),
@@ -827,6 +856,7 @@ impl Shape {
             Shape::Option { inner, .. } | Shape::List(inner) | Shape::ListEmpty(inner) => {
                 inner.collect_resources(out)
             }
+            Shape::FixedLengthList { inner, .. } => inner.collect_resources(out),
             Shape::Tuple(parts) => {
                 for p in parts {
                     p.collect_resources(out);
@@ -903,6 +933,14 @@ impl Shape {
             }
             Shape::List(inner) => format!("[{}]", inner.expected_debug_in(err_enums)),
             Shape::ListEmpty(_) => "[]".to_string(),
+            Shape::FixedLengthList { inner, n } => {
+                // Rust's `[T; N]` Debug renders identically to `Vec<T>`'s
+                // (`[a, b, c]`), so the harness's `{value:?}` interpolation
+                // produces the same per-element repetition we encode here.
+                let elem = inner.expected_debug_in(err_enums);
+                let parts: Vec<String> = (0..*n as usize).map(|_| elem.clone()).collect();
+                format!("[{}]", parts.join(", "))
+            }
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -2048,6 +2086,21 @@ fn tier2_shapes() -> Vec<Shape> {
                 ),
             ],
         })),
+        // `list<u32, 3>`: canon-ABI fixed-length list — `N × flat(T)`
+        // inlined on the wire, lifted as `Cell::TupleOf` with three
+        // homogeneous children. Pins the end-to-end desugar path
+        // (plan-builder repeats element N times → static-tuple
+        // codegen → `tuple(integer, integer, integer)` render).
+        Shape::FixedLengthList {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "42u32",
+                expected_debug: "42",
+            }),
+            n: 3,
+        },
     ]
 }
 
@@ -3485,6 +3538,14 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
         // Empty list — the before/after dump renders an empty list
         // as `list()`, no element substring to match.
         Shape::ListEmpty(_) => Some("list()".to_string()),
+        // `list<T, N>` desugars to `Cell::TupleOf` with N homogeneous
+        // children — matches `fmt_cell`'s `tuple(<child>, …)` rendering
+        // character-for-character.
+        Shape::FixedLengthList { inner, n } => {
+            let elem = predict_tier2_arg_inner(inner)?;
+            let parts: Vec<String> = (0..*n as usize).map(|_| elem.clone()).collect();
+            Some(format!("tuple({})", parts.join(", ")))
+        }
         Shape::Option { inner, is_some } => {
             if *is_some {
                 let inner_render = predict_tier2_arg_inner(inner)?;
@@ -3910,6 +3971,10 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
     // func()` in AsyncMode::Async). Harmless when only sync-lifted
     // exports are in use.
     config.wasm_component_model_async_stackful(true);
+    // Required for `list<T, N>` (canon-ABI fixed-length lists) — the
+    // canned shape sweep uses `Shape::FixedLengthList` to exercise the
+    // tier-2 desugar-to-`Cell::TupleOf` lift path.
+    config.wasm_component_model_fixed_length_lists(true);
     let engine = Engine::new(&config)?;
 
     let component = Component::from_binary(&engine, bytes)?;
