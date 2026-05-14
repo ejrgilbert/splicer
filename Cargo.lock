@@ -409,6 +409,8 @@ dependencies = [
 name = "builtin-manifest"
 version = "0.1.0"
 dependencies = [
+ "proc-macro2",
+ "quote",
  "serde",
  "toml 0.8.23",
  "wasmparser 0.247.0",
