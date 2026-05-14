@@ -94,24 +94,6 @@ struct Agg {
     window_start: Datetime,
 }
 
-/// Parsed config, materialized once on first observation. Pulls
-/// values via the codegen'd typed accessors, which read the manifest-
-/// declared defaults when the user didn't set anything in YAML.
-/// `buffer` is clamped to `>= 1` so `buffer = 0` doesn't lock the
-/// window open forever.
-struct Config {
-    buffer: u32,
-    flush_after_seconds: f64,
-}
-
-fn cached_config() -> &'static Config {
-    static C: OnceLock<Config> = OnceLock::new();
-    C.get_or_init(|| Config {
-        buffer: config::buffer().max(1),
-        flush_after_seconds: config::flush_after_seconds(),
-    })
-}
-
 /// `(interface, function)` is the metric attribute set; one
 /// accumulator per attribute set.
 type CallKey = (String, String);
@@ -278,7 +260,10 @@ impl AfterGuest for OtelBareMetrics {
         };
         let end_time = now();
         let duration_s = duration_seconds(&p.start_time, &end_time);
-        let cfg = cached_config();
+        // `buffer` clamped to `>= 1` so `buffer = 0` can't lock the
+        // window open forever.
+        let buffer = config::buffer().max(1);
+        let flush_after_seconds = config::flush_after_seconds();
 
         // Accumulate into the per-(iface, fn) window; capture whether
         // this measurement closes the window so we can flush after
@@ -306,7 +291,7 @@ impl AfterGuest for OtelBareMetrics {
 
             let elapsed = duration_seconds(&agg.window_start, &end_time);
             let should_flush =
-                u64::from(cfg.buffer) <= agg.count || elapsed >= cfg.flush_after_seconds;
+                u64::from(buffer) <= agg.count || elapsed >= flush_after_seconds;
             should_flush.then(|| map.remove(&k).expect("entry just inserted"))
         };
 

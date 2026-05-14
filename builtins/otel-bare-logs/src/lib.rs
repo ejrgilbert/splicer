@@ -34,7 +34,6 @@ mod bindings {
 // accessors in `mod config`. Defaults live only in `manifest.toml`.
 include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
 
-use std::sync::OnceLock;
 
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
 use bindings::splicer::common::types::CallId;
@@ -66,36 +65,6 @@ const SEVERITY_INFO: Severity = Severity { text: "INFO", number: 9 };
 const SEVERITY_WARN: Severity = Severity { text: "WARN", number: 13 };
 const SEVERITY_ERROR: Severity = Severity { text: "ERROR", number: 17 };
 const SEVERITY_FATAL: Severity = Severity { text: "FATAL", number: 21 };
-
-/// Parsed config, materialized once on first observation. Splice-time
-/// validation pins `severity` to one of the values declared in
-/// `manifest.toml`, so `parse_severity` can't fail here — an
-/// `expect` panic would mean splicer let an out-of-set value through.
-struct Config {
-    severity: Severity,
-}
-
-fn cached_config() -> &'static Config {
-    static C: OnceLock<Config> = OnceLock::new();
-    C.get_or_init(|| Config {
-        severity: parse_severity(config::severity())
-            .expect("splice-time validation guarantees a known severity"),
-    })
-}
-
-/// Case-insensitive match against the OTel spec-defined level names.
-/// `None` on unknown input — caller falls back to the default.
-fn parse_severity(s: &str) -> Option<Severity> {
-    match s.trim().to_ascii_uppercase().as_str() {
-        "TRACE" => Some(SEVERITY_TRACE),
-        "DEBUG" => Some(SEVERITY_DEBUG),
-        "INFO" => Some(SEVERITY_INFO),
-        "WARN" | "WARNING" => Some(SEVERITY_WARN),
-        "ERROR" => Some(SEVERITY_ERROR),
-        "FATAL" => Some(SEVERITY_FATAL),
-        _ => None,
-    }
-}
 
 /// OTel encodes "no parent" as the all-zero id. Treat empty strings
 /// the same way for resilience against hosts that report them.
@@ -154,13 +123,22 @@ impl AfterGuest for OtelBareLogs {
             )
         };
 
-        let cfg = cached_config();
+        // Codegen-emitted typed enum → exhaustive match. Adding a
+        // case to the manifest fails the build here until handled.
+        let severity = match config::severity() {
+            config::Severity::Trace => SEVERITY_TRACE,
+            config::Severity::Debug => SEVERITY_DEBUG,
+            config::Severity::Info => SEVERITY_INFO,
+            config::Severity::Warn | config::Severity::Warning => SEVERITY_WARN,
+            config::Severity::Error => SEVERITY_ERROR,
+            config::Severity::Fatal => SEVERITY_FATAL,
+        };
         let body = format!("{}::{}", call.interface_name, call.function_name);
         let record = LogRecord {
             timestamp: None,
             observed_timestamp: Some(now()),
-            severity_text: Some(cfg.severity.text.into()),
-            severity_number: Some(cfg.severity.number),
+            severity_text: Some(severity.text.into()),
+            severity_number: Some(severity.number),
             body: Some(encode_json_string(&body)),
             attributes: Some(vec![
                 kv("code.namespace", &call.interface_name),

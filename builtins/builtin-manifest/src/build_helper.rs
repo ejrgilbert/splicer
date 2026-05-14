@@ -116,9 +116,15 @@ fn build_config_module(manifest: &Manifest) -> Result<TokenStream, Box<dyn std::
     } else {
         TokenStream::new()
     };
-    let accessors: Result<Vec<TokenStream>, Box<dyn std::error::Error>> =
-        manifest.keys.iter().map(build_accessor).collect();
-    let accessors = accessors?;
+    let mut type_decls = Vec::new();
+    let mut accessors = Vec::new();
+    for key in &manifest.keys {
+        let ty = key.parsed_type().expect("manifest already validated");
+        if let TypeAst::Enum { cases } = &ty {
+            type_decls.push(build_enum_type(&key.name, cases));
+        }
+        accessors.push(build_accessor(key)?);
+    }
     Ok(quote! {
         #[doc = " Typed accessors generated from `manifest.toml`. Defaults live in"]
         #[doc = " `manifest.toml` only; values come from the substrate import as WAVE"]
@@ -131,11 +137,53 @@ fn build_config_module(manifest: &Manifest) -> Result<TokenStream, Box<dyn std::
                 crate::bindings::splicer::builtin_config::get::get(key)
             }
 
+            #(#type_decls)*
+
             #decoder
 
             #(#accessors)*
         }
     })
+}
+
+/// Synthesize a `pub enum <PascalCase-key-name>` for an
+/// `enum { ... }`-typed key. Variants are PascalCase'd from the
+/// manifest cases. `Copy` so the accessor can return by value;
+/// `Debug`/`PartialEq` for downstream `match`/`assert_eq!` ergonomics.
+fn build_enum_type(key_name: &str, cases: &[String]) -> TokenStream {
+    let type_name = format_ident!("{}", pascal_case(key_name));
+    let variants = cases.iter().map(|c| {
+        let variant = format_ident!("{}", pascal_case(c));
+        let case_doc = format!(" Manifest case `{c}`.");
+        quote! {
+            #[doc = #case_doc]
+            #variant,
+        }
+    });
+    quote! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum #type_name {
+            #(#variants)*
+        }
+    }
+}
+
+/// Map kebab-case / snake_case identifiers to UpperCamelCase (`info`
+/// → `Info`, `warn-error` → `WarnError`, `span_kind` → `SpanKind`).
+fn pascal_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper_next = true;
+    for c in name.chars() {
+        if c == '-' || c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Hand-rolled decoder for the WAVE-text subset our splicer-side
@@ -235,9 +283,12 @@ fn build_accessor(key: &ConfigKey) -> Result<TokenStream, Box<dyn std::error::Er
         TypeAst::String => Ok(build_string_accessor(
             &fn_name, key_lit, default_lit, doc_attr,
         )),
-        TypeAst::Enum { cases } => Ok(build_enum_accessor(
-            &fn_name, key_lit, default_lit, cases, doc_attr,
-        )),
+        TypeAst::Enum { cases } => {
+            let type_name = format_ident!("{}", pascal_case(&key.name));
+            Ok(build_enum_accessor(
+                &fn_name, &type_name, key_lit, default_lit, cases, doc_attr,
+            ))
+        }
         TypeAst::List(_) | TypeAst::Option(_) | TypeAst::Tuple(_) => Err(format!(
             "key '{}': compound-type codegen not yet implemented \
              (see the wasm-wave fallback note in builtin-manifest)",
@@ -294,6 +345,7 @@ fn build_string_accessor(
 
 fn build_enum_accessor(
     fn_name: &proc_macro2::Ident,
+    type_name: &proc_macro2::Ident,
     key_lit: &str,
     default_lit: &str,
     cases: &[String],
@@ -301,18 +353,19 @@ fn build_enum_accessor(
 ) -> TokenStream {
     let arms = cases.iter().map(|c| {
         let lit = c.as_str();
-        quote! { #lit => #lit, }
+        let variant = format_ident!("{}", pascal_case(c));
+        quote! { #lit => #type_name::#variant, }
     });
     quote! {
         #doc_attr
-        pub fn #fn_name() -> &'static str {
-            static V: OnceLock<&'static str> = OnceLock::new();
+        pub fn #fn_name() -> #type_name {
+            static V: OnceLock<#type_name> = OnceLock::new();
             *V.get_or_init(|| {
                 let raw = lookup(#key_lit)
                     .unwrap_or_else(|| #default_lit.to_string());
                 match raw.as_str() {
                     #(#arms)*
-                    _ => panic!("manifest-validated enum value"),
+                    _ => unreachable!("splice-time validation guarantees a declared case"),
                 }
             })
         }
