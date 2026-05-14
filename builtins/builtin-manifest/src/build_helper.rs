@@ -41,11 +41,17 @@ pub fn codegen(manifest_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo::rerun-if-changed={}", manifest_path.display());
 
     let src = std::fs::read_to_string(manifest_path).map_err(|e| {
-        format!("Failed to read manifest at {}: {e}", manifest_path.display())
+        format!(
+            "Failed to read manifest at {}: {e}",
+            manifest_path.display()
+        )
     })?;
     let manifest = Manifest::from_toml(&src)?;
     std::fs::write(&manifest_copy, &src).map_err(|e| {
-        format!("Failed to copy manifest to {}: {e}", manifest_copy.display())
+        format!(
+            "Failed to copy manifest to {}: {e}",
+            manifest_copy.display()
+        )
     })?;
 
     let tokens = build_codegen(&manifest, src.len(), &builtin_name)?;
@@ -273,7 +279,11 @@ fn build_accessor(key: &ConfigKey) -> Result<TokenStream, Box<dyn std::error::Er
         | TypeAst::S64
         | TypeAst::F32
         | TypeAst::F64 => Ok(build_numeric_accessor(
-            &fn_name, key_lit, default_lit, &ty, doc_attr,
+            &fn_name,
+            key_lit,
+            default_lit,
+            &ty,
+            doc_attr,
         )),
         TypeAst::Char => Err(format!(
             "key '{}': type `char` codegen not yet implemented",
@@ -281,12 +291,20 @@ fn build_accessor(key: &ConfigKey) -> Result<TokenStream, Box<dyn std::error::Er
         )
         .into()),
         TypeAst::String => Ok(build_string_accessor(
-            &fn_name, key_lit, default_lit, doc_attr,
+            &fn_name,
+            key_lit,
+            default_lit,
+            doc_attr,
         )),
         TypeAst::Enum { cases } => {
             let type_name = format_ident!("{}", pascal_case(&key.name));
             Ok(build_enum_accessor(
-                &fn_name, &type_name, key_lit, default_lit, cases, doc_attr,
+                &fn_name,
+                &type_name,
+                key_lit,
+                default_lit,
+                cases,
+                doc_attr,
             ))
         }
         TypeAst::List(_) | TypeAst::Option(_) | TypeAst::Tuple(_) => Err(format!(

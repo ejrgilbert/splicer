@@ -114,9 +114,15 @@ impl ConfigKey {
 pub enum ManifestError {
     Parse(String),
     /// `type` couldn't be parsed.
-    BadType { key: String, message: String },
+    BadType {
+        key: String,
+        message: String,
+    },
     /// `default` value didn't fit the declared type.
-    BadDefault { key: String, message: String },
+    BadDefault {
+        key: String,
+        message: String,
+    },
     DuplicateKey(String),
     /// `case_insensitive = true` on a non-enum type.
     CaseInsensitiveOnNonEnum(String),
@@ -133,7 +139,10 @@ impl std::fmt::Display for ManifestError {
                 write!(f, "key '{key}': bad type expression: {message}")
             }
             Self::BadDefault { key, message } => {
-                write!(f, "key '{key}': default does not fit declared type: {message}")
+                write!(
+                    f,
+                    "key '{key}': default does not fit declared type: {message}"
+                )
             }
             Self::DuplicateKey(key) => write!(f, "duplicate config key declared: '{key}'"),
             Self::CaseInsensitiveOnNonEnum(key) => write!(
@@ -386,7 +395,11 @@ fn encode_f32(f: f64) -> Result<String, String> {
     if !narrowed.is_finite() {
         return Err(format!(
             "value {f} is out of f32 range (would saturate to {})",
-            if narrowed.is_sign_negative() { "-inf" } else { "inf" },
+            if narrowed.is_sign_negative() {
+                "-inf"
+            } else {
+                "inf"
+            },
         ));
     }
     Ok(encode_float(f))
@@ -856,12 +869,36 @@ mod tests {
         use wasm_wave::wasm::{WasmTypeKind, WasmValue};
 
         let cases: &[(&str, toml::Value, WaveType)] = &[
-            ("u32", toml::Value::Integer(42), WaveType::simple(WasmTypeKind::U32).unwrap()),
-            ("u64", toml::Value::Integer(99), WaveType::simple(WasmTypeKind::U64).unwrap()),
-            ("s32", toml::Value::Integer(-7), WaveType::simple(WasmTypeKind::S32).unwrap()),
-            ("f64", toml::Value::Float(1.5), WaveType::simple(WasmTypeKind::F64).unwrap()),
-            ("f64-int", toml::Value::Integer(10), WaveType::simple(WasmTypeKind::F64).unwrap()),
-            ("bool", toml::Value::Boolean(true), WaveType::simple(WasmTypeKind::Bool).unwrap()),
+            (
+                "u32",
+                toml::Value::Integer(42),
+                WaveType::simple(WasmTypeKind::U32).unwrap(),
+            ),
+            (
+                "u64",
+                toml::Value::Integer(99),
+                WaveType::simple(WasmTypeKind::U64).unwrap(),
+            ),
+            (
+                "s32",
+                toml::Value::Integer(-7),
+                WaveType::simple(WasmTypeKind::S32).unwrap(),
+            ),
+            (
+                "f64",
+                toml::Value::Float(1.5),
+                WaveType::simple(WasmTypeKind::F64).unwrap(),
+            ),
+            (
+                "f64-int",
+                toml::Value::Integer(10),
+                WaveType::simple(WasmTypeKind::F64).unwrap(),
+            ),
+            (
+                "bool",
+                toml::Value::Boolean(true),
+                WaveType::simple(WasmTypeKind::Bool).unwrap(),
+            ),
             (
                 "string",
                 toml::Value::String("hello, \"world\"\n".into()),
@@ -875,7 +912,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{label}: wasm-wave parse of {wave:?}: {e}"));
             // Spot-check the typed value matches what we encoded.
             match (val, parsed.kind()) {
-                (toml::Value::Boolean(b), WasmTypeKind::Bool) => assert_eq!(*b, parsed.unwrap_bool()),
+                (toml::Value::Boolean(b), WasmTypeKind::Bool) => {
+                    assert_eq!(*b, parsed.unwrap_bool())
+                }
                 (toml::Value::Integer(n), WasmTypeKind::U32) => {
                     assert_eq!(*n as u32, parsed.unwrap_u32())
                 }
@@ -939,12 +978,8 @@ mod tests {
         // option<string> with a present value
         let opt_ty = WaveType::option(WaveType::simple(WasmTypeKind::String).unwrap());
         let opt_ast = TypeAst::Option(Box::new(TypeAst::String));
-        let wave = encode_toml_as_wave(
-            &toml::Value::String("hi".into()),
-            &opt_ast,
-            false,
-        )
-        .expect("encode option");
+        let wave = encode_toml_as_wave(&toml::Value::String("hi".into()), &opt_ast, false)
+            .expect("encode option");
         let parsed: Value = wasm_wave::from_str(&opt_ty, &wave).expect("parse option");
         let inner = parsed.unwrap_option().expect("some");
         assert_eq!(&*inner.unwrap_string(), "hi");

@@ -98,10 +98,7 @@ pub fn parse_wit_type(src: &str) -> Result<TypeAst, ParseError> {
     let ty = p.parse_type()?;
     p.skip_ws();
     if p.pos < p.src.len() {
-        return Err(p.err(format!(
-            "unexpected trailing input: {:?}",
-            &p.src[p.pos..]
-        )));
+        return Err(p.err(format!("unexpected trailing input: {:?}", &p.src[p.pos..])));
     }
     Ok(ty)
 }
@@ -208,9 +205,7 @@ impl<'a> Parser<'a> {
                         }
                         Some('>') => break,
                         _ => {
-                            return Err(
-                                self.err("expected ',' or '>' inside tuple<...>")
-                            );
+                            return Err(self.err("expected ',' or '>' inside tuple<...>"));
                         }
                     }
                 }
