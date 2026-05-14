@@ -223,30 +223,26 @@ fn print_builtin_details(name: &str) -> Result<()> {
         return Ok(());
     }
     println!();
-    println!("{}", "Config keys (can be overridden via `inject.builtin.config:`):\n".bold().bright_white());
+    println!(
+        "{}",
+        "Config keys and in-YAML defaults (overridable via `inject.builtin.config:`):\n"
+            .bold()
+            .bright_white()
+    );
     for key in &manifest.keys {
         for wrapped in wrap_doc(&key.doc, doc_wrap_width()) {
             println!("  /// {}", wrapped.italic().white());
         }
-        if !key.values.is_empty() {
-            let suffix = if key.case_insensitive {
-                " (case-insensitive)"
-            } else {
-                ""
-            };
-            println!(
-                "  /// {}",
-                format!("one of: {{{}}}{}", key.values.join(", "), suffix)
-                    .italic()
-                    .white(),
-            );
+        if key.case_insensitive {
+            println!("  /// {}", "(matched case-insensitively)".italic().white());
         }
         println!(
-            "  {}: {} = {};\n",
+            "  {}: {} = {};",
             key.name.cyan(),
-            key.kind.as_str().yellow(),
+            key.wit_type.yellow(),
             key.default_display().green(),
         );
+        println!();
     }
     Ok(())
 }

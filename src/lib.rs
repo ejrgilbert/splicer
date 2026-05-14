@@ -78,7 +78,7 @@ mod builtins;
 /// pieces that make sense to expose.
 pub mod builtin_info {
     pub use crate::builtins::{known_names, list_with_manifests, resolve_manifest};
-    pub use ::builtin_manifest::{BuiltinMeta, ConfigKey, KeyType, Manifest};
+    pub use ::builtin_manifest::{BuiltinMeta, ConfigKey, Manifest, TypeAst};
 }
 mod compose;
 mod config_provider;
