@@ -719,6 +719,7 @@ mod tests {
         );
         let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
         let world_id = resolve.select_world(&[world_pkg], Some("adapter")).unwrap();
+        let map_aliases = super::super::lift::desugar_map_aliases(&mut resolve);
         let target_iface =
             super::super::test_utils::iface_by_unversioned_qname(&resolve, "test:layout-fixture/t");
         let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
@@ -729,7 +730,8 @@ mod tests {
         let mut names = NameInterner::new();
         let iface_name = names.intern(TARGET_IFACE);
         let classified =
-            build_per_func_classified(&resolve, target_iface, &funcs, &mut names).unwrap();
+            build_per_func_classified(&resolve, target_iface, &funcs, &mut names, &map_aliases)
+                .unwrap();
         let (dispatches, plan) =
             lay_out_static_memory(classified, &funcs, &schema, names, iface_name).unwrap();
         LayoutEnv {
@@ -861,6 +863,7 @@ mod tests {
         );
         let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
         let world_id = resolve.select_world(&[world_pkg], Some("adapter")).unwrap();
+        let map_aliases = super::super::lift::desugar_map_aliases(&mut resolve);
         let target_iface =
             super::super::test_utils::iface_by_unversioned_qname(&resolve, target_iface_qname);
         let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
@@ -870,7 +873,8 @@ mod tests {
         let schema = compute_schema(&resolve, world_id, true, true).unwrap();
         let mut names = NameInterner::new();
         let iface_name = names.intern(&target_versioned);
-        let classified = build_per_func_classified(&resolve, target_iface, &funcs, &mut names)?;
+        let classified =
+            build_per_func_classified(&resolve, target_iface, &funcs, &mut names, &map_aliases)?;
         lay_out_static_memory(classified, &funcs, &schema, names, iface_name).map(|_| ())
     }
 

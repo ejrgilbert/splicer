@@ -4,9 +4,13 @@
 //! `cells` vec, so child indices can't desync. See
 //! `docs/tiers/lift-codegen.md`.
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use wit_parser::abi::WasmType;
-use wit_parser::{Resolve, Type};
+use wit_parser::{
+    Docs, Resolve, Span, Stability, Tuple, Type, TypeDef, TypeDefKind, TypeId, TypeOwner,
+};
 
 use super::super::super::abi::emit::{wasm_type_to_val, BlobSlice};
 use super::super::super::abi::flat_types;
@@ -256,8 +260,13 @@ pub(crate) struct LiftPlan {
 impl LiftPlan {
     /// Build a plan from a single WIT type. `names` interns every
     /// record type-name and field-name. Errors on unsupported shapes.
-    pub(super) fn for_type(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> Result<Self> {
-        let mut builder = LiftPlanBuilder::new();
+    pub(super) fn for_type(
+        ty: &Type,
+        resolve: &Resolve,
+        names: &mut NameInterner,
+        map_aliases: &MapAliases,
+    ) -> Result<Self> {
+        let mut builder = LiftPlanBuilder::new(map_aliases);
         let root = builder.push(ty, resolve, names);
         if let Some(err) = builder.error {
             return Err(err);
@@ -384,12 +393,78 @@ pub(crate) struct ListSpec<'a> {
     pub arm_guards: &'a [ArmGuard],
 }
 
+// ─── Map → list<tuple<K, V>> desugaring ───────────────────────────
+
+/// Synthetic `tuple<K, V>` typedef per `map<K, V>` in the resolve.
+/// Lift treats `map<K, V>` as canon-ABI shorthand for
+/// `list<tuple<K, V>>` (same flat `(ptr, len)`, same element memory
+/// layout), so the plan builder routes Map through `Cell::ListOf`
+/// with the synthetic tuple as the element type. The original Map
+/// typedef is left untouched — wit-bindgen-core's lower path still
+/// sees `TypeDefKind::Map(K, V)` and emits `MapLower` as before
+/// (which `src/adapter/abi/bindgen.rs` collapses to `(ptr, len)`).
+///
+/// Synthetic tuples are unnamed + unowned and unreferenced from any
+/// world / interface / function, so `LiveTypes` excludes them from
+/// embedded component metadata.
+/// Constructed only by [`desugar_map_aliases`]; the
+/// `LiftPlanBuilder` Map arm relies on the invariant that every
+/// reachable `Map(K, V)` typedef has a registered entry, so we do
+/// not expose a public empty-constructor (`Default`) escape hatch.
+#[derive(Clone, Debug)]
+pub(crate) struct MapAliases {
+    map_to_tuple: HashMap<TypeId, TypeId>,
+}
+
+impl MapAliases {
+    /// Synthetic tuple TypeId for a `Map(K, V)`. Panics if the
+    /// caller skipped [`desugar_map_aliases`] for this resolve —
+    /// the invariant is built-time and cheaper to enforce here
+    /// than at every call site.
+    fn tuple_for(&self, map_id: TypeId) -> TypeId {
+        *self
+            .map_to_tuple
+            .get(&map_id)
+            .expect("desugar_map_aliases must run before classify for any Map typedef")
+    }
+}
+
+/// Allocate a synthetic `tuple<K, V>` typedef for every `Map(K, V)`
+/// in `resolve` and return the Map-id → tuple-id mapping. Call once
+/// per resolve before classify.
+pub(crate) fn desugar_map_aliases(resolve: &mut Resolve) -> MapAliases {
+    let map_pairs: Vec<(TypeId, Type, Type)> = resolve
+        .types
+        .iter()
+        .filter_map(|(id, td)| match &td.kind {
+            TypeDefKind::Map(k, v) => Some((id, *k, *v)),
+            _ => None,
+        })
+        .collect();
+
+    let mut aliases = MapAliases {
+        map_to_tuple: HashMap::new(),
+    };
+    for (map_id, k, v) in map_pairs {
+        let tuple_id = resolve.types.alloc(TypeDef {
+            name: None,
+            kind: TypeDefKind::Tuple(Tuple { types: vec![k, v] }),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        aliases.map_to_tuple.insert(map_id, tuple_id);
+    }
+    aliases
+}
+
 // ─── Lift plan builder ────────────────────────────────────────────
 
 /// Allocates cells + plan-relative flat-slot positions while walking
 /// a WIT type. Children-before-parent recursion, so the parent cell
 /// is immutable as soon as it lands in `cells`.
-pub(super) struct LiftPlanBuilder {
+pub(super) struct LiftPlanBuilder<'a> {
     cells: Vec<Cell>,
     next_flat_slot: u32,
     /// Per-flat-slot joined wasm type for widening inside
@@ -402,10 +477,14 @@ pub(super) struct LiftPlanBuilder {
     arm_guard_stack: Vec<ArmGuard>,
     /// First error hit during the walk.
     error: Option<anyhow::Error>,
+    /// `map<K, V>` → synthetic `tuple<K, V>` typedef ids. Looked up
+    /// in `push` when a Map kind appears; the build must have run
+    /// `desugar_map_aliases` first.
+    map_aliases: &'a MapAliases,
 }
 
-impl LiftPlanBuilder {
-    pub(super) fn new() -> Self {
+impl<'a> LiftPlanBuilder<'a> {
+    pub(super) fn new(map_aliases: &'a MapAliases) -> Self {
         Self {
             cells: Vec::new(),
             slot_widening: Vec::new(),
@@ -413,6 +492,7 @@ impl LiftPlanBuilder {
             next_list_idx: 0,
             arm_guard_stack: Vec::new(),
             error: None,
+            map_aliases,
         }
     }
 
@@ -522,8 +602,15 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::Unknown => {
                     unreachable!("tier-2 lift: unresolved `Unknown` typedef")
                 }
-                wit_parser::TypeDefKind::FixedLengthList(_, _)
-                | wit_parser::TypeDefKind::Map(_, _) => {
+                wit_parser::TypeDefKind::Map(_, _) => {
+                    // Canon-ABI: `map<K, V>` ≡ `list<tuple<K, V>>` at the
+                    // wire. Route through the existing list-of-tuple path
+                    // using the synthetic tuple alias registered by
+                    // `desugar_map_aliases`.
+                    let tuple_id = self.map_aliases.tuple_for(*id);
+                    self.push_list_of(&Type::Id(tuple_id), resolve, names)
+                }
+                wit_parser::TypeDefKind::FixedLengthList(_, _) => {
                     todo!(
                         "tier-2 lift: unsupported TypeDefKind {:?}",
                         &resolve.types[*id].kind
@@ -829,7 +916,7 @@ impl LiftPlanBuilder {
         self.next_list_idx += 1;
         let ptr_slot = self.bump_flat_slot();
         let len_slot = self.bump_flat_slot();
-        let element_plan = match LiftPlan::for_type(elem, resolve, names) {
+        let element_plan = match LiftPlan::for_type(elem, resolve, names, self.map_aliases) {
             Ok(plan) => plan,
             Err(err) => {
                 self.record_error(err);

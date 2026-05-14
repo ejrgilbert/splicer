@@ -13,7 +13,7 @@ use super::super::blob::NameInterner;
 use super::super::cells::CellLayout;
 use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::super::{FuncClassified, FuncShape};
-use super::plan::{ArmGuard, Cell, HandleKind, LiftPlan};
+use super::plan::{desugar_map_aliases, ArmGuard, Cell, HandleKind, LiftPlan, MapAliases};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::record_info::RecordRuntimeFill;
@@ -121,6 +121,22 @@ const TEST_WIT: &str = r#"
         f-list-of-list: func(xs: list<list<u32>>);
         record list-pair { items: list<string>, scores: list<u32> }
         f-list-of-record: func(xs: list<point>);
+        // `map<K, V>` is canonical-ABI shorthand for `list<tuple<K, V>>`.
+        // Lift desugars via a synthetic tuple typedef, then reuses the
+        // existing `Cell::ListOf` + `Cell::TupleOf` path.
+        f-map-string-u32: func(m: map<string, u32>);
+        record map-pair { primary: map<string, u32>, secondary: map<u32, string> }
+        f-record-with-map: func(rwm: map-pair);
+        f-result-map: func() -> map<string, u32>;
+        // Nested-list value still gated — map<K, list<list<T>>> must
+        // bail at plan-build with the same message as `list<list<T>>`.
+        f-map-of-list-of-list: func(m: map<string, list<list<u32>>>);
+        // Type-alias chain over Map: `desugar_map_aliases` must register
+        // the underlying Map typedef even when the function references
+        // it through an alias. Push then peels the alias and lands on
+        // the same Map typeid — alias map lookup succeeds.
+        type aliased-map = map<string, u32>;
+        f-aliased-map: func(m: aliased-map);
         // `list<variant>` is still gated — covers the bail path that
         // the deleted `list_of_compound_element_bails_at_plan_build`
         // generic-test used to assert. New still-gated kinds drop in
@@ -148,25 +164,48 @@ const TEST_WIT: &str = r#"
     }
 "#;
 
-fn test_resolve() -> Resolve {
-    let mut r = Resolve::new();
-    r.push_str("test.wit", TEST_WIT)
+/// Test resolve bundled with its `MapAliases` sidecar. Fields are
+/// private + accessed via [`Self::resolve`] / [`Self::aliases`] so
+/// call sites can't drift into reading the bare `Resolve` without
+/// also having the matching alias table (a `Deref`-to-`Resolve`
+/// earlier draft compounded with two factory flavors and made it
+/// easy to forget which sites needed the aliases).
+pub(super) struct TestResolve {
+    inner: Resolve,
+    aliases: MapAliases,
+}
+
+impl TestResolve {
+    fn resolve(&self) -> &Resolve {
+        &self.inner
+    }
+
+    fn aliases(&self) -> &MapAliases {
+        &self.aliases
+    }
+}
+
+fn test_resolve() -> TestResolve {
+    let mut inner = Resolve::new();
+    inner
+        .push_str("test.wit", TEST_WIT)
         .expect("test WIT must parse");
-    r
+    let aliases = desugar_map_aliases(&mut inner);
+    TestResolve { inner, aliases }
 }
 
 /// Pair the standard test resolve with a fresh interner.
-fn setup() -> (Resolve, NameInterner) {
+fn setup() -> (TestResolve, NameInterner) {
     (test_resolve(), NameInterner::new())
 }
 
-fn iface_id(resolve: &Resolve) -> wit_parser::InterfaceId {
-    super::super::test_utils::iface_by_unversioned_qname(resolve, "test:lift/t")
+fn iface_id(resolve: &TestResolve) -> wit_parser::InterfaceId {
+    super::super::test_utils::iface_by_unversioned_qname(resolve.resolve(), "test:lift/t")
 }
 
-fn type_named(resolve: &Resolve, name: &str) -> Type {
+fn type_named(resolve: &TestResolve, name: &str) -> Type {
     Type::Id(
-        resolve.interfaces[iface_id(resolve)]
+        resolve.resolve().interfaces[iface_id(resolve)]
             .types
             .get(name)
             .copied()
@@ -174,8 +213,8 @@ fn type_named(resolve: &Resolve, name: &str) -> Type {
     )
 }
 
-fn func_named<'a>(resolve: &'a Resolve, name: &str) -> &'a WitFunction {
-    resolve.interfaces[iface_id(resolve)]
+fn func_named<'a>(resolve: &'a TestResolve, name: &str) -> &'a WitFunction {
+    resolve.resolve().interfaces[iface_id(resolve)]
         .functions
         .get(name)
         .unwrap_or_else(|| panic!("function `{name}` not found in fixture"))
@@ -185,16 +224,17 @@ fn func_named<'a>(resolve: &'a Resolve, name: &str) -> &'a WitFunction {
 
 /// Thin alias for `LiftPlan::for_type`. Unwraps; negative cases call
 /// `LiftPlan::for_type` directly.
-fn plan_for(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
-    LiftPlan::for_type(ty, resolve, names).expect("test fixture must classify")
+fn plan_for(ty: &Type, resolve: &TestResolve, names: &mut NameInterner) -> LiftPlan {
+    LiftPlan::for_type(ty, resolve.resolve(), names, resolve.aliases())
+        .expect("test fixture must classify")
 }
 
-fn plan_for_named(name: &str, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
+fn plan_for_named(name: &str, resolve: &TestResolve, names: &mut NameInterner) -> LiftPlan {
     plan_for(&type_named(resolve, name), resolve, names)
 }
 
 /// Plan for the first param of `func_name` in the fixture WIT.
-fn plan_for_param(func_name: &str, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
+fn plan_for_param(func_name: &str, resolve: &TestResolve, names: &mut NameInterner) -> LiftPlan {
     plan_for(&func_named(resolve, func_name).params[0].ty, resolve, names)
 }
 
@@ -271,7 +311,7 @@ fn dummy_sig() -> WasmSignature {
     }
 }
 
-fn make_param(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> ParamLift {
+fn make_param(ty: &Type, resolve: &TestResolve, names: &mut NameInterner) -> ParamLift {
     ParamLift {
         name: BlobSlice::EMPTY,
         plan: plan_for(ty, resolve, names),
@@ -281,7 +321,7 @@ fn make_param(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> ParamLi
 /// Build a `FuncClassified` with the given WIT param types; other
 /// fields are dummies (side-table builders only read params/result).
 fn func_with_params(
-    resolve: &Resolve,
+    resolve: &TestResolve,
     names: &mut NameInterner,
     param_names: &[&str],
 ) -> FuncClassified {
@@ -718,7 +758,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
 
 #[test]
 fn primitives_assign_one_cell_one_slot() {
-    let r = Resolve::new();
+    let r = test_resolve();
     let mut names = NameInterner::new();
     let cases: &[(Type, Cell)] = &[
         (Type::Bool, Cell::Bool { flat_slot: 0 }),
@@ -738,7 +778,7 @@ fn primitives_assign_one_cell_one_slot() {
 #[test]
 fn string_takes_two_flat_slots() {
     let mut names = NameInterner::new();
-    let plan = plan_for(&Type::String, &Resolve::new(), &mut names);
+    let plan = plan_for(&Type::String, &test_resolve(), &mut names);
     assert_eq!(
         plan.cells,
         vec![Cell::Text {
@@ -766,7 +806,7 @@ fn list_u8_classifies_as_bytes_cell() {
 
 #[test]
 fn char_assigns_one_cell_one_slot() {
-    let r = Resolve::new();
+    let r = test_resolve();
     let mut names = NameInterner::new();
     let plan = plan_for(&Type::Char, &r, &mut names);
     assert_eq!(plan.cells, vec![Cell::Char { flat_slot: 0 }]);
@@ -1245,7 +1285,7 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
     use super::sidetable::record_info::RecordSlotSource;
     use super::sidetable::variant_info::VariantSlotSource;
     let (r, mut names) = setup();
-    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
+    let (_, record_tuple_layout) = synth_record_info_layouts(r.resolve());
     let record_tuple_size = record_tuple_layout.size;
     for fn_name in [
         "f-list-tuple-u32-string",
@@ -1438,7 +1478,7 @@ fn walk_element_plan_pins_mixed_flags_scratch_bytes_literal() {
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-tuple-mixed-flags", &r, &mut names);
     let elem_plan = list_element_plan(&plan, 0);
-    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
+    let (_, record_tuple_layout) = synth_record_info_layouts(r.resolve());
     let (side, counts) = super::emit::walk_element_plan(elem_plan, record_tuple_layout.size);
     let flags_offsets: Vec<(u32, u32)> = side
         .iter()
@@ -1476,7 +1516,7 @@ fn walk_element_plan_pins_mixed_record_tuples_bytes_literal() {
     // expected values from the same per-cell formula) wouldn't.
     use super::sidetable::record_info::RecordSlotSource;
     let (r, mut names) = setup();
-    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
+    let (_, record_tuple_layout) = synth_record_info_layouts(r.resolve());
     let tuple_size = record_tuple_layout.size;
     let plan = plan_for_param("f-list-tuple-record-mixed", &r, &mut names);
     let elem_plan = list_element_plan(&plan, 0);
@@ -1509,7 +1549,7 @@ fn walk_element_plan_zero_counts_for_scalar_only() {
     // Scalar-only element plans must produce zero-counts so the
     // per-list buffer allocations stay gated off.
     let (r, mut names) = setup();
-    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
+    let (_, record_tuple_layout) = synth_record_info_layouts(r.resolve());
     for fn_name in ["f-list-u32", "f-list-string"] {
         let plan = plan_for_param(fn_name, &r, &mut names);
         let elem_plan = list_element_plan(&plan, 0);
@@ -1556,13 +1596,114 @@ fn nested_list_bails_at_plan_build() {
     let (r, mut names) = setup();
     let err = LiftPlan::for_type(
         &func_named(&r, "f-list-of-list").params[0].ty,
-        &r,
+        r.resolve(),
         &mut names,
+        r.aliases(),
     )
     .expect_err("nested list must bail at plan build");
     let msg = err.to_string();
     assert!(msg.contains("`list<T>` element type"));
     assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+}
+
+#[test]
+fn map_classifies_as_list_of_tuple() {
+    // `map<string, u32>` desugars to `list<tuple<string, u32>>`.
+    // Element plan: Text(slots 0..2) + IntegerZeroExt(slot 2)
+    // + TupleOf(children=[0, 1]). Outer: ListOf(ptr/len). Same
+    // shape as `f-list-tuple-u32-string` mod K/V order.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-map-string-u32", &r, &mut names);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf at cell 0, got {:?}", plan.cells[0]);
+    };
+    assert_eq!(element_plan.cells.len(), 3);
+    assert!(matches!(
+        element_plan.cells[0],
+        Cell::Text {
+            ptr_slot: 0,
+            len_slot: 1
+        }
+    ));
+    assert!(matches!(
+        element_plan.cells[1],
+        Cell::IntegerZeroExt { flat_slot: 2 }
+    ));
+    let Cell::TupleOf { children } = &element_plan.cells[2] else {
+        panic!(
+            "expected TupleOf at element-plan cell 2, got {:?}",
+            element_plan.cells[2]
+        );
+    };
+    assert_eq!(children.as_slice(), &[0, 1]);
+    // Outer flat: (ptr, len) — same as `list<T>`.
+    assert_eq!(plan.flat_slot_count, 2);
+}
+
+#[test]
+fn map_in_record_classifies_with_inner_list() {
+    // record map-pair { primary: map<string, u32>, secondary: map<u32, string> }
+    // Each field expands to its own ListOf with an internal TupleOf.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-record-with-map", &r, &mut names);
+    assert!(matches!(plan.cells[0], Cell::ListOf { .. }));
+    assert!(matches!(plan.cells[1], Cell::ListOf { .. }));
+    let Cell::RecordOf { fields, .. } = &plan.cells[2] else {
+        panic!("expected RecordOf at cell 2, got {:?}", plan.cells[2]);
+    };
+    assert_eq!(
+        fields.iter().map(|(_, idx)| *idx).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn map_with_nested_list_value_bails() {
+    // `map<string, list<list<u32>>>` desugars to
+    // `list<tuple<string, list<list<u32>>>>` — the nested-list value
+    // hits the same gate as `list<list<u32>>` (still tier-3). Pins
+    // that desugaring doesn't accidentally escape the gate.
+    let (r, mut names) = setup();
+    let err = LiftPlan::for_type(
+        &func_named(&r, "f-map-of-list-of-list").params[0].ty,
+        r.resolve(),
+        &mut names,
+        r.aliases(),
+    )
+    .expect_err("map<_, list<list<T>>> must bail at plan build");
+    let msg = err.to_string();
+    // The specific gate that should fire — pins this against an
+    // unrelated bail (e.g., flat-slot budget) silently passing the
+    // assertion.
+    assert!(
+        msg.contains("`list<T>` element type"),
+        "expected list-element gate message, got: {msg}"
+    );
+    assert!(
+        msg.contains("Still gated: nested list."),
+        "expected nested-list gate phrase to identify the specific bail, got: {msg}"
+    );
+}
+
+#[test]
+fn map_through_type_alias_classifies() {
+    // `type aliased-map = map<string, u32>;` + `func(m: aliased-map)`:
+    // `push` peels the alias via `TypeDefKind::Type(t)` and lands on
+    // the underlying Map typeid, which `desugar_map_aliases` has
+    // already registered. Pins that aliasing doesn't bypass the
+    // alias-map registration.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-aliased-map", &r, &mut names);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!(
+            "aliased map must classify as ListOf at cell 0, got {:?}",
+            plan.cells[0]
+        );
+    };
+    assert!(matches!(
+        element_plan.cells.last(),
+        Some(Cell::TupleOf { .. })
+    ));
 }
 
 #[test]
@@ -2236,8 +2377,13 @@ fn classify_func_params_yields_plan_relative_slots() {
     // absolute wasm-local position (3, 4) in the wrapper. Pins
     // the local-base-independence invariant.
     let (r, mut names) = setup();
-    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names)
-        .expect("f-mixed params must classify");
+    let params = classify_func_params(
+        r.resolve(),
+        func_named(&r, "f-mixed"),
+        &mut names,
+        r.aliases(),
+    )
+    .expect("f-mixed params must classify");
     assert_eq!(
         params[2].plan.cells,
         vec![Cell::Bytes {
@@ -2261,8 +2407,13 @@ fn param_plan_flat_slot_counts_compose_for_emit_local_base() {
     // it passes to `emit_lift_plan`. f-mixed(a: bool, s: string,
     // b: list<u8>, x: s64) → cumulative starts 0, 1, 3, 5; total 6.
     let (r, mut names) = setup();
-    let params = classify_func_params(&r, func_named(&r, "f-mixed"), &mut names)
-        .expect("f-mixed params must classify");
+    let params = classify_func_params(
+        r.resolve(),
+        func_named(&r, "f-mixed"),
+        &mut names,
+        r.aliases(),
+    )
+    .expect("f-mixed params must classify");
     let starts: Vec<u32> = params
         .iter()
         .scan(0u32, |acc, p| {
@@ -2397,7 +2548,7 @@ fn build_record_info_maps_assigns_per_param_counts_and_cell_idx() {
         func_with_params(&r, &mut names, &["point"]),
         func_with_params(&r, &mut names, &["point", "nested"]),
     ];
-    let (_, tuple) = synth_record_info_layouts(&r);
+    let (_, tuple) = synth_record_info_layouts(r.resolve());
     let maps = build_record_info_maps(&funcs, &tuple, 0);
 
     // Per-(fn, param) counts. New cases drop in here.
@@ -2567,6 +2718,12 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         ),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
+        // `map<K, V>` desugars to `list<tuple<K, V>>`; this pins that
+        // the emit path inherited from list-of-tuple stays wired when
+        // the element type comes from a synthetic tuple typedef
+        // (alloced by `desugar_map_aliases`, not an original WIT type).
+        plan_for_param("f-map-string-u32", &r, &mut names),
+        plan_for_named("map-pair", &r, &mut names),
         // Lists nested in joined arms — guards on the bump pre-pass
         // and on `emit_list_of_arm` body. Last entry stacks to depth 2.
         plan_for_param("f-result-list-list", &r, &mut names),
@@ -2574,7 +2731,7 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-result-of-variant-with-list", &r, &mut names),
     ];
     for plan in &plans {
-        validate_emit_lift_plan(plan, &r);
+        validate_emit_lift_plan(plan, r.resolve());
     }
 }
 
@@ -2584,14 +2741,14 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
 fn list_of_u32_emits_valid_wasm() {
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-u32", &r, &mut names);
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
 fn list_of_string_emits_valid_wasm() {
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-string", &r, &mut names);
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
@@ -2603,7 +2760,7 @@ fn list_of_option_u32_emits_valid_wasm() {
         &r,
         &mut names,
     );
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
@@ -2615,7 +2772,7 @@ fn list_of_result_u32_string_emits_valid_wasm() {
         &r,
         &mut names,
     );
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
@@ -2625,7 +2782,7 @@ fn list_of_tuple_u32_string_emits_valid_wasm() {
     // slot staging + the `PerIteration` tuple-of branch.
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-tuple-u32-string", &r, &mut names);
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
@@ -2635,7 +2792,7 @@ fn list_of_tuple_of_tuple_emits_valid_wasm() {
     // tuple-idx buffer. Pins the multi-tuple offset accounting.
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-tuple-of-tuple", &r, &mut names);
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
@@ -2645,7 +2802,7 @@ fn list_of_char_emits_valid_wasm() {
     // and the `Prestaged` CellSideData::Char branch.
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-char", &r, &mut names);
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
@@ -2666,6 +2823,10 @@ fn list_of_enum_emits_valid_wasm() {
         "#,
     )
     .unwrap();
+    // Empty map-alias map is produced via the standard desugar pass
+    // (no Map typedefs in this fixture) — keeps `MapAliases` un-
+    // constructible without going through the canonical route.
+    let aliases = desugar_map_aliases(&mut r);
     let iface = super::super::test_utils::iface_by_unversioned_qname(&r, "test:list-enum/t");
     let func_id = r.interfaces[iface]
         .functions
@@ -2675,8 +2836,8 @@ fn list_of_enum_emits_valid_wasm() {
         .clone();
     let func = &r.interfaces[iface].functions[&func_id];
     let mut names = NameInterner::new();
-    let plan =
-        LiftPlan::for_type(&func.params[0].ty, &r, &mut names).expect("list<color> must classify");
+    let plan = LiftPlan::for_type(&func.params[0].ty, &r, &mut names, &aliases)
+        .expect("list<color> must classify");
     validate_emit_lift_plan(&plan, &r);
 }
 
@@ -2687,7 +2848,7 @@ fn list_result_classifies_as_compound() {
     // `list<T>` plan (validate-emit coverage already pins emit shape).
     let (r, mut names) = setup();
     let func = func_named(&r, "f-result-list-u32");
-    let result_lift = classify_result_lift(&r, func, true, &mut names)
+    let result_lift = classify_result_lift(r.resolve(), func, true, &mut names, r.aliases())
         .expect("list<u32> result must classify")
         .expect("list<u32> result must produce a ResultLift");
     let compound = result_lift
@@ -2701,6 +2862,32 @@ fn list_result_classifies_as_compound() {
 }
 
 #[test]
+fn map_result_classifies_as_compound() {
+    // `map<K, V>` results route through retptr + Compound; the
+    // desugared element plan exposes the same `Cell::ListOf` shape
+    // as a `list<tuple<K, V>>` result. Pins `is_compound_result`
+    // accepting the Map kind.
+    let (r, mut names) = setup();
+    let func = func_named(&r, "f-result-map");
+    let result_lift = classify_result_lift(r.resolve(), func, true, &mut names, r.aliases())
+        .expect("map<string,u32> result must classify")
+        .expect("map<string,u32> result must produce a ResultLift");
+    let compound = result_lift
+        .compound()
+        .expect("map<string,u32> result must route through Compound");
+    let Cell::ListOf { element_plan, .. } = &compound.plan.cells[0] else {
+        panic!(
+            "Compound map-result root must be ListOf, got {:?}",
+            compound.plan.cells[0]
+        );
+    };
+    assert!(matches!(
+        element_plan.cells.last(),
+        Some(Cell::TupleOf { .. })
+    ));
+}
+
+#[test]
 fn list_char_result_classifies_as_compound() {
     // `list<char>` results take the same Compound route as `list<u32>`;
     // the result-side emit shares `emit_list_of_arm` with params, so
@@ -2710,7 +2897,7 @@ fn list_char_result_classifies_as_compound() {
     let r = test_resolve();
     let mut names = NameInterner::new();
     let func = func_named(&r, "f-result-list-char");
-    let result_lift = classify_result_lift(&r, func, true, &mut names)
+    let result_lift = classify_result_lift(r.resolve(), func, true, &mut names, r.aliases())
         .expect("list<char> result must classify")
         .expect("list<char> result must produce a ResultLift");
     let compound = result_lift
@@ -2729,5 +2916,5 @@ fn list_char_result_classifies_as_compound() {
 fn record_with_list_field_emits_valid_wasm() {
     let (r, mut names) = setup();
     let plan = plan_for_named("list-pair", &r, &mut names);
-    validate_emit_lift_plan(&plan, &r);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
