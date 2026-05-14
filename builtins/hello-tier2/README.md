@@ -21,21 +21,11 @@ type-name in the type label, and opaque handles
 (`resource` / `stream` / `future` / `error-context`) print as
 `kind(type)#id`.
 
-## Config keys
+Configurable keys, defaults, and the in-YAML scalar form live in the
+embedded `manifest.toml`. Run:
 
-Read at first call via `splicer:builtin-config/get` and cached for
-the rest of the wasm-instance lifetime.
-
-| Key        | Type   | Default       | Description                                  |
-|------------|--------|---------------|----------------------------------------------|
-| `greeting` | string | `hello-tier2` | Replaces the bracketed prefix in each line.  |
-
-Example splice config:
-
-```yaml
-inject:
-  - builtin:
-      name: hello-tier2
-      config:
-        greeting: "typed-logger"
+```sh
+splicer builtin hello-tier2
 ```
+
+to see them.

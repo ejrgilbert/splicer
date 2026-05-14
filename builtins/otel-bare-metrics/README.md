@@ -16,32 +16,11 @@ quiet sits unflushed until the next call. Tier-1 has no shutdown
 hook, so the unflushed tail (≤ one flush window per `(iface, fn)`)
 is dropped at process exit.
 
-## Config keys
+Configurable keys, defaults, and the in-YAML scalar form live in the
+embedded `manifest.toml`. Run:
 
-Read at first call via `splicer:builtin-config/get` and cached for
-the rest of the wasm-instance lifetime. Parse failures fall back to
-the default silently (tier-1 has no logging surface).
-
-| Key                   | Type | Default | Description                              |
-|-----------------------|------|---------|------------------------------------------|
-| `buffer`              | u32  | 1       | Samples per window before flushing.      |
-| `flush_after_seconds` | f64  | 10.0    | Wall-clock staleness flush trigger.      |
-
-**`buffer`** accumulates that many samples per `(iface, fn)` before
-flushing. `1` reproduces always-export-per-call. Clamped to a minimum
-of 1.
-
-**`flush_after_seconds`** triggers a flush when
-`now - window_start >= flush_after_seconds`. Effectively moot when
-`buffer == 1`.
-
-Example splice config:
-
-```yaml
-inject:
-  - builtin:
-      name: otel-bare-metrics
-      config:
-        buffer: 100
-        flush_after_seconds: 5.0
+```sh
+splicer builtin otel-bare-metrics
 ```
+
+to see them.

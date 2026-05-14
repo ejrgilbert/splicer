@@ -12,28 +12,14 @@ captured timestamps and `Ok` status. Pending spans are tracked per
 `(interface, function)` so concurrent or recursive invocations of the
 same name don't clobber each other.
 
-## Config keys
+Configurable keys, defaults, and the in-YAML scalar form live in the
+embedded `manifest.toml`. Run:
 
-Read at first call via `splicer:builtin-config/get` and cached for
-the rest of the wasm-instance lifetime. Unrecognized values fall back
-to the default silently (tier-1 has no logging surface).
-
-| Key         | Type   | Default    | Description       |
-|-------------|--------|------------|-------------------|
-| `span_kind` | string | `internal` | OTel span kind.   |
-
-**`span_kind`** accepts `internal` / `server` / `client` /
-`producer` / `consumer` (case-insensitive). Set it to `server` when
-wrapping incoming-request handlers (e.g. `wasi:http/handler@0.3.0`)
-so trace UIs render the spans as server-side request handling
-instead of an internal hop.
-
-Example splice config:
-
-```yaml
-inject:
-  - builtin:
-      name: otel-bare-spans
-      config:
-        span_kind: server
+```sh
+splicer builtin otel-bare-spans
 ```
+
+to see them. Tip: set `span_kind: server` when wrapping
+incoming-request handlers (e.g. `wasi:http/handler@0.3.0`) so trace
+UIs render the spans as server-side request handling instead of an
+internal hop.
