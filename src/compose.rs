@@ -858,9 +858,22 @@ mod tests {
         let (graph, node_paths) = build_graph_from_components(&comps)?;
 
         // Two rules, same mdl.name ("tracing"), different target
-        // interfaces. Fake adapter_path per rule — generate_wac only
-        // records the strings into wac_deps, never reads the file.
+        // interfaces. The adapter wasm is read for resource-bearing
+        // imports during planning, so each path must point at a real
+        // (minimal) component.
         let mdl_path = "/tmp/tracing.wasm".to_string();
+        let write_minimal = |name: &str| -> String {
+            let bytes = wat::parse_str("(component)").expect("compile minimal component");
+            let path = std::env::temp_dir().join(format!(
+                "splicer-test-{}-{}.wasm",
+                name,
+                std::process::id()
+            ));
+            std::fs::write(&path, bytes).expect("write tempfile");
+            path.to_string_lossy().into_owned()
+        };
+        let adapter_a_path = write_minimal("adapter-a");
+        let adapter_b_path = write_minimal("adapter-b");
         let mk_rule = |iface: &str, provider: &str, adapter_path: &str| SpliceRule::Before {
             interface: iface.to_string(),
             provider_name: Some(provider.to_string()),
@@ -881,8 +894,8 @@ mod tests {
             }],
         };
         let rules = vec![
-            mk_rule("my:providers/a@0.1.0", "provider-a", "/tmp/adapter-a.wasm"),
-            mk_rule("my:providers/b@0.1.0", "provider-b", "/tmp/adapter-b.wasm"),
+            mk_rule("my:providers/a@0.1.0", "provider-a", &adapter_a_path),
+            mk_rule("my:providers/b@0.1.0", "provider-b", &adapter_b_path),
         ];
 
         let out = crate::wac::generate_wac(
@@ -925,11 +938,11 @@ mod tests {
         };
         assert_eq!(
             path_for("my:tracing-adapter-providers-a-v0-v1-v0").as_deref(),
-            Some("/tmp/adapter-a.wasm"),
+            Some(adapter_a_path.as_str()),
         );
         assert_eq!(
             path_for("my:tracing-adapter-providers-b-v0-v1-v0").as_deref(),
-            Some("/tmp/adapter-b.wasm"),
+            Some(adapter_b_path.as_str()),
         );
         assert_eq!(path_for("my:tracing").as_deref(), Some(mdl_path.as_str()));
 
