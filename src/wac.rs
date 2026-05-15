@@ -698,12 +698,14 @@ struct SpliceCtx<'a> {
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: Vec<GeneratedAdapter>,
-    /// `(target_split_path, target_interface)` → has at least one
-    /// sync (non-async) function declared on that interface.
-    target_has_sync: HashMap<(String, String), bool>,
-    /// `middleware_path` → qualified name of the first non-`wasi:*`
-    /// peer import declared `async func`, or `None` if no offender.
-    middleware_first_async_peer: HashMap<String, Option<String>>,
+    /// Decode-cache: `(target_split_path, target_interface)` → has
+    /// at least one sync (non-async) function declared on that
+    /// interface.
+    target_has_sync_cache: HashMap<(String, String), bool>,
+    /// Decode-cache: `middleware_path` → qualified name of the first
+    /// non-`wasi:*` peer import declared `async func`, or `None` if
+    /// no offender.
+    middleware_first_async_peer_cache: HashMap<String, Option<String>>,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
@@ -1392,11 +1394,22 @@ fn preflight_sync_target_async_middleware(
     middleware_path: &str,
     target_interface: &str,
     target_split_path: &str,
+    accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<()> {
-    if !target_interface_has_sync_func(target_interface, target_split_path) {
+    let target_key = (target_split_path.to_string(), target_interface.to_string());
+    let has_sync = *accs
+        .target_has_sync_cache
+        .entry(target_key)
+        .or_insert_with(|| target_interface_has_sync_func(target_interface, target_split_path));
+    if !has_sync {
         return Ok(());
     }
-    let Some(offender) = first_async_peer_import(middleware_path) else {
+    let offender = accs
+        .middleware_first_async_peer_cache
+        .entry(middleware_path.to_string())
+        .or_insert_with(|| first_async_peer_import(middleware_path))
+        .clone();
+    let Some(offender) = offender else {
         return Ok(());
     };
     anyhow::bail!(
