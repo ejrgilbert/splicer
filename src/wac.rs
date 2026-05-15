@@ -88,6 +88,9 @@ pub struct WacOutput {
     /// disk while resolving the splice rules. Empty when no rule
     /// matched a tier-1 type-erased middleware.
     pub generated_adapters: Vec<GeneratedAdapter>,
+    /// True iff at least one rule produced a full match. `false` when
+    /// no rules were supplied or every rule was a no-op.
+    pub any_rule_matched: bool,
 }
 
 /// One `let` declaration in the rendered WAC. Each entity is a node
@@ -819,6 +822,7 @@ pub fn generate_wac(
     // Apply the rules in order of their declaration in the configuration.
     // This enforces an ordering semantic for the rule application.
     let mut diagnostics: Vec<ContractResult> = vec![];
+    let mut any_rule_matched = false;
     for (rule_idx, rule) in rules.iter().enumerate() {
         let mut any_interface_matched = false;
         let mut any_full_match = false;
@@ -830,6 +834,7 @@ pub fn generate_wac(
             diagnostics.extend(between.contract_results);
             diagnostics.extend(before.contract_results);
         }
+        any_rule_matched |= any_full_match;
         if !any_full_match {
             let iface = rule_interface(rule);
             if !any_interface_matched {
@@ -917,6 +922,7 @@ pub fn generate_wac(
         wac_deps: args,
         diagnostics,
         generated_adapters: accs.generated_adapters,
+        any_rule_matched,
     })
 }
 
