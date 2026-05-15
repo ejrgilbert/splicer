@@ -43,18 +43,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
-
       - name: Install build-time tooling
         # wkg + wasm-tools are needed by the Makefile pattern rule (wkg wit
-        # fetch + wasm-tools component new). Push doesn't use wkg.
-        run: |
-          cargo binstall -y "wkg@${{ env.WKG_VERSION }}"
-          cargo binstall -y wasm-tools
+        # fetch + wasm-tools component new). taiki-e/install-action uses
+        # prebuilt binaries where available and caches results on the
+        # runner's tool cache automatically.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wkg@${{ env.WKG_VERSION }},wasm-tools
 
       - name: Add wasm32-wasip1 target
         run: rustup target add wasm32-wasip1
+
+      - name: Cache cargo + builtin target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: builtins/${{ inputs.builtin }}
+          key: ${{ inputs.builtin }}
+
+      - name: Cache wkg fetch deps
+        uses: actions/cache@v4
+        with:
+          path: builtins/${{ inputs.builtin }}/wit/deps
+          key: wkg-deps-${{ inputs.builtin }}-${{ hashFiles(format('builtins/{0}/wkg.lock', inputs.builtin)) }}
+          restore-keys: |
+            wkg-deps-${{ inputs.builtin }}-
 
       - name: Setup oras
         uses: oras-project/setup-oras@v1

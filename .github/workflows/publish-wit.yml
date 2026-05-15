@@ -37,11 +37,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install cargo-binstall
-        uses: cargo-bins/cargo-binstall@main
-
       - name: Install wkg
-        run: cargo binstall -y "wkg@${{ env.WKG_VERSION }}"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wkg@${{ env.WKG_VERSION }}
 
       - name: Extract version from world.wit
         id: version
