@@ -253,6 +253,37 @@ fn stage_chain1_fixture(dir: &Path) {
     .unwrap();
 }
 
+const CHAINED_WASM_REL: &str = "tests/component-interposition/fixtures/chained.wasm";
+const ADDER_MDL_A_REL: &str = "tests/component-interposition/fixtures/adder_mdl_a.comp.wasm";
+
+fn typed_mismatch_fixture_present() -> bool {
+    let m = manifest_dir();
+    m.join(CHAINED_WASM_REL).exists() && m.join(ADDER_MDL_A_REL).exists()
+}
+
+/// Stage a yaml + wasm pair that splices an adder-interface middleware
+/// onto a wasi:http edge. Rules match (so the zero-match check passes),
+/// but `wac compose` fails because the middleware doesn't export the
+/// target interface.
+fn stage_typed_mismatch_fixture(dir: &Path) {
+    let m = manifest_dir();
+    std::fs::copy(m.join(CHAINED_WASM_REL), dir.join("chained.wasm")).unwrap();
+    std::fs::copy(m.join(ADDER_MDL_A_REL), dir.join("adder_mdl_a.comp.wasm")).unwrap();
+    let yaml = r#"version: 1
+rules:
+  - between:
+      interface: "wasi:http/handler@0.3.0-rc-2026-01-06"
+      inner:
+        name: srv-b
+      outer:
+        name: srv-a
+    inject:
+      - name: mismatched
+        path: "./adder_mdl_a.comp.wasm"
+"#;
+    std::fs::write(dir.join("mismatch.yaml"), yaml).unwrap();
+}
+
 /// When in-process compose fails, the error message must:
 /// - report that compose failed,
 /// - name the path where the WAC was preserved,
@@ -260,20 +291,24 @@ fn stage_chain1_fixture(dir: &Path) {
 /// - include a `wac compose ...` repro command the user can run.
 #[test]
 fn splice_compose_failure_preserves_wac_and_prints_repro() {
-    if !chain1_fixture_present() {
-        eprintln!("skipping: chain1 fixture not checked out");
+    if !typed_mismatch_fixture_present() {
+        eprintln!("skipping: typed-mismatch fixture not checked out");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    stage_chain1_fixture(dir.path());
+    stage_typed_mismatch_fixture(dir.path());
 
     let out = splicer_in(dir.path())
         .arg("splice")
-        .arg("chain1.yaml")
-        .arg("chain1.wasm")
+        .arg("mismatch.yaml")
+        .arg("chained.wasm")
+        .arg("--skip-type-check")
         .output()
         .unwrap();
-    assert!(!out.status.success(), "chain1 should fail at compose time");
+    assert!(
+        !out.status.success(),
+        "typed-mismatched splice should fail at compose time"
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -327,17 +362,18 @@ fn splice_failure_does_not_pollute_cwd() {
 /// hit. We get `output.wac` + `splits/` and a printed shell command.
 #[test]
 fn splice_plan_works_even_when_compose_would_fail() {
-    if !chain1_fixture_present() {
-        eprintln!("skipping: chain1 fixture not checked out");
+    if !typed_mismatch_fixture_present() {
+        eprintln!("skipping: typed-mismatch fixture not checked out");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    stage_chain1_fixture(dir.path());
+    stage_typed_mismatch_fixture(dir.path());
 
     let out = splicer_in(dir.path())
         .arg("splice")
-        .arg("chain1.yaml")
-        .arg("chain1.wasm")
+        .arg("mismatch.yaml")
+        .arg("chained.wasm")
+        .arg("--skip-type-check")
         .arg("--plan")
         .output()
         .unwrap();
