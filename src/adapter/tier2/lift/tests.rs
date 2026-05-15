@@ -119,6 +119,32 @@ const TEST_WIT: &str = r#"
         f-result-list-u32: func() -> list<u32>;
         f-result-list-char: func() -> list<char>;
         f-list-of-list: func(xs: list<list<u32>>);
+        // `list<list<T>>` per inner-T kind in the depth-2 nested-list
+        // scope (scalar / char / option / result / tuple / enum). Each
+        // exercises the inner element class through the nested
+        // `emit_list_of_arm` recursion.
+        f-list-of-list-string: func(xs: list<list<string>>);
+        f-list-of-list-char: func(xs: list<list<char>>);
+        f-list-of-list-option-u32: func(xs: list<list<option<u32>>>);
+        f-list-of-list-result-u32-string:
+            func(xs: list<list<result<u32, string>>>);
+        f-list-of-list-tuple-u32-u32: func(xs: list<list<tuple<u32, u32>>>);
+        f-list-of-list-color: func(xs: list<list<color>>);
+        // Nested-list at result position — retptr-loaded compound.
+        f-result-list-of-list-u32: func() -> list<list<u32>>;
+        // Depth-2 cap: a `list<…>` element-cell may only appear as
+        // the SOLE cell of its parent list's element plan. Wrapping
+        // a `list<T>` in option/tuple/record/variant/result inside
+        // another list violates the cap — emit's `nested_inner` lives
+        // on a single element-plan position and would panic without
+        // the gate. These fixtures pin the plan-build rejection.
+        f-list-option-list-u32: func(xs: list<option<list<u32>>>);
+        f-list-tuple-with-list-u32: func(xs: list<tuple<u32, list<u32>>>);
+        record list-field-record { ys: list<u32> }
+        f-list-record-with-list: func(xs: list<list-field-record>);
+        variant list-arm-variant { v(list<u32>), empty }
+        f-list-variant-list-arm: func(xs: list<list-arm-variant>);
+        f-list-result-with-list-ok: func(xs: list<result<list<u32>, u32>>);
         record list-pair { items: list<string>, scores: list<u32> }
         f-list-of-record: func(xs: list<point>);
         // `list<T, N>` (canon-ABI fixed-length list) flattens to
@@ -1616,20 +1642,92 @@ fn record_with_list_char_field_recurses_into_list() {
 }
 
 #[test]
-fn nested_list_bails_at_plan_build() {
-    // list<list<u32>>: nested lists aren't a supported element shape;
-    // plan-build surfaces the inner failure to the outer caller.
+fn nested_list_inner_with_option_pins_child_idx_class() {
+    // `list<list<option<u32>>>`: inner element plan = [disc, payload,
+    // Option]. The inner ListOf carries class `PrestagedNestedList`,
+    // its element plan's Option cell carries `PrestagedChildIdx` —
+    // gates inner-element wrapper-locals via `any_list_element_has_class`.
     let (r, mut names) = setup();
-    let err = LiftPlan::for_type(
+    let plan = plan_for_param("f-list-of-list-option-u32", &r, &mut names);
+    let [Cell::ListOf { element_plan, .. }] = plan.cells.as_slice() else {
+        panic!("expected one outer ListOf, got {:?}", plan.cells);
+    };
+    let [Cell::ListOf {
+        element_plan: inner_plan,
+        ..
+    }] = element_plan.cells.as_slice()
+    else {
+        panic!("expected one inner ListOf, got {:?}", element_plan.cells);
+    };
+    // Inner: IntegerZeroExt payload + Option parent (disc is a slot,
+    // not a cell — `push_option` only pushes one cell).
+    assert_eq!(inner_plan.cells.len(), 2);
+    assert!(matches!(inner_plan.cells[1], Cell::Option { .. }));
+    // Recursive gate-walker reaches the inner Option.
+    assert!(plan.any_list_element_has_class(super::plan::ListElementClass::PrestagedChildIdx));
+    assert!(plan.any_list_element_has_class(super::plan::ListElementClass::PrestagedNestedList));
+}
+
+#[test]
+fn nested_list_builds_with_listof_element() {
+    // `list<list<u32>>`: outer element plan = [inner ListOf]; inner
+    // element plan = [IntegerZeroExt]. Pins that the
+    // `PrestagedNestedList` class accepts a scalar inner element.
+    let (r, mut names) = setup();
+    let plan = LiftPlan::for_type(
         &func_named(&r, "f-list-of-list").params[0].ty,
         r.resolve(),
         &mut names,
         r.aliases(),
     )
-    .expect_err("nested list must bail at plan build");
-    let msg = err.to_string();
-    assert!(msg.contains("`list<T>` element type"));
-    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+    .expect("list<list<u32>> plan-build must succeed");
+    let [Cell::ListOf { element_plan, .. }] = plan.cells.as_slice() else {
+        panic!("expected one outer ListOf, got {:?}", plan.cells);
+    };
+    let [Cell::ListOf {
+        element_plan: inner_plan,
+        ..
+    }] = element_plan.cells.as_slice()
+    else {
+        panic!(
+            "expected one inner ListOf in outer element plan, got {:?}",
+            element_plan.cells
+        );
+    };
+    assert!(matches!(
+        inner_plan.cells.as_slice(),
+        [Cell::IntegerZeroExt { flat_slot: 0 }]
+    ));
+}
+
+#[test]
+fn nested_list_under_wrapper_bails_at_plan_build() {
+    // Depth-2 cap: a `list<…>` element-cell may only appear as the
+    // sole cell of its parent list's element plan. These shapes wrap
+    // a `list<T>` in option / tuple / record / variant / result
+    // inside another list — must all bail at plan-build so emit's
+    // single-position `nested_inner` invariant holds.
+    let (r, mut names) = setup();
+    for fixture in [
+        "f-list-option-list-u32",
+        "f-list-tuple-with-list-u32",
+        "f-list-record-with-list",
+        "f-list-variant-list-arm",
+        "f-list-result-with-list-ok",
+    ] {
+        let err = LiftPlan::for_type(
+            &func_named(&r, fixture).params[0].ty,
+            r.resolve(),
+            &mut names,
+            r.aliases(),
+        )
+        .expect_err(&format!("`{fixture}` must bail at plan-build"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`list<T>` element type"),
+            "`{fixture}`: expected list-element gate phrase, got: {msg}"
+        );
+    }
 }
 
 #[test]
@@ -1686,9 +1784,12 @@ fn map_in_record_classifies_with_inner_list() {
 #[test]
 fn map_with_nested_list_value_bails() {
     // `map<string, list<list<u32>>>` desugars to
-    // `list<tuple<string, list<list<u32>>>>` — the nested-list value
-    // hits the same gate as `list<list<u32>>` (still tier-3). Pins
-    // that desugaring doesn't accidentally escape the gate.
+    // `list<tuple<string, list<list<u32>>>>`. The inner `list<list<u32>>`
+    // can plan on its own (scope of this commit), but once it sits as
+    // a tuple field, the tuple becomes a list element whose nested
+    // sub-list is rejected by the depth-2 cap (the outer `Cell::ListOf`
+    // inside the tuple has class `None` because its inner cell is
+    // itself `PrestagedNestedList`).
     let (r, mut names) = setup();
     let err = LiftPlan::for_type(
         &func_named(&r, "f-map-of-list-of-list").params[0].ty,
@@ -1698,16 +1799,13 @@ fn map_with_nested_list_value_bails() {
     )
     .expect_err("map<_, list<list<T>>> must bail at plan build");
     let msg = err.to_string();
-    // The specific gate that should fire — pins this against an
-    // unrelated bail (e.g., flat-slot budget) silently passing the
-    // assertion.
     assert!(
         msg.contains("`list<T>` element type"),
         "expected list-element gate message, got: {msg}"
     );
     assert!(
-        msg.contains("Still gated: nested list."),
-        "expected nested-list gate phrase to identify the specific bail, got: {msg}"
+        msg.contains("further nesting"),
+        "expected the depth-cap phrase from the new gate, got: {msg}"
     );
 }
 
@@ -2926,6 +3024,16 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-result-list-list", &r, &mut names),
         plan_for_param("f-variant-list-arm", &r, &mut names),
         plan_for_param("f-result-of-variant-with-list", &r, &mut names),
+        // `list<list<T>>` (depth-2 nested-list) — inner T per supported
+        // class. Drives the nested pre-pass memory walk + the
+        // recursive `emit_list_of_arm` per outer iteration.
+        plan_for_param("f-list-of-list", &r, &mut names),
+        plan_for_param("f-list-of-list-string", &r, &mut names),
+        plan_for_param("f-list-of-list-char", &r, &mut names),
+        plan_for_param("f-list-of-list-option-u32", &r, &mut names),
+        plan_for_param("f-list-of-list-result-u32-string", &r, &mut names),
+        plan_for_param("f-list-of-list-tuple-u32-u32", &r, &mut names),
+        plan_for_param("f-list-of-list-color", &r, &mut names),
     ];
     for plan in &plans {
         validate_emit_lift_plan(plan, r.resolve());

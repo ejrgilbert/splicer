@@ -2101,6 +2101,65 @@ fn tier2_shapes() -> Vec<Shape> {
             }),
             n: 3,
         },
+        // `list<list<T>>` (depth-2 nested-list) — inner T = scalar,
+        // string, char, option, result, tuple, enum. Drives the nested
+        // pre-pass memory walk + the recursive `emit_list_of_arm` per
+        // outer iteration. `Shape::List` materializes one element per
+        // layer, so end-to-end the runtime sees `vec![vec![<lit>]]`
+        // and `fmt_cell` renders `list(list(<elem>))`.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Primitive {
+            name: "u32",
+            wit_type: "u32",
+            rust_ty: "u32",
+            rust_literal: "11u32",
+            expected_debug: "11",
+        })))),
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Primitive {
+            name: "string",
+            wit_type: "string",
+            rust_ty: "String",
+            rust_literal: "String::from(\"abc\")",
+            expected_debug: "\"abc\"",
+        })))),
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Primitive {
+            name: "char",
+            wit_type: "char",
+            rust_ty: "char",
+            rust_literal: "'q'",
+            expected_debug: "'q'",
+        })))),
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "7u32",
+                expected_debug: "7",
+            }),
+            is_some: true,
+        })))),
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "1u32",
+                expected_debug: "1",
+            },
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "2u32",
+                expected_debug: "2",
+            },
+        ]))))),
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Enum {
+            wit_name: "color",
+            rust_name: "Color",
+            cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
+            selected: 2,
+        })))),
     ]
 }
 

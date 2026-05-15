@@ -3,25 +3,48 @@
 Every other type lifts today (primitives, `string`, `list<u8>`,
 `enum`, `record`, `tuple`, `option`, `result`, `flags`, `variant`,
 `char`, `own<R>` / `borrow<R>`, `stream<T>` / `future<T>`,
-`error-context`, `list<T, N>`, and `list<T>` over every kind
-except nested lists).
+`error-context`, `list<T, N>`, `list<T>` over every kind, and
+`list<list<T>>` with `T` on the per-call-buffer-free subset).
 
 ## What's left
 
-### `list<list<T>>` (tier-3, list-element gate)
+### `list<list<T>>` inner kinds that need a per-call info buffer
 
-The only gated list-element kind. `Cell::allowed_as_list_element`
-(`lift/plan.rs`) is the gate; the bail fires at `push_list_of` and
-is pinned by `nested_list_bails_at_plan_build` in `lift/tests.rs`.
+Inner `T` ∈ `record` / `variant` / `flags` / `handle` still bails
+at plan-build via `Cell::ListOf::list_element_class` (`lift/plan.rs`)
+— the gate accepts `Scalar` / `PrestagedChar` / `PrestagedChildIdx` /
+`PrestagedTupleIndices` for the inner element plan and rejects the
+rest. To unblock each: extend the inner-element gate one class at a
+time and teach the matching info-buffer sizing pre-pass (the
+`fn_has_list_elem_*` gates already recurse into nested element
+plans via `LiftPlan::any_list_element_has_class`, so the wrapper
+locals are reachable; the per-call buffer count is the missing
+piece — needs `Σ_outer outer_j_inner_len * K_per_inner_elem` added
+to the accumulator).
 
-Child indices live in static side-table segments that assume
-build-time-known absolute indices. Lifting needs either per-call
-dynamic side-table growth (the route in use for `list<own<R>>` /
-`list<record>` / `list<variant>` etc. via per-call info buffers)
-or a schema-level "template + per-instance base." Multi-day
-recursive-design pass — settle the design before promoting.
+### `list<list<list<…>>>` (depth ≥ 3)
+
+Same gate rejects `PrestagedNestedList` as an inner-element class,
+so depth-3 plan-builds fail. The recursion in
+`build_list_emit_locals_for_plan` already self-handles arbitrary
+depth, but the cell-array sizing pre-pass only walks one level of
+nesting; extend it to recurse so deeper trees can size their slabs.
 
 ## Recently landed
+
+- `list<list<T>>` for `T` ∈ scalar / char / option / result / tuple /
+  enum — `Cell::ListOf` becomes an allowed list element (class
+  `PrestagedNestedList`) when the inner element plan stays on the
+  per-call-buffer-free subset (`lift/plan.rs`). Emit adds a nested
+  pre-pass that walks outer's memory to size the cell slab
+  (`emit_nested_list_pre_pass` in `lift/emit.rs`) and threads inner
+  `ListEmitLocals` via `ListEmitLocals.nested_inner`. The inner
+  list's `start_i` doubles as a running cursor — pre-pass seeds
+  `outer.start_i + outer.len`, the outer loop advances per iter.
+  `is_compound_result` already accepted `list<T>` non-u8, so no
+  classify change. Canned shapes per inner T live in
+  `tier2_shapes()`; gates fire on `f-map-of-list-of-list` (nested
+  list inside a tuple-element list rejects via the depth-2 cap).
 
 - `FixedLengthList(elem, N)` — canon-ABI flattens to `N × flat(T)`
   inlined, structurally identical to `tuple<T;N>`. Desugared at
