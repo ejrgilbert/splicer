@@ -2101,12 +2101,9 @@ fn tier2_shapes() -> Vec<Shape> {
             }),
             n: 3,
         },
-        // `list<list<T>>` (depth-2 nested-list) — inner T = scalar,
-        // string, char, option, result, tuple, enum. Drives the nested
-        // pre-pass memory walk + the recursive `emit_list_of_arm` per
-        // outer iteration. `Shape::List` materializes one element per
-        // layer, so end-to-end the runtime sees `vec![vec![<lit>]]`
-        // and `fmt_cell` renders `list(list(<elem>))`.
+        // `list<list<T>>` per-call-buffer-free inner kinds — scalar,
+        // string, char, option, tuple, enum. Drives the nested pre-pass
+        // memory walk + recursive arm.
         Shape::List(Box::new(Shape::List(Box::new(Shape::Primitive {
             name: "u32",
             wit_type: "u32",
@@ -2160,10 +2157,7 @@ fn tier2_shapes() -> Vec<Shape> {
             cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
             selected: 2,
         })))),
-        // Inner T = record. Pre-pass sums per-outer-iter inner
-        // contributions into `next_record_idx`; emit snaps and
-        // advances the inner's `record_slot_base` from
-        // `nested_inner_record_cursor` per outer iter.
+        // Inner T = record — exercises nested record_cursor.
         Shape::List(Box::new(Shape::List(Box::new(Shape::Record {
             wit_name: "point",
             rust_name: "Point",
@@ -2189,6 +2183,170 @@ fn tier2_shapes() -> Vec<Shape> {
                     },
                 ),
             ],
+        })))),
+        // Inner T = variant w/ primitive payloads — exercises nested
+        // variant_cursor. `selected: 1` lands on a payload-bearing arm.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 1,
+        })))),
+        // Co-presence: variant w/ record-typed payload — inner plan
+        // has RecordOf + Variant siblings; both cursors run in parallel.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Variant {
+            wit_name: "tagged-pt",
+            rust_name: "TaggedPt",
+            cases: vec![
+                VariantCase {
+                    wit_name: "empty",
+                    rust_name: "Empty",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "labeled",
+                    rust_name: "Labeled",
+                    payload: Some(Shape::Record {
+                        wit_name: "label",
+                        rust_name: "Label",
+                        fields: vec![
+                            (
+                                "x",
+                                Shape::Primitive {
+                                    name: "u32",
+                                    wit_type: "u32",
+                                    rust_ty: "u32",
+                                    rust_literal: "13u32",
+                                    expected_debug: "13",
+                                },
+                            ),
+                            (
+                                "y",
+                                Shape::Primitive {
+                                    name: "s32",
+                                    wit_type: "s32",
+                                    rust_ty: "i32",
+                                    rust_literal: "-4i32",
+                                    expected_debug: "-4",
+                                },
+                            ),
+                        ],
+                    }),
+                },
+            ],
+            selected: 1,
+        })))),
+        // Multi-record-payload variant: two arms each carry a distinct
+        // record. Inner plan ends up with two `Cell::RecordOf` + one
+        // `Cell::Variant`, so records_per_elem=2 vs variants_per_elem=1
+        // — the cursors advance at different strides per outer iter.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Variant {
+            wit_name: "tagged-pair",
+            rust_name: "TaggedPair",
+            cases: vec![
+                VariantCase {
+                    wit_name: "fst",
+                    rust_name: "Fst",
+                    payload: Some(Shape::Record {
+                        wit_name: "label-a",
+                        rust_name: "LabelA",
+                        fields: vec![(
+                            "v",
+                            Shape::Primitive {
+                                name: "u32",
+                                wit_type: "u32",
+                                rust_ty: "u32",
+                                rust_literal: "21u32",
+                                expected_debug: "21",
+                            },
+                        )],
+                    }),
+                },
+                VariantCase {
+                    wit_name: "snd",
+                    rust_name: "Snd",
+                    payload: Some(Shape::Record {
+                        wit_name: "label-b",
+                        rust_name: "LabelB",
+                        fields: vec![(
+                            "w",
+                            Shape::Primitive {
+                                name: "s32",
+                                wit_type: "s32",
+                                rust_ty: "i32",
+                                rust_literal: "-7i32",
+                                expected_debug: "-7",
+                            },
+                        )],
+                    }),
+                },
+            ],
+            selected: 0,
+        })))),
+        // Unit-arm-selected — clone of the primitive-payload variant
+        // with `selected: 0` so the disc-skips-payload-write branch
+        // runs inside the nested loop body.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 0,
         })))),
     ]
 }
