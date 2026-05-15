@@ -298,26 +298,19 @@ impl EmitPlan {
                 let routing_id = resolve_shim_node(id, composition, shim_comps);
 
                 if i > 0 {
-                    let mut current = prev_var.clone().ok_or_else(|| {
+                    let upstream = prev_var.clone().ok_or_else(|| {
                         anyhow::anyhow!(
                             "with_chain_routing: chain position {i} has no upstream var; \
                              chain construction produced an inconsistent ordering"
                         )
                     })?;
-                    if let Some(middlewares) = inject_plan.get(&i) {
-                        // IndexSet's iter doesn't impl DoubleEndedIterator,
-                        // so the .collect() is required for `.rev()`.
-                        let ordered: Vec<&Injection> = middlewares.iter().collect();
-                        for mdl in ordered.iter().rev() {
-                            current = self.add_middleware(
-                                mdl,
-                                interface,
-                                &current,
-                                composition,
-                                shim_comps,
-                            )?;
-                        }
-                    }
+                    let current = self.fold_inject_middlewares(
+                        upstream,
+                        inject_plan.get(&i),
+                        interface,
+                        composition,
+                        shim_comps,
+                    )?;
                     self.routing
                         .insert((routing_id, interface.name.clone()), current);
                 }
@@ -329,17 +322,13 @@ impl EmitPlan {
                 if i == chain.len() - 1 {
                     if let Some(top) = inject_plan.get(&(i + 1)) {
                         if !top.is_empty() {
-                            let mut current = node_var.clone();
-                            let ordered: Vec<&Injection> = top.iter().collect();
-                            for mdl in ordered.iter().rev() {
-                                current = self.add_middleware(
-                                    mdl,
-                                    interface,
-                                    &current,
-                                    composition,
-                                    shim_comps,
-                                )?;
-                            }
+                            let current = self.fold_inject_middlewares(
+                                node_var.clone(),
+                                Some(top),
+                                interface,
+                                composition,
+                                shim_comps,
+                            )?;
                             self.export_routing
                                 .insert((routing_id, interface.name.clone()), current);
                         }
@@ -459,6 +448,35 @@ impl EmitPlan {
         self
     }
 
+    /// Wrap `initial` with each middleware in `middlewares` in reverse
+    /// declaration order, threading the result of one wrap into the
+    /// downstream slot of the next. Returns the outermost var (or
+    /// `initial` unchanged if `middlewares` is `None` or empty).
+    ///
+    /// Reverse order preserves declared ordering: the first middleware
+    /// in the config ends up the outermost wrapper, which is what
+    /// callers want.
+    fn fold_inject_middlewares(
+        &mut self,
+        initial: String,
+        middlewares: Option<&IndexSet<Injection>>,
+        interface: &Contract,
+        composition: &CompositionGraph,
+        shim_comps: &HashMap<usize, usize>,
+    ) -> anyhow::Result<String> {
+        let Some(middlewares) = middlewares else {
+            return Ok(initial);
+        };
+        // IndexSet's iter doesn't impl DoubleEndedIterator, so the
+        // .collect() is required for `.rev()`.
+        let ordered: Vec<&Injection> = middlewares.iter().collect();
+        let mut current = initial;
+        for mdl in ordered.iter().rev() {
+            current = self.add_middleware(mdl, interface, &current, composition, shim_comps)?;
+        }
+        Ok(current)
+    }
+
     /// Materialize entities for a single middleware injection and
     /// return the var to use as the wrapped iface's new source.
     ///
@@ -527,18 +545,9 @@ impl EmitPlan {
                 }
             }
 
-            // Adapter instance. Same `(mdl, iface)` may be injected at
-            // multiple chain positions with different downstream
-            // providers — each needs its own instance, so disambiguate
-            // by use count just like simple middleware. Adapter pkg
-            // stays constant: the generated wasm is the same.
-            let count = self.adapter_counts.entry(adapter_pkg.clone()).or_insert(0);
-            let adapter_var = if *count == 0 {
-                adapter_pkg.clone()
-            } else {
-                format!("{adapter_pkg}-{count}")
-            };
-            *count += 1;
+            // Adapter pkg stays constant (same generated wasm); each
+            // chain position gets its own var.
+            let adapter_var = disambiguated_var(&mut self.adapter_counts, &adapter_pkg);
 
             let mut imports: Vec<(String, String)> =
                 vec![(interface.name.clone(), downstream_var.to_string())];
@@ -582,17 +591,9 @@ impl EmitPlan {
 
             Ok(adapter_var)
         } else {
-            // Simple middleware. Each use needs its own instance (each
-            // wraps a different downstream / position with its own
-            // state), so disambiguate `var` by use count while keeping
-            // `pkg` = `mdl.name`.
-            let count = self.simple_mdl_counts.entry(real_pkg.clone()).or_insert(0);
-            let mw_var = if *count == 0 {
-                real_pkg.clone()
-            } else {
-                format!("{real_pkg}-{count}")
-            };
-            *count += 1;
+            // Simple middleware: each chain position needs its own
+            // instance (independent state); pkg stays = `mdl.name`.
+            let mw_var = disambiguated_var(&mut self.simple_mdl_counts, &real_pkg);
             self.entities.insert(
                 mw_var.clone(),
                 Entity::wired(
@@ -1544,6 +1545,20 @@ fn resolve_shim_node(
         .find(|(_, n)| (n.component_num + 1) as usize == resolved)
         .map(|(id, _)| *id)
         .unwrap_or(inst_id)
+}
+
+/// First use of `pkg` returns `pkg`; subsequent uses get suffixed
+/// `pkg-1`, `pkg-2`, ... so multiple instances of the same component
+/// at different chain positions don't share a WAC var name.
+fn disambiguated_var(counts: &mut HashMap<String, usize>, pkg: &str) -> String {
+    let count = counts.entry(pkg.to_string()).or_insert(0);
+    let var = if *count == 0 {
+        pkg.to_string()
+    } else {
+        format!("{pkg}-{count}")
+    };
+    *count += 1;
+    var
 }
 
 /// Convert an arbitrary node label into a valid WAC kebab-case identifier.
