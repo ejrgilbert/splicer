@@ -10,13 +10,14 @@ Every other type lifts today (primitives, `string`, `list<u8>`,
 
 ### `list<list<T>>` inner kinds that need a per-call info buffer
 
-Inner `T` ∈ `variant` / `flags` / `handle` still bails at plan-build
-via `Cell::ListOf::list_element_class` (`lift/plan.rs`) — the gate
+Inner `T` ∈ `flags` / `handle` still bails at plan-build via
+`Cell::ListOf::list_element_class` (`lift/plan.rs`) — the gate
 accepts `Scalar` / `PrestagedChar` / `PrestagedChildIdx` /
-`PrestagedTupleIndices` / `PrestagedRecord` for the inner element
-plan and rejects the rest. To unblock each: extend the inner-element
-gate one class at a time and teach the matching info-buffer sizing
-pre-pass. Pattern (see record support for the template):
+`PrestagedTupleIndices` / `PrestagedRecord` / `PrestagedVariant`
+for the inner element plan and rejects the rest. To unblock each:
+extend the inner-element gate one class at a time and teach the
+matching info-buffer sizing pre-pass. Pattern (see record/variant
+support for the template):
 - Allow the new class in the gate.
 - Add a `nested_inner_<kind>_cursor` on `ListEmitLocals` (allocated
   only when the inner contributes that kind).
@@ -24,8 +25,8 @@ pre-pass. Pattern (see record support for the template):
   `emit_nested_list_pre_pass`.
 - Snap `inner.<kind>_slot_base = cursor` and advance the cursor per
   outer iter in `emit_list_of_arm`.
-- Update `LiftPlan::has_list_elem_<kind>` to recurse (record swap
-  to `any_list_element_has_class` shows the shape).
+- Update `LiftPlan::has_list_elem_<kind>` to recurse if it doesn't
+  already (record/variant already use `any_list_element_has_class`).
 
 ### `list<list<list<…>>>` (depth ≥ 3)
 
@@ -36,6 +37,20 @@ depth, but the cell-array sizing pre-pass only walks one level of
 nesting; extend it to recurse so deeper trees can size their slabs.
 
 ## Recently landed
+
+- `list<list<variant>>` — same shape as the record case below.
+  `PrestagedVariant` joins the allowed inner classes; `ListEmitLocals`
+  gains `nested_inner_variant_cursor`; `emit_nested_list_pre_pass`
+  bumps `lcl.next_variant_idx` by
+  `Σ inner_len_j * inner.variants_per_elem`, and `emit_list_of_arm`
+  snaps/advances `inner.variant_slot_base` per outer iter.
+  `has_list_elem_variant` already recursed via
+  `any_list_element_has_class` (record's swap had set the shape). The
+  per-block cursor-advance pattern got two helpers
+  (`emit_cursor_advance_by_len`, `emit_snap_and_advance_cursor`) so
+  the 11 existing sites — plus the future flags / handle additions —
+  collapse to one-liners. Canned shape `list<list<shape>>` joins
+  `tier2_shapes()`.
 
 - `list<list<record>>` — `PrestagedRecord` joins the allowed inner
   classes. `ListEmitLocals` gains `nested_inner_record_cursor`;
