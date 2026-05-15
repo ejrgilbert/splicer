@@ -80,6 +80,12 @@ When `splicer splice` detects that a middleware exports these interfaces (instea
 of the target interface directly), it automatically generates an adapter
 component and wires it into the composition.
 
+For Rust authors, [`splicer-tool-sdk`](splicer-tool-sdk/) ships
+ready-made building blocks for middleware and downstream tools. Common
+operations on lifted typed values live in one place, so your middleware
+and any consuming tools (decoders, replay drivers, fixture sanitizers)
+get them for free instead of each crate re-implementing them.
+
 For the full guide — including how to write a middleware, how adapter
 detection works, and what the generated adapter does internally — see
 [docs/adapter-components.md](docs/adapter-components.md).

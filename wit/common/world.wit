@@ -3,6 +3,8 @@
 /// Tier WIT packages (`splicer:tier1`, `splicer:tier2`, ...) import
 /// types defined here so the call-identity and lifted-value shapes
 /// stay consistent across tiers as middleware authors move up.
+///
+/// Paired with `splicer-tool-sdk/src/types.rs`; keep shapes in sync.
 package splicer:common@0.2.0;
 
 interface types {
