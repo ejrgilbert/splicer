@@ -682,6 +682,32 @@ impl EmitPlan {
     }
 }
 
+/// Read-only state shared across every rule + chain pass of a single
+/// `generate_wac` run.
+struct SpliceCtx<'a> {
+    composition: &'a CompositionGraph,
+    splits_path: &'a str,
+    shim_comps: &'a HashMap<usize, usize>,
+}
+
+/// Mutable per-run state accumulated as rules apply: contract-export
+/// memos, generated adapters, and decode-result caches for the
+/// sync-target / async-middleware preflight (so the same `.wasm` is
+/// only decoded once per `generate_wac` run, not per injection).
+#[derive(Default)]
+struct SpliceAccumulators {
+    checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
+    generated_adapters: Vec<GeneratedAdapter>,
+    /// Decode-cache: `(target_split_path, target_interface)` → has
+    /// at least one sync (non-async) function declared on that
+    /// interface.
+    target_has_sync_cache: HashMap<(String, String), bool>,
+    /// Decode-cache: `middleware_path` → qualified name of the first
+    /// non-`wasi:*` peer import declared `async func`, or `None` if
+    /// no offender.
+    middleware_first_async_peer_cache: HashMap<String, Option<String>>,
+}
+
 /// Generate WAC from a composition graph and a set of splicing rules.
 ///
 /// `node_paths` is `Some` for the multi-component path; when present each node's
@@ -783,35 +809,22 @@ pub fn generate_wac(
         });
     }
 
-    // This is to allow for caching the export contract discover of middleware components.
-    let mut checked_middlewares = HashMap::new();
+    let ctx = SpliceCtx {
+        composition,
+        splits_path,
+        shim_comps: &shim_comps,
+    };
+    let mut accs = SpliceAccumulators::default();
 
     // Apply the rules in order of their declaration in the configuration.
     // This enforces an ordering semantic for the rule application.
     let mut diagnostics: Vec<ContractResult> = vec![];
-    let mut generated_adapters: Vec<GeneratedAdapter> = vec![];
     for (rule_idx, rule) in rules.iter().enumerate() {
         let mut any_interface_matched = false;
         let mut any_full_match = false;
         for chain in chains.iter_mut() {
-            let between = apply_rule_between(
-                rule,
-                chain,
-                composition,
-                splits_path,
-                &shim_comps,
-                &mut checked_middlewares,
-                &mut generated_adapters,
-            )?;
-            let before = apply_rule_before(
-                rule,
-                chain,
-                composition,
-                splits_path,
-                &shim_comps,
-                &mut checked_middlewares,
-                &mut generated_adapters,
-            )?;
+            let between = apply_rule_between(rule, chain, &ctx, &mut accs)?;
+            let before = apply_rule_before(rule, chain, &ctx, &mut accs)?;
             any_interface_matched |= between.interface_matched | before.interface_matched;
             any_full_match |= between.full_match | before.full_match;
             diagnostics.extend(between.contract_results);
@@ -903,7 +916,7 @@ pub fn generate_wac(
         wac,
         wac_deps: args,
         diagnostics,
-        generated_adapters,
+        generated_adapters: accs.generated_adapters,
     })
 }
 
@@ -1007,11 +1020,8 @@ struct RuleApplyResult {
 fn apply_rule_between(
     rule: &SpliceRule,
     chain: &mut Chain,
-    composition: &CompositionGraph,
-    splits_path: &str,
-    shim_comps: &HashMap<usize, usize>,
-    checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-    generated_adapters: &mut Vec<GeneratedAdapter>,
+    ctx: &SpliceCtx,
+    accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
     let mut interface_matched = false;
@@ -1028,8 +1038,8 @@ fn apply_rule_between(
         for (i, window) in chain.chain.windows(2).enumerate() {
             let inner_id = window[0];
             let outer_id = window[1];
-            let inner_node = &composition.nodes[&inner_id];
-            let outer_node = &composition.nodes[&outer_id];
+            let inner_node = &ctx.composition.nodes[&inner_id];
+            let outer_node = &ctx.composition.nodes[&outer_id];
 
             let inner_var = get_name(inner_node).to_string();
             let outer_var = get_name(outer_node).to_string();
@@ -1043,8 +1053,12 @@ fn apply_rule_between(
                     (inner_id, inner_alias.clone()),
                     (outer_id, outer_alias.clone()),
                 ];
-                let consumer_path =
-                    chain.consumer_split_path(i + 1, composition, splits_path, shim_comps);
+                let consumer_path = chain.consumer_split_path(
+                    i + 1,
+                    ctx.composition,
+                    ctx.splits_path,
+                    ctx.shim_comps,
+                );
                 contract_results.extend(add_to_inject_plan(
                     interface,
                     inject,
@@ -1053,10 +1067,9 @@ fn apply_rule_between(
                     &mut chain.aliases,
                     &mut chain.inject_plan,
                     &chain.interface.ty_fingerprint,
-                    splits_path,
                     consumer_path,
-                    checked_middlewares,
-                    generated_adapters,
+                    ctx,
+                    accs,
                 )?);
             }
         }
@@ -1068,15 +1081,11 @@ fn apply_rule_between(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_rule_before(
     rule: &SpliceRule,
     chain: &mut Chain,
-    composition: &CompositionGraph,
-    splits_path: &str,
-    shim_comps: &HashMap<usize, usize>,
-    checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-    generated_adapters: &mut Vec<GeneratedAdapter>,
+    ctx: &SpliceCtx,
+    accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<RuleApplyResult> {
     let mut contract_results = vec![];
     let mut interface_matched = false;
@@ -1093,7 +1102,7 @@ fn apply_rule_before(
                 continue;
             }
             interface_matched = true;
-            let outer_node = &composition.nodes[id];
+            let outer_node = &ctx.composition.nodes[id];
             if let Some(provider) = provider_name {
                 if get_name(outer_node) != *provider {
                     continue;
@@ -1107,8 +1116,10 @@ fn apply_rule_before(
             // split (i) — the adapter mirrors the provider's full
             // import topology.
             let consumer_path = chain
-                .consumer_split_path(i + 1, composition, splits_path, shim_comps)
-                .or_else(|| chain.consumer_split_path(i, composition, splits_path, shim_comps));
+                .consumer_split_path(i + 1, ctx.composition, ctx.splits_path, ctx.shim_comps)
+                .or_else(|| {
+                    chain.consumer_split_path(i, ctx.composition, ctx.splits_path, ctx.shim_comps)
+                });
             contract_results.extend(add_to_inject_plan(
                 interface,
                 inject,
@@ -1117,10 +1128,9 @@ fn apply_rule_before(
                 &mut chain.aliases,
                 &mut chain.inject_plan,
                 &chain.interface.ty_fingerprint,
-                splits_path,
                 consumer_path,
-                checked_middlewares,
-                generated_adapters,
+                ctx,
+                accs,
             )?);
         }
     }
@@ -1140,10 +1150,9 @@ fn add_to_inject_plan(
     aliases: &mut HashMap<u32, Option<String>>,
     inject_plan: &mut InjectPlan,
     contract_fingerprint: &Option<String>,
-    splits_path: &str,
     consumer_split: Option<String>,
-    checked_middlewares: &mut HashMap<String, BTreeMap<String, ExportInfo>>,
-    generated_adapters: &mut Vec<GeneratedAdapter>,
+    ctx: &SpliceCtx,
+    accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<Vec<ContractResult>> {
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
@@ -1151,7 +1160,7 @@ fn add_to_inject_plan(
         to_inject,
         interface_name,
         contract_fingerprint,
-        checked_middlewares,
+        &mut accs.checked_middlewares,
     );
 
     // For tier-1 compatible middleware, generate a adapter component and substitute
@@ -1182,16 +1191,17 @@ fn add_to_inject_plan(
                         mw_path,
                         interface_name,
                         consumer_split_path,
+                        accs,
                     )?;
                 }
                 let adapter_path = generate_tier1_adapter(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
-                    splits_path,
+                    ctx.splits_path,
                     consumer_split_path,
                 )?;
-                generated_adapters.push(GeneratedAdapter {
+                accs.generated_adapters.push(GeneratedAdapter {
                     adapter_path: adapter_path.clone(),
                     middleware_name: injection.name.clone(),
                     target_interface: interface_name.to_string(),
@@ -1225,16 +1235,17 @@ fn add_to_inject_plan(
                         mw_path,
                         interface_name,
                         consumer_split_path,
+                        accs,
                     )?;
                 }
                 let adapter_path = generate_tier2_adapter(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
-                    splits_path,
+                    ctx.splits_path,
                     consumer_split_path,
                 )?;
-                generated_adapters.push(GeneratedAdapter {
+                accs.generated_adapters.push(GeneratedAdapter {
                     adapter_path: adapter_path.clone(),
                     middleware_name: injection.name.clone(),
                     target_interface: interface_name.to_string(),
@@ -1383,11 +1394,22 @@ fn preflight_sync_target_async_middleware(
     middleware_path: &str,
     target_interface: &str,
     target_split_path: &str,
+    accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<()> {
-    if !target_interface_has_sync_func(target_interface, target_split_path) {
+    let target_key = (target_split_path.to_string(), target_interface.to_string());
+    let has_sync = *accs
+        .target_has_sync_cache
+        .entry(target_key)
+        .or_insert_with(|| target_interface_has_sync_func(target_interface, target_split_path));
+    if !has_sync {
         return Ok(());
     }
-    let Some(offender) = first_async_peer_import(middleware_path) else {
+    let offender = accs
+        .middleware_first_async_peer_cache
+        .entry(middleware_path.to_string())
+        .or_insert_with(|| first_async_peer_import(middleware_path))
+        .clone();
+    let Some(offender) = offender else {
         return Ok(());
     };
     anyhow::bail!(
