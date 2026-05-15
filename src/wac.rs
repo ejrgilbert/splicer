@@ -90,6 +90,597 @@ pub struct WacOutput {
     pub generated_adapters: Vec<GeneratedAdapter>,
 }
 
+/// One `let` declaration in the rendered WAC. Each entity is a node
+/// instance, a middleware instance, a tier-1 adapter wrapper, or a
+/// builtin-config provider — all share the same shape.
+#[derive(Debug, Clone)]
+struct Entity {
+    /// The identifier introduced by `let var = ...`.
+    var: String,
+    /// The package name in `new my:pkg`.
+    pkg: String,
+    /// Explicit imports to wire as `"iface": src["iface"],`. Order is
+    /// preserved for deterministic rendering.
+    imports: Vec<(String, String)>,
+    /// Whether to append `...` so wac compose pulls remaining imports
+    /// from the host or matching peers.
+    catchall: bool,
+}
+
+impl Entity {
+    /// Catchall-only entity: `let var = new my:pkg { ... };`. No
+    /// explicit imports.
+    fn leaf(var: impl Into<String>, pkg: impl Into<String>) -> Self {
+        Self {
+            var: var.into(),
+            pkg: pkg.into(),
+            imports: vec![],
+            catchall: true,
+        }
+    }
+
+    /// Catchall entity with explicit import wirings:
+    /// `let var = new my:pkg { "iface": src["iface"], ..., ... };`.
+    fn wired(
+        var: impl Into<String>,
+        pkg: impl Into<String>,
+        imports: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            var: var.into(),
+            pkg: pkg.into(),
+            imports,
+            catchall: true,
+        }
+    }
+
+    /// Vars this entity references on its right-hand side. Used by the
+    /// renderer's topological sort.
+    fn deps(&self) -> impl Iterator<Item = &str> {
+        self.imports.iter().map(|(_, v)| v.as_str())
+    }
+
+    /// Render this entity as a single `let var = new my:pkg { ... };`
+    /// declaration. No trailing newline.
+    fn render(&self) -> String {
+        if self.imports.is_empty() && !self.catchall {
+            return format!("let {} = new {INST_PREFIX}:{} {{}};", self.var, self.pkg);
+        }
+        let mut s = format!("let {} = new {INST_PREFIX}:{} {{", self.var, self.pkg);
+        for (iface, src) in &self.imports {
+            s.push_str(&format!("\n    \"{iface}\": {src}[\"{iface}\"],"));
+        }
+        if self.catchall {
+            s.push_str("\n    ...");
+        }
+        s.push_str("\n};");
+        s
+    }
+}
+
+/// The plan IR — an ordered set of WAC entities + exports plus the
+/// routing decisions that produced them. Built up by a sequence of
+/// [`EmitPlan`] transformations; rendered by [`EmitPlan::render`].
+#[derive(Debug, Default)]
+struct EmitPlan {
+    // ── Output (consumed by `render`) ──
+    /// All entities to emit, keyed by their var name.
+    entities: BTreeMap<String, Entity>,
+    /// `(export_iface, source_var)` to emit `export src_var["iface"];` for.
+    exports: Vec<(String, String)>,
+    /// Composition node id → pkg name (drives wac_deps for the original
+    /// component splits).
+    used_comp_nodes: HashMap<u32, String>,
+    /// `pkg → path` for middleware/adapter/config-provider components
+    /// (drives wac_deps for injected components). Keyed by pkg so
+    /// multiple instances of the same middleware (e.g. `middleware-a`,
+    /// `middleware-a-1`) share one dep entry; `BTreeMap` keeps the
+    /// emitted command line deterministic.
+    used_middlewares: BTreeMap<String, String>,
+
+    // ── Planning state (carried between pipeline steps) ──
+    /// First non-`None` alias seen per node id. Drives the var assigned
+    /// to that node. Subsequent differing aliases for the same id are
+    /// silently ignored on the assumption that `add_to_inject_plan`
+    /// has already rejected inter-rule alias conflicts; the order
+    /// chosen here is "first chain to mention the node wins".
+    aliases: HashMap<u32, Option<String>>,
+    /// Composition node id → wac var. Multiple ids may share a var when
+    /// they resolve to the same split.
+    node_vars: HashMap<u32, String>,
+    /// `(consumer_id, iface)` → source var that should provide that
+    /// import after middleware routing. `consumer_id` is shim-resolved
+    /// so it matches the `with_exports` lookup convention.
+    routing: HashMap<(u32, String), String>,
+    /// `(provider_id, export_iface)` → wrapped var, populated when a
+    /// top-level wrap fronts the provider's export of that iface.
+    /// `provider_id` is shim-resolved.
+    export_routing: HashMap<(u32, String), String>,
+    /// Use-count per simple-middleware name. First use keeps the bare
+    /// `mdl.name`; subsequent uses suffix `-1`, `-2`, … so each
+    /// position gets its own instance (with its own state).
+    simple_mdl_counts: HashMap<String, usize>,
+    /// Use-count per tier-1 adapter `(mdl, iface)` pair. Same scheme as
+    /// [`Self::simple_mdl_counts`] — distinct downstream wirings get
+    /// distinct instances.
+    adapter_counts: HashMap<String, usize>,
+    /// Real-middleware vars already added (dedup tier-1 across rules).
+    emitted_real_vars: HashSet<String>,
+}
+
+impl EmitPlan {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pipeline step: collect the first alias each node receives across
+    /// all chains. `None` and missing both mean "use the sanitized node
+    /// name"; `Some(name)` overrides it.
+    fn with_aliases(mut self, chains: &[Chain]) -> Self {
+        for chain in chains {
+            for (id, alias) in &chain.aliases {
+                self.aliases.entry(*id).or_insert_with(|| alias.clone());
+            }
+        }
+        self
+    }
+
+    /// Pipeline step: assign one wac var per chain-participating node.
+    /// Nodes resolving to the same split share a var (one wac instance
+    /// per physical component), preserving resource-type identity.
+    /// Nodes outside every chain are skipped — wac compose's
+    /// peer-level flattening can surface auxiliary nodes whose
+    /// sanitized names would collide with chain participants.
+    fn with_node_vars(
+        mut self,
+        composition: &CompositionGraph,
+        chains: &[Chain],
+        shim_comps: &HashMap<usize, usize>,
+    ) -> Self {
+        let mut chain_nodes: BTreeSet<u32> = BTreeSet::new();
+        for chain in chains {
+            for id in &chain.chain {
+                chain_nodes.insert(*id);
+            }
+        }
+        let mut split_to_var: HashMap<usize, String> = HashMap::new();
+        for id in &chain_nodes {
+            let resolved_split = resolved_split_num(*id, composition, shim_comps);
+            if let Some(existing) = split_to_var.get(&resolved_split) {
+                self.node_vars.insert(*id, existing.clone());
+                continue;
+            }
+            let pkg = match self.aliases.get(id) {
+                Some(Some(a)) => a.clone(),
+                _ => sanitize_wac_id(get_name(&composition.nodes[id])),
+            };
+            self.node_vars.insert(*id, pkg.clone());
+            split_to_var.insert(resolved_split, pkg);
+        }
+        self
+    }
+
+    /// Pipeline step: walk each chain's `inject_plan`, materializing
+    /// middleware entities and recording the source var that each
+    /// `(consumer, iface)` import should be wired from. Top-level
+    /// wraps (chain_idx == chain.len()) are recorded into
+    /// [`Self::export_routing`] to front the consumer's export later.
+    ///
+    /// Middlewares within one slot are applied in reverse declaration
+    /// order so the first entry in the YAML's `inject:` list ends up
+    /// the outermost wrapper (called first at runtime).
+    fn with_chain_routing(
+        mut self,
+        chains: &[Chain],
+        composition: &CompositionGraph,
+        shim_comps: &HashMap<usize, usize>,
+    ) -> anyhow::Result<Self> {
+        for Chain {
+            interface,
+            chain,
+            inject_plan,
+            ..
+        } in chains
+        {
+            let mut prev_var: Option<String> = None;
+            for i in 0..chain.len() {
+                let id = chain[i];
+                let node_var = self.node_vars.get(&id).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "with_chain_routing: chain participant {id} has no var; \
+                         with_node_vars must run before with_chain_routing"
+                    )
+                })?;
+                // Routing keys store the shim-resolved id so the
+                // `with_exports` lookup matches; otherwise an export
+                // sourced from a shim wouldn't find the wiring stored
+                // under the raw chain id.
+                let routing_id = resolve_shim_node(id, composition, shim_comps);
+
+                if i > 0 {
+                    let mut current = prev_var.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "with_chain_routing: chain position {i} has no upstream var; \
+                             chain construction produced an inconsistent ordering"
+                        )
+                    })?;
+                    if let Some(middlewares) = inject_plan.get(&i) {
+                        // IndexSet's iter doesn't impl DoubleEndedIterator,
+                        // so the .collect() is required for `.rev()`.
+                        let ordered: Vec<&Injection> = middlewares.iter().collect();
+                        for mdl in ordered.iter().rev() {
+                            current = self.add_middleware(
+                                mdl,
+                                interface,
+                                &current,
+                                composition,
+                                shim_comps,
+                            )?;
+                        }
+                    }
+                    self.routing
+                        .insert((routing_id, interface.name.clone()), current);
+                }
+                // The current node consumes from the wrapped source above
+                // and re-provides the iface through itself; the next
+                // iteration's source is the node, not the wrapped input.
+                prev_var = Some(node_var.clone());
+
+                if i == chain.len() - 1 {
+                    if let Some(top) = inject_plan.get(&(i + 1)) {
+                        if !top.is_empty() {
+                            let mut current = node_var.clone();
+                            let ordered: Vec<&Injection> = top.iter().collect();
+                            for mdl in ordered.iter().rev() {
+                                current = self.add_middleware(
+                                    mdl,
+                                    interface,
+                                    &current,
+                                    composition,
+                                    shim_comps,
+                                )?;
+                            }
+                            self.export_routing
+                                .insert((routing_id, interface.name.clone()), current);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(self)
+    }
+
+    /// Pipeline step: build composition-node entities. Each
+    /// non-host import is wired from [`Self::routing`] when a chain
+    /// covered it, or from the source's node var as a fallback.
+    /// Split-deduped node ids share an entity (the first id wins).
+    ///
+    /// Routing lookups normalize the consumer id with `resolve_shim_node`
+    /// to match the convention `with_chain_routing` uses when storing.
+    ///
+    /// Bails if a node's sanitized name collides with a previously
+    /// added middleware/adapter/config-provider entity — silently
+    /// overwriting would lose the middleware's wiring.
+    fn with_node_entities(
+        mut self,
+        composition: &CompositionGraph,
+        shim_comps: &HashMap<usize, usize>,
+    ) -> anyhow::Result<Self> {
+        let mut emitted: HashSet<String> = HashSet::new();
+        let mut node_ids: Vec<u32> = self.node_vars.keys().copied().collect();
+        node_ids.sort();
+        for id in node_ids {
+            let var = self.node_vars[&id].clone();
+            if !emitted.insert(var.clone()) {
+                continue;
+            }
+            // Node names are derived from composition input; middleware
+            // names from rule YAML. A clash means user-visible config is
+            // ambiguous — fail loudly with both names so the user can
+            // alias one side.
+            if self.entities.contains_key(&var) {
+                anyhow::bail!(
+                    "WAC var name collision: composition node `{var}` \
+                     conflicts with a previously-emitted middleware entity \
+                     (rename the node alias or the middleware's `name:`)"
+                );
+            }
+            let node = &composition.nodes[&id];
+            let routing_id = resolve_shim_node(id, composition, shim_comps);
+            let mut imports: Vec<(String, String)> = Vec::new();
+            for conn in &node.imports {
+                if conn.is_host_import {
+                    continue;
+                }
+                let iface = &conn.interface_name;
+                let src_var = if let Some(routed) = self.routing.get(&(routing_id, iface.clone())) {
+                    routed.clone()
+                } else if let Some(src_id) = conn.source_instance {
+                    match self.node_vars.get(&src_id) {
+                        Some(v) => v.clone(),
+                        None => continue,
+                    }
+                } else {
+                    continue;
+                };
+                imports.push((iface.clone(), src_var));
+            }
+            self.entities.insert(
+                var.clone(),
+                Entity::wired(var.clone(), var.clone(), imports),
+            );
+            self.used_comp_nodes.insert(id, var);
+        }
+        Ok(self)
+    }
+
+    /// Pipeline step: build the `export` list from
+    /// `composition.component_exports`. Skips spurious shim re-exports
+    /// (an iface routed internally whose export source is never a
+    /// chain consumer) and routes through any top-level-wrap
+    /// middleware recorded in [`Self::export_routing`].
+    ///
+    /// Both `chain_consumers` membership and `export_routing` lookups
+    /// use shim-resolved ids so the export source matches whatever
+    /// `with_chain_routing` stored, even when the chain participant
+    /// and the export source are distinct shim aliases of the same
+    /// underlying instance.
+    fn with_exports(
+        mut self,
+        composition: &CompositionGraph,
+        chains: &[Chain],
+        handled_interfaces: &HashSet<String>,
+        shim_comps: &HashMap<usize, usize>,
+    ) -> Self {
+        let mut chain_consumers: HashSet<u32> = HashSet::new();
+        for chain in chains {
+            if let Some(last) = chain.chain.last() {
+                chain_consumers.insert(resolve_shim_node(*last, composition, shim_comps));
+            }
+        }
+        for (export_iface, info) in composition.component_exports.iter() {
+            let effective_id = resolve_shim_node(info.source_instance, composition, shim_comps);
+            if handled_interfaces.contains(export_iface) && !chain_consumers.contains(&effective_id)
+            {
+                continue;
+            }
+            let export_var = if let Some(wrapped) = self
+                .export_routing
+                .get(&(effective_id, export_iface.clone()))
+            {
+                wrapped.clone()
+            } else if let Some(v) = self.node_vars.get(&effective_id) {
+                v.clone()
+            } else {
+                continue;
+            };
+            self.exports.push((export_iface.clone(), export_var));
+        }
+        self
+    }
+
+    /// Materialize entities for a single middleware injection and
+    /// return the var to use as the wrapped iface's new source.
+    ///
+    /// Tier-1 adapters expand to up to three entities (real middleware
+    /// host-imports-only + optional config provider + adapter wrapper);
+    /// simple middlewares are one entity. Both flavors disambiguate
+    /// repeated uses by appending `-N` to the WAC `var`, while keeping
+    /// the WAC `pkg` constant (one wac_deps entry, multiple
+    /// instantiations).
+    fn add_middleware(
+        &mut self,
+        mdl: &Injection,
+        interface: &Contract,
+        downstream_var: &str,
+        composition: &CompositionGraph,
+        shim_comps: &HashMap<usize, usize>,
+    ) -> anyhow::Result<String> {
+        use crate::contract::{
+            versioned_interface, TIER1_PACKAGE, TIER1_VERSION, TIER2_PACKAGE, TIER2_VERSION,
+        };
+
+        let real_pkg = mdl.name.clone();
+        let mdl_path = mdl
+            .path
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| PATH_PLACEHOLDER.to_string());
+
+        if let Some(adapter_info) = &mdl.adapter_info {
+            let adapter_pkg = format!("{}-adapter-{}", mdl.name, sanitize_wac_id(&interface.name));
+            let cfg_pkg = mdl
+                .config_provider_path
+                .as_ref()
+                .map(|_| format!("{real_pkg}-config"));
+
+            // Real middleware (host-imports-only) is shared across all
+            // adapter uses of this `mdl.name`; emit once, dedup on
+            // subsequent calls.
+            if self.emitted_real_vars.insert(real_pkg.clone()) {
+                self.used_middlewares.insert(real_pkg.clone(), mdl_path);
+                match cfg_pkg.as_ref() {
+                    Some(cfg_pkg) => {
+                        self.entities
+                            .insert(cfg_pkg.clone(), Entity::leaf(cfg_pkg, cfg_pkg));
+                        self.used_middlewares.insert(
+                            cfg_pkg.clone(),
+                            mdl.config_provider_path.as_ref().unwrap().clone(),
+                        );
+                        self.entities.insert(
+                            real_pkg.clone(),
+                            Entity::wired(
+                                &real_pkg,
+                                &real_pkg,
+                                vec![(
+                                    crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED
+                                        .to_string(),
+                                    cfg_pkg.clone(),
+                                )],
+                            ),
+                        );
+                    }
+                    None => {
+                        self.entities
+                            .insert(real_pkg.clone(), Entity::leaf(&real_pkg, &real_pkg));
+                    }
+                }
+            }
+
+            // Adapter instance. Same `(mdl, iface)` may be injected at
+            // multiple chain positions with different downstream
+            // providers — each needs its own instance, so disambiguate
+            // by use count just like simple middleware. Adapter pkg
+            // stays constant: the generated wasm is the same.
+            let count = self.adapter_counts.entry(adapter_pkg.clone()).or_insert(0);
+            let adapter_var = if *count == 0 {
+                adapter_pkg.clone()
+            } else {
+                format!("{adapter_pkg}-{count}")
+            };
+            *count += 1;
+
+            let mut imports: Vec<(String, String)> =
+                vec![(interface.name.clone(), downstream_var.to_string())];
+            for hook_iface in &adapter_info.matched_hook_interfaces {
+                let version = if hook_iface.starts_with(&format!("{TIER1_PACKAGE}/")) {
+                    TIER1_VERSION
+                } else if hook_iface.starts_with(&format!("{TIER2_PACKAGE}/")) {
+                    TIER2_VERSION
+                } else {
+                    anyhow::bail!(
+                        "matched hook interface '{hook_iface}' is not part of any known tier package",
+                    );
+                };
+                imports.push((versioned_interface(hook_iface, version), real_pkg.clone()));
+            }
+            // Resource-bearing factored-types imports — `...` doesn't
+            // unify resource type identity across separately-imported
+            // instances from a non-host component. The adapter wasm
+            // was just generated by this same splice run; if it's
+            // unreadable, that's a bug worth surfacing.
+            let adapter_bytes = std::fs::read(&adapter_info.adapter_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read freshly-generated adapter wasm at `{}`: {e}",
+                    adapter_info.adapter_path,
+                )
+            })?;
+            for extra in factored_types_to_wire(
+                &resource_bearing_imports(&adapter_bytes),
+                &interface.name,
+                composition,
+                shim_comps,
+            )? {
+                imports.push((extra, downstream_var.to_string()));
+            }
+            self.entities.insert(
+                adapter_var.clone(),
+                Entity::wired(&adapter_var, &adapter_pkg, imports),
+            );
+            self.used_middlewares
+                .insert(adapter_pkg, adapter_info.adapter_path.clone());
+
+            Ok(adapter_var)
+        } else {
+            // Simple middleware. Each use needs its own instance (each
+            // wraps a different downstream / position with its own
+            // state), so disambiguate `var` by use count while keeping
+            // `pkg` = `mdl.name`.
+            let count = self.simple_mdl_counts.entry(real_pkg.clone()).or_insert(0);
+            let mw_var = if *count == 0 {
+                real_pkg.clone()
+            } else {
+                format!("{real_pkg}-{count}")
+            };
+            *count += 1;
+            self.entities.insert(
+                mw_var.clone(),
+                Entity::wired(
+                    &mw_var,
+                    &real_pkg,
+                    vec![(interface.name.clone(), downstream_var.to_string())],
+                ),
+            );
+            self.used_middlewares.insert(real_pkg, mdl_path);
+            Ok(mw_var)
+        }
+    }
+
+    /// Render the plan to WAC text. Entities are emitted in topological
+    /// order so every reference resolves to a name introduced earlier
+    /// in the file (wac compose rejects forward references). Cycles
+    /// bail loudly with the offending var names.
+    fn render(&self, pkg_name: &str) -> anyhow::Result<String> {
+        let mut lines = vec![format!("package {pkg_name};")];
+        for var in self.topo_sort()? {
+            lines.push(self.entities[&var].render());
+        }
+        for (iface, src) in &self.exports {
+            lines.push(format!("export {src}[\"{iface}\"];"));
+        }
+        Ok(lines.join("\n\n"))
+    }
+
+    /// Kahn's algorithm. External references (vars not in the plan)
+    /// are ignored — they're host imports or wac compose's
+    /// responsibility to resolve.
+    fn topo_sort(&self) -> anyhow::Result<Vec<String>> {
+        let mut in_degree: BTreeMap<String, usize> = BTreeMap::new();
+        let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for var in self.entities.keys() {
+            in_degree.insert(var.clone(), 0);
+        }
+        for (var, entity) in &self.entities {
+            let mut seen: HashSet<&str> = HashSet::new();
+            for dep in entity.deps() {
+                if dep == var.as_str() || !self.entities.contains_key(dep) || !seen.insert(dep) {
+                    continue;
+                }
+                *in_degree.get_mut(var).unwrap() += 1;
+                dependents
+                    .entry(dep.to_string())
+                    .or_default()
+                    .push(var.clone());
+            }
+        }
+
+        let mut queue: std::collections::VecDeque<String> = in_degree
+            .iter()
+            .filter(|(_, &d)| d == 0)
+            .map(|(v, _)| v.clone())
+            .collect();
+        let mut order: Vec<String> = Vec::with_capacity(self.entities.len());
+        while let Some(var) = queue.pop_front() {
+            order.push(var.clone());
+            if let Some(deps_of) = dependents.get(&var) {
+                for dep in deps_of {
+                    let d = in_degree.get_mut(dep).unwrap();
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push_back(dep.clone());
+                    }
+                }
+            }
+        }
+
+        if order.len() != self.entities.len() {
+            let placed: HashSet<&str> = order.iter().map(String::as_str).collect();
+            let mut cyclic: Vec<&str> = self
+                .entities
+                .keys()
+                .map(String::as_str)
+                .filter(|v| !placed.contains(v))
+                .collect();
+            cyclic.sort();
+            anyhow::bail!(
+                "WAC plan has dependency cycles among: [{}]",
+                cyclic.join(", ")
+            );
+        }
+        Ok(order)
+    }
+}
+
 /// Generate WAC from a composition graph and a set of splicing rules.
 ///
 /// `node_paths` is `Some` for the multi-component path; when present each node's
@@ -107,8 +698,6 @@ pub fn generate_wac(
     // generator's `consumer_split_path` lookup, once from the wac-dep
     // map — because both paths call `resolve_shim` for the same shim.
     log_shim_resolutions(&shim_comps);
-
-    let mut wac_lines = vec![format!("package {pkg_name};")];
 
     let mut handled_interfaces = HashSet::new();
 
@@ -288,374 +877,29 @@ pub fn generate_wac(
         }
     }
 
-    // Let's now generate WAC to handle the chains we've planned to emit
-    let mut mdl_override = None;
-    let mut last = String::new();
-    let mut instance_vars: HashMap<u32, String> = HashMap::new();
-    // resolved_split_num -> wac var (dedup across same-file nodes).
-    let mut split_to_var: HashMap<usize, String> = HashMap::new();
-    // orig_inst_id -> generated_outer_var
-    let mut outer_instances: HashMap<u32, String> = HashMap::new();
-    // inst_id -> used_name
-    let mut used_comp_nodes: HashMap<u32, String> = HashMap::new();
-    // (used_name, path)
-    let mut used_middlewares: Vec<(String, String)> = Vec::new();
-    // Real-middleware wac vars already emitted via `let mdl = new
-    // my:mdl { ... };`. Multiple rules can inject the same
-    // middleware (different target interfaces share the same wrapped
-    // hooks), so we emit the `let` once and reuse the var.
-    let mut emitted_mdl_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Pre-instantiation pass for fan-in topologies.
-    //
-    // A node that only ever appears at position 0 (innermost) across all chains is a
-    // pure provider — it doesn't consume any chained interface itself and is never the
-    // target of middleware injection.  We instantiate these eagerly in ascending node-ID
-    // order (which is topological order for synthetically-built graphs) so that when a
-    // fan-in consumer node is first encountered, ALL of its provider deps are already in
-    // `instance_vars` and can be wired up correctly in a single `let` statement.
-    //
-    // Nodes that appear at any position > 0 in MORE THAN ONE chain are "fan-in
-    // consumers".  Their instantiation is deferred until after the chain pass so that
-    // every per-interface middleware is created first.  Without deferral the consumer
-    // would be instantiated in the first chain it appears in, hardwiring the raw
-    // provider before later chains have a chance to inject middleware.
-    let fan_in_consumers: HashSet<u32>;
-    {
-        let mut node_positions: HashMap<u32, BTreeSet<usize>> = HashMap::new();
-        for chain in &chains {
-            for (pos, &id) in chain.chain.iter().enumerate() {
-                node_positions.entry(id).or_default().insert(pos);
-            }
-        }
-
-        // Count how many chains each node appears in at a non-zero position.
-        let mut non_zero_chain_count: HashMap<u32, usize> = HashMap::new();
-        for chain in &chains {
-            for (pos, &id) in chain.chain.iter().enumerate() {
-                if pos > 0 {
-                    *non_zero_chain_count.entry(id).or_default() += 1;
-                }
-            }
-        }
-        fan_in_consumers = non_zero_chain_count
-            .into_iter()
-            .filter(|(_, n)| *n > 1)
-            .map(|(id, _)| id)
-            .collect();
-
-        let mut pure_providers: Vec<u32> = node_positions
-            .iter()
-            .filter(|(_, positions)| positions.iter().all(|&p| p == 0))
-            .map(|(&id, _)| id)
-            .collect();
-        pure_providers.sort(); // ascending = topological order for synthetic graphs
-
-        // Collect aliases assigned to pure-provider nodes by any rule so that nodes
-        // pre-instantiated here use the same name that the chain pass would assign.
-        let mut pre_pass_aliases: HashMap<u32, Option<String>> = HashMap::new();
-        for chain in &chains {
-            for (&id, alias) in &chain.aliases {
-                pre_pass_aliases.insert(id, alias.clone());
-            }
-        }
-
-        for node_id in pure_providers {
-            let node = &composition.nodes[&node_id];
-            get_or_create_inst(
-                node_id,
-                &pre_pass_aliases,
-                node,
-                &mut WacState {
-                    instance_vars: &mut instance_vars,
-                    used_comp_nodes: &mut used_comp_nodes,
-                    wac_lines: &mut wac_lines,
-                },
-                &mut ShimDedup {
-                    composition,
-                    shim_comps: &shim_comps,
-                    split_to_var: &mut split_to_var,
-                },
-                &None,
-            );
-        }
-    }
-
-    // Per fan-in consumer: the final provider var for each of its imported interfaces
-    // after middleware has been applied.  Populated during the chain pass below.
-    let mut fan_in_iface_vars: HashMap<u32, HashMap<String, String>> = HashMap::new();
-    // Aliases for fan-in consumers (first chain that sets them wins).
-    let mut fan_in_aliases: HashMap<u32, HashMap<u32, Option<String>>> = HashMap::new();
-    // Top-level export injects on fan-in consumers — drained after
-    // the fan-in instantiation pass.
-    let mut deferred_top_level_injects: Vec<DeferredTopLevelInject> = Vec::new();
-    // (consumer_id, export_name) → var to use in the final
-    // `export <var>["<name>"];` line, when middleware fronts the
-    // consumer's export.
-    let mut export_overrides: HashMap<(u32, String), String> = HashMap::new();
-
-    for Chain {
-        interface: chain_interface,
-        chain,
-        aliases,
-        inject_plan,
-    } in chains.iter()
-    {
-        for (i, id) in chain.iter().enumerate() {
-            let is_fan_in_last = fan_in_consumers.contains(id) && i == chain.len() - 1;
-
-            // Splicing on a top-level export of a fan-in consumer:
-            // defer to the post-fan-in pass so the consumer var
-            // exists when we wire the middleware.
-            if chain.len() == 1 && is_fan_in_last {
-                if let Some(middlewares) = inject_plan.get(&(i + 1)) {
-                    deferred_top_level_injects.push(DeferredTopLevelInject {
-                        consumer_id: *id,
-                        chain_interface: chain_interface.clone(),
-                        middlewares: middlewares.clone(),
-                    });
-                }
-                continue;
-            }
-
-            if !is_fan_in_last {
-                let node = &composition.nodes[id];
-                let node_var = get_or_create_inst(
-                    *id,
-                    aliases,
-                    node,
-                    &mut WacState {
-                        instance_vars: &mut instance_vars,
-                        used_comp_nodes: &mut used_comp_nodes,
-                        wac_lines: &mut wac_lines,
-                    },
-                    &mut ShimDedup {
-                        composition,
-                        shim_comps: &shim_comps,
-                        split_to_var: &mut split_to_var,
-                    },
-                    &mdl_override,
-                );
-                // set up what to wire in next
-                last = node_var;
-                mdl_override = Some((chain_interface.clone(), last.clone()));
-            }
-
-            if let Some(middlewares) = inject_plan.get(&(i + 1)) {
-                // if the NEXT node has a middleware BEFORE it, inject here!
-                // Reverse the list of items to inject (this keeps me from having to deal with this in the `wac` generation logic).
-                // Through doing this, the order of middlewares invoked will follow the order of declaration in the configuration.
-                let reversed_list = reverse_set(middlewares);
-                for mdl in reversed_list.iter() {
-                    if let Some(adapter_info) = &mdl.adapter_info {
-                        // instantiate the middleware+adapter in wac script
-                        let (adapter_var, extra_args) = create_tier1_mdl(
-                            &last,
-                            mdl,
-                            chain_interface,
-                            adapter_info,
-                            composition,
-                            &shim_comps,
-                            &mut wac_lines,
-                            &mut emitted_mdl_vars,
-                        )?;
-                        last = adapter_var;
-                        used_middlewares.extend(extra_args);
-                    } else {
-                        // instantiate the middleware in wac script
-                        last = create_mdl(&last, &mdl.name, chain_interface, &mut wac_lines);
-                        used_middlewares.push((
-                            last.clone(),
-                            mdl.path
-                                .as_ref()
-                                .cloned()
-                                .unwrap_or(PATH_PLACEHOLDER.to_string()),
-                        ));
-                    }
-                    mdl_override = Some((chain_interface.clone(), last.clone()));
-                }
-            }
-
-            if is_fan_in_last {
-                // Record the final provider var for this interface so we can wire it
-                // when the consumer is instantiated after all chains are processed.
-                fan_in_iface_vars
-                    .entry(*id)
-                    .or_default()
-                    .insert(chain_interface.name.clone(), last.clone());
-                fan_in_aliases.entry(*id).or_insert_with(|| aliases.clone());
-            } else if i == chain.len() - 1 {
-                // If we're at the end of the chain, remember what our outermost layer is now.
-                // This makes sure we actually export middleware if it overrode the outermost service.
-                outer_instances.insert(*id, last.clone());
-            }
-        }
-    }
-
-    // Deferred instantiation of fan-in consumers.
-    //
-    // Now that every per-interface middleware has been created, we can instantiate
-    // each fan-in consumer once with all of its imports wired correctly.
-    for (consumer_id, iface_vars) in fan_in_iface_vars.iter() {
-        let consumer_node = &composition.nodes[consumer_id];
-        let aliases = fan_in_aliases.get(consumer_id).unwrap();
-
-        let alias = aliases.get(consumer_id).cloned();
-        let pkg = if let Some(Some(a)) = alias {
-            a
-        } else {
-            sanitize_wac_id(get_name(consumer_node))
-        };
-        used_comp_nodes.insert(*consumer_id, pkg.clone());
-        let node_var = instance_vars
-            .entry(*consumer_id)
-            .or_insert_with(|| pkg.clone())
-            .clone();
-
-        let mut line = format!("let {node_var} = new {INST_PREFIX}:{pkg} {{");
-        for conn in &consumer_node.imports {
-            if !conn.is_host_import {
-                let iface = &conn.interface_name;
-                let src_var = if let Some(v) = iface_vars.get(iface) {
-                    v.clone()
-                } else if let Some(v) = conn.source_instance.and_then(|id| instance_vars.get(&id)) {
-                    v.clone()
-                } else {
-                    continue;
-                };
-                line.push_str(&format!("\n    \"{iface}\": {src_var}[\"{iface}\"],"));
-            }
-        }
-        line.push_str("\n    ...\n};");
-        wac_lines.push(line);
-
-        outer_instances.insert(*consumer_id, node_var.clone());
-    }
-
-    // Drain deferred top-level-export injects.
-    for deferred in deferred_top_level_injects {
-        let Some(consumer_var) = instance_vars.get(&deferred.consumer_id).cloned() else {
-            anyhow::bail!(
-                "deferred top-level inject for instance {} but no var was created \
-                 (fan-in pass should have instantiated it); please file a bug",
-                deferred.consumer_id
-            );
-        };
-        let mut current_provider = consumer_var;
-        for mdl in reverse_set(&deferred.middlewares).iter() {
-            if let Some(adapter_info) = &mdl.adapter_info {
-                let (adapter_var, extra_args) = create_tier1_mdl(
-                    &current_provider,
-                    mdl,
-                    &deferred.chain_interface,
-                    adapter_info,
-                    composition,
-                    &shim_comps,
-                    &mut wac_lines,
-                    &mut emitted_mdl_vars,
-                )?;
-                current_provider = adapter_var;
-                used_middlewares.extend(extra_args);
-            } else {
-                current_provider = create_mdl(
-                    &current_provider,
-                    &mdl.name,
-                    &deferred.chain_interface,
-                    &mut wac_lines,
-                );
-                used_middlewares.push((
-                    current_provider.clone(),
-                    mdl.path
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or(PATH_PLACEHOLDER.to_string()),
-                ));
-            }
-        }
-        // Final adapter wraps the consumer for this export — re-route
-        // the export line through it.
-        export_overrides.insert(
-            (deferred.consumer_id, deferred.chain_interface.name),
-            current_provider,
-        );
-    }
-
-    // Generate WAC to export the appropriate functions
-    for (
-        export_name,
-        ExportInfo {
-            source_instance: outer_inst_id,
-            ..
-        },
-    ) in composition.component_exports.iter()
-    {
-        // A shim sub-component that provides an interface to another node in the
-        // graph will appear in `handled_interfaces` (the interface is internal
-        // wiring) but NOT in `outer_instances` (it is not the outermost node of
-        // its chain).  If such a node is also present in `component_exports` it
-        // is a spurious root-level export produced when wac compose flattens
-        // shim sub-components to the peer level.  Exporting it would reference
-        // the wrong (intermediate) instance, so we skip it here.
-        //
-        // Legitimate final exports (e.g. srv re-exporting an interface it
-        // consumes from a provider) ARE in `outer_instances` (srv is the last
-        // node of its chain), so they pass this check.
-        if handled_interfaces.contains(export_name) && !outer_instances.contains_key(outer_inst_id)
-        {
-            continue;
-        }
-
-        // If the export's source is a shim sub-component, route the
-        // export through its resolved outer instance — otherwise the
-        // export creates a separate shim instance whose resource type
-        // identity diverges from the outer's. (Mirrors the shim
-        // resolution `consumer_split_path` already does for splits.)
-        let effective_inst_id = resolve_shim_node(*outer_inst_id, composition, &shim_comps);
-
-        // Per-export override (set by the deferred top-level inject
-        // pass) wins over the consumer's generic outer-instance var.
-        let node_var = if let Some(override_var) =
-            export_overrides.get(&(effective_inst_id, export_name.clone()))
-        {
-            override_var.clone()
-        } else if let Some(generated_outer) = outer_instances.get(&effective_inst_id) {
-            generated_outer.clone()
-        } else {
-            let outer_node = &composition.nodes[&effective_inst_id];
-            get_or_create_inst(
-                effective_inst_id,
-                &HashMap::new(),
-                outer_node,
-                &mut WacState {
-                    instance_vars: &mut instance_vars,
-                    used_comp_nodes: &mut used_comp_nodes,
-                    wac_lines: &mut wac_lines,
-                },
-                &mut ShimDedup {
-                    composition,
-                    shim_comps: &shim_comps,
-                    split_to_var: &mut split_to_var,
-                },
-                &None,
-            )
-        };
-
-        let export_line = format!("export {node_var}[\"{export_name}\"];");
-        wac_lines.push(export_line);
-    }
-
-    // Create the wac command arguments!
+    // Plan + render. The plan accumulates entities and routing data
+    // without committing to an order; the renderer topo-sorts and emits
+    // `let` lines in dependency order. This is what lets a "middle"
+    // node (provider on one boundary, consumer on another) receive the
+    // right wiring regardless of which chain visits it first.
+    let plan = EmitPlan::new()
+        .with_aliases(&chains)
+        .with_node_vars(composition, &chains, &shim_comps)
+        .with_chain_routing(&chains, composition, &shim_comps)?
+        .with_node_entities(composition, &shim_comps)?
+        .with_exports(composition, &chains, &handled_interfaces, &shim_comps);
+    let wac = plan.render(pkg_name)?;
     let args = gen_wac_args(
         shim_comps,
         splits_path,
         composition,
-        &used_comp_nodes,
-        &used_middlewares,
+        &plan.used_comp_nodes,
+        &plan.used_middlewares,
         node_paths,
     );
 
     Ok(WacOutput {
-        wac: wac_lines.join("\n\n"),
+        wac,
         wac_deps: args,
         diagnostics,
         generated_adapters,
@@ -671,7 +915,7 @@ fn gen_wac_args(
     splits_path: &str,
     graph: &CompositionGraph,
     used_comps: &HashMap<u32, String>,
-    used_mdls: &Vec<(String, String)>,
+    used_mdls: &BTreeMap<String, String>,
     node_paths: Option<&HashMap<u32, PathBuf>>,
 ) -> BTreeMap<String, PathBuf> {
     let mut deps: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -691,13 +935,13 @@ fn gen_wac_args(
         deps.insert(format!("{INST_PREFIX}:{name}"), comp_path);
     }
 
-    // handle the used middlewares
     for (mw_name, mw_path) in used_mdls {
         deps.insert(format!("{INST_PREFIX}:{mw_name}"), PathBuf::from(mw_path));
     }
 
     deps
 }
+
 /// Pure: follow the shim chain until landing on a non-shim split.
 /// See [`log_shim_resolutions`] for the debug-level notice that
 /// fires once per non-trivial resolution at the top of [`generate_wac`].
@@ -744,14 +988,6 @@ fn log_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
             );
         }
     }
-}
-
-/// Middleware to wire in after the fan-in pass instantiates the
-/// consumer that exports `chain_interface`.
-struct DeferredTopLevelInject {
-    consumer_id: u32,
-    chain_interface: Contract,
-    middlewares: IndexSet<Injection>,
 }
 
 /// Return value from rule application functions.
@@ -1041,220 +1277,6 @@ fn add_to_inject_plan(
 
     middlewares.extend(resolved);
     Ok(final_results)
-}
-
-/// Shim-resolution context (compose graph + shim map + dedup map).
-struct ShimDedup<'a> {
-    composition: &'a CompositionGraph,
-    shim_comps: &'a HashMap<usize, usize>,
-    /// resolved_split_num -> wac instance var.
-    split_to_var: &'a mut HashMap<usize, String>,
-}
-
-/// Mutable wac-builder state shared across instance creation.
-struct WacState<'a> {
-    instance_vars: &'a mut HashMap<u32, String>,
-    used_comp_nodes: &'a mut HashMap<u32, String>,
-    wac_lines: &'a mut Vec<String>,
-}
-
-fn get_or_create_inst(
-    inst_id: u32,
-    aliases: &HashMap<u32, Option<String>>,
-    node: &ComponentNode,
-    state: &mut WacState,
-    dedup: &mut ShimDedup,
-    with_override: &Option<(Contract, String)>,
-) -> String {
-    if let Some(var) = state.instance_vars.get(&inst_id) {
-        return var.clone();
-    }
-    // Dedup nodes that resolve to the same split file: separate `new`
-    // invocations would create independent runtime instances with
-    // diverged resource type identities.
-    let resolved_split = resolved_split_num(inst_id, dedup.composition, dedup.shim_comps);
-    if let Some(existing_var) = dedup.split_to_var.get(&resolved_split) {
-        state.instance_vars.insert(inst_id, existing_var.clone());
-        return existing_var.clone();
-    }
-
-    let alias = aliases.get(&inst_id).cloned();
-
-    // it hasn't been instantiated yet! do so here
-    let pkg = if let Some(Some(alias)) = alias {
-        alias.clone()
-    } else {
-        sanitize_wac_id(get_name(node))
-    };
-    state.used_comp_nodes.insert(inst_id, pkg.clone());
-    let node_var = state
-        .instance_vars
-        .entry(inst_id)
-        .or_insert_with(|| pkg.clone())
-        .clone();
-    dedup.split_to_var.insert(resolved_split, node_var.clone());
-
-    let mut line = format!("let {node_var} = new {INST_PREFIX}:{pkg} {{");
-    for conn in &node.imports {
-        if !conn.is_host_import {
-            let src_id = conn.source_instance;
-            if let Some((
-                Contract {
-                    name: override_interface,
-                    ..
-                },
-                override_var,
-            )) = &with_override
-            {
-                let src_var = if conn.interface_name == *override_interface {
-                    override_var.clone()
-                } else if let Some(src_var) = state.instance_vars.get(&src_id.unwrap()) {
-                    // could be an import from the host!
-                    // only do this if it's not
-                    src_var.clone()
-                } else {
-                    continue;
-                };
-                line.push_str(&format!(
-                    "\n    \"{iface}\": {src}[\"{iface}\"],",
-                    iface = conn.interface_name,
-                    src = src_var
-                ));
-            }
-        }
-    }
-    line.push_str("\n    ...\n};");
-    state.wac_lines.push(line);
-
-    node_var
-}
-
-fn create_mdl(
-    input_inst: &String,
-    mw: &String,
-    interface: &Contract,
-    wac_lines: &mut Vec<String>,
-) -> String {
-    let mw_line = format!(
-        "let {mw} = new {INST_PREFIX}:{mw} {{\n    \"{interface}\": {input_inst}[\"{interface}\"], ...\n}};",
-        interface = interface.name,
-    );
-    wac_lines.push(mw_line);
-
-    mw.clone()
-}
-
-/// Emit WAC for a tier-1 adapter injection: two instances — the real middleware
-/// (host-imports only) and the generated adapter wrapper that wires both.
-///
-/// Returns `(adapter_var_name, [(pkg_name, path), ...])` where the vec has two
-/// entries: one for the real middleware and one for the adapter component.
-#[allow(clippy::too_many_arguments)]
-fn create_tier1_mdl(
-    downstream_inst: &str,
-    mdl: &Injection,
-    interface: &Contract,
-    adapter_info: &AdapterInjectionInfo,
-    composition: &CompositionGraph,
-    shim_comps: &HashMap<usize, usize>,
-    wac_lines: &mut Vec<String>,
-    emitted_mdl_vars: &mut std::collections::HashSet<String>,
-) -> anyhow::Result<(String, Vec<(String, String)>)> {
-    let real_var = mdl.name.clone();
-    // The adapter's core-wasm signature is specialized per target
-    // interface, so a single middleware injected on multiple rules
-    // must produce distinct adapter packages — one per interface —
-    // or the generated wac's `deps` map collides under one pkg name
-    // and only the last-generated adapter wasm reaches wac compose.
-    let adapter_var = format!("{}-adapter-{}", mdl.name, sanitize_wac_id(&interface.name));
-
-    let config_provider_var = mdl
-        .config_provider_path
-        .as_ref()
-        .map(|_| format!("{real_var}-config"));
-
-    // Real middleware. Substrate-consuming builtins need their
-    // patched provider wired explicitly — the host doesn't satisfy
-    // `splicer:builtin-config`. Emit once per mdl.name; adapters on
-    // later rules reuse the vars.
-    if emitted_mdl_vars.insert(real_var.clone()) {
-        if let Some(cfg_var) = config_provider_var.as_ref() {
-            wac_lines.push(format!(
-                "let {cfg_var} = new {INST_PREFIX}:{cfg_var} {{ ... }};"
-            ));
-            wac_lines.push(format!(
-                "let {real_var} = new {INST_PREFIX}:{real_var} {{\n    \
-                 \"{cfg_key}\": {cfg_var}[\"{cfg_key}\"],\n    ...\n}};",
-                cfg_key = crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED,
-            ));
-        } else {
-            wac_lines.push(format!(
-                "let {real_var} = new {INST_PREFIX}:{real_var} {{ ... }};"
-            ));
-        }
-    }
-
-    // Proxy — wires the downstream target interface and the hook interfaces
-    // from the real middleware instance. The adapter's hook imports are versioned,
-    // so the WAC lines use the versioned names to match both sides. Each hook
-    // interface is versioned by its own tier (tier-1 and tier-2 may evolve
-    // independently), detected by the `splicer:tierN/` package prefix.
-    use crate::contract::{
-        versioned_interface, TIER1_PACKAGE, TIER1_VERSION, TIER2_PACKAGE, TIER2_VERSION,
-    };
-    let mut adapter_line = format!(
-        "let {adapter_var} = new {INST_PREFIX}:{adapter_var} {{\n    \"{iface}\": {downstream_inst}[\"{iface}\"],",
-        iface = interface.name,
-    );
-    for hook_iface in &adapter_info.matched_hook_interfaces {
-        let version = if hook_iface.starts_with(&format!("{TIER1_PACKAGE}/")) {
-            TIER1_VERSION
-        } else if hook_iface.starts_with(&format!("{TIER2_PACKAGE}/")) {
-            TIER2_VERSION
-        } else {
-            anyhow::bail!(
-                "matched hook interface '{hook_iface}' is not part of any known tier package",
-            );
-        };
-        let versioned = versioned_interface(hook_iface, version);
-        adapter_line.push_str(&format!(
-            "\n    \"{versioned}\": {real_var}[\"{versioned}\"],"
-        ));
-    }
-    // Wire resource-bearing factored-types imports (e.g. `my:shape/types`)
-    // explicitly — `...` doesn't unify resource type identity across
-    // separately-imported instances from a non-host component.
-    if let Ok(adapter_bytes) = std::fs::read(&adapter_info.adapter_path) {
-        for extra in factored_types_to_wire(
-            &resource_bearing_imports(&adapter_bytes),
-            &interface.name,
-            composition,
-            shim_comps,
-        )? {
-            adapter_line.push_str(&format!(
-                "\n    \"{extra}\": {downstream_inst}[\"{extra}\"],"
-            ));
-        }
-    }
-    adapter_line.push_str("\n    ...\n};");
-    wac_lines.push(adapter_line);
-
-    let mut used = vec![
-        (
-            real_var,
-            mdl.path
-                .as_ref()
-                .cloned()
-                .unwrap_or(PATH_PLACEHOLDER.to_string()),
-        ),
-        (adapter_var.clone(), adapter_info.adapter_path.clone()),
-    ];
-    if let (Some(cfg_var), Some(cfg_path)) =
-        (config_provider_var, mdl.config_provider_path.as_ref())
-    {
-        used.push((cfg_var, cfg_path.clone()));
-    }
-    Ok((adapter_var, used))
 }
 
 fn rule_interface(rule: &SpliceRule) -> &str {
@@ -1549,14 +1571,6 @@ fn sanitize_wac_id(raw: &str) -> String {
         .join("-")
 }
 
-fn reverse_set(set: &IndexSet<Injection>) -> Vec<Injection> {
-    let mut res = vec![];
-    for item in set.iter() {
-        res.insert(0, item.clone());
-    }
-    res
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1667,114 +1681,231 @@ mod tests {
 
     // ── splicer:builtin-config provider wiring ───────────────────────
 
-    /// `create_tier1_mdl` with `config_provider_path` set must emit
-    /// the patched provider instance and wire its `get` export into
-    /// the real middleware's import.
+    /// Write a minimal valid component to a unique temp path and return
+    /// it. `add_middleware` reads the adapter wasm to discover
+    /// resource-bearing imports, so unit tests targeting it need a real
+    /// file on disk.
+    fn write_minimal_component(name: &str) -> String {
+        let bytes = wat::parse_str("(component)").expect("compile minimal component");
+        let path =
+            std::env::temp_dir().join(format!("splicer-test-{}-{}.wasm", name, std::process::id()));
+        std::fs::write(&path, bytes).expect("write tempfile");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// With `config_provider_path` set, [`EmitPlan::add_middleware`]
+    /// emits the patched provider as its own entity and wires its
+    /// `get` export into the real middleware's import.
     #[test]
     fn config_provider_wired_when_path_set() {
         use crate::parse::config::{AdapterInjectionInfo, Injection};
+        let cfg_path = write_minimal_component("metrics-config");
+        let adapter_path = write_minimal_component("metrics-adapter");
         let mdl = Injection {
             name: "metrics".to_string(),
             path: Some("/tmp/metrics.wasm".to_string()),
             builtin: Some("otel-bare-metrics".to_string()),
             builtin_config: Default::default(),
-            config_provider_path: Some("/tmp/metrics-config.wasm".to_string()),
-            adapter_info: None,
-        };
-        let adapter_info = AdapterInjectionInfo {
-            adapter_path: "/tmp/metrics-adapter.wasm".to_string(),
-            matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
+            config_provider_path: Some(cfg_path.clone()),
+            adapter_info: Some(AdapterInjectionInfo {
+                adapter_path,
+                matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
+            }),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
             ty_fingerprint: None,
         };
         let graph = synth_graph(1, &[]);
-        let mut lines: Vec<String> = Vec::new();
-        let mut emitted: std::collections::HashSet<String> = Default::default();
-        let (_adapter_var, used) = create_tier1_mdl(
-            "downstream",
-            &mdl,
-            &contract,
-            &adapter_info,
-            &graph,
-            &HashMap::new(),
-            &mut lines,
-            &mut emitted,
-        )
-        .expect("emit");
+        let mut plan = EmitPlan::new();
+        let _adapter_var = plan
+            .add_middleware(&mdl, &contract, "downstream", &graph, &HashMap::new())
+            .expect("plan");
 
-        let wac = lines.join("\n");
+        let cfg = plan
+            .entities
+            .get("metrics-config")
+            .expect("config provider entity must be added");
         assert!(
-            wac.contains("let metrics-config = new my:metrics-config { ... };"),
-            "config provider instance must be emitted; got:\n{wac}"
-        );
-        assert!(
-            wac.contains(
-                "let metrics = new my:metrics {\n    \
-                 \"splicer:builtin-config/get@0.1.0\": metrics-config[\"splicer:builtin-config/get@0.1.0\"]"
-            ),
-            "real middleware must wire the provider's get export; got:\n{wac}"
+            cfg.imports.is_empty() && cfg.catchall,
+            "config provider should be `{{ ... }}` form; got: {cfg:?}"
         );
 
-        // The `used` vec drives wac_deps; the config provider's path
-        // must be present so wac compose can find the patched bytes.
+        let real = plan
+            .entities
+            .get("metrics")
+            .expect("real middleware entity must be added");
         assert!(
-            used.iter()
-                .any(|(name, path)| name == "metrics-config" && path == "/tmp/metrics-config.wasm"),
-            "config provider must be registered in wac_deps; got: {used:?}"
+            real.imports
+                .iter()
+                .any(|(iface, src)| iface == "splicer:builtin-config/get@0.1.0"
+                    && src == "metrics-config"),
+            "real middleware must wire the provider's `get` export; got: {real:?}"
+        );
+
+        // wac_deps must include the patched provider so wac compose can
+        // find its bytes.
+        assert!(
+            plan.used_middlewares
+                .iter()
+                .any(|(name, path)| name == "metrics-config" && path == &cfg_path),
+            "config provider must be registered in used_middlewares; got: {:?}",
+            plan.used_middlewares
         );
     }
 
-    /// Without `config_provider_path`, the real-mdl line is the
+    /// Without `config_provider_path`, the real middleware is the
     /// unchanged `{ ... }` form — every existing tier-1 builtin
     /// (hello-tier1, otel-bare-spans) must keep working.
     #[test]
     fn config_provider_not_wired_when_path_unset() {
         use crate::parse::config::{AdapterInjectionInfo, Injection};
+        let adapter_path = write_minimal_component("hello-adapter");
         let mdl = Injection {
             name: "hello".to_string(),
             path: Some("/tmp/hello.wasm".to_string()),
             builtin: Some("hello-tier1".to_string()),
             builtin_config: Default::default(),
             config_provider_path: None,
-            adapter_info: None,
-        };
-        let adapter_info = AdapterInjectionInfo {
-            adapter_path: "/tmp/hello-adapter.wasm".to_string(),
-            matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
+            adapter_info: Some(AdapterInjectionInfo {
+                adapter_path,
+                matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
+            }),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
             ty_fingerprint: None,
         };
         let graph = synth_graph(1, &[]);
-        let mut lines: Vec<String> = Vec::new();
-        let mut emitted: std::collections::HashSet<String> = Default::default();
-        let (_adapter_var, used) = create_tier1_mdl(
-            "downstream",
-            &mdl,
-            &contract,
-            &adapter_info,
-            &graph,
-            &HashMap::new(),
-            &mut lines,
-            &mut emitted,
-        )
-        .expect("emit");
+        let mut plan = EmitPlan::new();
+        let _adapter_var = plan
+            .add_middleware(&mdl, &contract, "downstream", &graph, &HashMap::new())
+            .expect("plan");
 
-        let wac = lines.join("\n");
+        let real = plan
+            .entities
+            .get("hello")
+            .expect("real middleware entity must be added");
         assert!(
-            wac.contains("let hello = new my:hello { ... };"),
-            "real middleware should keep the unchanged `{{ ... }}` form; got:\n{wac}"
+            real.imports.is_empty() && real.catchall,
+            "real middleware should be `{{ ... }}` form; got: {real:?}"
         );
         assert!(
-            !wac.contains("hello-config"),
-            "no config provider instance should be emitted; got:\n{wac}"
+            !plan.entities.contains_key("hello-config"),
+            "no config provider entity should be added; got entities: {:?}",
+            plan.entities.keys().collect::<Vec<_>>()
         );
         assert!(
-            used.iter().all(|(name, _)| name != "hello-config"),
-            "no config provider should appear in wac_deps; got: {used:?}"
+            plan.used_middlewares
+                .iter()
+                .all(|(name, _)| name != "hello-config"),
+            "no config provider should appear in used_middlewares; got: {:?}",
+            plan.used_middlewares
+        );
+    }
+
+    // ── chain pass: middle node that is both consumer and provider ──
+
+    /// A "middle" node that PROVIDES one interface to its parent AND
+    /// CONSUMES a different interface from a child must still get its
+    /// child-side import re-routed through middleware injected by a
+    /// `before` rule on that child interface.
+    ///
+    /// Topology:
+    ///     inner ── test:demo/inner ──▶ middle ── test:demo/middle ──▶ outer
+    /// Rule:
+    ///     before: test:demo/inner, provider=inner  →  inject `mw`
+    /// Expected:
+    ///     `let middle = new my:middle { "test:demo/inner": mw[...], ... };`
+    /// Actual (bug):
+    ///     middle is greedy-instantiated by the outer-side chain
+    ///     before the inner-side chain runs, so the override is
+    ///     silently dropped. The `mw` instance is emitted but never
+    ///     wired into middle.
+    #[test]
+    fn middle_node_consumer_import_routes_through_inner_middleware() {
+        use crate::parse::config::{Injection, SpliceRule};
+        use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
+
+        let mut graph = CompositionGraph::new();
+
+        // node 0 = inner (leaf provider).
+        graph.add_node(0, ComponentNode::new("$inner".to_string(), 0, 0));
+
+        // node 1 = middle (consumes inner, provides middle iface).
+        let mut middle = ComponentNode::new("$middle".to_string(), 1, 1);
+        middle.add_import(InterfaceConnection {
+            interface_name: "test:demo/inner".to_string(),
+            source_instance: Some(0),
+            is_host_import: false,
+            fingerprint: None,
+            interface_type: None,
+        });
+        graph.add_node(1, middle);
+
+        // node 2 = outer (consumes middle, provides top-level export).
+        let mut outer = ComponentNode::new("$outer".to_string(), 2, 2);
+        outer.add_import(InterfaceConnection {
+            interface_name: "test:demo/middle".to_string(),
+            source_instance: Some(1),
+            is_host_import: false,
+            fingerprint: None,
+            interface_type: None,
+        });
+        graph.add_node(2, outer);
+
+        // Anchor for the export pass — composition must export
+        // something for `generate_wac` to terminate normally.
+        graph.add_export("test:demo/outer".to_string(), 2, None);
+
+        // `path: None` so contract validation degrades to a Warn and
+        // the chain pass uses the simple `create_mdl` path (no fs /
+        // adapter generation).
+        let rules = vec![SpliceRule::Before {
+            interface: "test:demo/inner".to_string(),
+            provider_name: Some("inner".to_string()),
+            provider_alias: None,
+            inject: vec![Injection {
+                name: "mw".to_string(),
+                path: None,
+                builtin: None,
+                builtin_config: Default::default(),
+                config_provider_path: None,
+                adapter_info: None,
+            }],
+        }];
+
+        let out = generate_wac(
+            HashMap::new(),
+            "/tmp/splicer-test-splits",
+            &graph,
+            &rules,
+            None,
+            "test:nested",
+        )
+        .expect("generate_wac");
+
+        assert!(
+            out.wac.contains("let mw = new my:mw {"),
+            "mw middleware var must be emitted; got:\n{}",
+            out.wac
+        );
+
+        let start = out
+            .wac
+            .find("let middle = new my:middle")
+            .expect("middle instance must be emitted");
+        let end = out.wac[start..]
+            .find("};")
+            .expect("middle block must close");
+        let middle_block = &out.wac[start..start + end];
+
+        assert!(
+            middle_block.contains("\"test:demo/inner\": mw[\"test:demo/inner\"]"),
+            "middle must wire `test:demo/inner` through the injected \
+             `mw` middleware (the inner `before` rule), but it doesn't. \
+             middle block:\n{middle_block}\n\nFull WAC:\n{}",
+            out.wac
         );
     }
 }
