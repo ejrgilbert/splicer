@@ -4,8 +4,7 @@
 //! suitable for logging or composing into a higher-level renderer.
 //!
 //! Panics on out-of-bounds child / side-table indices as those signal
-//! a splicer codegen contract violation, not a user-recoverable
-//! condition.
+//! a field-tree contract violation, not a user-recoverable condition.
 
 use crate::types::{Cell, FieldTree};
 
@@ -111,7 +110,7 @@ pub fn format_field_tree(tree: &FieldTree) -> String {
 fn side_table_get<'a, T>(table: &'a [T], idx: u32, name: &'static str) -> &'a T {
     table.get(idx as usize).unwrap_or_else(|| {
         panic!(
-            "{name} index {idx} out of bounds (len = {}); splicer codegen contract violation",
+            "{name} index {idx} out of bounds (len = {}); field-tree contract violation",
             table.len()
         )
     })

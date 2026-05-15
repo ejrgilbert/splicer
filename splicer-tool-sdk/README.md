@@ -62,7 +62,5 @@ strategies don't (splicer runs wit-bindgen for you at splice-time).
 
 ## API reference
 
-See [splicer-tool-sdk docs](https://crates.io/crates/wirm) for the
-full public API. The crate is organized into `types` (canonical
-mirrors of `splicer:common/types`), `strategy` (tier-3/4 traits), and
-helper modules built on top of them.
+See [docs.rs/splicer-tool-sdk](https://docs.rs/splicer-tool-sdk) for
+the full public API.
