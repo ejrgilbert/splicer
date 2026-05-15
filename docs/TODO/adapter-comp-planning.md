@@ -226,33 +226,27 @@ happen; revisit when upstream lands the event semantics.
 
 ## Per-tier performance characterization
 
-Every tier above 1 lifts canonical-ABI values into `field-value`
-trees on every call, then (for tier 3) lowers them back. That cost
-scales with payload size, not just call count.
+Nothing is benchmarked. No `bench/` directory exists. Tier 2 lifts
+canonical-ABI values into `field-value` trees on every call (tier 3
+will also lower them back), so cost scales with payload size, not
+just call count — worth measuring before locking in tier-3 / tier-4
+design choices.
 
-Worth measuring before locking in the design:
-
-- **Tier 1 baseline.** Sub-microsecond per hook call on a mid-size
-  multi-function interface. Already in the perf doc.
-- **Tier 2 per-call lifting.** How does it scale with payload size?
-  A 1MB HTTP body should hit the `bytes` fast path (no per-element
-  variant boxing); a 10k-element `list<u32>` won't. Need numbers for
-  representative shapes.
+- **Tier 1 baseline.** Per-hook overhead on a representative
+  multi-function interface.
+- **Tier 2 per-call lifting vs payload size.** A 1MB HTTP body should
+  hit the `bytes` fast path (no per-element variant boxing); a
+  10k-element `list<u32>` won't. Need numbers for representative shapes.
 - **Tier 2 multi-boundary recording overhead.** When a single
-  `wasi:http::handle` invocation triggers 50 inner calls on
-  `wasi:http/types` + `wasi:keyvalue` + `wasi:filesystem`, the
-  recorder pays the lift cost on every one. Aggregate cost matters
+  `wasi:http::handle` triggers 50 inner calls on `wasi:http/types` +
+  `wasi:keyvalue` + `wasi:filesystem`, aggregate lift cost matters
   more than per-call.
-- **Tier 3 round-trip cost.** Lifting + middleware processing +
-  lowering back. Probably 2× tier 2 plus the middleware's own work.
-- **Tier 4 vs direct call.** A tier-4 middleware replaces the
-  downstream, so the relevant comparison isn't "wrapping overhead"
-  but "would the same logic written as a normal component be
-  faster?" The answer should be "no, modulo the lift overhead on the
-  way in," but worth confirming.
-
-Action: add benchmarks to `bench/` once tier 2 lands. Don't design
-tier 3 / 4 around a perf model that hasn't been measured.
+- **Tier 3 round-trip cost.** Lift + middleware + lower-back; probably
+  2× tier 2 plus the middleware's own work.
+- **Tier 4 vs direct call.** Tier 4 replaces the downstream, so the
+  comparison is "would the same logic written as a normal component
+  be faster?" Should be "no, modulo entry-side lift overhead," but
+  worth pinning.
 
 ## The "one-per-signature" case
 
@@ -396,94 +390,55 @@ Open design questions for when we revisit:
 
 ## Built-in middleware keyword
 
-Today, adding any middleware means the user writes a component
-(`wit-bindgen::generate!`, implement the tier-1 guest traits, compile
-to wasm, point the YAML at the file). That's a lot of ceremony for
-well-known cases like tracing, logging, OpenTelemetry spans, or
-fuzzing where the middleware's behavior is entirely standard.
-
-### Sketch
-
-A `builtin:` keyword in the YAML that names a splicer-provided
-middleware. No file path, no hand-authored component:
+The `builtin: <name>` keyword and its supporting substrate have
+shipped. Users reference splicer-provided middleware in YAML:
 
 ```yaml
 rules:
   - before:
       interface: wasi:http/handler@0.3.0
     inject:
-      - builtin: logging
-      - builtin: otel
+      - builtin: otel-bare-spans
+      - builtin: otel-bare-metrics
         config:
-          endpoint: http://collector:4317
-          service_name: my-svc
-      - name: my-custom-mdl        # hand-authored still works alongside
+          aggregation: cumulative
+      - name: my-custom-mdl
         path: ./mine.wasm
 ```
 
-Splicer resolves `builtin: X` to either a pre-built component it
-ships with, or a generated one — transparently to the user. The
-interesting entries cover different mechanisms:
+What's in place:
 
-- **`logging` / `tracing`** — pure tier 1 (name-only). Ship as
-  a bundled `.wasm` blob in the splicer binary. The current
-  `otel-bare-logs` / `otel-bare-spans` / `otel-bare-metrics`
-  builtins under `builtins/` already cover this shape.
-- **`otel`** — tier 2 (value-aware spans with request fields).
-  Tier 2 has shipped, so the gate is open; the value-aware
-  builtins can now be authored.
-- **`fuzz` / `mock`** — one-per-sig. Generated via the Rust-codegen
-  path described in the "one-per-signature" section above.
+- Parser surface — `Injection::builtin` + `Injection::builtin_config`
+  in `src/parse/config.rs`.
+- Resolution — `src/builtins.rs` resolves in order: local override
+  (`SPLICER_BUILTINS_DIR`), on-disk cache, OCI pull from
+  `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>`.
+- Typed config — each builtin embeds a manifest section (see
+  `builtins/builtin-manifest/`); the splice-time validator type-checks
+  user-supplied `config:` keys against it.
+- Runtime config delivery — `splicer:builtin-config/get` substrate.
+  Splicer materializes a patched config provider next to the builtin
+  when its manifest declares config keys.
+- Shipped user-facing builtins: `hello-tier1`, `hello-tier2`,
+  `otel-bare-logs`, `otel-bare-metrics`, `otel-bare-spans`.
+- Internal-only template: `config-provider` (splicer-managed; not
+  user-referenceable).
 
-### Open design questions for when we revisit
+### Remaining work
 
-- **Where do built-in components live?** Embedded in the splicer
-  binary (simple, but grows binary size and forces lockstep versioning)
-  vs. a separate registry of published components fetched on first
-  use (leaner binary, but adds a network + supply-chain surface) vs.
-  a sibling crate that builds them locally (clean from-source, awkward
-  for `cargo install` distribution).
-- **Typed vs free-form config.** Typed per-builtin gives us
-  compile-time-like validation of `config:` keys (misspell `endpoint`
-  as `endoint` and get a parse error, not a runtime surprise) but
-  requires a Serde schema per builtin. Free-form map is simpler to
-  implement but offers no validation. For the UX goal here, typed
-  seems to win.
-- **How does config reach the component at runtime?** `wasi:config/store`
-  imports, a bundled data segment, env vars, or custom component-level
-  imports splicer wires up at compose time. Each option has different
-  implications for what the built-in component itself looks like and
-  whether the same mechanism generalizes across all builtins.
-- **Do users see the tier?** `builtin: logging` vs. `builtin: { kind:
-  tier1, name: logging }`. The point of built-ins is UX, so leaning
-  transparent — the tier is a static property of the registry entry.
-- **Namespacing / extensibility.** `builtin: otel` (bare) vs.
-  `builtin: splicer:otel` (namespaced). Matters if we ever want
-  third-party built-in registries. For v1: bare names, splicer owns
-  the namespace, design extensibility later.
-- **Composition / ordering.** Already free via the existing
-  `inject: [...]` list — each entry picks `builtin:` or `name: +
-  path:` independently, ordering drives the call stack the same way
-  it does today.
-- **MVP scope.** Probably pick two that exercise different paths —
-  one bundled (`logging` proves the embedded-blob path) and one
-  generated (`fuzz` proves the Rust-codegen path) — so both arms of
-  the design land at once. `otel` is the obvious third candidate
-  now that tier 2 has shipped.
-
-### Interaction with other planning items
-
-- **Tier 3 roadmap** — built-ins that need to *modify* values can't
-  ship until tier 3 does. Tier 2 (value observation) has shipped, so
-  value-aware read-only built-ins (otel, content-aware logging) are
-  unblocked.
-- **One-per-signature case** — `fuzz` / `mock` are the direct
-  motivating examples for that section's Rust-codegen path. If we
-  build built-ins before tier 2, the first generated built-in
-  exercises exactly that pipeline.
-- **Per-function interposition filter** — `funcs: [...]` should
-  compose with `builtin:` cleanly (e.g., run `otel` only on `handle`
-  but not `ping`). No design conflict, just a test-matrix entry.
+- **`fuzz` / `mock` builtins.** The one-per-sig case (see "The
+  one-per-signature case" above) — the Rust-codegen path via
+  `wit-bindgen` + `arbitrary` isn't wired yet. Building one exercises
+  that pipeline end-to-end.
+- **Tier-3 builtins.** Builtins that *modify* values can't ship until
+  tier 3 does. Read-only tier-2 builtins are unblocked.
+- **Third-party builtin namespacing.** Currently bare names; the OCI
+  repo prefix is hardcoded to `ejrgilbert/splicer/builtins`. If
+  third-party registries become a real ask, design `builtin: org/name`
+  syntax then.
+- **`funcs: [...]` interaction.** Per-function interposition filter
+  (see above) should compose cleanly with `builtin:` — pure test-matrix
+  concern, no design conflict.
 
 ## Canonical-ABI gaps
 

@@ -340,26 +340,26 @@ caller
 
 This pattern gives both worlds:
 
-- **Default (cells, fast)**: middleware exports `splicer:tier2/*`,
-  consumes the cell array directly, walks with the splicer-supplied
-  Rust helper crate or its own walker. Single canonical-ABI lower per
-  call, in-process traversal — sub-microsecond walk for typical
-  HTTP-scale payloads.
+- **Default (cells)**: middleware exports `splicer:tier2/*`, consumes
+  the cell array directly, walks with the splicer-supplied Rust helper
+  crate or its own walker. Single canonical-ABI lower per call,
+  in-process traversal — no cross-component boundary calls during the
+  walk itself.
 - **Ergonomic (resources, polyglot)**: middleware exports
   `splicer:tier2-resources/*`, never touches indices. Works
   idiomatically in every language without a splicer-provided helper.
 
   **Runtime cost** (the price of opting in): every accessor on
-  `lifted-value` is a component-boundary call. Walking a 50-field
-  record is ~150 boundary crossings (~5–10 μs at wasmtime's current
-  overhead) vs. ~250 ns for the direct-cells path — roughly **30×
-  slower per walk**. For light-touch middleware (auth, throttling,
-  tracer reading a few fields) this is irrelevant. For
-  traversal-heavy middleware (logger, recorder dumping the entire
-  tree) it's meaningful — at HTTP scale (~10 ms request budget),
-  ~0.1% added latency per traversal, still acceptable for most use
-  cases. If perf matters, drop the adapter-adapter and walk cells
-  directly.
+  `lifted-value` is a component-boundary call, so a walk of an
+  N-field record becomes O(N) boundary crossings vs. a single
+  in-process traversal for the direct-cells path. The crossover
+  where the resource path matters in practice depends on payload
+  shape and wasmtime's per-crossing cost; neither is benchmarked
+  yet. Light-touch middleware (auth, throttling, reading a few
+  fields) is plausibly fine either way; traversal-heavy middleware
+  (logger, recorder dumping the entire tree) is where the gap
+  shows up. If perf matters, drop the adapter-adapter and walk
+  cells directly.
 
 Not in scope for tier-2 v1; the cell wire format is forward-compatible
 with this shim landing later.
