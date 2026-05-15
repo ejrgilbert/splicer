@@ -324,6 +324,12 @@ fn run_splice(
     })?;
     print_diagnostics(&bundle.diagnostics);
 
+    if !plan && !bundle.any_rule_matched {
+        anyhow::bail!(
+            "no splice rules applied: every rule failed to match any nodes; see warnings above"
+        );
+    }
+
     finish(bundle, output, emit_wac, plan, splits)
 }
 

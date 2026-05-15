@@ -108,6 +108,9 @@ pub struct Bundle {
     /// adapter package key — this field is for callers who want the
     /// metadata too.
     pub generated_adapters: Vec<GeneratedAdapter>,
+    /// True iff at least one rule produced a full match. `false` when
+    /// no rules were supplied or every rule was a no-op.
+    pub any_rule_matched: bool,
 }
 
 impl Bundle {
@@ -204,6 +207,7 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
         wac_deps,
         diagnostics: out.diagnostics,
         generated_adapters: out.generated_adapters,
+        any_rule_matched: out.any_rule_matched,
     })
 }
 
@@ -274,6 +278,7 @@ pub fn compose(req: ComposeRequest) -> Result<Bundle> {
         wac_deps,
         diagnostics: out.diagnostics,
         generated_adapters: out.generated_adapters,
+        any_rule_matched: out.any_rule_matched,
     })
 }
 
