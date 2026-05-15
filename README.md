@@ -4,12 +4,13 @@
 
 `splicer` reads:
 
-* A **composition graph** (JSON)
+* A **component binary** as `.wasm` (the composition or a single component)
 * A **splice configuration** (YAML)
 
-It produces a modified plan that injects middleware components according to declarative rules.
+It produces a new composed `.wasm` (or the underlying plan pieces) that injects middleware components according to declarative rules.
 
-This tool is designed to work with component-based systems such as WASI HTTP services, but is interface-agnostic and can splice across any interface edge in a component graph.
+`splicer` is **interface-agnostic** — it operates on any WIT interface edge in a component graph.
+The same splice rules apply whether the targeted interface is `wasi:http/handler`, `wasi:cli/run`, `my:app/orders`, or a custom in-house contract.
 
 ---
 
@@ -24,17 +25,15 @@ When building component-based systems, middleware insertion often requires:
 
 `splicer` automates that planning step.
 
-Instead of manually restructuring component wiring, you define:
+Instead of manually restructuring component wiring, you define declarative rules on:
 
-* What interface to target
-* Where to inject middleware
-* What middleware components to insert
+* _which interface_ to target,
+* _what middleware_ to wire in, and
+* _where to invoke_ the middleware.
 
-And `splicer` generates the modified composition plan.
+`splicer` either produces the newly composed `.wasm` directly, or (with `--plan`) emits the underlying plan pieces (generated `wac` + split sub-components) for inspection or manual composition.
 
-A demo of `splicer` can be run using: `cargo run --example demo`
-
-A more in-depth usage of `splicer` is done in the external [`component-interposition`](https://github.com/ejrgilbert/component-interposition) repo.
+`splicer` operates directly on the component **binary** (no source code, and no original `wac` even when the input is itself a composition). The graph is **discovered** from the binary alone.
 
 ---
 
@@ -43,33 +42,45 @@ A more in-depth usage of `splicer` is done in the external [`component-interposi
 Most middleware doesn't need to match the exact type signature of the interface
 it's being placed on. A logging middleware that prints "before" and "after"
 around every call works the same whether the target interface is
-`wasi:http/handler` or `my:service/adder`, it only needs the function name.
+`my:service/adder`, `wasi:cli/run`, or `wasi:http/handler`; it only needs
+the function name.
 
 Splicer generates **adapter components** that bridge between a generic
 middleware WIT interface and the specific target interface. The middleware author
 writes against a simple contract; splicer handles all the type plumbing at
 composition time.
 
-### Middleware Tiers
+## Middleware Tiers
 
-| Tier       | Capability                                                                                                              | WIT                                          | Status        |
-|------------|-------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|---------------|
-| **Tier 1** | Hook (name only) — `on-call`, `on-return`, `should-block`: middleware sees the call identity but not types or data      | [`wit/tier1/world.wit`](wit/tier1/world.wit) | **Supported** |
-| **Tier 2** | Observe — middleware sees the typed values flowing through (lifted into a structural attribute tree); cannot modify     | `wit/tier2/world.wit` (planned)              | Planned       |
-| **Tier 3** | Transform — middleware sees AND modifies the values; downstream is still called                                         | `wit/tier3/world.wit` (planned)              | Planned       |
-| **Tier 4** | Virtualize — middleware replaces the downstream entirely (mocks, virts, replayers)                                      | `wit/tier4/world.wit` (planned)              | Planned       |
+| Tier       | Data access         | Calls downstream? | Capability                                                                              | WIT                                          | Status        |
+|------------|---------------------|-------------------|-----------------------------------------------------------------------------------------|----------------------------------------------|---------------|
+| **Tier 1** | none (call-id only) | yes _(skippable)_ | **Hooks**: middleware sees the call identity but _not types or data_                    | [`wit/tier1/world.wit`](wit/tier1/world.wit) | **Supported** |
+| **Tier 2** | read-only           | yes               | **Observe**: middleware sees the typed values flowing through; _cannot modify_          | [`wit/tier2/world.wit`](wit/tier2/world.wit) | **Supported** |
+| **Tier 3** | read + write        | yes               | **Transform**: middleware sees AND modifies the values; _downstream is still called_    | `wit/tier3/world.wit` (planned)              | Planned       |
+| **Tier 4** | read + write        | no                | **Virtualize**: middleware _replaces the downstream_ entirely (mocks, virts, replayers) | `wit/tier4/world.wit` (planned)              | Planned       |
 
 Each tier strictly adds one capability. Middleware written for a lower tier
 works unchanged when higher tiers become available.
 
-To write a tier-1 middleware, your component exports one or more of the
-interfaces defined in [`wit/tier1/world.wit`](wit/tier1/world.wit).
+"Skippable" (tier 1) vs "no" (tier 4) are different things. With
+`should-block` the adapter still **generates** the downstream call and
+asks the middleware at runtime whether to invoke it. It's a per-call gate.
+With virtualization the downstream call **is not in the adapter at
+all**; it cannot be reached, regardless of runtime state.
+
+To write a tier-1 or tier-2 middleware, your component exports one or more
+of the interfaces defined in its respective wit world, e.g. tier 1's
+[`wit/tier1/world.wit`](wit/tier1/world.wit). Tier-2 hooks receive
+arguments and results lifted into a structural `field-tree` (defined in
+[`wit/common/world.wit`](wit/common/world.wit)), so observation middleware
+can inspect typed values without depending on the target interface's
+concrete types.
 
 When `splicer splice` detects that a middleware exports these interfaces (instead
 of the target interface directly), it automatically generates an adapter
 component and wires it into the composition.
 
-For the full guide — including how to write a tier-1 middleware, how adapter
+For the full guide — including how to write a middleware, how adapter
 detection works, and what the generated adapter does internally — see
 [docs/adapter-components.md](docs/adapter-components.md).
 
@@ -86,12 +97,6 @@ inject:
   - builtin: hello-tier1
 ```
 
-The `bare` prefix marks tier-1 builtins that see only the call-id —
-no payload-derived data on the emitted signal. Value-aware tier-2
-siblings — `otel-spans`, `otel-metrics`, `otel-logs` (unprefixed) —
-are **planned but not yet implemented**; they'll arrive once tier-2
-codegen lands.
-
 | Name                                               | Tier | Description                                                                      |
 |----------------------------------------------------|------|----------------------------------------------------------------------------------|
 | [`hello-tier1`](builtins/hello-tier1/)             | 1    | `println!`s every wrapped call. Verifies splice rules fire.                      |
@@ -100,228 +105,102 @@ codegen lands.
 | [`otel-bare-metrics`](builtins/otel-bare-metrics/) | 1    | Emits `wasi:otel` count + duration-histogram metrics (no payload).               |
 | [`otel-bare-logs`](builtins/otel-bare-logs/)       | 1    | Emits a structured `wasi:otel` log per call (configurable severity, no payload). |
 
-Source crates live under [`builtins/`](builtins/); rebuild artifacts
-with `make build-builtins`. See
-[docs/splice-config.md](docs/splice-config.md#inject-entry-shapes) for
-the full `builtin:` schema (short + long forms, the `config:` block,
+See [docs/splice-config.md](docs/splice-config.md#inject-entry-shapes)
+for the full `builtin:` schema (short + long forms, the `config:` block,
 and the local-override → cache → OCI resolution order).
+
+The CLI includes helpful information on builtins. Run: `splicer builtin` to view. 
 
 ---
 
-# Installation
+# Build + Install
 
-From source:
+From [crates.io](https://crates.io/crates/splicer):
+
+```bash
+cargo install splicer
+```
+
+Or as a library dependency:
+
+```toml
+[dependencies]
+splicer = "2"
+```
+
+The library entry point is `splicer::splice(SpliceRequest) -> Bundle`;
+`examples/wac_compose.rs` is a runnable end-to-end demo.
+
+From source (for development):
 
 ```bash
 cargo build --release
+# binary at target/release/splicer
 ```
 
-Binary will be located at:
-
-```
-target/release/splicer
-```
-
----
-
-# Usage
-
-Splicer has two subcommands. Both produce a composed `.wasm` directly.
-
-### `splicer splice`: inject middleware into an existing composition
+Builtin source crates live under [`builtins/`](builtins/). You don't
+need to build them to use splicer, they're pulled from
+`ghcr.io/ejrgilbert/splicer/builtins/*` on demand. To rebuild local
+artifacts (for iterating on a builtin without re-publishing), run:
 
 ```bash
-splicer splice <SPLICE_CFG> <COMP_WASM> [-o composed.wasm]
+make build-builtins
 ```
 
-Reads splice rules from `SPLICE_CFG` (YAML), splits `COMP_WASM` into
-its sub-components, injects middleware per the rules, and writes the
-result to `composed.wasm`.
+Builds land in `assets/builtins/`; point `SPLICER_BUILTINS_DIR` at that
+directory to short-circuit the OCI pull.
 
-### `splicer compose`: synthesize a composition from N components
-
-```bash
-splicer compose <COMP_WASM>... [-o composed.wasm]
-```
-
-Discovers the composition graph by matching the components'
-import/export surfaces and writes the composed result.
-
-### Common flags
-
-| flag                  | description                                                                              |
-| --------------------- | ---------------------------------------------------------------------------------------- |
-| `-o, --output <PATH>` | Where to write the composed `.wasm` (default: `composed.wasm`).                          |
-| `--emit-wac [<PATH>]` | Also persist the intermediate WAC source (default: `./output.wac`). Useful for auditing. |
-| `--plan`              | Skip in-process compose; persist WAC + splits and print the `wac compose ...` command.   |
-| `--splits-dir <DIR>`  | (`splice` only) Persist split sub-components on disk instead of in a tempdir.            |
-| `--package <NAME>`    | Package name written to the generated WAC.                                               |
-| `--skip-type-check`   | (`splice` only) Demote contract type-check errors to warnings.                           |
-
-### Library usage
-
-The same pipeline is available as a Rust library:
-
-```rust
-let bundle = splicer::splice(splicer::SpliceRequest { /* ... */ })?;
-let composed: Vec<u8> = bundle.to_wasm()?;
-```
-
-See `examples/wac_compose.rs` for a runnable end-to-end demo.
+To kick the tires, `cargo run --example demo` runs a self-contained
+demo; for a fuller walkthrough see the external
+[`component-interposition`](https://github.com/ejrgilbert/component-interposition)
+repo.
 
 ---
 
 # Configuration Format
 
-Splicing behavior is defined in a YAML configuration file.
-
-See full specification:
-
-```
-docs/splice-config.md
-```
-
----
-
-# Example Configuration
+Splicing behavior is defined in a YAML configuration file:
 
 ```yaml
 version: 1
-
 rules:
   - before:
-      interface: wasi:http/handler
+      interface: my:app/orders
       provider:
-        name: auth
+        name: validate
     inject:
-        - middleware-a
-        - middleware-b
-
-  - between:
-      interface: wasi:http/handler
-      inner:
-        name: auth
-      outer:
-        name: handler
-    inject:
-        - tracing
+      - builtin: hello-tier1
 ```
 
----
+See [`docs/splice-config.md`](docs/splice-config.md) for the full
+specification.
 
-# Splice Semantics
-
-`splicer` operates on interface edges in the graph.
-
-If no matches are found, the generated `wac` will produce an identity component (roundtrips to same component).
-
-Two matching modes are supported:
-
-## 1. Single-Target Injection
-
-Inject middleware for a given interface, optionally scoped to a specific provider.
-
-```yaml
-before:
-  interface: wasi:http/handler
-  provider:
-    name: auth
-```
-
-If `provider.name` is omitted, all providers of that interface are matched.
-
----
-
-## 2. Between Injection
-
-Inject middleware between two specific components connected via an interface edge.
-
-```yaml
-between:
-   interface: wasi:http/handler
-   inner:
-     name: auth
-   outer:
-     name: handler
-```
-
-This replaces:
-
-```
-handler → auth
-```
-
-With:
-
-```
-handler → middleware → auth
-```
-
-Middleware chains are traversed in reverse order during injection to preserve declared ordering.
-
----
-
-# Rule Ordering
-
-Rules are applied in file order.
-
-Later rules operate on the graph after earlier modifications.
-
-This allows intentional stacking:
-
-```
-auth → logging → metrics → handler
-```
-
----
-
-# Validation
-
-The configuration will fail if:
-
-* `version` is missing or unsupported
-* Required fields are absent
-* Middleware list is empty
+`splicer` is a multi-subcommand CLI; run `splicer --help` to see
+what's available.
 
 ---
 
 # Testing
 
-In-process unit tests live under `src/` and exercise the adapter
-generator, WAC emitter, and composition planner directly:
+Unit tests cover the adapter generator, WAC emitter, and composition
+planner: `cargo test --lib`.
+
+End-to-end coverage lives in `tests/fuzz_and_run.rs`. It scaffolds
+provider/consumer/middleware crates, drives them through the full
+splicer pipeline (compose + splice, `before` and `between`), and
+invokes the result under `wasmtime`. Two entry points (both
+`#[ignore]`'d — they build real crates):
+
+- `test_canned` — a hardcoded catalog of value-type shapes crossed
+  with async modes and split-kind pipelines. Deterministic; the
+  regression canary.
+- `test_fuzz` — `arbitrary`-driven random shapes, reproducible via
+  `SPLICER_FUZZ_SEED` (replay any failing iter by re-running with
+  its seed and `SPLICER_FUZZ_ITERS=1`).
 
 ```bash
-cargo test --lib
-```
-
-## End-to-end fuzz + run harness
-
-`tests/fuzz_and_run.rs` scaffolds provider, consumer, and middleware
-crates in a tempdir, drives them through the full splicer pipeline
-(compose + splice for both `between` and `before` rules), and invokes
-the result under `wasmtime` to check the composition actually executes.
-
-Two entry points, both `#[ignore]`'d (they build real crates — slow):
-
-* `test_canned` — a hardcoded catalog of 22 value-type shapes * 2
-  async modes * 2 split-kind pipelines = 88 combos. Same shapes every
-  run. Quick-to-bisect canary for regressions in a known shape.
-
-* `test_fuzz` — `arbitrary`-driven random shapes. Reproducible via
-  `SPLICER_FUZZ_SEED` so any failure can be replayed. Each iter
-  prints `[i/N]` progress (requires `--nocapture`).
-
-```bash
-# Canned catalog — 88 combos, ~2 min
 cargo test --test fuzz_and_run -- --ignored --nocapture test_canned
-
-# Fuzz at PR CI config (25 iters × 2 modes × depth 5, ~2 min)
-SPLICER_FUZZ_ITERS=25 SPLICER_FUZZ_DEPTH=5 \
-  cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
-
-# Replay a single failing iteration
-SPLICER_FUZZ_SEED=<seed_from_output> SPLICER_FUZZ_ITERS=1 \
-  cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
+cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
 ```
 
 Env knobs:
@@ -332,39 +211,3 @@ Env knobs:
 | `SPLICER_FUZZ_ITERS`  | 30           | iterations per async mode (sync + async both run)       |
 | `SPLICER_FUZZ_DEPTH`  | 4            | max recursion depth for compound shapes                 |
 | `SPLICER_KEEP_TMPDIR` | unset        | preserve the tempdir for post-mortem inspection         |
-
----
-
-# Project Structure
-
-```
-splicer/
-├── src/
-├── docs/
-│   └── splice-config.md
-├── README.md
-```
-
----
-
-# Design Principles
-
-* **Declarative configuration**
-* **Deterministic ordering**
-* **Interface-driven matching**
-* **Graph-aware edge replacement**
-* **Middleware-agnostic**
-
-`splicer` does not assume HTTP semantics — it operates on generic interface edges.
-
----
-
-# Future Evolution
-
-The configuration format is versioned:
-
-```yaml
-version: 1
-```
-
-Breaking changes will increment the version number.
