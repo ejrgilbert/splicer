@@ -2160,6 +2160,36 @@ fn tier2_shapes() -> Vec<Shape> {
             cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
             selected: 2,
         })))),
+        // Inner T = record. Pre-pass sums per-outer-iter inner
+        // contributions into `next_record_idx`; emit snaps and
+        // advances the inner's `record_slot_base` from
+        // `nested_inner_record_cursor` per outer iter.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Record {
+            wit_name: "point",
+            rust_name: "Point",
+            fields: vec![
+                (
+                    "x",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "3u32",
+                        expected_debug: "3",
+                    },
+                ),
+                (
+                    "y",
+                    Shape::Primitive {
+                        name: "s32",
+                        wit_type: "s32",
+                        rust_ty: "i32",
+                        rust_literal: "-5i32",
+                        expected_debug: "-5",
+                    },
+                ),
+            ],
+        })))),
     ]
 }
 

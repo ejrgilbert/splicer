@@ -10,17 +10,22 @@ Every other type lifts today (primitives, `string`, `list<u8>`,
 
 ### `list<list<T>>` inner kinds that need a per-call info buffer
 
-Inner `T` ∈ `record` / `variant` / `flags` / `handle` still bails
-at plan-build via `Cell::ListOf::list_element_class` (`lift/plan.rs`)
-— the gate accepts `Scalar` / `PrestagedChar` / `PrestagedChildIdx` /
-`PrestagedTupleIndices` for the inner element plan and rejects the
-rest. To unblock each: extend the inner-element gate one class at a
-time and teach the matching info-buffer sizing pre-pass (the
-`fn_has_list_elem_*` gates already recurse into nested element
-plans via `LiftPlan::any_list_element_has_class`, so the wrapper
-locals are reachable; the per-call buffer count is the missing
-piece — needs `Σ_outer outer_j_inner_len * K_per_inner_elem` added
-to the accumulator).
+Inner `T` ∈ `variant` / `flags` / `handle` still bails at plan-build
+via `Cell::ListOf::list_element_class` (`lift/plan.rs`) — the gate
+accepts `Scalar` / `PrestagedChar` / `PrestagedChildIdx` /
+`PrestagedTupleIndices` / `PrestagedRecord` for the inner element
+plan and rejects the rest. To unblock each: extend the inner-element
+gate one class at a time and teach the matching info-buffer sizing
+pre-pass. Pattern (see record support for the template):
+- Allow the new class in the gate.
+- Add a `nested_inner_<kind>_cursor` on `ListEmitLocals` (allocated
+  only when the inner contributes that kind).
+- Seed the cursor + bump the wrapper-level `next_<kind>_idx` in
+  `emit_nested_list_pre_pass`.
+- Snap `inner.<kind>_slot_base = cursor` and advance the cursor per
+  outer iter in `emit_list_of_arm`.
+- Update `LiftPlan::has_list_elem_<kind>` to recurse (record swap
+  to `any_list_element_has_class` shows the shape).
 
 ### `list<list<list<…>>>` (depth ≥ 3)
 
@@ -31,6 +36,17 @@ depth, but the cell-array sizing pre-pass only walks one level of
 nesting; extend it to recurse so deeper trees can size their slabs.
 
 ## Recently landed
+
+- `list<list<record>>` — `PrestagedRecord` joins the allowed inner
+  classes. `ListEmitLocals` gains `nested_inner_record_cursor`;
+  `emit_nested_list_pre_pass` bumps `lcl.next_record_idx` by
+  `Σ inner_len_j * inner.records_per_elem`, and `emit_list_of_arm`
+  snaps/advances `inner.record_slot_base` from the cursor per outer
+  iter. `LiftPlan::has_list_elem_record` switched to the recursive
+  `any_list_element_has_class(PrestagedRecord)` so the wrapper-level
+  `record-info` buffer gets the runtime-sized alloc path. Canned
+  shape `list<list<point>>` lives in `tier2_shapes()`; fixture
+  `f-list-of-list-point` covers plan + emit validation.
 
 - `list<list<T>>` for `T` ∈ scalar / char / option / result / tuple /
   enum — `Cell::ListOf` becomes an allowed list element (class
