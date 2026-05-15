@@ -1,0 +1,77 @@
+name: Publish SDK
+
+# Tag-triggered crates.io publish for splicer-tool-sdk. Tag scheme
+# `sdk-v<version>` keeps the SDK's release cadence independent of
+# splicer's `v*` tags (which publish the root splicer crate) and the
+# manual workflow_dispatch flows for WIT + builtins.
+on:
+  push:
+    tags:
+      - "sdk-v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish splicer-tool-sdk to crates.io
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: splicer-tool-sdk
+
+      - name: Extract version from tag
+        id: tag
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#sdk-v}"
+          if [ "$tag" = "$version" ]; then
+            echo "::error::Tag '$tag' is not of the form 'sdk-v<version>'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Tag version: $version"
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          toml="splicer-tool-sdk/Cargo.toml"
+          cargo_version=$(grep -E '^version = ' "$toml" \
+            | head -n 1 \
+            | sed -E 's/version = "([^"]+)".*/\1/')
+          tag_version="${{ steps.tag.outputs.version }}"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error file=$toml::Cargo.toml version '$cargo_version' does not match tag version '$tag_version'. Bump the version in Cargo.toml before tagging, or retag with the correct version."
+            exit 1
+          fi
+          echo "Cargo.toml version matches: $cargo_version"
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_API_TOKEN }}
+        working-directory: splicer-tool-sdk
+        run: cargo publish --locked
+
+      - name: Summarize published crate
+        env:
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          {
+            echo "### Published splicer-tool-sdk"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Version | \`$VERSION\` |"
+            echo "| crates.io | https://crates.io/crates/splicer-tool-sdk/$VERSION |"
+            echo "| docs.rs | https://docs.rs/splicer-tool-sdk/$VERSION |"
+            echo ""
+            echo "Install with:"
+            echo '```'
+            echo "cargo add splicer-tool-sdk@$VERSION"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

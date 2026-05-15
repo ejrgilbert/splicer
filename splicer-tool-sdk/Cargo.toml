@@ -1,0 +1,13 @@
+[package]
+name = "splicer-tool-sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["Elizabeth Gilbert"]
+description = "Canonical Rust types + helpers for splicer middleware and tooling. Use with wit_bindgen's `with:` parameter to share one type identity across every crate that handles splicer:common/types values."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ejrgilbert/splicer"
+keywords = ["wasm", "WebAssembly", "components", "splicer"]
+categories = ["wasm"]
+
+[workspace]
