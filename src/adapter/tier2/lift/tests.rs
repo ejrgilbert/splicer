@@ -130,6 +130,11 @@ const TEST_WIT: &str = r#"
             func(xs: list<list<result<u32, string>>>);
         f-list-of-list-tuple-u32-u32: func(xs: list<list<tuple<u32, u32>>>);
         f-list-of-list-color: func(xs: list<list<color>>);
+        // Inner T = record: per-outer-iter cursors for both cell-array
+        // and record-info — pre-pass sums `inner_len_j * records_per_elem`
+        // into wrapper-level `next_record_idx`; emit snaps + advances
+        // `inner.record_slot_base` from `nested_inner_record_cursor`.
+        f-list-of-list-point: func(xs: list<list<point>>);
         // Nested-list at result position — retptr-loaded compound.
         f-result-list-of-list-u32: func() -> list<list<u32>>;
         // Depth-2 cap: a `list<…>` element-cell may only appear as
@@ -3034,6 +3039,7 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-list-of-list-result-u32-string", &r, &mut names),
         plan_for_param("f-list-of-list-tuple-u32-u32", &r, &mut names),
         plan_for_param("f-list-of-list-color", &r, &mut names),
+        plan_for_param("f-list-of-list-point", &r, &mut names),
     ];
     for plan in &plans {
         validate_emit_lift_plan(plan, r.resolve());

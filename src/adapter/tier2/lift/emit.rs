@@ -383,6 +383,11 @@ pub(crate) struct ListEmitLocals {
     /// inner's `start_i` keeps its single base-pointer meaning.
     /// `Some` iff `nested_inner` is `Some`.
     pub nested_inner_cursor: Option<u32>,
+    /// Record-info twin of [`Self::nested_inner_cursor`]: seeded to
+    /// pre-bump `lcl.next_record_idx`, advances by
+    /// `inner.len * inner.records_per_elem` per outer iter. `Some` iff
+    /// the inner element plan has record-info contributions.
+    pub nested_inner_record_cursor: Option<u32>,
     /// Outer-ptr scratch for the nested-list pre-pass memory walk.
     /// `Some` iff `nested_inner` is `Some`.
     pub nested_outer_ptr_scratch: Option<u32>,
@@ -466,7 +471,7 @@ fn build_list_emit_locals_for_plan(
     // Nested-list recursion: element plan is exactly one `Cell::ListOf`.
     // Enforced by `push_list_of`'s depth-2 cap, so any other shape
     // means a plan-build bug.
-    let (nested_inner, nested_inner_cursor, nested_outer_ptr_scratch) =
+    let (nested_inner, nested_inner_cursor, nested_inner_record_cursor, nested_outer_ptr_scratch) =
         match element_plan.cells.as_slice() {
             [Cell::ListOf {
                 element_plan: inner_plan,
@@ -480,10 +485,20 @@ fn build_list_emit_locals_for_plan(
                     builder,
                 );
                 let cursor = builder.alloc_local(ValType::I32);
+                // Only when inner contributes record-info entries; otherwise
+                // the cursor would be dead.
+                let record_cursor = inner
+                    .record_slot_base
+                    .map(|_| builder.alloc_local(ValType::I32));
                 let ptr_scratch = builder.alloc_local(ValType::I32);
-                (Some(Box::new(inner)), Some(cursor), Some(ptr_scratch))
+                (
+                    Some(Box::new(inner)),
+                    Some(cursor),
+                    record_cursor,
+                    Some(ptr_scratch),
+                )
             }
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         };
     ListEmitLocals {
         start_i,
@@ -514,6 +529,7 @@ fn build_list_emit_locals_for_plan(
         variants_per_elem,
         nested_inner,
         nested_inner_cursor,
+        nested_inner_record_cursor,
         nested_outer_ptr_scratch,
     }
 }
@@ -1279,7 +1295,9 @@ fn nested_inner_of(outer_ll: &ListEmitLocals) -> (&ListEmitLocals, u32) {
 /// by `inner_len_j * inner_elem_count` per element. Seeds the cursor
 /// to `outer.start_i + outer.len`. Runs inside the outer's arm-guard
 /// block. Guarded by `outer.len > 0` so the empty-outer path skips
-/// the loop preamble.
+/// the loop preamble. If the inner element plan contributes records,
+/// the same walk also bumps `lcl.next_record_idx` so the wrapper-level
+/// record-info slab is sized correctly.
 fn emit_nested_list_pre_pass(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -1311,6 +1329,29 @@ fn emit_nested_list_pre_pass(
     f.instructions().local_get(outer_ll.len);
     f.instructions().i32_add();
     f.instructions().local_set(cursor);
+    // record_cursor = next_record_idx (pre-bump). Per outer iter the
+    // emit-side snaps `inner.record_slot_base = record_cursor` and
+    // advances by `inner.len * inner.records_per_elem`. Only
+    // `records_per_elem` is needed inside the walk loop — the cursor
+    // seed runs once here.
+    let records_per_elem = outer_ll.nested_inner_record_cursor.map(|rc| {
+        let per_elem = inner_ll.records_per_elem;
+        debug_assert!(
+            per_elem > 0,
+            "nested_inner_record_cursor allocated only when inner contributes records",
+        );
+        // records_per_elem ≤ inner_elem_count by construction
+        // (`walk_element_plan` bumps `counts.records` only on cells
+        // that also count toward `inner_elem_count`), so the cell-slab
+        // overflow trap below guards the record-slab math too.
+        debug_assert!(per_elem <= inner_elem_count);
+        f.instructions().local_get(
+            lcl.next_record_idx
+                .expect("fn_has_list_elem_record gate disagrees with nested_inner_record_cursor"),
+        );
+        f.instructions().local_set(rc);
+        per_elem
+    });
     // Skip the entire walk when outer is empty — saves the
     // loop preamble + branch on hot empty-outer paths. `if_` fires
     // on non-zero, so `local_get(outer.len)` is the natural guard.
@@ -1322,6 +1363,7 @@ fn emit_nested_list_pre_pass(
     // for (j = 0; j < outer.len; j++) {
     //     inner.len = mem[outer_ptr + j*8 + 4];
     //     trap_check; next_cell_idx += inner.len * inner_elem_count;
+    //     (if inner records) next_record_idx += inner.len * records_per_elem;
     // }
     f.instructions().i32_const(0);
     f.instructions().local_set(outer_ll.j);
@@ -1358,6 +1400,20 @@ fn emit_nested_list_pre_pass(
     }
     f.instructions().i32_add();
     f.instructions().local_set(lcl.next_cell_idx);
+    // next_record_idx += inner.len * records_per_elem.
+    if let Some(per_elem) = records_per_elem {
+        let next_record_idx = lcl
+            .next_record_idx
+            .expect("fn_has_list_elem_record gate disagrees with nested_inner_record_cursor");
+        f.instructions().local_get(next_record_idx);
+        f.instructions().local_get(inner_ll.len);
+        if per_elem != 1 {
+            f.instructions().i32_const(per_elem as i32);
+            f.instructions().i32_mul();
+        }
+        f.instructions().i32_add();
+        f.instructions().local_set(next_record_idx);
+    }
     f.instructions().local_get(outer_ll.j);
     f.instructions().i32_const(1);
     f.instructions().i32_add();
@@ -1786,10 +1842,9 @@ fn emit_list_of_arm(
                 };
                 emit_stage_tuple_slot(f, lcl, ll, offset_in_elem, children);
             }
-            // Nested list: copy inner.len from outer's elem-flats and
-            // snap inner.start_i to the running cursor (pre-pass seeded
-            // it; iter-end advances it). After this, `emit_list_of_arm`
-            // for the inner reads inner.start_i as a plain base.
+            // Nested list: copy inner.len from outer's elem-flats; snap
+            // inner.start_i (and inner.record_slot_base, if applicable)
+            // to their running cursors. Iter-end advances them.
             Cell::ListOf { len_slot, .. } => {
                 let (inner_ll, cursor) = nested_inner_of(ll);
                 f.instructions()
@@ -1797,6 +1852,13 @@ fn emit_list_of_arm(
                 f.instructions().local_set(inner_ll.len);
                 f.instructions().local_get(cursor);
                 f.instructions().local_set(inner_ll.start_i);
+                if let Some(rc) = ll.nested_inner_record_cursor {
+                    let dest = inner_ll
+                        .record_slot_base
+                        .expect("nested_inner_record_cursor ⇔ inner.record_slot_base");
+                    f.instructions().local_get(rc);
+                    f.instructions().local_set(dest);
+                }
             }
             _ => {}
         }
@@ -1817,10 +1879,11 @@ fn emit_list_of_arm(
             lcl,
             list_slot_for_cell,
         );
-        // Advance running cursor: cursor += inner.len * inner_elem_count.
-        // The cursor (not inner.start_i) carries the running state
-        // across outer iters; inner.start_i was snapped to the cursor's
-        // value at iter-start and stays as a base.
+        // Advance running cursor(s): cursor += inner.len * inner_elem_count
+        // (and record-cursor += inner.len * records_per_elem, if any).
+        // The cursor (not inner.start_i / inner.record_slot_base)
+        // carries the running state across outer iters; the inner's
+        // bases were snapped at iter-start and stay fixed.
         if let Cell::ListOf {
             element_plan: inner_plan,
             ..
@@ -1836,6 +1899,17 @@ fn emit_list_of_arm(
             }
             f.instructions().i32_add();
             f.instructions().local_set(cursor);
+            if let Some(rc) = ll.nested_inner_record_cursor {
+                let per_elem = inner_ll.records_per_elem;
+                f.instructions().local_get(rc);
+                f.instructions().local_get(inner_ll.len);
+                if per_elem != 1 {
+                    f.instructions().i32_const(per_elem as i32);
+                    f.instructions().i32_mul();
+                }
+                f.instructions().i32_add();
+                f.instructions().local_set(rc);
+            }
         }
     }
     debug_assert_eq!(

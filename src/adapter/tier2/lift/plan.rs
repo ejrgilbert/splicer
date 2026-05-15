@@ -206,9 +206,10 @@ pub(crate) enum ListElementClass {
     PrestagedVariant,
     /// `Cell::ListOf` — `list<list<T>>` with inner cells limited to
     /// the per-call-buffer-free subset (Scalar / PrestagedChar /
-    /// PrestagedChildIdx / PrestagedTupleIndices) and no further
-    /// nesting. Inner emit runs per outer iter; inner `start_i` is
-    /// a running cursor staged off `outer.start_i + outer.len`.
+    /// PrestagedChildIdx / PrestagedTupleIndices) plus PrestagedRecord
+    /// (nested pre-pass also sizes its record-info contribution).
+    /// No further nesting. Inner `start_i` is a running cursor staged
+    /// off `outer.start_i + outer.len`.
     PrestagedNestedList,
 }
 
@@ -233,10 +234,10 @@ impl Cell {
             | Cell::Text { .. }
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
-            // Gate inner cells to the per-call-buffer-free subset so
-            // outer `push_list_of`'s `allowed_as_list_element` rejects
-            // record / variant / flags / handle / further nesting in
-            // the inner element.
+            // Inner cells must be sizeable by the nested pre-pass:
+            // per-call-buffer-free classes plus PrestagedRecord (whose
+            // record-info contribution is summed in
+            // `emit_nested_list_pre_pass`).
             Cell::ListOf { element_plan, .. } => element_plan
                 .cells
                 .iter()
@@ -247,6 +248,7 @@ impl Cell {
                             | Some(ListElementClass::PrestagedChar)
                             | Some(ListElementClass::PrestagedChildIdx)
                             | Some(ListElementClass::PrestagedTupleIndices)
+                            | Some(ListElementClass::PrestagedRecord)
                     )
                 })
                 .then_some(ListElementClass::PrestagedNestedList),
@@ -333,45 +335,28 @@ impl LiftPlan {
             .any(|c| matches!(c, Cell::Char { .. }))
     }
 
-    /// Any list has a `Cell::Handle` in its element plan. Picks the
-    /// runtime-sized handle-info-buffer path over the static-count one.
+    /// Any list (top-level or nested-list inner) has a `Cell::Handle`
+    /// in its element plan. Picks the runtime-sized handle-info-buffer
+    /// path over the static-count one. Recursive so the gate stays
+    /// honest if a future nested-inner class widening lets handles in
+    /// (today the inner-element gate rejects them).
     pub(crate) fn has_list_elem_handle(&self) -> bool {
-        self.list_specs().any(|spec| {
-            spec.element_plan
-                .cells
-                .iter()
-                .any(|c| matches!(c, Cell::Handle { .. }))
-        })
+        self.any_list_element_has_class(ListElementClass::PrestagedHandle)
     }
 
     /// Companion to [`has_list_elem_handle`] for `Cell::Flags`.
     pub(crate) fn has_list_elem_flags(&self) -> bool {
-        self.list_specs().any(|spec| {
-            spec.element_plan
-                .cells
-                .iter()
-                .any(|c| matches!(c, Cell::Flags { .. }))
-        })
+        self.any_list_element_has_class(ListElementClass::PrestagedFlags)
     }
 
     /// Companion to [`has_list_elem_handle`] for `Cell::RecordOf`.
     pub(crate) fn has_list_elem_record(&self) -> bool {
-        self.list_specs().any(|spec| {
-            spec.element_plan
-                .cells
-                .iter()
-                .any(|c| matches!(c, Cell::RecordOf { .. }))
-        })
+        self.any_list_element_has_class(ListElementClass::PrestagedRecord)
     }
 
     /// Companion to [`has_list_elem_handle`] for `Cell::Variant`.
     pub(crate) fn has_list_elem_variant(&self) -> bool {
-        self.list_specs().any(|spec| {
-            spec.element_plan
-                .cells
-                .iter()
-                .any(|c| matches!(c, Cell::Variant { .. }))
-        })
+        self.any_list_element_has_class(ListElementClass::PrestagedVariant)
     }
 
     /// Whether any list (top-level or nested-list inner) has a
@@ -1050,12 +1035,13 @@ impl<'a> LiftPlanBuilder<'a> {
                  result, tuple, flags, record, variant, \
                  own/borrow/stream/future/error-context handles, plus \
                  `list<list<T>>` where the inner `T` stays on scalars / \
-                 char / option / result / tuple / enum — with allowed inner \
-                 cells throughout). Still gated: `list<list<T>>` whose \
-                 inner element needs a per-call info buffer (record / \
-                 variant / flags / handle), further nesting, or a \
-                 nested-list wrapped in option / tuple / record / variant / \
-                 result. File a request at {ISSUES_URL} to bump priority."
+                 char / option / result / tuple / enum / record — with \
+                 allowed inner cells throughout). Still gated: \
+                 `list<list<T>>` whose inner element needs a per-call \
+                 info buffer for variant / flags / handle, further \
+                 nesting, or a nested-list wrapped in option / tuple / \
+                 record / variant / result. File a request at \
+                 {ISSUES_URL} to bump priority."
             ));
         }
         let arm_guards = self.arm_guard_stack.clone();
