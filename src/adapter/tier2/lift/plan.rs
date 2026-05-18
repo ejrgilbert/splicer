@@ -204,13 +204,9 @@ pub(crate) enum ListElementClass {
     /// `Cell::Variant`. Per-arm payload child indices resolve to
     /// `elem_cell_base + child_pos_in_elem` at the dispatch site.
     PrestagedVariant,
-    /// `Cell::ListOf` — `list<list<T>>` with inner cells limited to
-    /// the per-call-buffer-free subset (Scalar / PrestagedChar /
-    /// PrestagedChildIdx / PrestagedTupleIndices) plus PrestagedFlags,
-    /// PrestagedRecord, and PrestagedVariant (nested pre-pass also
-    /// sizes their flags-info / record-info / variant-info
-    /// contributions). No further nesting. Inner `start_i` is a
-    /// running cursor staged off `outer.start_i + outer.len`.
+    /// `Cell::ListOf` — `list<list<T>>`. Inner classes are gated in
+    /// the [`Cell::list_element_class`] arm. No further nesting.
+    /// Inner `start_i` is a cursor staged off `outer.start_i + outer.len`.
     PrestagedNestedList,
 }
 
@@ -235,10 +231,7 @@ impl Cell {
             | Cell::Text { .. }
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
-            // Inner cells must be sizeable by the nested pre-pass:
-            // per-call-buffer-free classes plus PrestagedFlags /
-            // PrestagedRecord / PrestagedVariant (whose info-buffer
-            // contributions are summed in `emit_nested_list_pre_pass`).
+            // Inner cells must be sizeable by `emit_nested_list_pre_pass`.
             Cell::ListOf { element_plan, .. } => element_plan
                 .cells
                 .iter()
@@ -249,6 +242,7 @@ impl Cell {
                             | Some(ListElementClass::PrestagedChar)
                             | Some(ListElementClass::PrestagedChildIdx)
                             | Some(ListElementClass::PrestagedTupleIndices)
+                            | Some(ListElementClass::PrestagedHandle)
                             | Some(ListElementClass::PrestagedFlags)
                             | Some(ListElementClass::PrestagedRecord)
                             | Some(ListElementClass::PrestagedVariant)
@@ -340,9 +334,7 @@ impl LiftPlan {
 
     /// Any list (top-level or nested-list inner) has a `Cell::Handle`
     /// in its element plan. Picks the runtime-sized handle-info-buffer
-    /// path over the static-count one. Recursive so the gate stays
-    /// honest if a future nested-inner class widening lets handles in
-    /// (today the inner-element gate rejects them).
+    /// path over the static-count one.
     pub(crate) fn has_list_elem_handle(&self) -> bool {
         self.any_list_element_has_class(ListElementClass::PrestagedHandle)
     }

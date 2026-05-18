@@ -386,22 +386,61 @@ pub(crate) struct NestedListLocals {
     /// Kept separate from `inner.start_i` so the inner's `start_i`
     /// keeps its single base-pointer meaning.
     pub cursor: u32,
-    /// Flags-info twin of [`Self::cursor`]: seeded to pre-bump
-    /// `lcl.next_flags_idx`, advances by `inner.len * inner.flags.count_per_elem`
-    /// per outer iter. `Some` iff inner contributes flags. Flags
-    /// scratch is per-call cabi_realloc'd inside the inner's
-    /// `emit_list_of_arm`, so no scratch cursor is needed here.
-    pub flags_cursor: Option<u32>,
-    /// Record-info twin: seeded to pre-bump `lcl.next_record_idx`,
-    /// advances by `inner.len * inner.record.count_per_elem`. `Some`
-    /// iff inner contributes records.
-    pub record_cursor: Option<u32>,
-    /// Variant-info twin: seeded to pre-bump `lcl.next_variant_idx`,
-    /// advances by `inner.len * inner.variant.count_per_elem`. `Some`
-    /// iff inner contributes variants.
-    pub variant_cursor: Option<u32>,
+    /// Per-kind cursors paired with the inner list's [`KindBuffers`].
+    /// Seeded from `lcl.next_<kind>_idx`; advances per outer iter.
+    pub kinds: NestedKindCursors,
     /// Outer-ptr scratch for the nested-list pre-pass memory walk.
     pub outer_ptr_scratch: u32,
+}
+
+/// One cursor per [`KindBuffers`] entry; `None` iff inner contributes
+/// zero entries of that kind.
+pub(crate) struct NestedKindCursors {
+    pub handle: Option<u32>,
+    pub flags: Option<u32>,
+    pub record: Option<u32>,
+    pub variant: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct NestedKindRow<'a> {
+    cursor: Option<u32>,
+    kb: &'a KindBuffers,
+    next_idx: Option<u32>,
+    label: &'static str,
+}
+
+fn nested_kind_rows<'a>(
+    nested: &NestedListLocals,
+    inner_ll: &'a ListEmitLocals,
+    lcl: &WrapperLocals,
+) -> [NestedKindRow<'a>; 4] {
+    [
+        NestedKindRow {
+            cursor: nested.kinds.handle,
+            kb: &inner_ll.handle,
+            next_idx: lcl.next_handle_idx,
+            label: "handle",
+        },
+        NestedKindRow {
+            cursor: nested.kinds.flags,
+            kb: &inner_ll.flags,
+            next_idx: lcl.next_flags_idx,
+            label: "flags",
+        },
+        NestedKindRow {
+            cursor: nested.kinds.record,
+            kb: &inner_ll.record,
+            next_idx: lcl.next_record_idx,
+            label: "record",
+        },
+        NestedKindRow {
+            cursor: nested.kinds.variant,
+            kb: &inner_ll.variant,
+            next_idx: lcl.next_variant_idx,
+            label: "variant",
+        },
+    ]
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
@@ -506,25 +545,19 @@ fn build_list_emit_locals_for_plan(
             );
             let cursor = builder.alloc_local(ValType::I32);
             // Per-kind cursor allocated only when inner contributes that kind.
-            let flags_cursor = inner
-                .flags
-                .slot_base
-                .map(|_| builder.alloc_local(ValType::I32));
-            let record_cursor = inner
-                .record
-                .slot_base
-                .map(|_| builder.alloc_local(ValType::I32));
-            let variant_cursor = inner
-                .variant
-                .slot_base
-                .map(|_| builder.alloc_local(ValType::I32));
+            let mut alloc_if =
+                |kb: &KindBuffers| kb.slot_base.map(|_| builder.alloc_local(ValType::I32));
+            let kinds = NestedKindCursors {
+                handle: alloc_if(&inner.handle),
+                flags: alloc_if(&inner.flags),
+                record: alloc_if(&inner.record),
+                variant: alloc_if(&inner.variant),
+            };
             let outer_ptr_scratch = builder.alloc_local(ValType::I32);
             Some(NestedListLocals {
                 inner: Box::new(inner),
                 cursor,
-                flags_cursor,
-                record_cursor,
-                variant_cursor,
+                kinds,
                 outer_ptr_scratch,
             })
         }
@@ -1374,75 +1407,38 @@ fn emit_nested_list_pre_pass(
         outer_ll.elem_byte_size, 8,
         "nested-list outer element must be canon-ABI list = (ptr, len) 8 bytes",
     );
-    // cursor = outer.start_i + outer.len  (initial position of the
-    // first inner-cell slot; advanced per outer iter by emit).
+    let rows = nested_kind_rows(nested, inner_ll, lcl);
+    // Skip cursor seeds + data walk on empty outer.
+    f.instructions().local_get(outer_ll.len);
+    f.instructions().if_(BlockType::Empty);
+    // cursor = outer.start_i + outer.len.
     f.instructions().local_get(outer_ll.start_i);
     f.instructions().local_get(outer_ll.len);
     f.instructions().i32_add();
     f.instructions().local_set(cursor);
-    // <kind>_cursor = next_<kind>_idx (pre-bump). Per outer iter, emit
-    // snaps `inner.<kind>.slot_base = <kind>_cursor` and advances by
-    // `inner.len * inner.<kind>.count_per_elem`. Cursor seed runs once
-    // here; the per_elem stride is captured for the walk loop below.
-    let seed_cursor = |f: &mut Function,
-                       cursor: Option<u32>,
-                       inner_kb: &KindBuffers,
-                       next_idx: Option<u32>,
-                       gate_label: &str|
-     -> Option<u32> {
-        cursor.map(|c| {
-            let per_elem = inner_kb.count_per_elem;
-            debug_assert!(
-                per_elem > 0,
-                "nested cursor allocated only when inner contributes {gate_label}",
-            );
-            // per_elem ≤ inner_elem_count by construction (walk_element_plan
-            // bumps the kind count only on cells contributing to inner_elem_count),
-            // so the cell-slab overflow trap guards this kind's slab too.
-            debug_assert!(per_elem <= inner_elem_count);
-            f.instructions().local_get(next_idx.unwrap_or_else(|| {
-                panic!(
-                    "fn_has_list_elem_{gate_label} gate disagrees with nested.{gate_label}_cursor"
-                )
-            }));
-            f.instructions().local_set(c);
-            per_elem
-        })
-    };
-    let flags_per_elem = seed_cursor(
-        f,
-        nested.flags_cursor,
-        &inner_ll.flags,
-        lcl.next_flags_idx,
-        "flags",
-    );
-    let records_per_elem = seed_cursor(
-        f,
-        nested.record_cursor,
-        &inner_ll.record,
-        lcl.next_record_idx,
-        "record",
-    );
-    let variants_per_elem = seed_cursor(
-        f,
-        nested.variant_cursor,
-        &inner_ll.variant,
-        lcl.next_variant_idx,
-        "variant",
-    );
-    // Skip the entire walk when outer is empty — saves the
-    // loop preamble + branch on hot empty-outer paths. `if_` fires
-    // on non-zero, so `local_get(outer.len)` is the natural guard.
-    f.instructions().local_get(outer_ll.len);
-    f.instructions().if_(BlockType::Empty);
-    // Load outer.ptr into scratch for the walk.
+    for row in rows {
+        let Some(c) = row.cursor else { continue };
+        debug_assert!(
+            row.kb.count_per_elem > 0,
+            "nested cursor allocated only when inner contributes {}",
+            row.label,
+        );
+        // count_per_elem ≤ inner_elem_count by construction → the
+        // cell-slab overflow trap below guards this kind's slab too.
+        debug_assert!(row.kb.count_per_elem <= inner_elem_count);
+        let next_idx = row.next_idx.unwrap_or_else(|| {
+            panic!(
+                "fn_has_list_elem_{} gate disagrees with nested.kinds.{}",
+                row.label, row.label
+            )
+        });
+        f.instructions().local_get(next_idx);
+        f.instructions().local_set(c);
+    }
     push_widened_get(f, plan, local_base, outer_spec.ptr_slot, WasmType::I32);
     f.instructions().local_set(outer_ptr_scratch);
-    // for (j = 0; j < outer.len; j++) {
-    //     inner.len = mem[outer_ptr + j*8 + 4];
-    //     trap_check; next_cell_idx += inner.len * inner_elem_count;
-    //     (per per-element kind) next_<kind>_idx += inner.len * <kind>_per_elem;
-    // }
+    // for j in 0..outer.len: inner.len = mem[outer_ptr + j*8 + 4];
+    //   trap_check; bump next_cell_idx + each contributed next_<kind>_idx.
     f.instructions().i32_const(0);
     f.instructions().local_set(outer_ll.j);
     f.instructions().block(BlockType::Empty);
@@ -1471,20 +1467,17 @@ fn emit_nested_list_pre_pass(
         ctx.cell_layout.size,
     );
     emit_cursor_advance_by_len(f, lcl.next_cell_idx, inner_ll.len, inner_elem_count);
-    // next_<kind>_idx += inner.len * <kind>_per_elem.
-    for (per_elem, next_idx, gate_label) in [
-        (flags_per_elem, lcl.next_flags_idx, "flags"),
-        (records_per_elem, lcl.next_record_idx, "record"),
-        (variants_per_elem, lcl.next_variant_idx, "variant"),
-    ] {
-        if let Some(per_elem) = per_elem {
-            let next_idx = next_idx.unwrap_or_else(|| {
-                panic!(
-                    "fn_has_list_elem_{gate_label} gate disagrees with nested.{gate_label}_cursor"
-                )
-            });
-            emit_cursor_advance_by_len(f, next_idx, inner_ll.len, per_elem);
+    for row in rows {
+        if row.cursor.is_none() {
+            continue;
         }
+        let next_idx = row.next_idx.unwrap_or_else(|| {
+            panic!(
+                "fn_has_list_elem_{} gate disagrees with nested.kinds.{}",
+                row.label, row.label
+            )
+        });
+        emit_cursor_advance_by_len(f, next_idx, inner_ll.len, row.kb.count_per_elem);
     }
     f.instructions().local_get(outer_ll.j);
     f.instructions().i32_const(1);
@@ -1865,18 +1858,13 @@ fn emit_list_of_arm(
                 f.instructions().local_set(inner_ll.len);
                 f.instructions().local_get(nested.cursor);
                 f.instructions().local_set(inner_ll.start_i);
-                for (cursor, kb, kind_label) in [
-                    (nested.flags_cursor, &inner_ll.flags, "flags"),
-                    (nested.record_cursor, &inner_ll.record, "record"),
-                    (nested.variant_cursor, &inner_ll.variant, "variant"),
-                ] {
-                    if let Some(cursor) = cursor {
-                        let dest = kb.slot_base.unwrap_or_else(|| {
-                            panic!("nested.{kind_label}_cursor ⇔ inner.{kind_label}.slot_base")
-                        });
-                        f.instructions().local_get(cursor);
-                        f.instructions().local_set(dest);
-                    }
+                for row in nested_kind_rows(nested, inner_ll, lcl) {
+                    let Some(cursor) = row.cursor else { continue };
+                    let dest = row.kb.slot_base.unwrap_or_else(|| {
+                        panic!("nested.kinds.{} ⇔ inner.{}.slot_base", row.label, row.label)
+                    });
+                    f.instructions().local_get(cursor);
+                    f.instructions().local_set(dest);
                 }
             }
             _ => {}
@@ -1909,13 +1897,9 @@ fn emit_list_of_arm(
             let nested = nested_of(ll);
             let inner_ll = nested.inner.as_ref();
             emit_cursor_advance_by_len(f, nested.cursor, inner_ll.len, inner_plan.cell_count());
-            for (cursor, kb) in [
-                (nested.flags_cursor, &inner_ll.flags),
-                (nested.record_cursor, &inner_ll.record),
-                (nested.variant_cursor, &inner_ll.variant),
-            ] {
-                if let Some(cursor) = cursor {
-                    emit_cursor_advance_by_len(f, cursor, inner_ll.len, kb.count_per_elem);
+            for row in nested_kind_rows(nested, inner_ll, lcl) {
+                if let Some(cursor) = row.cursor {
+                    emit_cursor_advance_by_len(f, cursor, inner_ll.len, row.kb.count_per_elem);
                 }
             }
         }
