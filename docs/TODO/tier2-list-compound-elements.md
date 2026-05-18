@@ -4,29 +4,23 @@ Every other type lifts today (primitives, `string`, `list<u8>`,
 `enum`, `record`, `tuple`, `option`, `result`, `flags`, `variant`,
 `char`, `own<R>` / `borrow<R>`, `stream<T>` / `future<T>`,
 `error-context`, `list<T, N>`, `list<T>` over every kind, and
-`list<list<T>>` with `T` on the per-call-buffer-free subset).
+`list<list<T>>` over every supported inner kind — depth-2 only).
 
 ## What's left
 
-### `list<list<T>>` inner kinds that need a per-call info buffer
+### Unify `NestedListLocals` per-kind cursors with `KindBuffers`
 
-Inner `T` ∈ `flags` / `handle` still bails at plan-build via
-`Cell::ListOf::list_element_class` (`lift/plan.rs`) — the gate
-accepts `Scalar` / `PrestagedChar` / `PrestagedChildIdx` /
-`PrestagedTupleIndices` / `PrestagedRecord` / `PrestagedVariant`
-for the inner element plan and rejects the rest. To unblock each:
-extend the inner-element gate one class at a time and teach the
-matching info-buffer sizing pre-pass. Pattern (see record/variant
-support for the template):
-- Allow the new class in the gate.
-- Add a `nested_inner_<kind>_cursor` on `ListEmitLocals` (allocated
-  only when the inner contributes that kind).
-- Seed the cursor + bump the wrapper-level `next_<kind>_idx` in
-  `emit_nested_list_pre_pass`.
-- Snap `inner.<kind>_slot_base = cursor` and advance the cursor per
-  outer iter in `emit_list_of_arm`.
-- Update `LiftPlan::has_list_elem_<kind>` to recurse if it doesn't
-  already (record/variant already use `any_list_element_has_class`).
+Today `NestedListLocals` has four flat `Option<u32>` cursor fields
+(`handle_cursor`, `flags_cursor`, `record_cursor`, `variant_cursor`)
+that mirror the four `KindBuffers` substructs on `ListEmitLocals`
+but aren't unified the same way. Each new kind adds a row to three
+parallel arrays in `emit_nested_list_pre_pass` and `emit_list_of_arm`.
+A `NestedKindCursors { handle, flags, record, variant }` aligned
+with `KindBuffers` plus a `for_each_nested_kind(nested, inner_ll, 
+…)` helper would let the call sites zip `(cursor, kb, label)` rows
+instead of hand-aligning them, and would let the cursor seeds move
+inside the `if outer.len > 0` guard (~5 dead wasm instructions per
+contributed kind per outer list today).
 
 ### `list<list<list<…>>>` (depth ≥ 3)
 
@@ -37,6 +31,38 @@ depth, but the cell-array sizing pre-pass only walks one level of
 nesting; extend it to recurse so deeper trees can size their slabs.
 
 ## Recently landed
+
+- `list<list<handle>>` — `PrestagedHandle` joins the allowed inner
+  classes. `NestedListLocals` gains `handle_cursor`;
+  `emit_nested_list_pre_pass` bumps `lcl.next_handle_idx` by
+  `Σ inner_len_j * inner.handle.count_per_elem`, and
+  `emit_list_of_arm`'s nested arm snaps/advances
+  `inner.handle.slot_base` from the cursor per outer iter. Drops
+  into the existing per-kind cursor / snap / advance arrays
+  (alongside flags / record / variant) as one more row. Test-
+  harness fix: `consumer_pass_expr` + `Shape::List` rust_literal
+  now recurse via `Shape::contains_resource()` so
+  `list<list<own<R>>>` constructs handles in the outer mode (no
+  spurious `.await`) and passes by value (no spurious `&`). Canned
+  shape `list<list<own<cat>>>` joins `tier2_shapes()`.
+
+- `list<list<flags>>` — `PrestagedFlags` joins the allowed inner
+  classes. The refactor that landed alongside it collapsed the 12
+  flat per-kind fields on `ListEmitLocals` (handle / flags / record
+  / variant × `{slot_base, count_per_elem, buf_base, bytes_per_elem}`)
+  into four `KindBuffers` substructures, so the nested-list per-kind
+  loops (snap-and-advance in the pre-pass, snap-from-cursor at outer
+  iter start, advance-by-len at outer iter end) iterate over a
+  homogeneous `[(cursor, kb, label); N]` array. `NestedListLocals`
+  gains `flags_cursor`; `emit_nested_list_pre_pass` bumps
+  `lcl.next_flags_idx` by `Σ inner_len_j * inner.flags.count_per_elem`.
+  Per-call flags-set-flags scratch (`inner.flags.buf_base`) stays
+  per-outer-iter `cabi_realloc`'d inside the inner's
+  `emit_list_of_arm` — no new wrapper-level allocation. Canned
+  shapes: `list<list<fperms>>` (single-kind cursor flow) and
+  `list<list<tuple<fperms, fcaps>>>` (3-bit / 5-bit mismatch pins
+  cumulative `scratch_offset_in_elem` stride math, analogous to
+  `list_list_variant_tagged-pair_fst`).
 
 - `list<list<variant>>` — same shape as the record case below.
   `PrestagedVariant` joins the allowed inner classes; `ListEmitLocals`

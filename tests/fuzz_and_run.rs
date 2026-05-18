@@ -584,17 +584,14 @@ impl Shape {
                 }
             }
             Shape::List(inner) => {
-                // wit-bindgen lowers `list<T>` params as `&[T]` with
-                // `T` owned (e.g. `&[String]`, not `&[&str]`) regardless
-                // of outer mode. Force the element to Async-mode so a
-                // `string` element renders as `String::from(...)`.
-                // Exception: resource constructors stay tied to the
-                // outer mode — a `.await` in a sync `run()` is a
-                // compile error, and `&[Cat]` is the right shape for
-                // `list<own<R>>` regardless.
-                let elem_mode = match inner.as_ref() {
-                    Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => mode,
-                    _ => AsyncMode::Async,
+                // Force Async-mode so `string` elements render as
+                // `String::from(...)`; subtrees with a resource
+                // constructor (direct or nested) stay on outer mode
+                // since `.await` in sync `run()` doesn't compile.
+                let elem_mode = if inner.contains_resource() {
+                    mode
+                } else {
+                    AsyncMode::Async
                 };
                 format!("vec![{}]", inner.rust_literal(side, elem_mode))
             }
@@ -604,13 +601,13 @@ impl Shape {
                 "vec![]".to_string()
             }
             Shape::FixedLengthList { inner, n } => {
-                // wit-bindgen renders `list<T, N>` as `[T; N]` (Rust
-                // array). Same owned-element rule as `List`: force
-                // Async-mode on the inner literal so a `string` element
-                // becomes `String::from(...)` regardless of outer mode.
-                let elem_mode = match inner.as_ref() {
-                    Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => mode,
-                    _ => AsyncMode::Async,
+                // Same owned-element + resource rule as `Shape::List`:
+                // force Async-mode unless the subtree contains a resource
+                // constructor, in which case stay on outer mode.
+                let elem_mode = if inner.contains_resource() {
+                    mode
+                } else {
+                    AsyncMode::Async
                 };
                 let lit = inner.rust_literal(side, elem_mode);
                 let parts: Vec<String> = (0..*n as usize).map(|_| lit.clone()).collect();
@@ -759,12 +756,11 @@ impl Shape {
         if matches!(self, Shape::ResourceOwn { .. }) {
             return v_ident.to_string();
         }
-        // `list<own<R>>` — wit-bindgen takes `Vec<R>` by value (the
-        // ownership transfer is in the elements; you can't borrow a
-        // slice of resources because each handle has to move into
-        // the call). Pass-by-value regardless of mode.
+        // `list<…own<R>…>` — wit-bindgen takes the Vec by value to
+        // move each resource handle into the call. Recurse so nested
+        // forms (`list<list<own<R>>>`, etc.) match too.
         if let Shape::List(inner) | Shape::ListEmpty(inner) = self {
-            if matches!(inner.as_ref(), Shape::ResourceOwn { .. }) {
+            if inner.contains_resource() {
                 return v_ident.to_string();
             }
         }
@@ -2191,6 +2187,14 @@ fn tier2_shapes() -> Vec<Shape> {
                 selected: 0b10010,
             },
         ]))))),
+        // Inner T = own<R> — exercises nested handle_cursor. The
+        // borrow<R> sibling rides on the unit-test validator fixture
+        // (`f-list-of-list-handle-borrow`) since the echo signature
+        // here can't return borrow.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::ResourceOwn {
+            wit_name: "cat",
+            rust_name: "Cat",
+        })))),
         // Inner T = record — exercises nested record_cursor.
         Shape::List(Box::new(Shape::List(Box::new(Shape::Record {
             wit_name: "point",

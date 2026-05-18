@@ -135,6 +135,11 @@ const TEST_WIT: &str = r#"
         // into wrapper-level `next_record_idx`; emit snaps + advances
         // `inner.record_slot_base` from `nested_inner_record_cursor`.
         f-list-of-list-point: func(xs: list<list<point>>);
+        // Inner T = own / borrow — `Cell::Handle` rides nested
+        // `handle_cursor`. Borrow lives in this fixture only (echo
+        // signature in `tier2_shapes()` can't return borrow).
+        f-list-of-list-handle-own: func(xs: list<list<own<my-res>>>);
+        f-list-of-list-handle-borrow: func(xs: list<list<borrow<my-res>>>);
         // Nested-list at result position — retptr-loaded compound.
         f-result-list-of-list-u32: func() -> list<list<u32>>;
         // Depth-2 cap: a `list<…>` element-cell may only appear as
@@ -3040,6 +3045,8 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-list-of-list-tuple-u32-u32", &r, &mut names),
         plan_for_param("f-list-of-list-color", &r, &mut names),
         plan_for_param("f-list-of-list-point", &r, &mut names),
+        plan_for_param("f-list-of-list-handle-own", &r, &mut names),
+        plan_for_param("f-list-of-list-handle-borrow", &r, &mut names),
     ];
     for plan in &plans {
         validate_emit_lift_plan(plan, r.resolve());

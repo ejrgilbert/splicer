@@ -386,11 +386,15 @@ pub(crate) struct NestedListLocals {
     /// Kept separate from `inner.start_i` so the inner's `start_i`
     /// keeps its single base-pointer meaning.
     pub cursor: u32,
-    /// Flags-info twin of [`Self::cursor`]: seeded to pre-bump
-    /// `lcl.next_flags_idx`, advances by `inner.len * inner.flags.count_per_elem`
-    /// per outer iter. `Some` iff inner contributes flags. Flags
-    /// scratch is per-call cabi_realloc'd inside the inner's
-    /// `emit_list_of_arm`, so no scratch cursor is needed here.
+    /// Handle-info twin of [`Self::cursor`]: seeded to pre-bump
+    /// `lcl.next_handle_idx`, advances by `inner.len * inner.handle.count_per_elem`
+    /// per outer iter. `Some` iff inner contributes handles.
+    pub handle_cursor: Option<u32>,
+    /// Flags-info twin: seeded to pre-bump `lcl.next_flags_idx`,
+    /// advances by `inner.len * inner.flags.count_per_elem`. `Some`
+    /// iff inner contributes flags. Flags scratch is per-call
+    /// `cabi_realloc`'d inside the inner's `emit_list_of_arm`, so no
+    /// scratch cursor is needed here.
     pub flags_cursor: Option<u32>,
     /// Record-info twin: seeded to pre-bump `lcl.next_record_idx`,
     /// advances by `inner.len * inner.record.count_per_elem`. `Some`
@@ -506,6 +510,10 @@ fn build_list_emit_locals_for_plan(
             );
             let cursor = builder.alloc_local(ValType::I32);
             // Per-kind cursor allocated only when inner contributes that kind.
+            let handle_cursor = inner
+                .handle
+                .slot_base
+                .map(|_| builder.alloc_local(ValType::I32));
             let flags_cursor = inner
                 .flags
                 .slot_base
@@ -522,6 +530,7 @@ fn build_list_emit_locals_for_plan(
             Some(NestedListLocals {
                 inner: Box::new(inner),
                 cursor,
+                handle_cursor,
                 flags_cursor,
                 record_cursor,
                 variant_cursor,
@@ -1409,6 +1418,13 @@ fn emit_nested_list_pre_pass(
             per_elem
         })
     };
+    let handles_per_elem = seed_cursor(
+        f,
+        nested.handle_cursor,
+        &inner_ll.handle,
+        lcl.next_handle_idx,
+        "handle",
+    );
     let flags_per_elem = seed_cursor(
         f,
         nested.flags_cursor,
@@ -1473,6 +1489,7 @@ fn emit_nested_list_pre_pass(
     emit_cursor_advance_by_len(f, lcl.next_cell_idx, inner_ll.len, inner_elem_count);
     // next_<kind>_idx += inner.len * <kind>_per_elem.
     for (per_elem, next_idx, gate_label) in [
+        (handles_per_elem, lcl.next_handle_idx, "handle"),
         (flags_per_elem, lcl.next_flags_idx, "flags"),
         (records_per_elem, lcl.next_record_idx, "record"),
         (variants_per_elem, lcl.next_variant_idx, "variant"),
@@ -1866,6 +1883,7 @@ fn emit_list_of_arm(
                 f.instructions().local_get(nested.cursor);
                 f.instructions().local_set(inner_ll.start_i);
                 for (cursor, kb, kind_label) in [
+                    (nested.handle_cursor, &inner_ll.handle, "handle"),
                     (nested.flags_cursor, &inner_ll.flags, "flags"),
                     (nested.record_cursor, &inner_ll.record, "record"),
                     (nested.variant_cursor, &inner_ll.variant, "variant"),
@@ -1910,6 +1928,7 @@ fn emit_list_of_arm(
             let inner_ll = nested.inner.as_ref();
             emit_cursor_advance_by_len(f, nested.cursor, inner_ll.len, inner_plan.cell_count());
             for (cursor, kb) in [
+                (nested.handle_cursor, &inner_ll.handle),
                 (nested.flags_cursor, &inner_ll.flags),
                 (nested.record_cursor, &inner_ll.record),
                 (nested.variant_cursor, &inner_ll.variant),
