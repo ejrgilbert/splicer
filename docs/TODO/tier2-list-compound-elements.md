@@ -8,20 +8,6 @@ Every other type lifts today (primitives, `string`, `list<u8>`,
 
 ## What's left
 
-### Unify `NestedListLocals` per-kind cursors with `KindBuffers`
-
-Today `NestedListLocals` has four flat `Option<u32>` cursor fields
-(`handle_cursor`, `flags_cursor`, `record_cursor`, `variant_cursor`)
-that mirror the four `KindBuffers` substructs on `ListEmitLocals`
-but aren't unified the same way. Each new kind adds a row to three
-parallel arrays in `emit_nested_list_pre_pass` and `emit_list_of_arm`.
-A `NestedKindCursors { handle, flags, record, variant }` aligned
-with `KindBuffers` plus a `for_each_nested_kind(nested, inner_ll, 
-…)` helper would let the call sites zip `(cursor, kb, label)` rows
-instead of hand-aligning them, and would let the cursor seeds move
-inside the `if outer.len > 0` guard (~5 dead wasm instructions per
-contributed kind per outer list today).
-
 ### `list<list<list<…>>>` (depth ≥ 3)
 
 Same gate rejects `PrestagedNestedList` as an inner-element class,
@@ -31,6 +17,19 @@ depth, but the cell-array sizing pre-pass only walks one level of
 nesting; extend it to recurse so deeper trees can size their slabs.
 
 ## Recently landed
+
+- Nested-list cursor unification — `NestedListLocals`'s four flat
+  `Option<u32>` cursor fields collapsed into a `NestedKindCursors`
+  substruct mirroring `KindBuffers`, and a `nested_kind_rows()`
+  helper now owns the single kind list. The three call sites
+  (pre-pass seed, pre-pass walk-loop wrapper-counter advance,
+  iter-start inner-slot snap, iter-end cursor advance) iterate
+  `for row in nested_kind_rows(...)` instead of hand-aligning
+  parallel 4-row tables. Pre-pass cursor seeds also moved inside
+  the `if outer.len > 0` guard so the empty-outer fast path skips
+  them. Adding a new kind now touches two sites instead of five:
+  one row in `nested_kind_rows` and one field on `NestedKindCursors`
+  (plus the existing `KindBuffers`).
 
 - `list<list<handle>>` — `PrestagedHandle` joins the allowed inner
   classes. `NestedListLocals` gains `handle_cursor`;
