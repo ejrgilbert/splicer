@@ -30,14 +30,11 @@ use wit_parser::abi::WasmType;
 /// phases share the same indices. Result-lift-only locals live on
 /// [`ResultEmitPlan`].
 ///
-/// **Stage-then-consume invariant** (applies to the `Option<u32>`
-/// staging slots: `tuple_slot_ptr`, `list_elem_handle_base`,
-/// `list_elem_flags_base`, `list_elem_record_base`,
-/// `list_elem_variant_base`, `handle_info_base`, etc.): each is a
-/// single shared local set immediately before its consumer emits.
-/// Interleaving any emit between stage and consume silently clobbers
-/// it. Future refactors that reorder must keep stage→consume
-/// contiguous, or split into one local per consumer.
+/// **Stage-then-consume invariant**: the `Option<u32>` staging slots
+/// (`tuple_slot_ptr`, `list_elem_*_base`, `*_info_base`, etc.) are
+/// each a single shared local set immediately before their consumer
+/// emits. Interleaving any emit between stage and consume silently
+/// clobbers them — keep stage→consume contiguous.
 pub(crate) struct WrapperLocals {
     /// Scratch for the cell write address.
     pub addr: u32,
@@ -90,10 +87,10 @@ pub(crate) struct WrapperLocals {
     pub cells_base: u32,
     /// Running cell-index counter; holds `total_cells` after pre-pass.
     pub next_cell_idx: u32,
-    /// Per-iteration `handle_slot_base + j * handles_per_elem`. Stage-
+    /// Per-iter `ll.handle.slot_base + j * count_per_elem`. Stage-
     /// then-consume; `Some` iff [`fn_has_list_elem_handle`].
     pub list_elem_handle_base: Option<u32>,
-    /// Per-iteration `flags_slot_base + j * flags_per_elem` + scratch
+    /// Per-iter `ll.flags.slot_base + j * count_per_elem` + scratch
     /// base. Stage-then-consume; `Some` iff [`fn_has_list_elem_flags`].
     pub list_elem_flags_base: Option<u32>,
     pub list_elem_flags_scratch_base: Option<u32>,
@@ -106,13 +103,13 @@ pub(crate) struct WrapperLocals {
     /// Runtime cell-payload idx (list-element handles, non-zero offset).
     pub handle_payload_idx: Option<u32>,
     /// Running handle-info entry count: starts at static count, bumps
-    /// by `len * handles_per_elem` per list. Sizes `cabi_realloc` +
-    /// patches `handle_infos.len`. `Some` iff list-elem-handle present.
+    /// by `len * ll.handle.count_per_elem` per list. Sizes `cabi_realloc`
+    /// + patches `handle_infos.len`. `Some` iff list-elem-handle present.
     pub next_handle_idx: Option<u32>,
     pub next_flags_idx: Option<u32>,
     pub next_record_idx: Option<u32>,
-    /// Per-iteration `record_slot_base + j * records_per_elem` +
-    /// tuples sub-region base. Stage-then-consume.
+    /// Per-iter `ll.record.slot_base + j * count_per_elem` + tuples
+    /// sub-region base. Stage-then-consume.
     pub list_elem_record_base: Option<u32>,
     pub list_elem_record_tuples_base: Option<u32>,
     pub record_slot_addr: Option<u32>,
@@ -313,6 +310,17 @@ pub(crate) struct PlanCursor<'a> {
     pub elem_cell_base: Option<u32>,
 }
 
+/// Per-info-kind buffer locals for one list. Handle/variant leave
+/// `buf_base`/`bytes_per_elem` unused so all four kinds share shape.
+pub(crate) struct KindBuffers {
+    /// Slice base in the wrapper-level info buffer; `None` iff zero entries.
+    pub slot_base: Option<u32>,
+    pub count_per_elem: u32,
+    /// Per-call cabi_realloc'd scratch base; `None` for handle/variant.
+    pub buf_base: Option<u32>,
+    pub bytes_per_elem: u32,
+}
+
 /// Per-`Cell::ListOf` emit-time bundle. One entry per list-of cell;
 /// parallel to [`LiftPlan::list_specs`].
 pub(crate) struct ListEmitLocals {
@@ -347,28 +355,12 @@ pub(crate) struct ListEmitLocals {
     /// Per-iteration cell-array base (`start_i + j*elem_count`).
     /// Always allocated — saves 1–2 insns per cell per iter vs recomputing.
     pub elem_cell_base: u32,
-    /// Handle-info buffer starting slot for this list's elements.
-    pub handle_slot_base: Option<u32>,
-    pub handles_per_elem: u32,
-    pub flags_slot_base: Option<u32>,
-    pub flags_per_elem: u32,
-    /// Per-call set-flags scratch buffer base; sized at
-    /// `len * flags_scratch_bytes_per_elem`.
-    pub flags_scratch_buf_base: Option<u32>,
-    /// `Σ info.item_names.len() * STRING_FLAT_BYTES` across element-
-    /// plan `Cell::Flags` cells — variable per cell, so each carries
-    /// its own `scratch_offset_in_elem`.
-    pub flags_scratch_bytes_per_elem: u32,
-    pub record_slot_base: Option<u32>,
-    pub records_per_elem: u32,
-    /// Per-call field-tuples scratch base; sized at
-    /// `len * record_tuples_bytes_per_elem`.
-    pub record_tuples_buf_base: Option<u32>,
-    /// `Σ fields.len() * tuple_size` across element-plan `Cell::RecordOf`
-    /// cells — variable per cell.
-    pub record_tuples_bytes_per_elem: u32,
-    pub variant_slot_base: Option<u32>,
-    pub variants_per_elem: u32,
+    /// Per-info-kind buffer locals. Flags/record use the scratch pair;
+    /// handle/variant leave it `None`/`0`.
+    pub handle: KindBuffers,
+    pub flags: KindBuffers,
+    pub record: KindBuffers,
+    pub variant: KindBuffers,
     /// Nested-list state: `Some` exactly when this list's element plan
     /// is `[Cell::ListOf]` (enforced by `push_list_of`'s depth-2 cap).
     /// Bundles inner locals + per-kind cursors + outer-ptr scratch so
@@ -394,15 +386,19 @@ pub(crate) struct NestedListLocals {
     /// Kept separate from `inner.start_i` so the inner's `start_i`
     /// keeps its single base-pointer meaning.
     pub cursor: u32,
-    /// Record-info twin of [`Self::cursor`]: seeded to pre-bump
-    /// `lcl.next_record_idx`, advances by
-    /// `inner.len * inner.records_per_elem` per outer iter. `Some` iff
-    /// the inner element plan has record-info contributions.
+    /// Flags-info twin of [`Self::cursor`]: seeded to pre-bump
+    /// `lcl.next_flags_idx`, advances by `inner.len * inner.flags.count_per_elem`
+    /// per outer iter. `Some` iff inner contributes flags. Flags
+    /// scratch is per-call cabi_realloc'd inside the inner's
+    /// `emit_list_of_arm`, so no scratch cursor is needed here.
+    pub flags_cursor: Option<u32>,
+    /// Record-info twin: seeded to pre-bump `lcl.next_record_idx`,
+    /// advances by `inner.len * inner.record.count_per_elem`. `Some`
+    /// iff inner contributes records.
     pub record_cursor: Option<u32>,
-    /// Variant-info twin of [`Self::record_cursor`]: seeded to
-    /// pre-bump `lcl.next_variant_idx`, advances by
-    /// `inner.len * inner.variants_per_elem` per outer iter. `Some`
-    /// iff the inner element plan has variant-info contributions.
+    /// Variant-info twin: seeded to pre-bump `lcl.next_variant_idx`,
+    /// advances by `inner.len * inner.variant.count_per_elem`. `Some`
+    /// iff inner contributes variants.
     pub variant_cursor: Option<u32>,
     /// Outer-ptr scratch for the nested-list pre-pass memory walk.
     pub outer_ptr_scratch: u32,
@@ -468,20 +464,30 @@ fn build_list_emit_locals_for_plan(
         (counts.tuple_idx_slots > 0).then(|| builder.alloc_local(ValType::I32));
     let chars_per_elem = counts.chars;
     let tuple_idx_count_per_elem = counts.tuple_idx_slots;
-    let handle_slot_base = (counts.handles > 0).then(|| builder.alloc_local(ValType::I32));
-    let handles_per_elem = counts.handles;
-    let flags_slot_base = (counts.flags > 0).then(|| builder.alloc_local(ValType::I32));
-    let flags_scratch_buf_base =
-        (counts.flags_scratch_bytes > 0).then(|| builder.alloc_local(ValType::I32));
-    let flags_per_elem = counts.flags;
-    let flags_scratch_bytes_per_elem = counts.flags_scratch_bytes;
-    let record_slot_base = (counts.records > 0).then(|| builder.alloc_local(ValType::I32));
-    let records_per_elem = counts.records;
-    let record_tuples_buf_base =
-        (counts.record_tuples_bytes > 0).then(|| builder.alloc_local(ValType::I32));
-    let record_tuples_bytes_per_elem = counts.record_tuples_bytes;
-    let variant_slot_base = (counts.variants > 0).then(|| builder.alloc_local(ValType::I32));
-    let variants_per_elem = counts.variants;
+    let handle = KindBuffers {
+        slot_base: (counts.handles > 0).then(|| builder.alloc_local(ValType::I32)),
+        count_per_elem: counts.handles,
+        buf_base: None,
+        bytes_per_elem: 0,
+    };
+    let flags = KindBuffers {
+        slot_base: (counts.flags > 0).then(|| builder.alloc_local(ValType::I32)),
+        count_per_elem: counts.flags,
+        buf_base: (counts.flags_scratch_bytes > 0).then(|| builder.alloc_local(ValType::I32)),
+        bytes_per_elem: counts.flags_scratch_bytes,
+    };
+    let record = KindBuffers {
+        slot_base: (counts.records > 0).then(|| builder.alloc_local(ValType::I32)),
+        count_per_elem: counts.records,
+        buf_base: (counts.record_tuples_bytes > 0).then(|| builder.alloc_local(ValType::I32)),
+        bytes_per_elem: counts.record_tuples_bytes,
+    };
+    let variant = KindBuffers {
+        slot_base: (counts.variants > 0).then(|| builder.alloc_local(ValType::I32)),
+        count_per_elem: counts.variants,
+        buf_base: None,
+        bytes_per_elem: 0,
+    };
     let elem_cell_base = builder.alloc_local(ValType::I32);
     // Nested-list recursion: element plan is exactly one `Cell::ListOf`.
     // Enforced by `push_list_of`'s depth-2 cap, so any other shape
@@ -499,19 +505,24 @@ fn build_list_emit_locals_for_plan(
                 builder,
             );
             let cursor = builder.alloc_local(ValType::I32);
-            // Per-kind cursor allocated only when the inner element
-            // plan contributes that kind — otherwise the cursor would
-            // be dead. Add an arm here for each new gated kind.
+            // Per-kind cursor allocated only when inner contributes that kind.
+            let flags_cursor = inner
+                .flags
+                .slot_base
+                .map(|_| builder.alloc_local(ValType::I32));
             let record_cursor = inner
-                .record_slot_base
+                .record
+                .slot_base
                 .map(|_| builder.alloc_local(ValType::I32));
             let variant_cursor = inner
-                .variant_slot_base
+                .variant
+                .slot_base
                 .map(|_| builder.alloc_local(ValType::I32));
             let outer_ptr_scratch = builder.alloc_local(ValType::I32);
             Some(NestedListLocals {
                 inner: Box::new(inner),
                 cursor,
+                flags_cursor,
                 record_cursor,
                 variant_cursor,
                 outer_ptr_scratch,
@@ -534,18 +545,10 @@ fn build_list_emit_locals_for_plan(
         tuple_idx_buf_base,
         tuple_idx_count_per_elem,
         elem_cell_base,
-        handle_slot_base,
-        handles_per_elem,
-        flags_slot_base,
-        flags_per_elem,
-        flags_scratch_buf_base,
-        flags_scratch_bytes_per_elem,
-        record_slot_base,
-        records_per_elem,
-        record_tuples_buf_base,
-        record_tuples_bytes_per_elem,
-        variant_slot_base,
-        variants_per_elem,
+        handle,
+        flags,
+        record,
+        variant,
         nested,
     }
 }
@@ -1187,6 +1190,55 @@ fn emit_cursor_advance_by_len(f: &mut Function, cursor: u32, len_local: u32, per
     f.instructions().local_set(cursor);
 }
 
+/// Per-iter `dest = kb.slot_base + j * kb.count_per_elem`. No-op
+/// when `kb.slot_base` is `None`. Uniform across all info kinds.
+fn emit_set_per_iter_slot_base(
+    f: &mut Function,
+    kb: &KindBuffers,
+    dest_opt: Option<u32>,
+    j: u32,
+    kind_label: &str,
+) {
+    let Some(slot_base) = kb.slot_base else {
+        return;
+    };
+    let dest = dest_opt.unwrap_or_else(|| {
+        panic!("fn_has_list_elem_{kind_label} disagrees with {kind_label}.slot_base")
+    });
+    f.instructions().local_get(slot_base);
+    f.instructions().local_get(j);
+    if kb.count_per_elem != 1 {
+        f.instructions().i32_const(kb.count_per_elem as i32);
+        f.instructions().i32_mul();
+    }
+    f.instructions().i32_add();
+    f.instructions().local_set(dest);
+}
+
+/// Per-iter `dest = kb.buf_base + j * kb.bytes_per_elem`. No-op
+/// when `kb.buf_base` is `None`. Stride is always > 1 byte so the
+/// `* 1` fold from [`emit_set_per_iter_slot_base`] never applies.
+fn emit_set_per_iter_scratch_base(
+    f: &mut Function,
+    kb: &KindBuffers,
+    dest_opt: Option<u32>,
+    j: u32,
+    kind_label: &str,
+) {
+    let Some(buf_base) = kb.buf_base else {
+        return;
+    };
+    let dest = dest_opt.unwrap_or_else(|| {
+        panic!("fn_has_list_elem_{kind_label} disagrees with {kind_label}.buf_base")
+    });
+    f.instructions().local_get(buf_base);
+    f.instructions().local_get(j);
+    f.instructions().i32_const(kb.bytes_per_elem as i32);
+    f.instructions().i32_mul();
+    f.instructions().i32_add();
+    f.instructions().local_set(dest);
+}
+
 /// Snap `slot_base = cursor`, then advance the cursor by
 /// `len_local * per_elem`. This is the per-list "give this list its
 /// slice of the wrapper-level info buffer, then walk the cursor past
@@ -1261,51 +1313,16 @@ pub(crate) fn emit_list_pre_pass(
             ctx.cell_layout.size,
         );
         emit_cursor_advance_by_len(f, lcl.next_cell_idx, ll.len, elem_count);
-        // Mirror the per-list bump on each kind's running counter
-        // when this list contributes element entries of that kind.
-        if let (Some(next_handle_idx), Some(handle_slot_base)) =
-            (lcl.next_handle_idx, ll.handle_slot_base)
-        {
-            emit_snap_and_advance_cursor(
-                f,
-                next_handle_idx,
-                handle_slot_base,
-                ll.len,
-                ll.handles_per_elem,
-            );
-        }
-        if let (Some(next_flags_idx), Some(flags_slot_base)) =
-            (lcl.next_flags_idx, ll.flags_slot_base)
-        {
-            emit_snap_and_advance_cursor(
-                f,
-                next_flags_idx,
-                flags_slot_base,
-                ll.len,
-                ll.flags_per_elem,
-            );
-        }
-        if let (Some(next_record_idx), Some(record_slot_base)) =
-            (lcl.next_record_idx, ll.record_slot_base)
-        {
-            emit_snap_and_advance_cursor(
-                f,
-                next_record_idx,
-                record_slot_base,
-                ll.len,
-                ll.records_per_elem,
-            );
-        }
-        if let (Some(next_variant_idx), Some(variant_slot_base)) =
-            (lcl.next_variant_idx, ll.variant_slot_base)
-        {
-            emit_snap_and_advance_cursor(
-                f,
-                next_variant_idx,
-                variant_slot_base,
-                ll.len,
-                ll.variants_per_elem,
-            );
+        // Mirror the per-list bump on each kind's running counter.
+        for (next_idx, kb) in [
+            (lcl.next_handle_idx, &ll.handle),
+            (lcl.next_flags_idx, &ll.flags),
+            (lcl.next_record_idx, &ll.record),
+            (lcl.next_variant_idx, &ll.variant),
+        ] {
+            if let (Some(next_idx), Some(slot_base)) = (next_idx, kb.slot_base) {
+                emit_snap_and_advance_cursor(f, next_idx, slot_base, ll.len, kb.count_per_elem);
+            }
         }
         if ll.nested.is_some() {
             emit_nested_list_pre_pass(f, ctx, plan, &spec, ll, local_base, lcl);
@@ -1363,44 +1380,56 @@ fn emit_nested_list_pre_pass(
     f.instructions().local_get(outer_ll.len);
     f.instructions().i32_add();
     f.instructions().local_set(cursor);
-    // record_cursor = next_record_idx (pre-bump). Per outer iter the
-    // emit-side snaps `inner.record_slot_base = record_cursor` and
-    // advances by `inner.len * inner.records_per_elem`. Only
-    // `records_per_elem` is needed inside the walk loop — the cursor
-    // seed runs once here.
-    let records_per_elem = nested.record_cursor.map(|rc| {
-        let per_elem = inner_ll.records_per_elem;
-        debug_assert!(
-            per_elem > 0,
-            "nested.record_cursor allocated only when inner contributes records",
-        );
-        // records_per_elem ≤ inner_elem_count by construction
-        // (`walk_element_plan` bumps `counts.records` only on cells
-        // that also count toward `inner_elem_count`), so the cell-slab
-        // overflow trap below guards the record-slab math too.
-        debug_assert!(per_elem <= inner_elem_count);
-        f.instructions().local_get(
-            lcl.next_record_idx
-                .expect("fn_has_list_elem_record gate disagrees with nested.record_cursor"),
-        );
-        f.instructions().local_set(rc);
-        per_elem
-    });
-    // Same shape for variant-info contributions.
-    let variants_per_elem = nested.variant_cursor.map(|vc| {
-        let per_elem = inner_ll.variants_per_elem;
-        debug_assert!(
-            per_elem > 0,
-            "nested.variant_cursor allocated only when inner contributes variants",
-        );
-        debug_assert!(per_elem <= inner_elem_count);
-        f.instructions().local_get(
-            lcl.next_variant_idx
-                .expect("fn_has_list_elem_variant gate disagrees with nested.variant_cursor"),
-        );
-        f.instructions().local_set(vc);
-        per_elem
-    });
+    // <kind>_cursor = next_<kind>_idx (pre-bump). Per outer iter, emit
+    // snaps `inner.<kind>.slot_base = <kind>_cursor` and advances by
+    // `inner.len * inner.<kind>.count_per_elem`. Cursor seed runs once
+    // here; the per_elem stride is captured for the walk loop below.
+    let seed_cursor = |f: &mut Function,
+                       cursor: Option<u32>,
+                       inner_kb: &KindBuffers,
+                       next_idx: Option<u32>,
+                       gate_label: &str|
+     -> Option<u32> {
+        cursor.map(|c| {
+            let per_elem = inner_kb.count_per_elem;
+            debug_assert!(
+                per_elem > 0,
+                "nested cursor allocated only when inner contributes {gate_label}",
+            );
+            // per_elem ≤ inner_elem_count by construction (walk_element_plan
+            // bumps the kind count only on cells contributing to inner_elem_count),
+            // so the cell-slab overflow trap guards this kind's slab too.
+            debug_assert!(per_elem <= inner_elem_count);
+            f.instructions().local_get(next_idx.unwrap_or_else(|| {
+                panic!(
+                    "fn_has_list_elem_{gate_label} gate disagrees with nested.{gate_label}_cursor"
+                )
+            }));
+            f.instructions().local_set(c);
+            per_elem
+        })
+    };
+    let flags_per_elem = seed_cursor(
+        f,
+        nested.flags_cursor,
+        &inner_ll.flags,
+        lcl.next_flags_idx,
+        "flags",
+    );
+    let records_per_elem = seed_cursor(
+        f,
+        nested.record_cursor,
+        &inner_ll.record,
+        lcl.next_record_idx,
+        "record",
+    );
+    let variants_per_elem = seed_cursor(
+        f,
+        nested.variant_cursor,
+        &inner_ll.variant,
+        lcl.next_variant_idx,
+        "variant",
+    );
     // Skip the entire walk when outer is empty — saves the
     // loop preamble + branch on hot empty-outer paths. `if_` fires
     // on non-zero, so `local_get(outer.len)` is the natural guard.
@@ -1412,8 +1441,7 @@ fn emit_nested_list_pre_pass(
     // for (j = 0; j < outer.len; j++) {
     //     inner.len = mem[outer_ptr + j*8 + 4];
     //     trap_check; next_cell_idx += inner.len * inner_elem_count;
-    //     (if inner records)  next_record_idx  += inner.len * records_per_elem;
-    //     (if inner variants) next_variant_idx += inner.len * variants_per_elem;
+    //     (per per-element kind) next_<kind>_idx += inner.len * <kind>_per_elem;
     // }
     f.instructions().i32_const(0);
     f.instructions().local_set(outer_ll.j);
@@ -1443,19 +1471,20 @@ fn emit_nested_list_pre_pass(
         ctx.cell_layout.size,
     );
     emit_cursor_advance_by_len(f, lcl.next_cell_idx, inner_ll.len, inner_elem_count);
-    // next_record_idx += inner.len * records_per_elem.
-    if let Some(per_elem) = records_per_elem {
-        let next_record_idx = lcl
-            .next_record_idx
-            .expect("fn_has_list_elem_record gate disagrees with nested.record_cursor");
-        emit_cursor_advance_by_len(f, next_record_idx, inner_ll.len, per_elem);
-    }
-    // next_variant_idx += inner.len * variants_per_elem.
-    if let Some(per_elem) = variants_per_elem {
-        let next_variant_idx = lcl
-            .next_variant_idx
-            .expect("fn_has_list_elem_variant gate disagrees with nested.variant_cursor");
-        emit_cursor_advance_by_len(f, next_variant_idx, inner_ll.len, per_elem);
+    // next_<kind>_idx += inner.len * <kind>_per_elem.
+    for (per_elem, next_idx, gate_label) in [
+        (flags_per_elem, lcl.next_flags_idx, "flags"),
+        (records_per_elem, lcl.next_record_idx, "record"),
+        (variants_per_elem, lcl.next_variant_idx, "variant"),
+    ] {
+        if let Some(per_elem) = per_elem {
+            let next_idx = next_idx.unwrap_or_else(|| {
+                panic!(
+                    "fn_has_list_elem_{gate_label} gate disagrees with nested.{gate_label}_cursor"
+                )
+            });
+            emit_cursor_advance_by_len(f, next_idx, inner_ll.len, per_elem);
+        }
     }
     f.instructions().local_get(outer_ll.j);
     f.instructions().i32_const(1);
@@ -1707,24 +1736,24 @@ fn emit_list_of_arm(
         emit_cabi_realloc_call_runtime(f, ctx.cabi_realloc_idx, 4, ll.len, elem_bytes, buf_base);
     }
     // Per-element flags set-flags scratch.
-    if let Some(buf_base) = ll.flags_scratch_buf_base {
+    if let Some(buf_base) = ll.flags.buf_base {
         emit_cabi_realloc_call_runtime(
             f,
             ctx.cabi_realloc_idx,
             4,
             ll.len,
-            ll.flags_scratch_bytes_per_elem,
+            ll.flags.bytes_per_elem,
             buf_base,
         );
     }
     // Per-element record field-tuples scratch.
-    if let Some(buf_base) = ll.record_tuples_buf_base {
+    if let Some(buf_base) = ll.record.buf_base {
         emit_cabi_realloc_call_runtime(
             f,
             ctx.cabi_realloc_idx,
             ctx.record_info.tuple_align,
             ll.len,
-            ll.record_tuples_bytes_per_elem,
+            ll.record.bytes_per_elem,
             buf_base,
         );
     }
@@ -1768,98 +1797,38 @@ fn emit_list_of_arm(
     f.instructions().i32_add();
     f.instructions().local_set(ll.elem_cell_base);
 
-    // list_elem_handle_base = handle_slot_base + j * handles_per_elem
-    if let Some(slot_base) = ll.handle_slot_base {
-        let dest = lcl
-            .list_elem_handle_base
-            .expect("fn_has_list_elem_handle disagrees with handle_slot_base");
-        f.instructions().local_get(slot_base);
-        f.instructions().local_get(ll.j);
-        if ll.handles_per_elem != 1 {
-            f.instructions().i32_const(ll.handles_per_elem as i32);
-            f.instructions().i32_mul();
-        }
-        f.instructions().i32_add();
-        f.instructions().local_set(dest);
+    // Per-iter `dest = slot_base + j * count_per_elem` across all four
+    // info kinds; gated to the kinds this list contributes.
+    for (kb, dest, label) in [
+        (&ll.handle, lcl.list_elem_handle_base, "handle"),
+        (&ll.flags, lcl.list_elem_flags_base, "flags"),
+        (&ll.record, lcl.list_elem_record_base, "record"),
+        (&ll.variant, lcl.list_elem_variant_base, "variant"),
+    ] {
+        emit_set_per_iter_slot_base(f, kb, dest, ll.j, label);
     }
 
-    // list_elem_flags_base = flags_slot_base + j * flags_per_elem,
-    // list_elem_flags_scratch_base = flags_scratch_buf_base + j * scratch_bytes.
-    if let Some(slot_base) = ll.flags_slot_base {
-        let dest = lcl
-            .list_elem_flags_base
-            .expect("fn_has_list_elem_flags disagrees with flags_slot_base");
-        f.instructions().local_get(slot_base);
-        f.instructions().local_get(ll.j);
-        if ll.flags_per_elem != 1 {
-            f.instructions().i32_const(ll.flags_per_elem as i32);
-            f.instructions().i32_mul();
-        }
-        f.instructions().i32_add();
-        f.instructions().local_set(dest);
-    }
-    if let Some(buf_base) = ll.flags_scratch_buf_base {
-        let dest = lcl
-            .list_elem_flags_scratch_base
-            .expect("fn_has_list_elem_flags disagrees with flags_scratch_buf_base");
-        // Stride min is 1 cell's `STRING_FLAT_BYTES` (gated by Some).
-        debug_assert!(
-            ll.flags_scratch_bytes_per_elem >= STRING_FLAT_BYTES,
-            "flags_scratch_bytes_per_elem ({}) below 1 cell's worth of \
-             pair-bytes ({STRING_FLAT_BYTES})",
-            ll.flags_scratch_bytes_per_elem,
-        );
-        f.instructions().local_get(buf_base);
-        f.instructions().local_get(ll.j);
-        f.instructions()
-            .i32_const(ll.flags_scratch_bytes_per_elem as i32);
-        f.instructions().i32_mul();
-        f.instructions().i32_add();
-        f.instructions().local_set(dest);
-    }
-
-    // list_elem_record_base = record_slot_base + j * records_per_elem,
-    // list_elem_record_tuples_base = record_tuples_buf_base + j * ...
-    if let Some(slot_base) = ll.record_slot_base {
-        let dest = lcl
-            .list_elem_record_base
-            .expect("fn_has_list_elem_record disagrees with record_slot_base");
-        f.instructions().local_get(slot_base);
-        f.instructions().local_get(ll.j);
-        if ll.records_per_elem != 1 {
-            f.instructions().i32_const(ll.records_per_elem as i32);
-            f.instructions().i32_mul();
-        }
-        f.instructions().i32_add();
-        f.instructions().local_set(dest);
-    }
-    if let Some(buf_base) = ll.record_tuples_buf_base {
-        let dest = lcl
-            .list_elem_record_tuples_base
-            .expect("fn_has_list_elem_record disagrees with record_tuples_buf_base");
-        f.instructions().local_get(buf_base);
-        f.instructions().local_get(ll.j);
-        f.instructions()
-            .i32_const(ll.record_tuples_bytes_per_elem as i32);
-        f.instructions().i32_mul();
-        f.instructions().i32_add();
-        f.instructions().local_set(dest);
-    }
-
-    // list_elem_variant_base = variant_slot_base + j * variants_per_elem
-    if let Some(slot_base) = ll.variant_slot_base {
-        let dest = lcl
-            .list_elem_variant_base
-            .expect("fn_has_list_elem_variant disagrees with variant_slot_base");
-        f.instructions().local_get(slot_base);
-        f.instructions().local_get(ll.j);
-        if ll.variants_per_elem != 1 {
-            f.instructions().i32_const(ll.variants_per_elem as i32);
-            f.instructions().i32_mul();
-        }
-        f.instructions().i32_add();
-        f.instructions().local_set(dest);
-    }
+    // Per-iter scratch base; only flags/record carry one. Floor stride
+    // is 1 cell's worth (gated by Some); pinned as a debug_assert.
+    debug_assert!(
+        ll.flags.buf_base.is_none() || ll.flags.bytes_per_elem >= STRING_FLAT_BYTES,
+        "flags.bytes_per_elem ({}) below 1 cell's pair-bytes ({STRING_FLAT_BYTES})",
+        ll.flags.bytes_per_elem,
+    );
+    emit_set_per_iter_scratch_base(
+        f,
+        &ll.flags,
+        lcl.list_elem_flags_scratch_base,
+        ll.j,
+        "flags",
+    );
+    emit_set_per_iter_scratch_base(
+        f,
+        &ll.record,
+        lcl.list_elem_record_tuples_base,
+        ll.j,
+        "record",
+    );
 
     // Per element-plan cell: stage addr (and any per-iter scratch),
     // then dispatch. `char_idx` walks char-cells so multi-char
@@ -1886,8 +1855,7 @@ fn emit_list_of_arm(
                 emit_stage_tuple_slot(f, lcl, ll, offset_in_elem, children);
             }
             // Nested list: copy inner.len from outer's elem-flats; snap
-            // inner.start_i (and inner.record_slot_base /
-            // inner.variant_slot_base, if applicable) to their running
+            // inner.start_i + inner.<kind>.slot_base to their running
             // cursors. Iter-end advances them.
             Cell::ListOf { len_slot, .. } => {
                 let nested = nested_of(ll);
@@ -1897,19 +1865,18 @@ fn emit_list_of_arm(
                 f.instructions().local_set(inner_ll.len);
                 f.instructions().local_get(nested.cursor);
                 f.instructions().local_set(inner_ll.start_i);
-                if let Some(rc) = nested.record_cursor {
-                    let dest = inner_ll
-                        .record_slot_base
-                        .expect("nested.record_cursor ⇔ inner.record_slot_base");
-                    f.instructions().local_get(rc);
-                    f.instructions().local_set(dest);
-                }
-                if let Some(vc) = nested.variant_cursor {
-                    let dest = inner_ll
-                        .variant_slot_base
-                        .expect("nested.variant_cursor ⇔ inner.variant_slot_base");
-                    f.instructions().local_get(vc);
-                    f.instructions().local_set(dest);
+                for (cursor, kb, kind_label) in [
+                    (nested.flags_cursor, &inner_ll.flags, "flags"),
+                    (nested.record_cursor, &inner_ll.record, "record"),
+                    (nested.variant_cursor, &inner_ll.variant, "variant"),
+                ] {
+                    if let Some(cursor) = cursor {
+                        let dest = kb.slot_base.unwrap_or_else(|| {
+                            panic!("nested.{kind_label}_cursor ⇔ inner.{kind_label}.slot_base")
+                        });
+                        f.instructions().local_get(cursor);
+                        f.instructions().local_set(dest);
+                    }
                 }
             }
             _ => {}
@@ -1932,11 +1899,8 @@ fn emit_list_of_arm(
             list_slot_for_cell,
         );
         // Advance running cursor(s): cursor += inner.len * inner_elem_count
-        // (and record-cursor / variant-cursor += inner.len * per_elem,
-        // if applicable). The cursors (not inner.start_i /
-        // inner.record_slot_base / inner.variant_slot_base) carry the
-        // running state across outer iters; the inner's bases were
-        // snapped at iter-start and stay fixed.
+        // (and per-kind cursors += inner.len * inner.<kind>.count_per_elem).
+        // Inner's bases were snapped at iter-start and stay fixed.
         if let Cell::ListOf {
             element_plan: inner_plan,
             ..
@@ -1945,11 +1909,14 @@ fn emit_list_of_arm(
             let nested = nested_of(ll);
             let inner_ll = nested.inner.as_ref();
             emit_cursor_advance_by_len(f, nested.cursor, inner_ll.len, inner_plan.cell_count());
-            if let Some(rc) = nested.record_cursor {
-                emit_cursor_advance_by_len(f, rc, inner_ll.len, inner_ll.records_per_elem);
-            }
-            if let Some(vc) = nested.variant_cursor {
-                emit_cursor_advance_by_len(f, vc, inner_ll.len, inner_ll.variants_per_elem);
+            for (cursor, kb) in [
+                (nested.flags_cursor, &inner_ll.flags),
+                (nested.record_cursor, &inner_ll.record),
+                (nested.variant_cursor, &inner_ll.variant),
+            ] {
+                if let Some(cursor) = cursor {
+                    emit_cursor_advance_by_len(f, cursor, inner_ll.len, kb.count_per_elem);
+                }
             }
         }
     }

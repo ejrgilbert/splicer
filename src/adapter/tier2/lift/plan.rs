@@ -206,11 +206,11 @@ pub(crate) enum ListElementClass {
     PrestagedVariant,
     /// `Cell::ListOf` — `list<list<T>>` with inner cells limited to
     /// the per-call-buffer-free subset (Scalar / PrestagedChar /
-    /// PrestagedChildIdx / PrestagedTupleIndices) plus PrestagedRecord
-    /// and PrestagedVariant (nested pre-pass also sizes their
-    /// record-info / variant-info contributions). No further nesting.
-    /// Inner `start_i` is a running cursor staged off
-    /// `outer.start_i + outer.len`.
+    /// PrestagedChildIdx / PrestagedTupleIndices) plus PrestagedFlags,
+    /// PrestagedRecord, and PrestagedVariant (nested pre-pass also
+    /// sizes their flags-info / record-info / variant-info
+    /// contributions). No further nesting. Inner `start_i` is a
+    /// running cursor staged off `outer.start_i + outer.len`.
     PrestagedNestedList,
 }
 
@@ -236,9 +236,9 @@ impl Cell {
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
             // Inner cells must be sizeable by the nested pre-pass:
-            // per-call-buffer-free classes plus PrestagedRecord /
-            // PrestagedVariant (whose info-buffer contributions are
-            // summed in `emit_nested_list_pre_pass`).
+            // per-call-buffer-free classes plus PrestagedFlags /
+            // PrestagedRecord / PrestagedVariant (whose info-buffer
+            // contributions are summed in `emit_nested_list_pre_pass`).
             Cell::ListOf { element_plan, .. } => element_plan
                 .cells
                 .iter()
@@ -249,6 +249,7 @@ impl Cell {
                             | Some(ListElementClass::PrestagedChar)
                             | Some(ListElementClass::PrestagedChildIdx)
                             | Some(ListElementClass::PrestagedTupleIndices)
+                            | Some(ListElementClass::PrestagedFlags)
                             | Some(ListElementClass::PrestagedRecord)
                             | Some(ListElementClass::PrestagedVariant)
                     )

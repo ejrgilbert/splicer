@@ -2157,6 +2157,40 @@ fn tier2_shapes() -> Vec<Shape> {
             cases: vec![("red", "Red"), ("green", "Green"), ("blue", "Blue")],
             selected: 2,
         })))),
+        // Inner T = flags — exercises nested flags_cursor + per-call
+        // set-flags scratch (cabi_realloc'd inside the inner's emit).
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0b101,
+        })))),
+        // Multi-flags-per-element: tuple<fperms, fcaps> with mismatched
+        // bit counts (3 vs 5) — inner plan has two Cell::Flags cells,
+        // so `count_per_elem=2` and the cumulative
+        // `scratch_offset_in_elem` for the second cell must equal
+        // `3 * STRING_FLAT_BYTES`, not 5x. Pins the stride math
+        // analogous to `list_list_variant_tagged-pair_fst`.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Flags {
+                wit_name: "fperms",
+                rust_name: "Fperms",
+                flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+                selected: 0b101,
+            },
+            Shape::Flags {
+                wit_name: "fcaps",
+                rust_name: "Fcaps",
+                flags: vec![
+                    ("net", "NET"),
+                    ("fs", "FS"),
+                    ("gpu", "GPU"),
+                    ("sched", "SCHED"),
+                    ("syscall", "SYSCALL"),
+                ],
+                selected: 0b10010,
+            },
+        ]))))),
         // Inner T = record — exercises nested record_cursor.
         Shape::List(Box::new(Shape::List(Box::new(Shape::Record {
             wit_name: "point",
