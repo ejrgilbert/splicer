@@ -697,13 +697,7 @@ pub(super) fn walk_element_plan(
         .cells
         .iter()
         .map(|cell| {
-            let class = cell.list_element_class().unwrap_or_else(|| {
-                unreachable!(
-                    "Cell {cell:?} reached walk_element_plan despite \
-                     Cell::list_element_class() rejecting it"
-                )
-            });
-            match class {
+            match cell.list_element_class() {
                 ListElementClass::Scalar => CellSideData::None,
                 ListElementClass::PrestagedChar => {
                     counts.chars += 1;
@@ -1374,14 +1368,10 @@ fn nested_of(outer_ll: &ListEmitLocals) -> &NestedListLocals {
         .expect("Cell::ListOf element ⇒ nested locals allocated")
 }
 
-/// Nested-list pre-pass: walk outer's data and bump `next_cell_idx`
-/// by `inner_len_j * inner_elem_count` per element. Seeds the cursor
-/// to `outer.start_i + outer.len`. Runs inside the outer's arm-guard
-/// block. Guarded by `outer.len > 0` so the empty-outer path skips
-/// the loop preamble. If the inner element plan contributes records
-/// or variants, the same walk also bumps `lcl.next_record_idx` /
-/// `lcl.next_variant_idx` so the wrapper-level info slabs are sized
-/// correctly.
+/// Nested-list pre-pass: top-level entry. Seeds the outer's nested
+/// cursors, loads outer's data pointer from its flat slot, then
+/// dispatches to the recursive walker. Runs inside outer's arm-guard
+/// block; guarded by `outer.len > 0` so empty-outer skips the walk.
 fn emit_nested_list_pre_pass(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -1392,31 +1382,34 @@ fn emit_nested_list_pre_pass(
     lcl: &WrapperLocals,
 ) {
     let nested = nested_of(outer_ll);
-    let inner_ll = nested.inner.as_ref();
-    let cursor = nested.cursor;
-    let outer_ptr_scratch = nested.outer_ptr_scratch;
-    // `walk_element_plan` produced one side-data entry per inner-plan
-    // cell, so the count matches `inner_element_plan.cell_count()`.
-    let inner_elem_count = inner_ll.elem_cell_side.len() as u32;
-    // Outer element type is `list<T>` (depth-2 cap) → flat layout is
-    // (i32 ptr, i32 len) = 8 bytes, len at offset 4. The pre-pass
-    // load math below hard-codes that; pin it here so a layout drift
-    // in the canon-ABI list lower would surface as a debug-build
-    // panic rather than silent misread.
+    // `nested.is_some()` ⇒ outer element is a list = canon-ABI
+    // `(ptr, len)` = 8 bytes flat. The j*8 stride in
+    // `emit_pre_pass_data_walk` hard-codes that; pin it here so a
+    // layout drift surfaces as a debug panic at one entry point. The
+    // invariant holds at every nested level too (each recursive
+    // frame's outer is itself a list), so one assertion suffices.
     debug_assert_eq!(
         outer_ll.elem_byte_size, 8,
         "nested-list outer element must be canon-ABI list = (ptr, len) 8 bytes",
     );
-    let rows = nested_kind_rows(nested, inner_ll, lcl);
     // Skip cursor seeds + data walk on empty outer.
     f.instructions().local_get(outer_ll.len);
     f.instructions().if_(BlockType::Empty);
-    // cursor = outer.start_i + outer.len.
-    f.instructions().local_get(outer_ll.start_i);
-    f.instructions().local_get(outer_ll.len);
-    f.instructions().i32_add();
-    f.instructions().local_set(cursor);
-    for row in rows {
+    f.instructions().local_get(lcl.next_cell_idx);
+    f.instructions().local_set(nested.cursor);
+    emit_seed_nested_kinds(f, nested, lcl);
+    push_widened_get(f, plan, local_base, outer_spec.ptr_slot, WasmType::I32);
+    f.instructions().local_set(nested.outer_ptr_scratch);
+    emit_pre_pass_data_walk(f, ctx, lcl, outer_ll);
+    f.instructions().end(); // if outer.len > 0
+}
+
+/// Seed `nested.kinds.<kind>` from the current global
+/// `lcl.next_<kind>_idx` for every kind `nested.inner` contributes.
+fn emit_seed_nested_kinds(f: &mut Function, nested: &NestedListLocals, lcl: &WrapperLocals) {
+    let inner_ll = nested.inner.as_ref();
+    let inner_elem_count = inner_ll.elem_cell_side.len() as u32;
+    for row in nested_kind_rows(nested, inner_ll, lcl) {
         let Some(c) = row.cursor else { continue };
         debug_assert!(
             row.kb.count_per_elem > 0,
@@ -1424,7 +1417,7 @@ fn emit_nested_list_pre_pass(
             row.label,
         );
         // count_per_elem ≤ inner_elem_count by construction → the
-        // cell-slab overflow trap below guards this kind's slab too.
+        // cell-slab overflow trap guards this kind's slab too.
         debug_assert!(row.kb.count_per_elem <= inner_elem_count);
         let next_idx = row.next_idx.unwrap_or_else(|| {
             panic!(
@@ -1435,10 +1428,40 @@ fn emit_nested_list_pre_pass(
         f.instructions().local_get(next_idx);
         f.instructions().local_set(c);
     }
-    push_widened_get(f, plan, local_base, outer_spec.ptr_slot, WasmType::I32);
-    f.instructions().local_set(outer_ptr_scratch);
-    // for j in 0..outer.len: inner.len = mem[outer_ptr + j*8 + 4];
-    //   trap_check; bump next_cell_idx + each contributed next_<kind>_idx.
+}
+
+/// Recursive nested-list pre-pass walker.
+///
+/// The cell slab is laid out contiguously by level — all of middle's
+/// element cells, then all of inner's, etc. — so the size of the
+/// next level's region can't be computed depth-first; we have to
+/// finish bumping for *this* level before the recursive call can
+/// seed where inner's region starts. Two passes per level:
+///
+/// 1. **Size next level's region.** Walk this level's elements once,
+///    bumping the wrapper-level cell + per-kind counters by
+///    `inner.len * per_elem` per element.
+/// 2. **Recurse (depth ≥ 3 only).** If the inner level (`inner_ll`)
+///    is itself a nested list, seed `inner_ll.nested`'s cursors then
+///    loop a second time to load each per-element inner pointer +
+///    length and recurse on `inner_ll`.
+///
+/// Per-level trap so a runaway inner length can't overflow the
+/// level above.
+fn emit_pre_pass_data_walk(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    lcl: &WrapperLocals,
+    outer_ll: &ListEmitLocals,
+) {
+    let nested = nested_of(outer_ll);
+    let inner_ll = nested.inner.as_ref();
+    let inner_elem_count = inner_ll.elem_cell_side.len() as u32;
+    let outer_ptr = nested.outer_ptr_scratch;
+    let rows = nested_kind_rows(nested, inner_ll, lcl);
+
+    // First pass: for j in 0..outer.len, read inner.len from memory,
+    // trap-check, bump global cell + kind counters by inner.len * per_elem.
     f.instructions().i32_const(0);
     f.instructions().local_set(outer_ll.j);
     f.instructions().block(BlockType::Empty);
@@ -1448,7 +1471,7 @@ fn emit_nested_list_pre_pass(
     f.instructions().i32_ge_u();
     f.instructions().br_if(1);
     // inner.len = i32_load (outer_ptr + j*8 + 4)
-    f.instructions().local_get(outer_ptr_scratch);
+    f.instructions().local_get(outer_ptr);
     f.instructions().local_get(outer_ll.j);
     f.instructions().i32_const(8);
     f.instructions().i32_mul();
@@ -1486,7 +1509,55 @@ fn emit_nested_list_pre_pass(
     f.instructions().br(0);
     f.instructions().end(); // loop
     f.instructions().end(); // block
-    f.instructions().end(); // if outer.len > 0
+
+    // Second pass (depth ≥ 3): inner_ll is itself a nested list. Seed
+    // inner_ll.nested's cursors (now pointing at start of the deeper
+    // level's region) and recurse once per outer element.
+    let Some(inner_nested) = inner_ll.nested.as_ref() else {
+        return;
+    };
+    f.instructions().local_get(lcl.next_cell_idx);
+    f.instructions().local_set(inner_nested.cursor);
+    emit_seed_nested_kinds(f, inner_nested, lcl);
+    f.instructions().i32_const(0);
+    f.instructions().local_set(outer_ll.j);
+    f.instructions().block(BlockType::Empty);
+    f.instructions().loop_(BlockType::Empty);
+    f.instructions().local_get(outer_ll.j);
+    f.instructions().local_get(outer_ll.len);
+    f.instructions().i32_ge_u();
+    f.instructions().br_if(1);
+    // elem_addr = outer_ptr + j*8; reuse outer_ll.elem_addr as scratch
+    // (used by main-emit, free during pre-pass). Two loads share the addr.
+    f.instructions().local_get(outer_ptr);
+    f.instructions().local_get(outer_ll.j);
+    f.instructions().i32_const(8);
+    f.instructions().i32_mul();
+    f.instructions().i32_add();
+    f.instructions().local_tee(outer_ll.elem_addr);
+    // inner_ptr = i32_load (elem_addr + 0)
+    f.instructions().i32_load(MemArg {
+        offset: 0,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    });
+    f.instructions().local_set(inner_nested.outer_ptr_scratch);
+    // inner.len = i32_load (elem_addr + 4)
+    f.instructions().local_get(outer_ll.elem_addr);
+    f.instructions().i32_load(MemArg {
+        offset: 4,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    });
+    f.instructions().local_set(inner_ll.len);
+    emit_pre_pass_data_walk(f, ctx, lcl, inner_ll);
+    f.instructions().local_get(outer_ll.j);
+    f.instructions().i32_const(1);
+    f.instructions().i32_add();
+    f.instructions().local_set(outer_ll.j);
+    f.instructions().br(0);
+    f.instructions().end(); // loop
+    f.instructions().end(); // block
 }
 
 /// Emit one cell at `lcl.addr`. `list_slot` is `Some` exactly for
