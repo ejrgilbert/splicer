@@ -2419,6 +2419,96 @@ fn tier2_shapes() -> Vec<Shape> {
                 expected_debug: "55",
             })))),
         )))))),
+        // `list<wrapper-with-list>`: inner Cell::ListOf shares the
+        // outer's element_plan with sibling cells — per-cell-pos
+        // NestedListLocals.
+        Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "11u32",
+                expected_debug: "11",
+            },
+            Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "22u32",
+                expected_debug: "22",
+            })),
+        ]))),
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "33u32",
+                expected_debug: "33",
+            }))),
+            is_some: true,
+        })),
+        // Wrapper-with-list with an INACTIVE list arm. Pins the
+        // arm-guard around snap+iter-end-advance in `emit_list_of_arm`:
+        // when the unit arm is active, the variant's joined len-slot is
+        // zero-padded by `emit_variant_dispatch`, but the snap reading
+        // it without the guard would still consume + advance the
+        // shared cursor for every outer iter. The chosen shape
+        // additionally exercises a SECOND variant case carrying its
+        // own list — both Cell::ListOfs share the joined ptr/len slots,
+        // so the cursor double-advance bug would surface here.
+        Shape::List(Box::new(Shape::Variant {
+            wit_name: "rt-arms-both-list",
+            rust_name: "RtArmsBothList",
+            cases: vec![
+                VariantCase {
+                    wit_name: "a",
+                    rust_name: "A",
+                    payload: Some(Shape::List(Box::new(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "77u32",
+                        expected_debug: "77",
+                    }))),
+                },
+                VariantCase {
+                    wit_name: "b",
+                    rust_name: "B",
+                    payload: Some(Shape::List(Box::new(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "88u32",
+                        expected_debug: "88",
+                    }))),
+                },
+            ],
+            selected: 1,
+        })),
+        // TODO: enable `map<string, list<list<u32>>>` (wrapper-with-list
+        // via the Map desugar) once `wac-types` accepts `map<K, V>` at
+        // parse time — tracked by `test_tier2_map_blocked_on_wac` below.
+        // The lift-validator fixture `f-map-of-list-of-list` already
+        // pins the desugar path through emit.
+        // Shape::Map {
+        //     key: Box::new(Shape::Primitive {
+        //         name: "string",
+        //         wit_type: "string",
+        //         rust_ty: "String",
+        //         rust_literal: r#"String::from("k")"#,
+        //         expected_debug: r#""k""#,
+        //     }),
+        //     value: Box::new(Shape::List(Box::new(Shape::List(Box::new(
+        //         Shape::Primitive {
+        //             name: "u32",
+        //             wit_type: "u32",
+        //             rust_ty: "u32",
+        //             rust_literal: "44u32",
+        //             expected_debug: "44",
+        //         },
+        //     ))))),
+        // },
     ]
 }
 
