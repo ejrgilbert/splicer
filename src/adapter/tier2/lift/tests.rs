@@ -163,19 +163,22 @@ const TEST_WIT: &str = r#"
         // depth ceiling.
         f-list-of-list-of-list-of-list-of-list-u32:
             func(xs: list<list<list<list<list<u32>>>>>);
-        // Position cap: a `list<…>` element-cell may only appear as
-        // the SOLE cell of its parent list's element plan. Wrapping
-        // a `list<T>` in option/tuple/record/variant/result inside
-        // another list violates the cap — emit's `nested_inner` lives
-        // on a single element-plan position and would panic without
-        // the gate. These fixtures pin the plan-build rejection.
+        // `list<wrapper-with-list>`: inner `list<T>` shares its parent's
+        // element plan with sibling cells. Each Cell::ListOf gets its
+        // own NestedListLocals entry keyed by cell_pos.
         f-list-option-list-u32: func(xs: list<option<list<u32>>>);
         f-list-tuple-with-list-u32: func(xs: list<tuple<u32, list<u32>>>);
         record list-field-record { ys: list<u32> }
         f-list-record-with-list: func(xs: list<list-field-record>);
         variant list-arm-variant { v(list<u32>), empty }
         f-list-variant-list-arm: func(xs: list<list-arm-variant>);
+        // Both arms carry a list — same joined ptr/len slots, distinct
+        // Cell::ListOf cells. Snap+advance in main emit must arm-gate or
+        // the inactive arm's sibling cell would double-advance the cursor.
+        variant list-arms-both-list { a(list<u32>), b(list<u32>) }
+        f-list-variant-both-arms-list: func(xs: list<list-arms-both-list>);
         f-list-result-with-list-ok: func(xs: list<result<list<u32>, u32>>);
+        f-list-result-with-list-both: func(xs: list<result<list<u32>, list<u32>>>);
         record list-pair { items: list<string>, scores: list<u32> }
         f-list-of-record: func(xs: list<point>);
         // `list<T, N>` (canon-ABI fixed-length list) flattens to
@@ -211,8 +214,9 @@ const TEST_WIT: &str = r#"
         record map-pair { primary: map<string, u32>, secondary: map<u32, string> }
         f-record-with-map: func(rwm: map-pair);
         f-result-map: func() -> map<string, u32>;
-        // Nested-list value still gated — map<K, list<list<T>>> must
-        // bail at plan-build with the same message as `list<list<T>>`.
+        // map<K, V> ≡ list<tuple<K, V>>, so map<K, list<list<T>>>
+        // desugars to a list whose tuple element holds a nested list —
+        // same wrapper-with-list axis as the fixtures above.
         f-map-of-list-of-list: func(m: map<string, list<list<u32>>>);
         // Type-alias chain over Map: `desugar_map_aliases` must register
         // the underlying Map typedef even when the function references
@@ -1732,32 +1736,23 @@ fn nested_list_builds_with_listof_element() {
 }
 
 #[test]
-fn nested_list_under_wrapper_bails_at_plan_build() {
-    // Depth-2 cap: a `list<…>` element-cell may only appear as the
-    // sole cell of its parent list's element plan. These shapes wrap
-    // a `list<T>` in option / tuple / record / variant / result
-    // inside another list — must all bail at plan-build so emit's
-    // single-position `nested_inner` invariant holds.
+fn nested_list_under_wrapper_emits_valid_wasm() {
+    // `list<wrapper-with-list>`: an inner `list<T>` shares its parent's
+    // element plan with sibling cells (option disc, tuple fields, record
+    // fields, variant arms, result arms). Each Cell::ListOf gets its
+    // own NestedListLocals entry, keyed by cell_pos.
     let (r, mut names) = setup();
     for fixture in [
         "f-list-option-list-u32",
         "f-list-tuple-with-list-u32",
         "f-list-record-with-list",
         "f-list-variant-list-arm",
+        "f-list-variant-both-arms-list",
         "f-list-result-with-list-ok",
+        "f-list-result-with-list-both",
     ] {
-        let err = LiftPlan::for_type(
-            &func_named(&r, fixture).params[0].ty,
-            r.resolve(),
-            &mut names,
-            r.aliases(),
-        )
-        .expect_err(&format!("`{fixture}` must bail at plan-build"));
-        let msg = err.to_string();
-        assert!(
-            msg.contains("`list<T>` element type"),
-            "`{fixture}`: expected list-element gate phrase, got: {msg}"
-        );
+        let plan = plan_for_param(fixture, &r, &mut names);
+        validate_emit_lift_plan(&plan, r.resolve());
     }
 }
 
@@ -1813,27 +1808,15 @@ fn map_in_record_classifies_with_inner_list() {
 }
 
 #[test]
-fn map_with_nested_list_value_bails() {
+fn map_with_nested_list_value_emits_valid_wasm() {
     // `map<string, list<list<u32>>>` desugars to
-    // `list<tuple<string, list<list<u32>>>>`. The inner `list<list<u32>>`
-    // plans on its own, but once it sits as a tuple field, the outer
-    // list rejects the tuple's element-plan — the position cap requires
-    // a `Cell::ListOf` element-cell to be the sole cell of its parent
-    // list's element plan, and the tuple-element plan also carries Text
-    // and TupleOf cells.
+    // `list<tuple<string, list<list<u32>>>>` — the tuple element_plan
+    // carries Text, ListOf, and TupleOf, exercising the per-cell-pos
+    // nested locals against a depth-3 nested list (outer + inner
+    // list<list<u32>>).
     let (r, mut names) = setup();
-    let err = LiftPlan::for_type(
-        &func_named(&r, "f-map-of-list-of-list").params[0].ty,
-        r.resolve(),
-        &mut names,
-        r.aliases(),
-    )
-    .expect_err("map<_, list<list<T>>> must bail at plan build");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported `list<T>` element type"),
-        "expected list-element gate message, got: {msg}"
-    );
+    let plan = plan_for_param("f-map-of-list-of-list", &r, &mut names);
+    validate_emit_lift_plan(&plan, r.resolve());
 }
 
 #[test]
@@ -3076,6 +3059,16 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-list-of-list-of-list-record-with-handle", &r, &mut names),
         // Depth-5 — recursive second pass nesting four deep, scalar leaf.
         plan_for_param("f-list-of-list-of-list-of-list-of-list-u32", &r, &mut names),
+        // `list<wrapper-with-list>` — Cell::ListOf shares its parent
+        // element_plan with sibling cells.
+        plan_for_param("f-list-option-list-u32", &r, &mut names),
+        plan_for_param("f-list-tuple-with-list-u32", &r, &mut names),
+        plan_for_param("f-list-record-with-list", &r, &mut names),
+        plan_for_param("f-list-variant-list-arm", &r, &mut names),
+        plan_for_param("f-list-variant-both-arms-list", &r, &mut names),
+        plan_for_param("f-list-result-with-list-ok", &r, &mut names),
+        plan_for_param("f-list-result-with-list-both", &r, &mut names),
+        plan_for_param("f-map-of-list-of-list", &r, &mut names),
     ];
     for plan in &plans {
         validate_emit_lift_plan(plan, r.resolve());

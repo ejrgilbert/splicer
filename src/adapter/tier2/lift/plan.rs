@@ -984,23 +984,6 @@ impl<'a> LiftPlanBuilder<'a> {
                 LiftPlan::stub_for(*elem)
             }
         };
-        // Position cap: a `Cell::ListOf` element-cell must be the *sole*
-        // cell of its parent list's element plan — emit's nested-list
-        // locals (`NestedListLocals`) hang off a single element-plan
-        // position. Lifting `list<wrapper-with-list>` (option / tuple /
-        // record / variant / result containing a list, inside another
-        // list) needs per-`Cell::ListOf` nested locals; not yet done.
-        let nested_position_ok = !element_plan
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::ListOf { .. }))
-            || matches!(element_plan.cells.as_slice(), [Cell::ListOf { .. }]);
-        if !nested_position_ok {
-            self.record_error(anyhow!(
-                "unsupported `list<T>` element type {elem:?}. File a \
-                 request at {ISSUES_URL}."
-            ));
-        }
         let arm_guards = self.arm_guard_stack.clone();
         self.push_cell(Cell::ListOf {
             list_idx,
