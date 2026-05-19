@@ -2486,6 +2486,130 @@ fn tier2_shapes() -> Vec<Shape> {
             ],
             selected: 1,
         })),
+        // `list<option<list<u32>>>` with `is_some: false` — option disc=0
+        // must skip the inner list write; the joined ptr/len slots are
+        // zero-padded and the inner ListOf's snap+advance must be
+        // arm-gated so the shared cursor doesn't consume them.
+        Shape::List(Box::new(Shape::Option {
+            inner: Box::new(Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "33u32",
+                expected_debug: "33",
+            }))),
+            is_some: false,
+        })),
+        // `list<tuple<list<u32>, list<u32>>>` — two `Cell::ListOf`s at
+        // distinct positions in the same element_plan, both active per
+        // outer iter. Pins per-cell-pos NestedListLocals advancing in
+        // lockstep — the variant cases above only ever activate one
+        // arm at a time, so this is the only canned shape with
+        // concurrent ListOf cursors.
+        Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "44u32",
+                expected_debug: "44",
+            })),
+            Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "55u32",
+                expected_debug: "55",
+            })),
+        ]))),
+        // `list<record-with-list-field>` — Record sibling cell shares
+        // the element_plan with the inner Cell::ListOf; pins
+        // per-cell-pos NestedListLocals keyed off the record's child
+        // cell position.
+        Shape::List(Box::new(Shape::Record {
+            wit_name: "list-rec",
+            rust_name: "ListRec",
+            fields: vec![(
+                "ys",
+                Shape::List(Box::new(Shape::Primitive {
+                    name: "u32",
+                    wit_type: "u32",
+                    rust_ty: "u32",
+                    rust_literal: "66u32",
+                    expected_debug: "66",
+                })),
+            )],
+        })),
+        // `list<variant { v(list<u32>), empty }>` with the UNIT arm
+        // selected. The active arm carries no payload, but the inactive
+        // arm has a list — without an arm-guard around snap+iter-end-
+        // advance, the ListOf cell would consume the (zero-padded)
+        // joined slots and advance the shared cursor every outer iter.
+        // Distinct from `rt-arms-both-list` (both arms list) above.
+        Shape::List(Box::new(Shape::Variant {
+            wit_name: "rt-one-list-arm",
+            rust_name: "RtOneListArm",
+            cases: vec![
+                VariantCase {
+                    wit_name: "v",
+                    rust_name: "V",
+                    payload: Some(Shape::List(Box::new(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "44u32",
+                        expected_debug: "44",
+                    }))),
+                },
+                VariantCase {
+                    wit_name: "empty",
+                    rust_name: "Empty",
+                    payload: None,
+                },
+            ],
+            selected: 1,
+        })),
+        // `list<result<list<u32>, u32>>` — list lives in the ok arm.
+        // Result's joined flat slots widen to fit the list's 2-slot
+        // ptr+len; the inner list's snap must read from those joined
+        // slots only when the ok arm is active.
+        Shape::List(Box::new(Shape::Result_ {
+            ok: Some(Box::new(Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "66u32",
+                expected_debug: "66",
+            })))),
+            err: Some(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "99u32",
+                expected_debug: "99",
+            })),
+            is_ok: true,
+        })),
+        // `list<result<list<u32>, list<u32>>>` — both arms carry a list,
+        // sharing the joined ptr/len slots. Arm-guard prevents the
+        // inactive arm's ListOf from double-advancing the cursor.
+        Shape::List(Box::new(Shape::Result_ {
+            ok: Some(Box::new(Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "77u32",
+                expected_debug: "77",
+            })))),
+            err: Some(Box::new(Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "88u32",
+                expected_debug: "88",
+            })))),
+            is_ok: true,
+        })),
         // TODO: enable `map<string, list<list<u32>>>` (wrapper-with-list
         // via the Map desugar) once `wac-types` accepts `map<K, V>` at
         // parse time — tracked by `test_tier2_map_blocked_on_wac` below.
