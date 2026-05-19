@@ -2386,6 +2386,39 @@ fn tier2_shapes() -> Vec<Shape> {
             ],
             selected: 0,
         })))),
+        // Depth-3: scalar leaf pins the recursive
+        // `emit_pre_pass_data_walk`'s second pass (middle's data
+        // walked once per outer iter).
+        Shape::List(Box::new(Shape::List(Box::new(Shape::List(Box::new(
+            Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "21u32",
+                expected_debug: "21",
+            },
+        )))))),
+        // Depth-3 with a per-kind-contributed leaf — flags rides the
+        // recursive cursor through three levels.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::List(Box::new(
+            Shape::Flags {
+                wit_name: "fperms",
+                rust_name: "Fperms",
+                flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+                selected: 0b110,
+            },
+        )))))),
+        // Depth-5 — recursive second pass nests four deep. No
+        // hardcoded depth ceiling anywhere; this pins recursion as generic.
+        Shape::List(Box::new(Shape::List(Box::new(Shape::List(Box::new(
+            Shape::List(Box::new(Shape::List(Box::new(Shape::Primitive {
+                name: "u32",
+                wit_type: "u32",
+                rust_ty: "u32",
+                rust_literal: "55u32",
+                expected_debug: "55",
+            })))),
+        )))))),
     ]
 }
 

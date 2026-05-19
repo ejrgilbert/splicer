@@ -4,19 +4,54 @@ Every other type lifts today (primitives, `string`, `list<u8>`,
 `enum`, `record`, `tuple`, `option`, `result`, `flags`, `variant`,
 `char`, `own<R>` / `borrow<R>`, `stream<T>` / `future<T>`,
 `error-context`, `list<T, N>`, `list<T>` over every kind, and
-`list<list<T>>` over every supported inner kind — depth-2 only).
+`list<list<…>>` over every supported leaf kind at any depth).
 
 ## What's left
 
-### `list<list<list<…>>>` (depth ≥ 3)
+### `list<wrapper-with-list>` (list-in-wrapper inside another list)
 
-Same gate rejects `PrestagedNestedList` as an inner-element class,
-so depth-3 plan-builds fail. The recursion in
-`build_list_emit_locals_for_plan` already self-handles arbitrary
-depth, but the cell-array sizing pre-pass only walks one level of
-nesting; extend it to recurse so deeper trees can size their slabs.
+The position cap in `push_list_of` (`lift/plan.rs`) rejects shapes
+where a `Cell::ListOf` element-cell appears alongside other cells in
+its parent list's element plan:
+
+- `list<option<list<u32>>>`
+- `list<tuple<u32, list<u32>>>`
+- `list<record { ys: list<u32> }>`
+- `list<variant { v(list<u32>), empty }>`
+- `list<result<list<u32>, u32>>`
+- `map<K, list<list<T>>>` (desugars to
+  `list<tuple<K, list<list<T>>>>`, so falls under the same cap)
+
+Emit's `NestedListLocals` (`lift/emit.rs`) hangs off a single
+element-plan position — the `[Cell::ListOf]` match arm in
+`build_list_emit_locals_for_plan`. To lift these shapes, that
+singular `nested: Option<NestedListLocals>` becomes per-`Cell::ListOf`
+locals (e.g. `Vec<NestedListLocals>` keyed by `list_idx`, or a
+position-indexed map). Then the pre-pass spec iteration and
+`emit_list_of_arm`'s element loop look up by cell position rather
+than `nested_of(ll)`. No per-WIT-type matching needed — the cell
+tree already represents any nested structure.
 
 ## Recently landed
+
+- `list<list<…>>` depth ≥ 3 — `Cell::list_element_class` now returns
+  `PrestagedNestedList` for any `Cell::ListOf`, so the cell tree
+  recurses freely. The pre-pass data walk in `lift/emit.rs` splits
+  into `emit_nested_list_pre_pass` (top-level entry — seeds outer
+  cursors, loads outer.ptr from a flat slot) and a recursive
+  `emit_pre_pass_data_walk` (two passes per level: bump globals by
+  `inner.len * per_elem`, then if inner is itself a nested list,
+  loop again to load per-element inner pointer + length and recurse).
+  Cell-slab-overflow trap fires at every level. The `allowed_as_list_element`
+  helper and `Option` wrapping on `list_element_class` are dropped
+  since every Cell variant lifts. Position cap unchanged: a
+  `Cell::ListOf` element-cell must still be the sole cell of its
+  parent list's element plan. Validator-fixture entries
+  `f-list-of-list-of-list-u32`, `-flags`, and
+  `f-list-of-list-of-list-of-list-of-list-u32` plus canned shapes
+  `list<list<list<u32>>>`, `list<list<list<fperms>>>`, and
+  `list<list<list<list<list<u32>>>>>` cover the depth axis at scalar,
+  per-kind-contributed, and depth-5.
 
 - Nested-list cursor unification — `NestedListLocals`'s four flat
   `Option<u32>` cursor fields collapsed into a `NestedKindCursors`

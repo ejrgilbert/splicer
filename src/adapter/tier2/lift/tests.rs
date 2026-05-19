@@ -142,7 +142,28 @@ const TEST_WIT: &str = r#"
         f-list-of-list-handle-borrow: func(xs: list<list<borrow<my-res>>>);
         // Nested-list at result position — retptr-loaded compound.
         f-result-list-of-list-u32: func() -> list<list<u32>>;
-        // Depth-2 cap: a `list<…>` element-cell may only appear as
+        // Depth-3 nesting: scalar leaf pins the recursive
+        // `emit_pre_pass_data_walk` (the second pass walks the middle
+        // list's data per outer iter). Per-kind-leaf variants pin each
+        // kind's cursor recursion through three levels.
+        f-list-of-list-of-list-u32: func(xs: list<list<list<u32>>>);
+        f-list-of-list-of-list-char: func(xs: list<list<list<char>>>);
+        f-list-of-list-of-list-flags: func(xs: list<list<list<fperms>>>);
+        f-list-of-list-of-list-point: func(xs: list<list<list<point>>>);
+        f-list-of-list-of-list-shape: func(xs: list<list<list<shape>>>);
+        f-list-of-list-of-list-handle-own: func(xs: list<list<list<own<my-res>>>>);
+        // Multi-kind leaf — record carrying a handle field exercises
+        // both record + handle cursors through three levels in one shot.
+        record point-and-handle { p: point, h: own<my-res> }
+        f-list-of-list-of-list-record-with-handle:
+            func(xs: list<list<list<point-and-handle>>>);
+        // Depth-5 — the recursive second pass nests four deep
+        // (outer → mid → mid2 → mid3). No new code path beyond
+        // depth-3; pins that recursion is generic with no hardcoded
+        // depth ceiling.
+        f-list-of-list-of-list-of-list-of-list-u32:
+            func(xs: list<list<list<list<list<u32>>>>>);
+        // Position cap: a `list<…>` element-cell may only appear as
         // the SOLE cell of its parent list's element plan. Wrapping
         // a `list<T>` in option/tuple/record/variant/result inside
         // another list violates the cap — emit's `nested_inner` lives
@@ -1795,11 +1816,11 @@ fn map_in_record_classifies_with_inner_list() {
 fn map_with_nested_list_value_bails() {
     // `map<string, list<list<u32>>>` desugars to
     // `list<tuple<string, list<list<u32>>>>`. The inner `list<list<u32>>`
-    // can plan on its own (scope of this commit), but once it sits as
-    // a tuple field, the tuple becomes a list element whose nested
-    // sub-list is rejected by the depth-2 cap (the outer `Cell::ListOf`
-    // inside the tuple has class `None` because its inner cell is
-    // itself `PrestagedNestedList`).
+    // plans on its own, but once it sits as a tuple field, the outer
+    // list rejects the tuple's element-plan — the position cap requires
+    // a `Cell::ListOf` element-cell to be the sole cell of its parent
+    // list's element plan, and the tuple-element plan also carries Text
+    // and TupleOf cells.
     let (r, mut names) = setup();
     let err = LiftPlan::for_type(
         &func_named(&r, "f-map-of-list-of-list").params[0].ty,
@@ -1810,12 +1831,8 @@ fn map_with_nested_list_value_bails() {
     .expect_err("map<_, list<list<T>>> must bail at plan build");
     let msg = err.to_string();
     assert!(
-        msg.contains("`list<T>` element type"),
+        msg.contains("unsupported `list<T>` element type"),
         "expected list-element gate message, got: {msg}"
-    );
-    assert!(
-        msg.contains("further nesting"),
-        "expected the depth-cap phrase from the new gate, got: {msg}"
     );
 }
 
@@ -3047,6 +3064,18 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-list-of-list-point", &r, &mut names),
         plan_for_param("f-list-of-list-handle-own", &r, &mut names),
         plan_for_param("f-list-of-list-handle-borrow", &r, &mut names),
+        // Depth-3 — recursive `emit_pre_pass_data_walk` across leaf
+        // kinds (scalar / char / flags / record / variant / handle)
+        // plus a multi-kind leaf (record carrying a handle field).
+        plan_for_param("f-list-of-list-of-list-u32", &r, &mut names),
+        plan_for_param("f-list-of-list-of-list-char", &r, &mut names),
+        plan_for_param("f-list-of-list-of-list-flags", &r, &mut names),
+        plan_for_param("f-list-of-list-of-list-point", &r, &mut names),
+        plan_for_param("f-list-of-list-of-list-shape", &r, &mut names),
+        plan_for_param("f-list-of-list-of-list-handle-own", &r, &mut names),
+        plan_for_param("f-list-of-list-of-list-record-with-handle", &r, &mut names),
+        // Depth-5 — recursive second pass nesting four deep, scalar leaf.
+        plan_for_param("f-list-of-list-of-list-of-list-of-list-u32", &r, &mut names),
     ];
     for plan in &plans {
         validate_emit_lift_plan(plan, r.resolve());
