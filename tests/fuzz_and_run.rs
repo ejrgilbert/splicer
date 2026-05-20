@@ -3751,17 +3751,9 @@ fn consumer_shape_dep_wit(shape: &Shape, mode: AsyncMode) -> String {
 #[ignore]
 fn test_tier1_canned() {
     require_splicer_toolchain();
-
-    let tmp = tempfile::tempdir().expect("mktempdir");
-    let root_buf = tmp.path().to_path_buf();
-    // SPLICER_KEEP_TMPDIR=1 disables auto-cleanup so post-mortem
-    // inspection (wasm-tools print, cat *.wac) is possible.
-    if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
-        eprintln!("(keeping tmpdir: {})", root_buf.display());
-        std::mem::forget(tmp);
-    }
+    let (root_buf, _tmp) = make_keepable_tempdir();
     let root = root_buf.as_path();
-    eprintln!("canned: work dir = {}", root.display());
+    eprintln!("tier1-canned: work dir = {}", root.display());
 
     let shapes = select_shapes();
     assert!(
@@ -3775,13 +3767,13 @@ fn test_tier1_canned() {
     );
     // Mode as outer loop so each mode transition only rebuilds
     // consumer + dep once; the provider is the only per-shape crate.
+    scaffold_common(root).expect("scaffold common");
     let mut failures: Vec<(String, String)> = Vec::new();
     let total_shapes = shapes.len() * ALL_ASYNC_MODES.len();
     let mut shape_idx = 0usize;
     for &mode in ALL_ASYNC_MODES {
         let mode_tag = mode.tag();
         eprintln!("\n### mode: {mode_tag} ###");
-        scaffold_common(root, mode).expect("scaffold common");
         for shape in &shapes {
             shape_idx += 1;
             let shape_name = shape.name();
@@ -3817,7 +3809,10 @@ fn test_tier1_canned() {
 #[ignore]
 fn test_tier2_canned() {
     require_splicer_toolchain();
-    let workspace = scaffold_tier2_workspace();
+    let (root_buf, _tmp) = make_keepable_tempdir();
+    let root = root_buf.as_path();
+    eprintln!("tier2-canned: work dir = {}", root.display());
+    scaffold_tier2_workspace_in(root);
 
     let shapes = match std::env::var("SPLICER_RUNTIME_SHAPES").ok() {
         None => tier2_shapes(),
@@ -3848,7 +3843,7 @@ fn test_tier2_canned() {
             // panics on `list<T, N>` under `async: true`. Tier-2 fuzz
             // gates async drawing via `GenSupport`; canned has fixed
             // shapes including `fixed_list_u32_3` so can't toggle yet.
-            let captured = run_tier2_pipeline_for_shape(&workspace, shape, AsyncMode::Sync);
+            let captured = run_tier2_pipeline_for_shape(root, shape, AsyncMode::Sync);
             assert_tier2_pipeline_output(shape, &captured);
         }));
         if let Err(panic) = result {
@@ -3871,7 +3866,9 @@ fn test_tier2_canned() {
 #[ignore]
 fn test_tier2_map_blocked_on_wac() {
     require_splicer_toolchain();
-    let workspace = scaffold_tier2_workspace();
+    let (root_buf, _tmp) = make_keepable_tempdir();
+    let root = root_buf.as_path();
+    scaffold_tier2_workspace_in(root);
 
     let shape = Shape::Map {
         key: Box::new(Shape::Primitive {
@@ -3891,7 +3888,7 @@ fn test_tier2_map_blocked_on_wac() {
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_tier2_pipeline_for_shape(&workspace, &shape, AsyncMode::Sync);
+        run_tier2_pipeline_for_shape(root, &shape, AsyncMode::Sync);
     }));
     let panic = result.expect_err(
         "tier-2 Map pipeline unexpectedly succeeded — `wac` may have shipped Map support; \
@@ -3905,29 +3902,12 @@ fn test_tier2_map_blocked_on_wac() {
     );
 }
 
-/// Cargo workspace reused across `test_tier2_canned` /
-/// `test_tier2_fuzz`. Only per-shape WIT + lib.rs files are rewritten.
-struct Tier2Workspace {
-    _tmp: Option<tempfile::TempDir>,
-    root: PathBuf,
-}
-
-fn scaffold_tier2_workspace() -> Tier2Workspace {
-    let tmp = tempfile::tempdir().expect("mktempdir");
-    let root_buf = tmp.path().to_path_buf();
-    // SPLICER_KEEP_TMPDIR=1 disables auto-cleanup; use `mem::forget`
-    // (not `None`) so the TempDir's Drop doesn't delete the dir at
-    // end of this function.
-    let tmp_to_keep = if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
-        eprintln!("(keeping tmpdir: {})", root_buf.display());
-        std::mem::forget(tmp);
-        None
-    } else {
-        Some(tmp)
-    };
-    let root = root_buf.as_path();
-    eprintln!("tier2: work dir = {}", root.display());
-
+/// Write the tier-2 workspace (cargo workspace + provider/consumer
+/// placeholders + middleware crate). The middleware doesn't vary per
+/// mode or shape, so this runs once per test. Per-shape provider +
+/// consumer rewrites are `write_per_shape_files`'s job. The caller
+/// owns the tempdir.
+fn scaffold_tier2_workspace_in(root: &Path) {
     std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML).expect("workspace toml");
     write_crate(
         root,
@@ -3960,11 +3940,6 @@ fn scaffold_tier2_workspace() -> Tier2Workspace {
         ],
     )
     .expect("tier-2 middleware scaffold");
-
-    Tier2Workspace {
-        _tmp: tmp_to_keep,
-        root: root_buf,
-    }
 }
 
 /// Shared by `test_tier2_canned` + `test_tier2_fuzz` to keep their
@@ -3998,12 +3973,7 @@ fn assert_tier2_pipeline_output(shape: &Shape, captured: &str) {
 /// Run the full Before-pipeline for one shape under a tier-2
 /// middleware. Returns the captured stdout/stderr trace from
 /// wasmtime so callers can pin whatever markers they need.
-fn run_tier2_pipeline_for_shape(
-    workspace: &Tier2Workspace,
-    shape: &Shape,
-    mode: AsyncMode,
-) -> String {
-    let root = workspace.root.as_path();
+fn run_tier2_pipeline_for_shape(root: &Path, shape: &Shape, mode: AsyncMode) -> String {
     write_per_shape_files(root, shape, mode).expect("write shape files");
 
     run_quiet(
@@ -4213,42 +4183,53 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
 /// the sync-mode failure output before async layer piles on top.
 const ALL_ASYNC_MODES: &[AsyncMode] = &[AsyncMode::Sync, AsyncMode::Async];
 
-/// Fuzz twin of `test_tier1_canned` — drives the same scaffold with
-/// `gen_shape`-generated shapes. `iter_seed = base_seed + i` so any
-/// failure replays with `SPLICER_FUZZ_SEED=<iter_seed> SPLICER_FUZZ_ITERS=1`.
+/// How `drive_fuzz` classifies splicer-rejected shapes. Adding a new
+/// tier with its own bail family means adding a variant here, not a
+/// new bool.
+#[derive(Clone, Copy)]
+enum BailPolicy {
+    /// Tier-1: `is_expected_bail` recognizes shapes splicer legitimately
+    /// refuses (flat-rep caps, etc.).
+    Tier1,
+    /// Tier-2: no expected-bail path today; every refusal is a failure.
+    Strict,
+}
+
+/// Shared fuzz driver. Env-driven loop over (mode, iter): generates a
+/// shape, calls `per_mode` on mode boundaries, then runs `per_iter`
+/// inside `catch_unwind` and classifies any panic per `bails`.
 ///
-/// Env vars (all override `DEFAULT_FUZZ_*` / module constants):
+/// Env vars (override `DEFAULT_FUZZ_*` / module constants):
 ///   SPLICER_FUZZ_SEED            — base u64 seed
-///   SPLICER_FUZZ_ITERS           — iterations
+///   SPLICER_FUZZ_ITERS           — iterations per mode
 ///   SPLICER_FUZZ_DEPTH           — max recursion depth
 ///   SPLICER_FUZZ_TUPLE_MAX       — max tuple arity
 ///   SPLICER_FUZZ_FIXED_LIST_MAX  — max `list<T, N>` length
-#[test]
-#[ignore]
-fn test_tier1_fuzz() {
-    require_splicer_toolchain();
-
+///
+/// `iter_seed = base_seed.wrapping_add(i)` — replay one iter via
+/// `SPLICER_FUZZ_SEED=<iter_seed> SPLICER_FUZZ_ITERS=1`.
+fn drive_fuzz(
+    label: &str,
+    bails: BailPolicy,
+    setup: impl FnOnce(&Path),
+    mut per_mode: impl FnMut(&Path, AsyncMode),
+    mut per_iter: impl FnMut(&Path, &Shape, AsyncMode),
+) {
     let base_seed: u64 = env_or("SPLICER_FUZZ_SEED", DEFAULT_FUZZ_SEED);
     let iters: u32 = env_or("SPLICER_FUZZ_ITERS", DEFAULT_FUZZ_ITERS);
     let max_depth: u32 = env_or("SPLICER_FUZZ_DEPTH", DEFAULT_FUZZ_DEPTH);
     let limits = GenLimits::from_env();
+    let (root_buf, _tmp) = make_keepable_tempdir();
+    let root = root_buf.as_path();
 
     eprintln!(
-        "tier1-fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth} \
+        "{label}: iters={iters} base_seed={base_seed} max_depth={max_depth} \
          tuple_arity={:?} fixed_list_len={:?}",
         limits.tuple_arity, limits.fixed_list_len,
     );
+    eprintln!("{label}: work dir = {}", root.display());
 
-    let tmp = tempfile::tempdir().expect("mktempdir");
-    let root_buf = tmp.path().to_path_buf();
-    // SPLICER_KEEP_TMPDIR=1 disables auto-cleanup so post-mortem
-    // inspection (wasm-tools print, cat *.wac) is possible.
-    if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
-        eprintln!("(keeping tmpdir: {})", root_buf.display());
-        std::mem::forget(tmp);
-    }
-    let root = root_buf.as_path();
-    eprintln!("tier1-fuzz: work dir = {}", root.display());
+    setup(root);
 
     let mut failures: Vec<String> = Vec::new();
     let mut expected_bails = 0usize;
@@ -4256,15 +4237,14 @@ fn test_tier1_fuzz() {
     let mut total_runs: usize = 0;
 
     // Mode as outer loop (see test_tier1_canned). The per-iter seed
-    // is mode-independent so both modes see the same shape sequence —
-    // a failure in only one mode isolates mode as the cause.
+    // is mode-independent, so both modes see the same shape sequence
+    // — a failure in only one mode isolates mode as the cause.
     let total_iters_all_modes = (iters as usize) * ALL_ASYNC_MODES.len();
     let mut run_idx = 0usize;
     for &mode in ALL_ASYNC_MODES {
         let mode_tag = mode.tag();
         eprintln!("\n### mode: {mode_tag} ###");
-        scaffold_common(root, mode).expect("scaffold common");
-
+        per_mode(root, mode);
         let support = GenSupport::for_mode(mode);
 
         for i in 0..iters {
@@ -4273,8 +4253,8 @@ fn test_tier1_fuzz() {
             let iter_seed = base_seed.wrapping_add(i as u64);
             let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
             let mut u = arbitrary::Unstructured::new(&buf);
-
             let mut counters = NominalCounters::default();
+
             let shape = match gen_shape(&mut u, max_depth, true, &mut counters, &limits, &support) {
                 Ok(s) => s,
                 Err(e) => {
@@ -4289,43 +4269,40 @@ fn test_tier1_fuzz() {
                 "\n=== [{run_idx}/{total_iters_all_modes}] iter {i} seed {iter_seed} mode {mode_tag}: {shape_name} ==="
             );
 
-            if let Err(e) = write_per_shape_files(root, &shape, mode) {
-                failures.push(format!(
-                    "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: write_per_shape_files: {e}"
-                ));
-                continue;
-            }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_pipeline_for_shape(root, &shape, ALL_PIPELINE_KINDS)
+                per_iter(root, &shape, mode)
             }));
             if let Err(panic) = result {
                 let msg = panic_msg(&*panic);
-                if is_expected_bail(&msg) {
+                let prefix =
+                    format!("iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`");
+                let head = msg.lines().next().unwrap_or(&msg);
+                if matches!(bails, BailPolicy::Tier1) && is_expected_bail(&msg) {
                     expected_bails += 1;
-                    eprintln!(
-                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: expected-bail ({})",
-                        msg.lines().next().unwrap_or(&msg)
-                    );
+                    eprintln!("{prefix}: expected-bail ({head})");
                 } else if is_harness_bail(&msg) {
                     harness_bails += 1;
-                    eprintln!(
-                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: harness-bail ({})",
-                        msg.lines().next().unwrap_or(&msg)
-                    );
+                    eprintln!("{prefix}: harness-bail ({head})");
                 } else {
-                    failures.push(format!(
-                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: {msg}"
-                    ));
+                    failures.push(format!("{prefix}: {msg}"));
                 }
             }
         }
     }
 
-    eprintln!(
-        "tier1-fuzz: passed={} expected_bails={expected_bails} harness_bails={harness_bails} failures={}",
-        total_runs - failures.len() - expected_bails - harness_bails,
-        failures.len()
-    );
+    let passed = total_runs - failures.len() - expected_bails - harness_bails;
+    match bails {
+        BailPolicy::Tier1 => eprintln!(
+            "{label}: passed={passed} expected_bails={expected_bails} \
+             harness_bails={harness_bails} failures={}",
+            failures.len(),
+        ),
+        BailPolicy::Strict => eprintln!(
+            "{label}: passed={passed} harness_bails={harness_bails} failures={}",
+            failures.len(),
+        ),
+    }
+
     if !failures.is_empty() {
         for f in failures.iter().take(MAX_FAILURES_SHOWN) {
             eprintln!("  {f}");
@@ -4334,105 +4311,43 @@ fn test_tier1_fuzz() {
             eprintln!("  ... and {} more", failures.len() - MAX_FAILURES_SHOWN);
         }
         panic!(
-            "{} fuzz iterations failed — replay a single case with \
+            "{} {label} iterations failed — replay a single case with \
              SPLICER_FUZZ_SEED=<iter_seed_from_output> SPLICER_FUZZ_ITERS=1",
-            failures.len()
+            failures.len(),
         );
     }
 }
 
-/// Tier-2 twin of `test_tier1_fuzz` — routes shapes through the
-/// tier-2 pipeline and asserts the on-call/on-return markers.
+#[test]
+#[ignore]
+fn test_tier1_fuzz() {
+    require_splicer_toolchain();
+    drive_fuzz(
+        "tier1-fuzz",
+        BailPolicy::Tier1,
+        |root| scaffold_common(root).expect("scaffold common"),
+        |_root, _mode| {},
+        |root, shape, mode| {
+            write_per_shape_files(root, shape, mode).expect("write_per_shape_files");
+            run_pipeline_for_shape(root, shape, ALL_PIPELINE_KINDS);
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn test_tier2_fuzz() {
     require_splicer_toolchain();
-
-    let base_seed: u64 = env_or("SPLICER_FUZZ_SEED", DEFAULT_FUZZ_SEED);
-    let iters: u32 = env_or("SPLICER_FUZZ_ITERS", DEFAULT_FUZZ_ITERS);
-    let max_depth: u32 = env_or("SPLICER_FUZZ_DEPTH", DEFAULT_FUZZ_DEPTH);
-    let limits = GenLimits::from_env();
-
-    eprintln!(
-        "tier2-fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth} \
-         tuple_arity={:?} fixed_list_len={:?}",
-        limits.tuple_arity, limits.fixed_list_len,
+    drive_fuzz(
+        "tier2-fuzz",
+        BailPolicy::Strict,
+        scaffold_tier2_workspace_in,
+        |_root, _mode| {},
+        |root, shape, mode| {
+            let captured = run_tier2_pipeline_for_shape(root, shape, mode);
+            assert_tier2_pipeline_output(shape, &captured);
+        },
     );
-
-    let workspace = scaffold_tier2_workspace();
-
-    let mut failures: Vec<String> = Vec::new();
-    let mut harness_bails = 0usize;
-    let mut total_runs: usize = 0;
-
-    let total_iters_all_modes = (iters as usize) * ALL_ASYNC_MODES.len();
-    let mut run_idx = 0usize;
-    for &mode in ALL_ASYNC_MODES {
-        let mode_tag = mode.tag();
-        eprintln!("\n### mode: {mode_tag} ###");
-        let support = GenSupport::for_mode(mode);
-
-        for i in 0..iters {
-            total_runs += 1;
-            run_idx += 1;
-            let iter_seed = base_seed.wrapping_add(i as u64);
-            let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
-            let mut u = arbitrary::Unstructured::new(&buf);
-
-            let mut counters = NominalCounters::default();
-            let shape = match gen_shape(&mut u, max_depth, true, &mut counters, &limits, &support) {
-                Ok(s) => s,
-                Err(e) => {
-                    failures.push(format!(
-                        "iter {i} seed {iter_seed} mode {mode_tag}: gen_shape: {e}"
-                    ));
-                    continue;
-                }
-            };
-            let shape_name = shape.name();
-            eprintln!(
-                "\n=== [{run_idx}/{total_iters_all_modes}] iter {i} seed {iter_seed} mode {mode_tag}: {shape_name} ==="
-            );
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let captured = run_tier2_pipeline_for_shape(&workspace, &shape, mode);
-                assert_tier2_pipeline_output(&shape, &captured);
-            }));
-            if let Err(panic) = result {
-                let msg = panic_msg(&*panic);
-                if is_harness_bail(&msg) {
-                    harness_bails += 1;
-                    eprintln!(
-                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: harness-bail ({})",
-                        msg.lines().next().unwrap_or(&msg)
-                    );
-                } else {
-                    failures.push(format!(
-                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: {msg}"
-                    ));
-                }
-            }
-        }
-    }
-
-    eprintln!(
-        "tier2-fuzz: passed={} harness_bails={harness_bails} failures={}",
-        total_runs - failures.len() - harness_bails,
-        failures.len(),
-    );
-    if !failures.is_empty() {
-        for f in failures.iter().take(MAX_FAILURES_SHOWN) {
-            eprintln!("  {f}");
-        }
-        if failures.len() > MAX_FAILURES_SHOWN {
-            eprintln!("  ... and {} more", failures.len() - MAX_FAILURES_SHOWN);
-        }
-        panic!(
-            "{} tier-2 fuzz iterations failed — replay a single case with \
-             SPLICER_FUZZ_SEED=<iter_seed_from_output> SPLICER_FUZZ_ITERS=1",
-            failures.len()
-        );
-    }
 }
 
 /// Pick which shapes to run. Without the env var, the full
@@ -4765,6 +4680,28 @@ fn require_splicer_toolchain() {
     require_tool("wac");
 }
 
+/// Create a tempdir + honor `SPLICER_KEEP_TMPDIR`. When set, the
+/// `TempDir`'s Drop is suppressed via `mem::forget` so the dir
+/// survives the test for post-mortem inspection (wasm-tools print,
+/// cat *.wac, etc.); the caller gets `None` in that case. Otherwise
+/// the returned `TempDir` must outlive any path use.
+///
+/// **Bind the second element to a named `_tmp`, not `_`.** A `_`
+/// pattern drops the `Option<TempDir>` immediately, deleting the
+/// dir before the test runs (same bug we just fixed in tier-2).
+#[must_use]
+fn make_keepable_tempdir() -> (PathBuf, Option<tempfile::TempDir>) {
+    let tmp = tempfile::tempdir().expect("mktempdir");
+    let root_buf = tmp.path().to_path_buf();
+    if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
+        eprintln!("(keeping tmpdir: {})", root_buf.display());
+        std::mem::forget(tmp);
+        (root_buf, None)
+    } else {
+        (root_buf, Some(tmp))
+    }
+}
+
 /// Read + parse an env var; fall back to `default` on any failure.
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -4833,10 +4770,9 @@ fn run_quiet(cmd: &mut Command, label: &str) {
     }
 }
 
-/// Per-mode setup: workspace + middleware. `write_per_shape_files`
-/// overwrites the provider + consumer per shape afterwards. Re-run
-/// per AsyncMode because the consumer's world depends on it.
-fn scaffold_common(root: &Path, _mode: AsyncMode) -> std::io::Result<()> {
+/// Tier-1 workspace + middleware setup; runs once. Provider +
+/// consumer files are rewritten per shape by `write_per_shape_files`.
+fn scaffold_common(root: &Path) -> std::io::Result<()> {
     std::fs::write(root.join("Cargo.toml"), WORKSPACE_CARGO_TOML)?;
 
     write_crate(
