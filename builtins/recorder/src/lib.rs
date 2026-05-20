@@ -91,6 +91,19 @@ fn drain_to<W: Write>(buf: &mut Vec<u8>, mut out: W) {
 /// preceding event temporarily grew it past this.
 const BUF_FLOOR_CAPACITY: usize = 8 * 1024;
 
+/// Splicer-injected edge identifier for this recorder instance,
+/// fetched once via the config substrate. Splicer guarantees this key
+/// is present on every spliced recorder; the fallback only matters if
+/// someone wires the recorder up without going through splicer.
+#[allow(dead_code)] // wired into the file sink in the next change
+fn edge_id() -> &'static str {
+    static V: OnceLock<String> = OnceLock::new();
+    V.get_or_init(|| {
+        crate::bindings::splicer::builtin_config::get::get("_splicer_edge_id")
+            .unwrap_or_else(|| "unknown-edge".to_string())
+    })
+}
+
 /// Convert `wasi:clocks/wall-clock.datetime` to u64 ns since epoch.
 /// Saturating is defensive; for any plausible wall-clock value the
 /// product fits in u64 (u64::MAX ns is ~584 years).
