@@ -1,13 +1,23 @@
-//! Bridge between splicer's cells wire format and wasm-wave's value
-//! model.
+//! `WitTyped`: the trait that lets a Rust value flow to and from a
+//! wasm-wave Value (and through that, splicer's cells wire format).
 //!
-//! Cells are splicer's WIT-representable structural wire format,
-//! used by tier-2 hooks and trace files. wasm-wave's `WasmValue` is
-//! the in-Rust typed value model. This module converts between them.
+//! `WitTyped` impls split by where the type comes from:
 //!
-//! Supports primitive, list, option, result, tuple, record, variant,
-//! enum, and flags shapes. Resources, streams, futures, and
-//! error-context cells return an error.
+//! - **WIT core types** (this file): primitives (`bool`, ints, floats,
+//!   `char`, `String`) and generic containers (`Vec<T>`, `Option<T>`,
+//!   `Result<T, E>`). These have a fixed Rust shape, so the impls are
+//!   hand-written here and shared across every wrapper crate.
+//! - **User-defined types** (in `splicer::adapter::typed::emit_wit_typed`):
+//!   record, enum, and variant types that a user declares in their
+//!   target WIT. Their Rust shape changes per WIT, so splicer
+//!   generates the impls per wrapper crate. The generated impls call
+//!   into the core-type impls here for field and element conversion.
+//!
+//! Also in this file: the lower-level [`cells_to_value`] function
+//! that turns cells (the wire format used by tier-2 hooks and
+//! recorded traces) into a wasm-wave Value. Strategies that consume
+//! traces typically reach for [`cells_to_typed`] instead, which
+//! chains cells → Value → typed Rust in one call.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -28,6 +38,104 @@ pub trait WitTyped: Sized {
     fn to_value(&self) -> WaveValue;
     /// Decode a wasm-wave Value into a typed Rust value.
     fn from_value(value: &WaveValue) -> Result<Self, BridgeError>;
+}
+
+// ---- primitive impls --------------------------------------------------
+
+// Every Copy primitive whose `WaveType` constant, `make_*` constructor,
+// and `unwrap_*` accessor follow the same naming pattern flows through
+// this macro. Only `String` diverges (needs `Cow` plumbing).
+macro_rules! impl_wit_typed_primitive {
+    ($($ty:ty => $wave_ty:ident, $make:ident, $unwrap:ident);* $(;)?) => {$(
+        impl WitTyped for $ty {
+            fn wave_type() -> WaveType { WaveType::$wave_ty }
+            fn to_value(&self) -> WaveValue { WaveValue::$make(*self) }
+            fn from_value(v: &WaveValue) -> Result<Self, BridgeError> { Ok(v.$unwrap()) }
+        }
+    )*};
+}
+
+impl_wit_typed_primitive! {
+    bool => BOOL, make_bool, unwrap_bool;
+    u8 => U8, make_u8, unwrap_u8;
+    u16 => U16, make_u16, unwrap_u16;
+    u32 => U32, make_u32, unwrap_u32;
+    u64 => U64, make_u64, unwrap_u64;
+    i8 => S8, make_s8, unwrap_s8;
+    i16 => S16, make_s16, unwrap_s16;
+    i32 => S32, make_s32, unwrap_s32;
+    i64 => S64, make_s64, unwrap_s64;
+    f32 => F32, make_f32, unwrap_f32;
+    f64 => F64, make_f64, unwrap_f64;
+    char => CHAR, make_char, unwrap_char;
+}
+
+impl WitTyped for String {
+    fn wave_type() -> WaveType {
+        WaveType::STRING
+    }
+    fn to_value(&self) -> WaveValue {
+        WaveValue::make_string(Cow::Borrowed(self.as_str()))
+    }
+    fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+        Ok(v.unwrap_string().into_owned())
+    }
+}
+
+// ---- compound impls ---------------------------------------------------
+
+impl<T: WitTyped> WitTyped for Vec<T> {
+    fn wave_type() -> WaveType {
+        WaveType::list(T::wave_type())
+    }
+    fn to_value(&self) -> WaveValue {
+        let ty = Self::wave_type();
+        WaveValue::make_list(&ty, self.iter().map(T::to_value))
+            .expect("element values match the list's declared element type")
+    }
+    fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+        v.unwrap_list().map(|c| T::from_value(&c)).collect()
+    }
+}
+
+impl<T: WitTyped> WitTyped for Option<T> {
+    fn wave_type() -> WaveType {
+        WaveType::option(T::wave_type())
+    }
+    fn to_value(&self) -> WaveValue {
+        let ty = Self::wave_type();
+        let inner = self.as_ref().map(T::to_value);
+        WaveValue::make_option(&ty, inner).expect("inner value matches declared option type")
+    }
+    fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+        match v.unwrap_option() {
+            Some(inner) => Ok(Some(T::from_value(&inner)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<T: WitTyped, E: WitTyped> WitTyped for Result<T, E> {
+    fn wave_type() -> WaveType {
+        WaveType::result(Some(T::wave_type()), Some(E::wave_type()))
+    }
+    fn to_value(&self) -> WaveValue {
+        let ty = Self::wave_type();
+        let inner = match self {
+            Ok(t) => Ok(Some(t.to_value())),
+            Err(e) => Err(Some(e.to_value())),
+        };
+        WaveValue::make_result(&ty, inner).expect("inner value matches declared result type")
+    }
+    fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+        match v.unwrap_result() {
+            Ok(Some(inner)) => Ok(Ok(T::from_value(&inner)?)),
+            Err(Some(inner)) => Ok(Err(E::from_value(&inner)?)),
+            Ok(None) | Err(None) => Err(BridgeError::Unsupported(
+                "unit-arm result not yet supported for WitTyped<Result<T, E>>",
+            )),
+        }
+    }
 }
 
 /// Decode the cell at `root` directly into a typed Rust value.
