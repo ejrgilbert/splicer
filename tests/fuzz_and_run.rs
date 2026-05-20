@@ -2740,7 +2740,7 @@ fn tier2_shapes() -> Vec<Shape> {
     ]
 }
 
-// ─── Arbitrary-driven generator (used by test_fuzz) ─
+// ─── Arbitrary-driven generator (used by test_tier1_fuzz + test_tier2_fuzz) ─
 //
 // Generates `Shape` trees from an `arbitrary::Unstructured`. Records
 // can't nest inside other records — WIT only declares record types at
@@ -2792,10 +2792,8 @@ impl GenLimits {
     }
 }
 
-/// Which middleware tier the active fuzz iter targets. Future-proofs
-/// for a tier-2 fuzz runner (Phase 4); today only `Tier1` is wired.
+/// Which middleware tier the active fuzz iter targets.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 enum Tier {
     Tier1,
     Tier2,
@@ -4051,7 +4049,11 @@ fn test_tier2_canned() {
             shape_name
         );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let captured = run_tier2_pipeline_for_shape(&workspace, shape);
+            // TODO: pinned to sync — wit-bindgen 0.57.1's `generate!`
+            // panics on `list<T, N>` under `async: true`. Tier-2 fuzz
+            // gates async drawing via `GenSupport`; canned has fixed
+            // shapes including `fixed_list_u32_3` so can't toggle yet.
+            let captured = run_tier2_pipeline_for_shape(&workspace, shape, AsyncMode::Sync);
             let expected_args = predict_tier2_args_marker(shape)
                 .expect("every tier2_shapes() entry must be renderable by predict_tier2_arg_inner");
             // `expected_args` already includes the `args=[...]` wrapping.
@@ -4124,7 +4126,7 @@ fn test_tier2_map_blocked_on_wac() {
     };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_tier2_pipeline_for_shape(&workspace, &shape);
+        run_tier2_pipeline_for_shape(&workspace, &shape, AsyncMode::Sync);
     }));
     let panic = result.expect_err(
         "tier-2 Map pipeline unexpectedly succeeded — `wac` may have shipped Map support; \
@@ -4199,17 +4201,46 @@ fn scaffold_tier2_workspace() -> Tier2Workspace {
     }
 }
 
+/// Assert the tier-2 middleware traced the expected on-call /
+/// on-return cells and that the consumer still observed the round-trip
+/// value. Shared by `test_tier2_canned` and `test_tier2_fuzz` so the
+/// fuzz harness can't drift from the canned assertion shape.
+fn assert_tier2_pipeline_output(shape: &Shape, captured: &str) {
+    let shape_name = shape.name();
+    let expected_args = predict_tier2_args_marker(shape)
+        .expect("predict_tier2_arg_inner must render every generated/canned shape");
+    let expected_marker =
+        format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo {expected_args}");
+    assert!(
+        captured.contains(&expected_marker),
+        "tier-2 on-call rendered the wrong cell for `{shape_name}` — \
+         expected substring `{expected_marker}`\n--- trace ---\n{captured}",
+    );
+    let expected_result_inner = predict_tier2_result_marker(shape)
+        .expect("predict_tier2_arg_inner must render every generated/canned shape");
+    let expected_return_marker =
+        format!("mdl: tier2-on-return {TARGET_INTERFACE}#foo result={expected_result_inner}");
+    assert!(
+        captured.contains(&expected_return_marker),
+        "tier-2 on-return rendered the wrong cell for `{shape_name}` — \
+         expected substring `{expected_return_marker}`\n--- trace ---\n{captured}",
+    );
+    let expected_got = format!("consumer: got {}", shape.expected_debug());
+    assert!(
+        captured.contains(&expected_got),
+        "[{shape_name}] consumer didn't see `{expected_got}`\n--- trace ---\n{captured}",
+    );
+}
+
 /// Run the full Before-pipeline for one shape under a tier-2
 /// middleware. Returns the captured stdout/stderr trace from
 /// wasmtime so callers can pin whatever markers they need.
-fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> String {
+fn run_tier2_pipeline_for_shape(
+    workspace: &Tier2Workspace,
+    shape: &Shape,
+    mode: AsyncMode,
+) -> String {
     let root = workspace.root.as_path();
-    // TODO: pinned to sync — wit-bindgen 0.57.1's `generate!` with
-    // `async: true` panics ("not yet implemented") on every
-    // `list<T, N>` shape, top-level or nested. Flip to looping
-    // `ALL_ASYNC_MODES` once wit-bindgen supports fixed-length lists
-    // under async-mode bindings.
-    let mode = AsyncMode::Sync;
     write_per_shape_files(root, shape, mode).expect("write shape files");
 
     run_quiet(
@@ -4450,7 +4481,7 @@ const ALL_ASYNC_MODES: &[AsyncMode] = &[AsyncMode::Sync, AsyncMode::Async];
 /// replay is visible on every failing line.
 #[test]
 #[ignore]
-fn test_fuzz() {
+fn test_tier1_fuzz() {
     require_splicer_toolchain();
 
     let base_seed: u64 = env_or("SPLICER_FUZZ_SEED", DEFAULT_FUZZ_SEED);
@@ -4459,7 +4490,7 @@ fn test_fuzz() {
     let limits = GenLimits::from_env();
 
     eprintln!(
-        "fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth} \
+        "tier1-fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth} \
          tuple_arity={:?} fixed_list_len={:?}",
         limits.tuple_arity, limits.fixed_list_len,
     );
@@ -4473,7 +4504,7 @@ fn test_fuzz() {
         std::mem::forget(tmp);
     }
     let root = root_buf.as_path();
-    eprintln!("fuzz: work dir = {}", root.display());
+    eprintln!("tier1-fuzz: work dir = {}", root.display());
 
     let mut failures: Vec<String> = Vec::new();
     let mut expected_bails = 0usize;
@@ -4550,7 +4581,7 @@ fn test_fuzz() {
     }
 
     eprintln!(
-        "fuzz: passed={} expected_bails={expected_bails} harness_bails={harness_bails} failures={}",
+        "tier1-fuzz: passed={} expected_bails={expected_bails} harness_bails={harness_bails} failures={}",
         total_runs - failures.len() - expected_bails - harness_bails,
         failures.len()
     );
@@ -4563,6 +4594,105 @@ fn test_fuzz() {
         }
         panic!(
             "{} fuzz iterations failed — replay a single case with \
+             SPLICER_FUZZ_SEED=<iter_seed_from_output> SPLICER_FUZZ_ITERS=1",
+            failures.len()
+        );
+    }
+}
+
+/// Tier-2 fuzz: same loop shape as `test_tier1_fuzz`, but routes shapes
+/// through `run_tier2_pipeline_for_shape` and asserts the tier-2
+/// observation markers. Uses `GenSupport::for_tier_mode(Tier::Tier2,
+/// mode)` so async-mode draws skip features wit-bindgen can't bind
+/// (e.g. `list<T, N>`).
+#[test]
+#[ignore]
+fn test_tier2_fuzz() {
+    require_splicer_toolchain();
+
+    let base_seed: u64 = env_or("SPLICER_FUZZ_SEED", DEFAULT_FUZZ_SEED);
+    let iters: u32 = env_or("SPLICER_FUZZ_ITERS", DEFAULT_FUZZ_ITERS);
+    let max_depth: u32 = env_or("SPLICER_FUZZ_DEPTH", DEFAULT_FUZZ_DEPTH);
+    let limits = GenLimits::from_env();
+
+    eprintln!(
+        "tier2-fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth} \
+         tuple_arity={:?} fixed_list_len={:?}",
+        limits.tuple_arity, limits.fixed_list_len,
+    );
+
+    // `scaffold_tier2_workspace` already owns the tempdir lifecycle and
+    // honors `SPLICER_KEEP_TMPDIR` internally.
+    let workspace = scaffold_tier2_workspace();
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut harness_bails = 0usize;
+    let mut total_runs: usize = 0;
+
+    let total_iters_all_modes = (iters as usize) * ALL_ASYNC_MODES.len();
+    let mut run_idx = 0usize;
+    for &mode in ALL_ASYNC_MODES {
+        let mode_tag = mode.tag();
+        eprintln!("\n### mode: {mode_tag} ###");
+        let support = GenSupport::for_tier_mode(Tier::Tier2, mode);
+
+        for i in 0..iters {
+            total_runs += 1;
+            run_idx += 1;
+            let iter_seed = base_seed.wrapping_add(i as u64);
+            let buf = fuzz_seeded_bytes(iter_seed, FUZZ_BYTES_PER_ITER);
+            let mut u = arbitrary::Unstructured::new(&buf);
+
+            let mut counters = NominalCounters::default();
+            let shape = match gen_shape(&mut u, max_depth, true, &mut counters, &limits, &support) {
+                Ok(s) => s,
+                Err(e) => {
+                    failures.push(format!(
+                        "iter {i} seed {iter_seed} mode {mode_tag}: gen_shape: {e}"
+                    ));
+                    continue;
+                }
+            };
+            let shape_name = shape.name();
+            eprintln!(
+                "\n=== [{run_idx}/{total_iters_all_modes}] iter {i} seed {iter_seed} mode {mode_tag}: {shape_name} ==="
+            );
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let captured = run_tier2_pipeline_for_shape(&workspace, &shape, mode);
+                assert_tier2_pipeline_output(&shape, &captured);
+            }));
+            if let Err(panic) = result {
+                let msg = panic_msg(&*panic);
+                if is_harness_bail(&msg, mode) {
+                    harness_bails += 1;
+                    eprintln!(
+                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: harness-bail ({})",
+                        msg.lines().next().unwrap_or(&msg)
+                    );
+                } else {
+                    failures.push(format!(
+                        "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: {msg}"
+                    ));
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "tier2-fuzz: passed={} harness_bails={harness_bails} failures={}",
+        total_runs - failures.len() - harness_bails,
+        failures.len(),
+    );
+    if !failures.is_empty() {
+        for f in failures.iter().take(MAX_FAILURES_SHOWN) {
+            eprintln!("  {f}");
+        }
+        if failures.len() > MAX_FAILURES_SHOWN {
+            eprintln!("  ... and {} more", failures.len() - MAX_FAILURES_SHOWN);
+        }
+        panic!(
+            "{} tier-2 fuzz iterations failed — replay a single case with \
              SPLICER_FUZZ_SEED=<iter_seed_from_output> SPLICER_FUZZ_ITERS=1",
             failures.len()
         );
