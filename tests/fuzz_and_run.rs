@@ -4209,8 +4209,7 @@ fn assert_tier2_pipeline_output(shape: &Shape, captured: &str) {
     let shape_name = shape.name();
     let expected_args = predict_tier2_args_marker(shape)
         .expect("predict_tier2_arg_inner must render every generated/canned shape");
-    let expected_marker =
-        format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo {expected_args}");
+    let expected_marker = format!("mdl: tier2-on-call {TARGET_INTERFACE}#foo {expected_args}");
     assert!(
         captured.contains(&expected_marker),
         "tier-2 on-call rendered the wrong cell for `{shape_name}` — \
