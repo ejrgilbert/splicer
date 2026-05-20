@@ -236,17 +236,27 @@ fn emit_method_body(
 
     // The downstream closure unpacks args back into positional and
     // calls the target import. For tier-3 (forward); skipped entirely
-    // for tier-4 (virtualize).
+    // for tier-4 (virtualize). The import is awaited iff the Guest
+    // method is async (mirroring whether the WIT marked it `async func`).
     let target_call = build_target_call(method_ident, params, guest_module_path);
+    let target_call = if method.sig.asyncness.is_some() {
+        quote! { #target_call.await }
+    } else {
+        target_call
+    };
 
     let dispatch = match behavior {
         Behavior::Forward => {
+            // Annotate the closure's `args` parameter explicitly:
+            // Rust doesn't always propagate the trait's `Args`
+            // generic through the qualified `<_ as Trait<...>>::handle`
+            // dispatch into closure-parameter inference (E0282).
             quote! {
                 <_ as ::splicer_tool_sdk::ForwardStrategy<#args_ident, #return_ty>>::handle(
                     s,
                     call,
                     args,
-                    |args| async move { #target_call },
+                    |args: #args_ident| async move { #target_call },
                 )
             }
         }
