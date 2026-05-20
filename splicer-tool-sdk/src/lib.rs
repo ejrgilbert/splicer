@@ -21,7 +21,7 @@ pub use strategy::{ForwardStrategy, VirtualizeStrategy};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };
-pub use wave_bridge::{cells_to_value, BridgeError};
+pub use wave_bridge::{cells_to_typed, cells_to_value, BridgeError, WitTyped};
 
 /// Re-export wasm-wave so consumers depend on one crate and pick up
 /// the same `WasmType` / `WasmValue` traits the SDK's bridge speaks.

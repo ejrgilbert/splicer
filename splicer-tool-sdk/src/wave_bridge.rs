@@ -1,29 +1,41 @@
 //! Bridge between splicer's cells wire format and wasm-wave's value
 //! model.
 //!
-//! Splicer uses [`crate::Cell`] / [`crate::FieldTree`] on the wire
-//! (tier-2 lift, recorder/replayer trace files, etc.) because cells
-//! are WIT-representable and self-describing — properties tier-2
-//! needs. wasm-wave's [`wasm_wave::wasm::WasmValue`] is the in-Rust
-//! typed value model; this module converts between the two.
+//! Cells are splicer's WIT-representable structural wire format,
+//! used by tier-2 hooks and trace files. wasm-wave's `WasmValue` is
+//! the in-Rust typed value model. This module converts between them.
 //!
-//! Strategy authors don't touch cells directly. They write a bound
-//! like `R: WasmValue` on their `VirtualizeStrategy` impl, the
-//! generated wrapper crate provides the per-type `WasmType` /
-//! `WasmValue` impls (emitted by splicer's stage-3 codegen), and the
-//! SDK ships this bridge as the cells/Value boundary.
-//!
-//! v1 covers value-typed shapes: primitives, list, option, result,
-//! tuple, record, variant, enum, flags. Resources, streams, futures,
-//! and error-context cells return an error — v2 territory.
+//! Supports primitive, list, option, result, tuple, record, variant,
+//! enum, and flags shapes. Resources, streams, futures, and
+//! error-context cells return an error.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
+use wasm_wave::value::{Type as WaveType, Value as WaveValue};
 use wasm_wave::wasm::{WasmType, WasmTypeKind, WasmValue, WasmValueError};
 
 use crate::types::{Cell, FieldTree};
+
+/// Carries a Rust type's WIT type info plus both conversion
+/// directions to/from [`WaveValue`].
+pub trait WitTyped: Sized {
+    /// The WIT type this Rust type corresponds to, as a wasm-wave
+    /// `Type` instance.
+    fn wave_type() -> WaveType;
+    /// Convert a typed Rust value into a wasm-wave Value.
+    fn to_value(&self) -> WaveValue;
+    /// Decode a wasm-wave Value into a typed Rust value.
+    fn from_value(value: &WaveValue) -> Result<Self, BridgeError>;
+}
+
+/// Decode the cell at `root` directly into a typed Rust value.
+/// Convenience over [`cells_to_value`] + [`WitTyped::from_value`].
+pub fn cells_to_typed<T: WitTyped>(tree: &FieldTree, root: u32) -> Result<T, BridgeError> {
+    let value: WaveValue = cells_to_value(tree, root, &T::wave_type())?;
+    T::from_value(&value)
+}
 
 /// Decode the cell at `root` (an index into `tree.cells`) into a
 /// `WasmValue` typed by `expected_type`. Walks cells and the
@@ -747,6 +759,68 @@ mod tests {
             cells_to_value::<Value>(&t, 0, &Type::STRING),
             Err(BridgeError::KindMismatch { .. })
         ));
+    }
+
+    /// Hand-written WitTyped impl for a primitive-only struct.
+    /// Verifies the trait + cells_to_typed pipeline end-to-end.
+    /// Stage-3 codegen will emit this exact shape automatically for
+    /// every wit-bindgen-generated type.
+    #[derive(Debug, PartialEq)]
+    struct Point {
+        x: u32,
+        y: u32,
+    }
+
+    impl WitTyped for Point {
+        fn wave_type() -> WaveType {
+            WaveType::record([("x", WaveType::U32), ("y", WaveType::U32)]).unwrap()
+        }
+        fn to_value(&self) -> WaveValue {
+            WaveValue::make_record(
+                &Self::wave_type(),
+                [("x", WaveValue::make_u32(self.x)), ("y", WaveValue::make_u32(self.y))],
+            )
+            .expect("record matches wave_type")
+        }
+        fn from_value(value: &WaveValue) -> Result<Self, BridgeError> {
+            let mut x: Option<u32> = None;
+            let mut y: Option<u32> = None;
+            for (name, v) in value.unwrap_record() {
+                match name.as_ref() {
+                    "x" => x = Some(v.unwrap_u32()),
+                    "y" => y = Some(v.unwrap_u32()),
+                    _ => {}
+                }
+            }
+            Ok(Self {
+                x: x.ok_or_else(|| BridgeError::MissingField { name: "x".into() })?,
+                y: y.ok_or_else(|| BridgeError::MissingField { name: "y".into() })?,
+            })
+        }
+    }
+
+    #[test]
+    fn cells_to_typed_round_trips_record() {
+        let mut t = empty_tree(
+            vec![Cell::Integer(3), Cell::Integer(4), Cell::RecordOf(0)],
+            2,
+        );
+        t.record_infos.push(RecordInfo {
+            type_name: "point".into(),
+            fields: vec![("x".into(), 0), ("y".into(), 1)],
+        });
+        let p: Point = cells_to_typed(&t, t.root).unwrap();
+        assert_eq!(p, Point { x: 3, y: 4 });
+    }
+
+    #[test]
+    fn wit_typed_to_value_round_trip_via_wave() {
+        // typed → Value → typed (without involving cells; just
+        // confirms the WitTyped pair is consistent on its own).
+        let p = Point { x: 7, y: 11 };
+        let v = p.to_value();
+        let back = Point::from_value(&v).unwrap();
+        assert_eq!(back, p);
     }
 
     #[test]

@@ -15,5 +15,11 @@
 //!    `.wasm` and caches the result.
 
 mod behavior_meta;
+mod bindgen;
+mod bindings_walk;
 
 pub use behavior_meta::{read_behavior, read_behavior_from_str, Behavior, BehaviorReadError};
+pub use bindgen::run_wit_bindgen_rust;
+pub use bindings_walk::{
+    walk_bindings, GuestMethod, GuestTrait, TypeDef, TypeDefKind, WrapperBindings,
+};
