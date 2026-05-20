@@ -13,10 +13,12 @@
 
 pub mod format;
 pub mod strategy;
+pub mod typed_from_cells;
 pub mod types;
 
 pub use format::{cell_to_str, format_field_tree};
 pub use strategy::WrapperStrategy;
+pub use typed_from_cells::{FromCellsError, FromCellsResult, TypedFromCells};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };
