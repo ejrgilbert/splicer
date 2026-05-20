@@ -36,6 +36,10 @@
 
 use anyhow::Context;
 use arbitrary::Arbitrary;
+use splicer::types::{
+    COMMON_PACKAGE, COMMON_VERSION, TIER1_AFTER, TIER1_BEFORE, TIER1_PACKAGE, TIER1_VERSION,
+    TIER2_AFTER, TIER2_BEFORE, TIER2_PACKAGE, TIER2_VERSION,
+};
 use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -71,6 +75,8 @@ const MAX_FAILURES_SHOWN: usize = 20;
 
 /// Arity bounds for generated tuples.
 const TUPLE_ARITY: std::ops::RangeInclusive<usize> = 2..=3;
+/// Element count for generated `list<T, N>` (canon-ABI fixed-length).
+const FIXED_LIST_LEN: std::ops::RangeInclusive<u32> = 1..=4;
 /// WIT field names for generated records.
 const RECORD_FIELD_NAMES: &[&str] = &["a", "b", "c"];
 /// Distinct WIT record names the generator cycles through; length
@@ -127,6 +133,33 @@ const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
 enum BindingsSide {
     Provider,
     Consumer,
+}
+
+/// How a path expression evaluates for `pass_expr`'s purposes.
+/// Three cases matter because Copy-vs-non-Copy reads differently
+/// across them:
+///   - `Owned`: `v` or `v.0` from owned outer. Non-Copy can be moved.
+///   - `RefBinding`: `o` from `match &v { Ok(o) => … }` or `|x|` closure
+///     binding. Path is `&T`; Copy needs `*path`; non-Copy can't move.
+///   - `PlaceFromRef`: `o.0` — field access on a `&T` binding. Place
+///     read works for Copy directly; non-Copy can't move out.
+#[derive(Clone, Copy)]
+enum PathKind {
+    Owned,
+    RefBinding,
+    PlaceFromRef,
+}
+
+impl PathKind {
+    /// Path kind after a field-access (or analogous place projection).
+    /// Owned stays Owned (place-from-owned is movable). Either ref
+    /// variant collapses to `PlaceFromRef`.
+    fn sub_path_kind(self) -> Self {
+        match self {
+            PathKind::Owned => PathKind::Owned,
+            PathKind::RefBinding | PathKind::PlaceFromRef => PathKind::PlaceFromRef,
+        }
+    }
 }
 
 impl BindingsSide {
@@ -284,24 +317,6 @@ struct VariantCase {
     /// Optional payload type. `None` → unit variant; `Some(s)` →
     /// tuple-struct variant carrying a single `s` value.
     payload: Option<Shape>,
-}
-
-/// Turn a `String::from("…")` Rust source fragment into a bare
-/// string literal (`"…"`) — used when the consumer's sync-mode
-/// binding wants `&str` instead of `String`. The input is
-/// always-generated-by-us so we don't need a real parser.
-fn extract_string_literal(src: &str) -> String {
-    // `String::from("hello")` → `"hello"`. Anything that doesn't
-    // match falls back to the original string — this keeps the
-    // helper robust to callers that accidentally pass a non-
-    // `String::from` literal.
-    let Some(rest) = src.strip_prefix("String::from(") else {
-        return src.to_string();
-    };
-    let Some(inner) = rest.strip_suffix(')') else {
-        return src.to_string();
-    };
-    inner.to_string()
 }
 
 impl Shape {
@@ -552,29 +567,11 @@ impl Shape {
 
     fn rust_literal(&self, side: BindingsSide, mode: AsyncMode) -> String {
         match self {
-            Shape::Primitive {
-                rust_ty,
-                rust_literal,
-                ..
-            } => {
-                // wit-bindgen's sync imports take `&str` for string
-                // params — including inside tuples (`(u32, &str)`),
-                // `result<_, string>` (`Result<_, &str>`), variant
-                // payloads, etc. `ownership: Owning` doesn't rewrite
-                // those inner slots. Async imports use owned `String`
-                // uniformly. So for the string primitive only: emit a
-                // plain str literal on the consumer side in sync mode,
-                // and an owned `String` everywhere else.
-                let consumer_sync_string = *rust_ty == "String"
-                    && matches!(side, BindingsSide::Consumer)
-                    && matches!(mode, AsyncMode::Sync);
-                if consumer_sync_string {
-                    // rust_literal is `String::from("hello")`; strip
-                    // to `"hello"`.
-                    extract_string_literal(rust_literal)
-                } else {
-                    (*rust_literal).to_string()
-                }
+            Shape::Primitive { rust_literal, .. } => {
+                // Canonical owned form regardless of side / mode.
+                // `pass_expr` is the single source of truth for any
+                // sync-mode borrow substitution (e.g. String → &str).
+                (*rust_literal).to_string()
             }
             Shape::Option { inner, is_some } => {
                 if *is_some {
@@ -741,78 +738,188 @@ impl Shape {
     /// shared reference, so we prefix with `&` where wit-bindgen's
     /// sync-import signature demands a borrow.
     fn consumer_pass_expr(&self, v_ident: &str, mode: AsyncMode) -> String {
-        // `borrow<T>` always passes a reference regardless of mode —
-        // wit-bindgen emits `foo(x: &Cat)` for both sync and async
-        // imports because the canonical-ABI rule (borrow doesn't
-        // transfer ownership) is independent of async lifting.
+        self.pass_expr(v_ident, PathKind::Owned, mode)
+    }
+
+    /// Build the expression to pass to `api::foo(...)`. Encodes
+    /// wit-bindgen's binding rules in one place.
+    ///
+    /// **Async mode:** every shape passes by value.
+    ///
+    /// **Sync mode rules:**
+    /// - Copy leaves (Primitive non-String, Enum, Flags, FixedLengthList of Copy): by value.
+    /// - String: `path.as_str()`.
+    /// - List / ListEmpty: `&path[..]`.
+    /// - Record / Variant: `&path` (`ownership: Owning` doesn't derive Copy).
+    /// - Tuple: by value when every leaf is real-Copy; otherwise rebuild as
+    ///   `(part0_view, part1_view, …)` with field-access sub-paths.
+    /// - Option<T>: by value when T real-Copy; `path.as_deref()` for inner
+    ///   List/String; otherwise `path.as_ref().map(|x| inner_view(x))`.
+    /// - Result<O, E>: by value when both arms real-Copy; otherwise
+    ///   `match &path { Ok(o) => Ok(view(o)), Err(e) => Err(view(e)) }`.
+    /// - ResourceOwn: by value (ownership transfer; not Copy but moved).
+    /// - ResourceBorrow: `&path`.
+    /// - `list<…resource…>`: by value (wit-bindgen takes Vec by value to move
+    ///   handles in).
+    ///
+    /// **`path_is_ref`** — when set, the input expression already
+    /// evaluates to `&T` (e.g. bound by a `match &v` arm). Copy
+    /// leaves then need `*path` to deref; non-Copy leaves wanting
+    /// `&T` already have it.
+    fn pass_expr(&self, path: &str, kind: PathKind, mode: AsyncMode) -> String {
+        // Resource handles: mode-independent.
         if matches!(self, Shape::ResourceBorrow { .. }) {
-            return format!("&{v_ident}");
+            return match kind {
+                PathKind::RefBinding => path.to_string(),
+                _ => format!("&{path}"),
+            };
         }
-        // `own<T>` is an ownership transfer — wit-bindgen takes the
-        // handle by value in both sync and async, so the call site
-        // hands over `v` directly without `&`. This must be checked
-        // before the generic sync-Copy path below: handles aren't Copy
-        // so `is_copy_in` would otherwise force a borrow.
         if matches!(self, Shape::ResourceOwn { .. }) {
-            return v_ident.to_string();
+            debug_assert!(
+                matches!(kind, PathKind::Owned),
+                "ResourceOwn via non-owned path can't move",
+            );
+            return path.to_string();
         }
-        // `list<…own<R>…>` — wit-bindgen takes the Vec by value to
-        // move each resource handle into the call. Recurse so nested
-        // forms (`list<list<own<R>>>`, etc.) match too.
+        // `list<…resource…>`: pass the Vec by value so wit-bindgen can move handles.
         if let Shape::List(inner) | Shape::ListEmpty(inner) = self {
             if inner.contains_resource() {
-                return v_ident.to_string();
+                debug_assert!(matches!(kind, PathKind::Owned));
+                return path.to_string();
             }
         }
+        // Async mode: everything owned, by value.
         if matches!(mode, AsyncMode::Async) {
-            return v_ident.to_string();
+            return self.value_form(path, kind);
         }
-        // Sync import convention: wit-bindgen emits `foo(x: T)` when
-        // the generated Rust type is `Copy`, and `foo(x: &T)`
-        // otherwise. `is_copy_in(Sync)` approximates that — inside
-        // structural containers (Tuple, Result, Option, List)
-        // wit-bindgen substitutes `&str` for `string` (Copy-ish);
-        // inside nominal containers (Record, Variant) the
-        // `ownership: Owning` annotation keeps fields as owned
-        // `String` (not Copy).
-        if self.is_copy_in(AsyncMode::Sync) {
-            v_ident.to_string()
-        } else {
-            format!("&{v_ident}")
+        // Sync mode: dispatch on shape.
+        match self {
+            Shape::Primitive { rust_ty, .. } if *rust_ty == "String" => {
+                // wit-bindgen sync wants `&str`. `.as_str()` works on `String`,
+                // `&String`, and place expressions via auto-deref.
+                format!("{path}.as_str()")
+            }
+            Shape::List(_) | Shape::ListEmpty(_) => format!("&{path}[..]"),
+            Shape::Primitive { .. }
+            | Shape::Enum { .. }
+            | Shape::Flags { .. }
+            | Shape::FixedLengthList { .. }
+            | Shape::Record { .. }
+            | Shape::Variant { .. }
+            | Shape::Map { .. } => self.value_form(path, kind),
+            // Compounds: only rebuild when some descendant needs substitution.
+            Shape::Tuple(parts) => {
+                if !self.has_sync_substitution() {
+                    return self.value_form(path, kind);
+                }
+                let sub_kind = kind.sub_path_kind();
+                let elems: Vec<String> = parts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| p.pass_expr(&format!("{path}.{i}"), sub_kind, mode))
+                    .collect();
+                format!("({})", elems.join(", "))
+            }
+            Shape::Option { inner, .. } => {
+                if !self.has_sync_substitution() {
+                    return self.value_form(path, kind);
+                }
+                // Single-shot: Option<Vec<T>> → Option<&[T]>, Option<String> → Option<&str>.
+                if matches!(inner.as_ref(), Shape::List(_) | Shape::ListEmpty(_))
+                    || matches!(inner.as_ref(),
+                        Shape::Primitive { rust_ty, .. } if *rust_ty == "String")
+                {
+                    return format!("{path}.as_deref()");
+                }
+                // Compound inner — `.as_ref().map(|x| view(x))` binds x: &Inner.
+                let inner_view = inner.pass_expr("x", PathKind::RefBinding, mode);
+                format!("{path}.as_ref().map(|x| {inner_view})")
+            }
+            Shape::Result_ { ok, err, .. } => {
+                if !self.has_sync_substitution() {
+                    return self.value_form(path, kind);
+                }
+                // match-ref binds o/e as &Inner.
+                let head = match kind {
+                    PathKind::RefBinding => path.to_string(),
+                    _ => format!("&{path}"),
+                };
+                let ok_arm = match ok {
+                    Some(o) => {
+                        format!(
+                            "Ok(o) => Ok({})",
+                            o.pass_expr("o", PathKind::RefBinding, mode)
+                        )
+                    }
+                    None => "Ok(()) => Ok(())".to_string(),
+                };
+                let err_arm = match err {
+                    Some(e) => {
+                        format!(
+                            "Err(e) => Err({})",
+                            e.pass_expr("e", PathKind::RefBinding, mode)
+                        )
+                    }
+                    None => "Err(()) => Err(())".to_string(),
+                };
+                format!("match {head} {{ {ok_arm}, {err_arm} }}")
+            }
+            Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => unreachable!(),
         }
     }
 
-    /// Mode-aware Copy-ness approximation for wit-bindgen's sync
-    /// import rules. In Sync context, `string` is passed as `&str`
-    /// (Copy); in Async context, as `String` (not). `Record` and
-    /// `Variant` branches recurse with `Async` because
-    /// `ownership: Owning` forces their internals to owned types
-    /// regardless of the outer mode.
-    fn is_copy_in(&self, mode: AsyncMode) -> bool {
+    /// Render `path` as the owned-by-value form wit-bindgen expects:
+    /// move when owned, deref when `&T` binding + Copy, place-read when
+    /// behind a ref but Copy, clone when behind a ref + non-Copy.
+    fn value_form(&self, path: &str, kind: PathKind) -> String {
+        match kind {
+            PathKind::Owned => path.to_string(),
+            PathKind::PlaceFromRef if self.is_rust_copy() => path.to_string(),
+            PathKind::RefBinding if self.is_rust_copy() => format!("*{path}"),
+            PathKind::RefBinding | PathKind::PlaceFromRef => format!("{path}.clone()"),
+        }
+    }
+
+    /// True if any descendant shape needs a sync-mode borrow
+    /// substitution (`list<T>` → `&[T]`, `string` → `&str`). When
+    /// false, the whole shape can be passed by value without rebuild.
+    /// Doesn't descend into Record / Variant fields — `ownership:
+    /// Owning` keeps those owned, so no substitution applies inside.
+    fn has_sync_substitution(&self) -> bool {
         match self {
-            Shape::Primitive { rust_ty, .. } => {
-                *rust_ty != "String" || matches!(mode, AsyncMode::Sync)
-            }
-            Shape::Option { inner, .. } => inner.is_copy_in(mode),
-            Shape::List(_) | Shape::ListEmpty(_) | Shape::Map { .. } => false,
-            // `[T; N]` impls `Copy` whenever `T: Copy` — independent of N.
-            Shape::FixedLengthList { inner, .. } => inner.is_copy_in(mode),
-            Shape::Tuple(parts) => parts.iter().all(|p| p.is_copy_in(mode)),
-            Shape::Record { fields, .. } => {
-                fields.iter().all(|(_, s)| s.is_copy_in(AsyncMode::Async))
-            }
-            Shape::Variant { cases, .. } => cases.iter().all(|c| {
-                c.payload
-                    .as_ref()
-                    .is_none_or(|s| s.is_copy_in(AsyncMode::Async))
-            }),
-            Shape::Enum { .. } | Shape::Flags { .. } => true,
+            Shape::List(_) | Shape::ListEmpty(_) => true,
+            Shape::Primitive { rust_ty, .. } => *rust_ty == "String",
+            Shape::Tuple(parts) => parts.iter().any(Self::has_sync_substitution),
+            Shape::Option { inner, .. } => inner.has_sync_substitution(),
+            Shape::FixedLengthList { inner, .. } => inner.has_sync_substitution(),
             Shape::Result_ { ok, err, .. } => {
-                ok.as_ref().is_none_or(|s| s.is_copy_in(mode))
-                    && err.as_ref().is_none_or(|s| s.is_copy_in(mode))
+                ok.as_ref().is_some_and(|s| s.has_sync_substitution())
+                    || err.as_ref().is_some_and(|s| s.has_sync_substitution())
             }
-            // Resource handles are not Copy — wit-bindgen generates a
-            // `Drop` impl that releases the underlying handle.
+            Shape::Map { key, value } => {
+                key.has_sync_substitution() || value.has_sync_substitution()
+            }
+            _ => false,
+        }
+    }
+
+    /// Real Rust `Copy`-ness — true only when the wit-bindgen-generated
+    /// Rust type actually derives `Copy`. Records and Variants are
+    /// *never* Copy regardless of fields/payloads: `ownership: Owning`
+    /// doesn't derive Copy on them. Resources have `Drop` impls.
+    fn is_rust_copy(&self) -> bool {
+        match self {
+            Shape::Primitive { rust_ty, .. } => *rust_ty != "String",
+            Shape::Enum { .. } | Shape::Flags { .. } => true,
+            Shape::Option { inner, .. } => inner.is_rust_copy(),
+            Shape::List(_) | Shape::ListEmpty(_) | Shape::Map { .. } => false,
+            Shape::FixedLengthList { inner, .. } => inner.is_rust_copy(),
+            Shape::Tuple(parts) => parts.iter().all(Self::is_rust_copy),
+            Shape::Result_ { ok, err, .. } => {
+                ok.as_ref().is_none_or(|s| s.is_rust_copy())
+                    && err.as_ref().is_none_or(|s| s.is_rust_copy())
+            }
+            Shape::Record { .. } | Shape::Variant { .. } => false,
             Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => false,
         }
     }
@@ -2656,6 +2763,56 @@ struct NominalCounters {
     flags: usize,
 }
 
+/// Per-iter generator knobs. Two flavors live here:
+///   - breadth knobs (`tuple_arity`, `fixed_list_len`) — env-overridable
+///     defaults from module constants;
+///   - toolchain-capability gates (`allow_fixed_list`, future
+///     `allow_stream` / `allow_resource` / …) — flipped by the caller
+///     per iter, e.g. when the active `AsyncMode` is incompatible with
+///     a wit-bindgen / wac-types capability.
+///
+/// Both kinds are **tree-global**: they don't change as `gen_shape`
+/// recurses (unlike `allow_nominal`, which is positional because WIT
+/// forbids nested record decls). Keeping them on a single struct
+/// avoids fan-out of bool parameters as more caps land.
+#[derive(Clone)]
+struct GenLimits {
+    tuple_arity: std::ops::RangeInclusive<usize>,
+    fixed_list_len: std::ops::RangeInclusive<u32>,
+    /// Allow `Shape::FixedLengthList` anywhere in the tree. Gated to
+    /// sync mode because wit-bindgen 0.57.1's `generate!` panics
+    /// ("not yet implemented") on `list<T, N>` under `async: true`.
+    /// See the TODO on `run_tier2_pipeline_for_shape`.
+    allow_fixed_list: bool,
+}
+
+impl Default for GenLimits {
+    fn default() -> Self {
+        Self {
+            tuple_arity: TUPLE_ARITY,
+            fixed_list_len: FIXED_LIST_LEN,
+            allow_fixed_list: true,
+        }
+    }
+}
+
+impl GenLimits {
+    /// Build limits with each upper bound overridable via env. The
+    /// lower bound stays pinned to the module constant so callers can
+    /// only widen, not invert, the range. Capability gates take their
+    /// default value — callers flip them after construction based on
+    /// the runtime context (mode, target toolchain, etc.).
+    fn from_env() -> Self {
+        let tuple_max = env_or("SPLICER_FUZZ_TUPLE_MAX", *TUPLE_ARITY.end());
+        let fixed_max = env_or("SPLICER_FUZZ_FIXED_LIST_MAX", *FIXED_LIST_LEN.end());
+        Self {
+            tuple_arity: *TUPLE_ARITY.start()..=tuple_max.max(*TUPLE_ARITY.start()),
+            fixed_list_len: *FIXED_LIST_LEN.start()..=fixed_max.max(*FIXED_LIST_LEN.start()),
+            ..Self::default()
+        }
+    }
+}
+
 impl NominalCounters {
     fn available_nominals(&self) -> Vec<NominalKind> {
         let mut v = Vec::new();
@@ -2688,23 +2845,36 @@ fn gen_shape(
     max_depth: u32,
     allow_nominal: bool,
     counters: &mut NominalCounters,
+    limits: &GenLimits,
 ) -> arbitrary::Result<Shape> {
     let can_recurse = max_depth > 0;
     let any_nominal_left = !counters.available_nominals().is_empty();
-    // 0=primitive, 1=option, 2=list, 3=tuple, 4=result, 5=nominal
-    // (Result is structural — allowed even in nominal-banned contexts —
-    // but its payloads propagate `allow_nominal=false`.)
-    let max_kind: u8 = match (can_recurse, allow_nominal, any_nominal_left) {
-        (false, _, _) => 0,
-        (true, false, _) => 4,
-        (true, true, false) => 4,
-        (true, true, true) => 5,
+    // Kinds: 0=primitive, 1=option, 2=list, 3=tuple, 4=result,
+    // 5=nominal, 6=list-empty, 7=fixed-length-list. Nominal (5) is
+    // dropped when `allow_nominal=false` (record field / variant
+    // payload) or when every name pool is exhausted. List-empty is
+    // structural — always allowed when we can recurse. Fixed-length
+    // list (7) is gated by `limits.allow_fixed_list` — see the field
+    // docs for the wit-bindgen async-mode caveat.
+    let with_fixed = limits.allow_fixed_list && can_recurse;
+    let kinds: &[u8] = match (can_recurse, allow_nominal, any_nominal_left, with_fixed) {
+        (false, _, _, _) => &[0],
+        (true, false, _, false) | (true, true, false, false) => &[0, 1, 2, 3, 4, 6],
+        (true, true, true, false) => &[0, 1, 2, 3, 4, 5, 6],
+        (true, false, _, true) | (true, true, false, true) => &[0, 1, 2, 3, 4, 6, 7],
+        (true, true, true, true) => &[0, 1, 2, 3, 4, 5, 6, 7],
     };
-    let kind: u8 = u.int_in_range(0..=max_kind)?;
+    let kind = kinds[u.int_in_range(0..=kinds.len() - 1)?];
     match kind {
         0 => pick_primitive(u),
         1 => Ok(Shape::Option {
-            inner: Box::new(gen_shape(u, max_depth - 1, allow_nominal, counters)?),
+            inner: Box::new(gen_shape(
+                u,
+                max_depth - 1,
+                allow_nominal,
+                counters,
+                limits,
+            )?),
             is_some: u.arbitrary()?,
         }),
         2 => Ok(Shape::List(Box::new(gen_shape(
@@ -2712,16 +2882,41 @@ fn gen_shape(
             max_depth - 1,
             allow_nominal,
             counters,
+            limits,
         )?))),
         3 => {
-            let n: usize = u.int_in_range(TUPLE_ARITY)?;
+            let n: usize = u.int_in_range(limits.tuple_arity.clone())?;
             let parts: arbitrary::Result<Vec<Shape>> = (0..n)
-                .map(|_| gen_shape(u, max_depth - 1, allow_nominal, counters))
+                .map(|_| gen_shape(u, max_depth - 1, allow_nominal, counters, limits))
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
-        4 => gen_result(u, max_depth, allow_nominal, counters),
-        5 => gen_nominal(u, max_depth, counters),
+        4 => gen_result(u, max_depth, allow_nominal, counters, limits),
+        5 => gen_nominal(u, max_depth, counters, limits),
+        6 => {
+            // wit-component rejects an empty `list<own<R>>` at compose
+            // time (Type mismatch). The contains_resource check
+            // degrades the draw to a regular list so we never emit
+            // that combination.
+            let inner = gen_shape(u, max_depth - 1, allow_nominal, counters, limits)?;
+            if inner.contains_resource() {
+                Ok(Shape::List(Box::new(inner)))
+            } else {
+                Ok(Shape::ListEmpty(Box::new(inner)))
+            }
+        }
+        7 => {
+            let n: u32 = u.int_in_range(limits.fixed_list_len.clone())?;
+            // TODO: harness-only gate. Consumer scaffold moves `[T; N]`
+            // by value (E0508 on non-Copy `T`). Drop once
+            // `consumer_pass_expr` learns clone-before-pass for
+            // non-Copy fixed-length arrays.
+            let inner = pick_copy_primitive(u)?;
+            Ok(Shape::FixedLengthList {
+                inner: Box::new(inner),
+                n,
+            })
+        }
         _ => unreachable!(),
     }
 }
@@ -2733,13 +2928,14 @@ fn gen_nominal(
     u: &mut arbitrary::Unstructured<'_>,
     max_depth: u32,
     counters: &mut NominalCounters,
+    limits: &GenLimits,
 ) -> arbitrary::Result<Shape> {
     let available = counters.available_nominals();
     debug_assert!(!available.is_empty());
     let pick = available[u.int_in_range(0..=available.len() - 1)?];
     match pick {
-        NominalKind::Record => gen_record(u, max_depth, counters),
-        NominalKind::Variant => gen_variant(u, max_depth, counters),
+        NominalKind::Record => gen_record(u, max_depth, counters, limits),
+        NominalKind::Variant => gen_variant(u, max_depth, counters, limits),
         NominalKind::Enum => gen_enum(u, counters),
         NominalKind::Flags => gen_flags(u, counters),
     }
@@ -2749,13 +2945,14 @@ fn gen_record(
     u: &mut arbitrary::Unstructured<'_>,
     max_depth: u32,
     counters: &mut NominalCounters,
+    limits: &GenLimits,
 ) -> arbitrary::Result<Shape> {
     let idx = counters.records;
     counters.records += 1;
     let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
     let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
         .map(|i| {
-            let fshape = gen_shape(u, max_depth - 1, false, counters)?;
+            let fshape = gen_shape(u, max_depth - 1, false, counters, limits)?;
             Ok((RECORD_FIELD_NAMES[i], fshape))
         })
         .collect();
@@ -2774,6 +2971,7 @@ fn gen_variant(
     u: &mut arbitrary::Unstructured<'_>,
     max_depth: u32,
     counters: &mut NominalCounters,
+    limits: &GenLimits,
 ) -> arbitrary::Result<Shape> {
     let idx = counters.variants;
     counters.variants += 1;
@@ -2781,7 +2979,7 @@ fn gen_variant(
     let mut cases: Vec<VariantCase> = Vec::with_capacity(n);
     for i in 0..n {
         let payload = if bool::arbitrary(u)? {
-            Some(gen_shape(u, max_depth - 1, false, counters)?)
+            Some(gen_shape(u, max_depth - 1, false, counters, limits)?)
         } else {
             None
         };
@@ -2845,6 +3043,7 @@ fn gen_result(
     max_depth: u32,
     allow_nominal: bool,
     counters: &mut NominalCounters,
+    limits: &GenLimits,
 ) -> arbitrary::Result<Shape> {
     // Each side is independently present or absent. If both absent,
     // that's a bare `result` with no payloads — legal WIT.
@@ -2854,6 +3053,7 @@ fn gen_result(
             max_depth - 1,
             allow_nominal,
             counters,
+            limits,
         )?))
     } else {
         None
@@ -2864,6 +3064,7 @@ fn gen_result(
             max_depth - 1,
             allow_nominal,
             counters,
+            limits,
         )?))
     } else {
         None
@@ -2874,6 +3075,22 @@ fn gen_result(
 
 fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
     let atoms = primitive_atoms();
+    let idx: usize = u.int_in_range(0..=atoms.len() - 1)?;
+    Ok(atoms[idx].clone())
+}
+
+/// Like `pick_primitive` but only over primitives whose Rust type is
+/// always `Copy`. Used inside FixedLengthList to keep `[T; N]` Copy —
+/// see the TODO on the kind-7 arm in `gen_shape`.
+fn pick_copy_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
+    let atoms: Vec<Shape> = primitive_atoms()
+        .into_iter()
+        .filter(Shape::is_rust_copy)
+        .collect();
+    debug_assert!(
+        !atoms.is_empty(),
+        "primitive_atoms has at least one Copy type"
+    );
     let idx: usize = u.int_in_range(0..=atoms.len() - 1)?;
     Ok(atoms[idx].clone())
 }
@@ -3137,16 +3354,57 @@ impl AfterGuest for Mdl {
 bindings::export!(Mdl with_types_in bindings);
 "#;
 
-const MIDDLEWARE_WORLD_WIT: &str = r#"package my:middleware@1.0.0;
-
-world mdl {
-    export splicer:tier1/before@0.2.0;
-    export splicer:tier1/after@0.2.0;
+/// Tier-1 middleware's `world.wit`. The exported interface names + the
+/// version come from `splicer::types::TIER1_*` (emitted by build.rs
+/// from `wit/tier1/world.wit`) so bumping the tier-1 package version
+/// propagates without manual scaffold edits.
+fn middleware_world_wit() -> String {
+    format!(
+        "package my:middleware@1.0.0;\n\
+         \n\
+         world mdl {{\n\
+             \x20   export {TIER1_BEFORE}@{TIER1_VERSION};\n\
+             \x20   export {TIER1_AFTER}@{TIER1_VERSION};\n\
+         }}\n",
+    )
 }
-"#;
 
 const MIDDLEWARE_TIER1_DEP_WIT: &str = include_str!("../wit/tier1/world.wit");
 const MIDDLEWARE_COMMON_DEP_WIT: &str = include_str!("../wit/common/world.wit");
+
+/// Filesystem dir name under `wit/deps/` for the tier-1 package — the
+/// directory name is just for filesystem layout (wit-bindgen reads the
+/// real version from the package decl inside), but keeping it in sync
+/// with the actual version avoids confusion.
+fn tier1_dep_dir() -> String {
+    format!(
+        "deps/{}/package.wit",
+        dep_dir_name(TIER1_PACKAGE, TIER1_VERSION)
+    )
+}
+
+/// Dep dir for tier-2.
+fn tier2_dep_dir() -> String {
+    format!(
+        "deps/{}/package.wit",
+        dep_dir_name(TIER2_PACKAGE, TIER2_VERSION)
+    )
+}
+
+/// Dep dir for the shared `splicer:common` package.
+fn common_dep_dir() -> String {
+    format!(
+        "deps/{}/package.wit",
+        dep_dir_name(COMMON_PACKAGE, COMMON_VERSION)
+    )
+}
+
+/// Build a `splicer-<name>-<version>` directory slug. Mirrors the form
+/// wkg / wit tooling uses for fetched dep packages.
+fn dep_dir_name(pkg: &str, version: &str) -> String {
+    let slug = pkg.replace(':', "-");
+    format!("{slug}-{version}")
+}
 
 // ─── Tier-2 middleware fixture (used by `test_tier2_smoke`) ───────
 //
@@ -3303,13 +3561,18 @@ impl AfterGuest for Mdl {
 bindings::export!(Mdl with_types_in bindings);
 "#;
 
-const MIDDLEWARE_TIER2_WORLD_WIT: &str = r#"package my:middleware-tier2@1.0.0;
-
-world tier2-mdl {
-    export splicer:tier2/before@0.1.0;
-    export splicer:tier2/after@0.1.0;
+/// Tier-2 middleware's `world.wit`, version-stitched from the build.rs
+/// `TIER2_*` consts the same way the tier-1 helper above is.
+fn middleware_tier2_world_wit() -> String {
+    format!(
+        "package my:middleware-tier2@1.0.0;\n\
+         \n\
+         world tier2-mdl {{\n\
+             \x20   export {TIER2_BEFORE}@{TIER2_VERSION};\n\
+             \x20   export {TIER2_AFTER}@{TIER2_VERSION};\n\
+         }}\n",
+    )
 }
-"#;
 
 const MIDDLEWARE_TIER2_DEP_WIT: &str = include_str!("../wit/tier2/world.wit");
 
@@ -3861,21 +4124,18 @@ fn scaffold_tier2_workspace() -> Tier2Workspace {
         &[],
     )
     .expect("consumer scaffold");
+    let world_wit = middleware_tier2_world_wit();
+    let tier2_dep = tier2_dep_dir();
+    let common_dep = common_dep_dir();
     write_crate(
         root,
         "middleware",
         MIDDLEWARE_CARGO_TOML,
         MIDDLEWARE_TIER2_LIB_RS,
         &[
-            ("world.wit", MIDDLEWARE_TIER2_WORLD_WIT),
-            (
-                "deps/splicer-tier2-0.1.0/package.wit",
-                MIDDLEWARE_TIER2_DEP_WIT,
-            ),
-            (
-                "deps/splicer-common-0.1.0/package.wit",
-                MIDDLEWARE_COMMON_DEP_WIT,
-            ),
+            ("world.wit", world_wit.as_str()),
+            (tier2_dep.as_str(), MIDDLEWARE_TIER2_DEP_WIT),
+            (common_dep.as_str(), MIDDLEWARE_COMMON_DEP_WIT),
         ],
     )
     .expect("tier-2 middleware scaffold");
@@ -3891,6 +4151,11 @@ fn scaffold_tier2_workspace() -> Tier2Workspace {
 /// wasmtime so callers can pin whatever markers they need.
 fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> String {
     let root = workspace.root.as_path();
+    // TODO: pinned to sync — wit-bindgen 0.57.1's `generate!` with
+    // `async: true` panics ("not yet implemented") on every
+    // `list<T, N>` shape, top-level or nested. Flip to looping
+    // `ALL_ASYNC_MODES` once wit-bindgen supports fixed-length lists
+    // under async-mode bindings.
     let mode = AsyncMode::Sync;
     write_per_shape_files(root, shape, mode).expect("write shape files");
 
@@ -4118,10 +4383,12 @@ const ALL_ASYNC_MODES: &[AsyncMode] = &[AsyncMode::Sync, AsyncMode::Async];
 /// iteration rebuilds the provider crate, so a handful of iters is a
 /// minute of work.
 ///
-/// Env vars override the `DEFAULT_FUZZ_*` constants:
-///   SPLICER_FUZZ_SEED   — base u64 seed (default: `DEFAULT_FUZZ_SEED`)
-///   SPLICER_FUZZ_ITERS  — iterations to run
-///   SPLICER_FUZZ_DEPTH  — max recursion depth per shape
+/// Env vars override the `DEFAULT_FUZZ_*` / module-level constants:
+///   SPLICER_FUZZ_SEED            — base u64 seed (default: `DEFAULT_FUZZ_SEED`)
+///   SPLICER_FUZZ_ITERS           — iterations to run
+///   SPLICER_FUZZ_DEPTH           — max recursion depth per shape
+///   SPLICER_FUZZ_TUPLE_MAX       — max generated tuple arity (lower bound stays at `TUPLE_ARITY.start()`)
+///   SPLICER_FUZZ_FIXED_LIST_MAX  — max generated `list<T, N>` length
 ///
 /// Each iteration uses `base_seed.wrapping_add(iter_idx)` so any
 /// failure can be replayed with `SPLICER_FUZZ_SEED=<iter_seed> \
@@ -4136,8 +4403,13 @@ fn test_fuzz() {
     let base_seed: u64 = env_or("SPLICER_FUZZ_SEED", DEFAULT_FUZZ_SEED);
     let iters: u32 = env_or("SPLICER_FUZZ_ITERS", DEFAULT_FUZZ_ITERS);
     let max_depth: u32 = env_or("SPLICER_FUZZ_DEPTH", DEFAULT_FUZZ_DEPTH);
+    let limits = GenLimits::from_env();
 
-    eprintln!("fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth}");
+    eprintln!(
+        "fuzz: iters={iters} base_seed={base_seed} max_depth={max_depth} \
+         tuple_arity={:?} fixed_list_len={:?}",
+        limits.tuple_arity, limits.fixed_list_len,
+    );
 
     let tmp = tempfile::tempdir().expect("mktempdir");
     let root_buf = tmp.path().to_path_buf();
@@ -4166,6 +4438,14 @@ fn test_fuzz() {
         eprintln!("\n### mode: {mode_tag} ###");
         scaffold_common(root, mode).expect("scaffold common");
 
+        // Mode-derived capability gates layered on top of the env
+        // defaults. Today this is just `allow_fixed_list`; future caps
+        // (streams/futures/resources) flip the same way.
+        let iter_limits = GenLimits {
+            allow_fixed_list: matches!(mode, AsyncMode::Sync) && limits.allow_fixed_list,
+            ..limits.clone()
+        };
+
         for i in 0..iters {
             total_runs += 1;
             run_idx += 1;
@@ -4174,7 +4454,7 @@ fn test_fuzz() {
             let mut u = arbitrary::Unstructured::new(&buf);
 
             let mut counters = NominalCounters::default();
-            let shape = match gen_shape(&mut u, max_depth, true, &mut counters) {
+            let shape = match gen_shape(&mut u, max_depth, true, &mut counters, &iter_limits) {
                 Ok(s) => s,
                 Err(e) => {
                     failures.push(format!(
@@ -4671,21 +4951,18 @@ fn scaffold_common(root: &Path, _mode: AsyncMode) -> std::io::Result<()> {
         "// placeholder\n",
         &[],
     )?;
+    let world_wit = middleware_world_wit();
+    let tier1_dep = tier1_dep_dir();
+    let common_dep = common_dep_dir();
     write_crate(
         root,
         "middleware",
         MIDDLEWARE_CARGO_TOML,
         MIDDLEWARE_LIB_RS,
         &[
-            ("world.wit", MIDDLEWARE_WORLD_WIT),
-            (
-                "deps/splicer-tier1-0.2.0/package.wit",
-                MIDDLEWARE_TIER1_DEP_WIT,
-            ),
-            (
-                "deps/splicer-common-0.1.0/package.wit",
-                MIDDLEWARE_COMMON_DEP_WIT,
-            ),
+            ("world.wit", world_wit.as_str()),
+            (tier1_dep.as_str(), MIDDLEWARE_TIER1_DEP_WIT),
+            (common_dep.as_str(), MIDDLEWARE_COMMON_DEP_WIT),
         ],
     )?;
     Ok(())
