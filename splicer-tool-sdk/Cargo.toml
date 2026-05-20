@@ -11,3 +11,6 @@ keywords = ["wasm", "WebAssembly", "components", "splicer"]
 categories = ["wasm"]
 
 [workspace]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -12,9 +12,11 @@
 //! See the crate-root `README.md` for the full `with:` boilerplate.
 
 pub mod format;
+pub mod strategy;
 pub mod types;
 
 pub use format::{cell_to_str, format_field_tree};
+pub use strategy::WrapperStrategy;
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };
