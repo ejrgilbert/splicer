@@ -1037,7 +1037,9 @@ fn build_per_edge_providers(
     splits_path: &str,
 ) -> anyhow::Result<Vec<Injection>> {
     let splits_dir = std::path::Path::new(splits_path);
-    let edge_suffix = crate::edge_id::sanitize_for_filename(edge_id);
+    // Suffix flows into `my:<name>` package keys, so it must be a
+    // valid WAC identifier
+    let edge_suffix = sanitize_wac_id(edge_id);
     inject
         .iter()
         .map(|inj| {
@@ -1681,20 +1683,19 @@ fn disambiguated_var(counts: &mut HashMap<String, usize>, pkg: &str) -> String {
 /// Convert an arbitrary node label into a valid WAC kebab-case identifier.
 ///
 /// Node names in pre-composed binaries often look like `my:service/foo-shim`
-/// (a WIT package path). WAC identifiers are `word ("-" word)*` where each
-/// `word` is `[a-z][a-z0-9]* | [A-Z][A-Z0-9]*` — i.e. each hyphen-separated
-/// segment must start with a letter. We replace every invalid character with
-/// `-`, strip a leading `my-` that would otherwise double the namespace
-/// prefix into `my:my-…`, and prefix any digit-leading segment with `v` so
-/// version numbers like `1.0.0` (which sanitize to `-1-0-0`) don't produce
-/// invalid `1`/`0` word segments.
+/// `v`-prefixes digit-leading segments and strips a redundant `my-`
+/// to avoid the eventual `my:my-...` package name.
 fn sanitize_wac_id(raw: &str) -> String {
-    let sanitized = raw.replace([':', '/', '.', '_', '@'], "-");
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     let stripped = sanitized
         .strip_prefix(&format!("{INST_PREFIX}-"))
         .unwrap_or(&sanitized);
     stripped
         .split('-')
+        .filter(|s| !s.is_empty())
         .map(|seg| match seg.chars().next() {
             Some(c) if c.is_ascii_digit() => format!("v{seg}"),
             _ => seg.to_string(),
