@@ -495,7 +495,9 @@ pub(crate) fn build_lower_params_to_memory(
     let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
     let field_offsets = sizes.field_offsets(&param_types);
 
-    // Concatenate every param's flat wasm-locals in canonical order.
+    // Total flat-width across all params. The wrapper's first
+    // `total_flat_count` wasm locals are these flat params, in
+    // canonical order — the lower-mode bindgen invariant.
     // `flat_types(...)` panic only fires if `is_primitive_param_ty` is
     // widened without re-bounding flat width; primitives flatten to
     // one slot each, far below `MAX_FLAT_PARAMS`.
@@ -507,11 +509,10 @@ pub(crate) fn build_lower_params_to_memory(
                 .len() as u32
         })
         .sum();
-    let all_flat_locals: Vec<u32> = (0..total_flat_count).collect();
 
     let addr_local = indices.alloc_local(wasm_encoder::ValType::I32);
     let mut bg = super::WasmEncoderBindgen::new(sizes, addr_local, indices)
-        .with_param_flat_locals(all_flat_locals);
+        .with_param_flat_count(total_flat_count);
 
     for ((field_off, _field_size), ty) in field_offsets.iter().zip(&param_types) {
         // Both addends are bounded by each tier's LAYOUT_SIZE_BUDGET
