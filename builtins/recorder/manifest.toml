@@ -5,7 +5,7 @@ description = "Record every wrapped call's lifted args + result as a binary stre
 name = "sink"
 type = "enum { stdout, stderr, file }"
 case_insensitive = true
-default = "stdout"
+default = "file"
 doc = "Where binary frames are written. `file` opens `<preopen>/<dir>/<edge_id>.bin` and is the only safe choice when more than one recorder is spliced into the same composition. `stdout`/`stderr` share one stream so multiple recorders interleave and can't be demultiplexed; use them for single-instance debugging only."
 
 [[key]]
