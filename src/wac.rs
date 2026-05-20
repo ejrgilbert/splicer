@@ -1025,6 +1025,33 @@ struct RuleApplyResult {
     full_match: bool,
 }
 
+/// For injections whose builtin imports `splicer:builtin-config`,
+/// clone each with an edge-uniquified `name` and emit a per-edge
+/// `<name>-config.wasm` stamped with the resolved `edge_id`.
+/// Injections without a config provider pass through unchanged.
+/// Callers feed the returned vec to `add_to_inject_plan` so each
+/// physical edge gets its own WAC instance + provider.
+fn build_per_edge_providers(
+    inject: &[Injection],
+    edge_id: &str,
+    splits_path: &str,
+) -> anyhow::Result<Vec<Injection>> {
+    let splits_dir = std::path::Path::new(splits_path);
+    let edge_suffix = crate::edge_id::sanitize_for_filename(edge_id);
+    inject
+        .iter()
+        .map(|inj| {
+            if inj.config_as_wave.is_none() {
+                return Ok(inj.clone());
+            }
+            let mut clone = inj.clone();
+            clone.name = format!("{}-{edge_suffix}", inj.name);
+            crate::config_provider::build_provider_for_edge(&mut clone, edge_id, splits_dir)?;
+            Ok(clone)
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_rule_between(
     rule: &SpliceRule,
@@ -1058,6 +1085,9 @@ fn apply_rule_between(
             interface_matched = true;
             if *inner_name == inner_var && *outer_name == outer_var {
                 full_match = true;
+                let edge_id =
+                    crate::edge_id::derive_edge_id(interface, Some(&outer_var), &inner_var);
+                let edge_inject = build_per_edge_providers(inject, &edge_id, ctx.splits_path)?;
                 let new_aliases = vec![
                     (inner_id, inner_alias.clone()),
                     (outer_id, outer_alias.clone()),
@@ -1070,7 +1100,7 @@ fn apply_rule_between(
                 );
                 contract_results.extend(add_to_inject_plan(
                     interface,
-                    inject,
+                    &edge_inject,
                     i + 1,
                     &new_aliases,
                     &mut chain.aliases,
@@ -1118,6 +1148,18 @@ fn apply_rule_before(
                 }
             }
             full_match = true;
+            let provider_var = get_name(outer_node).to_string();
+            // Caller name comes from the next position toward the
+            // consumer side of the chain; `None` when this match is
+            // the outermost chain position (boundary edge — caller
+            // is external to the composition).
+            let caller_var = chain
+                .chain
+                .get(i + 1)
+                .map(|caller_id| get_name(&ctx.composition.nodes[caller_id]).to_string());
+            let edge_id =
+                crate::edge_id::derive_edge_id(interface, caller_var.as_deref(), &provider_var);
+            let edge_inject = build_per_edge_providers(inject, &edge_id, ctx.splits_path)?;
             let new_aliases = vec![(*id, provider_alias.clone())];
             // Prefer the consumer's split (i+1) so the adapter copies
             // its import surface. At the outermost chain position
@@ -1131,7 +1173,7 @@ fn apply_rule_before(
                 });
             contract_results.extend(add_to_inject_plan(
                 interface,
-                inject,
+                &edge_inject,
                 i + 1,
                 &new_aliases,
                 &mut chain.aliases,
@@ -1796,6 +1838,7 @@ mod tests {
             path: Some("/tmp/metrics.wasm".to_string()),
             builtin: Some("otel-bare-metrics".to_string()),
             builtin_config: Default::default(),
+            config_as_wave: None,
             config_provider_path: Some(cfg_path.clone()),
             adapter_info: Some(AdapterInjectionInfo {
                 adapter_path,
@@ -1857,6 +1900,7 @@ mod tests {
             path: Some("/tmp/hello.wasm".to_string()),
             builtin: Some("hello-tier1".to_string()),
             builtin_config: Default::default(),
+            config_as_wave: None,
             config_provider_path: None,
             adapter_info: Some(AdapterInjectionInfo {
                 adapter_path,
@@ -1962,6 +2006,7 @@ mod tests {
                 path: None,
                 builtin: None,
                 builtin_config: Default::default(),
+                config_as_wave: None,
                 config_provider_path: None,
                 adapter_info: None,
                 tier: None,

@@ -346,8 +346,10 @@ fn materialize_tier1_2_builtins(
                 .to_string();
             inj.path = Some(path_str);
 
-            // No-op for builtins that don't import the substrate.
-            crate::config_provider::ensure_provider_for(inj, splits_dir)?;
+            // Validate config against the manifest now (we have the
+            // bytes); the per-edge provider wasm is emitted later in
+            // wac.rs once the chain walk has resolved an edge_id.
+            crate::config_provider::validate_config_as_wave(inj)?;
         }
     }
     Ok(())
@@ -570,6 +572,7 @@ rules:
                 path: None,
                 builtin: Some("does-not-exist".into()),
                 builtin_config: Default::default(),
+                config_as_wave: None,
                 config_provider_path: None,
                 adapter_info: None,
                 tier: None,

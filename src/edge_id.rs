@@ -2,10 +2,10 @@
 //! `{interface}::{caller}->{provider}`, or `{interface}::->{provider}`
 //! at the composition boundary.
 
-/// Reserved substrate key under which splicer publishes the edge_id
-/// into every substrate-importing builtin. The single-underscore
-/// prefix marks it as splicer-internal — user manifests can never
-/// declare keys with this prefix.
+/// Reserved key splicer publishes into every builtin that imports
+/// `splicer:builtin-config`. The single-underscore prefix marks it as
+/// splicer-internal — user manifests can never declare keys with this
+/// prefix.
 pub const EDGE_ID_CONFIG_KEY: &str = "_splicer_edge_id";
 
 /// Canonical edge_id for an `interface` edge from `from` (the caller)
@@ -84,10 +84,7 @@ mod tests {
                 "unexpected char {c:?} in {out}"
             );
         }
-        assert_eq!(
-            out,
-            "wasi_http_handler@0.3.0-rc-2026-01-06__srv-b-_srv-a",
-        );
+        assert_eq!(out, "wasi_http_handler@0.3.0-rc-2026-01-06__srv-b-_srv-a",);
     }
 
     #[test]
