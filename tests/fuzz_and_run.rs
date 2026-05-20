@@ -38,6 +38,7 @@ use splicer::{compose, splice, ComponentInput, ComposeRequest, SpliceRequest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 
 /// Matches the CLI default so generated WAC is byte-identical to
 /// what `splicer compose` / `splicer splice` emit.
@@ -76,8 +77,12 @@ const GEN_FLAGS_RUST_NAMES: &[&str] = &["Fl0", "Fl1", "Fl2", "Fl3"];
 /// Capped at 8 to stay within wit-bindgen's single-byte flat-rep bucket.
 const GEN_FLAGS_WIT_FLAG_NAMES: &[&str] = &["fa", "fb", "fc", "fd", "fe", "ff", "fg", "fh"];
 const GEN_FLAGS_RUST_FLAG_NAMES: &[&str] = &["FA", "FB", "FC", "FD", "FE", "FF", "FG", "FH"];
-/// In-memory stdout buffer for captured guest output (1 MiB).
-const STDOUT_CAPTURE_BYTES: usize = 1 << 20;
+/// In-memory cap for captured guest stdout. Deep nested shapes plus
+/// dual-side `{r:?}` prints plus tier-2 trace markers add up; 8 MiB
+/// leaves headroom for everything `tier2_shapes()` exercises today.
+/// `invoke_run` asserts the buffer wasn't truncated so a marker miss
+/// fails loudly rather than as a confusing substring-not-found panic.
+const STDOUT_CAPTURE_BYTES: usize = 8 << 20;
 
 // ─── Shape definitions ────────────────────────────────────────────
 //
@@ -2617,20 +2622,10 @@ impl GenLimits {
     }
 }
 
-/// Which middleware tier the active fuzz iter targets.
-#[derive(Clone, Copy)]
-enum Tier {
-    Tier1,
-    Tier2,
-}
-
-/// Per-iter toolchain capability gates. Each flag records whether a
-/// given wit feature can be drawn for this (tier, mode) combination —
-/// some are blocked by external limitations (wit-bindgen, wac-types),
-/// others are simply not wired into the generator yet.
-///
-/// Build via [`GenSupport::for_tier_mode`]; never construct directly
-/// so the rule table stays the single source of truth.
+/// Per-iter toolchain capability gates. Build via
+/// [`GenSupport::for_mode`]; never construct directly so the rule
+/// table stays the single source of truth. Add a `Tier` parameter
+/// when the first tier-specific rule lands.
 #[derive(Clone, Copy)]
 struct GenSupport {
     /// `list<T, N>` — wit-bindgen 0.57.1 panics ("not yet implemented")
@@ -2657,10 +2652,7 @@ struct GenSupport {
 }
 
 impl GenSupport {
-    /// Encode the rule table in one place. Adding a new feature is a
-    /// matter of flipping a flag here, not editing the generator
-    /// dispatch.
-    fn for_tier_mode(_tier: Tier, mode: AsyncMode) -> Self {
+    fn for_mode(mode: AsyncMode) -> Self {
         Self {
             fixed_length_lists: matches!(mode, AsyncMode::Sync),
             maps: false,
@@ -2936,25 +2928,32 @@ fn gen_result(
     Ok(Shape::Result_ { ok, err, is_ok })
 }
 
+// Cache the primitive pool + Copy-only subset — `gen_shape` draws
+// hundreds of primitives per iter, and re-allocating these per draw
+// was the biggest avoidable cost in the in-process generator.
+static PRIMITIVE_ATOMS: LazyLock<Vec<Shape>> = LazyLock::new(primitive_atoms);
+static COPY_PRIMITIVE_ATOMS: LazyLock<Vec<Shape>> = LazyLock::new(|| {
+    PRIMITIVE_ATOMS
+        .iter()
+        .filter(|s| s.is_rust_copy())
+        .cloned()
+        .collect()
+});
+
 fn pick_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
-    let atoms = primitive_atoms();
-    let idx: usize = u.int_in_range(0..=atoms.len() - 1)?;
-    Ok(atoms[idx].clone())
+    let idx: usize = u.int_in_range(0..=PRIMITIVE_ATOMS.len() - 1)?;
+    Ok(PRIMITIVE_ATOMS[idx].clone())
 }
 
 /// Copy-only subset of `pick_primitive` — keeps `[T; N]` Copy under
 /// FixedLengthList. See the TODO on `gen_shape`'s kind-7 arm.
 fn pick_copy_primitive(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Shape> {
-    let atoms: Vec<Shape> = primitive_atoms()
-        .into_iter()
-        .filter(Shape::is_rust_copy)
-        .collect();
     debug_assert!(
-        !atoms.is_empty(),
+        !COPY_PRIMITIVE_ATOMS.is_empty(),
         "primitive_atoms has at least one Copy type"
     );
-    let idx: usize = u.int_in_range(0..=atoms.len() - 1)?;
-    Ok(atoms[idx].clone())
+    let idx: usize = u.int_in_range(0..=COPY_PRIMITIVE_ATOMS.len() - 1)?;
+    Ok(COPY_PRIMITIVE_ATOMS[idx].clone())
 }
 
 /// Deterministic LCG so a failing iter is replayable via
@@ -3606,10 +3605,9 @@ fn provider_lib_rs_resource(shape: &Shape, mode: AsyncMode) -> String {
         .iter()
         .map(|(_, r)| {
             format!(
-                "struct {r}Impl;\n\nimpl GuestCat_ for {r}Impl {{\n    \
+                "struct {r}Impl;\n\nimpl Guest{r} for {r}Impl {{\n    \
                  {prefix}fn new() -> Self {{ {r}Impl }}\n}}\n"
             )
-            .replace("GuestCat_", &format!("Guest{r}"))
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -3633,20 +3631,16 @@ fn provider_lib_rs_resource(shape: &Shape, mode: AsyncMode) -> String {
         format!(
             "{prefix}fn foo(x: {path}::{rust_name}Borrow<'_>) {{\n        \
              let _ = x;\n        \
-             {received}\n    \
+             {received_print}\n    \
              }}",
-            prefix = mode.rust_prefix(),
-            received = received_print,
         )
     } else {
         let ty = shape.rust_ty(BindingsSide::Provider);
         format!(
             "{prefix}fn foo(x: {ty}) -> {ty} {{\n        \
-             {received}\n        \
+             {received_print}\n        \
              x\n    \
              }}",
-            prefix = mode.rust_prefix(),
-            received = received_print,
         )
     };
 
@@ -3869,9 +3863,12 @@ struct Tier2Workspace {
 fn scaffold_tier2_workspace() -> Tier2Workspace {
     let tmp = tempfile::tempdir().expect("mktempdir");
     let root_buf = tmp.path().to_path_buf();
-    let _kept = std::env::var("SPLICER_KEEP_TMPDIR").is_ok();
-    let tmp_to_keep = if _kept {
+    // SPLICER_KEEP_TMPDIR=1 disables auto-cleanup; use `mem::forget`
+    // (not `None`) so the TempDir's Drop doesn't delete the dir at
+    // end of this function.
+    let tmp_to_keep = if std::env::var("SPLICER_KEEP_TMPDIR").is_ok() {
         eprintln!("(keeping tmpdir: {})", root_buf.display());
+        std::mem::forget(tmp);
         None
     } else {
         Some(tmp)
@@ -3989,16 +3986,24 @@ fn run_tier2_pipeline_for_shape(
 }
 
 /// Expected `args=[…]` substring; `None` for unrenderable shapes.
-/// Returns the wrapped form so handle shapes can omit the closing `]`
-/// past the runtime-varying `id`.
 fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
-    let inner = predict_tier2_arg_inner(shape)?;
-    // A trailing `,` marks a resource-handle anchor — runtime appends
-    // ` id=N))…]`. Skip the closing `]` so substring match works.
+    Some(wrap_anchored(
+        "args=[x: ",
+        &predict_tier2_arg_inner(shape)?,
+        "]",
+    ))
+}
+
+/// Wrap `inner` with `open`/`close`, except: if `inner` ends in `,`,
+/// drop `close`. That's the resource-handle anchor — predictions for
+/// `own<R>` / `borrow<R>` end with `resource-handle({wit_name},` so
+/// the runtime's ` id=N))…` suffix can be matched permissively by
+/// `contains`. Mid-`inner` resources still aren't substring-matchable.
+fn wrap_anchored(open: &str, inner: &str, close: &str) -> String {
     if inner.ends_with(',') {
-        Some(format!("args=[x: {inner}"))
+        format!("{open}{inner}")
     } else {
-        Some(format!("args=[x: {inner}]"))
+        format!("{open}{inner}{close}")
     }
 }
 
@@ -4070,12 +4075,13 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
         } => {
             let case = cases.get(*selected)?;
             let payload = match &case.payload {
-                Some(p) => format!("some({})", predict_tier2_arg_inner(p)?),
+                Some(p) => wrap_anchored("some(", &predict_tier2_arg_inner(p)?, ")"),
                 None => "none".to_string(),
             };
-            Some(format!(
-                "variant-case({wit_name}::{}, {payload})",
-                case.wit_name
+            Some(wrap_anchored(
+                &format!("variant-case({wit_name}::{}, ", case.wit_name),
+                &payload,
+                ")",
             ))
         }
         Shape::Record {
@@ -4088,43 +4094,44 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                     Some(format!("{fname}: {inner}"))
                 })
                 .collect::<Option<_>>()?;
-            Some(format!("record({wit_name} {{ {} }})", parts.join(", ")))
+            Some(wrap_anchored(
+                &format!("record({wit_name} {{ "),
+                &parts.join(", "),
+                " })",
+            ))
         }
         Shape::Tuple(elems) => {
             let parts: Vec<String> = elems
                 .iter()
                 .map(predict_tier2_arg_inner)
                 .collect::<Option<_>>()?;
-            Some(format!("tuple({})", parts.join(", ")))
+            Some(wrap_anchored("tuple(", &parts.join(", "), ")"))
         }
         // Map desugars to list-of-tuple in the cell tree.
         Shape::Map { key, value } => {
             let k = predict_tier2_arg_inner(key)?;
             let v = predict_tier2_arg_inner(value)?;
-            Some(format!("list(tuple({k}, {v}))"))
+            Some(wrap_anchored("list(tuple(", &format!("{k}, {v}"), "))"))
         }
-        // `vec![<one literal>]` from `Shape::List`'s rust_literal — one
-        // child cell. Trailing `,` from a resource-handle anchor drops
-        // the closing paren (see `predict_tier2_args_marker`).
-        Shape::List(inner) => {
-            let elem = predict_tier2_arg_inner(inner)?;
-            if elem.ends_with(',') {
-                Some(format!("list({elem}"))
-            } else {
-                Some(format!("list({elem})"))
-            }
-        }
+        Shape::List(inner) => Some(wrap_anchored(
+            "list(",
+            &predict_tier2_arg_inner(inner)?,
+            ")",
+        )),
         Shape::ListEmpty(_) => Some("list()".to_string()),
         // `list<T, N>` lowers to `Cell::TupleOf` with N homogeneous children.
         Shape::FixedLengthList { inner, n } => {
             let elem = predict_tier2_arg_inner(inner)?;
             let parts: Vec<String> = (0..*n as usize).map(|_| elem.clone()).collect();
-            Some(format!("tuple({})", parts.join(", ")))
+            Some(wrap_anchored("tuple(", &parts.join(", "), ")"))
         }
         Shape::Option { inner, is_some } => {
             if *is_some {
-                let inner_render = predict_tier2_arg_inner(inner)?;
-                Some(format!("option-some({inner_render})"))
+                Some(wrap_anchored(
+                    "option-some(",
+                    &predict_tier2_arg_inner(inner)?,
+                    ")",
+                ))
             } else {
                 Some("option-none".to_string())
             }
@@ -4136,10 +4143,10 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 ("result-err", err)
             };
             let payload_render = match arm_shape.as_ref() {
-                Some(s) => format!("some({})", predict_tier2_arg_inner(s)?),
+                Some(s) => wrap_anchored("some(", &predict_tier2_arg_inner(s)?, ")"),
                 None => "none".to_string(),
             };
-            Some(format!("{arm_name}({payload_render})"))
+            Some(wrap_anchored(&format!("{arm_name}("), &payload_render, ")"))
         }
         // Trailing `,` is the permissive anchor — runtime appends
         // ` id=N))` which `contains` matches past.
@@ -4206,7 +4213,7 @@ fn test_tier1_fuzz() {
         eprintln!("\n### mode: {mode_tag} ###");
         scaffold_common(root, mode).expect("scaffold common");
 
-        let support = GenSupport::for_tier_mode(Tier::Tier1, mode);
+        let support = GenSupport::for_mode(mode);
 
         for i in 0..iters {
             total_runs += 1;
@@ -4247,7 +4254,7 @@ fn test_tier1_fuzz() {
                         "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: expected-bail ({})",
                         msg.lines().next().unwrap_or(&msg)
                     );
-                } else if is_harness_bail(&msg, mode) {
+                } else if is_harness_bail(&msg) {
                     harness_bails += 1;
                     eprintln!(
                         "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: harness-bail ({})",
@@ -4311,7 +4318,7 @@ fn test_tier2_fuzz() {
     for &mode in ALL_ASYNC_MODES {
         let mode_tag = mode.tag();
         eprintln!("\n### mode: {mode_tag} ###");
-        let support = GenSupport::for_tier_mode(Tier::Tier2, mode);
+        let support = GenSupport::for_mode(mode);
 
         for i in 0..iters {
             total_runs += 1;
@@ -4341,7 +4348,7 @@ fn test_tier2_fuzz() {
             }));
             if let Err(panic) = result {
                 let msg = panic_msg(&*panic);
-                if is_harness_bail(&msg, mode) {
+                if is_harness_bail(&msg) {
                     harness_bails += 1;
                     eprintln!(
                         "iter {i} seed {iter_seed} mode {mode_tag} shape `{shape_name}`: harness-bail ({})",
@@ -4674,6 +4681,14 @@ fn invoke_run(bytes: &[u8]) -> anyhow::Result<String> {
     })?;
 
     let bytes = stdout_pipe.contents();
+    // `MemoryOutputPipe` silently drops bytes past the cap. Surface
+    // that as a clean failure so a missing marker isn't blamed on a
+    // truncated trace.
+    anyhow::ensure!(
+        bytes.len() < STDOUT_CAPTURE_BYTES,
+        "captured stdout filled the {STDOUT_CAPTURE_BYTES}-byte cap; \
+         later trace bytes were dropped — bump `STDOUT_CAPTURE_BYTES`",
+    );
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -4727,7 +4742,7 @@ fn is_expected_bail(msg: &str) -> bool {
 /// Cargo-build failures = harness/wit-bindgen mismatch, not splicer.
 /// Splicer only runs after the components compile, so any rustc
 /// error is upstream.
-fn is_harness_bail(msg: &str, _mode: AsyncMode) -> bool {
+fn is_harness_bail(msg: &str) -> bool {
     msg.contains("cargo build: exit")
 }
 
