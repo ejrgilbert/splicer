@@ -12,5 +12,8 @@ categories = ["wasm"]
 
 [workspace]
 
+[dependencies]
+splicer-tool-sdk-derive = { version = "0.1.0", path = "../splicer-tool-sdk-derive" }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

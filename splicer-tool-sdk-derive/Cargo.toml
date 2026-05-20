@@ -1,0 +1,19 @@
+[package]
+name = "splicer-tool-sdk-derive"
+version = "0.1.0"
+edition = "2021"
+authors = ["Elizabeth Gilbert"]
+description = "Derive macros for splicer-tool-sdk. Re-exported from `splicer-tool-sdk`; depend on that crate, not this one."
+license = "Apache-2.0"
+repository = "https://github.com/ejrgilbert/splicer"
+
+[lib]
+proc-macro = true
+
+[workspace]
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+heck = "0.5"

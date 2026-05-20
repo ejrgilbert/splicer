@@ -17,6 +17,11 @@ pub mod typed_from_cells;
 pub mod types;
 
 pub use format::{cell_to_str, format_field_tree};
+// Both the trait and the derive macro are exposed at this path:
+// trait in the type namespace, derive macro in the macro namespace,
+// so the two re-exports do not collide. Same trick serde uses for
+// `serde::Deserialize`.
+pub use splicer_tool_sdk_derive::TypedFromCells;
 pub use strategy::WrapperStrategy;
 pub use typed_from_cells::{FromCellsError, FromCellsResult, TypedFromCells};
 pub use types::{
