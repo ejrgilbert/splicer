@@ -80,8 +80,8 @@ is already specced in the multi-edge doc; no design negotiation needed.
   `src/adapter/typed/matrix_tests.rs` with sync `func` fixtures so both paths
   are exercised.
 
-No Phase 3 — Phase 1's Stream C scopes `between_subgraph`, and Phase 2
-picks up the rest.
+Skipped Phase 3 — Phase 1's Stream C already covered `between_subgraph`,
+and Phase 2 picks up the rest.
 
 ## Phase 4: record + replay loop (2-3 weeks)
 

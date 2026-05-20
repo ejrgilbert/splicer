@@ -233,8 +233,15 @@ work in the same splice config. Apply `redact-strings` to every
 `wasi:http/handler` edge via per-interface targeting (`before` /
 `between`), and apply `record` to the billing subgraph's boundary via
 `between_subgraph` in the same YAML. Different rules, different
-mechanics, both valid. The substrate handles both uniformly because
-both reduce to "wire wrappers on some set of edges."
+mechanics, both valid. The substrate handles both uniformly because both
+reduce to "wire wrappers on some set of edges."
+
+**Sequencing.** The substrate doc's v1 ship presupposes recorder doc
+steps 2-5 (edge_id auto-injection, file-sink, `on_edge` selector,
+`splicer edges` CLI). v1 step 5 (`record`) and step 6 (`replay`,
+value-typed) of *this* doc correspond to recorder doc step 7
+(replayer as tier-4 virtualize). `between_subgraph` (recorder doc
+step 6) is the prerequisite for the differential-testing capstone.
 
 ## Use cases that drop out of the substrate
 
@@ -251,14 +258,19 @@ version-B's outbound calls; compare the version-B outbound trace to
 the version-A outbound trace. Differences flag behavioral regressions
 introduced by the refactor.
 
-**Pieces reused:** `between_subgraph` selector, recorder writing cells
-keyed by `edge_id`, value-typed replayer driving the subgraph with
-recorded inbound inputs.
+**Pieces reused:** `between_subgraph` selector (recorder doc step 6),
+recorder writing cells keyed by `edge_id`, value-typed replayer driving
+the subgraph with recorded inbound inputs (recorder doc step 7).
 
 **Pieces new:** a cells **trace diff** (read two cells streams in
 parallel, compare call-by-call, report differences with paths into the
 cell trees). Implemented as a library in `splicer-tool-sdk` plus a CLI
 surface (`splicer trace diff <old.cells> <new.cells>`).
+
+**Roadmap slot:** after recorder doc step 7 (replayer) and substrate
+doc step 6 (value-typed replay) land. Drops out cheaply because the
+heavy machinery is already shipped; the diff itself is tens to
+low-hundreds of lines.
 
 **Why this is a high-value demo:** "refactor this subsystem and prove
 the boundary contract did not change" is a concrete pain point that

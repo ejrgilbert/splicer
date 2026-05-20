@@ -138,7 +138,7 @@ logic, or the encode/decode contracts.
 | 4    | `on_edge: "<id>"` YAML selector. Splicer enumerates composition edges, derives ids, matches against the literal. Error message lists available edges when no match. | not started |
 | 5    | `splicer edges <composition>` CLI subcommand for enumeration. Splicer also logs matched edge_ids during `splice` runs so operators can copy them from output. | not started |
 | 6    | Higher-level selectors (`on_node`, `on_interface`, `between_subgraph`). Expand to multi per-edge rules at parse time. Default is "all edges in the unit"; optional `filter:` block narrows to a subset by interface name or explicit edge_id list. | not started |
-| 7    | Replayer builtin (tier-4 virtualize). Consumes steps 2-6; no new primitives. Subset replay (virtualize some boundary edges, leave the rest live) falls out of step 6's filter block. | not started |
+| 7    | Replayer builtin (tier-4 virtualize). Consumes steps 2-6; no new primitives. Subset replay (virtualize some boundary edges, leave the rest live) falls out of step 6's filter block. See [`docs/TODO/tier3-tier4-substrate.md`](../../docs/TODO/tier3-tier4-substrate.md) for the `WrapperStrategy` + codegen template architecture that lands here. | not started |
 
 Steps 2 and 3 unlock the recorder for multi-edge use. Steps 4 and 5
 unlock the replayer's user-facing config. Step 6 is pure UX polish on

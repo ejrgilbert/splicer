@@ -83,6 +83,7 @@ pub mod builtin_info {
 mod compose;
 mod config_provider;
 mod contract;
+mod edge_id;
 mod parse;
 mod split;
 mod wac;
