@@ -139,8 +139,8 @@ jobs:
      - uses: taiki-e/install-action@v2
        with:
          tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
-     - name: Canned shape catalog
-       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_canned
+     - name: Canned shape catalog (tier-1 + tier-2)
+       run: cargo test --test fuzz_and_run -- --ignored --nocapture canned
 
   fuzz_and_run_fuzz:
    name: Fuzz + Run (fuzz)
@@ -156,11 +156,14 @@ jobs:
      - uses: taiki-e/install-action@v2
        with:
          tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
-     - name: Fuzz (25 iters, depth 5)
+     # Tier-1 only until the tier-2-surfaced splicer bugs
+     # (lift-to-flat past end of param_flat_locals) are fixed; enable
+     # tier-2 by widening the filter to bare `fuzz` once those land.
+     - name: Fuzz tier-1 (25 iters, depth 5)
        env:
          SPLICER_FUZZ_ITERS: "25"
          SPLICER_FUZZ_DEPTH: "5"
-       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
+       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_tier1_fuzz
 
   # Heavier fuzz run on every push to main — re-validates the merged
   # code against deeper shape trees than PR CI exercised. Gated on the
@@ -182,8 +185,13 @@ jobs:
      - uses: taiki-e/install-action@v2
        with:
          tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
-     - name: Fuzz (200 iters, depth 6)
+     # Tier-1 only — same caveat as PR fuzz above. Post-merge widens
+     # iters / depth + the per-iter breadth knobs (tuple arity, fixed
+     # list length) for thorough coverage.
+     - name: Fuzz tier-1 (200 iters, depth 6, wider breadth)
        env:
          SPLICER_FUZZ_ITERS: "200"
          SPLICER_FUZZ_DEPTH: "6"
-       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_fuzz
+         SPLICER_FUZZ_TUPLE_MAX: "5"
+         SPLICER_FUZZ_FIXED_LIST_MAX: "8"
+       run: cargo test --test fuzz_and_run -- --ignored --nocapture test_tier1_fuzz

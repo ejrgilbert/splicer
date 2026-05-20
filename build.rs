@@ -135,6 +135,27 @@ fn main() {
         generated.push_str("];\n\n");
     }
 
+    // Emit COMMON_PACKAGE / COMMON_VERSION from wit/common/world.wit so
+    // test scaffolds + any caller threading through versioned interface
+    // names don't have to hardcode them. Keeps the wit-bump fix to a
+    // single file.
+    let common_path = wit_dir.join("common").join("world.wit");
+    if common_path.exists() {
+        println!("cargo::rerun-if-changed={}", common_path.display());
+        let wit_src = fs::read_to_string(&common_path).unwrap_or_else(|e| {
+            panic!("Failed to read {}: {e}", common_path.display());
+        });
+        let (pkg_unversioned, pkg_version) = parse_package_decl(&wit_src, &common_path);
+        generated.push_str(&format!(
+            "/// Package key for the shared `splicer:common` types (no version suffix).\n\
+             #[allow(dead_code)]\n\
+             pub const COMMON_PACKAGE: &str = \"{pkg_unversioned}\";\n\n\
+             /// Semver version of the `splicer:common` WIT package.\n\
+             #[allow(dead_code)]\n\
+             pub const COMMON_VERSION: &str = \"{pkg_version}\";\n\n"
+        ));
+    }
+
     validate_schema_names(wit_dir);
 
     fs::write(&dest, &generated).unwrap();
