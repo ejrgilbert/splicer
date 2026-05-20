@@ -2760,27 +2760,13 @@ struct NominalCounters {
     flags: usize,
 }
 
-/// Per-iter generator knobs. Two flavors live here:
-///   - breadth knobs (`tuple_arity`, `fixed_list_len`) — env-overridable
-///     defaults from module constants;
-///   - toolchain-capability gates (`allow_fixed_list`, future
-///     `allow_stream` / `allow_resource` / …) — flipped by the caller
-///     per iter, e.g. when the active `AsyncMode` is incompatible with
-///     a wit-bindgen / wac-types capability.
-///
-/// Both kinds are **tree-global**: they don't change as `gen_shape`
-/// recurses (unlike `allow_nominal`, which is positional because WIT
-/// forbids nested record decls). Keeping them on a single struct
-/// avoids fan-out of bool parameters as more caps land.
+/// Env-tunable breadth knobs that bound how *wide* a generated shape
+/// tree can get. Independent of toolchain capability — see
+/// [`GenSupport`] for that.
 #[derive(Clone)]
 struct GenLimits {
     tuple_arity: std::ops::RangeInclusive<usize>,
     fixed_list_len: std::ops::RangeInclusive<u32>,
-    /// Allow `Shape::FixedLengthList` anywhere in the tree. Gated to
-    /// sync mode because wit-bindgen 0.57.1's `generate!` panics
-    /// ("not yet implemented") on `list<T, N>` under `async: true`.
-    /// See the TODO on `run_tier2_pipeline_for_shape`.
-    allow_fixed_list: bool,
 }
 
 impl Default for GenLimits {
@@ -2788,24 +2774,77 @@ impl Default for GenLimits {
         Self {
             tuple_arity: TUPLE_ARITY,
             fixed_list_len: FIXED_LIST_LEN,
-            allow_fixed_list: true,
         }
     }
 }
 
 impl GenLimits {
-    /// Build limits with each upper bound overridable via env. The
-    /// lower bound stays pinned to the module constant so callers can
-    /// only widen, not invert, the range. Capability gates take their
-    /// default value — callers flip them after construction based on
-    /// the runtime context (mode, target toolchain, etc.).
+    /// Each upper bound is env-overridable; the lower bound stays
+    /// pinned to the module constant so callers can only widen, not
+    /// invert, the range.
     fn from_env() -> Self {
         let tuple_max = env_or("SPLICER_FUZZ_TUPLE_MAX", *TUPLE_ARITY.end());
         let fixed_max = env_or("SPLICER_FUZZ_FIXED_LIST_MAX", *FIXED_LIST_LEN.end());
         Self {
             tuple_arity: *TUPLE_ARITY.start()..=tuple_max.max(*TUPLE_ARITY.start()),
             fixed_list_len: *FIXED_LIST_LEN.start()..=fixed_max.max(*FIXED_LIST_LEN.start()),
-            ..Self::default()
+        }
+    }
+}
+
+/// Which middleware tier the active fuzz iter targets. Future-proofs
+/// for a tier-2 fuzz runner (Phase 4); today only `Tier1` is wired.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum Tier {
+    Tier1,
+    Tier2,
+}
+
+/// Per-iter toolchain capability gates. Each flag records whether a
+/// given wit feature can be drawn for this (tier, mode) combination —
+/// some are blocked by external limitations (wit-bindgen, wac-types),
+/// others are simply not wired into the generator yet.
+///
+/// Build via [`GenSupport::for_tier_mode`]; never construct directly
+/// so the rule table stays the single source of truth.
+#[derive(Clone, Copy)]
+struct GenSupport {
+    /// `list<T, N>` — wit-bindgen 0.57.1 panics ("not yet implemented")
+    /// on it under `async: true`, so only enabled in sync mode. See
+    /// the TODO on `run_tier2_pipeline_for_shape`.
+    fixed_length_lists: bool,
+    /// `map<K, V>` — blocked by `wac-types`
+    /// (`test_tier2_map_blocked_on_wac`). Not yet generated.
+    #[allow(dead_code)]
+    maps: bool,
+    /// `own<R>` / `borrow<R>` — not yet wired into the generator;
+    /// canned coverage only.
+    #[allow(dead_code)]
+    resources: bool,
+    /// `stream<T>` — not yet wired into the generator.
+    #[allow(dead_code)]
+    streams: bool,
+    /// `future<T>` — not yet wired into the generator.
+    #[allow(dead_code)]
+    futures: bool,
+    /// `error-context` — not yet wired into the generator.
+    #[allow(dead_code)]
+    error_context: bool,
+}
+
+impl GenSupport {
+    /// Encode the rule table in one place. Adding a new feature is a
+    /// matter of flipping a flag here, not editing the generator
+    /// dispatch.
+    fn for_tier_mode(_tier: Tier, mode: AsyncMode) -> Self {
+        Self {
+            fixed_length_lists: matches!(mode, AsyncMode::Sync),
+            maps: false,
+            resources: false,
+            streams: false,
+            futures: false,
+            error_context: false,
         }
     }
 }
@@ -2843,6 +2882,7 @@ fn gen_shape(
     allow_nominal: bool,
     counters: &mut NominalCounters,
     limits: &GenLimits,
+    support: &GenSupport,
 ) -> arbitrary::Result<Shape> {
     let can_recurse = max_depth > 0;
     let any_nominal_left = !counters.available_nominals().is_empty();
@@ -2851,9 +2891,9 @@ fn gen_shape(
     // dropped when `allow_nominal=false` (record field / variant
     // payload) or when every name pool is exhausted. List-empty is
     // structural — always allowed when we can recurse. Fixed-length
-    // list (7) is gated by `limits.allow_fixed_list` — see the field
-    // docs for the wit-bindgen async-mode caveat.
-    let with_fixed = limits.allow_fixed_list && can_recurse;
+    // list (7) is gated by `support.fixed_length_lists` — see the field
+    // docs in `GenSupport`.
+    let with_fixed = support.fixed_length_lists && can_recurse;
     let kinds: &[u8] = match (can_recurse, allow_nominal, any_nominal_left, with_fixed) {
         (false, _, _, _) => &[0],
         (true, false, _, false) | (true, true, false, false) => &[0, 1, 2, 3, 4, 6],
@@ -2871,6 +2911,7 @@ fn gen_shape(
                 allow_nominal,
                 counters,
                 limits,
+                support,
             )?),
             is_some: u.arbitrary()?,
         }),
@@ -2880,22 +2921,23 @@ fn gen_shape(
             allow_nominal,
             counters,
             limits,
+            support,
         )?))),
         3 => {
             let n: usize = u.int_in_range(limits.tuple_arity.clone())?;
             let parts: arbitrary::Result<Vec<Shape>> = (0..n)
-                .map(|_| gen_shape(u, max_depth - 1, allow_nominal, counters, limits))
+                .map(|_| gen_shape(u, max_depth - 1, allow_nominal, counters, limits, support))
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
-        4 => gen_result(u, max_depth, allow_nominal, counters, limits),
-        5 => gen_nominal(u, max_depth, counters, limits),
+        4 => gen_result(u, max_depth, allow_nominal, counters, limits, support),
+        5 => gen_nominal(u, max_depth, counters, limits, support),
         6 => {
             // wit-component rejects an empty `list<own<R>>` at compose
             // time (Type mismatch). The contains_resource check
             // degrades the draw to a regular list so we never emit
             // that combination.
-            let inner = gen_shape(u, max_depth - 1, allow_nominal, counters, limits)?;
+            let inner = gen_shape(u, max_depth - 1, allow_nominal, counters, limits, support)?;
             if inner.contains_resource() {
                 Ok(Shape::List(Box::new(inner)))
             } else {
@@ -2926,13 +2968,14 @@ fn gen_nominal(
     max_depth: u32,
     counters: &mut NominalCounters,
     limits: &GenLimits,
+    support: &GenSupport,
 ) -> arbitrary::Result<Shape> {
     let available = counters.available_nominals();
     debug_assert!(!available.is_empty());
     let pick = available[u.int_in_range(0..=available.len() - 1)?];
     match pick {
-        NominalKind::Record => gen_record(u, max_depth, counters, limits),
-        NominalKind::Variant => gen_variant(u, max_depth, counters, limits),
+        NominalKind::Record => gen_record(u, max_depth, counters, limits, support),
+        NominalKind::Variant => gen_variant(u, max_depth, counters, limits, support),
         NominalKind::Enum => gen_enum(u, counters),
         NominalKind::Flags => gen_flags(u, counters),
     }
@@ -2943,13 +2986,14 @@ fn gen_record(
     max_depth: u32,
     counters: &mut NominalCounters,
     limits: &GenLimits,
+    support: &GenSupport,
 ) -> arbitrary::Result<Shape> {
     let idx = counters.records;
     counters.records += 1;
     let n: usize = u.int_in_range(1..=RECORD_FIELD_NAMES.len())?;
     let fields: arbitrary::Result<Vec<(&'static str, Shape)>> = (0..n)
         .map(|i| {
-            let fshape = gen_shape(u, max_depth - 1, false, counters, limits)?;
+            let fshape = gen_shape(u, max_depth - 1, false, counters, limits, support)?;
             Ok((RECORD_FIELD_NAMES[i], fshape))
         })
         .collect();
@@ -2969,6 +3013,7 @@ fn gen_variant(
     max_depth: u32,
     counters: &mut NominalCounters,
     limits: &GenLimits,
+    support: &GenSupport,
 ) -> arbitrary::Result<Shape> {
     let idx = counters.variants;
     counters.variants += 1;
@@ -2976,7 +3021,14 @@ fn gen_variant(
     let mut cases: Vec<VariantCase> = Vec::with_capacity(n);
     for i in 0..n {
         let payload = if bool::arbitrary(u)? {
-            Some(gen_shape(u, max_depth - 1, false, counters, limits)?)
+            Some(gen_shape(
+                u,
+                max_depth - 1,
+                false,
+                counters,
+                limits,
+                support,
+            )?)
         } else {
             None
         };
@@ -3041,6 +3093,7 @@ fn gen_result(
     allow_nominal: bool,
     counters: &mut NominalCounters,
     limits: &GenLimits,
+    support: &GenSupport,
 ) -> arbitrary::Result<Shape> {
     // Each side is independently present or absent. If both absent,
     // that's a bare `result` with no payloads — legal WIT.
@@ -3051,6 +3104,7 @@ fn gen_result(
             allow_nominal,
             counters,
             limits,
+            support,
         )?))
     } else {
         None
@@ -3062,6 +3116,7 @@ fn gen_result(
             allow_nominal,
             counters,
             limits,
+            support,
         )?))
     } else {
         None
@@ -4436,13 +4491,9 @@ fn test_fuzz() {
         eprintln!("\n### mode: {mode_tag} ###");
         scaffold_common(root, mode).expect("scaffold common");
 
-        // Mode-derived capability gates layered on top of the env
-        // defaults. Today this is just `allow_fixed_list`; future caps
-        // (streams/futures/resources) flip the same way.
-        let iter_limits = GenLimits {
-            allow_fixed_list: matches!(mode, AsyncMode::Sync) && limits.allow_fixed_list,
-            ..limits.clone()
-        };
+        // Toolchain capabilities for this (tier, mode) — encoded once
+        // in `GenSupport::for_tier_mode`.
+        let support = GenSupport::for_tier_mode(Tier::Tier1, mode);
 
         for i in 0..iters {
             total_runs += 1;
@@ -4452,7 +4503,7 @@ fn test_fuzz() {
             let mut u = arbitrary::Unstructured::new(&buf);
 
             let mut counters = NominalCounters::default();
-            let shape = match gen_shape(&mut u, max_depth, true, &mut counters, &iter_limits) {
+            let shape = match gen_shape(&mut u, max_depth, true, &mut counters, &limits, &support) {
                 Ok(s) => s,
                 Err(e) => {
                     failures.push(format!(
