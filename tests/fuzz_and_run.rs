@@ -2691,6 +2691,63 @@ enum NominalKind {
     Flags,
 }
 
+/// What `gen_shape` can draw at a given recursion point. The
+/// dispatch in `gen_shape` matches exhaustively on this, so adding
+/// a kind here forces the compiler to flag every gate table and
+/// every dispatch arm that needs an update.
+#[derive(Clone, Copy)]
+enum Kind {
+    Primitive,
+    Option,
+    List,
+    Tuple,
+    Result_,
+    /// Record / Variant / Enum / Flags — gated on `allow_nominal`
+    /// and the per-kind name pool.
+    Nominal,
+    ListEmpty,
+    /// `list<T, N>` — gated on `GenSupport::fixed_length_lists`.
+    FixedLengthList,
+}
+
+const KINDS_LEAF: &[Kind] = &[Kind::Primitive];
+const KINDS_STRUCT: &[Kind] = &[
+    Kind::Primitive,
+    Kind::Option,
+    Kind::List,
+    Kind::Tuple,
+    Kind::Result_,
+    Kind::ListEmpty,
+];
+const KINDS_STRUCT_NOM: &[Kind] = &[
+    Kind::Primitive,
+    Kind::Option,
+    Kind::List,
+    Kind::Tuple,
+    Kind::Result_,
+    Kind::Nominal,
+    Kind::ListEmpty,
+];
+const KINDS_STRUCT_FIXED: &[Kind] = &[
+    Kind::Primitive,
+    Kind::Option,
+    Kind::List,
+    Kind::Tuple,
+    Kind::Result_,
+    Kind::ListEmpty,
+    Kind::FixedLengthList,
+];
+const KINDS_FULL: &[Kind] = &[
+    Kind::Primitive,
+    Kind::Option,
+    Kind::List,
+    Kind::Tuple,
+    Kind::Result_,
+    Kind::Nominal,
+    Kind::ListEmpty,
+    Kind::FixedLengthList,
+];
+
 fn gen_shape(
     u: &mut arbitrary::Unstructured<'_>,
     max_depth: u32,
@@ -2700,23 +2757,19 @@ fn gen_shape(
     support: &GenSupport,
 ) -> arbitrary::Result<Shape> {
     let can_recurse = max_depth > 0;
-    let any_nominal_left = !counters.available_nominals().is_empty();
-    // Kinds: 0=primitive, 1=option, 2=list, 3=tuple, 4=result,
-    // 5=nominal, 6=list-empty, 7=fixed-length-list. Nominal needs
-    // `allow_nominal` + a non-exhausted pool; fixed-length-list is
-    // gated by `support.fixed_length_lists`.
-    let with_fixed = support.fixed_length_lists && can_recurse;
-    let kinds: &[u8] = match (can_recurse, allow_nominal, any_nominal_left, with_fixed) {
-        (false, _, _, _) => &[0],
-        (true, false, _, false) | (true, true, false, false) => &[0, 1, 2, 3, 4, 6],
-        (true, true, true, false) => &[0, 1, 2, 3, 4, 5, 6],
-        (true, false, _, true) | (true, true, false, true) => &[0, 1, 2, 3, 4, 6, 7],
-        (true, true, true, true) => &[0, 1, 2, 3, 4, 5, 6, 7],
+    let nominal_ok = allow_nominal && !counters.available_nominals().is_empty();
+    let fixed_ok = support.fixed_length_lists && can_recurse;
+    let kinds: &[Kind] = match (can_recurse, nominal_ok, fixed_ok) {
+        (false, _, _) => KINDS_LEAF,
+        (true, false, false) => KINDS_STRUCT,
+        (true, true, false) => KINDS_STRUCT_NOM,
+        (true, false, true) => KINDS_STRUCT_FIXED,
+        (true, true, true) => KINDS_FULL,
     };
     let kind = kinds[u.int_in_range(0..=kinds.len() - 1)?];
     match kind {
-        0 => pick_primitive(u),
-        1 => Ok(Shape::Option {
+        Kind::Primitive => pick_primitive(u),
+        Kind::Option => Ok(Shape::Option {
             inner: Box::new(gen_shape(
                 u,
                 max_depth - 1,
@@ -2727,7 +2780,7 @@ fn gen_shape(
             )?),
             is_some: u.arbitrary()?,
         }),
-        2 => Ok(Shape::List(Box::new(gen_shape(
+        Kind::List => Ok(Shape::List(Box::new(gen_shape(
             u,
             max_depth - 1,
             allow_nominal,
@@ -2735,16 +2788,16 @@ fn gen_shape(
             limits,
             support,
         )?))),
-        3 => {
+        Kind::Tuple => {
             let n: usize = u.int_in_range(limits.tuple_arity.clone())?;
             let parts: arbitrary::Result<Vec<Shape>> = (0..n)
                 .map(|_| gen_shape(u, max_depth - 1, allow_nominal, counters, limits, support))
                 .collect();
             Ok(Shape::Tuple(parts?))
         }
-        4 => gen_result(u, max_depth, allow_nominal, counters, limits, support),
-        5 => gen_nominal(u, max_depth, counters, limits, support),
-        6 => {
+        Kind::Result_ => gen_result(u, max_depth, allow_nominal, counters, limits, support),
+        Kind::Nominal => gen_nominal(u, max_depth, counters, limits, support),
+        Kind::ListEmpty => {
             // wit-component rejects empty `list<own<R>>` at compose
             // (Type mismatch); degrade to a regular list in that case.
             let inner = gen_shape(u, max_depth - 1, allow_nominal, counters, limits, support)?;
@@ -2754,7 +2807,7 @@ fn gen_shape(
                 Ok(Shape::ListEmpty(Box::new(inner)))
             }
         }
-        7 => {
+        Kind::FixedLengthList => {
             let n: u32 = u.int_in_range(limits.fixed_list_len.clone())?;
             // TODO: harness-only gate. Consumer scaffold moves `[T; N]`
             // by value (E0508 on non-Copy `T`). Drop once
@@ -2766,7 +2819,6 @@ fn gen_shape(
                 n,
             })
         }
-        _ => unreachable!(),
     }
 }
 
