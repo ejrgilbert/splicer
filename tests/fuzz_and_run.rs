@@ -162,6 +162,16 @@ impl PathKind {
     }
 }
 
+/// Where in the shape tree `pass_expr` is rendering. Matters for
+/// nominal types (Record / Variant / Enum / Flags): wit-bindgen takes
+/// them by value at top level (when real-`Copy`) but always by `&T`
+/// inside a compound rebuild (Tuple / Option / Result arm).
+#[derive(Clone, Copy)]
+enum Position {
+    Top,
+    InCompound,
+}
+
 impl BindingsSide {
     fn path(self) -> &'static str {
         match self {
@@ -580,33 +590,10 @@ impl Shape {
                     "None".to_string()
                 }
             }
-            Shape::List(inner) => {
-                // Force Async-mode so `string` elements render as
-                // `String::from(...)`; subtrees with a resource
-                // constructor (direct or nested) stay on outer mode
-                // since `.await` in sync `run()` doesn't compile.
-                let elem_mode = if inner.contains_resource() {
-                    mode
-                } else {
-                    AsyncMode::Async
-                };
-                format!("vec![{}]", inner.rust_literal(side, elem_mode))
-            }
-            Shape::ListEmpty(_) => {
-                // Empty literal — type is inferred from the
-                // wit-bindgen-generated param signature (`&[T]`).
-                "vec![]".to_string()
-            }
+            Shape::List(inner) => format!("vec![{}]", inner.rust_literal(side, mode)),
+            Shape::ListEmpty(_) => "vec![]".to_string(),
             Shape::FixedLengthList { inner, n } => {
-                // Same owned-element + resource rule as `Shape::List`:
-                // force Async-mode unless the subtree contains a resource
-                // constructor, in which case stay on outer mode.
-                let elem_mode = if inner.contains_resource() {
-                    mode
-                } else {
-                    AsyncMode::Async
-                };
-                let lit = inner.rust_literal(side, elem_mode);
+                let lit = inner.rust_literal(side, mode);
                 let parts: Vec<String> = (0..*n as usize).map(|_| lit.clone()).collect();
                 format!("[{}]", parts.join(", "))
             }
@@ -618,31 +605,17 @@ impl Shape {
                     .join(", ");
                 format!("({inside})")
             }
-            // Single-entry `BTreeMap`. Force owned `K`/`V` via Async-mode
-            // (same trick as `Shape::List` — wit-bindgen's `Map` always
-            // takes owned key/value).
-            Shape::Map { key, value } => {
-                let elem_mode = AsyncMode::Async;
-                format!(
-                    "std::collections::BTreeMap::from([({}, {})])",
-                    key.rust_literal(side, elem_mode),
-                    value.rust_literal(side, elem_mode),
-                )
-            }
+            Shape::Map { key, value } => format!(
+                "std::collections::BTreeMap::from([({}, {})])",
+                key.rust_literal(side, mode),
+                value.rust_literal(side, mode),
+            ),
             Shape::Record {
                 rust_name, fields, ..
             } => {
-                // `ownership: Owning` forces record fields to owned
-                // types on the consumer side even in sync mode — so
-                // a `string` field is `String`, not `&str`. Recurse
-                // with Async-mode so the field emitter uses
-                // `String::from(...)` regardless of the outer mode.
-                let inner_mode = AsyncMode::Async;
                 let inits = fields
                     .iter()
-                    .map(|(fname, fshape)| {
-                        format!("{fname}: {}", fshape.rust_literal(side, inner_mode))
-                    })
+                    .map(|(fname, fshape)| format!("{fname}: {}", fshape.rust_literal(side, mode)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("{}::{rust_name} {{ {inits} }}", side.path())
@@ -653,14 +626,11 @@ impl Shape {
                 selected,
                 ..
             } => {
-                // Same owned-payload rule as Record — variants with
-                // `ownership: Owning` use owned payload types.
-                let inner_mode = AsyncMode::Async;
                 let case = &cases[*selected];
                 let payload = case
                     .payload
                     .as_ref()
-                    .map(|p| format!("({})", p.rust_literal(side, inner_mode)))
+                    .map(|p| format!("({})", p.rust_literal(side, mode)))
                     .unwrap_or_default();
                 format!("{}::{rust_name}::{}{payload}", side.path(), case.rust_name)
             }
@@ -738,7 +708,7 @@ impl Shape {
     /// shared reference, so we prefix with `&` where wit-bindgen's
     /// sync-import signature demands a borrow.
     fn consumer_pass_expr(&self, v_ident: &str, mode: AsyncMode) -> String {
-        self.pass_expr(v_ident, PathKind::Owned, mode)
+        self.pass_expr(v_ident, PathKind::Owned, Position::Top, mode)
     }
 
     /// Build the expression to pass to `api::foo(...)`. Encodes
@@ -766,13 +736,10 @@ impl Shape {
     /// evaluates to `&T` (e.g. bound by a `match &v` arm). Copy
     /// leaves then need `*path` to deref; non-Copy leaves wanting
     /// `&T` already have it.
-    fn pass_expr(&self, path: &str, kind: PathKind, mode: AsyncMode) -> String {
+    fn pass_expr(&self, path: &str, kind: PathKind, position: Position, mode: AsyncMode) -> String {
         // Resource handles: mode-independent.
         if matches!(self, Shape::ResourceBorrow { .. }) {
-            return match kind {
-                PathKind::RefBinding => path.to_string(),
-                _ => format!("&{path}"),
-            };
+            return self.borrow_form(path, kind);
         }
         if matches!(self, Shape::ResourceOwn { .. }) {
             debug_assert!(
@@ -800,28 +767,44 @@ impl Shape {
                 format!("{path}.as_str()")
             }
             Shape::List(_) | Shape::ListEmpty(_) => format!("&{path}[..]"),
-            Shape::Primitive { .. }
-            | Shape::Enum { .. }
-            | Shape::Flags { .. }
-            | Shape::FixedLengthList { .. }
-            | Shape::Record { .. }
-            | Shape::Variant { .. }
-            | Shape::Map { .. } => self.value_form(path, kind),
-            // Compounds: only rebuild when some descendant needs substitution.
+            Shape::Primitive { .. } | Shape::FixedLengthList { .. } => self.value_form(path, kind),
+            // Nominal types. Wit-bindgen takes Copy nominals by value at the
+            // top level; non-Copy nominals always by `&T`; inside a compound
+            // rebuild every nominal (even Copy) becomes `&T` because
+            // wit-bindgen substitutes per-arm borrows in those positions.
+            Shape::Enum { .. } | Shape::Flags { .. } => match position {
+                Position::Top => self.value_form(path, kind),
+                Position::InCompound => self.borrow_form(path, kind),
+            },
+            Shape::Record { .. } | Shape::Variant { .. } | Shape::Map { .. } => {
+                let by_ref = matches!(position, Position::InCompound) || !self.is_rust_copy();
+                if by_ref {
+                    self.borrow_form(path, kind)
+                } else {
+                    self.value_form(path, kind)
+                }
+            }
+            // Compounds: rebuild when some descendant needs substitution.
+            // Inside another compound (`Position::InCompound`) we always
+            // rebuild because wit-bindgen also wants per-arm `&T` borrows
+            // for any nominal sub-shape — `has_sync_substitution` alone
+            // doesn't capture that.
             Shape::Tuple(parts) => {
-                if !self.has_sync_substitution() {
+                if matches!(position, Position::Top) && !self.has_sync_substitution() {
                     return self.value_form(path, kind);
                 }
                 let sub_kind = kind.sub_path_kind();
                 let elems: Vec<String> = parts
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| p.pass_expr(&format!("{path}.{i}"), sub_kind, mode))
+                    .map(|(i, p)| {
+                        p.pass_expr(&format!("{path}.{i}"), sub_kind, Position::InCompound, mode)
+                    })
                     .collect();
                 format!("({})", elems.join(", "))
             }
             Shape::Option { inner, .. } => {
-                if !self.has_sync_substitution() {
+                if matches!(position, Position::Top) && !self.has_sync_substitution() {
                     return self.value_form(path, kind);
                 }
                 // Single-shot: Option<Vec<T>> → Option<&[T]>, Option<String> → Option<&str>.
@@ -832,11 +815,12 @@ impl Shape {
                     return format!("{path}.as_deref()");
                 }
                 // Compound inner — `.as_ref().map(|x| view(x))` binds x: &Inner.
-                let inner_view = inner.pass_expr("x", PathKind::RefBinding, mode);
+                let inner_view =
+                    inner.pass_expr("x", PathKind::RefBinding, Position::InCompound, mode);
                 format!("{path}.as_ref().map(|x| {inner_view})")
             }
             Shape::Result_ { ok, err, .. } => {
-                if !self.has_sync_substitution() {
+                if matches!(position, Position::Top) && !self.has_sync_substitution() {
                     return self.value_form(path, kind);
                 }
                 // match-ref binds o/e as &Inner.
@@ -845,21 +829,17 @@ impl Shape {
                     _ => format!("&{path}"),
                 };
                 let ok_arm = match ok {
-                    Some(o) => {
-                        format!(
-                            "Ok(o) => Ok({})",
-                            o.pass_expr("o", PathKind::RefBinding, mode)
-                        )
-                    }
+                    Some(o) => format!(
+                        "Ok(o) => Ok({})",
+                        o.pass_expr("o", PathKind::RefBinding, Position::InCompound, mode),
+                    ),
                     None => "Ok(()) => Ok(())".to_string(),
                 };
                 let err_arm = match err {
-                    Some(e) => {
-                        format!(
-                            "Err(e) => Err({})",
-                            e.pass_expr("e", PathKind::RefBinding, mode)
-                        )
-                    }
+                    Some(e) => format!(
+                        "Err(e) => Err({})",
+                        e.pass_expr("e", PathKind::RefBinding, Position::InCompound, mode),
+                    ),
                     None => "Err(()) => Err(())".to_string(),
                 };
                 format!("match {head} {{ {ok_arm}, {err_arm} }}")
@@ -880,15 +860,28 @@ impl Shape {
         }
     }
 
-    /// True if any descendant shape needs a sync-mode borrow
-    /// substitution (`list<T>` → `&[T]`, `string` → `&str`). When
-    /// false, the whole shape can be passed by value without rebuild.
-    /// Doesn't descend into Record / Variant fields — `ownership:
-    /// Owning` keeps those owned, so no substitution applies inside.
+    /// Render `path` as a `&T` reference. `RefBinding` already evaluates
+    /// to `&T`, so passes through; `Owned` and `PlaceFromRef` need `&`.
+    fn borrow_form(&self, path: &str, kind: PathKind) -> String {
+        match kind {
+            PathKind::RefBinding => path.to_string(),
+            PathKind::Owned | PathKind::PlaceFromRef => format!("&{path}"),
+        }
+    }
+
+    /// True if any descendant shape needs a per-spot sync-mode borrow
+    /// substitution that the outer `&v` can't satisfy:
+    ///   - `list<T>` → `&[T]`, `string` → `&str`,
+    ///   - non-Copy `Record` / `Variant` → `&T` borrow individually inside
+    ///     compounds (wit-bindgen takes those by reference).
+    ///
+    /// When false, the whole shape passes either by value (Copy) or by
+    /// `&v` (whole-borrow) without restructuring.
     fn has_sync_substitution(&self) -> bool {
         match self {
             Shape::List(_) | Shape::ListEmpty(_) => true,
             Shape::Primitive { rust_ty, .. } => *rust_ty == "String",
+            Shape::Record { .. } | Shape::Variant { .. } => !self.is_rust_copy(),
             Shape::Tuple(parts) => parts.iter().any(Self::has_sync_substitution),
             Shape::Option { inner, .. } => inner.has_sync_substitution(),
             Shape::FixedLengthList { inner, .. } => inner.has_sync_substitution(),
@@ -904,9 +897,10 @@ impl Shape {
     }
 
     /// Real Rust `Copy`-ness — true only when the wit-bindgen-generated
-    /// Rust type actually derives `Copy`. Records and Variants are
-    /// *never* Copy regardless of fields/payloads: `ownership: Owning`
-    /// doesn't derive Copy on them. Resources have `Drop` impls.
+    /// Rust type actually derives `Copy`. Strings, Lists, Maps, and
+    /// Resources are never Copy. Records and Variants are Copy iff
+    /// every field/payload is — wit-bindgen does derive Copy for those
+    /// cases (e.g. a record of `u32`s).
     fn is_rust_copy(&self) -> bool {
         match self {
             Shape::Primitive { rust_ty, .. } => *rust_ty != "String",
@@ -919,7 +913,10 @@ impl Shape {
                 ok.as_ref().is_none_or(|s| s.is_rust_copy())
                     && err.as_ref().is_none_or(|s| s.is_rust_copy())
             }
-            Shape::Record { .. } | Shape::Variant { .. } => false,
+            Shape::Record { fields, .. } => fields.iter().all(|(_, s)| s.is_rust_copy()),
+            Shape::Variant { cases, .. } => cases
+                .iter()
+                .all(|c| c.payload.as_ref().is_none_or(|s| s.is_rust_copy())),
             Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => false,
         }
     }
@@ -3239,6 +3236,7 @@ fn consumer_lib_rs(shape: &Shape, mode: AsyncMode) -> String {
     // are dispatched through the precomputed `expected_debug` strings
     // and the `is_top_borrow` branch below.
     let literal = shape.rust_literal(BindingsSide::Consumer, mode);
+    let rust_ty = shape.rust_ty(BindingsSide::Consumer);
     let pass_expr = shape.consumer_pass_expr("v", mode);
 
     let has_resource = shape.contains_resource();
@@ -3288,7 +3286,7 @@ struct Consumer;
 
 impl Guest for Consumer {{
     {rust_prefix}fn run() {{
-        let v = {literal};
+        let v: {rust_ty} = {literal};
         {send_print}
         {call_and_got}
     }}
