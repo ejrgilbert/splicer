@@ -22,7 +22,7 @@ pub use format::{cell_to_str, format_field_tree};
 // so the two re-exports do not collide. Same trick serde uses for
 // `serde::Deserialize`.
 pub use splicer_tool_sdk_derive::TypedFromCells;
-pub use strategy::{TransformStrategy, VirtualizeStrategy};
+pub use strategy::{ForwardStrategy, VirtualizeStrategy};
 pub use typed_from_cells::{FromCellsError, FromCellsResult, TypedFromCells};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,

@@ -54,6 +54,11 @@ wac-graph = "0.10"
 tempfile = "3"
 builtin-manifest = { path = "builtins/builtin-manifest" }
 toml = "0.8"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+prettyplease = "0.2"
+heck = "0.5"
 
 [dev-dependencies]
 wat = "1"

@@ -1,5 +1,5 @@
 //! Tier-3 and tier-4 strategy traits. Each user-authored strategy
-//! implements **exactly one** of [`TransformStrategy`] (tier-3) or
+//! implements **exactly one** of [`ForwardStrategy`] (tier-3) or
 //! [`VirtualizeStrategy`] (tier-4); splicer's per-target codegen
 //! template reads the strategy crate's source to find which trait is
 //! impl'd and emits the matching wrapper shape.
@@ -15,14 +15,14 @@
 
 use crate::types::CallId;
 
-/// **Tier-3 (transform) strategy.** Implement this when your
+/// **Tier-3 (forward) strategy.** Implement this when your
 /// middleware forwards each call to the wrapped target, optionally
 /// transforming arguments before or the result after.
 ///
 /// The codegen-emitted wrapper imports the target's interface and
 /// gives you a `downstream` closure that invokes it. Retry, latency,
 /// rate-limit, redact, normalize, default-fill, clamp, log, and
-/// memoize are all transforms.
+/// memoize all fit this shape.
 ///
 /// `Args` and `R` are generic at the *trait* level so each strategy
 /// can narrow accepted call shapes via its impl's where-clause —
@@ -32,11 +32,11 @@ use crate::types::CallId;
 /// # Example: log every wrapped call, then forward
 ///
 /// ```ignore
-/// use splicer_tool_sdk::{CallId, TransformStrategy};
+/// use splicer_tool_sdk::{CallId, ForwardStrategy};
 ///
 /// struct LogCalls;
 ///
-/// impl<Args, R> TransformStrategy<Args, R> for LogCalls {
+/// impl<Args, R> ForwardStrategy<Args, R> for LogCalls {
 ///     async fn handle(
 ///         &self,
 ///         call: CallId,
@@ -60,7 +60,7 @@ use crate::types::CallId;
 // We intentionally omit a `Send` bound on the returned future:
 // generated wrappers run in single-threaded wasm components.
 #[allow(async_fn_in_trait)]
-pub trait TransformStrategy<Args, R> {
+pub trait ForwardStrategy<Args, R> {
     /// Handle one wrapped invocation. `downstream` invokes the
     /// wrapped target; call it (with original or mutated `args`),
     /// then optionally mutate and return its result.
@@ -107,7 +107,7 @@ pub trait TransformStrategy<Args, R> {
 ///
 /// # Per-strategy state
 ///
-/// Same lifecycle and concurrency story as [`TransformStrategy`]:
+/// Same lifecycle and concurrency story as [`ForwardStrategy`]:
 /// one instance per wrapper component, mutate via interior
 /// mutability, don't hold borrows across `.await`.
 #[allow(async_fn_in_trait)]
@@ -121,10 +121,10 @@ pub trait VirtualizeStrategy<Args, R> {
 mod tests {
     use super::*;
 
-    /// Pass-through transform: forwards args to downstream unchanged.
+    /// Pass-through forward: hands args to downstream unchanged.
     struct PassThrough;
 
-    impl<Args, R> TransformStrategy<Args, R> for PassThrough {
+    impl<Args, R> ForwardStrategy<Args, R> for PassThrough {
         async fn handle(
             &self,
             _call: CallId,
@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transform_pass_through_forwards_args() {
+    async fn forward_pass_through_hands_off_args() {
         let strat = PassThrough;
         let r: u32 = strat
             .handle(call(), (10u32, 20u32), |(a, b)| async move { a + b })
