@@ -11,10 +11,14 @@ use std::path::PathBuf;
 
 use splicer::lowlevel::{build_wrapper, Behavior, BuildConfig, GenerateWrapperInput};
 
+// `async func` so wit-bindgen emits an `async fn` Guest method —
+// matches the `async fn` body our `emit_method` codegen produces.
+// Mixing sync WIT with our async-emit'd Guest impl is a real shape
+// mismatch (E0053) and needs separate sync-bridging work to support.
 const TIER4_TARGET_WIT: &str = r#"
     package smoke:tier4@0.1.0;
     interface ops {
-        add: func(a: u32, b: u32) -> u32;
+        add: async func(a: u32, b: u32) -> u32;
     }
     world tier4-smoke {
         export ops;

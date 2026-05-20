@@ -199,7 +199,7 @@ fn emit_args_witty(args_ident: &syn::Ident, params: &[(syn::Ident, syn::Type)]) 
             ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
                 #(#from_value_inits)*
                 for (name, v) in value.unwrap_record() {
-                    match name.as_ref() {
+                    match &*name {
                         #(#from_value_arms)*
                         _ => {}
                     }
@@ -269,7 +269,8 @@ fn emit_method_body(
                 id: 0,
             };
             let args = #args_construct;
-            STRATEGY.with_borrow(|s| #dispatch).await
+            let s = strategy();
+            #dispatch.await
         }
     }
 }

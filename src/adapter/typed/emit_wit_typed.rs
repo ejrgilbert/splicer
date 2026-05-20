@@ -96,7 +96,7 @@ fn emit_unit_enum(module_path: &[String], e: &ItemEnum) -> Option<TokenStream> {
                 value: &::splicer_tool_sdk::wasm_wave::value::Value,
             ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
                 let case = value.unwrap_enum();
-                match case.as_ref() {
+                match &*case {
                     #(#from_arms,)*
                     other => ::core::result::Result::Err(
                         ::splicer_tool_sdk::BridgeError::UnknownCase {
@@ -212,7 +212,7 @@ fn emit_variant(module_path: &[String], e: &ItemEnum) -> Option<TokenStream> {
                 value: &::splicer_tool_sdk::wasm_wave::value::Value,
             ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
                 let (case, payload) = value.unwrap_variant();
-                match case.as_ref() {
+                match &*case {
                     #(#from_arms,)*
                     other => ::core::result::Result::Err(
                         ::splicer_tool_sdk::BridgeError::UnknownCase {
@@ -295,7 +295,7 @@ fn emit_record(module_path: &[String], s: &ItemStruct) -> Option<TokenStream> {
             ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
                 #(#from_value_inits)*
                 for (name, v) in value.unwrap_record() {
-                    match name.as_ref() {
+                    match &*name {
                         #(#from_value_arms)*
                         _ => {}
                     }

@@ -71,7 +71,11 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         }
 
         use ::splicer_tool_sdk::{CallId, WitTyped};
-        use ::std::cell::RefCell;
+        // `WasmValue` (a trait) needs to be in scope so emitted
+        // `Value::make_record(...)` / `value.unwrap_record()` calls
+        // resolve to the trait methods rather than a (non-existent)
+        // inherent impl on `wasm_wave::value::Value`.
+        use ::splicer_tool_sdk::wasm_wave::wasm::WasmValue;
         #strategy_trait_use
 
         // Per-user-type WitTyped impls (records, enums, variants).
@@ -81,14 +85,20 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         #(#args_structs)*
         #(#args_witty_impls)*
 
-        // One shared strategy instance for the whole wrapper. The
-        // strategy crate must impl Default so we can construct it
-        // here without configuration.
-        thread_local! {
-            static STRATEGY: RefCell<#strategy_crate_ident::#strategy_type_ident> =
-                RefCell::new(
-                    <#strategy_crate_ident::#strategy_type_ident as ::core::default::Default>::default()
-                );
+        // One shared strategy instance for the whole wrapper. Stored
+        // as `OnceLock<S>` so the strategy reference has `'static`
+        // lifetime — avoids the borrow-across-`.await` lifetime
+        // conflict that `thread_local! { RefCell<S> }` would trip.
+        // The strategy type must impl `Default` (for lazy init) and
+        // `Sync` (for static storage); strategies needing interior
+        // mutability can wrap their state in atomic / lock primitives.
+        static STRATEGY: ::std::sync::OnceLock<#strategy_crate_ident::#strategy_type_ident> =
+            ::std::sync::OnceLock::new();
+
+        fn strategy() -> &'static #strategy_crate_ident::#strategy_type_ident {
+            STRATEGY.get_or_init(
+                <#strategy_crate_ident::#strategy_type_ident as ::core::default::Default>::default
+            )
         }
 
         // The user-facing Guest impl target. Each `impl Guest for Wrapper`
@@ -186,8 +196,10 @@ mod tests {
             out.contains("use ::splicer_tool_sdk::ForwardStrategy"),
             "forward dispatch expects ForwardStrategy use:\n{out}"
         );
-        // The thread_local strategy instance.
-        assert!(out.contains("thread_local"), "expected thread_local!:\n{out}");
+        // The strategy is stored in a OnceLock<S> so the `&S`
+        // handed to handle() has `'static` lifetime (avoids
+        // borrow-across-await with thread_local!{RefCell<S>}).
+        assert!(out.contains("OnceLock"), "expected OnceLock storage:\n{out}");
         assert!(
             out.contains("my_strategy :: MyStrategy")
                 || out.contains("my_strategy::MyStrategy"),

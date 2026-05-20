@@ -167,7 +167,7 @@ mod tests {
             lib.contains("ForwardStrategy"),
             "forward pipeline should use ForwardStrategy:\n{lib}"
         );
-        assert!(lib.contains("thread_local"), "missing thread_local:\n{lib}");
+        assert!(lib.contains("OnceLock"), "missing OnceLock storage:\n{lib}");
         assert!(
             lib.contains("bindings::export!"),
             "missing component-export hookup:\n{lib}"
