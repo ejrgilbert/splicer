@@ -1,0 +1,9 @@
+[builtin]
+description = "Smoke-test tier-4 builtin: virtualize strategy that synthesizes the default value of each wrapped call's return type."
+behavior = "virtualize"
+
+[[key]]
+name = "greeting"
+type = "string"
+default = "hello-tier4"
+doc = "Prefix printed before the synthesized return."

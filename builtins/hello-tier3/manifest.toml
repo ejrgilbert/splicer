@@ -1,0 +1,9 @@
+[builtin]
+description = "Smoke-test tier-3 builtin: forward strategy that prints a greeting before and after each wrapped call."
+behavior = "forward"
+
+[[key]]
+name = "greeting"
+type = "string"
+default = "hello-tier3"
+doc = "Prefix printed before the wrapped call's interface#function name."

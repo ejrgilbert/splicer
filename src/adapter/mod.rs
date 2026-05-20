@@ -22,7 +22,7 @@ mod mem_layout;
 mod resolve;
 mod tier1;
 mod tier2;
-pub(crate) mod typed;
+pub mod typed;
 
 use tier1::build_adapter;
 use tier2::build_tier2_adapter;

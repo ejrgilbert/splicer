@@ -215,16 +215,12 @@ mod tests {
         );
     }
 
-    /// End-to-end build test. Gated behind SPLICER_BUILD_E2E so it
-    /// doesn't run in normal CI (slow; needs cargo + wasm-tools +
-    /// wasm32-wasip1 target + paths to the SDK and adapter). Run it
-    /// manually with:
-    /// `SPLICER_BUILD_E2E=1 cargo test ... e2e_build_tiny_wrapper`.
+    /// End-to-end build test. Marked `#[ignore]` because it shells
+    /// out to cargo and needs the `wasm32-wasip1` target installed.
+    /// Run with `cargo test ... e2e_build_tiny_wrapper -- --ignored`.
     #[test]
+    #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
     fn e2e_build_tiny_wrapper() {
-        if std::env::var_os("SPLICER_BUILD_E2E").is_none() {
-            return;
-        }
         let cache_dir = tempfile::tempdir().unwrap();
         let adapter = std::env::var_os("SPLICER_PREVIEW1_ADAPTER")
             .map(PathBuf::from)

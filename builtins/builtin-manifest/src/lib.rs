@@ -61,6 +61,12 @@ pub struct Manifest {
 pub struct BuiltinMeta {
     /// One-line description shown by `splicer builtin list`.
     pub description: String,
+    /// For tier-3/4 builtins: `"forward"` (the strategy passes calls
+    /// through to the wrapped target) or `"virtualize"` (the strategy
+    /// replaces the wrapped target). Absent for tier-1/2 builtins,
+    /// where tier is inferred from the component's WIT exports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavior: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
