@@ -243,14 +243,11 @@ impl<T: TypedFromCells> TypedFromCells for Vec<T> {
     }
 }
 
-// TODO(stage-3): revisit whether `Args` should be a tuple or a
-// per-function generated struct. Today we ship tuple blanket impls
-// (arity 1-8) so the codegen template can package args as `(a, b)`,
-// matching proxy-component's structural shape. Once the stage-3
-// template is sketched, weigh "8 hardcoded tuple impls in the SDK"
-// against "one struct + impls generated per wrapped function" and
-// pick. If we switch to per-function structs, this whole macro
-// block and the 8 invocations below disappear.
+// The tuple blanket impls below (arity 1-8) are now used only for
+// `R` (multi-result WIT functions return Rust tuples). The codegen
+// template emits a per-function generated struct for `Args`, so
+// `Args` does not consume these impls. Drop arity-N impls when no
+// target WIT in use exercises an N-result function.
 //
 // In the slice pattern below, each `$T` ident binds twice in the
 // macro body: once as a type (`$T::from_cells`) and once as a value
