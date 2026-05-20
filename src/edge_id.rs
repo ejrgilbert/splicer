@@ -1,4 +1,4 @@
-//! Canonical edge_id rendering + filesystem-safe form. Format:
+//! Canonical edge_id rendering. Format:
 //! `{interface}::{caller}->{provider}`, or `{interface}::->{provider}`
 //! at the composition boundary.
 
@@ -17,20 +17,6 @@ pub fn derive_edge_id(interface: &str, from: Option<&str>, to: &str) -> String {
         Some(caller) => format!("{interface}::{caller}->{to}"),
         None => format!("{interface}::->{to}"),
     }
-}
-
-/// Filesystem-safe transformation of an edge_id. Replaces any
-/// character outside `[A-Za-z0-9._@-]` with `_`. Idempotent and
-/// stable across runs; the same input always produces the same
-/// output, so recording filenames are deterministic too.
-pub fn sanitize_for_filename(edge_id: &str) -> String {
-    edge_id
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' | '@' => c,
-            _ => '_',
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -72,33 +58,5 @@ mod tests {
         let a = derive_edge_id("ns:pkg/iface@1.2.3", Some("caller"), "provider");
         let b = derive_edge_id("ns:pkg/iface@1.2.3", Some("caller"), "provider");
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn sanitize_replaces_colons_slashes_and_arrows() {
-        let raw = "wasi:http/handler@0.3.0-rc-2026-01-06::srv-b->srv-a";
-        let out = sanitize_for_filename(raw);
-        for c in out.chars() {
-            assert!(
-                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'),
-                "unexpected char {c:?} in {out}"
-            );
-        }
-        assert_eq!(out, "wasi_http_handler@0.3.0-rc-2026-01-06__srv-b-_srv-a",);
-    }
-
-    #[test]
-    fn sanitize_boundary_form() {
-        // Leading `->` survives as `-_` (the `-` is allowed, `>` is not).
-        assert_eq!(
-            sanitize_for_filename("ns:pkg/iface@1.0.0::->srv-a"),
-            "ns_pkg_iface@1.0.0__-_srv-a",
-        );
-    }
-
-    #[test]
-    fn sanitize_idempotent_on_safe_input() {
-        let safe = "wasi_http_handler@0.3.0__srv-b_srv-a";
-        assert_eq!(sanitize_for_filename(safe), safe);
     }
 }

@@ -133,8 +133,8 @@ logic, or the encode/decode contracts.
 | Step | What lands                                                                       | Status              |
 | ---- | -------------------------------------------------------------------------------- | ------------------- |
 | 1    | Recorder ships as-is (single-edge, single-sink).                                 | **done**            |
-| 2    | Splicer auto-injects `_splicer_edge_id` into every spliced builtin's config.     | not started         |
-| 3    | Recorder reads `_splicer_edge_id`; file-sink lands; default sink switches to file (one file per edge). Stdout/stderr documented as single-instance-only. | not started |
+| 2    | Splicer auto-injects `_splicer_edge_id` into every spliced builtin's config.     | **done**            |
+| 3    | Recorder reads `_splicer_edge_id`; file-sink lands; default sink switches to file (one file per edge). Stdout/stderr documented as single-instance-only. | **done**    |
 | 4    | `on_edge: "<id>"` YAML selector. Splicer enumerates composition edges, derives ids, matches against the literal. Error message lists available edges when no match. | not started |
 | 5    | `splicer edges <composition>` CLI subcommand for enumeration. Splicer also logs matched edge_ids during `splice` runs so operators can copy them from output. | not started |
 | 6    | Higher-level selectors (`on_node`, `on_interface`, `between_subgraph`). Expand to multi per-edge rules at parse time. Default is "all edges in the unit"; optional `filter:` block narrows to a subset by interface name or explicit edge_id list. | not started |
