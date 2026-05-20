@@ -18,12 +18,14 @@ mod assemble;
 mod behavior_meta;
 mod bindgen;
 mod bindings_walk;
+mod build;
 mod emit_method;
 mod emit_wit_typed;
 
 pub use assemble::{
     assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs,
 };
+pub use build::{build_wrapper, cache_key, BuildConfig};
 pub use behavior_meta::{read_behavior, read_behavior_from_str, Behavior, BehaviorReadError};
 pub use bindgen::run_wit_bindgen_rust;
 pub use bindings_walk::{
