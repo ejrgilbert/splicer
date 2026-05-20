@@ -73,11 +73,18 @@ use super::emit::wasm_type_to_val;
 /// The same bindgen drives both `lift_from_memory` (memory → flat
 /// values on the wasm stack) and `lower_to_memory` (flat values from
 /// wasm function params → memory). Lift uses [`Self::addr_local`] +
-/// the load arms; lower additionally uses
-/// [`Self::param_flat_locals`] / [`Self::flat_cursor`] to feed the
-/// scalar lift-to-flat arms (`I32FromU32`, etc.) plus the store arms.
-/// A bindgen built without param-flat-locals only handles lift; to
-/// drive lower, callers chain [`Self::with_param_flat_locals`].
+/// the load arms; lower additionally uses [`Self::flat_cursor`] +
+/// [`Self::param_flat_count`] to feed the scalar lift-to-flat arms
+/// (`I32FromU32`, etc.) plus the store arms. Pure-lift contexts can
+/// skip [`Self::with_param_flat_count`].
+///
+/// Lower-mode invariant: wasm local index == `flat_cursor`. The
+/// caller arranges for the wrapper's first `param_flat_count` locals
+/// to be exactly the flat params, in canonical order. The replay
+/// helpers rely on this to remap `LocalGet(k)` by cursor arithmetic.
+/// Variant arms canonically overlap on the joined-flat window, so
+/// `finish_block_body` rewinds the cursor for arm blocks tagged via
+/// `VariantPayloadName`.
 pub(crate) struct WasmEncoderBindgen<'a> {
     /// Top-level instruction buffer — the final output that goes into
     /// the target Function. Emits land here when no block is active.
@@ -103,16 +110,10 @@ pub(crate) struct WasmEncoderBindgen<'a> {
     /// uses for its own locals, so all of the function's locals land
     /// in one contiguous, correctly-indexed block.
     indices: &'a mut LocalsBuilder,
-    /// Flat wasm-locals that scalar lift-to-flat arms (`I32FromU32`,
-    /// `I64FromU64`, `CoreF32FromF32`, …) read from in canonical
-    /// left-to-right order. Empty for pure-lift use; populated via
-    /// [`Self::with_param_flat_locals`] to enable lower.
-    param_flat_locals: Vec<u32>,
-    /// Cursor into [`Self::param_flat_locals`] — bumped one slot per
-    /// scalar lift-to-flat emit. The cursor is global across the whole
-    /// lower sequence (not reset per param), so callers concatenate
-    /// per-param flat-locals in canonical order before constructing
-    /// the bindgen.
+    /// Width of the wrapper's flat-param block. `0` for lift-only.
+    param_flat_count: u32,
+    /// Next flat slot to consume; also the wasm-local index, by the
+    /// lower-mode invariant.
     flat_cursor: u32,
     /// Lazy per-`ValType` scratch local for the value-shuffle template
     /// stores need (`local.set $tmp; local.get $addr; local.get $tmp;
@@ -139,6 +140,9 @@ struct ActiveBlock {
     /// actual canonical-ABI flat-slot positions at replay time.
     /// Unused on the lift side (lifts don't read flat slots).
     start_cursor: u32,
+    /// Set on `VariantPayloadName`; triggers cursor rewind in
+    /// `finish_block_body`.
+    is_variant_arm: bool,
 }
 
 /// A captured block body — the wasm instructions emitted between a
@@ -160,7 +164,7 @@ struct CompletedBlock {
     iter_addr_local: Option<u32>,
     /// Cursor at the moment this block was opened (lower-mode only).
     /// Together with `end_cursor`, gives the [start, end) range of
-    /// `param_flat_locals` indices the body's `LocalGet`s reference.
+    /// flat-param indices the body's `LocalGet`s reference.
     start_cursor: u32,
     /// Cursor at the moment this block was closed. `end - start` is
     /// the number of flat slots this block consumed.
@@ -180,18 +184,16 @@ impl<'a> WasmEncoderBindgen<'a> {
             sizes,
             addr_local,
             indices,
-            param_flat_locals: Vec::new(),
+            param_flat_count: 0,
             flat_cursor: 0,
             store_tmp_by_valtype: HashMap::new(),
         }
     }
 
-    /// Enable lower-mode: scalar lift-to-flat arms emit `local.get`s
-    /// that read sequentially from `locals`. Pass the concatenation of
-    /// each param's flat wasm-locals in canonical (param-declaration)
-    /// order. Pure lift contexts can skip this builder.
-    pub fn with_param_flat_locals(mut self, locals: Vec<u32>) -> Self {
-        self.param_flat_locals = locals;
+    /// Enable lower-mode with `count` flat-param locals at indices
+    /// `0..count` in canonical order.
+    pub fn with_param_flat_count(mut self, count: u32) -> Self {
+        self.param_flat_count = count;
         self
     }
 
@@ -310,27 +312,16 @@ impl<'a> WasmEncoderBindgen<'a> {
         idx
     }
 
-    /// Emit `local.get $param_flat_locals[cursor]; cursor += 1` —
-    /// reads the next flat slot the canonical-ABI lower expects from
-    /// the wrapper export's wasm function params. Used by the scalar
-    /// lift-to-flat arms (`I32FromU32`, `I64FromU64`, etc.), which
-    /// are no-ops at the wasm layer but consume one flat slot.
+    /// Emit `local.get $cursor; cursor += 1` for a scalar lift-to-flat.
     fn emit_get_flat_slot(&mut self) {
-        let local = *self
-            .param_flat_locals
-            .get(self.flat_cursor as usize)
-            .unwrap_or_else(|| {
-                panic!(
-                    "lift-to-flat past end of param_flat_locals \
-                     (cursor={}, len={}). Did the caller forget \
-                     `with_param_flat_locals`, or feed the wrong \
-                     param flat width?",
-                    self.flat_cursor,
-                    self.param_flat_locals.len(),
-                )
-            });
-        self.emit_one(Instruction::LocalGet(local));
-        self.flat_cursor += 1;
+        let idx = self.flat_cursor;
+        assert!(
+            idx < self.param_flat_count,
+            "lift-to-flat past end of param flat (cursor={idx}, count={count})",
+            count = self.param_flat_count,
+        );
+        self.emit_one(Instruction::LocalGet(idx));
+        self.flat_cursor = idx + 1;
     }
 
     /// Emit a bitcast sequence to convert the top-of-stack value's
@@ -379,6 +370,7 @@ impl<'a> WasmEncoderBindgen<'a> {
             buffer: Vec::new(),
             iter_addr_local: None,
             start_cursor: self.flat_cursor,
+            is_variant_arm: false,
         });
     }
 
@@ -389,6 +381,12 @@ impl<'a> WasmEncoderBindgen<'a> {
             .pop()
             .expect("finish_block without matching push_block");
         let end_cursor = self.flat_cursor;
+        // Sibling variant arms overlap on the joined-flat window;
+        // rewind so the next arm starts at the same cursor. The
+        // captured `end_cursor` keeps the replay range intact.
+        if active.is_variant_arm {
+            self.flat_cursor = active.start_cursor;
+        }
         self.completed_blocks.push(CompletedBlock {
             body: active.buffer,
             iter_addr_local: active.iter_addr_local,
@@ -417,7 +415,11 @@ impl<'a> WasmEncoderBindgen<'a> {
         });
         let joined_total = joined.len() as u32;
 
-        let start = self.completed_blocks.len() - n_arms;
+        let start = self
+            .completed_blocks
+            .len()
+            .checked_sub(n_arms)
+            .expect("fewer captured arm blocks than arms");
         let arms: Vec<CompletedBlock> = self.completed_blocks.drain(start..).collect();
         let variant_start = arms[0].start_cursor;
 
@@ -437,10 +439,7 @@ impl<'a> WasmEncoderBindgen<'a> {
             .collect();
 
         // Disc lives at the variant's first flat slot.
-        let disc_param_local = *self
-            .param_flat_locals
-            .get(variant_start as usize)
-            .expect("variant disc cursor in range");
+        let disc_param_local = variant_start;
         let disc_local = self.alloc_local(ValType::I32);
         self.emit_one(Instruction::LocalGet(disc_param_local));
         self.emit_one(Instruction::LocalSet(disc_local));
@@ -467,11 +466,7 @@ impl<'a> WasmEncoderBindgen<'a> {
                 .map(|wt| self.alloc_local(wasm_type_to_val(*wt)))
                 .collect();
             for (m, &arm_wt) in arm_flat.iter().enumerate() {
-                let joined_idx = (variant_start as usize) + 1 + m;
-                let joined_local = *self
-                    .param_flat_locals
-                    .get(joined_idx)
-                    .expect("variant payload cursor in range");
+                let joined_local = variant_start + 1 + m as u32;
                 self.emit_one(Instruction::LocalGet(joined_local));
                 self.emit_bitcast(&cast(joined[m + 1], arm_wt));
                 self.emit_one(Instruction::LocalSet(arm_locals[m]));
@@ -620,7 +615,11 @@ impl<'a> WasmEncoderBindgen<'a> {
 
         // Pop the arm blocks (most recent n, in arm order).
         let n = arm_types.len();
-        let start = self.completed_blocks.len() - n;
+        let start = self
+            .completed_blocks
+            .len()
+            .checked_sub(n)
+            .expect("fewer captured arm blocks than arms");
         let arm_blocks: Vec<CompletedBlock> = self.completed_blocks.drain(start..).collect();
 
         // Compute arm natural flats.
@@ -995,7 +994,15 @@ impl Bindgen for WasmEncoderBindgen<'_> {
                 self.emit_one(Instruction::I32Const(*val));
                 produce_n(results, 1);
             }
-            AbiInst::IterElem { .. } | AbiInst::VariantPayloadName => {
+            AbiInst::IterElem { .. } => {
+                produce_n(results, 1);
+            }
+            AbiInst::VariantPayloadName => {
+                // Tag the arm so `finish_block_body` rewinds its cursor.
+                self.block_buffers
+                    .last_mut()
+                    .expect("VariantPayloadName outside a block")
+                    .is_variant_arm = true;
                 produce_n(results, 1);
             }
 
@@ -1292,7 +1299,7 @@ impl WasmEncoderBindgen<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wit_bindgen_core::abi::lift_from_memory;
+    use wit_bindgen_core::abi::{lift_from_memory, lower_to_memory};
     use wit_parser::{Docs, Field, Record, Span, Stability, TypeDef, TypeDefKind, TypeOwner};
 
     fn new_sizes(resolve: &Resolve) -> SizeAlign {
@@ -1598,5 +1605,91 @@ mod tests {
             1,
             "ok (list) arm should widen Pointer to PointerOrI64"
         );
+    }
+
+    /// `variant { a(u64), b(u64), c(u64) }` — arms overlap on the
+    /// joined-flat payload slot. Without the arm-rewind, arm 2's
+    /// body reads past `param_flat_count` and panics at codegen.
+    #[test]
+    fn lower_variant_arms_share_joined_payload_slot() {
+        let mut resolve = Resolve::default();
+        let variant_id = resolve.types.alloc(TypeDef {
+            name: Some("v".to_string()),
+            kind: TypeDefKind::Variant(wit_parser::Variant {
+                cases: vec![
+                    wit_parser::Case {
+                        name: "a".to_string(),
+                        ty: Some(Type::U64),
+                        docs: Docs::default(),
+                        span: Span::default(),
+                    },
+                    wit_parser::Case {
+                        name: "b".to_string(),
+                        ty: Some(Type::U64),
+                        docs: Docs::default(),
+                        span: Span::default(),
+                    },
+                    wit_parser::Case {
+                        name: "c".to_string(),
+                        ty: Some(Type::U64),
+                        docs: Docs::default(),
+                        span: Span::default(),
+                    },
+                ],
+            }),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        let sizes = new_sizes(&resolve);
+        // Joined flat = [disc, i64 payload] = 2 wrapper params.
+        let mut indices = LocalsBuilder::new(2);
+        let addr_local = indices.alloc_local(ValType::I32);
+        let mut bg =
+            WasmEncoderBindgen::new(&sizes, addr_local, &mut indices).with_param_flat_count(2);
+        bg.emit_set_addr_const(0);
+        lower_to_memory(&resolve, &mut bg, (), (), &Type::Id(variant_id));
+
+        let insts = bg.into_instructions();
+        let count_inst =
+            |pred: fn(&Instruction<'_>) -> bool| insts.iter().filter(|i| pred(i)).count();
+        // One br_table; disc read once; payload param pre-loaded
+        // once per arm (3 arms → 3 reads of local 1).
+        assert_eq!(count_inst(|i| matches!(i, Instruction::BrTable(_, _))), 1);
+        assert_eq!(count_inst(|i| matches!(i, Instruction::LocalGet(0))), 1);
+        assert_eq!(count_inst(|i| matches!(i, Instruction::LocalGet(1))), 3);
+    }
+
+    /// Lower-side `option<u32>` — one `br_table` over the two arms,
+    /// payload param pre-loaded only for `Some`.
+    #[test]
+    fn lower_option_emits_dispatch() {
+        let mut resolve = Resolve::default();
+        let opt_id = resolve.types.alloc(TypeDef {
+            name: Some("o".to_string()),
+            kind: TypeDefKind::Option(Type::U32),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        let sizes = new_sizes(&resolve);
+        // option<u32> joined flat = [disc, i32] = 2 slots.
+        let mut indices = LocalsBuilder::new(2);
+        let addr_local = indices.alloc_local(ValType::I32);
+        let mut bg =
+            WasmEncoderBindgen::new(&sizes, addr_local, &mut indices).with_param_flat_count(2);
+        bg.emit_set_addr_const(0);
+        lower_to_memory(&resolve, &mut bg, (), (), &Type::Id(opt_id));
+
+        let insts = bg.into_instructions();
+        let count_inst =
+            |pred: fn(&Instruction<'_>) -> bool| insts.iter().filter(|i| pred(i)).count();
+        // One br_table; disc read once; payload pre-loaded only for
+        // Some (None has no payload).
+        assert_eq!(count_inst(|i| matches!(i, Instruction::BrTable(_, _))), 1);
+        assert_eq!(count_inst(|i| matches!(i, Instruction::LocalGet(0))), 1);
+        assert_eq!(count_inst(|i| matches!(i, Instruction::LocalGet(1))), 1);
     }
 }
