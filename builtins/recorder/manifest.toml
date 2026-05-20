@@ -3,7 +3,13 @@ description = "Record every wrapped call's lifted args + result as a binary stre
 
 [[key]]
 name = "sink"
-type = "enum { stdout, stderr }"
+type = "enum { stdout, stderr, file }"
 case_insensitive = true
 default = "stdout"
-doc = "Which standard stream binary frames are appended to. Use `stderr` when the wrapped component itself prints structured output on stdout (the recorder stream needs its own channel to parse)."
+doc = "Where binary frames are written. `file` opens `<preopen>/<dir>/<edge_id>.bin` and is the only safe choice when more than one recorder is spliced into the same composition. `stdout`/`stderr` share one stream so multiple recorders interleave and can't be demultiplexed; use them for single-instance debugging only."
+
+[[key]]
+name = "dir"
+type = "string"
+default = "./recordings"
+doc = "Directory (relative to the host-provided wasi:filesystem preopen) where the `file` sink lands each edge's recording. Components nested under the preopen are created lazily if missing. Ignored when `sink` is `stdout`/`stderr`."
