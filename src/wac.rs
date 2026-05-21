@@ -606,10 +606,8 @@ impl EmitPlan {
             } else {
                 vec![(interface.name.clone(), downstream_var.to_string())]
             };
-            self.entities.insert(
-                mw_var.clone(),
-                Entity::wired(&mw_var, &real_pkg, imports),
-            );
+            self.entities
+                .insert(mw_var.clone(), Entity::wired(&mw_var, &real_pkg, imports));
             self.used_middlewares.insert(real_pkg, mdl_path);
             Ok(mw_var)
         }
