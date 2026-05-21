@@ -573,12 +573,11 @@ mod tests {
     }
 
     /// Single-flat-slot compound result (`tuple<u32>`) — comes back
-    /// flat, not via retptr, so `is_compound_result` falls through to
-    /// no-lift. Build must succeed (after-hook sees `result:
-    /// option::none`); the regression guard is the lack of a panic
-    /// from `Compound → retptr scratch reserved`.
+    /// flat (not via retptr). Compound emit reads from `lcl.result`
+    /// instead of memory; the regression guard pins both the build
+    /// and validate paths through the no-retptr Compound branch.
     #[test]
-    fn dispatch_module_with_single_slot_tuple_result_falls_through() {
+    fn dispatch_module_with_single_slot_tuple_result_lifts_from_flat() {
         let wat = r#"(component
             (component $inner
                 (core module $m
@@ -607,7 +606,7 @@ mod tests {
             common_wit,
             tier2_wit,
         )
-        .expect("single-slot tuple result must fall through to no-lift, not panic");
+        .expect("single-slot tuple result must build via no-retptr Compound, not panic");
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
             .expect("emitted adapter component should validate");
@@ -1652,14 +1651,12 @@ mod tests {
     }
 
     /// Single-flat-slot variant (`variant { only }` → just disc, no
-    /// payloads) — comes back flat, not retptr. The
-    /// `is_compound_result(Variant) && result_at_retptr` gate falls
-    /// through to single-cell path; variant isn't in
-    /// `is_supported_direct_result`, so classify returns None → no
-    /// lift, after-hook sees `result: option::none`. Pins the
-    /// fall-through against future regressions.
+    /// payloads) — comes back flat, not retptr. Routes through the
+    /// no-retptr Compound branch (variant is in `is_compound_result`),
+    /// reading the disc from `lcl.result`. Pins the build + validate
+    /// of this single-cell flat-Compound path.
     #[test]
-    fn dispatch_module_with_single_slot_variant_result_falls_through() {
+    fn dispatch_module_with_single_slot_variant_result_lifts_from_flat() {
         let wat = r#"(component
             (component $inner
                 (core module $m
@@ -1690,7 +1687,7 @@ mod tests {
             common_wit,
             tier2_wit,
         )
-        .expect("single-slot variant must fall through to no-lift, not panic");
+        .expect("single-slot variant must build via no-retptr Compound, not panic");
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
             .expect("emitted adapter component should validate");
@@ -1933,12 +1930,12 @@ mod tests {
     }
 
     /// Single-flat-slot compound result (`result<_, _>`) — flat is
-    /// just the i32 disc, comes back direct (not retptr). Pins the
-    /// `result_at_retptr` fall-through gate for the Result Compound
-    /// branch — must build successfully, after-hook sees
-    /// `result: option::none`.
+    /// just the i32 disc, comes back direct (not retptr). Routes
+    /// through the no-retptr Compound branch (reading the disc from
+    /// `lcl.result`); the after-hook sees `result-err(none)` or
+    /// `result-ok(none)`.
     #[test]
-    fn dispatch_module_with_single_slot_result_result_falls_through() {
+    fn dispatch_module_with_single_slot_result_result_lifts_from_flat() {
         let wat = r#"(component
             (component $inner
                 (core module $m
@@ -1967,7 +1964,7 @@ mod tests {
             common_wit,
             tier2_wit,
         )
-        .expect("single-slot result must fall through to no-lift, not panic");
+        .expect("single-slot result must build via no-retptr Compound, not panic");
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(&bytes)
             .expect("emitted adapter component should validate");
