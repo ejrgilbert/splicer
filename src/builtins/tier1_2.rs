@@ -1,9 +1,6 @@
-//! Registry-backed catalogue of middleware components shipped with splicer.
-//!
-//! Each builtin is published as an OCI artifact under
-//! `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>` by the
-//! `publish-builtin.yml` workflow. At runtime, [`materialize_into`]
-//! resolves a builtin in this order:
+//! Tier-1/2 builtins: pre-built wasm components published to an OCI
+//! registry. At splice-time [`materialize_into`] resolves a builtin
+//! in this order:
 //!
 //!   1. `$SPLICER_BUILTINS_DIR/<name>.wasm` — local override, intended
 //!      for iterating on a builtin without re-publishing. `make
@@ -11,14 +8,6 @@
 //!      natural value to point this at.
 //!   2. On-disk cache at `<user-cache>/splicer/builtins/<name>@<version>.wasm`.
 //!   3. OCI pull from ghcr, populating the cache for next time.
-//!
-//! Builtins are referenced from the splice config YAML as
-//! `inject: [{ builtin: <name> }]`. The parser populates
-//! [`crate::parse::config::Injection::builtin`] with the name; the
-//! splice pipeline then calls [`materialize_into`] before contract
-//! validation runs to write the resolved bytes to disk under the
-//! splits dir, after which the rest of the pipeline treats the
-//! injection like any other path-backed middleware.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
