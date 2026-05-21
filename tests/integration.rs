@@ -64,12 +64,32 @@ fn ensure_fixtures_built() {
             );
             return;
         }
+        // Build the tier-1/2 builtin wasms from this branch's source so
+        // splicer doesn't fall back to OCI (which would test whatever's
+        // currently published, not this branch).
+        let status = match Command::new("make")
+            .arg("build-builtins")
+            .status()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ensure_fixtures_built: spawn make build-builtins: {e}");
+                return;
+            }
+        };
+        if !status.success() {
+            eprintln!(
+                "ensure_fixtures_built: make build-builtins failed with exit code {:?}",
+                status.code()
+            );
+            return;
+        }
         FIXTURES_BUILD_OK.store(true, Ordering::Relaxed);
     });
     assert!(
         FIXTURES_BUILD_OK.load(Ordering::Relaxed),
         "fixture build failed — see the first FAILED integration_* test's \
-         output for the actual `./run.sh build` error"
+         output for the actual build error"
     );
 }
 
@@ -80,10 +100,15 @@ fn run_config(opt: &str) {
         panic!("component-interposition submodule not ready");
     }
     ensure_fixtures_built();
+    let builtins_dir = std::env::current_dir()
+        .expect("cwd")
+        .join("assets")
+        .join("builtins");
     let status = Command::new("./run.sh")
         .arg("all")
         .arg(format!("--{}", opt))
         .arg("--skip-build")
+        .env("SPLICER_BUILTINS_DIR", &builtins_dir)
         .current_dir(SUBMODULE_PATH)
         .status()
         .unwrap_or_else(|e| panic!("failed to run ./run.sh all --{}: {}", opt, e));
