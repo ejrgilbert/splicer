@@ -1,5 +1,5 @@
 //! Tier-3 and tier-4 strategy traits. Each user-authored strategy
-//! implements **exactly one** of [`ForwardStrategy`] (tier-3) or
+//! implements **exactly one** of [`TransformStrategy`] (tier-3) or
 //! [`VirtualizeStrategy`] (tier-4); splicer's per-target codegen
 //! template reads the strategy crate's source to find which trait is
 //! impl'd and emits the matching wrapper shape.
@@ -32,11 +32,11 @@ use crate::types::CallId;
 /// # Example: log every wrapped call, then forward
 ///
 /// ```ignore
-/// use splicer_tool_sdk::{CallId, ForwardStrategy};
+/// use splicer_tool_sdk::{CallId, TransformStrategy};
 ///
 /// struct LogCalls;
 ///
-/// impl<Args, R> ForwardStrategy<Args, R> for LogCalls {
+/// impl<Args, R> TransformStrategy<Args, R> for LogCalls {
 ///     async fn handle(
 ///         &self,
 ///         call: CallId,
@@ -60,7 +60,7 @@ use crate::types::CallId;
 // We intentionally omit a `Send` bound on the returned future:
 // generated wrappers run in single-threaded wasm components.
 #[allow(async_fn_in_trait)]
-pub trait ForwardStrategy<Args, R> {
+pub trait TransformStrategy<Args, R> {
     /// Handle one wrapped invocation. `downstream` invokes the
     /// wrapped target; call it (with original or mutated `args`),
     /// then optionally mutate and return its result.
@@ -107,7 +107,7 @@ pub trait ForwardStrategy<Args, R> {
 ///
 /// # Per-strategy state
 ///
-/// Same lifecycle and concurrency story as [`ForwardStrategy`]:
+/// Same lifecycle and concurrency story as [`TransformStrategy`]:
 /// one instance per wrapper component, mutate via interior
 /// mutability, don't hold borrows across `.await`.
 #[allow(async_fn_in_trait)]
@@ -124,7 +124,7 @@ mod tests {
     /// Pass-through forward: hands args to downstream unchanged.
     struct PassThrough;
 
-    impl<Args, R> ForwardStrategy<Args, R> for PassThrough {
+    impl<Args, R> TransformStrategy<Args, R> for PassThrough {
         async fn handle(
             &self,
             _call: CallId,

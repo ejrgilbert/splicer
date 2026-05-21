@@ -12,9 +12,10 @@ use builtin_manifest::Tier;
 /// What the strategy does to the wrapped target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Behavior {
-    /// Strategy forwards each call to the wrapped target. Wrapper
-    /// imports the target's interface.
-    Forward,
+    /// Strategy transforms the call — receives typed args + result
+    /// and may mutate either before forwarding to the wrapped target.
+    /// Wrapper imports the target's interface.
+    Transform,
     /// Strategy replaces the wrapped target. Wrapper does not import
     /// the target's interface.
     Virtualize,
@@ -76,7 +77,7 @@ pub fn read_behavior(crate_dir: &Path) -> Result<Behavior, BehaviorReadError> {
 pub fn read_behavior_from_str(toml_text: &str) -> Result<Behavior, BehaviorReadError> {
     let manifest: builtin_manifest::Manifest = toml::from_str(toml_text)?;
     match manifest.builtin.tier {
-        Tier::Tier3 => Ok(Behavior::Forward),
+        Tier::Tier3 => Ok(Behavior::Transform),
         Tier::Tier4 => Ok(Behavior::Virtualize),
         other => Err(BehaviorReadError::NotTyped(other)),
     }
@@ -93,7 +94,7 @@ mod tests {
             description = "hello-tier3 smoke"
             tier = 3
         "#;
-        assert_eq!(read_behavior_from_str(toml).unwrap(), Behavior::Forward);
+        assert_eq!(read_behavior_from_str(toml).unwrap(), Behavior::Transform);
     }
 
     #[test]

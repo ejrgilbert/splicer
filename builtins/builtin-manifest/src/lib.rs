@@ -78,8 +78,9 @@ pub enum Tier {
     Tier1,
     /// Typed observation hooks (lifted args/result as cells). Wasm builtin.
     Tier2,
-    /// Forward strategy — passes through to the wrapped target,
-    /// optionally transforming. Source crate, splicer-built per target.
+    /// Transform strategy — typed access to the call; may mutate
+    /// args/result while forwarding to the wrapped target. Source
+    /// crate, splicer-built per target.
     Tier3,
     /// Virtualize strategy — replaces the wrapped target. Source
     /// crate, splicer-built per target.
@@ -112,13 +113,13 @@ impl From<Tier> for u8 {
 
 impl Tier {
     /// Human-readable single-word label suitable for `splicer
-    /// builtin` output: `"name-only"`, `"observe"`, `"forward"`,
+    /// builtin` output: `"name-only"`, `"observe"`, `"transform"`,
     /// `"virtualize"`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Tier1 => "name-only",
             Self::Tier2 => "observe",
-            Self::Tier3 => "forward",
+            Self::Tier3 => "transform",
             Self::Tier4 => "virtualize",
         }
     }

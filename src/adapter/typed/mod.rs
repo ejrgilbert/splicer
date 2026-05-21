@@ -83,7 +83,7 @@ pub struct GenerateWrapperInput<'a> {
     /// Qualified name of the wrapped interface, e.g.
     /// `"wasi:keyvalue/store@0.2.0"`. Goes into each emitted `CallId`.
     pub interface_qualified_name: &'a str,
-    /// Forward (tier-3) or virtualize (tier-4).
+    /// Transform (tier-3) or virtualize (tier-4).
     pub behavior: Behavior,
     /// The strategy's Cargo package name.
     pub strategy_crate_name: &'a str,
@@ -150,8 +150,8 @@ mod tests {
     }
 
     #[test]
-    fn forward_pipeline_produces_a_complete_wrapper_crate() {
-        let crate_out = generate_wrapper_crate(&input(Behavior::Forward)).unwrap();
+    fn transform_pipeline_produces_a_complete_wrapper_crate() {
+        let crate_out = generate_wrapper_crate(&input(Behavior::Transform)).unwrap();
         // Crate name reflects both inputs and is a valid Cargo ident.
         assert!(
             crate_out.crate_name.starts_with("splicer_wrapper_"),
@@ -164,8 +164,8 @@ mod tests {
         let lib = &crate_out.lib_rs;
         assert!(lib.contains("mod bindings"), "missing bindings:\n{lib}");
         assert!(
-            lib.contains("ForwardStrategy"),
-            "forward pipeline should use ForwardStrategy:\n{lib}"
+            lib.contains("TransformStrategy"),
+            "transform pipeline should use TransformStrategy:\n{lib}"
         );
         assert!(lib.contains("OnceLock"), "missing OnceLock storage:\n{lib}");
         assert!(
@@ -187,8 +187,8 @@ mod tests {
             crate_out.lib_rs
         );
         assert!(
-            !crate_out.lib_rs.contains("ForwardStrategy"),
-            "virtualize pipeline should not import ForwardStrategy:\n{}",
+            !crate_out.lib_rs.contains("TransformStrategy"),
+            "virtualize pipeline should not import TransformStrategy:\n{}",
             crate_out.lib_rs
         );
     }

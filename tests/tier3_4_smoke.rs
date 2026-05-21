@@ -112,7 +112,7 @@ fn hello_tier3_builds_to_a_valid_component() {
         TIER3_TARGET_WIT,
         "tier3-smoke",
         "smoke:tier3/ops@0.1.0",
-        Behavior::Forward,
+        Behavior::Transform,
         "hello-tier3",
         "HelloTier3",
     );

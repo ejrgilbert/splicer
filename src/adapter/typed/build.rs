@@ -38,7 +38,7 @@ pub fn cache_key(input: &GenerateWrapperInput<'_>) -> String {
     input.world_name.hash(&mut h);
     input.interface_qualified_name.hash(&mut h);
     match input.behavior {
-        Behavior::Forward => "forward".hash(&mut h),
+        Behavior::Transform => "transform".hash(&mut h),
         Behavior::Virtualize => "virtualize".hash(&mut h),
     }
     input.strategy_crate_name.hash(&mut h);
@@ -181,27 +181,27 @@ mod tests {
 
     #[test]
     fn cache_key_is_deterministic() {
-        let a = cache_key(&sample_input(Behavior::Forward));
-        let b = cache_key(&sample_input(Behavior::Forward));
+        let a = cache_key(&sample_input(Behavior::Transform));
+        let b = cache_key(&sample_input(Behavior::Transform));
         assert_eq!(a, b);
     }
 
     #[test]
     fn cache_key_distinguishes_behavior() {
         assert_ne!(
-            cache_key(&sample_input(Behavior::Forward)),
+            cache_key(&sample_input(Behavior::Transform)),
             cache_key(&sample_input(Behavior::Virtualize)),
         );
     }
 
     #[test]
     fn cache_key_distinguishes_target_wit() {
-        let mut a = sample_input(Behavior::Forward);
+        let mut a = sample_input(Behavior::Transform);
         let other_wit = "package t:p@0.2.0; interface i { f: func(); } world w { export i; }";
         a.target_wit = other_wit;
         assert_ne!(
             cache_key(&a),
-            cache_key(&sample_input(Behavior::Forward)),
+            cache_key(&sample_input(Behavior::Transform)),
         );
     }
 

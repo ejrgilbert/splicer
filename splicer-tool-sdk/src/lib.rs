@@ -17,7 +17,7 @@ pub mod types;
 pub mod wave_bridge;
 
 pub use format::{cell_to_str, format_field_tree};
-pub use strategy::{ForwardStrategy, VirtualizeStrategy};
+pub use strategy::{TransformStrategy, VirtualizeStrategy};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };

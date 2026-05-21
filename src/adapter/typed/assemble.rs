@@ -45,7 +45,7 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
     // The behavior-specific use exposes whichever strategy trait the
     // emitted method bodies dispatch through.
     let strategy_trait_use = match inputs.behavior {
-        Behavior::Forward => quote!(use ::splicer_tool_sdk::ForwardStrategy;),
+        Behavior::Transform => quote!(use ::splicer_tool_sdk::TransformStrategy;),
         Behavior::Virtualize => quote!(use ::splicer_tool_sdk::VirtualizeStrategy;),
     };
 
@@ -187,14 +187,14 @@ mod tests {
 
     #[test]
     fn assembled_lib_rs_has_required_pieces() {
-        let out = assemble_for_tiny(Behavior::Forward);
+        let out = assemble_for_tiny(Behavior::Transform);
 
         // The bindings get wrapped in `mod bindings`.
         assert!(out.contains("mod bindings"), "expected `mod bindings`:\n{out}");
         // Shared use statements.
         assert!(
-            out.contains("use ::splicer_tool_sdk::ForwardStrategy"),
-            "forward dispatch expects ForwardStrategy use:\n{out}"
+            out.contains("use ::splicer_tool_sdk::TransformStrategy"),
+            "forward dispatch expects TransformStrategy use:\n{out}"
         );
         // The strategy is stored in a OnceLock<S> so the `&S`
         // handed to handle() has `'static` lifetime (avoids
@@ -221,8 +221,8 @@ mod tests {
             "virtualize dispatch expects VirtualizeStrategy use:\n{out}"
         );
         assert!(
-            !out.contains("use ::splicer_tool_sdk::ForwardStrategy"),
-            "virtualize emission should not import ForwardStrategy:\n{out}"
+            !out.contains("use ::splicer_tool_sdk::TransformStrategy"),
+            "virtualize emission should not import TransformStrategy:\n{out}"
         );
     }
 

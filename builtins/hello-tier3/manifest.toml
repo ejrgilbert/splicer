@@ -1,5 +1,5 @@
 [builtin]
-description = "Smoke-test tier-3 builtin: forward strategy that prints a greeting before and after each wrapped call."
+description = "Smoke-test tier-3 builtin: transform strategy that prints a greeting before and after each wrapped call."
 tier = 3
 
 [[key]]

@@ -235,7 +235,7 @@ fn emit_method_body(
     };
 
     // The downstream closure unpacks args back into positional and
-    // calls the target import. For tier-3 (forward); skipped entirely
+    // calls the target import. For tier-3 (transform); skipped entirely
     // for tier-4 (virtualize). The import is awaited iff the Guest
     // method is async (mirroring whether the WIT marked it `async func`).
     let target_call = build_target_call(method_ident, params, guest_module_path);
@@ -246,13 +246,13 @@ fn emit_method_body(
     };
 
     let dispatch = match behavior {
-        Behavior::Forward => {
+        Behavior::Transform => {
             // Annotate the closure's `args` parameter explicitly:
             // Rust doesn't always propagate the trait's `Args`
             // generic through the qualified `<_ as Trait<...>>::handle`
             // dispatch into closure-parameter inference (E0282).
             quote! {
-                <_ as ::splicer_tool_sdk::ForwardStrategy<#args_ident, #return_ty>>::handle(
+                <_ as ::splicer_tool_sdk::TransformStrategy<#args_ident, #return_ty>>::handle(
                     s,
                     call,
                     args,
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn emits_args_struct_with_fields() {
-        let out = emit_for_tiny(Behavior::Forward);
+        let out = emit_for_tiny(Behavior::Transform);
         assert!(
             out.contains("pub struct OpsAddArgs"),
             "expected OpsAddArgs struct: {out}"
@@ -368,10 +368,10 @@ mod tests {
 
     #[test]
     fn forward_emission_uses_forward_strategy_and_downstream_closure() {
-        let out = emit_for_tiny(Behavior::Forward);
+        let out = emit_for_tiny(Behavior::Transform);
         assert!(
-            out.contains("ForwardStrategy"),
-            "expected ForwardStrategy dispatch: {out}"
+            out.contains("TransformStrategy"),
+            "expected TransformStrategy dispatch: {out}"
         );
         // The downstream closure calls the import-side bindings path.
         assert!(
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn call_id_carries_interface_and_function_names() {
-        let out = emit_for_tiny(Behavior::Forward);
+        let out = emit_for_tiny(Behavior::Transform);
         assert!(
             out.contains("\"test:pkg/ops@0.1.0\""),
             "expected qualified interface in CallId: {out}"
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn args_struct_witty_impl_emitted() {
-        let out = emit_for_tiny(Behavior::Forward);
+        let out = emit_for_tiny(Behavior::Transform);
         assert!(
             out.contains("impl :: splicer_tool_sdk :: WitTyped for OpsAddArgs"),
             "expected WitTyped impl for args struct: {out}"
@@ -435,7 +435,7 @@ mod tests {
         let src = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = walk_bindings(&src).unwrap();
         let g = &bindings.guest_traits[0];
-        let emitted = emit_guest(g, "test:pkg/ops@0.1.0", Behavior::Forward);
+        let emitted = emit_guest(g, "test:pkg/ops@0.1.0", Behavior::Transform);
         let out = normalize(
             &emitted
                 .args_structs
