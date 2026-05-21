@@ -61,12 +61,67 @@ pub struct Manifest {
 pub struct BuiltinMeta {
     /// One-line description shown by `splicer builtin list`.
     pub description: String,
-    /// For tier-3/4 builtins: `"forward"` (the strategy passes calls
-    /// through to the wrapped target) or `"virtualize"` (the strategy
-    /// replaces the wrapped target). Absent for tier-1/2 builtins,
-    /// where tier is inferred from the component's WIT exports.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub behavior: Option<String>,
+    /// Which splicer tier this builtin participates in. Required;
+    /// tier-3 implies forward (calls pass through to the wrapped
+    /// target), tier-4 implies virtualize (the strategy replaces
+    /// the target).
+    pub tier: Tier,
+}
+
+/// Splicer's tier classification. Manifest reads `tier = 1` through
+/// `tier = 4`; `try_from`/`into` `u8` keeps the on-disk form numeric
+/// while enforcing the 1..=4 range at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub enum Tier {
+    /// Name-only hooks (before/after, no payload). Wasm builtin.
+    Tier1,
+    /// Typed observation hooks (lifted args/result as cells). Wasm builtin.
+    Tier2,
+    /// Forward strategy — passes through to the wrapped target,
+    /// optionally transforming. Source crate, splicer-built per target.
+    Tier3,
+    /// Virtualize strategy — replaces the wrapped target. Source
+    /// crate, splicer-built per target.
+    Tier4,
+}
+
+impl TryFrom<u8> for Tier {
+    type Error = String;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(Self::Tier1),
+            2 => Ok(Self::Tier2),
+            3 => Ok(Self::Tier3),
+            4 => Ok(Self::Tier4),
+            _ => Err(format!("invalid tier {v}; expected 1, 2, 3, or 4")),
+        }
+    }
+}
+
+impl From<Tier> for u8 {
+    fn from(t: Tier) -> u8 {
+        match t {
+            Tier::Tier1 => 1,
+            Tier::Tier2 => 2,
+            Tier::Tier3 => 3,
+            Tier::Tier4 => 4,
+        }
+    }
+}
+
+impl Tier {
+    /// Human-readable single-word label suitable for `splicer
+    /// builtin` output: `"name-only"`, `"observe"`, `"forward"`,
+    /// `"virtualize"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tier1 => "name-only",
+            Self::Tier2 => "observe",
+            Self::Tier3 => "forward",
+            Self::Tier4 => "virtualize",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

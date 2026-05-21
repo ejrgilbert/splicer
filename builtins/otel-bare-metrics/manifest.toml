@@ -1,5 +1,6 @@
 [builtin]
 description = "Emit OpenTelemetry call-count + duration-histogram metrics with delta-window aggregation."
+tier = 1
 
 [[key]]
 name = "buffer"

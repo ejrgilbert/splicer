@@ -1,6 +1,6 @@
 [builtin]
 description = "Smoke-test tier-4 builtin: virtualize strategy that synthesizes the default value of each wrapped call's return type."
-behavior = "virtualize"
+tier = 4
 
 [[key]]
 name = "greeting"

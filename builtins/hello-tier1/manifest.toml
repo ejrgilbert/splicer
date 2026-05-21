@@ -1,5 +1,6 @@
 [builtin]
 description = "Smoke-test tier-1 builtin: prints a greeting before/after each wrapped call."
+tier = 1
 
 [[key]]
 name = "greeting"

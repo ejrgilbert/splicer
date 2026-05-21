@@ -1,11 +1,13 @@
-//! Read a strategy crate's behavior declaration from its
-//! `manifest.toml`. The `[builtin]` block declares
-//! `behavior = "forward"` or `"virtualize"` alongside the
-//! description and config keys; the schema lives in
-//! `builtin_manifest::Manifest` and we delegate parsing there.
+//! Read a strategy crate's `Behavior` (forward vs virtualize) from
+//! its `manifest.toml`. Reads the manifest's required `tier` field
+//! via `builtin_manifest::Manifest` and maps tier-3 → forward,
+//! tier-4 → virtualize. Tier-1/2 manifests are rejected as not
+//! tier-3/4 builtins.
 
 use std::fmt;
 use std::path::Path;
+
+use builtin_manifest::Tier;
 
 /// What the strategy does to the wrapped target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,12 +27,8 @@ pub enum BehaviorReadError {
     Io(std::io::Error),
     /// Failed to parse the file as a `builtin_manifest::Manifest`.
     Toml(toml::de::Error),
-    /// `[builtin]` had no `behavior` key. tier-1/2 manifests legitimately
-    /// omit it; this is how callers detect a non-tier-3/4 builtin.
-    FieldMissing,
-    /// `behavior` value was something other than `"forward"` or
-    /// `"virtualize"`.
-    UnknownValue(String),
+    /// Manifest's `tier` was 1 or 2 — not a tier-3/4 builtin.
+    NotTyped(Tier),
 }
 
 impl fmt::Display for BehaviorReadError {
@@ -38,13 +36,10 @@ impl fmt::Display for BehaviorReadError {
         match self {
             Self::Io(e) => write!(f, "failed to read strategy manifest.toml: {e}"),
             Self::Toml(e) => write!(f, "failed to parse strategy manifest.toml: {e}"),
-            Self::FieldMissing => write!(
+            Self::NotTyped(t) => write!(
                 f,
-                "[builtin] has no `behavior` key; set it to \"forward\" or \"virtualize\""
-            ),
-            Self::UnknownValue(v) => write!(
-                f,
-                "[builtin] behavior = {v:?}; expected \"forward\" or \"virtualize\""
+                "manifest declares tier-{}; expected tier-3 or tier-4",
+                u8::from(*t)
             ),
         }
     }
@@ -80,14 +75,10 @@ pub fn read_behavior(crate_dir: &Path) -> Result<Behavior, BehaviorReadError> {
 /// Same as [`read_behavior`] but takes the file text directly.
 pub fn read_behavior_from_str(toml_text: &str) -> Result<Behavior, BehaviorReadError> {
     let manifest: builtin_manifest::Manifest = toml::from_str(toml_text)?;
-    let raw = manifest
-        .builtin
-        .behavior
-        .ok_or(BehaviorReadError::FieldMissing)?;
-    match raw.as_str() {
-        "forward" => Ok(Behavior::Forward),
-        "virtualize" => Ok(Behavior::Virtualize),
-        _ => Err(BehaviorReadError::UnknownValue(raw)),
+    match manifest.builtin.tier {
+        Tier::Tier3 => Ok(Behavior::Forward),
+        Tier::Tier4 => Ok(Behavior::Virtualize),
+        other => Err(BehaviorReadError::NotTyped(other)),
     }
 }
 
@@ -96,50 +87,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_forward() {
+    fn reads_forward_from_tier3_manifest() {
         let toml = r#"
             [builtin]
             description = "hello-tier3 smoke"
-            behavior = "forward"
+            tier = 3
         "#;
         assert_eq!(read_behavior_from_str(toml).unwrap(), Behavior::Forward);
     }
 
     #[test]
-    fn reads_virtualize() {
+    fn reads_virtualize_from_tier4_manifest() {
         let toml = r#"
             [builtin]
             description = "hello-tier4 smoke"
-            behavior = "virtualize"
+            tier = 4
         "#;
         assert_eq!(read_behavior_from_str(toml).unwrap(), Behavior::Virtualize);
     }
 
     #[test]
-    fn missing_behavior_field_errors() {
-        // tier-1/2 manifests legitimately have no behavior field;
-        // callers use FieldMissing to detect that case.
+    fn tier1_manifest_is_not_typed() {
         let toml = r#"
             [builtin]
             description = "tier-1 builtin"
+            tier = 1
         "#;
         assert!(matches!(
             read_behavior_from_str(toml),
-            Err(BehaviorReadError::FieldMissing)
+            Err(BehaviorReadError::NotTyped(Tier::Tier1))
         ));
     }
 
     #[test]
-    fn rejects_unknown_value() {
+    fn tier2_manifest_is_not_typed() {
+        let toml = r#"
+            [builtin]
+            description = "tier-2 builtin"
+            tier = 2
+        "#;
+        assert!(matches!(
+            read_behavior_from_str(toml),
+            Err(BehaviorReadError::NotTyped(Tier::Tier2))
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_tier() {
         let toml = r#"
             [builtin]
             description = "..."
-            behavior = "mock"
+            tier = 99
         "#;
-        match read_behavior_from_str(toml) {
-            Err(BehaviorReadError::UnknownValue(v)) => assert_eq!(v, "mock"),
-            other => panic!("expected UnknownValue, got {other:?}"),
-        }
+        assert!(matches!(
+            read_behavior_from_str(toml),
+            Err(BehaviorReadError::Toml(_))
+        ));
+    }
+
+    #[test]
+    fn missing_tier_field_errors() {
+        let toml = r#"
+            [builtin]
+            description = "old-style manifest"
+        "#;
+        assert!(matches!(
+            read_behavior_from_str(toml),
+            Err(BehaviorReadError::Toml(_))
+        ));
     }
 
     #[test]

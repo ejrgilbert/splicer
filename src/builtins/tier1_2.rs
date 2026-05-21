@@ -112,27 +112,18 @@ pub fn known_names() -> Vec<&'static str> {
     names
 }
 
-/// Resolve every user-facing builtin's bytes, extract its manifest
-/// (when present), and return the pairs in `known_names()` order.
-/// Resolution errors land as `Err(...)` rather than panicking so the
-/// caller can render partial output — `splicer builtin` shouldn't
-/// crash when one OCI pull misbehaves.
-pub fn list_with_manifests() -> Vec<(&'static str, Result<Option<builtin_manifest::Manifest>>)> {
-    let mut out = Vec::new();
-    for name in known_names() {
-        let entry = (|| -> Result<Option<builtin_manifest::Manifest>> {
-            let bytes = load_resolved_bytes(name)?;
-            builtin_manifest::extract_for_builtin(&bytes, name)
-                .map_err(|e| anyhow::anyhow!("manifest extraction failed: {e}"))
-        })();
-        out.push((name, entry));
-    }
-    out
+/// Resolve a tier-1/2 builtin's bytes and extract its embedded
+/// manifest if present. `Ok(None)` for builtins that predate the
+/// manifest substrate; `Err` for resolution failures.
+pub fn manifest_for(name: &str) -> Result<Option<builtin_manifest::Manifest>> {
+    let bytes = load_resolved_bytes(name)?;
+    builtin_manifest::extract_for_builtin(&bytes, name)
+        .map_err(|e| anyhow::anyhow!("manifest extraction failed: {e}"))
 }
 
-/// Resolve a single builtin's bytes and extract its embedded manifest.
-/// Errors when the builtin name is unknown, the bytes can't be
-/// fetched, or no matching manifest section is present.
+/// Resolve a single tier-1/2 builtin's manifest. Errors when the
+/// builtin name is unknown, the bytes can't be fetched, or no
+/// matching manifest section is present.
 pub fn resolve_manifest(name: &str) -> Result<builtin_manifest::Manifest> {
     let bytes = load_resolved_bytes(name)?;
     builtin_manifest::extract_for_builtin(&bytes, name)

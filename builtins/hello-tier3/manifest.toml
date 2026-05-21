@@ -1,6 +1,6 @@
 [builtin]
 description = "Smoke-test tier-3 builtin: forward strategy that prints a greeting before and after each wrapped call."
-behavior = "forward"
+tier = 3
 
 [[key]]
 name = "greeting"
