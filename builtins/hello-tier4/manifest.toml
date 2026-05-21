@@ -1,5 +1,5 @@
 [builtin]
-description = "Smoke-test tier-4 builtin: virtualize strategy that synthesizes the default value of each wrapped call's return type."
+description = "Smoke-test virtualize: replaces wrapped calls with `R::default()`. Requires return type to impl Default."
 tier = 4
 
 [[key]]

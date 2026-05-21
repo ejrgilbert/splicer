@@ -108,17 +108,20 @@ fn lookup(name: &str) -> Result<&'static Dir<'static>> {
 
 /// Codegen + build the tier-3/4 wrapper specialized to
 /// `target_interface`, using the WIT from `split_bytes`. Drops the
-/// produced wasm at `splits_dir/builtins/<name>.wasm`.
+/// produced wasm at `splits_dir/builtins/<name>.wasm`. Returns the
+/// path and the resolved tier so the caller can cache it on the
+/// injection without re-reading the manifest.
 pub fn materialize(
     splits_dir: &Path,
     name: &str,
     split_bytes: &[u8],
     target_interface: &str,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Tier)> {
     let manifest = read_manifest(name)?;
     let behavior = behavior_for(&manifest, name)?;
     let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
-    build_and_install(splits_dir, name, behavior, &target)
+    let path = build_and_install(splits_dir, name, behavior, &target)?;
+    Ok((path, manifest.builtin.tier))
 }
 
 fn build_and_install(
@@ -161,11 +164,10 @@ fn build_and_install(
         strategy_type: &strategy_type,
         splicer_tool_sdk_path: sdk_path_str,
     };
-    let build_cache = cache_root.join("build-cache");
     let built = build_wrapper(
         &input,
         &BuildConfig {
-            cache_dir: &build_cache,
+            build_root: &cache_root,
             adapter_wasm: &adapter_path,
             target: None,
         },
@@ -288,13 +290,14 @@ mod tests {
         "#;
         let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
         let splits = tempfile::tempdir().unwrap();
-        let out = materialize(
+        let (out, tier) = materialize(
             splits.path(),
             "hello-tier3",
             &composition,
             "test:demo/ops@0.1.0",
         )
         .expect("materialize");
+        assert_eq!(tier, Tier::Tier3);
         assert!(out.ends_with("builtins/hello-tier3.wasm"));
         let bytes = std::fs::read(&out).expect("read");
         assert!(bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]), "wasm magic");

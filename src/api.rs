@@ -572,6 +572,7 @@ rules:
                 builtin_config: Default::default(),
                 config_provider_path: None,
                 adapter_info: None,
+                tier: None,
             }],
         }];
         let tmp = tempfile::tempdir().unwrap();

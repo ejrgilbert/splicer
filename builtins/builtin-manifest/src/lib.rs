@@ -123,6 +123,13 @@ impl Tier {
             Self::Tier4 => "virtualize",
         }
     }
+
+    /// Whether middlewares at this tier import the target interface
+    /// (so the call can be forwarded downstream). True for Tier1–3;
+    /// false for Tier4 (virtualize), which replaces the downstream.
+    pub fn imports_target(self) -> bool {
+        !matches!(self, Self::Tier4)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

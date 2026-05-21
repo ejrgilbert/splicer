@@ -792,6 +792,7 @@ mod tests {
             inject: vec![Injection {
                 name: "a-middleware".to_string(),
                 adapter_info: None,
+                tier: None,
                 builtin: None,
                 builtin_config: Default::default(),
                 config_provider_path: None,
@@ -891,6 +892,7 @@ mod tests {
                         "splicer:tier1/after".to_string(),
                     ],
                 }),
+                tier: None,
             }],
         };
         let rules = vec![

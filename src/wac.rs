@@ -598,13 +598,17 @@ impl EmitPlan {
             // Simple middleware: each chain position needs its own
             // instance (independent state); pkg stays = `mdl.name`.
             let mw_var = disambiguated_var(&mut self.simple_mdl_counts, &real_pkg);
+            // Tier-4 (virtualize) middlewares don't import the target
+            // (they replace the downstream instead of forwarding); the
+            // wac wire must be skipped for those.
+            let imports = if mdl.tier.is_some_and(|t| !t.imports_target()) {
+                Vec::new()
+            } else {
+                vec![(interface.name.clone(), downstream_var.to_string())]
+            };
             self.entities.insert(
                 mw_var.clone(),
-                Entity::wired(
-                    &mw_var,
-                    &real_pkg,
-                    vec![(interface.name.clone(), downstream_var.to_string())],
-                ),
+                Entity::wired(&mw_var, &real_pkg, imports),
             );
             self.used_middlewares.insert(real_pkg, mdl_path);
             Ok(mw_var)
@@ -1181,7 +1185,7 @@ fn materialize_tier3_4_inline(
         })?;
         let split_bytes = std::fs::read(split_path)
             .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))?;
-        let wrapper_path = crate::builtins::typed::materialize(
+        let (wrapper_path, tier) = crate::builtins::typed::materialize(
             std::path::Path::new(ctx.splits_path),
             builtin,
             &split_bytes,
@@ -1194,9 +1198,11 @@ fn materialize_tier3_4_inline(
                 anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display())
             })?
             .to_string();
-        let mut clone = inj.clone();
-        clone.path = Some(path_str);
-        out.push(clone);
+        out.push(Injection {
+            path: Some(path_str),
+            tier: Some(tier),
+            ..inj.clone()
+        });
     }
     Ok(out)
 }
@@ -1273,16 +1279,11 @@ fn add_to_inject_plan(
                     matched_hook_interfaces: matched_interfaces.clone(),
                 });
                 resolved.push(Injection {
-                    name: injection.name.clone(),
-                    // Keep the original middleware path; adapter_path goes in adapter_info.
-                    path: injection.path.clone(),
-                    builtin: injection.builtin.clone(),
-                    builtin_config: injection.builtin_config.clone(),
-                    config_provider_path: injection.config_provider_path.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         matched_hook_interfaces: matched_interfaces,
                     }),
+                    ..injection.clone()
                 });
                 // Tier1Compatible is fully handled here; no diagnostic needed upstream.
             }
@@ -1317,15 +1318,11 @@ fn add_to_inject_plan(
                     matched_hook_interfaces: matched_interfaces.clone(),
                 });
                 resolved.push(Injection {
-                    name: injection.name.clone(),
-                    path: injection.path.clone(),
-                    builtin: injection.builtin.clone(),
-                    builtin_config: injection.builtin_config.clone(),
-                    config_provider_path: injection.config_provider_path.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         matched_hook_interfaces: matched_interfaces,
                     }),
+                    ..injection.clone()
                 });
             }
             other => {
@@ -1806,6 +1803,7 @@ mod tests {
                 adapter_path,
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
+            tier: None,
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -1866,6 +1864,7 @@ mod tests {
                 adapter_path,
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
+            tier: None,
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -1967,6 +1966,7 @@ mod tests {
                 builtin_config: Default::default(),
                 config_provider_path: None,
                 adapter_info: None,
+                tier: None,
             }],
         }];
 

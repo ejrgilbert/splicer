@@ -57,7 +57,7 @@ fn build_and_validate(
     let adapter = root
         .join("builtins")
         .join("wasi_snapshot_preview1.reactor.wasm");
-    let cache_dir = tempfile::tempdir().expect("tempdir");
+    let build_root = tempfile::tempdir().expect("tempdir");
 
     let wasm_path = build_wrapper(
         &GenerateWrapperInput {
@@ -71,7 +71,7 @@ fn build_and_validate(
             splicer_tool_sdk_path: sdk.to_str().unwrap(),
         },
         &BuildConfig {
-            cache_dir: cache_dir.path(),
+            build_root: build_root.path(),
             adapter_wasm: &adapter,
             target: None,
         },

@@ -181,6 +181,10 @@ pub struct Injection {
     /// adapters splicer wrote.
     #[serde(skip)]
     pub(crate) adapter_info: Option<AdapterInjectionInfo>,
+    /// Cached builtin tier. Stamped when the splice pipeline resolves
+    /// a builtin so downstream stages don't re-read the manifest.
+    #[serde(skip)]
+    pub(crate) tier: Option<builtin_manifest::Tier>,
 }
 
 impl PartialEq for Injection {
@@ -222,6 +226,7 @@ impl Injection {
             builtin_config: BTreeMap::new(),
             config_provider_path: None,
             adapter_info: None,
+            tier: None,
         }
     }
 
@@ -236,6 +241,7 @@ impl Injection {
             builtin_config: BTreeMap::new(),
             config_provider_path: None,
             adapter_info: None,
+            tier: None,
         }
     }
 
@@ -251,6 +257,7 @@ impl Injection {
             builtin_config: BTreeMap::new(),
             config_provider_path: None,
             adapter_info: None,
+            tier: None,
         }
     }
 }
@@ -568,6 +575,7 @@ fn into_injection(yaml: YamlInjection) -> Injection {
         builtin_config,
         config_provider_path: None,
         adapter_info: None,
+        tier: None,
     }
 }
 

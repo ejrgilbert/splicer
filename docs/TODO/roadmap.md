@@ -70,15 +70,6 @@ is already specced in the multi-edge doc; no design negotiation needed.
   `fn` bodies that `block_on` the async strategy, or split the strategy trait
   into sync + async variants. Currently restricts the harness to `async func`
   targets only (see `tests/component-interposition/splicer-rules/builtin-hello-tier3.yaml`).
-- [ ] **WAC wiring for tier-4 (virtualize) middleware in `between` rules.** The
-  generated tier-4 wrapper exports the target interface but does NOT import it
-  (the strategy synthesizes the result instead of calling downstream). WAC's
-  current `between` wiring assumes the middleware imports the target so it can
-  thread `inner` → middleware → `outer`. For tier-4, the `inner` component
-  should be disconnected from the wrapper entirely (the wrapper IS the new
-  provider). Surfaces today as `component <middleware> has no import named
-  <interface>` during `wac compose` on `builtin-hello-tier4.yaml`. Fix lives in
-  `wac.rs::apply_rule_between` / chain rendering.
 
 Skipped Phase 3 — Phase 1's Stream C already covered `between_subgraph`,
 and Phase 2 picks up the rest.
