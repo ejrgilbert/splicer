@@ -399,7 +399,8 @@ impl<'a> WasmEncoderBindgen<'a> {
     /// br_table per arm, pre-load arm-typed locals from joined-flat
     /// slots with joined→arm bitcasts so each arm sees its arm-flat
     /// types (the wrapper params are in joined-flat). Cursor lands at
-    /// `variant_start + joined_flat.len()`.
+    /// `variant_start + joined_flat.len()`. Nested-variant correctness
+    /// is pinned by `lower_nested_variant_routes_through_replay`.
     fn emit_variant_dispatch_for_lower(
         &mut self,
         resolve: &Resolve,
@@ -507,6 +508,11 @@ impl<'a> WasmEncoderBindgen<'a> {
             let mapped = match inst {
                 Instruction::LocalGet(k) if *k >= block_range.0 && *k < block_range.1 => {
                     let pos = (*k - block_start) as usize;
+                    debug_assert!(
+                        pos < arm_locals.len(),
+                        "arm-local pos {pos} >= arm_locals.len() ({})",
+                        arm_locals.len(),
+                    );
                     Instruction::LocalGet(arm_locals[pos])
                 }
                 other => other.clone(),
@@ -1691,5 +1697,73 @@ mod tests {
         assert_eq!(count_inst(|i| matches!(i, Instruction::BrTable(_, _))), 1);
         assert_eq!(count_inst(|i| matches!(i, Instruction::LocalGet(0))), 1);
         assert_eq!(count_inst(|i| matches!(i, Instruction::LocalGet(1))), 1);
+    }
+
+    /// `variant { x(variant { p(u64), q(u64), r(u64) }), y(u8) }` —
+    /// nested variant lower. Outer arm 0's captured body contains
+    /// the inner variant's full dispatch; replay rewrites the inner
+    /// emit's cursor-space `LocalGet`s onto outer arm 0's arm-locals.
+    /// Joined flat: outer = `[i32 disc, i32 (inner disc | u8), i64 (u64)]`.
+    #[test]
+    fn lower_nested_variant_routes_through_replay() {
+        let mut resolve = Resolve::default();
+        let inner_id = resolve.types.alloc(TypeDef {
+            name: Some("inner".to_string()),
+            kind: TypeDefKind::Variant(wit_parser::Variant {
+                cases: ["p", "q", "r"]
+                    .into_iter()
+                    .map(|n| wit_parser::Case {
+                        name: n.to_string(),
+                        ty: Some(Type::U64),
+                        docs: Docs::default(),
+                        span: Span::default(),
+                    })
+                    .collect(),
+            }),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        let outer_id = resolve.types.alloc(TypeDef {
+            name: Some("outer".to_string()),
+            kind: TypeDefKind::Variant(wit_parser::Variant {
+                cases: vec![
+                    wit_parser::Case {
+                        name: "x".to_string(),
+                        ty: Some(Type::Id(inner_id)),
+                        docs: Docs::default(),
+                        span: Span::default(),
+                    },
+                    wit_parser::Case {
+                        name: "y".to_string(),
+                        ty: Some(Type::U8),
+                        docs: Docs::default(),
+                        span: Span::default(),
+                    },
+                ],
+            }),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        let sizes = new_sizes(&resolve);
+        // Outer joined flat = 3 slots: [disc, joined-payload-0, joined-payload-1].
+        let mut indices = LocalsBuilder::new(3);
+        let addr_local = indices.alloc_local(ValType::I32);
+        let mut bg =
+            WasmEncoderBindgen::new(&sizes, addr_local, &mut indices).with_param_flat_count(3);
+        bg.emit_set_addr_const(0);
+        lower_to_memory(&resolve, &mut bg, (), (), &Type::Id(outer_id));
+
+        let insts = bg.into_instructions();
+        let count_inst =
+            |pred: fn(&Instruction<'_>) -> bool| insts.iter().filter(|i| pred(i)).count();
+        // Two br_tables: outer dispatch + replayed inner dispatch.
+        assert_eq!(count_inst(|i| matches!(i, Instruction::BrTable(_, _))), 2);
+        // Outer disc read once at slot 0; no cursor-space LocalGet(0)
+        // survives from the inner arm bodies — those got remapped.
+        assert_eq!(count_inst(|i| matches!(i, Instruction::LocalGet(0))), 1);
     }
 }
