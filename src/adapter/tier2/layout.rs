@@ -602,10 +602,18 @@ pub(super) fn lay_out_static_memory(
                             handle_fill: handle_per_cell_fill.for_result(i),
                         };
                         let cell_side = fold_cell_side_data(&compound.plan, &sources);
+                        // Tie scratch reservation to the same sig
+                        // predicate classify saw — else emit reads
+                        // from the wrong place.
+                        debug_assert_eq!(
+                            retptr_offset.is_some(),
+                            fc.shape.result_at_retptr(&fc.export_sig, &fc.import_sig),
+                            "retptr scratch reservation must match \
+                             classify-time result_at_retptr",
+                        );
                         ResultSourceLayout::Compound {
                             compound,
-                            retptr_offset: retptr_offset
-                                .expect("Compound → retptr scratch reserved"),
+                            retptr_offset,
                             cell_side,
                         }
                     }

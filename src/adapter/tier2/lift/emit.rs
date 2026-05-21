@@ -148,14 +148,16 @@ pub(crate) enum ResultEmitPlan<'a> {
         source_local: u32,
         side_data: CellSideData,
     },
-    /// Retptr-loaded result. `addr_local` drives the
-    /// `lift_from_memory`-built `loads` sequence; the wrapper
-    /// `local.set`s values into `synth_locals` (LIFO), with
-    /// `local_base = synth_locals[0]`.
+    /// Compound result. With `retptr_offset = Some(off)`, `addr_local`
+    /// drives the `lift_from_memory`-built `loads` sequence; the
+    /// wrapper `local.set`s values into `synth_locals` (LIFO), with
+    /// `local_base = synth_locals[0]`. With `retptr_offset = None`,
+    /// the sync flat return already sits in `synth_locals[0]` (=
+    /// `lcl.result`) — `loads` is empty and the prefix is a no-op.
     Compound {
         plan: &'a LiftPlan,
-        retptr_offset: i32,
-        addr_local: u32,
+        retptr_offset: Option<i32>,
+        addr_local: Option<u32>,
         synth_locals: Vec<u32>,
         loads: Vec<Instruction<'static>>,
         side_refs: CellSideRefs<'a>,
@@ -906,7 +908,6 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 cell_side,
             } => {
                 let side_refs = CellSideRefs { cell_side };
-                let addr_local = builder.alloc_local(ValType::I32);
                 let flat = flat_types(resolve, &compound.ty, None).unwrap_or_else(|| {
                     panic!(
                         "Compound result must flatten within MAX_FLAT_PARAMS ({}) — \
@@ -919,19 +920,38 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                     compound.plan.flat_slot_count as usize,
                     "canonical-ABI flat count (emit) must match classify-time plan"
                 );
-                // Contiguous synth locals: cell N's flat slot
-                // resolves to `synth_locals[0] + N = synth_locals[N]`.
-                let synth_locals: Vec<u32> = flat
-                    .into_iter()
-                    .map(|wt| builder.alloc_local(wasm_type_to_val(wt)))
-                    .collect();
-                debug_assert!(
-                    synth_locals.windows(2).all(|w| w[1] == w[0] + 1),
-                    "synth_locals must be contiguous (plan slot N = synth_locals[0] + N)",
-                );
-                let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, &mut builder);
-                lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
-                let loads = bindgen.into_instructions();
+                // Compound-from-retptr: alloc scratch + bindgen-driven
+                // memory loads. Compound-from-flat (single-slot sync):
+                // reuse `lcl.result` as the lone synth local; no addr,
+                // no loads.
+                let (addr_local, synth_locals, loads) = if retptr_offset.is_some() {
+                    let addr_local = builder.alloc_local(ValType::I32);
+                    let synth_locals: Vec<u32> = flat
+                        .into_iter()
+                        .map(|wt| builder.alloc_local(wasm_type_to_val(wt)))
+                        .collect();
+                    debug_assert!(
+                        synth_locals.windows(2).all(|w| w[1] == w[0] + 1),
+                        "synth_locals must be contiguous \
+                             (plan slot N = synth_locals[0] + N)",
+                    );
+                    let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, &mut builder);
+                    lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
+                    (Some(addr_local), synth_locals, bindgen.into_instructions())
+                } else {
+                    // Canonical ABI: any result that overflows
+                    // MAX_FLAT_RESULTS gets a retptr. On wasm32 that
+                    // cap is 1 — so no-retptr ⇒ exactly one flat slot.
+                    assert_eq!(
+                        flat.len(),
+                        1,
+                        "no-retptr compound must have exactly one flat slot \
+                             (sync flat return lands in lcl.result)",
+                    );
+                    let flat_local = result
+                        .expect("no-retptr compound result → sync direct-return local allocated");
+                    (None, vec![flat_local], Vec::new())
+                };
                 let list_locals = alloc_list_emit_locals(
                     &compound.plan,
                     resolve,
@@ -2899,13 +2919,14 @@ pub(crate) fn emit_lift_result(
 
 /// Emit compound-result prefix: load bytes from `retptr_offset` via
 /// `loads`, then capture each flat value into `synth_locals` in
-/// REVERSE order (wasm stack is LIFO).
+/// REVERSE order (wasm stack is LIFO). No-op for no-retptr compounds
+/// (the value already sits in `synth_locals[0] = lcl.result`).
 pub(crate) fn emit_lift_compound_prefix(
     f: &mut Function,
     plan_flat_slot_count: u32,
-    retptr_offset: i32,
+    retptr_offset: Option<i32>,
     loads: &[Instruction<'static>],
-    addr_local: u32,
+    addr_local: Option<u32>,
     synth_locals: &[u32],
 ) {
     assert_eq!(
@@ -2913,6 +2934,11 @@ pub(crate) fn emit_lift_compound_prefix(
         plan_flat_slot_count as usize,
         "synthetic-local count (emit) must match classify-time plan flat slot count"
     );
+    let Some(retptr_offset) = retptr_offset else {
+        debug_assert!(loads.is_empty(), "no-retptr compound must have no loads");
+        return;
+    };
+    let addr_local = addr_local.expect("retptr compound → addr_local allocated");
     f.instructions().i32_const(retptr_offset);
     f.instructions().local_set(addr_local);
     for inst in loads {

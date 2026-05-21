@@ -90,11 +90,12 @@ pub(crate) struct ResultLayout {
 pub(crate) enum ResultSourceLayout {
     /// Sync flat return; source is `lcl.result`.
     Direct { cell: Cell, side_data: CellSideData },
-    /// Retptr-loaded; both multi-cell compounds and single-cell-at-
-    /// retptr kinds route here.
+    /// Compound result. `retptr_offset` is `None` for single-flat-slot
+    /// compounds (e.g. `result<_, _>`, `list<s8, 1>`) — emit reads
+    /// from `lcl.result` instead of memory.
     Compound {
         compound: CompoundResult,
-        retptr_offset: i32,
+        retptr_offset: Option<i32>,
         /// One entry per `compound.plan.cells` position.
         cell_side: Vec<CellSideData>,
     },
@@ -123,6 +124,14 @@ pub(crate) fn classify_func_params(
 /// Classify the function's return value. `result_at_retptr` picks
 /// the deciding sig (export for sync, import for async — async always
 /// retptr's non-void). Returns `None` for void or unsupported.
+///
+/// Routing:
+///   - retptr OR compound-shaped → Compound (multi-cell, or single-
+///     cell that needs a wrapper cell tree). Compound emit reads from
+///     retptr memory when retptr is reserved, else from `lcl.result`
+///     (sync single-flat-slot fall-through).
+///   - direct-shaped, no retptr → Direct (sync flat read from
+///     `lcl.result`).
 pub(crate) fn classify_result_lift(
     resolve: &Resolve,
     func: &WitFunction,
@@ -134,9 +143,10 @@ pub(crate) fn classify_result_lift(
         return Ok(None);
     };
 
-    // Retptr gate skips single-flat-slot compounds (e.g. `tuple<u32>`):
-    // they return flat with no retptr scratch and fall through.
-    if result_at_retptr && is_supported_result(ty, resolve) {
+    if result_at_retptr || is_compound_result(ty, resolve) {
+        if !is_supported_result(ty, resolve) {
+            return Ok(None);
+        }
         let plan = LiftPlan::for_type(ty, resolve, names, map_aliases)?;
         return Ok(Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
