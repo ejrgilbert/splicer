@@ -27,9 +27,12 @@ pub(crate) fn build_enum_info_blob(
     for fd in per_func {
         let mut params = Vec::with_capacity(fd.params.len());
         for p in &mut fd.params {
-            params.push(append_range(&mut bytes, entry_layout, segment_id, |visit| {
-                visit_enum_cases_mut(&mut p.plan, visit)
-            }));
+            params.push(append_range(
+                &mut bytes,
+                entry_layout,
+                segment_id,
+                |visit| visit_enum_cases_mut(&mut p.plan, visit),
+            ));
         }
         per_param.push(params);
         let sym = match fd.result_lift.as_mut() {
@@ -90,7 +93,7 @@ fn append_range(
         }
         entry_count += case_names.len() as u32;
     });
-    (entry_count > 0).then(|| SymRef {
+    (entry_count > 0).then_some(SymRef {
         target: segment_id,
         off: range_start,
         len: entry_count,
