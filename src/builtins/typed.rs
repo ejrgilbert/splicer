@@ -21,10 +21,8 @@ use crate::adapter::typed::{
 
 /// Each shipped tier-3/4 builtin's source tree. Add an entry when
 /// shipping a new builtin.
-static EMBEDDED: &[(&str, &Dir<'_>)] = &[
-    ("hello-tier3", &HELLO_TIER3),
-    ("hello-tier4", &HELLO_TIER4),
-];
+static EMBEDDED: &[(&str, &Dir<'_>)] =
+    &[("hello-tier3", &HELLO_TIER3), ("hello-tier4", &HELLO_TIER4)];
 
 static HELLO_TIER3: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/builtins/hello-tier3");
 static HELLO_TIER4: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/builtins/hello-tier4");
@@ -71,11 +69,8 @@ pub fn read_manifest(name: &str) -> Result<Manifest> {
     let file = dir
         .get_file("manifest.toml")
         .with_context(|| format!("embedded tier-3/4 builtin '{name}' has no manifest.toml"))?;
-    let text = file
-        .contents_utf8()
-        .context("manifest.toml is not UTF-8")?;
-    toml::from_str(text)
-        .with_context(|| format!("failed to parse manifest.toml for '{name}'"))
+    let text = file.contents_utf8().context("manifest.toml is not UTF-8")?;
+    toml::from_str(text).with_context(|| format!("failed to parse manifest.toml for '{name}'"))
 }
 
 /// Extract the named builtin's source tree into `dest_dir` (created
@@ -95,9 +90,12 @@ pub fn extract(name: &str, dest_dir: &Path) -> Result<PathBuf> {
 pub fn extract_sdk(dest_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(dest_dir)
         .with_context(|| format!("could not create {}", dest_dir.display()))?;
-    EMBEDDED_SDK
-        .extract(dest_dir)
-        .with_context(|| format!("could not extract splicer-tool-sdk into {}", dest_dir.display()))?;
+    EMBEDDED_SDK.extract(dest_dir).with_context(|| {
+        format!(
+            "could not extract splicer-tool-sdk into {}",
+            dest_dir.display()
+        )
+    })?;
     Ok(dest_dir.to_path_buf())
 }
 
@@ -108,23 +106,18 @@ fn lookup(name: &str) -> Result<&'static Dir<'static>> {
         .with_context(|| format!("no embedded tier-3/4 builtin named '{name}'"))
 }
 
-/// Resolve a tier-3/4 builtin into a wasm component on disk under
-/// `splits_dir/builtins/<name>.wasm`. Idempotent on the output path
-/// thanks to the per-build cache in `build_wrapper`.
-///
-/// `composition_bytes` + `target_interface` drive WIT extraction:
-/// the wrapper exports (and, for tier-3, imports) whatever interface
-/// the YAML rule names, against the actual types found in the
-/// composition.
+/// Codegen + build the tier-3/4 wrapper specialized to
+/// `target_interface`, using the WIT from `split_bytes`. Drops the
+/// produced wasm at `splits_dir/builtins/<name>.wasm`.
 pub fn materialize(
     splits_dir: &Path,
     name: &str,
-    composition_bytes: &[u8],
+    split_bytes: &[u8],
     target_interface: &str,
 ) -> Result<PathBuf> {
     let manifest = read_manifest(name)?;
     let behavior = behavior_for(&manifest, name)?;
-    let target = target_wit_for_codegen(composition_bytes, target_interface, behavior)?;
+    let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
     build_and_install(splits_dir, name, behavior, &target)
 }
 

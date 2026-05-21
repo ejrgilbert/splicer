@@ -49,7 +49,10 @@ pub fn cache_key(input: &GenerateWrapperInput<'_>) -> String {
 
 /// Build a wrapper component for `input`, caching the result. Returns
 /// the path to the produced wasm component (in `cache_dir`).
-pub fn build_wrapper(input: &GenerateWrapperInput<'_>, config: &BuildConfig<'_>) -> Result<PathBuf> {
+pub fn build_wrapper(
+    input: &GenerateWrapperInput<'_>,
+    config: &BuildConfig<'_>,
+) -> Result<PathBuf> {
     require_tool("cargo")?;
 
     let key = cache_key(input);
@@ -83,8 +86,7 @@ fn build_in_dir(
         .with_context(|| format!("could not create {}", src_dir.display()))?;
     fs::write(build_dir.join("Cargo.toml"), &generated.cargo_toml)
         .context("could not write Cargo.toml")?;
-    fs::write(src_dir.join("lib.rs"), &generated.lib_rs)
-        .context("could not write src/lib.rs")?;
+    fs::write(src_dir.join("lib.rs"), &generated.lib_rs).context("could not write src/lib.rs")?;
 
     let target = config.target.unwrap_or("wasm32-wasip1");
     let out = run_cargo_build(build_dir, target)?;
@@ -157,8 +159,7 @@ fn require_tool(name: &str) -> Result<()> {
             "`{name}` is not on PATH. Tier-3/4 wrappers are compiled with cargo at \
              splice-time; install Rust (https://rustup.rs) before splicing."
         )),
-        Err(e) => Err(anyhow::Error::new(e)
-            .context(format!("could not probe `{name}` on PATH"))),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("could not probe `{name}` on PATH"))),
     }
 }
 
@@ -199,10 +200,7 @@ mod tests {
         let mut a = sample_input(Behavior::Transform);
         let other_wit = "package t:p@0.2.0; interface i { f: func(); } world w { export i; }";
         a.target_wit = other_wit;
-        assert_ne!(
-            cache_key(&a),
-            cache_key(&sample_input(Behavior::Transform)),
-        );
+        assert_ne!(cache_key(&a), cache_key(&sample_input(Behavior::Transform)),);
     }
 
     #[test]

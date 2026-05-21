@@ -54,7 +54,9 @@ fn build_and_validate(
     let root = workspace_root();
     let sdk = root.join("splicer-tool-sdk");
     let strategy = root.join("builtins").join(strategy_dir_name);
-    let adapter = root.join("builtins").join("wasi_snapshot_preview1.reactor.wasm");
+    let adapter = root
+        .join("builtins")
+        .join("wasi_snapshot_preview1.reactor.wasm");
     let cache_dir = tempfile::tempdir().expect("tempdir");
 
     let wasm_path = build_wrapper(

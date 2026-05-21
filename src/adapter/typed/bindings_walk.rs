@@ -149,7 +149,10 @@ mod tests {
         assert_eq!(bindings.guest_traits.len(), 1);
         let g = &bindings.guest_traits[0];
         let methods: Vec<String> = g.methods.iter().map(|m| m.ident.to_string()).collect();
-        assert!(methods.iter().any(|s| s == "add"), "Guest methods: {methods:?}");
+        assert!(
+            methods.iter().any(|s| s == "add"),
+            "Guest methods: {methods:?}"
+        );
         assert_eq!(g.module_path.last().map(String::as_str), Some("ops"));
     }
 

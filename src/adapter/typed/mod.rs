@@ -23,15 +23,11 @@ mod emit_method;
 mod emit_wit_typed;
 pub(crate) mod target_wit;
 
-pub use assemble::{
-    assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs,
-};
-pub use build::{build_wrapper, cache_key, BuildConfig};
-pub use behavior_meta::{read_behavior, read_behavior_from_str, Behavior, BehaviorReadError};
+pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
+pub use behavior_meta::Behavior;
 pub use bindgen::run_wit_bindgen_rust;
-pub use bindings_walk::{
-    walk_bindings, GuestMethod, GuestTrait, TypeDef, TypeDefKind, WrapperBindings,
-};
+pub use bindings_walk::walk_bindings;
+pub use build::{build_wrapper, BuildConfig};
 pub use emit_method::{emit_guest, EmittedGuest};
 pub use emit_wit_typed::emit_wit_typed_impls;
 pub use target_wit::{target_wit_for_codegen, TargetWit};
@@ -61,7 +57,8 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         strategy_type: input.strategy_type,
     })?;
 
-    let crate_name = make_wrapper_crate_name(input.interface_qualified_name, input.strategy_crate_name);
+    let crate_name =
+        make_wrapper_crate_name(input.interface_qualified_name, input.strategy_crate_name);
     let cargo_toml = assemble_cargo_toml(&CargoTomlInputs {
         crate_name: &crate_name,
         strategy_crate_name: input.strategy_crate_name,

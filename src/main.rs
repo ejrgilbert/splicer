@@ -221,11 +221,13 @@ fn print_builtin_list() -> Result<()> {
 
 /// `[tier-N label]` badge for the `builtin list` output, or `[??]`
 /// when the manifest isn't readable.
-fn tier_badge(
-    result: Result<&Option<builtin_info::Manifest>, &anyhow::Error>,
-) -> String {
+fn tier_badge(result: Result<&Option<builtin_info::Manifest>, &anyhow::Error>) -> String {
     match result {
-        Ok(Some(m)) => format!("[tier-{} {}]", u8::from(m.builtin.tier), m.builtin.tier.label()),
+        Ok(Some(m)) => format!(
+            "[tier-{} {}]",
+            u8::from(m.builtin.tier),
+            m.builtin.tier.label()
+        ),
         _ => "[??]".to_string(),
     }
 }
@@ -269,7 +271,11 @@ fn print_builtin_details(name: &str) -> Result<()> {
             println!("  {}{}", "/// ".dimmed(), wrapped.italic().white().dimmed());
         }
         if key.case_insensitive {
-            println!("  {}{}", "/// ".dimmed(), "(matched case-insensitively)".italic().white().dimmed());
+            println!(
+                "  {}{}",
+                "/// ".dimmed(),
+                "(matched case-insensitively)".italic().white().dimmed()
+            );
         }
         println!(
             "  {}: {} = {};",

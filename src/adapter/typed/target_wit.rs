@@ -123,7 +123,10 @@ mod tests {
         assert_eq!(target.world_name, WRAPPER_WORLD);
         assert_eq!(target.qualified_name, "test:demo/ops@0.1.0");
         let wit = &target.wit_text;
-        assert!(wit.contains(&format!("package {WRAPPER_PACKAGE};")), "{wit}");
+        assert!(
+            wit.contains(&format!("package {WRAPPER_PACKAGE};")),
+            "{wit}"
+        );
         assert!(wit.contains(&format!("world {WRAPPER_WORLD}")), "{wit}");
         assert!(wit.contains("export test:demo/ops@0.1.0;"), "{wit}");
         assert!(wit.contains("import test:demo/ops@0.1.0;"), "{wit}");

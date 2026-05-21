@@ -362,8 +362,14 @@ mod tests {
             out.contains("pub struct OpsAddArgs"),
             "expected OpsAddArgs struct: {out}"
         );
-        assert!(out.contains("pub a : u32"), "expected field `a: u32`: {out}");
-        assert!(out.contains("pub b : u32"), "expected field `b: u32`: {out}");
+        assert!(
+            out.contains("pub a : u32"),
+            "expected field `a: u32`: {out}"
+        );
+        assert!(
+            out.contains("pub b : u32"),
+            "expected field `b: u32`: {out}"
+        );
     }
 
     #[test]
@@ -379,8 +385,14 @@ mod tests {
             "expected import-side call to bindings::test::pkg::ops::add: {out}"
         );
         // The closure threads args back into positional args.
-        assert!(out.contains("args . a"), "expected args.a in closure: {out}");
-        assert!(out.contains("args . b"), "expected args.b in closure: {out}");
+        assert!(
+            out.contains("args . a"),
+            "expected args.a in closure: {out}"
+        );
+        assert!(
+            out.contains("args . b"),
+            "expected args.b in closure: {out}"
+        );
     }
 
     #[test]
@@ -408,7 +420,10 @@ mod tests {
             out.contains("\"test:pkg/ops@0.1.0\""),
             "expected qualified interface in CallId: {out}"
         );
-        assert!(out.contains("\"add\""), "expected function name in CallId: {out}");
+        assert!(
+            out.contains("\"add\""),
+            "expected function name in CallId: {out}"
+        );
     }
 
     #[test]
@@ -419,8 +434,14 @@ mod tests {
             "expected WitTyped impl for args struct: {out}"
         );
         // Kebab-case field names appear in the impl.
-        assert!(out.contains("\"a\""), "expected kebab-case field name 'a': {out}");
-        assert!(out.contains("\"b\""), "expected kebab-case field name 'b': {out}");
+        assert!(
+            out.contains("\"a\""),
+            "expected kebab-case field name 'a': {out}"
+        );
+        assert!(
+            out.contains("\"b\""),
+            "expected kebab-case field name 'b': {out}"
+        );
     }
 
     #[test]

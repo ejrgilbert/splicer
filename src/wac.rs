@@ -12,6 +12,7 @@ pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
 use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
 use crate::split::gen_split_path;
+use anyhow::Context;
 
 // chain_idx -> set of middlewares to inject AFTER
 type InjectPlan = HashMap<usize, IndexSet<Injection>>;
@@ -1147,6 +1148,59 @@ fn apply_rule_before(
     })
 }
 
+/// Codegen+build any tier-3/4 builtins in `to_inject`, stamping the
+/// produced wrapper path on a clone. Non-tier-3/4 entries pass through.
+fn materialize_tier3_4_inline(
+    interface_name: &str,
+    to_inject: &[Injection],
+    consumer_split: Option<&str>,
+    ctx: &SpliceCtx,
+) -> anyhow::Result<Vec<Injection>> {
+    let has_tier3_4 = to_inject.iter().any(|inj| {
+        inj.builtin
+            .as_deref()
+            .map(crate::builtins::typed::is_typed)
+            .unwrap_or(false)
+    });
+    if !has_tier3_4 {
+        return Ok(to_inject.to_vec());
+    }
+
+    let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
+    for inj in to_inject.iter() {
+        let Some(builtin) = inj.builtin.as_deref() else {
+            out.push(inj.clone());
+            continue;
+        };
+        if !crate::builtins::typed::is_typed(builtin) {
+            out.push(inj.clone());
+            continue;
+        }
+        let split_path = consumer_split.ok_or_else(|| {
+            anyhow::anyhow!("no split for tier-3/4 '{builtin}' on '{interface_name}'")
+        })?;
+        let split_bytes = std::fs::read(split_path)
+            .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))?;
+        let wrapper_path = crate::builtins::typed::materialize(
+            std::path::Path::new(ctx.splits_path),
+            builtin,
+            &split_bytes,
+            interface_name,
+        )
+        .with_context(|| format!("materialize tier-3/4 '{builtin}' on '{interface_name}'"))?;
+        let path_str = wrapper_path
+            .to_str()
+            .ok_or_else(|| {
+                anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display())
+            })?
+            .to_string();
+        let mut clone = inj.clone();
+        clone.path = Some(path_str);
+        out.push(clone);
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_to_inject_plan(
     interface_name: &str,
@@ -1160,10 +1214,15 @@ fn add_to_inject_plan(
     ctx: &SpliceCtx,
     accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<Vec<ContractResult>> {
+    // Tier-3/4 wrappers ARE the adapter — codegen them here so
+    // validate_contract sees their exports.
+    let to_inject_materialized =
+        materialize_tier3_4_inline(interface_name, to_inject, consumer_split.as_deref(), ctx)?;
+
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
     let contract_results = validate_contract(
-        to_inject,
+        &to_inject_materialized,
         interface_name,
         contract_fingerprint,
         &mut accs.checked_middlewares,
@@ -1171,9 +1230,9 @@ fn add_to_inject_plan(
 
     // For tier-1 compatible middleware, generate a adapter component and substitute
     // the injection path so the rest of the WAC generation uses the adapter.
-    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
+    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject_materialized.len());
     let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
-    for (injection, result) in to_inject.iter().zip(contract_results) {
+    for (injection, result) in to_inject_materialized.iter().zip(contract_results) {
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
                 // `consumer_split` is the split the adapter inherits

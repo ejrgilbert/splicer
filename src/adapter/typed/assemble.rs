@@ -31,22 +31,25 @@ pub struct WrapperCrateInputs<'a> {
 
 /// Assemble a complete `lib.rs` source string for the wrapper crate.
 pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
-    let bindings_file = syn::parse_file(inputs.bindings_src)
-        .context("could not parse bindings source as Rust")?;
+    let bindings_file =
+        syn::parse_file(inputs.bindings_src).context("could not parse bindings source as Rust")?;
     let bindings_items = &bindings_file.items;
 
     let strategy_crate_ident = syn::Ident::new(
         &inputs.strategy_crate_name.replace('-', "_"),
         proc_macro2::Span::call_site(),
     );
-    let strategy_type_ident =
-        syn::Ident::new(inputs.strategy_type, proc_macro2::Span::call_site());
+    let strategy_type_ident = syn::Ident::new(inputs.strategy_type, proc_macro2::Span::call_site());
 
     // The behavior-specific use exposes whichever strategy trait the
     // emitted method bodies dispatch through.
     let strategy_trait_use = match inputs.behavior {
-        Behavior::Transform => quote!(use ::splicer_tool_sdk::TransformStrategy;),
-        Behavior::Virtualize => quote!(use ::splicer_tool_sdk::VirtualizeStrategy;),
+        Behavior::Transform => quote!(
+            use ::splicer_tool_sdk::TransformStrategy;
+        ),
+        Behavior::Virtualize => quote!(
+            use ::splicer_tool_sdk::VirtualizeStrategy;
+        ),
     };
 
     let witty_impls = inputs.witty_impls;
@@ -190,7 +193,10 @@ mod tests {
         let out = assemble_for_tiny(Behavior::Transform);
 
         // The bindings get wrapped in `mod bindings`.
-        assert!(out.contains("mod bindings"), "expected `mod bindings`:\n{out}");
+        assert!(
+            out.contains("mod bindings"),
+            "expected `mod bindings`:\n{out}"
+        );
         // Shared use statements.
         assert!(
             out.contains("use ::splicer_tool_sdk::TransformStrategy"),
@@ -199,10 +205,12 @@ mod tests {
         // The strategy is stored in a OnceLock<S> so the `&S`
         // handed to handle() has `'static` lifetime (avoids
         // borrow-across-await with thread_local!{RefCell<S>}).
-        assert!(out.contains("OnceLock"), "expected OnceLock storage:\n{out}");
         assert!(
-            out.contains("my_strategy :: MyStrategy")
-                || out.contains("my_strategy::MyStrategy"),
+            out.contains("OnceLock"),
+            "expected OnceLock storage:\n{out}"
+        );
+        assert!(
+            out.contains("my_strategy :: MyStrategy") || out.contains("my_strategy::MyStrategy"),
             "expected snake-cased strategy path:\n{out}"
         );
         // The wrapper struct + Guest impl.
@@ -248,9 +256,7 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("cdylib")
         );
-        assert!(parsed["dependencies"]
-            .get("splicer-tool-sdk")
-            .is_some());
+        assert!(parsed["dependencies"].get("splicer-tool-sdk").is_some());
         assert!(parsed["dependencies"].get("my-strategy").is_some());
         assert!(parsed["dependencies"].get("wit-bindgen").is_some());
     }

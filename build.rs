@@ -237,7 +237,11 @@ fn copy_sdk_subtree(src_root: &Path, dest_root: &Path) {
         if src.is_file() {
             let dest = dest_root.join(name);
             fs::copy(&src, &dest).unwrap_or_else(|e| {
-                panic!("Failed to copy {} -> {}: {e}", src.display(), dest.display());
+                panic!(
+                    "Failed to copy {} -> {}: {e}",
+                    src.display(),
+                    dest.display()
+                );
             });
         }
     }

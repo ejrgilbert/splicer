@@ -182,12 +182,10 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
     let (splits_path, shim_comps) =
         split_out_composition(&composition_wasm, &Some(splits_dir_str))?;
 
-    // Materialize builtin middleware bytes to disk now that splits_dir
-    // is established. Stamps `injection.path` so the rest of the
-    // pipeline (contract validation, tier-1 detection, adapter
-    // generation, WAC) treats builtins as ordinary path-backed
-    // middleware.
-    materialize_builtins(&mut cfg, std::path::Path::new(&splits_path), &bytes)?;
+    // Tier-1/2 builtins: drop pre-built bytes under splits_dir/builtins/.
+    // Tier-3/4 builtins skip this pass — they're codegen'd lazily in
+    // `generate_wac`, per matched rule, against the rule's target.
+    materialize_tier1_2_builtins(&mut cfg, std::path::Path::new(&splits_path))?;
 
     let out = generate_wac(shim_comps, &splits_path, &graph, &cfg, None, &package_name)?;
 
@@ -321,29 +319,21 @@ pub fn compose_wac(wac: &str, wac_deps: &BTreeMap<String, PathBuf>) -> Result<Ve
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/// Walk every injection in `rules`; for builtin-form entries, write
-/// the embedded bytes from [`crate::builtins`] to disk under
-/// `splits_dir/builtins/` and stamp the resulting absolute path onto
-/// the injection. After this runs, every injection that came in via
-/// `builtin: ...` looks identical to a path-backed user middleware
-/// from the rest of the pipeline's perspective.
-///
-/// `composition_bytes` is threaded through because tier-3/4 builtins
-/// specialize their generated wrapper against the target interface's
-/// real WIT shape, which is recovered from the composition's
-/// embedded component types.
-fn materialize_builtins(
+/// Materialize tier-1/2 builtin bytes to disk and stamp `inj.path`.
+/// Tier-3/4 builtins are deferred to `generate_wac` (per-rule codegen).
+fn materialize_tier1_2_builtins(
     rules: &mut [SpliceRule],
     splits_dir: &std::path::Path,
-    composition_bytes: &[u8],
 ) -> Result<()> {
     for rule in rules.iter_mut() {
-        let target_interface = rule.interface().to_string();
         for inj in rule.inject_mut().iter_mut() {
             let Some(builtin) = inj.builtin.as_deref() else {
                 continue;
             };
-            let path = builtins::materialize(splits_dir, builtin, composition_bytes, &target_interface)
+            if builtins::typed::is_typed(builtin) {
+                continue;
+            }
+            let path = builtins::materialize_into(splits_dir, builtin)
                 .with_context(|| format!("Failed to materialize builtin '{builtin}'"))?;
             let path_str = path
                 .to_str()
@@ -408,7 +398,7 @@ mod tests {
     use crate::parse::config::parse_yaml;
     use std::path::Path;
 
-    /// `materialize_builtins` should resolve every builtin-form
+    /// `materialize_tier1_2_builtins` should resolve every builtin-form
     /// injection's bytes (here, from a local override) and stamp
     /// `inj.path` so the rest of the pipeline sees a normal
     /// path-backed middleware.
@@ -425,7 +415,7 @@ rules:
         with_fake_builtins(&["hello-tier1"], || {
             let mut rules = parse_yaml(yaml).expect("parse");
             let tmp = tempfile::tempdir().unwrap();
-            materialize_builtins(&mut rules, tmp.path(), &[]).expect("materialize");
+            materialize_tier1_2_builtins(&mut rules, tmp.path()).expect("materialize");
 
             let inj = &rules[0].inject()[0];
             assert_eq!(inj.builtin.as_deref(), Some("hello-tier1"));
@@ -457,7 +447,7 @@ rules:
 "#;
         let mut rules = parse_yaml(yaml).expect("parse");
         let tmp = tempfile::tempdir().unwrap();
-        materialize_builtins(&mut rules, tmp.path(), &[]).expect("materialize");
+        materialize_tier1_2_builtins(&mut rules, tmp.path()).expect("materialize");
 
         let inj = &rules[0].inject()[0];
         assert!(inj.builtin.is_none());
@@ -484,7 +474,7 @@ rules:
         with_fake_builtins(&["hello-tier1"], || {
             let mut rules = parse_yaml(yaml).expect("parse");
             let tmp = tempfile::tempdir().unwrap();
-            materialize_builtins(&mut rules, tmp.path(), &[]).expect("materialize");
+            materialize_tier1_2_builtins(&mut rules, tmp.path()).expect("materialize");
 
             let inject = &rules[0].inject();
             assert_eq!(inject[0].path.as_deref(), Some("./tracing.wasm"));
@@ -511,7 +501,7 @@ rules:
         with_fake_builtins(&["hello-tier1"], || {
             let mut rules = parse_yaml(yaml).expect("parse");
             let tmp = tempfile::tempdir().unwrap();
-            materialize_builtins(&mut rules, tmp.path(), &[]).expect("materialize");
+            materialize_tier1_2_builtins(&mut rules, tmp.path()).expect("materialize");
 
             let inj = &rules[0].inject()[0];
             assert_eq!(inj.name, "greeter");
@@ -585,7 +575,7 @@ rules:
             }],
         }];
         let tmp = tempfile::tempdir().unwrap();
-        let err = materialize_builtins(&mut rules, tmp.path(), &[]).unwrap_err();
+        let err = materialize_tier1_2_builtins(&mut rules, tmp.path()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("does-not-exist"), "error names builtin: {msg}");
         assert!(msg.contains("hello-tier1"), "error lists available: {msg}");

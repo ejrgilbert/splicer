@@ -7,7 +7,6 @@
 //! unifies both — callers don't think about distribution mechanics.
 
 use anyhow::Result;
-use builtin_manifest::Tier;
 use std::path::{Path, PathBuf};
 
 /// User cache directory: `$XDG_CACHE_HOME` or `~/.cache` on Unix,
@@ -23,14 +22,14 @@ pub(super) fn user_cache_dir() -> Option<PathBuf> {
 }
 
 mod tier1_2;
-mod typed;
+pub(crate) mod typed;
 
 pub use tier1_2::materialize_into;
 
 pub(crate) use tier1_2::load_resolved_bytes;
 
 #[cfg(test)]
-pub(crate) use tier1_2::{with_fake_builtins, FAKE_BUILTIN_WASM};
+pub(crate) use tier1_2::with_fake_builtins;
 
 /// Names of every user-facing builtin shipped with this splicer
 /// build, sorted. Spans both tier-1/2 (OCI-distributed wasm) and
@@ -71,33 +70,5 @@ pub fn resolve_manifest(name: &str) -> Result<builtin_manifest::Manifest> {
         typed::read_manifest(name)
     } else {
         tier1_2::resolve_manifest(name)
-    }
-}
-
-/// Resolve a builtin to a wasm component at
-/// `splits_dir/builtins/<name>.wasm`. Tier-1/2 pull pre-built bytes
-/// via [`materialize_into`]; tier-3/4 extract the embedded strategy
-/// source and run the codegen + cargo build pipeline, which is why
-/// they need the composition bytes + target interface to specialize
-/// the wrapper against. Either way the returned absolute path is
-/// what the rest of the splice pipeline stamps onto the injection.
-pub fn materialize(
-    splits_dir: &Path,
-    name: &str,
-    composition_bytes: &[u8],
-    target_interface: &str,
-) -> Result<PathBuf> {
-    if typed::is_typed(name) {
-        match typed::read_manifest(name)?.builtin.tier {
-            Tier::Tier3 | Tier::Tier4 => {
-                typed::materialize(splits_dir, name, composition_bytes, target_interface)
-            }
-            other => anyhow::bail!(
-                "builtin '{name}' is registered under the tier-3/4 embed but its manifest \
-                 declares tier {other:?}"
-            ),
-        }
-    } else {
-        materialize_into(splits_dir, name)
     }
 }

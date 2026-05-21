@@ -20,12 +20,15 @@ pub fn run_wit_bindgen_rust(wit_text: &str, world_name: Option<&str>) -> Result<
     let pkg_id = resolve
         .push_str("<in-memory>", wit_text)
         .context("failed to parse input WIT")?;
-    let world_id = resolve
-        .select_world(&[pkg_id], world_name)
-        .with_context(|| match world_name {
-            Some(n) => format!("could not select world '{n}'"),
-            None => "could not select default world (WIT contains multiple worlds?)".to_string(),
-        })?;
+    let world_id =
+        resolve
+            .select_world(&[pkg_id], world_name)
+            .with_context(|| match world_name {
+                Some(n) => format!("could not select world '{n}'"),
+                None => {
+                    "could not select default world (WIT contains multiple worlds?)".to_string()
+                }
+            })?;
 
     let mut generator = wit_bindgen_rust::Opts {
         generate_all: true,

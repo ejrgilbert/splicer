@@ -377,8 +377,14 @@ mod tests {
 
         // Rust field identifiers come out as snake_case from wit-bindgen
         // (`pet_name`), but we emit the WIT kebab-case in the impl.
-        assert!(combined.contains("\"pet-name\""), "want kebab-case key: {combined}");
-        assert!(combined.contains("\"age-years\""), "want kebab-case key: {combined}");
+        assert!(
+            combined.contains("\"pet-name\""),
+            "want kebab-case key: {combined}"
+        );
+        assert!(
+            combined.contains("\"age-years\""),
+            "want kebab-case key: {combined}"
+        );
         assert!(
             combined.contains("self . pet_name"),
             "self.<snake_case> access expected: {combined}"
