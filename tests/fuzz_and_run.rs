@@ -2547,6 +2547,40 @@ fn tier2_shapes() -> Vec<Shape> {
             })))),
             is_ok: true,
         })),
+        // `result<_, _>` (both arms unit) — single flat slot, no
+        // retptr, Compound emit reads disc from `lcl.result`.
+        Shape::Result_ {
+            ok: None,
+            err: None,
+            is_ok: false,
+        },
+        Shape::Result_ {
+            ok: None,
+            err: None,
+            is_ok: true,
+        },
+        // `list<T, 1>` — single-element TupleOf, same no-retptr path.
+        // i32-narrow + i64 cover both flat wasm types.
+        Shape::FixedLengthList {
+            inner: Box::new(Shape::Primitive {
+                name: "s8",
+                wit_type: "s8",
+                rust_ty: "i8",
+                rust_literal: "-7i8",
+                expected_debug: "-7",
+            }),
+            n: 1,
+        },
+        Shape::FixedLengthList {
+            inner: Box::new(Shape::Primitive {
+                name: "s64",
+                wit_type: "s64",
+                rust_ty: "i64",
+                rust_literal: "-42i64",
+                expected_debug: "-42",
+            }),
+            n: 1,
+        },
         // TODO: enable `map<string, list<list<u32>>>` (wrapper-with-list
         // via the Map desugar) once `wac-types` accepts `map<K, V>` at
         // parse time — tracked by `test_tier2_map_blocked_on_wac` below.
