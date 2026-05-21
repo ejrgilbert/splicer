@@ -51,11 +51,23 @@ pub(crate) enum Cell {
     /// scratch buffer (1–4 bytes), then write `cell::text(ptr, len)`
     /// referencing the scratch.
     Char { flat_slot: u32 },
-    /// `enum { ... }` → `cell::enum-case(u32)`.
+    /// `enum { ... }` → `cell::enum-case(u32)`. Cell payload at
+    /// runtime is `disc + entry_offset`, indexing into the per-(fn,
+    /// param | result) `enum-infos` slice. `entry_offset` is the
+    /// cumulative case-count of all earlier enums in this range's
+    /// plan-walk order.
+    ///
+    /// Plan builder pushes `0`; **must** be stamped by
+    /// [`super::sidetable::enum_info::build_enum_info_blob`] before
+    /// any emit phase reads it. For a sole enum in its range the
+    /// un-stamped `0` happens to be the right value, so a skipped
+    /// stamp produces silently-wrong wasm only for multi-enum
+    /// ranges — single-enum tests pass either way.
     EnumCase {
         flat_slot: u32,
         type_name: BlobSlice,
         case_names: Vec<BlobSlice>,
+        entry_offset: u32,
     },
     /// `record { ... }` → `cell::record-of(u32)`. Children live
     /// elsewhere in the same plan; `fields` references them by
@@ -566,6 +578,7 @@ impl<'a> LiftPlanBuilder<'a> {
                         flat_slot,
                         type_name,
                         case_names,
+                        entry_offset: 0,
                     })
                 }
                 wit_parser::TypeDefKind::Record(_) => self.push_record(ty, resolve, names),

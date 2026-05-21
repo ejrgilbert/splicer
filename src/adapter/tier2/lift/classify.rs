@@ -41,6 +41,13 @@ impl ResultLift {
             _ => None,
         }
     }
+
+    pub(crate) fn compound_mut(&mut self) -> Option<&mut CompoundResult> {
+        match &mut self.source {
+            ResultSource::Compound(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// Classify-time per-parameter lift recipe. Offsets and per-cell

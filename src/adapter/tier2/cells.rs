@@ -139,10 +139,13 @@ impl StoreKind {
 /// lifted values; `ConstI32` for build-time-known indices (record-of,
 /// static option/result child idx) — list-element emit reuses `Local`
 /// for the per-iteration `elem_cell_base + relative_idx`.
+/// `LocalPlusConst` adds a build-time offset to a runtime local
+/// (enum-case shifts the raw disc by its `entry_offset`).
 #[derive(Clone, Copy)]
 pub(crate) enum PayloadSource {
     Local(u32),
     ConstI32(i32),
+    LocalPlusConst { local: u32, offset: i32 },
 }
 
 /// One value to write into a cell's payload area. `offset` is
@@ -173,6 +176,13 @@ impl CellLayout {
                 }
                 PayloadSource::ConstI32(c) => {
                     f.instructions().i32_const(c);
+                }
+                PayloadSource::LocalPlusConst { local, offset } => {
+                    f.instructions().local_get(local);
+                    if offset != 0 {
+                        f.instructions().i32_const(offset);
+                        f.instructions().i32_add();
+                    }
                 }
             }
             let mem = MemArg {
@@ -435,15 +445,25 @@ impl CellLayout {
     }
 
     /// `cell::enum-case(u32)` — index into `field-tree.enum-infos`.
-    /// Enum-info entries are laid out per-case in disc order, so the
-    /// side-table index equals the runtime disc.
-    pub(crate) fn emit_enum_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
+    /// Payload is `disc + entry_offset`: `entry_offset` shifts past
+    /// any earlier enums' case-name ranges in the per-(fn, param)
+    /// slice. See [`super::lift::plan::Cell::EnumCase::entry_offset`].
+    pub(crate) fn emit_enum_case(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        source_local: u32,
+        entry_offset: u32,
+    ) {
         self.emit_cell(
             f,
             addr_local,
             self.disc_of("enum-case"),
             &[PayloadPart {
-                source: PayloadSource::Local(side_table_idx),
+                source: PayloadSource::LocalPlusConst {
+                    local: source_local,
+                    offset: entry_offset as i32,
+                },
                 kind: StoreKind::I32,
                 offset: 0,
             }],
@@ -887,6 +907,121 @@ mod tests {
         build_and_validate(&[ValType::I32, ValType::I32], |f| {
             cl.emit_handle_cell(f, 0, "resource-handle", PayloadSource::Local(1))
         });
+    }
+
+    #[test]
+    fn enum_case_with_zero_offset_skips_add() {
+        // Sole enum in its range → `entry_offset == 0`; the
+        // `LocalPlusConst` short-circuit elides `i32.const 0 + i32.add`.
+        let cl = synth_cell_layout();
+        let baseline = capture_function_body(&[ValType::I32, ValType::I32], |f| {
+            cl.emit_enum_case(f, 0, 1, 0);
+        });
+        // Validate too.
+        build_and_validate(&[ValType::I32, ValType::I32], |f| {
+            cl.emit_enum_case(f, 0, 1, 0)
+        });
+        assert!(
+            !baseline.iter().any(|i| matches!(i, OpKind::I32Add)),
+            "offset=0 must not emit i32.add, found in {baseline:?}",
+        );
+    }
+
+    #[test]
+    fn enum_case_with_nonzero_offset_emits_add() {
+        // Non-first enum in a multi-enum range → `disc + entry_offset`
+        // must materialize as `i32.const offset; i32.add` before the store.
+        let cl = synth_cell_layout();
+        let body = capture_function_body(&[ValType::I32, ValType::I32], |f| {
+            cl.emit_enum_case(f, 0, 1, 5);
+        });
+        build_and_validate(&[ValType::I32, ValType::I32], |f| {
+            cl.emit_enum_case(f, 0, 1, 5)
+        });
+        let consts: Vec<i32> = body
+            .iter()
+            .filter_map(|i| match i {
+                OpKind::I32Const(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert!(consts.contains(&5), "expected i32.const 5 in {body:?}");
+        assert_eq!(
+            body.iter().filter(|i| matches!(i, OpKind::I32Add)).count(),
+            1,
+            "expected exactly one i32.add in {body:?}",
+        );
+    }
+
+    /// Minimal operator tag for inspecting emitted bytes. Tracks only
+    /// the ops the enum-case tests assert on; other ops collapse into
+    /// `Other` to keep the matcher tiny.
+    #[derive(Debug, PartialEq, Eq)]
+    enum OpKind {
+        I32Const(i32),
+        I32Add,
+        Other,
+    }
+
+    /// Encode a one-function module via `build_and_validate`'s pipeline
+    /// but, instead of validating, decode the code section to the tag
+    /// list above. Lets tests assert on emitted instructions without
+    /// pulling in a full disassembler.
+    fn capture_function_body(
+        param_types: &[ValType],
+        emit_body: impl FnOnce(&mut Function),
+    ) -> Vec<OpKind> {
+        let mut module = Module::new();
+
+        let mut types = TypeSection::new();
+        types.ty().function(param_types.iter().copied(), []);
+        module.section(&types);
+
+        let mut imports = ImportSection::new();
+        imports.import(
+            "env",
+            "memory",
+            EntityType::Memory(MemoryType {
+                minimum: 1,
+                maximum: None,
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            }),
+        );
+        module.section(&imports);
+
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        module.section(&funcs);
+
+        let mut code = CodeSection::new();
+        let mut f = Function::new([]);
+        emit_body(&mut f);
+        f.instructions().end();
+        code.function(&f);
+        module.section(&code);
+
+        let bytes = module.finish();
+        let mut ops = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            if let wasmparser::Payload::CodeSectionEntry(body) =
+                payload.expect("emitted module parses")
+            {
+                for op in body
+                    .get_operators_reader()
+                    .expect("body has an operators reader")
+                {
+                    let op = op.expect("operator decodes");
+                    ops.push(match op {
+                        wasmparser::Operator::I32Const { value } => OpKind::I32Const(value),
+                        wasmparser::Operator::I32Add => OpKind::I32Add,
+                        _ => OpKind::Other,
+                    });
+                }
+            }
+        }
+        ops
     }
 
     /// Structural fuzz over primitive cell-emit helpers — picks a

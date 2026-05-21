@@ -359,6 +359,7 @@ fn enum_cell(names: &mut NameInterner, flat_slot: u32, type_name: &str, cases: &
         flat_slot,
         type_name,
         case_names,
+        entry_offset: 0,
     }
 }
 
@@ -2774,26 +2775,103 @@ fn flags_scratch_sizes_count_both_param_and_result_cells() {
     );
 }
 
-// ─── Side-table N=1 invariant ─────────────────────────────────
+// ─── Multi-enum-per-range layout ──────────────────────────────
 
 #[test]
-#[should_panic(expected = "≤1 EnumCase per range")]
-fn build_enum_info_blob_panics_on_multi_enum_plan() {
-    // Pin the structural N=1 invariant in `build_enum_info_blob`:
-    // a record with two distinct enum fields (`two-enums { c: color,
-    // m: mood }`) produces two `Cell::EnumCase` cells in one plan,
-    // which the per-cell `cell::enum-case(disc)` payload encoding
-    // can't disambiguate within a single per-(fn, param) range.
-    // Documented in build_enum_info_blob's doc; this test fails the
-    // build the moment a future change makes the plan-builder
-    // produce multi-enum plans without first introducing a per-cell
-    // side-table-idx scheme.
+fn build_enum_info_blob_stamps_entry_offsets_for_multi_enum_plan() {
+    // `two-enums { c: color, m: mood }` lays two enums into one
+    // (fn, param) range; the second enum's cells must shift their
+    // payload by `color.case_count` so `enum-infos[payload]` lands
+    // on the right case-name.
+    use super::plan::Cell;
     use super::sidetable::enum_info::build_enum_info_blob;
     let (r, mut names) = setup();
-    let fd = func_with_params(&r, &mut names, &["two-enums"]);
+    let mut fd = func_with_params(&r, &mut names, &["two-enums"]);
     let entry_layout = synth_info_layout("enum-info");
     let segment_id = super::super::blob::SymbolBases::new().alloc();
-    let _ = build_enum_info_blob(&[fd], &entry_layout, segment_id);
+    let _ = build_enum_info_blob(std::slice::from_mut(&mut fd), &entry_layout, segment_id);
+
+    // The plan's two EnumCase cells (one per enum field) carry
+    // offsets 0 and `color.case_count` (= 3 — red/green/blue).
+    let enum_offsets: Vec<u32> = fd.params[0]
+        .plan
+        .cells
+        .iter()
+        .filter_map(|c| match c {
+            Cell::EnumCase { entry_offset, .. } => Some(*entry_offset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(enum_offsets, vec![0, 3]);
+}
+
+#[test]
+fn build_enum_info_blob_handles_direct_result_enum() {
+    // Direct-result enum routes through the standalone-cell visitor
+    // (not the plan walker). Offset stays 0; SymRef len = case count.
+    use super::plan::Cell;
+    use super::sidetable::enum_info::build_enum_info_blob;
+    let (r, mut names) = setup();
+    let mut fd = func_with_params(&r, &mut names, &[]);
+    fd.result_lift = Some(ResultLift {
+        source: ResultSource::Direct(enum_cell(&mut names, 0, "color", &["red", "green", "blue"])),
+    });
+    let entry_layout = synth_info_layout("enum-info");
+    let segment_id = super::super::blob::SymbolBases::new().alloc();
+    let blob = build_enum_info_blob(std::slice::from_mut(&mut fd), &entry_layout, segment_id);
+
+    let sym = blob.per_result[0].expect("direct enum result must produce a SymRef");
+    assert_eq!(sym.len, 3);
+    let ResultSource::Direct(Cell::EnumCase { entry_offset, .. }) =
+        &fd.result_lift.as_ref().unwrap().source
+    else {
+        unreachable!();
+    };
+    assert_eq!(*entry_offset, 0);
+}
+
+#[test]
+fn build_enum_info_blob_stamps_list_element_enum() {
+    // `list<list<color>>` — the enum lives two element-plans deep;
+    // `visit_enum_cases_mut` must recurse through both ListOf cells
+    // and still stamp the inner EnumCase at offset 0.
+    use super::classify::ParamLift;
+    use super::plan::Cell;
+    use super::sidetable::enum_info::build_enum_info_blob;
+    let (r, mut names) = setup();
+    let mut fd = func_with_params(&r, &mut names, &[]);
+    fd.params.push(ParamLift {
+        name: names.intern("xs"),
+        plan: plan_for_param("f-list-of-list-color", &r, &mut names),
+    });
+    let entry_layout = synth_info_layout("enum-info");
+    let segment_id = super::super::blob::SymbolBases::new().alloc();
+    let blob = build_enum_info_blob(std::slice::from_mut(&mut fd), &entry_layout, segment_id);
+
+    let sym = blob.per_param[0][0].expect("nested enum must produce a SymRef");
+    assert_eq!(sym.len, 3);
+
+    // Drill to the innermost element_plan and verify the EnumCase
+    // was stamped at offset 0.
+    let outer_list = &fd.params[0].plan.cells[0];
+    let Cell::ListOf {
+        element_plan: outer_elem,
+        ..
+    } = outer_list
+    else {
+        panic!("outer cell must be ListOf");
+    };
+    let Cell::ListOf {
+        element_plan: inner_elem,
+        ..
+    } = &outer_elem.cells[0]
+    else {
+        panic!("inner cell must be ListOf");
+    };
+    let Cell::EnumCase { entry_offset, .. } = &inner_elem.cells[0] else {
+        panic!("innermost cell must be EnumCase");
+    };
+    assert_eq!(*entry_offset, 0);
 }
 
 // ─── Side-table dedup ─────────────────────────────────────────
