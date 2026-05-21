@@ -19,6 +19,7 @@ mod behavior_meta;
 mod bindgen;
 mod bindings_walk;
 mod build;
+mod embedded;
 mod emit_method;
 mod emit_wit_typed;
 

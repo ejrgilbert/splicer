@@ -60,6 +60,7 @@ quote = "1"
 proc-macro2 = "1"
 prettyplease = "0.2"
 heck = "0.5"
+include_dir = "0.7"
 
 [dev-dependencies]
 wat = "1"
