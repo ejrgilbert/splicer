@@ -15,7 +15,9 @@ use heck::ToUpperCamelCase;
 use include_dir::{include_dir, Dir};
 use std::path::{Path, PathBuf};
 
-use crate::adapter::typed::{build_wrapper, Behavior, BuildConfig, GenerateWrapperInput};
+use crate::adapter::typed::{
+    build_wrapper, target_wit_for_codegen, Behavior, BuildConfig, GenerateWrapperInput, TargetWit,
+};
 
 /// Each shipped tier-3/4 builtin's source tree. Add an entry when
 /// shipping a new builtin.
@@ -110,17 +112,28 @@ fn lookup(name: &str) -> Result<&'static Dir<'static>> {
 /// `splits_dir/builtins/<name>.wasm`. Idempotent on the output path
 /// thanks to the per-build cache in `build_wrapper`.
 ///
-/// `target_wit` is the WIT text for the target the wrapper interposes
-/// on; `world_name` selects which world inside the WIT; and
-/// `target_iface_qualified` is the fully-qualified name that the
-/// generated `CallId` reports at runtime (e.g.
-/// `"wasi:http/handler@0.3.0"`). Chunk 2 of the tier-3/4 substrate
-/// roadmap replaces the hardcoded placeholder these defaults to.
-pub fn materialize(splits_dir: &Path, name: &str) -> Result<PathBuf> {
+/// `composition_bytes` + `target_interface` drive WIT extraction:
+/// the wrapper exports (and, for tier-3, imports) whatever interface
+/// the YAML rule names, against the actual types found in the
+/// composition.
+pub fn materialize(
+    splits_dir: &Path,
+    name: &str,
+    composition_bytes: &[u8],
+    target_interface: &str,
+) -> Result<PathBuf> {
     let manifest = read_manifest(name)?;
     let behavior = behavior_for(&manifest, name)?;
-    let (target_wit, world_name, iface_qualified) = placeholder_target(behavior);
+    let target = target_wit_for_codegen(composition_bytes, target_interface, behavior)?;
+    build_and_install(splits_dir, name, behavior, &target)
+}
 
+fn build_and_install(
+    splits_dir: &Path,
+    name: &str,
+    behavior: Behavior,
+    target: &TargetWit,
+) -> Result<PathBuf> {
     let cache_root = typed_cache_root()?;
     let strategy_dir = cache_root.join("strategies").join(name);
     extract(name, &strategy_dir)?;
@@ -146,9 +159,9 @@ pub fn materialize(splits_dir: &Path, name: &str) -> Result<PathBuf> {
         .with_context(|| format!("sdk path is not UTF-8: {}", sdk_dir.display()))?;
 
     let input = GenerateWrapperInput {
-        target_wit: &target_wit,
-        world_name: Some(&world_name),
-        interface_qualified_name: &iface_qualified,
+        target_wit: &target.wit_text,
+        world_name: Some(&target.world_name),
+        interface_qualified_name: &target.qualified_name,
         behavior,
         strategy_crate_name: name,
         strategy_crate_path: strategy_path_str,
@@ -193,63 +206,12 @@ fn behavior_for(manifest: &Manifest, name: &str) -> Result<Behavior> {
 /// strategy crates, and the embedded SDK live here. Survives between
 /// splices so cargo's incremental compilation can warm up.
 fn typed_cache_root() -> Result<PathBuf> {
-    let base = user_cache_dir().context(
+    let base = super::user_cache_dir().context(
         "no user cache directory available; \
          set XDG_CACHE_HOME or HOME to enable tier-3/4 codegen",
     )?;
     Ok(base.join("splicer").join("typed-builtins"))
 }
-
-fn user_cache_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
-    }
-}
-
-/// Placeholder target WIT used by chunk 1 of the tier-3/4 pipeline:
-/// the codegen template needs *some* WIT to compile against before
-/// chunk 2's extraction lands. Borrowed verbatim from
-/// `tests/tier3_4_smoke.rs` so the placeholder paths through the same
-/// shape the smoke tests already cover.
-fn placeholder_target(behavior: Behavior) -> (String, String, String) {
-    match behavior {
-        Behavior::Transform => (
-            PLACEHOLDER_TIER3_WIT.to_string(),
-            "tier3-smoke".to_string(),
-            "smoke:tier3/ops@0.1.0".to_string(),
-        ),
-        Behavior::Virtualize => (
-            PLACEHOLDER_TIER4_WIT.to_string(),
-            "tier4-smoke".to_string(),
-            "smoke:tier4/ops@0.1.0".to_string(),
-        ),
-    }
-}
-
-const PLACEHOLDER_TIER3_WIT: &str = r#"
-    package smoke:tier3@0.1.0;
-    interface ops {
-        add: async func(a: u32, b: u32) -> u32;
-    }
-    world tier3-smoke {
-        export ops;
-        import ops;
-    }
-"#;
-
-const PLACEHOLDER_TIER4_WIT: &str = r#"
-    package smoke:tier4@0.1.0;
-    interface ops {
-        add: async func(a: u32, b: u32) -> u32;
-    }
-    world tier4-smoke {
-        export ops;
-    }
-"#;
 
 #[cfg(test)]
 mod tests {
@@ -314,16 +276,32 @@ mod tests {
         assert!(dest.join("src/lib.rs").exists());
     }
 
-    /// End-to-end materialize: extracts the strategy + SDK, runs the
-    /// codegen + cargo + wasm-tools pipeline, and drops a valid wasm
-    /// component under `splits_dir/builtins/<name>.wasm`. Shells out
-    /// to cargo, so gated behind `--ignored` to keep `cargo test`
-    /// fast.
+    /// End-to-end materialize: synthesizes a tiny composition that
+    /// exports an interface, then drives the full strategy + SDK
+    /// extract → codegen → cargo → install pipeline against it.
+    /// Shells out to cargo, gated behind `--ignored`.
     #[test]
     #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
     fn materialize_tier3_produces_a_component() {
+        use crate::adapter::typed::target_wit::test_fixture::component_from_wit;
+        const FIXTURE_WIT: &str = r#"
+            package test:demo@0.1.0;
+            interface ops {
+                add: async func(a: u32, b: u32) -> u32;
+            }
+            world demo {
+                export ops;
+            }
+        "#;
+        let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
         let splits = tempfile::tempdir().unwrap();
-        let out = materialize(splits.path(), "hello-tier3").expect("materialize");
+        let out = materialize(
+            splits.path(),
+            "hello-tier3",
+            &composition,
+            "test:demo/ops@0.1.0",
+        )
+        .expect("materialize");
         assert!(out.ends_with("builtins/hello-tier3.wasm"));
         let bytes = std::fs::read(&out).expect("read");
         assert!(bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]), "wasm magic");

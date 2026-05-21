@@ -27,7 +27,11 @@ pub fn run_wit_bindgen_rust(wit_text: &str, world_name: Option<&str>) -> Result<
             None => "could not select default world (WIT contains multiple worlds?)".to_string(),
         })?;
 
-    let mut generator = wit_bindgen_rust::Opts::default().build();
+    let mut generator = wit_bindgen_rust::Opts {
+        generate_all: true,
+        ..Default::default()
+    }
+    .build();
     let mut files = Files::default();
     generator
         .generate(&mut resolve, world_id, &mut files)

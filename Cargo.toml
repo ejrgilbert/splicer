@@ -65,6 +65,7 @@ include_dir = "0.7"
 [dev-dependencies]
 wat = "1"
 arbitrary = "1"
+wit-component = { version = "0.247", features = ["dummy-module"] }
 wasmtime = { version = "44", features = ["component-model", "component-model-async", "async"] }
 wasmtime-wasi = "44"
 tokio = { version = "1", features = ["rt", "macros"] }

@@ -836,7 +836,7 @@ pub fn generate_wac(
         }
         any_rule_matched |= any_full_match;
         if !any_full_match {
-            let iface = rule_interface(rule);
+            let iface = rule.interface();
             if !any_interface_matched {
                 // Interface name itself wasn't found — suggest close matches.
                 let available: Vec<&str> =
@@ -1295,13 +1295,6 @@ fn add_to_inject_plan(
 
     middlewares.extend(resolved);
     Ok(final_results)
-}
-
-fn rule_interface(rule: &SpliceRule) -> &str {
-    match rule {
-        SpliceRule::Before { interface, .. } => interface,
-        SpliceRule::Between { interface, .. } => interface,
-    }
 }
 
 /// Helper to get the instance name from a node

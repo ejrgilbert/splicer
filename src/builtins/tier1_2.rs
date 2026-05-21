@@ -223,7 +223,7 @@ fn write_cache_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn cache_path_for(name: &str, version: &str) -> Result<PathBuf> {
-    let base = user_cache_dir().context(
+    let base = super::user_cache_dir().context(
         "no user cache directory available; \
          set SPLICER_BUILTINS_DIR to a directory of pre-built .wasm files",
     )?;
@@ -231,18 +231,6 @@ fn cache_path_for(name: &str, version: &str) -> Result<PathBuf> {
         .join("splicer")
         .join(BUILTIN_SUBDIR)
         .join(format!("{name}@{version}.wasm")))
-}
-
-/// User cache directory: `$XDG_CACHE_HOME` or `~/.cache` on Unix,
-/// `%LOCALAPPDATA%` on Windows.
-fn user_cache_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
-    }
 }
 
 fn oci_reference(name: &str, version: &str) -> String {

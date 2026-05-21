@@ -287,6 +287,15 @@ pub enum SpliceRule {
 }
 
 impl SpliceRule {
+    /// The target interface this rule applies to.
+    pub fn interface(&self) -> &str {
+        match self {
+            SpliceRule::Before { interface, .. } | SpliceRule::Between { interface, .. } => {
+                interface
+            }
+        }
+    }
+
     /// The injection list for this rule. Both variants always carry
     /// one — only the matching strategy around it differs.
     pub fn inject(&self) -> &[Injection] {

@@ -10,6 +10,18 @@ use anyhow::Result;
 use builtin_manifest::Tier;
 use std::path::{Path, PathBuf};
 
+/// User cache directory: `$XDG_CACHE_HOME` or `~/.cache` on Unix,
+/// `%LOCALAPPDATA%` on Windows.
+pub(super) fn user_cache_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
+    }
+}
+
 mod tier1_2;
 mod typed;
 
@@ -63,16 +75,23 @@ pub fn resolve_manifest(name: &str) -> Result<builtin_manifest::Manifest> {
 }
 
 /// Resolve a builtin to a wasm component at
-/// `splits_dir/builtins/<name>.wasm`, picking the distribution path
-/// from its manifest tier: tier-1/2 pull pre-built bytes via
-/// [`materialize_into`]; tier-3/4 extract the embedded strategy
-/// source and run the codegen + cargo build pipeline. Either way the
-/// returned absolute path is what the rest of the splice pipeline
-/// stamps onto the injection.
-pub fn materialize(splits_dir: &Path, name: &str) -> Result<PathBuf> {
+/// `splits_dir/builtins/<name>.wasm`. Tier-1/2 pull pre-built bytes
+/// via [`materialize_into`]; tier-3/4 extract the embedded strategy
+/// source and run the codegen + cargo build pipeline, which is why
+/// they need the composition bytes + target interface to specialize
+/// the wrapper against. Either way the returned absolute path is
+/// what the rest of the splice pipeline stamps onto the injection.
+pub fn materialize(
+    splits_dir: &Path,
+    name: &str,
+    composition_bytes: &[u8],
+    target_interface: &str,
+) -> Result<PathBuf> {
     if typed::is_typed(name) {
         match typed::read_manifest(name)?.builtin.tier {
-            Tier::Tier3 | Tier::Tier4 => typed::materialize(splits_dir, name),
+            Tier::Tier3 | Tier::Tier4 => {
+                typed::materialize(splits_dir, name, composition_bytes, target_interface)
+            }
             other => anyhow::bail!(
                 "builtin '{name}' is registered under the tier-3/4 embed but its manifest \
                  declares tier {other:?}"

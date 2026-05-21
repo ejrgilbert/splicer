@@ -21,6 +21,7 @@ mod bindings_walk;
 mod build;
 mod emit_method;
 mod emit_wit_typed;
+pub(crate) mod target_wit;
 
 pub use assemble::{
     assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs,
@@ -33,6 +34,7 @@ pub use bindings_walk::{
 };
 pub use emit_method::{emit_guest, EmittedGuest};
 pub use emit_wit_typed::emit_wit_typed_impls;
+pub use target_wit::{target_wit_for_codegen, TargetWit};
 
 use anyhow::Result;
 
