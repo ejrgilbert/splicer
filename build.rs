@@ -162,6 +162,119 @@ fn main() {
 
     generate_builtin_manifest(&out_dir);
     generate_builtin_config_constants(&out_dir);
+    stage_sdk_embed(&out_dir);
+}
+
+/// Stage a clean copy of `splicer-tool-sdk` under `$OUT_DIR/embedded-sdk/`
+/// so the `include_dir!` macro in `src/builtins/typed.rs` can embed
+/// the SDK source without sweeping `splicer-tool-sdk/target/` (hundreds
+/// of MB after a local `cargo build`) into the splicer binary.
+///
+/// Copies only what the wrapper crate's path-dep needs: `src/`,
+/// `Cargo.toml`, and `README.md` if it exists. Skips `target/`,
+/// `Cargo.lock`, hidden files.
+///
+/// TODO: stop embedding once splicer-tool-sdk is published to crates.io;
+/// the generated wrapper Cargo.toml can then use a versioned dep.
+fn stage_sdk_embed(out_dir: &str) {
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
+    let src_root = Path::new(&manifest_dir).join("splicer-tool-sdk");
+    let dest_root = Path::new(out_dir).join("embedded-sdk");
+
+    // Watch every source file under the SDK so cargo rebuilds when SDK
+    // sources change. `target/` is excluded by `should_include`.
+    rerun_for_sdk_sources(&src_root);
+
+    if dest_root.exists() {
+        fs::remove_dir_all(&dest_root).unwrap_or_else(|e| {
+            panic!("Failed to clean {}: {e}", dest_root.display());
+        });
+    }
+    fs::create_dir_all(&dest_root).unwrap_or_else(|e| {
+        panic!("Failed to create {}: {e}", dest_root.display());
+    });
+
+    copy_sdk_subtree(&src_root, &dest_root);
+}
+
+fn rerun_for_sdk_sources(src_root: &Path) {
+    // Re-run when the SDK source tree changes. Watching the root
+    // suffices for additions/removals; watching key files inside
+    // catches edits cargo wouldn't otherwise notice.
+    println!("cargo::rerun-if-changed={}", src_root.display());
+    let cargo_toml = src_root.join("Cargo.toml");
+    if cargo_toml.exists() {
+        println!("cargo::rerun-if-changed={}", cargo_toml.display());
+    }
+    let src_dir = src_root.join("src");
+    if src_dir.is_dir() {
+        walk_for_rerun(&src_dir);
+    }
+}
+
+fn walk_for_rerun(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            walk_for_rerun(&path);
+        } else if ft.is_file() {
+            println!("cargo::rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+fn copy_sdk_subtree(src_root: &Path, dest_root: &Path) {
+    for name in ["Cargo.toml", "README.md"] {
+        let src = src_root.join(name);
+        if src.is_file() {
+            let dest = dest_root.join(name);
+            fs::copy(&src, &dest).unwrap_or_else(|e| {
+                panic!("Failed to copy {} -> {}: {e}", src.display(), dest.display());
+            });
+        }
+    }
+    let src_dir = src_root.join("src");
+    if src_dir.is_dir() {
+        let dest_dir = dest_root.join("src");
+        copy_dir_recursive(&src_dir, &dest_dir);
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) {
+    fs::create_dir_all(dest).unwrap_or_else(|e| {
+        panic!("Failed to create {}: {e}", dest.display());
+    });
+    let Ok(entries) = fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let src_path = entry.path();
+        let dest_path = dest.join(&name);
+        if ft.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path);
+        } else if ft.is_file() {
+            fs::copy(&src_path, &dest_path).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to copy {} -> {}: {e}",
+                    src_path.display(),
+                    dest_path.display()
+                );
+            });
+        }
+    }
 }
 
 /// Emit `BUILTIN_CONFIG_*` constants for `src/config_provider.rs`

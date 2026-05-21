@@ -333,7 +333,7 @@ fn materialize_builtins(rules: &mut [SpliceRule], splits_dir: &std::path::Path) 
             let Some(builtin) = inj.builtin.as_deref() else {
                 continue;
             };
-            let path = builtins::materialize_into(splits_dir, builtin)
+            let path = builtins::materialize(splits_dir, builtin)
                 .with_context(|| format!("Failed to materialize builtin '{builtin}'"))?;
             let path_str = path
                 .to_str()

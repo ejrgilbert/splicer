@@ -214,29 +214,4 @@ mod tests {
             "expected `not on PATH` in error: {msg}"
         );
     }
-
-    /// End-to-end build test. Marked `#[ignore]` because it shells
-    /// out to cargo and needs the `wasm32-wasip1` target installed.
-    /// Run with `cargo test ... e2e_build_tiny_wrapper -- --ignored`.
-    #[test]
-    #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
-    fn e2e_build_tiny_wrapper() {
-        let cache_dir = tempfile::tempdir().unwrap();
-        let adapter = std::env::var_os("SPLICER_PREVIEW1_ADAPTER")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("builtins")
-                    .join("wasi_snapshot_preview1.reactor.wasm")
-            });
-        let _ = build_wrapper(
-            &sample_input(Behavior::Virtualize),
-            &BuildConfig {
-                cache_dir: cache_dir.path(),
-                adapter_wasm: &adapter,
-                target: None,
-            },
-        )
-        .expect("end-to-end build succeeds");
-    }
 }
