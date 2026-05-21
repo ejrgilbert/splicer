@@ -366,6 +366,21 @@ fn generate_builtin_manifest(out_dir: &str) {
                 continue;
             }
             println!("cargo::rerun-if-changed={}", cargo_toml.display());
+            // Recursively watch each builtin's source tree (src/, wit/,
+            // manifest.toml) so edits get picked up by the include_dir!
+            // embeds in src/builtins/typed.rs without manually bumping
+            // the Cargo.toml mtime.
+            let entry_path = entry.path();
+            for sub in ["src", "wit"] {
+                let dir = entry_path.join(sub);
+                if dir.is_dir() {
+                    walk_for_rerun(&dir);
+                }
+            }
+            let manifest = entry_path.join("manifest.toml");
+            if manifest.is_file() {
+                println!("cargo::rerun-if-changed={}", manifest.display());
+            }
             let src = fs::read_to_string(&cargo_toml).unwrap_or_else(|e| {
                 panic!("Failed to read {}: {e}", cargo_toml.display());
             });

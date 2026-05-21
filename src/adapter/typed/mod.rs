@@ -103,8 +103,17 @@ pub struct WrapperCrate {
 }
 
 /// Sanitize `interface@version` + strategy name into a valid Cargo
-/// package identifier: lowercase alphanumerics + underscores.
+/// package identifier: lowercase alphanumerics + underscores, plus a
+/// short hash suffix of the original inputs so distinct interfaces
+/// that sanitize identically (`wasi:http/handler@0.3.0` vs
+/// `wasi-http-handler-0-3-0`) get distinct crate names. Without the
+/// suffix both would collide on the shared `CARGO_TARGET_DIR`'s
+/// `<crate>.wasm` output and the second build would clobber the
+/// first.
 fn make_wrapper_crate_name(interface: &str, strategy: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
     let sanitize = |s: &str| -> String {
         s.chars()
             .map(|c| {
@@ -116,10 +125,15 @@ fn make_wrapper_crate_name(interface: &str, strategy: &str) -> String {
             })
             .collect()
     };
+    let mut h = DefaultHasher::new();
+    interface.hash(&mut h);
+    strategy.hash(&mut h);
+    let suffix = format!("{:08x}", h.finish() as u32);
     format!(
-        "splicer_wrapper_{}_{}",
+        "splicer_wrapper_{}_{}_{}",
         sanitize(interface),
-        sanitize(strategy)
+        sanitize(strategy),
+        suffix,
     )
 }
 
@@ -190,5 +204,14 @@ mod tests {
             "virtualize pipeline should not import TransformStrategy:\n{}",
             crate_out.lib_rs
         );
+    }
+
+    #[test]
+    fn wrapper_crate_name_distinguishes_inputs_that_sanitize_identically() {
+        // Both inputs sanitize to "wasi_http_handler_0_3_0" — the hash
+        // suffix is what keeps the two crate names distinct.
+        let a = make_wrapper_crate_name("wasi:http/handler@0.3.0", "s");
+        let b = make_wrapper_crate_name("wasi-http-handler-0-3-0", "s");
+        assert_ne!(a, b);
     }
 }

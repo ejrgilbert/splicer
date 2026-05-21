@@ -49,6 +49,7 @@ fn build_dir_key(input: &GenerateWrapperInput<'_>) -> String {
     input.strategy_crate_name.hash(&mut h);
     input.strategy_crate_path.hash(&mut h);
     input.strategy_type.hash(&mut h);
+    input.splicer_tool_sdk_path.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -226,6 +227,16 @@ mod tests {
         let mut a = sample_input(Behavior::Transform);
         let other_wit = "package t:p@0.2.0; interface i { f: func(); } world w { export i; }";
         a.target_wit = other_wit;
+        assert_ne!(
+            build_dir_key(&a),
+            build_dir_key(&sample_input(Behavior::Transform)),
+        );
+    }
+
+    #[test]
+    fn build_dir_key_distinguishes_sdk_path() {
+        let mut a = sample_input(Behavior::Transform);
+        a.splicer_tool_sdk_path = "/some/other/sdk";
         assert_ne!(
             build_dir_key(&a),
             build_dir_key(&sample_input(Behavior::Transform)),
