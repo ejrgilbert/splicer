@@ -41,7 +41,7 @@ use crate::types::CallId;
 ///         &self,
 ///         call: CallId,
 ///         args: Args,
-///         downstream: impl AsyncFnOnce(Args) -> R,
+///         downstream: impl AsyncFn(Args) -> R,
 ///     ) -> R {
 ///         println!("calling {}#{}", call.interface_name, call.function_name);
 ///         downstream(args).await
@@ -63,12 +63,15 @@ use crate::types::CallId;
 pub trait TransformStrategy<Args, R> {
     /// Handle one wrapped invocation. `downstream` invokes the
     /// wrapped target; call it (with original or mutated `args`),
-    /// then optionally mutate and return its result.
+    /// then optionally mutate and return its result. The closure is
+    /// `AsyncFn`, so strategies that need to invoke the target more
+    /// than once (retry, redundancy) can — with an `Args: Clone`
+    /// bound on their impl so each attempt gets its own `args`.
     async fn handle(
         &self,
         call: CallId,
         args: Args,
-        downstream: impl AsyncFnOnce(Args) -> R,
+        downstream: impl AsyncFn(Args) -> R,
     ) -> R;
 }
 
@@ -130,7 +133,7 @@ mod tests {
             &self,
             _call: CallId,
             args: Args,
-            downstream: impl AsyncFnOnce(Args) -> R,
+            downstream: impl AsyncFn(Args) -> R,
         ) -> R {
             downstream(args).await
         }

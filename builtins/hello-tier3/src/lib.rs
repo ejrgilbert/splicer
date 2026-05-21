@@ -13,7 +13,7 @@ impl<Args, R> TransformStrategy<Args, R> for HelloTier3 {
         &self,
         call: CallId,
         args: Args,
-        downstream: impl AsyncFnOnce(Args) -> R,
+        downstream: impl AsyncFn(Args) -> R,
     ) -> R {
         println!(
             "[hello-tier3] before {}#{}",
