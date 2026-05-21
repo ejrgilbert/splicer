@@ -1755,7 +1755,9 @@ fn emit_single_slot_cell(
             cell_layout.emit_floating(f, addr, lcl.ext_f64);
         }
         Cell::FloatingF64 { .. } => cell_layout.emit_floating(f, addr, source),
-        Cell::EnumCase { .. } => cell_layout.emit_enum_case(f, addr, source),
+        Cell::EnumCase { entry_offset, .. } => {
+            cell_layout.emit_enum_case(f, addr, source, *entry_offset)
+        }
         Cell::Flags { .. } => {
             let CellSideData::Flags(fill) = side_data else {
                 panic!("Flags cell paired with non-Flags side data {side_data:?}");

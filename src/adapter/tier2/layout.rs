@@ -300,7 +300,7 @@ fn resolve_param_result_ranges(
 /// `FuncDispatch` records. Takes ownership of the classify output and
 /// returns a fully-built dispatch list — no back-fill state possible.
 pub(super) fn lay_out_static_memory(
-    per_func: Vec<FuncClassified>,
+    mut per_func: Vec<FuncClassified>,
     funcs: &[&WitFunction],
     schema: &SchemaLayouts,
     names: NameInterner,
@@ -349,7 +349,7 @@ pub(super) fn lay_out_static_memory(
     let enum_info_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
-    let enum_info = build_enum_info_blob(&per_func, &schema.enum_info_layout, enum_info_id);
+    let enum_info = build_enum_info_blob(&mut per_func, &schema.enum_info_layout, enum_info_id);
     let SideTableBlob {
         segment: enum_segment,
         per_param: enum_per_param_sym,
