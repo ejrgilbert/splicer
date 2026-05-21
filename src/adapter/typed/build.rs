@@ -87,7 +87,8 @@ fn build_in_dir(
 
     let target = config.target.unwrap_or("wasm32-wasip1");
     // Shared target dir across every wrapper build so cargo amortizes
-    // the dep closure once instead of per-build.
+    // the dep closure once instead of per-build. Concurrent splices are
+    // serialized by cargo's own `target/debug/.cargo-lock`.
     let cargo_target_dir = config.build_root.join("target");
     let out = run_cargo_build(build_dir, &cargo_target_dir, target)?;
     if !out.status.success() {

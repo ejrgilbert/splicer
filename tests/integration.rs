@@ -67,10 +67,7 @@ fn ensure_fixtures_built() {
         // Build the tier-1/2 builtin wasms from this branch's source so
         // splicer doesn't fall back to OCI (which would test whatever's
         // currently published, not this branch).
-        let status = match Command::new("make")
-            .arg("build-builtins")
-            .status()
-        {
+        let status = match Command::new("make").arg("build-builtins").status() {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("ensure_fixtures_built: spawn make build-builtins: {e}");

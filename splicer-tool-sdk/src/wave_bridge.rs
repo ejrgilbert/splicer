@@ -132,7 +132,83 @@ impl<T: WitTyped, E: WitTyped> WitTyped for Result<T, E> {
             Ok(Some(inner)) => Ok(Ok(T::from_value(&inner)?)),
             Err(Some(inner)) => Ok(Err(E::from_value(&inner)?)),
             Ok(None) | Err(None) => Err(BridgeError::Unsupported(
-                "unit-arm result not yet supported for WitTyped<Result<T, E>>",
+                "result arm/type shape mismatch (both arms expected payloads)",
+            )),
+        }
+    }
+}
+
+// wit-bindgen-rust emits `()` for `result<...>` arms that don't carry a
+// payload — `result<u32>` → `Result<u32, ()>`, `result<_, E>` →
+// `Result<(), E>`, `result<_>` → `Result<(), ()>`. `()` is intentionally
+// NOT impl'd as `WitTyped` (no Wave type maps to it); each unit-arm
+// `Result` shape gets its own impl below, which keeps the bounds on the
+// generic `impl<T, E>` above from triggering coherence overlap.
+
+impl<T: WitTyped> WitTyped for Result<T, ()> {
+    fn wave_type() -> WaveType {
+        WaveType::result(Some(T::wave_type()), None)
+    }
+    fn to_value(&self) -> WaveValue {
+        let ty = Self::wave_type();
+        let inner = match self {
+            Ok(t) => Ok(Some(t.to_value())),
+            Err(()) => Err(None),
+        };
+        WaveValue::make_result(&ty, inner).expect("inner value matches declared result type")
+    }
+    fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+        match v.unwrap_result() {
+            Ok(Some(inner)) => Ok(Ok(T::from_value(&inner)?)),
+            Err(None) => Ok(Err(())),
+            Ok(None) | Err(Some(_)) => Err(BridgeError::Unsupported(
+                "result arm payload mismatch for Result<T, ()>",
+            )),
+        }
+    }
+}
+
+impl<E: WitTyped> WitTyped for Result<(), E> {
+    fn wave_type() -> WaveType {
+        WaveType::result(None, Some(E::wave_type()))
+    }
+    fn to_value(&self) -> WaveValue {
+        let ty = Self::wave_type();
+        let inner = match self {
+            Ok(()) => Ok(None),
+            Err(e) => Err(Some(e.to_value())),
+        };
+        WaveValue::make_result(&ty, inner).expect("inner value matches declared result type")
+    }
+    fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+        match v.unwrap_result() {
+            Ok(None) => Ok(Ok(())),
+            Err(Some(inner)) => Ok(Err(E::from_value(&inner)?)),
+            Ok(Some(_)) | Err(None) => Err(BridgeError::Unsupported(
+                "result arm payload mismatch for Result<(), E>",
+            )),
+        }
+    }
+}
+
+impl WitTyped for Result<(), ()> {
+    fn wave_type() -> WaveType {
+        WaveType::result(None, None)
+    }
+    fn to_value(&self) -> WaveValue {
+        let ty = Self::wave_type();
+        let inner = match self {
+            Ok(()) => Ok(None),
+            Err(()) => Err(None),
+        };
+        WaveValue::make_result(&ty, inner).expect("inner value matches declared result type")
+    }
+    fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+        match v.unwrap_result() {
+            Ok(None) => Ok(Ok(())),
+            Err(None) => Ok(Err(())),
+            Ok(Some(_)) | Err(Some(_)) => Err(BridgeError::Unsupported(
+                "result arm payload mismatch for Result<(), ()>",
             )),
         }
     }

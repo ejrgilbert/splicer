@@ -127,28 +127,52 @@ pub struct CargoTomlInputs<'a> {
     pub splicer_tool_sdk_path: &'a str,
 }
 
-/// Assemble the wrapper crate's Cargo.toml.
+/// Assemble the wrapper crate's Cargo.toml. Serialized through the
+/// `toml` crate so paths with special chars (esp. Windows backslashes)
+/// get escaped correctly instead of breaking the TOML.
 pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
-    format!(
-        r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2021"
-publish = false
+    use toml::map::Map;
+    use toml::Value;
 
-[lib]
-crate-type = ["cdylib"]
+    let mut package = Map::new();
+    package.insert("name".into(), Value::String(inputs.crate_name.into()));
+    package.insert("version".into(), Value::String("0.1.0".into()));
+    package.insert("edition".into(), Value::String("2021".into()));
+    package.insert("publish".into(), Value::Boolean(false));
 
-[dependencies]
-splicer-tool-sdk = {{ path = "{sdk}" }}
-"{strategy}" = {{ path = "{strategy_path}" }}
-wit-bindgen = "0.57"
-"#,
-        name = inputs.crate_name,
-        sdk = inputs.splicer_tool_sdk_path,
-        strategy = inputs.strategy_crate_name,
-        strategy_path = inputs.strategy_crate_path,
-    )
+    let mut lib = Map::new();
+    lib.insert(
+        "crate-type".into(),
+        Value::Array(vec![Value::String("cdylib".into())]),
+    );
+
+    let mut sdk_dep = Map::new();
+    sdk_dep.insert(
+        "path".into(),
+        Value::String(inputs.splicer_tool_sdk_path.into()),
+    );
+
+    let mut strategy_dep = Map::new();
+    strategy_dep.insert(
+        "path".into(),
+        Value::String(inputs.strategy_crate_path.into()),
+    );
+
+    let mut dependencies = Map::new();
+    dependencies.insert("splicer-tool-sdk".into(), Value::Table(sdk_dep));
+    dependencies.insert(
+        inputs.strategy_crate_name.into(),
+        Value::Table(strategy_dep),
+    );
+    dependencies.insert("wit-bindgen".into(), Value::String("0.57".into()));
+
+    let mut root = Map::new();
+    root.insert("package".into(), Value::Table(package));
+    root.insert("lib".into(), Value::Table(lib));
+    root.insert("dependencies".into(), Value::Table(dependencies));
+
+    toml::to_string(&Value::Table(root))
+        .expect("toml serialization of strings + booleans + tables is infallible")
 }
 
 #[cfg(test)]
@@ -259,5 +283,27 @@ mod tests {
         assert!(parsed["dependencies"].get("splicer-tool-sdk").is_some());
         assert!(parsed["dependencies"].get("my-strategy").is_some());
         assert!(parsed["dependencies"].get("wit-bindgen").is_some());
+    }
+
+    #[test]
+    fn cargo_toml_escapes_paths_with_special_chars() {
+        // Windows-style backslashes + a path containing a `"` that
+        // would close the TOML string literal under naive `format!`.
+        let toml = assemble_cargo_toml(&CargoTomlInputs {
+            crate_name: "wrapper",
+            strategy_crate_name: "strat",
+            strategy_crate_path: r#"C:\Users\me\strat-"with-quote""#,
+            splicer_tool_sdk_path: r"D:\sdk\splicer-tool-sdk",
+        });
+        let parsed: toml::Value =
+            toml::from_str(&toml).expect("Cargo.toml with special-char paths still parses");
+        assert_eq!(
+            parsed["dependencies"]["strat"]["path"].as_str(),
+            Some(r#"C:\Users\me\strat-"with-quote""#),
+        );
+        assert_eq!(
+            parsed["dependencies"]["splicer-tool-sdk"]["path"].as_str(),
+            Some(r"D:\sdk\splicer-tool-sdk"),
+        );
     }
 }
