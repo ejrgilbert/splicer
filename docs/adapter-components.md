@@ -27,8 +27,8 @@ docs:
 
 - [Tier 1: Name-Only Hooks](./tiers/tier-1.md) — shipped
 - [Tier 2: Observation](./tiers/tier-2.md) — shipped
-- [Tier 3: Transform](./tiers/tier-3.md) — planned
-- [Tier 4: Virtualize](./tiers/tier-4.md) — planned
+- [Tier 3: Transform](./tiers/tier-3.md) — shipped (builtin-only)
+- [Tier 4: Virtualize](./tiers/tier-4.md) — shipped (builtin-only)
 
 For a low-level architecture walkthrough of the generator itself, see
 [`adapter-internals.md`](./adapter-internals.md). For broader planning
@@ -48,20 +48,26 @@ and 2 leave the call flowing through unchanged (observation only).
 Tier 3 lets the middleware modify what flows through; tier 4 lets it
 replace the downstream entirely.
 
-| Tier | See call name | See typed data | Modify data | Bypass downstream | Status        |
-|------|---------------|----------------|-------------|-------------------|---------------|
-| [1](./tiers/tier-1.md) | yes | no  | no  | partial (block) | **supported** |
-| [2](./tiers/tier-2.md) | yes | yes | no  | no              | **supported** |
-| [3](./tiers/tier-3.md) | yes | yes | yes | no              | planned       |
-| [4](./tiers/tier-4.md) | yes | yes | yes | yes             | planned       |
+| Tier                   | See call name | See typed data | Modify data | Bypass downstream | Status                  |
+|------------------------|---------------|----------------|-------------|-------------------|-------------------------|
+| [1](./tiers/tier-1.md) | yes           | no             | no          | partial (block)   | **supported**           |
+| [2](./tiers/tier-2.md) | yes           | yes            | no          | no                | **supported**           |
+| [3](./tiers/tier-3.md) | yes           | yes            | yes         | no                | **supported** (builtin) |
+| [4](./tiers/tier-4.md) | yes           | yes            | yes         | yes               | **supported** (builtin) |
 
-The tiers split along two emit-path families in the adapter generator.
-Tiers 1 and 2 share a **pass-through observation** path: arguments flow
-to the downstream unchanged, hooks fire on the side. Tiers 3 and 4
-share a **value synthesis** path: the wrapper materializes
-canonical-ABI values from structural attributes — tier 3 uses the
-synthesized values to call the downstream, tier 4 uses them as the
-return value directly and elides the downstream call entirely.
+The tiers split along two emit-path families:
+
+- **Tiers 1 and 2** are wasm-component middleware against a WIT hook
+  ABI. Splicer generates a separate adapter component that lifts
+  canonical-ABI values into a uniform structural representation
+  (`field-tree` for tier-2) and fires the middleware's hooks. Two
+  artifacts: the middleware + the generated adapter.
+- **Tiers 3 and 4** are Rust strategy crates against the
+  [`splicer-tool-sdk`](../splicer-tool-sdk/) strategy traits. Splicer
+  reads the target's WIT, runs `wit-bindgen` to get typed Rust
+  bindings, and emits a wrapper crate that dispatches each method to
+  the strategy. The wrapper IS the adapter — one artifact. See
+  [tier-3.md](./tiers/tier-3.md) and [tier-4.md](./tiers/tier-4.md).
 
 Each tier strictly adds one capability over the previous. Middleware
 written for a lower tier works unchanged when higher tiers become
@@ -128,6 +134,12 @@ modification), ship them as **separate components** and chain them via
 at the configuration level rather than hidden inside one component's
 exports.
 
+A middleware that matches none of the tier shapes — doesn't export
+the target interface directly, doesn't export any `splicer:tierN/*`
+package — is injected with a warning: splicer can't confirm type
+safety, but won't block the splice in case the user knows something
+splicer doesn't.
+
 ### Composing middleware in a chain
 
 A splice rule's `inject: [m1, m2, m3]` produces a chain where `m1` is
@@ -174,60 +186,3 @@ Reorder the same three to `[t3, t2, t1]` and `t2` will observe the
 post-transform args on the way in (because `t3` is now outside it) and
 the pre-back-transform result on the way out — different snapshots,
 same overall correctness.
-
-## How Splicer Detects Adapter Eligibility
-
-When processing a splice rule, splicer checks each middleware component:
-
-1. **Does it export the target interface directly?** If yes, no adapter
-   is needed — the middleware is wired in as-is. A type fingerprint
-   check ensures the middleware's export is structurally compatible
-   with the interface it's being placed on.
-
-2. **Does it export interfaces from exactly one `splicer:tierN/*`
-   package?** If yes, splicer classifies the middleware as tier-N
-   compatible and generates an adapter component automatically. The
-   adapter file is written to the splits directory alongside the split
-   sub-components. Within that tier, any non-empty subset of the tier's
-   interfaces is valid.
-
-3. **Does it export interfaces from multiple tier packages?** Splicer
-   rejects with an error:
-   ```
-   middleware `my-middleware.wasm` exports interfaces from multiple tiers
-   (tier 1: splicer:tier1/before; tier 2: splicer:tier2/before).
-
-   A middleware must implement exactly one tier. To combine behaviors,
-   ship them as separate components and chain them in `inject: [...]`.
-   ```
-   See ["One tier per middleware"](#one-tier-per-middleware) for the
-   rationale.
-
-4. **None of the above?** Splicer emits a warning: the middleware
-   doesn't match the target interface and isn't adapter-compatible. It
-   can still be injected (the user may know something splicer doesn't),
-   but type safety is unconfirmed.
-
-## Adapter Component Internals (Brief)
-
-For those curious about what's inside the generated `.wasm`: the
-adapter is a self-contained WebAssembly component that contains two
-nested core modules (a memory provider and a dispatch module) plus the
-canonical-ABI glue to lift and lower between the component model and
-core Wasm. The dispatch module implements the before/call/after/block
-sequencing in straight-line Wasm, using the component model's async
-primitives (`waitable-set`, `subtask`, `task.return`) for async
-function support.
-
-The adapter handles sync functions, async functions, functions with
-string parameters, functions with resource types, and functions with
-complex result types (like `result<response, error-code>`) — all
-transparently. The middleware component never needs to know about any
-of this.
-
-For a low-level architecture walkthrough of the generator itself —
-module layout, type-flow from cviz through `wit-parser` to emitted
-wasm, how `wit-bindgen-core::abi::lift_from_memory` drives the
-`task.return` loads, heterogeneous-variant widening, and what splicer
-still owns vs. inherits from upstream — see
-[`adapter-internals.md`](./adapter-internals.md).

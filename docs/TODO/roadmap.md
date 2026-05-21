@@ -35,13 +35,13 @@ Multi-edge doc steps 2-3:
 
 ### Stream B — tier-3 substrate foundation (~2 weeks)
 
-Substrate doc TL;DR foundation items:
-- [ ] `WrapperStrategy` trait in `splicer-tool-sdk`
+Substrate foundation items:
+- [x] Strategy traits in `splicer-tool-sdk` (`TransformStrategy`, `VirtualizeStrategy` — split per behavior instead of one unified trait)
 - [ ] `TypedFromCells` derive macro
 - [ ] `TraceReader` skeleton (no resource correlation yet)
-- [ ] Codegen template skeleton (`syn`/`quote`) in `src/codegen/typed_builtins/`
-- [ ] Cargo build pipeline + cache (`(WIT-hash, template-version, sdk-version) -> .wasm`)
-- [ ] `hello-tier3` + `hello-tier4` smoke builtins (if time remains in the phase)
+- [x] Codegen template (`syn`/`quote`) at `src/adapter/typed/`
+- [x] Cargo build pipeline (persistent per-build dirs under `<user-cache>/splicer/typed-builtins/builds/` + shared `CARGO_TARGET_DIR`; cargo's incremental handles staleness, no custom wasm cache)
+- [x] `hello-tier3` + `hello-tier4` smoke builtins (end-to-end through `./run.sh --builtin-hello-tier{3,4}`)
 
 ### Stream C — subgraph selection (~1-1.5 weeks)
 
@@ -63,13 +63,19 @@ is already specced in the multi-edge doc; no design negotiation needed.
 - [ ] `redact-strings` builtin (drives `TypedVisit` derive + type-predicate matcher)
 - [ ] Multi-edge step 4: `on_edge: <id>` literal selector
 - [ ] Multi-edge step 5: `splicer edges <composition>` CLI
+- [ ] **User-form tier-3/4 middleware.** Today tier-3/4 only works for shipped
+  builtins — the codegen pipeline reads strategy source from splicer's
+  `include_dir!` embed. To support BYO strategy crates, add a YAML shape that
+  points splicer at a user strategy crate path (analogue of tier-1/2's
+  `name:` + `path:`), and feed it through the same codegen pipeline.
 - [ ] **Sync-target support in tier-3/4 codegen.** Today wit-bindgen emits sync
   `fn` Guest methods for `func` WIT signatures but `emit_method.rs` always emits
-  `async fn` bodies (matching the async `WrapperStrategy::handle`), so sync
-  targets fail the wrapper crate's compile with E0053. Options: emit sync
-  `fn` bodies that `block_on` the async strategy, or split the strategy trait
-  into sync + async variants. Currently restricts the harness to `async func`
-  targets only (see `tests/component-interposition/splicer-rules/builtin-hello-tier3.yaml`).
+  `async fn` bodies (matching the async `TransformStrategy` / `VirtualizeStrategy`
+  traits), so sync targets fail the wrapper crate's compile with E0053. Options:
+  emit sync `fn` bodies that `block_on` the async strategy, or split the
+  strategy traits into sync + async variants. Currently restricts the harness
+  to `async func` targets only (see
+  `tests/component-interposition/splicer-rules/builtin-hello-tier3.yaml`).
 
 Skipped Phase 3 — Phase 1's Stream C already covered `between_subgraph`,
 and Phase 2 picks up the rest.

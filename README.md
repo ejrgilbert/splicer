@@ -52,12 +52,12 @@ composition time.
 
 ## Middleware Tiers
 
-| Tier       | Data access         | Calls downstream? | Capability                                                                              | WIT                                          | Status        |
-|------------|---------------------|-------------------|-----------------------------------------------------------------------------------------|----------------------------------------------|---------------|
-| **Tier 1** | none (call-id only) | yes _(skippable)_ | **Hooks**: middleware sees the call identity but _not types or data_                    | [`wit/tier1/world.wit`](wit/tier1/world.wit) | **Supported** |
-| **Tier 2** | read-only           | yes               | **Observe**: middleware sees the typed values flowing through; _cannot modify_          | [`wit/tier2/world.wit`](wit/tier2/world.wit) | **Supported** |
-| **Tier 3** | read + write        | yes               | **Transform**: middleware sees AND modifies the values; _downstream is still called_    | `wit/tier3/world.wit` (planned)              | Planned       |
-| **Tier 4** | read + write        | no                | **Virtualize**: middleware _replaces the downstream_ entirely (mocks, virts, replayers) | `wit/tier4/world.wit` (planned)              | Planned       |
+| Tier       | Data access         | Calls downstream? | Capability                                                                              | Contract                                                    | Status        |
+|------------|---------------------|-------------------|-----------------------------------------------------------------------------------------|-------------------------------------------------------------|---------------|
+| **Tier 1** | none (call-id only) | yes _(skippable)_ | **Hooks**: middleware sees the call identity but _not types or data_                    | [`wit/tier1/world.wit`](wit/tier1/world.wit)                | **Supported** |
+| **Tier 2** | read-only           | yes               | **Observe**: middleware sees the typed values flowing through; _cannot modify_          | [`wit/tier2/world.wit`](wit/tier2/world.wit)                | **Supported** |
+| **Tier 3** | read + write        | yes               | **Transform**: middleware sees AND modifies the values; _downstream is still called_    | [`splicer_tool_sdk::TransformStrategy`](splicer-tool-sdk/)  | **Supported** |
+| **Tier 4** | read + write        | no                | **Virtualize**: middleware _replaces the downstream_ entirely (mocks, virts, replayers) | [`splicer_tool_sdk::VirtualizeStrategy`](splicer-tool-sdk/) | **Supported** |
 
 Each tier strictly adds one capability. Middleware written for a lower tier
 works unchanged when higher tiers become available.
@@ -68,9 +68,9 @@ asks the middleware at runtime whether to invoke it. It's a per-call gate.
 With virtualization the downstream call **is not in the adapter at
 all**; it cannot be reached, regardless of runtime state.
 
-To write a tier-1 or tier-2 middleware, your component exports one or more
-of the interfaces defined in its respective wit world, e.g. tier 1's
-[`wit/tier1/world.wit`](wit/tier1/world.wit). Tier-2 hooks receive
+Tier-1 and tier-2 middleware are **components**: your wasm exports one
+or more of the interfaces defined in the relevant tier WIT world (e.g.
+[`wit/tier1/world.wit`](wit/tier1/world.wit)). Tier-2 hooks receive
 arguments and results lifted into a structural `field-tree` (defined in
 [`wit/common/world.wit`](wit/common/world.wit)), so observation middleware
 can inspect typed values without depending on the target interface's
@@ -79,6 +79,16 @@ concrete types.
 When `splicer splice` detects that a middleware exports these interfaces (instead
 of the target interface directly), it automatically generates an adapter
 component and wires it into the composition.
+
+Tier-3 and tier-4 middleware are **Rust strategy crates** implementing
+[`TransformStrategy`](splicer-tool-sdk/) or
+[`VirtualizeStrategy`](splicer-tool-sdk/) from
+[`splicer-tool-sdk`](splicer-tool-sdk/). Splicer codegens a per-target
+wrapper at splice-time; the wrapper is the adapter. See
+[tier-3](docs/tiers/tier-3.md) / [tier-4](docs/tiers/tier-4.md).
+
+Tier-3/4 currently ships only via builtins. User-form tier-3/4 (point
+splicer at your own strategy crate) is planned.
 
 For Rust authors, [`splicer-tool-sdk`](splicer-tool-sdk/) ships
 ready-made building blocks for middleware and downstream tools. Common
@@ -94,19 +104,26 @@ detection works, and what the generated adapter does internally — see
 
 # Builtins
 
-Splicer ships pre-built middleware components, fetched on demand from
-`ghcr.io/ejrgilbert/splicer/builtins/*`. Reference one from a splice
-config without supplying a path:
+Splicer ships middleware as builtins, referenced by name in a splice
+config:
 
 ```yaml
 inject:
   - builtin: hello-tier1
 ```
 
+Tier-1/2 builtins are pre-built wasm fetched on demand from
+`ghcr.io/ejrgilbert/splicer/builtins/*`. Tier-3/4 builtins are Rust
+strategy crates embedded in splicer's binary; the wrapper is codegen'd
+and compiled per-target at splice-time (requires `cargo` and
+`wasm32-wasip1` on PATH).
+
 | Name                                               | Tier | Description                                                                      |
 |----------------------------------------------------|------|----------------------------------------------------------------------------------|
 | [`hello-tier1`](builtins/hello-tier1/)             | 1    | `println!`s every wrapped call. Verifies splice rules fire.                      |
 | [`hello-tier2`](builtins/hello-tier2/)             | 2    | `println!`s every wrapped call with lifted arg + result values.                  |
+| [`hello-tier3`](builtins/hello-tier3/)             | 3    | Pass-through transform; `println!`s before/after each wrapped call.              |
+| [`hello-tier4`](builtins/hello-tier4/)             | 4    | Returns `R::default()` instead of forwarding. Requires `R: Default`.             |
 | [`otel-bare-spans`](builtins/otel-bare-spans/)     | 1    | Emits a `wasi:otel` span per call (timing + call-id attrs, no payload).          |
 | [`otel-bare-metrics`](builtins/otel-bare-metrics/) | 1    | Emits `wasi:otel` count + duration-histogram metrics (no payload).               |
 | [`otel-bare-logs`](builtins/otel-bare-logs/)       | 1    | Emits a structured `wasi:otel` log per call (configurable severity, no payload). |
