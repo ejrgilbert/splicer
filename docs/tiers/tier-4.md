@@ -45,13 +45,13 @@ has no bounds on `Args` or `R`, strategies declare bounds on the impl,
 mismatches with the target surface as cargo trait-bound errors at
 splice-time.
 
-| Strategy intent              | Typical bound on the impl                                  |
-|------------------------------|------------------------------------------------------------|
-| Default-stub (`hello-tier4`) | `R: Default`                                               |
-| Trace replay                 | `R: TypedFromCells` (planned)                              |
-| Fixture mock                 | `R: TypedFromCells` (planned)                              |
-| Random fuzz response         | `R: for<'a> Arbitrary<'a>` (planned)                       |
-| Chaos: return configured Err | `R: IntoResult, R::Err: Clone` (planned)                   |
+| Strategy intent              | Typical bound on the impl                                                                           |
+|------------------------------|-----------------------------------------------------------------------------------------------------|
+| Default-stub (`hello-tier4`) | `R: Default`                                                                                        |
+| Trace replay                 | `R: WitTyped` (use `splicer_tool_sdk::cells_to_typed` to decode a tier-2 cells stream into `R`)     |
+| Fixture mock                 | `R: WitTyped` (decode a configured cells/WAVE-text fixture)                                         |
+| Random fuzz response         | `R: for<'a> Arbitrary<'a>` (planned)                                                                |
+| Chaos: return configured Err | `R: IntoResult, R::Err: Clone` (planned)                                                            |
 
 `hello-tier4` won't wrap an interface whose return type contains a
 resource handle (resources can't impl `Default`).

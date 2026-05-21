@@ -52,25 +52,25 @@ handles resources at tier-3 / tier-4:
 ## Strategies and what each needs
 
 Each strategy declares its requirements via where-clauses on its
-`WrapperStrategy` impl. The substrate trait stays minimal; per-strategy
-bounds carry the specifics.
+`TransformStrategy` or `VirtualizeStrategy` impl. The substrate traits
+stay minimal; per-strategy bounds carry the specifics.
 
-| Tool                          | Tier   | What the strategy needs                                  |
-|-------------------------------|--------|----------------------------------------------------------|
-| `replay`                      | tier-4 | `TraceReader` + `R: TypedFromCells`; resource impls (v2) |
+| Tool                          | Tier   | What the strategy needs                                   |
+|-------------------------------|--------|-----------------------------------------------------------|
+| `replay`                      | tier-4 | `TraceReader` + `R: WitTyped` (decoded via `cells_to_typed`); resource impls (resource path) |
 | `fuzz` (input)                | tier-3 | `Args: Arbitrary` + RNG; predicate `no-resources-in-args` |
-| `mock`                        | tier-4 | configured cells + `R: TypedFromCells`                   |
-| `chaos-err`                   | tier-4 | configured err variant + `R: TypedFromCells` on err type |
-| `retry-with-backoff`          | tier-3 | `R: IntoResult` + predicate `returns-result`             |
-| `timeout`                     | tier-3 | async race primitives + `R: IntoResult`                  |
-| `circuit-breaker`             | tier-2 | (post-`should-skip`); not a tier-3 builtin in practice   |
-| `rate-limiter`                | tier-3 | state machine, no type bounds                            |
+| `mock`                        | tier-4 | configured cells + `R: WitTyped`                          |
+| `chaos-err`                   | tier-4 | configured err variant + `R: WitTyped` on err type        |
+| `retry-with-backoff`          | tier-3 | `R: IntoResult` + predicate `returns-result`              |
+| `timeout`                     | tier-3 | async race primitives + `R: IntoResult`                   |
+| `circuit-breaker`             | tier-2 | (post-`should-skip`); not a tier-3 builtin in practice    |
+| `rate-limiter`                | tier-3 | state machine, no type bounds                             |
 | `memoize`                     | tier-3 | `Args: Hash, R: Clone` + predicate `no-resources-anywhere` |
 | `redact-strings`              | tier-3 | `Args, R: TypedVisit` + predicate `contains-type: string` |
 | `normalize-strings`           | tier-3 | `Args, R: TypedVisit` + predicate `contains-type: string` |
-| `default-fill-options`        | tier-3 | `Args: TypedVisit` + predicate `has-option`              |
-| `clamp-numerics`              | tier-3 | `Args, R: TypedVisit` + predicate `has-numeric`          |
-| `mutation-fuzz-seen-shapes`   | tier-3 | `Args: TypedVisit` + RNG                                 |
+| `default-fill-options`        | tier-3 | `Args: TypedVisit` + predicate `has-option`               |
+| `clamp-numerics`              | tier-3 | `Args, R: TypedVisit` + predicate `has-numeric`           |
+| `mutation-fuzz-seen-shapes`   | tier-3 | `Args: TypedVisit` + RNG                                  |
 
 Tools whose value is target-specific (HTTP header inject, KV
 transparent encryption, filesystem path sandbox, custom request
@@ -103,25 +103,37 @@ Type-predicate matching also helps non-walking strategies. `retry`
 matches only `returns-result`; `memoize` matches
 `no-resources-anywhere`. Composable with existing name-based matching.
 
-## Wire format: cells end-to-end
+## Wire format vs user-facing format
 
-Splicer uses cells (the schema defined in `wit/common/world.wit`) as
-the single wire format across the recorder, replayer, fuzz seed
-corpus, and any future cells-consuming tool. Tier-2 already lifts to
-cells; the recorder writes cells; the replayer reads cells back
-through `TypedFromCells` derives.
+Two distinct layers, deliberately separated:
 
-Cells is self-describing, which tier-2 needs because the middleware
-does not know the target's WIT. The typed-codegen path (where the
-codegen *does* know the target WIT) reads cells via the SDK's
-`TypedFromCells` derive, which wit-bindgen emits per generated type
-via `additional_derives`. The recorder/replayer loop is single-format,
-no bridge layer between recording and replaying.
+- **Cells** is the **wire format** — the schema defined in
+  `wit/common/world.wit`. Tier-2 lifts canonical-ABI values into
+  cells; the recorder writes cells; the replayer reads cells.
+  Self-describing, so tier-2 middleware can produce cells without
+  knowing the target's WIT.
+- **WAVE** is the **user-facing typed format** — the wasm component
+  model's canonical text representation. Debug logs, fixture
+  authoring, `splicer trace diff`, golden-file capture, and any
+  other tooling that surfaces typed values to a human or another
+  toolchain speaks WAVE.
+
+The bridge between the two is [`WitTyped`](../../splicer-tool-sdk/src/wave_bridge.rs)
++ [`cells_to_typed`](../../splicer-tool-sdk/src/wave_bridge.rs). The
+tier-3/4 codegen auto-impls `WitTyped` for every type wit-bindgen
+generates; `cells_to_typed::<R>(cells)` walks a cells stream and
+constructs an `R` by dispatching through the impls.
+
+A tier-4 replay strategy then takes a cells trace from disk (written
+by the tier-2 recorder), threads it through `cells_to_typed`, and
+returns the resulting `R`. Cells stays the on-disk format; the
+strategy sees typed Rust.
 
 proxy-component uses WAVE for its trace format. Splicer cites
 proxy-component as prior art for the `wrapped-` namespace +
-`MockedResource` codegen pattern but adopts cells in place of WAVE for
-the trace wire format.
+`MockedResource` codegen pattern but adopts cells in place of WAVE
+for the **trace wire format** — WAVE remains the user-facing typed
+surface.
 
 ## v2 scope (resource support)
 
@@ -134,7 +146,7 @@ HTTP record/replay as the forcing function:
 - `MockedResource { handle, name }` pattern + emitted `GuestResource`
   impls.
 - Correlation map plumbing in `TraceReader`.
-- `TypedFromCells` impls for `Resource<T>`.
+- `WitTyped` impls for `Resource<T>`.
 - wac composition wiring for the types interface (full virt).
 - Target: wasi:http first, then wasi:keyvalue (where WIT permits),
   wasi:filesystem (where WIT permits).
@@ -148,8 +160,8 @@ to resources at all.
 
 1. Trait bounds on the strategy traits stay minimal (no `Clone`, no
    `Hash`). Per-strategy bounds go on impl where-clauses.
-2. `TypedFromCells` derive macro is designed to accommodate resource
-   types even if v1 emits no impls for them.
+2. The `WitTyped` derive (planned) is designed to accommodate resource
+   types even if the value-typed substrate emits no impls for them.
 3. Codegen template iterates over `(interfaces, functions)` AND
    `(interfaces, resources, methods)` from v1, with the resource list
    always empty. v2 fills it.
@@ -286,5 +298,5 @@ strategy configurations applied to `between_subgraph` boundaries.
 - `wit/common/world.wit`: cell representation that flows end-to-end.
 - `src/adapter/typed/`: shipped codegen + cargo build pipeline.
 - `splicer-tool-sdk/`: home for `TransformStrategy`,
-  `VirtualizeStrategy`, and the SDK helpers still to land
-  (`TypedFromCells`, `TypedVisit`, `TraceReader`).
+  `VirtualizeStrategy`, `WitTyped`, `cells_to_typed`, and the SDK
+  helpers still to land (`TypedVisit`, `TraceReader`, `#[derive(WitTyped)]`).

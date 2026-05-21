@@ -85,7 +85,8 @@ pub trait TransformStrategy<Args, R> {
 ///
 /// `Args` and `R` are generic at the *trait* level so each strategy
 /// can narrow accepted call shapes via its impl's where-clause —
-/// e.g. replay requires `R: TypedFromCells`, fuzz requires
+/// e.g. replay requires `R: WitTyped` (so [`crate::cells_to_typed`]
+/// can decode a recorded cells stream into `R`), fuzz requires
 /// `Args: Arbitrary`.
 ///
 /// # Example: synthesize the default value for any return type

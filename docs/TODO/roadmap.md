@@ -37,7 +37,7 @@ Multi-edge doc steps 2-3:
 
 Substrate foundation items:
 - [x] Strategy traits in `splicer-tool-sdk` (`TransformStrategy`, `VirtualizeStrategy` — split per behavior instead of one unified trait)
-- [ ] `TypedFromCells` derive macro
+- [ ] `#[derive(WitTyped)]` proc-macro for user types (codegen auto-impls it for generated wrapper types today; standalone derive is for user code)
 - [ ] `TraceReader` skeleton (no resource correlation yet)
 - [x] Codegen template (`syn`/`quote`) at `src/adapter/typed/`
 - [x] Cargo build pipeline (persistent per-build dirs under `<user-cache>/splicer/typed-builtins/builds/` + shared `CARGO_TARGET_DIR`; cargo's incremental handles staleness, no custom wasm cache)
@@ -100,7 +100,7 @@ proxy-component is the blueprint; adapt with cells in place of WAVE:
 - [ ] `wrapped-` namespace WIT rewriting
 - [ ] `MockedResource { handle, name }` pattern + `GuestResource` impls
 - [ ] Resource correlation map in `TraceReader`
-- [ ] `TypedFromCells` impls for `Resource<T>`
+- [ ] `WitTyped` impls for `Resource<T>`
 - [ ] wac composition wiring for types interfaces (full virt)
 - [ ] HTTP record/replay demo
 
@@ -118,6 +118,6 @@ Defer until post-paper, no blocking impact:
 
 Where the calendar can slip:
 1. **`wasi:filesystem` integration in recorder** (Stream A, step 3). Resource-heavy API.
-2. **`TypedFromCells` derive for resources** (Phase 6). Trickiest derive corner.
+2. **`WitTyped` derive for resources** (Phase 6). Trickiest derive corner.
 3. **wac composition rewriting for full virt** (Phase 6). May need splicer's WAC emitter restructuring.
 4. **Cells binary on-disk format** (Phase 1 Stream A / 4). Framing, versioning, edge_id tagging details.
