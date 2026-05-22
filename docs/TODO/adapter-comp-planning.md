@@ -9,18 +9,19 @@ on what hasn't been built yet.
 
 ## Middleware tier roadmap
 
-Tiers 1 and 2 are shipped. Tiers 3 and 4 are planned. The
+Tiers 1 and 2 are shipped. Tiers 3 and 4 have shipped for builtins;
+user-form (BYO strategy crate) support is on the roadmap. The
 user-facing taxonomy and per-tier WIT shapes live in
 [`adapter-components.md`](../adapter-components.md) and the per-tier
 docs under [`tiers/`](../tiers/); this section captures only the
 open design questions that aren't settled there.
 
-| Tier | New capability                                       | Status      |
-|------|------------------------------------------------------|-------------|
-| 1    | see function name                                    | **shipped** |
-| 2    | observe typed args / results (no modify)             | **shipped** |
-| 3    | modify typed args / results, downstream still called | planned     |
-| 4    | replace the downstream entirely (virtualize)         | planned     |
+| Tier | New capability                                       | Status                       |
+|------|------------------------------------------------------|------------------------------|
+| 1    | see function name                                    | **shipped**                  |
+| 2    | observe typed args / results (no modify)             | **shipped**                  |
+| 3    | modify typed args / results, downstream still called | **shipped (builtin-only)**   |
+| 4    | replace the downstream entirely (virtualize)         | **shipped (builtin-only)**   |
 
 ### Open design questions for tier 3 / 4
 
@@ -227,10 +228,11 @@ happen; revisit when upstream lands the event semantics.
 ## Per-tier performance characterization
 
 Nothing is benchmarked. No `bench/` directory exists. Tier 2 lifts
-canonical-ABI values into `field-value` trees on every call (tier 3
-will also lower them back), so cost scales with payload size, not
-just call count — worth measuring before locking in tier-3 / tier-4
-design choices.
+canonical-ABI values into `field-value` trees on every call, so cost
+scales with payload size, not just call count. Tier 3 / tier 4 take a
+different path (typed Rust values via wit-bindgen, no field-tree lift
+in the data path), so their cost model is independent of tier 2's —
+worth measuring before optimization decisions.
 
 - **Tier 1 baseline.** Per-hook overhead on a representative
   multi-function interface.
@@ -241,8 +243,9 @@ design choices.
   `wasi:http::handle` triggers 50 inner calls on `wasi:http/types` +
   `wasi:keyvalue` + `wasi:filesystem`, aggregate lift cost matters
   more than per-call.
-- **Tier 3 round-trip cost.** Lift + middleware + lower-back; probably
-  2× tier 2 plus the middleware's own work.
+- **Tier 3 round-trip cost.** wit-bindgen-typed args + middleware
+  strategy + downstream call + return. Cost model differs from tier 2
+  (no field-tree lift in the data path); measure independently.
 - **Tier 4 vs direct call.** Tier 4 replaces the downstream, so the
   comparison is "would the same logic written as a normal component
   be faster?" Should be "no, modulo entry-side lift overhead," but
@@ -307,16 +310,16 @@ code generator, and `wirm` is not involved. The cost is an external
 
 ### Generation strategy summary
 
-Tier 1 and tier 2 both use `wasm-encoder` + `wit-bindgen-core::abi`
-for direct core-module construction; tier 2 additionally lifts
+Tier 1 and tier 2 use `wasm-encoder` + `wit-bindgen-core::abi` for
+direct core-module construction; tier 2 additionally lifts
 canonical-ABI values into the `field-tree` cell-array representation
 defined in `wit/common/world.wit` (no WAVE serialization on the wire
-path). Tier 3 will reuse the tier-2 lift plus add a lower-back path
-once it's specified. The one-per-sig case (fuzzer / mock) is where
-the strategies diverge: Rust codegen via `syn` / `quote` +
-`wit-bindgen` + `arbitrary`, then an external `cargo build` — the
-`arbitrary` derive handles all type complexity, so the codegen stays
-small.
+path). Tier 3 and tier 4 take a different path: Rust codegen via
+`syn` / `quote` + `wit-bindgen` + an external `cargo build`, with the
+user strategy dispatched against wit-bindgen-generated typed Rust
+values directly (no field-tree lift in the data path). For
+fuzz / mock builtins the `arbitrary` derive handles the
+type-construction work; the codegen template stays small.
 
 Useful references for tier-3 / one-per-sig work:
 

@@ -14,7 +14,7 @@ detail; this doc is the calendar overlay.
 |-------|----------|------------|
 | 1     | ~2 weeks | 3 streams in parallel: finish recorder, tier-3 substrate foundation, `between_subgraph` selector |
 | 2     | 1-2 weeks| `fuzz-input`, `redact-strings`, smoke tests, multi-edge UX (`on_edge` + `splicer edges` CLI) |
-| 4     | 2-3 weeks| Record + replay loop (multi-edge step 7 + substrate steps 5-6) |
+| 4     | 2-3 weeks| Record + replay loop (multi-edge step 7 + record/replay strategies) |
 | 5     | ~1 week  | Trace diff CLI + differential-testing demo (v1 paper demo) |
 | 6     | 2-3 weeks| v2 resource support → HTTP record/replay (v2 paper demo if needed) |
 
@@ -77,17 +77,17 @@ is already specced in the multi-edge doc; no design negotiation needed.
   to `async func` targets only (see
   `tests/component-interposition/splicer-rules/builtin-hello-tier3.yaml`).
   When this lands, extend the matrix tests in
-  `src/adapter/typed/mod.rs` with sync `func` fixtures so both paths
+  `src/adapter/typed/matrix_tests.rs` with sync `func` fixtures so both paths
   are exercised.
 
-Skipped Phase 3 — Phase 1's Stream C already covered `between_subgraph`,
-and Phase 2 picks up the rest.
+No Phase 3 — Phase 1's Stream C scopes `between_subgraph`, and Phase 2
+picks up the rest.
 
 ## Phase 4: record + replay loop (2-3 weeks)
 
 - [ ] Multi-edge step 7: replayer builtin (tier-4 virtualize)
-- [ ] Substrate step 5: `record` strategy (cells to sink)
-- [ ] Substrate step 6: `replay` strategy (cells → typed values, value-typed targets)
+- [ ] `record` strategy (cells to sink)
+- [ ] `replay` strategy (cells → typed values, value-typed targets)
 
 ## Phase 5: capstone + v1 demo (~1 week)
 

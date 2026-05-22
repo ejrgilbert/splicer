@@ -114,8 +114,9 @@ for canonical-ABI flat-slot counts, `wit_parser::abi::join` for
 variant payload joining, and `wit_bindgen_core::abi::lift_from_memory`
 to walk a WIT type from a memory address and push flat values onto
 the stack (used for retptr-loaded compound results and async
-`task.return` flat loads). `lower_to_memory` is the inverse and is
-anticipated for tier-3's modify-and-write-back path.
+`task.return` flat loads). `lower_to_memory` is the inverse; tier-3
+shipped via a different route (Rust wrappers via wit-bindgen) and does
+not extend the field-tree lift with a lower-back path.
 
 We do **not** use `wit_bindgen_core::abi::call(...)` as a wrapper
 driver. It's built around a typed recursive `Value` representation
