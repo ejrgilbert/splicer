@@ -96,11 +96,6 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-features --verbose --all-targets
 
-  # Exercises the tier-3/4 codegen + cargo + wit-component pipeline.
-  # Marked `#[ignore]` in-source because they shell out to cargo and
-  # need the wasm32-wasip1 target; this job is the only place they
-  # actually run. Keep `--ignored` filters narrow so unrelated ignored
-  # tests in the repo don't get pulled in.
   tier3_4_codegen:
    name: Tier-3/4 codegen pipeline
    runs-on: ubuntu-latest
