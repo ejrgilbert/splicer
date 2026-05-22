@@ -1,29 +1,51 @@
-//! Emit the per-method pieces of the wrapper crate: a synthetic
-//! args struct (record) per Guest function, its `WitTyped` impl,
-//! and the `Guest` trait impl whose method bodies dispatch into the
-//! strategy through a `thread_local!` instance.
+//! Emit the per-method pieces of the wrapper: a synthetic args
+//! struct per Guest function (packing positional params into one
+//! `WitTyped` value), and the `Guest` trait impl whose method bodies
+//! dispatch into the strategy.
 //!
-//! Args structs are splicer-synthesized — they pack a function's
-//! positional parameters into a single named-field record so the
-//! strategy receives one typed `Args` value and the same `WitTyped`
-//! machinery as user-defined types covers them.
+//! Args-struct field types are taken from the IR so named user types
+//! render as the absolute `bindings::<path>::<Ident>` — copying the
+//! syn type from the Guest signature would leave the ident unresolved
+//! at the top of `lib.rs`.
+//!
+//! # What this emits
+//!
+//! For `add: async func(a: u32, b: u32) -> u32` exported by `ops`
+//! under a Transform strategy:
+//!
+//! ```ignore
+//! pub struct OpsAddArgs { pub a: u32, pub b: u32 }
+//!
+//! impl bindings::exports::pkg::ops::Guest for Wrapper {
+//!     async fn add(a: u32, b: u32) -> u32 {
+//!         let call = ::splicer_tool_sdk::CallId { /* … */ };
+//!         let args = OpsAddArgs { a, b };
+//!         let s = strategy();
+//!         <_ as ::splicer_tool_sdk::TransformStrategy<OpsAddArgs, u32>>::handle(
+//!             s, call, args,
+//!             |args: OpsAddArgs| async move {
+//!                 bindings::pkg::ops::add(args.a, args.b).await
+//!             },
+//!         ).await
+//!     }
+//! }
+//! ```
+//!
+//! Virtualize emission drops the closure and dispatches through
+//! `VirtualizeStrategy::handle` instead.
 
-use heck::{ToKebabCase, ToUpperCamelCase};
+use heck::ToUpperCamelCase;
 use proc_macro2::TokenStream;
 use quote::quote;
 
 use super::behavior_meta::Behavior;
-use super::bindings_walk::{GuestMethod, GuestTrait};
+use super::bindings_index::{bindings_path_tokens, GuestMethod, GuestTrait};
+use super::ir::{args_struct_ident, NamedKind, NamedType, RecordField, TypeLocation, WrapperIR};
 
-/// What [`emit_guest`] produces for a single Guest trait. The wrapper
-/// crate's `lib.rs` inlines each piece into the appropriate place
-/// (`args_structs` + `args_witty_impls` go alongside the other
-/// user-type impls; `guest_impl` goes after them).
+/// What [`emit_guest`] produces for a single Guest trait.
 pub struct EmittedGuest {
     /// One args struct definition per method.
     pub args_structs: Vec<TokenStream>,
-    /// One `WitTyped` impl per args struct.
-    pub args_witty_impls: Vec<TokenStream>,
     /// A single `impl <ModPath>::Guest for Wrapper` block containing
     /// every method body.
     pub guest_impl: TokenStream,
@@ -37,30 +59,28 @@ pub fn emit_guest(
     g: &GuestTrait,
     interface_qualified_name: &str,
     behavior: Behavior,
+    ir: &WrapperIR,
 ) -> EmittedGuest {
+    // Last segment is the interface name; an empty path would silently
+    // derive the wrong args ident and miss the lookup downstream.
     let interface_pascal = g
         .module_path
         .last()
-        .cloned()
-        .unwrap_or_default()
+        .expect("Guest trait module path is empty")
         .to_upper_camel_case();
 
     let mut args_structs = Vec::with_capacity(g.methods.len());
-    let mut args_witty_impls = Vec::with_capacity(g.methods.len());
     let mut method_bodies = Vec::with_capacity(g.methods.len());
 
     for method in &g.methods {
-        let params = extract_named_params(&method.sig);
-        let return_ty = return_type(&method.sig);
-        let args_ident = args_struct_ident(&interface_pascal, &method.ident);
+        let args_ident = args_struct_ident(&interface_pascal, &method.ident.to_string());
+        let args_record = find_args_record(ir, &args_ident);
 
-        args_structs.push(emit_args_struct(&args_ident, &params));
-        args_witty_impls.push(emit_args_witty(&args_ident, &params));
+        args_structs.push(emit_args_struct(&args_ident, args_record));
         method_bodies.push(emit_method_body(
             method,
             &args_ident,
-            &params,
-            &return_ty,
+            args_record,
             interface_qualified_name,
             behavior,
             &g.module_path,
@@ -76,138 +96,41 @@ pub fn emit_guest(
 
     EmittedGuest {
         args_structs,
-        args_witty_impls,
         guest_impl,
     }
 }
 
-fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {
-    sig.inputs
+fn find_args_record<'a>(ir: &'a WrapperIR, args_ident: &syn::Ident) -> &'a NamedType {
+    ir.args_records
         .iter()
-        .filter_map(|arg| match arg {
-            syn::FnArg::Typed(pat_typed) => {
-                if let syn::Pat::Ident(pat_ident) = &*pat_typed.pat {
-                    Some((pat_ident.ident.clone(), (*pat_typed.ty).clone()))
-                } else {
-                    None
-                }
-            }
-            // `&self` / `&mut self` don't appear in wit-bindgen Guest
-            // trait methods (they're free functions, not methods on a
-            // resource); ignore if encountered.
-            _ => None,
+        .find(|t| t.rust_ident == *args_ident)
+        .unwrap_or_else(|| {
+            panic!(
+                "IR has no synthesized args record for `{args_ident}`; \
+                 the Resolve walk and Guest-trait extraction disagree on methods"
+            )
         })
-        .collect()
 }
 
-fn return_type(sig: &syn::Signature) -> TokenStream {
-    match &sig.output {
-        syn::ReturnType::Default => quote!(()),
-        syn::ReturnType::Type(_, ty) => quote!(#ty),
+fn args_fields(t: &NamedType) -> &[RecordField] {
+    match &t.kind {
+        NamedKind::Record { fields } => fields.as_slice(),
+        _ => unreachable!("args records must be NamedKind::Record"),
     }
 }
 
-fn args_struct_ident(interface_pascal: &str, method_ident: &syn::Ident) -> syn::Ident {
-    let method_pascal = method_ident.to_string().to_upper_camel_case();
-    let name = format!("{interface_pascal}{method_pascal}Args");
-    syn::Ident::new(&name, proc_macro2::Span::call_site())
-}
-
-fn emit_args_struct(args_ident: &syn::Ident, params: &[(syn::Ident, syn::Type)]) -> TokenStream {
-    if params.is_empty() {
-        return quote! {
-            pub struct #args_ident;
-        };
-    }
-    let fields = params.iter().map(|(name, ty)| quote! { pub #name: #ty });
+fn emit_args_struct(args_ident: &syn::Ident, args_record: &NamedType) -> TokenStream {
+    debug_assert!(matches!(args_record.location, TypeLocation::TopLevel));
+    let field_tokens = args_fields(args_record).iter().map(|f| {
+        let name = &f.rust_ident;
+        let ty = f.ty.to_tokens();
+        quote! { pub #name: #ty }
+    });
+    // Named-empty `{}` (not `;`) so the zero-arg `WitTyped` impl can
+    // construct via `Self {}`.
     quote! {
         pub struct #args_ident {
-            #(#fields),*
-        }
-    }
-}
-
-fn emit_args_witty(args_ident: &syn::Ident, params: &[(syn::Ident, syn::Type)]) -> TokenStream {
-    // Empty-args case: emit a record with no fields. wasm-wave's
-    // `Type::record` won't accept zero fields, so emit a unit-like
-    // impl that pretends the value is a tuple with no elements.
-    if params.is_empty() {
-        return quote! {
-            impl ::splicer_tool_sdk::WitTyped for #args_ident {
-                fn wave_type() -> ::splicer_tool_sdk::wasm_wave::value::Type {
-                    ::splicer_tool_sdk::wasm_wave::value::Type::tuple([])
-                        .expect("zero-element tuple is permitted")
-                }
-                fn to_value(&self) -> ::splicer_tool_sdk::wasm_wave::value::Value {
-                    ::splicer_tool_sdk::wasm_wave::value::Value::make_tuple(
-                        &Self::wave_type(),
-                        ::core::iter::empty::<::splicer_tool_sdk::wasm_wave::value::Value>(),
-                    ).expect("empty tuple is consistent with declared type")
-                }
-                fn from_value(
-                    _value: &::splicer_tool_sdk::wasm_wave::value::Value,
-                ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
-                    ::core::result::Result::Ok(Self)
-                }
-            }
-        };
-    }
-    let pairs: Vec<_> = params
-        .iter()
-        .map(|(name, ty)| (name.clone(), name.to_string().to_kebab_case(), ty.clone()))
-        .collect();
-
-    let wave_type_fields = pairs.iter().map(|(_, wit_name, ty)| {
-        quote! { (#wit_name, <#ty as ::splicer_tool_sdk::WitTyped>::wave_type()) }
-    });
-    let to_value_fields = pairs.iter().map(|(ident, wit_name, ty)| {
-        quote! { (#wit_name, <#ty as ::splicer_tool_sdk::WitTyped>::to_value(&self.#ident)) }
-    });
-    let from_value_inits = pairs.iter().map(|(ident, _, _)| {
-        quote! { let mut #ident = ::core::option::Option::None; }
-    });
-    let from_value_arms = pairs.iter().map(|(ident, wit_name, ty)| {
-        quote! {
-            #wit_name => #ident = ::core::option::Option::Some(
-                <#ty as ::splicer_tool_sdk::WitTyped>::from_value(&v)?
-            ),
-        }
-    });
-    let from_value_constructors = pairs.iter().map(|(ident, wit_name, _)| {
-        quote! {
-            #ident: #ident.ok_or_else(|| ::splicer_tool_sdk::BridgeError::MissingField {
-                name: #wit_name.into(),
-            })?,
-        }
-    });
-
-    quote! {
-        impl ::splicer_tool_sdk::WitTyped for #args_ident {
-            fn wave_type() -> ::splicer_tool_sdk::wasm_wave::value::Type {
-                ::splicer_tool_sdk::wasm_wave::value::Type::record([
-                    #(#wave_type_fields),*
-                ]).expect("args struct has at least one field")
-            }
-            fn to_value(&self) -> ::splicer_tool_sdk::wasm_wave::value::Value {
-                ::splicer_tool_sdk::wasm_wave::value::Value::make_record(
-                    &Self::wave_type(),
-                    [#(#to_value_fields),*],
-                ).expect("emitted field values match the declared record type")
-            }
-            fn from_value(
-                value: &::splicer_tool_sdk::wasm_wave::value::Value,
-            ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
-                #(#from_value_inits)*
-                for (name, v) in value.unwrap_record() {
-                    match &*name {
-                        #(#from_value_arms)*
-                        _ => {}
-                    }
-                }
-                ::core::result::Result::Ok(Self {
-                    #(#from_value_constructors)*
-                })
-            }
+            #(#field_tokens),*
         }
     }
 }
@@ -215,8 +138,7 @@ fn emit_args_witty(args_ident: &syn::Ident, params: &[(syn::Ident, syn::Type)]) 
 fn emit_method_body(
     method: &GuestMethod,
     args_ident: &syn::Ident,
-    params: &[(syn::Ident, syn::Type)],
-    return_ty: &TokenStream,
+    args_record: &NamedType,
     interface_qualified_name: &str,
     behavior: Behavior,
     guest_module_path: &[String],
@@ -225,20 +147,31 @@ fn emit_method_body(
     let method_name = method_ident.to_string();
     let sig_inputs = &method.sig.inputs;
     let sig_output = &method.sig.output;
+    let return_ty = return_type(&method.sig);
+    let fields = args_fields(args_record);
 
-    // Construct args { a, b, ... } from the function's positional params.
-    let args_construct = if params.is_empty() {
-        quote! { #args_ident }
-    } else {
-        let names = params.iter().map(|(n, _)| n);
-        quote! { #args_ident { #(#names),* } }
-    };
+    // Both sides of the pairing come from the same kebab→snake mirror,
+    // so positional indexing is sound by construction.
+    let positional_params = extract_named_params(&method.sig);
+    assert_eq!(
+        positional_params.len(),
+        fields.len(),
+        "Guest method `{}`: syn signature has {} params but IR args record has {} fields",
+        method_ident,
+        positional_params.len(),
+        fields.len()
+    );
+    let inits = fields.iter().enumerate().map(|(i, f)| {
+        let field = &f.rust_ident;
+        let value = &positional_params[i].0;
+        quote! { #field: #value }
+    });
+    let args_construct = quote! { #args_ident { #(#inits),* } };
 
-    // The downstream closure unpacks args back into positional and
-    // calls the target import. For tier-3 (transform); skipped entirely
-    // for tier-4 (virtualize). The import is awaited iff the Guest
-    // method is async (mirroring whether the WIT marked it `async func`).
-    let target_call = build_target_call(method_ident, params, guest_module_path);
+    // Transform strategies forward to the wrapped target via the
+    // closure; virtualize strategies replace the target and never
+    // call into it. `.await` only if the Guest method is async.
+    let target_call = build_target_call(method_ident, fields, guest_module_path);
     let target_call = if method.sig.asyncness.is_some() {
         quote! { #target_call.await }
     } else {
@@ -247,10 +180,9 @@ fn emit_method_body(
 
     let dispatch = match behavior {
         Behavior::Transform => {
-            // Annotate the closure's `args` parameter explicitly:
-            // Rust doesn't always propagate the trait's `Args`
-            // generic through the qualified `<_ as Trait<...>>::handle`
-            // dispatch into closure-parameter inference (E0282).
+            // Annotate the closure parameter — qualified
+            // `<_ as Trait<…>>::handle` dispatch doesn't propagate
+            // into closure inference (E0282).
             quote! {
                 <_ as ::splicer_tool_sdk::TransformStrategy<#args_ident, #return_ty>>::handle(
                     s,
@@ -285,70 +217,102 @@ fn emit_method_body(
     }
 }
 
-/// Build the closure body that calls the wrapped target with the
-/// args unpacked: `bindings::test::pkg::ops::add(args.a, args.b)`.
-/// The path is the *import* side of the bindings (no `exports::`
-/// prefix) — that's where wit-bindgen places the target's import
-/// callables.
+fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(pat_typed) => match &*pat_typed.pat {
+                syn::Pat::Ident(pat_ident) => {
+                    Some((pat_ident.ident.clone(), (*pat_typed.ty).clone()))
+                }
+                other => panic!(
+                    "Guest method `{}` has a non-Ident parameter pattern `{}`; \
+                     the wrapper codegen expects `Ident: Type`",
+                    sig.ident,
+                    quote!(#other),
+                ),
+            },
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect()
+}
+
+fn return_type(sig: &syn::Signature) -> TokenStream {
+    match &sig.output {
+        syn::ReturnType::Default => quote!(()),
+        syn::ReturnType::Type(_, ty) => quote!(#ty),
+    }
+}
+
+/// Build the closure body that calls the wrapped target with args
+/// unpacked, against the import-side path
+/// (`bindings::<pkg>::<iface>::<method>`, no `exports::` prefix).
 fn build_target_call(
     method_ident: &syn::Ident,
-    params: &[(syn::Ident, syn::Type)],
+    fields: &[RecordField],
     guest_module_path: &[String],
 ) -> TokenStream {
-    // The Guest trait lives under `exports::<pkg>::<iface>`. The
-    // matching import lives under `<pkg>::<iface>` (no exports
-    // prefix). Strip the leading `exports` segment if present.
-    let import_segments: Vec<&str> = guest_module_path
-        .iter()
-        .map(String::as_str)
-        .skip_while(|s| *s == "exports")
-        .collect();
-    let import_path: TokenStream = if import_segments.is_empty() {
-        quote!(bindings)
-    } else {
-        let segs = import_segments
-            .iter()
-            .map(|s| syn::Ident::new(s, proc_macro2::Span::call_site()));
-        quote!(bindings::#(#segs)::*)
-    };
-    let arg_exprs = params.iter().map(|(n, _)| quote! { args.#n });
+    // The Guest trait lives at `exports::<pkg>::<iface>`; the import
+    // side drops that prefix.
+    assert_eq!(
+        guest_module_path.first().map(String::as_str),
+        Some("exports"),
+        "Guest trait module path must start with `exports`; got {guest_module_path:?}",
+    );
+    let import_path = bindings_path_tokens(&guest_module_path[1..], None);
+    let arg_exprs = fields.iter().map(|f| {
+        let name = &f.rust_ident;
+        quote! { args.#name }
+    });
     quote! { #import_path::#method_ident(#(#arg_exprs),*) }
 }
 
 fn build_module_path(segments: &[String]) -> TokenStream {
-    let idents = segments
-        .iter()
-        .map(|s| syn::Ident::new(s, proc_macro2::Span::call_site()));
-    quote!(bindings::#(#idents)::*)
+    bindings_path_tokens(segments, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::adapter::typed::bindgen::run_wit_bindgen_rust;
-    use crate::adapter::typed::bindings_walk::walk_bindings;
+    use crate::adapter::typed::bindings_index::build_bindings_index;
+    use crate::adapter::typed::ir::build_ir;
+
+    const INTERFACE_QN: &str = "test:pkg/ops@0.1.0";
+
+    const TINY_WIT: &str = r#"
+        package test:pkg@0.1.0;
+        interface ops {
+            add: func(a: u32, b: u32) -> u32;
+        }
+        world w { export ops; }
+    "#;
 
     fn normalize(s: &str) -> String {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
-    fn emit_for_tiny(behavior: Behavior) -> String {
-        let wit = r#"
-            package test:pkg@0.1.0;
-            interface ops {
-                add: func(a: u32, b: u32) -> u32;
-            }
-            world w { export ops; }
-        "#;
-        let src = run_wit_bindgen_rust(wit, Some("w")).unwrap();
-        let bindings = walk_bindings(&src).unwrap();
+    fn emit_for_wit(wit: &str, behavior: Behavior) -> EmittedGuest {
+        let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
+        let bindings = build_bindings_index(&src).unwrap();
+        let ir = build_ir(&resolve, world_id, &bindings).unwrap();
         let g = &bindings.guest_traits[0];
-        let emitted = emit_guest(g, "test:pkg/ops@0.1.0", behavior);
+        emit_guest(g, INTERFACE_QN, behavior, &ir)
+    }
+
+    fn args_structs_str(emitted: &EmittedGuest) -> String {
+        normalize(
+            &emitted
+                .args_structs
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<String>(),
+        )
+    }
+
+    fn full_emission_str(emitted: &EmittedGuest) -> String {
         let mut out = String::new();
         for t in &emitted.args_structs {
-            out.push_str(&t.to_string());
-        }
-        for t in &emitted.args_witty_impls {
             out.push_str(&t.to_string());
         }
         out.push_str(&emitted.guest_impl.to_string());
@@ -357,7 +321,7 @@ mod tests {
 
     #[test]
     fn emits_args_struct_with_fields() {
-        let out = emit_for_tiny(Behavior::Transform);
+        let out = full_emission_str(&emit_for_wit(TINY_WIT, Behavior::Transform));
         assert!(
             out.contains("pub struct OpsAddArgs"),
             "expected OpsAddArgs struct: {out}"
@@ -374,17 +338,15 @@ mod tests {
 
     #[test]
     fn forward_emission_uses_forward_strategy_and_downstream_closure() {
-        let out = emit_for_tiny(Behavior::Transform);
+        let out = full_emission_str(&emit_for_wit(TINY_WIT, Behavior::Transform));
         assert!(
             out.contains("TransformStrategy"),
             "expected TransformStrategy dispatch: {out}"
         );
-        // The downstream closure calls the import-side bindings path.
         assert!(
             out.contains("bindings :: test :: pkg :: ops :: add"),
             "expected import-side call to bindings::test::pkg::ops::add: {out}"
         );
-        // The closure threads args back into positional args.
         assert!(
             out.contains("args . a"),
             "expected args.a in closure: {out}"
@@ -397,12 +359,11 @@ mod tests {
 
     #[test]
     fn virtualize_emission_uses_virtualize_strategy_without_closure() {
-        let out = emit_for_tiny(Behavior::Virtualize);
+        let out = full_emission_str(&emit_for_wit(TINY_WIT, Behavior::Virtualize));
         assert!(
             out.contains("VirtualizeStrategy"),
             "expected VirtualizeStrategy dispatch: {out}"
         );
-        // No downstream closure — virtualize strategies don't get one.
         assert!(
             !out.contains("async move"),
             "virtualize emission should not contain a downstream closure: {out}"
@@ -415,7 +376,7 @@ mod tests {
 
     #[test]
     fn call_id_carries_interface_and_function_names() {
-        let out = emit_for_tiny(Behavior::Transform);
+        let out = full_emission_str(&emit_for_wit(TINY_WIT, Behavior::Transform));
         assert!(
             out.contains("\"test:pkg/ops@0.1.0\""),
             "expected qualified interface in CallId: {out}"
@@ -423,24 +384,6 @@ mod tests {
         assert!(
             out.contains("\"add\""),
             "expected function name in CallId: {out}"
-        );
-    }
-
-    #[test]
-    fn args_struct_witty_impl_emitted() {
-        let out = emit_for_tiny(Behavior::Transform);
-        assert!(
-            out.contains("impl :: splicer_tool_sdk :: WitTyped for OpsAddArgs"),
-            "expected WitTyped impl for args struct: {out}"
-        );
-        // Kebab-case field names appear in the impl.
-        assert!(
-            out.contains("\"a\""),
-            "expected kebab-case field name 'a': {out}"
-        );
-        assert!(
-            out.contains("\"b\""),
-            "expected kebab-case field name 'b': {out}"
         );
     }
 
@@ -453,25 +396,31 @@ mod tests {
             }
             world w { export ops; }
         "#;
-        let src = run_wit_bindgen_rust(wit, Some("w")).unwrap();
-        let bindings = walk_bindings(&src).unwrap();
-        let g = &bindings.guest_traits[0];
-        let emitted = emit_guest(g, "test:pkg/ops@0.1.0", Behavior::Transform);
-        let out = normalize(
-            &emitted
-                .args_structs
-                .iter()
-                .chain(&emitted.args_witty_impls)
-                .map(|t| t.to_string())
-                .collect::<String>(),
-        );
+        let out = args_structs_str(&emit_for_wit(wit, Behavior::Transform));
         assert!(
-            out.contains("pub struct OpsNoopArgs ;"),
-            "expected unit struct for zero-arg method: {out}"
+            out.contains("pub struct OpsNoopArgs { }"),
+            "expected named-empty struct for zero-arg method: {out}"
         );
+    }
+
+    #[test]
+    fn args_struct_with_named_user_type_uses_absolute_bindings_path() {
+        // Named user types reach the args-struct decl from a scope
+        // where the local Rust ident isn't visible, so field types
+        // must resolve via the absolute `bindings::…::Ident` path.
+        let wit = r#"
+            package test:pkg@0.1.0;
+            interface ops {
+                record point { x: u32, y: u32 }
+                place: func(p: point);
+            }
+            world w { export ops; }
+        "#;
+        let decls = args_structs_str(&emit_for_wit(wit, Behavior::Transform));
         assert!(
-            out.contains("Type :: tuple"),
-            "expected zero-tuple WitTyped for unit args: {out}"
+            decls.contains("bindings :: exports :: test :: pkg :: ops :: Point")
+                || decls.contains("bindings::exports::test::pkg::ops::Point"),
+            "args struct field should use absolute bindings:: path: {decls}"
         );
     }
 }

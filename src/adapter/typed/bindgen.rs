@@ -4,19 +4,24 @@
 
 use anyhow::{anyhow, Context, Result};
 use wit_bindgen_core::{Files, WorldGenerator};
-use wit_parser::Resolve;
+use wit_parser::{Resolve, WorldId};
 
-/// Run wit-bindgen-rust against the given WIT text and produce the
-/// bindings source. Returns the contents of the single `.rs` file
-/// wit-bindgen-rust emits.
+/// Run wit-bindgen-rust against the given WIT text.
 ///
-/// `world_name` selects which world to generate bindings for. Pass
-/// `None` if the WIT contains exactly one world.
-pub fn run_wit_bindgen_rust(wit_text: &str, world_name: Option<&str>) -> Result<String> {
+/// Returns the parsed [`Resolve`], the [`WorldId`] the bindings were
+/// generated for, and the Rust source. Keeping the [`Resolve`] lets
+/// downstream walks read WIT semantics directly rather than inferring
+/// them from the emitted Rust.
+///
+/// `world_name` selects which world. Pass `None` if the WIT contains
+/// exactly one world.
+pub fn run_wit_bindgen_rust(
+    wit_text: &str,
+    world_name: Option<&str>,
+) -> Result<(Resolve, WorldId, String)> {
     let mut resolve = Resolve::new();
-    // The path is a label for wit-parser's diagnostic messages,
-    // not a real file. `<in-memory>` makes that obvious if an error
-    // bubbles up.
+    // The label appears in wit-parser diagnostics if parsing fails;
+    // there's no real file backing this call.
     let pkg_id = resolve
         .push_str("<in-memory>", wit_text)
         .context("failed to parse input WIT")?;
@@ -40,13 +45,25 @@ pub fn run_wit_bindgen_rust(wit_text: &str, world_name: Option<&str>) -> Result<
         .generate(&mut resolve, world_id, &mut files)
         .context("wit-bindgen-rust generation failed")?;
 
-    let (_, bytes) = files
+    let rs_files: Vec<_> = files
         .iter()
-        .find(|(name, _)| name.ends_with(".rs"))
-        .ok_or_else(|| anyhow!("wit-bindgen-rust produced no .rs output"))?;
-    std::str::from_utf8(bytes)
+        .filter(|(name, _)| name.ends_with(".rs"))
+        .collect();
+    let bytes = match rs_files.as_slice() {
+        [(_, bytes)] => *bytes,
+        [] => return Err(anyhow!("wit-bindgen-rust produced no .rs output")),
+        many => {
+            let names: Vec<&str> = many.iter().map(|(name, _)| *name).collect();
+            return Err(anyhow!(
+                "wit-bindgen-rust produced {} .rs files; expected exactly one: {names:?}",
+                many.len()
+            ));
+        }
+    };
+    let source = std::str::from_utf8(bytes)
         .map(String::from)
-        .context("wit-bindgen-rust output is not UTF-8")
+        .context("wit-bindgen-rust output is not UTF-8")?;
+    Ok((resolve, world_id, source))
 }
 
 #[cfg(test)]
@@ -67,7 +84,7 @@ mod tests {
 
     #[test]
     fn generates_bindings_for_tiny_world() {
-        let src = run_wit_bindgen_rust(TINY_WIT, Some("demo")).unwrap();
+        let (_resolve, _world, src) = run_wit_bindgen_rust(TINY_WIT, Some("demo")).unwrap();
         // Sanity-check the output looks like wit-bindgen-rust bindings.
         assert!(
             src.contains("pub trait Guest"),

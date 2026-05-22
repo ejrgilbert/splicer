@@ -3,49 +3,53 @@
 //! bytecode-emitting [`super::tier1`] and [`super::tier2`]
 //! adapters; emits Rust source that downstream stages compile to
 //! wasm via `cargo build`.
-//!
-//! Pipeline (stages 3-4 of `docs/TODO/tier3-tier4-substrate.md`):
-//! 1. [`read_behavior`] reads the strategy crate's `Cargo.toml`
-//!    `[package.metadata.splicer] behavior = ...` declaration.
-//! 2. The codegen template emits a Cargo project tailored to the
-//!    declared behavior: forward strategies get a wrapper that
-//!    imports the target; virtualize strategies get a wrapper that
-//!    does not.
-//! 3. The cargo build pipeline compiles the project to a wrapper
-//!    `.wasm` and caches the result.
 
 mod assemble;
 mod behavior_meta;
 mod bindgen;
-mod bindings_walk;
+mod bindings_index;
 mod build;
 mod emit_method;
 mod emit_wit_typed;
+mod ir;
 pub(crate) mod target_wit;
 
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
 pub use behavior_meta::Behavior;
 pub use bindgen::run_wit_bindgen_rust;
-pub use bindings_walk::walk_bindings;
+pub use bindings_index::build_bindings_index;
 pub use build::{build_wrapper, BuildConfig};
 pub use emit_method::{emit_guest, EmittedGuest};
 pub use emit_wit_typed::emit_wit_typed_impls;
+#[allow(unused_imports)]
+pub use ir::{build_ir, NamedKind, NamedType, WitTypeRef, WrapperIR};
 pub use target_wit::{target_wit_for_codegen, TargetWit};
 
 use anyhow::Result;
 
 /// One-call orchestrator: take a target WIT and a strategy reference,
 /// produce the full source of a wrapper crate that compiles to a
-/// wasm component. Threads the six module pipeline:
-/// wit-bindgen → walk → emit_wit_typed → emit_method → assemble.
+/// wasm component.
 pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<WrapperCrate> {
-    let bindings_src = run_wit_bindgen_rust(input.target_wit, input.world_name)?;
-    let bindings = walk_bindings(&bindings_src)?;
-    let witty_impls = emit_wit_typed_impls(&bindings.types);
+    // Two complementary views of the same WIT: the Resolve walk drives
+    // the IR (what kind of WIT thing is this — record, flags, …); the
+    // syn walk indexes wit-bindgen's emitted shapes. The IR consults
+    // the index per type to confirm wit-bindgen produced the expected
+    // Rust shape, so the walks aren't independent, but they capture
+    // distinct slices of the same source.
+    let (resolve, world_id, bindings_src) =
+        run_wit_bindgen_rust(input.target_wit, input.world_name)?;
+    let bindings = build_bindings_index(&bindings_src)?;
+    let ir = build_ir(&resolve, world_id, &bindings)?;
+    // User-declared types + per-method synthesized args records both
+    // ride the same emitter via NamedKind dispatch.
+    let user_impls = emit_wit_typed_impls(&ir.types);
+    let args_impls = emit_wit_typed_impls(&ir.args_records);
+    let witty_impls: Vec<_> = user_impls.into_iter().chain(args_impls).collect();
     let guests: Vec<EmittedGuest> = bindings
         .guest_traits
         .iter()
-        .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior))
+        .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior, &ir))
         .collect();
 
     let lib_rs = assemble_lib_rs(&WrapperCrateInputs {
@@ -138,13 +142,18 @@ fn make_wrapper_crate_name(interface: &str, strategy: &str) -> String {
 }
 
 #[cfg(test)]
+mod bindgen_contract_tests;
+#[cfg(test)]
+mod matrix_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     const TINY_WIT: &str = r#"
         package test:pkg@0.1.0;
         interface ops {
-            add: func(a: u32, b: u32) -> u32;
+            add: async func(a: u32, b: u32) -> u32;
         }
         world w { export ops; }
     "#;

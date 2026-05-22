@@ -2,6 +2,34 @@
 //! a wrapper crate: `src/lib.rs` and `Cargo.toml`. Output is plain
 //! source strings ready to write to disk; running `cargo build` on
 //! the resulting project is a downstream concern.
+//!
+//! # What this emits
+//!
+//! The `lib.rs` for a Transform-strategy wrapper looks roughly like:
+//!
+//! ```ignore
+//! mod bindings { /* wit-bindgen-rust output, verbatim */ }
+//!
+//! use ::splicer_tool_sdk::{CallId, WitTyped};
+//! use ::splicer_tool_sdk::wasm_wave::wasm::WasmValue;
+//! use ::splicer_tool_sdk::TransformStrategy;
+//!
+//! pub struct OpsAddArgs { /* … */ }
+//! impl ::splicer_tool_sdk::WitTyped for OpsAddArgs { /* … */ }
+//! impl ::splicer_tool_sdk::WitTyped for bindings::exports::pkg::ops::Point { /* … */ }
+//! // one impl per user-declared type + per synthesized args record
+//!
+//! static STRATEGY: ::std::sync::OnceLock<my_strategy::MyStrategy> =
+//!     ::std::sync::OnceLock::new();
+//! fn strategy() -> &'static my_strategy::MyStrategy { /* OnceLock get-or-init */ }
+//!
+//! struct Wrapper;
+//! impl bindings::exports::pkg::ops::Guest for Wrapper { /* method bodies */ }
+//!
+//! bindings::export!(Wrapper with_types_in bindings);
+//! ```
+//!
+//! Virtualize emits `VirtualizeStrategy` instead of `TransformStrategy`.
 
 use anyhow::{Context, Result};
 use proc_macro2::TokenStream;
@@ -58,11 +86,6 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         .iter()
         .flat_map(|g| g.args_structs.iter())
         .collect();
-    let args_witty_impls: Vec<&TokenStream> = inputs
-        .guests
-        .iter()
-        .flat_map(|g| g.args_witty_impls.iter())
-        .collect();
     let guest_impls: Vec<&TokenStream> = inputs.guests.iter().map(|g| &g.guest_impl).collect();
 
     let assembled = quote! {
@@ -81,12 +104,10 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         use ::splicer_tool_sdk::wasm_wave::wasm::WasmValue;
         #strategy_trait_use
 
-        // Per-user-type WitTyped impls (records, enums, variants).
-        #(#witty_impls)*
-
-        // Per-method args structs and their WitTyped impls.
+        // Args record decls (top-level structs), then `WitTyped`
+        // impls for user types and args records alike.
         #(#args_structs)*
-        #(#args_witty_impls)*
+        #(#witty_impls)*
 
         // One shared strategy instance for the whole wrapper. Stored
         // as `OnceLock<S>` so the strategy reference has `'static`
@@ -179,9 +200,12 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
 mod tests {
     use super::*;
     use crate::adapter::typed::bindgen::run_wit_bindgen_rust;
-    use crate::adapter::typed::bindings_walk::walk_bindings;
+    use crate::adapter::typed::bindings_index::build_bindings_index;
     use crate::adapter::typed::emit_method::emit_guest;
     use crate::adapter::typed::emit_wit_typed::emit_wit_typed_impls;
+    use crate::adapter::typed::ir::build_ir;
+
+    const INTERFACE_QN: &str = "test:pkg/ops@0.1.0";
 
     const TINY_WIT: &str = r#"
         package test:pkg@0.1.0;
@@ -191,14 +215,17 @@ mod tests {
         world w { export ops; }
     "#;
 
-    fn assemble_for_tiny(behavior: Behavior) -> String {
-        let bindings_src = run_wit_bindgen_rust(TINY_WIT, Some("w")).unwrap();
-        let bindings = walk_bindings(&bindings_src).unwrap();
-        let witty_impls = emit_wit_typed_impls(&bindings.types);
+    fn assemble_for_wit(wit: &str, behavior: Behavior) -> String {
+        let (resolve, world_id, bindings_src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
+        let bindings = build_bindings_index(&bindings_src).unwrap();
+        let ir = build_ir(&resolve, world_id, &bindings).unwrap();
+        let user_impls = emit_wit_typed_impls(&ir.types);
+        let args_impls = emit_wit_typed_impls(&ir.args_records);
+        let witty_impls: Vec<_> = user_impls.into_iter().chain(args_impls).collect();
         let guests: Vec<EmittedGuest> = bindings
             .guest_traits
             .iter()
-            .map(|g| emit_guest(g, "test:pkg/ops@0.1.0", behavior))
+            .map(|g| emit_guest(g, INTERFACE_QN, behavior, &ir))
             .collect();
 
         let inputs = WrapperCrateInputs {
@@ -214,7 +241,7 @@ mod tests {
 
     #[test]
     fn assembled_lib_rs_has_required_pieces() {
-        let out = assemble_for_tiny(Behavior::Transform);
+        let out = assemble_for_wit(TINY_WIT, Behavior::Transform);
 
         // The bindings get wrapped in `mod bindings`.
         assert!(
@@ -247,7 +274,7 @@ mod tests {
 
     #[test]
     fn virtualize_behavior_imports_virtualize_strategy() {
-        let out = assemble_for_tiny(Behavior::Virtualize);
+        let out = assemble_for_wit(TINY_WIT, Behavior::Virtualize);
         assert!(
             out.contains("use ::splicer_tool_sdk::VirtualizeStrategy"),
             "virtualize dispatch expects VirtualizeStrategy use:\n{out}"

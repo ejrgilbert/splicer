@@ -214,6 +214,53 @@ impl WitTyped for Result<(), ()> {
     }
 }
 
+// ---- tuple impls ------------------------------------------------------
+//
+// `tuple<T1, ..., Tn>` lowers to `(T1, ..., Tn)`. Rust has no
+// arity-agnostic tuple syntax for trait impls, so the SDK enumerates
+// blanket impls 1..=12 — bump the list if a real WIT needs higher
+// arity.
+//
+// `()` is intentionally NOT impl'd (no Wave type maps to it).
+
+macro_rules! impl_wit_typed_tuple {
+    ($($T:ident => $idx:tt),+) => {
+        impl<$($T: WitTyped),+> WitTyped for ($($T,)+) {
+            fn wave_type() -> WaveType {
+                WaveType::tuple([$($T::wave_type()),+])
+                    .expect("WIT tuple has at least one element type")
+            }
+            fn to_value(&self) -> WaveValue {
+                let ty = Self::wave_type();
+                WaveValue::make_tuple(&ty, [$(self.$idx.to_value()),+])
+                    .expect("element values match the declared tuple type")
+            }
+            fn from_value(v: &WaveValue) -> Result<Self, BridgeError> {
+                let mut it = v.unwrap_tuple();
+                Ok(( $({
+                    let next = it.next().ok_or(BridgeError::ExpectedTypeShape(
+                        "tuple value has fewer elements than the declared type",
+                    ))?;
+                    $T::from_value(&next)?
+                },)+ ))
+            }
+        }
+    };
+}
+
+impl_wit_typed_tuple!(T1 => 0);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6, T8 => 7);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6, T8 => 7, T9 => 8);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6, T8 => 7, T9 => 8, T10 => 9);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6, T8 => 7, T9 => 8, T10 => 9, T11 => 10);
+impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6, T8 => 7, T9 => 8, T10 => 9, T11 => 10, T12 => 11);
+
 /// Decode the cell at `root` directly into a typed Rust value.
 /// Convenience over [`cells_to_value`] + [`WitTyped::from_value`].
 pub fn cells_to_typed<T: WitTyped>(tree: &FieldTree, root: u32) -> Result<T, BridgeError> {
@@ -252,7 +299,9 @@ pub enum BridgeError {
     },
     /// An integer cell didn't fit the narrower target type.
     IntOutOfRange { value: i64, target: WasmTypeKind },
-    /// A variant/enum case name didn't appear in the expected type.
+    /// A name (variant/enum case, record field, or flag) didn't
+    /// appear in the expected type's declared members. Signals
+    /// encoder/decoder schema drift — usually a bug, not noise.
     UnknownCase {
         type_kind: WasmTypeKind,
         case: String,
@@ -267,8 +316,8 @@ pub enum BridgeError {
     ExpectedTypeShape(&'static str),
     /// `Cell::Integer` didn't represent a valid Unicode codepoint.
     InvalidChar(u32),
-    /// Cell shape isn't supported in v1 (resources, streams,
-    /// futures, error-context).
+    /// Cell shape isn't supported (resources, streams, futures,
+    /// error-context).
     Unsupported(&'static str),
     /// wasm-wave rejected the constructed value (e.g. flag name
     /// unknown, payload type mismatch).
@@ -291,7 +340,12 @@ impl fmt::Display for BridgeError {
                 write!(f, "Integer {value} out of range for {target:?}")
             }
             Self::UnknownCase { type_kind, case } => {
-                write!(f, "unknown case {case:?} for {type_kind:?}")
+                let member_word = match type_kind {
+                    WasmTypeKind::Record => "field",
+                    WasmTypeKind::Flags => "flag",
+                    _ => "case",
+                };
+                write!(f, "unknown {member_word} {case:?} for {type_kind:?}")
             }
             Self::MissingField { name } => write!(f, "missing field {name:?} in cell"),
             Self::BytesWithNonU8Element { element_kind } => write!(
@@ -300,7 +354,7 @@ impl fmt::Display for BridgeError {
             ),
             Self::ExpectedTypeShape(s) => write!(f, "expected-type shape issue: {s}"),
             Self::InvalidChar(c) => write!(f, "Integer {c} is not a valid Unicode codepoint"),
-            Self::Unsupported(s) => write!(f, "{s} cells are not supported in v1"),
+            Self::Unsupported(s) => write!(f, "{s} cells are not supported"),
             Self::WasmValue(e) => write!(f, "wasm-wave value construction failed: {e}"),
         }
     }
@@ -422,7 +476,8 @@ fn decode_cell<V: WasmValue>(
         WasmTypeKind::Option => decode_option::<V>(tree, cell, expected),
         WasmTypeKind::Result => decode_result::<V>(tree, cell, expected),
         WasmTypeKind::Flags => decode_flags::<V>(tree, cell, expected),
-        // Resources, streams, futures, error-context: v2.
+        // Resources, streams, futures, and error-context aren't
+        // supported.
         _ => Err(BridgeError::Unsupported("non-value-typed shape")),
     }
 }
@@ -1008,16 +1063,73 @@ mod tests {
     }
 
     #[test]
+    fn wit_typed_tuple_roundtrips_via_wave() {
+        // 1-tuple (matches WIT `tuple<u32>`).
+        let one: (u32,) = (42,);
+        let v = one.to_value();
+        let back: (u32,) = WitTyped::from_value(&v).unwrap();
+        assert_eq!(back, one);
+
+        // 2-tuple, mixed primitive + String (matches `tuple<u32, string>`).
+        let two: (u32, String) = (7, "hi".to_string());
+        let v = two.to_value();
+        let back: (u32, String) = WitTyped::from_value(&v).unwrap();
+        assert_eq!(back, two);
+
+        // 3-tuple, nesting an Option (matches `tuple<u32, string, option<u32>>`).
+        let three: (u32, String, Option<u32>) = (3, "x".into(), Some(9));
+        let v = three.to_value();
+        let back: (u32, String, Option<u32>) = WitTyped::from_value(&v).unwrap();
+        assert_eq!(back, three);
+    }
+
+    #[test]
+    fn sentinel_record_for_zero_arg_args_roundtrips() {
+        // wasm-wave rejects both empty records and empty tuples, so
+        // the unit shape gets encoded as a 1-field sentinel record.
+        // Exercise that shape at runtime to catch a regression in
+        // wasm-wave's Type/Value APIs.
+        let ty = WaveType::record([("unit", WaveType::BOOL)])
+            .expect("single-field record is permitted");
+        let v = WaveValue::make_record(&ty, [("unit", WaveValue::make_bool(true))])
+            .expect("sentinel field matches the declared record type");
+        let mut fields = v.unwrap_record();
+        let (name, _val) = fields.next().expect("one field present");
+        assert_eq!(name.as_ref(), "unit");
+    }
+
+    #[test]
+    fn wit_typed_tuple_roundtrips_at_high_arity() {
+        // Lower arities are exercised above; this hits the upper end
+        // of the macro expansion.
+        type Eight = (u8, u16, u32, u64, i32, bool, char, String);
+        let eight: Eight = (1, 2, 3, 4, -5, true, 'z', "tail".to_string());
+        let v = eight.to_value();
+        let back: Eight = WitTyped::from_value(&v).unwrap();
+        assert_eq!(back, eight);
+    }
+
+    #[test]
+    fn wit_typed_tuple_wave_type_matches_explicit_construction() {
+        // The blanket impl's WaveType must equal what the SDK would
+        // build by hand — the codegen relies on this equivalence.
+        let blanket = <(u32, String) as WitTyped>::wave_type();
+        let manual = WaveType::tuple([WaveType::U32, WaveType::STRING]).unwrap();
+        // Wave Types compare by structural equality.
+        assert_eq!(blanket, manual);
+    }
+
+    #[test]
     fn resource_cell_errors_as_unsupported() {
         let mut t = empty_tree(vec![Cell::ResourceHandle(0)], 0);
         t.handle_infos.push(crate::HandleInfo {
             type_name: "thing".into(),
             id: 42,
         });
-        // Use any expected type; resource cells should be rejected
-        // before type matching takes effect, but with a non-resource
-        // expected type the error message indicates kind mismatch
-        // rather than Unsupported. Cells-side resources are v2.
+        // Resource cells aren't a supported shape; with a
+        // non-resource expected type the error surfaces as kind
+        // mismatch rather than Unsupported, but either way the cell
+        // is rejected.
         let res = cells_to_value::<Value>(&t, 0, &Type::BOOL);
         assert!(res.is_err());
     }

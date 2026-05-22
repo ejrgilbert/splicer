@@ -76,6 +76,9 @@ is already specced in the multi-edge doc; no design negotiation needed.
   strategy traits into sync + async variants. Currently restricts the harness
   to `async func` targets only (see
   `tests/component-interposition/splicer-rules/builtin-hello-tier3.yaml`).
+  When this lands, extend the matrix tests in
+  `src/adapter/typed/mod.rs` with sync `func` fixtures so both paths
+  are exercised.
 
 Skipped Phase 3 — Phase 1's Stream C already covered `between_subgraph`,
 and Phase 2 picks up the rest.

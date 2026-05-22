@@ -27,11 +27,11 @@ const WRAPPER_WORLD: &str = "target";
 /// transitive deps — wit-bindgen tolerates unused packages, and a
 /// precise closure walk would reach into wit-parser internals.
 pub fn target_wit_for_codegen(
-    composition_bytes: &[u8],
+    component_bytes: &[u8],
     target_interface: &str,
     behavior: Behavior,
 ) -> Result<TargetWit> {
-    let resolve = decode_input_resolve(composition_bytes)?;
+    let resolve = decode_input_resolve(component_bytes)?;
     let target_iface_id = find_target_interface(&resolve, target_interface)?;
     let qualified = resolve
         .id_of(target_iface_id)
@@ -152,8 +152,9 @@ mod tests {
         let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
         let target = target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform)
             .expect("extract");
-        let src = run_wit_bindgen_rust(&target.wit_text, Some(&target.world_name))
-            .expect("wit-bindgen accepts extracted WIT");
+        let (_resolve, _world, src) =
+            run_wit_bindgen_rust(&target.wit_text, Some(&target.world_name))
+                .expect("wit-bindgen accepts extracted WIT");
         assert!(src.contains("pub trait Guest"), "bindings shape:\n{src}");
     }
 
