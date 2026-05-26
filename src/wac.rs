@@ -1229,29 +1229,26 @@ fn materialize_tier3_4_inline(
     consumer_split: Option<&str>,
     ctx: &SpliceCtx,
 ) -> anyhow::Result<Vec<Injection>> {
-    let classify = |inj: &Injection| -> Tier3_4Kind {
+    let classify = |inj: &Injection| -> Option<Tier3_4Kind> {
         if inj
             .builtin
             .as_deref()
             .map(crate::builtins::typed::is_typed)
             .unwrap_or(false)
         {
-            return Tier3_4Kind::Builtin;
+            return Some(Tier3_4Kind::Builtin);
         }
         if inj.builtin.is_none() {
             if let Some(p) = inj.path.as_deref() {
                 if crate::builtins::typed::is_user_typed_strategy_dir(std::path::Path::new(p)) {
-                    return Tier3_4Kind::User;
+                    return Some(Tier3_4Kind::User);
                 }
             }
         }
-        Tier3_4Kind::Passthrough
+        None
     };
 
-    let any_typed = to_inject
-        .iter()
-        .any(|inj| !matches!(classify(inj), Tier3_4Kind::Passthrough));
-    if !any_typed {
+    if !to_inject.iter().any(|inj| classify(inj).is_some()) {
         return Ok(to_inject.to_vec());
     }
 
@@ -1266,10 +1263,10 @@ fn materialize_tier3_4_inline(
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
     for inj in to_inject.iter() {
         match classify(inj) {
-            Tier3_4Kind::Passthrough => {
+            None => {
                 out.push(inj.clone());
             }
-            Tier3_4Kind::Builtin => {
+            Some(Tier3_4Kind::Builtin) => {
                 let builtin = inj.builtin.as_deref().expect("classified as Builtin");
                 let split_bytes = read_split(builtin)?;
                 let (wrapper_path, tier) = crate::builtins::typed::materialize(
@@ -1283,7 +1280,7 @@ fn materialize_tier3_4_inline(
                 })?;
                 out.push(stamp_materialized(inj, wrapper_path, tier)?);
             }
-            Tier3_4Kind::User => {
+            Some(Tier3_4Kind::User) => {
                 let strategy_dir = inj.path.as_deref().expect("classified as User");
                 let split_bytes = read_split(&inj.name)?;
                 let (wrapper_path, tier) = crate::builtins::typed::materialize_user(
@@ -1306,10 +1303,12 @@ fn materialize_tier3_4_inline(
     Ok(out)
 }
 
+/// Which distribution path a tier-3/4 strategy comes from. The
+/// classifier returns `Option<Tier3_4Kind>`; `None` means the
+/// injection isn't tier-3/4 and should pass through to tier-1/2
+/// handling unchanged.
 #[allow(non_camel_case_types)]
 enum Tier3_4Kind {
-    /// Not a tier-3/4 strategy — pass through to tier-1/2 handling.
-    Passthrough,
     /// Embedded builtin (`builtin:` referenced an entry in
     /// [`crate::builtins::typed`]).
     Builtin,
