@@ -38,9 +38,9 @@ use heck::ToUpperCamelCase;
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use super::behavior_meta::Behavior;
 use super::bindings_index::{bindings_path_tokens, GuestMethod, GuestTrait};
 use super::ir::{args_struct_ident, NamedKind, NamedType, RecordField, TypeLocation, WrapperIR};
+use super::Behavior;
 
 /// What [`emit_guest`] produces for a single Guest trait.
 pub struct EmittedGuest {

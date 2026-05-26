@@ -5,7 +5,6 @@
 //! wasm via `cargo build`.
 
 mod assemble;
-mod behavior_meta;
 mod bindgen;
 mod bindings_index;
 mod build;
@@ -15,7 +14,6 @@ mod ir;
 pub(crate) mod target_wit;
 
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
-pub use behavior_meta::Behavior;
 pub use bindgen::run_wit_bindgen_rust;
 pub use bindings_index::build_bindings_index;
 pub use build::{build_wrapper, BuildConfig};
@@ -26,6 +24,19 @@ pub use ir::{build_ir, NamedKind, NamedType, WitTypeRef, WrapperIR};
 pub use target_wit::{target_wit_for_codegen, TargetWit};
 
 use anyhow::Result;
+
+/// What the strategy does to the wrapped target — the codegen
+/// template's transform/virtualize knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Behavior {
+    /// Strategy transforms the call — receives typed args + result
+    /// and may mutate either before forwarding to the wrapped target.
+    /// Wrapper imports the target's interface.
+    Transform,
+    /// Strategy replaces the wrapped target. Wrapper does not import
+    /// the target's interface.
+    Virtualize,
+}
 
 /// One-call orchestrator: take a target WIT and a strategy reference,
 /// produce the full source of a wrapper crate that compiles to a

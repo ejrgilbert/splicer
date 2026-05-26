@@ -35,8 +35,8 @@ use anyhow::{Context, Result};
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use super::behavior_meta::Behavior;
 use super::emit_method::EmittedGuest;
+use super::Behavior;
 
 /// Inputs to [`assemble_lib_rs`]. Each piece comes from one of the
 /// emitter modules; this assembler just stitches them together with
