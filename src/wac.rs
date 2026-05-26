@@ -1256,7 +1256,9 @@ fn materialize_tier3_4_inline(
             &split_bytes,
             interface_name,
         )
-        .with_context(|| format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'"))?;
+        .with_context(|| {
+            format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'")
+        })?;
         out.push(stamp_materialized(inj, wrapper_path, tier)?);
     }
     Ok(out)

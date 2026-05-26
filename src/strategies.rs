@@ -53,8 +53,7 @@ static EMBEDDED_SDK: Dir<'_> = include_dir!("$OUT_DIR/embedded-sdk");
 /// core module into a wasm component. Pulled from `builtins/`
 /// alongside the strategy crates so splicer doesn't need it on disk
 /// at splice-time.
-const PREVIEW1_ADAPTER: &[u8] =
-    include_bytes!("../builtins/wasi_snapshot_preview1.reactor.wasm");
+const PREVIEW1_ADAPTER: &[u8] = include_bytes!("../builtins/wasi_snapshot_preview1.reactor.wasm");
 
 /// Subdirectory of the per-process splits dir that materialized
 /// builtin wasms land in. Mirrors the constant tier-1/2 uses; kept in
