@@ -476,8 +476,12 @@ fn build_list_emit_locals_for_plan(
     let elem_addr = builder.alloc_local(ValType::I32);
     // Contiguous flat-slot locals: plan slot N → elem_flat_locals[0] + N.
     let elem_ty = element_plan.source_ty;
-    let flat = flat_types(resolve, &elem_ty, None)
-        .expect("list element type must flatten within MAX_FLAT_PARAMS");
+    let flat = flat_types(resolve, &elem_ty, None).unwrap_or_else(|| {
+        unreachable!(
+            "list element type must flatten within MAX_FLAT_PARAMS — \
+             LiftPlanBuilder::push_list_of should reject upstream"
+        )
+    });
     let elem_flat_locals: Vec<u32> = flat
         .iter()
         .map(|wt| builder.alloc_local(wasm_type_to_val(*wt)))
@@ -909,9 +913,9 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             } => {
                 let side_refs = CellSideRefs { cell_side };
                 let flat = flat_types(resolve, &compound.ty, None).unwrap_or_else(|| {
-                    panic!(
+                    unreachable!(
                         "Compound result must flatten within MAX_FLAT_PARAMS ({}) — \
-                             classify_result_lift only returns Compound for kinds that do",
+                         classify_result_lift rejects upstream",
                         Resolve::MAX_FLAT_PARAMS
                     )
                 });

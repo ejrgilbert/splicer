@@ -2,10 +2,11 @@
 //! `LiftPlan` per param/result; the layout phase wraps these into
 //! `ParamLayout` / `ResultLayout` with offsets filled in.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
+use super::super::super::abi::flat_types;
 use super::super::blob::NameInterner;
 use super::plan::{Cell, LiftPlan, MapAliases};
 use super::sidetable::CellSideData;
@@ -146,6 +147,14 @@ pub(crate) fn classify_result_lift(
     if result_at_retptr || is_compound_result(ty, resolve) {
         if !is_supported_result(ty, resolve) {
             return Ok(None);
+        }
+        // Compound emit reads the result's flat representation at
+        // emit.rs:912; bail early when it would overflow.
+        if flat_types(resolve, ty, None).is_none() {
+            return Err(anyhow!(
+                "compound result flat representation exceeds MAX_FLAT_PARAMS ({})",
+                Resolve::MAX_FLAT_PARAMS,
+            ));
         }
         let plan = LiftPlan::for_type(ty, resolve, names, map_aliases)?;
         return Ok(Some(ResultLift {

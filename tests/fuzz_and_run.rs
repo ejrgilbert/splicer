@@ -4233,10 +4233,12 @@ const ALL_ASYNC_MODES: &[AsyncMode] = &[AsyncMode::Sync, AsyncMode::Async];
 /// new bool.
 #[derive(Clone, Copy)]
 enum BailPolicy {
-    /// Tier-1: `is_expected_bail` recognizes shapes splicer legitimately
-    /// refuses (flat-rep caps, etc.).
+    /// Both tiers: `is_expected_bail` recognizes shapes splicer
+    /// legitimately refuses (flat-rep caps, etc.).
     Tier1,
-    /// Tier-2: no expected-bail path today; every refusal is a failure.
+    /// Reserved for a future tier with no expected-bail path; every
+    /// refusal is a failure.
+    #[allow(dead_code)]
     Strict,
 }
 
@@ -4385,7 +4387,7 @@ fn test_tier2_fuzz() {
     require_splicer_toolchain();
     drive_fuzz(
         "tier2-fuzz",
-        BailPolicy::Strict,
+        BailPolicy::Tier1,
         scaffold_tier2_workspace_in,
         |_root, _mode| {},
         |root, shape, mode| {

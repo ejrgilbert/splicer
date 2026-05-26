@@ -779,6 +779,23 @@ impl<'a> LiftPlanBuilder<'a> {
         })
     }
 
+    /// Placeholder discriminator-style cell for the flat-overflow paths
+    /// in [`Self::push_result`] / [`Self::push_variant`]. `for_type`
+    /// returns `Err` before any caller reads the stub.
+    fn stub_disc_cell(&mut self) -> u32 {
+        self.push_cell(Cell::Bool { flat_slot: 0 })
+    }
+
+    /// Record a "{kind} flat representation exceeds MAX_FLAT_PARAMS"
+    /// error — fuzz-harness `is_expected_bail` recognizer matches on
+    /// the "flat representation" substring.
+    fn record_flat_overflow(&mut self, kind: &str) {
+        self.record_error(anyhow!(
+            "{kind} flat representation exceeds MAX_FLAT_PARAMS ({})",
+            Resolve::MAX_FLAT_PARAMS,
+        ));
+    }
+
     /// Disc slot then inner type — canonical-ABI `[disc, ...flat(T)]`.
     /// No `push_arm`: option's payload slots are dedicated (not joined)
     /// and lower zeroes them on `none`, so `option<list<T>>` runs
@@ -802,8 +819,10 @@ impl<'a> LiftPlanBuilder<'a> {
             unreachable!("Result kind came from non-Result TypeDefKind")
         };
         let r = r.clone();
-        let joined = flat_types(resolve, ty, None)
-            .expect("result<T, E> must flatten within MAX_FLAT_PARAMS");
+        let Some(joined) = flat_types(resolve, ty, None) else {
+            self.record_flat_overflow("result<T, E>");
+            return self.stub_disc_cell();
+        };
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
@@ -870,8 +889,10 @@ impl<'a> LiftPlanBuilder<'a> {
             .expect("Variant kind implies variant-info available");
         let type_name = names.intern(&info.type_name);
         let case_names = info.item_names.iter().map(|n| names.intern(n)).collect();
-        let joined =
-            flat_types(resolve, ty, None).expect("variant must flatten within MAX_FLAT_PARAMS");
+        let Some(joined) = flat_types(resolve, ty, None) else {
+            self.record_flat_overflow("variant");
+            return self.stub_disc_cell();
+        };
 
         let disc_slot = self.bump_flat_slot();
         let arms_base = self.next_flat_slot;
@@ -990,6 +1011,12 @@ impl<'a> LiftPlanBuilder<'a> {
         self.next_list_idx += 1;
         let ptr_slot = self.bump_flat_slot();
         let len_slot = self.bump_flat_slot();
+        // The element's flat slots are materialized as per-iteration
+        // locals during list emit, so the element type itself must
+        // flatten within MAX_FLAT_PARAMS.
+        if flat_types(resolve, elem, None).is_none() {
+            self.record_flat_overflow("list element");
+        }
         let element_plan = match LiftPlan::for_type(elem, resolve, names, self.map_aliases) {
             Ok(plan) => plan,
             Err(err) => {
