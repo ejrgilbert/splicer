@@ -1248,7 +1248,9 @@ fn materialize_tier3_4_inline(
         Tier3_4Kind::Passthrough
     };
 
-    let any_typed = to_inject.iter().any(|inj| !matches!(classify(inj), Tier3_4Kind::Passthrough));
+    let any_typed = to_inject
+        .iter()
+        .any(|inj| !matches!(classify(inj), Tier3_4Kind::Passthrough));
     if !any_typed {
         return Ok(to_inject.to_vec());
     }

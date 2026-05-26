@@ -199,8 +199,7 @@ fn read_user_manifest(strategy_dir: &Path) -> Result<Manifest> {
             manifest_path.display()
         )
     })?;
-    toml::from_str(&text)
-        .with_context(|| format!("failed to parse {}", manifest_path.display()))
+    toml::from_str(&text).with_context(|| format!("failed to parse {}", manifest_path.display()))
 }
 
 /// Cargo-side metadata read from a user-supplied strategy crate's
@@ -320,10 +319,12 @@ fn run_codegen_build(
     behavior: Behavior,
     target: &TargetWit,
 ) -> Result<PathBuf> {
-    let strategy_path_str = plan
-        .strategy_dir
-        .to_str()
-        .with_context(|| format!("strategy path is not UTF-8: {}", plan.strategy_dir.display()))?;
+    let strategy_path_str = plan.strategy_dir.to_str().with_context(|| {
+        format!(
+            "strategy path is not UTF-8: {}",
+            plan.strategy_dir.display()
+        )
+    })?;
     let sdk_path_str = plan
         .sdk_dir
         .to_str()
@@ -368,9 +369,8 @@ fn run_codegen_build(
 fn ensure_preview1_adapter(cache_root: &Path) -> Result<PathBuf> {
     let path = cache_root.join("wasi_snapshot_preview1.reactor.wasm");
     if !path.exists() {
-        std::fs::write(&path, PREVIEW1_ADAPTER).with_context(|| {
-            format!("could not write preview1 adapter to {}", path.display())
-        })?;
+        std::fs::write(&path, PREVIEW1_ADAPTER)
+            .with_context(|| format!("could not write preview1 adapter to {}", path.display()))?;
     }
     Ok(path)
 }
