@@ -77,43 +77,43 @@ A complete strategy crate needs:
   `[builtin] tier = 3` plus the description shown by `splicer builtin
   <name>`.
 - A `Default`-able strategy struct named in PascalCase form of the
-  builtin name (`hello-tier3` → `HelloTier3`), exported from `lib.rs`.
+  Cargo package name (`hello-tier3` → `HelloTier3`), exported from
+  `lib.rs`.
 
 The splice-time codegen pipeline assumes this layout — manifest tier,
 struct name, and trait impl together tell splicer which wrapper shape
 to emit.
 
-Reference a tier-3 builtin from a splice config the same way as any
-other builtin:
+### Referencing your strategy from a splice config
 
-```yaml
-inject:
-  - builtin: hello-tier3
-```
+Two distribution paths, same crate layout:
 
-## User-form: BYO strategy crate
+- **Builtin** (shipped with splicer): reference by name.
 
-Point splicer at your own strategy crate by using the `name:` + `path:`
-form, where `path:` is the **strategy crate's directory** (not a
-`.wasm` file):
+  ```yaml
+  inject:
+    - builtin: hello-tier3
+  ```
 
-```yaml
-inject:
-  - name: greeter             # WAC variable name
-    path: ./my-strategy       # directory: Cargo.toml + manifest.toml + src/
-```
+- **User-supplied** (BYO crate): `name:` + `path:`, where `path:` is
+  the **strategy crate's directory** (not a `.wasm` file).
 
-Splicer detects the directory at materialize time and runs the same
-codegen + cargo pipeline as the builtin path, against your sources.
-The strategy crate's layout is the one described above (Cargo.toml,
-`manifest.toml` declaring `tier = 3`, a `Default`-able strategy
-struct). The Cargo package name and PascalCase Rust ident are read
-from the strategy's own `Cargo.toml` — the YAML `name:` is only the
-WAC variable identifier.
+  ```yaml
+  inject:
+    - name: greeter             # WAC variable name
+      path: ./my-strategy       # directory: Cargo.toml + manifest.toml + src/
+  ```
 
-**SDK dependency.** Until `splicer-tool-sdk` is published to
-crates.io, your strategy crate must depend on it via a path
-dependency:
+  Splicer detects the directory at materialize time and runs the same
+  codegen + cargo pipeline as the builtin path, against your sources.
+  The Cargo package name and PascalCase Rust ident are read from the
+  strategy's own `Cargo.toml` — the YAML `name:` is only the WAC
+  variable identifier, so it doesn't have to match the crate name.
+
+### SDK dependency (user-supplied only)
+
+Until `splicer-tool-sdk` is published to crates.io, your strategy
+crate must depend on it via a path dependency:
 
 ```toml
 [dependencies]

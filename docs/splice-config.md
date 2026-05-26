@@ -200,7 +200,7 @@ containing a `manifest.toml` is treated as a tier-3/4 strategy crate
 root and runs the codegen + cargo build described in [tier-3][t3] and
 [tier-4][t4].
 
-[t3]: ./tiers/tier-3.md#user-form-byo-strategy-crate
+[t3]: ./tiers/tier-3.md#referencing-your-strategy-from-a-splice-config
 [t4]: ./tiers/tier-4.md
 
 ### Builtin middleware

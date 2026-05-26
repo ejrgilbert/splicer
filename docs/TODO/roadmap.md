@@ -65,7 +65,7 @@ is already specced in the multi-edge doc; no design negotiation needed.
 - [ ] Multi-edge step 5: `splicer edges <composition>` CLI
 - [x] **User-form tier-3/4 middleware.** YAML `name:` + `path:` to a strategy
   crate directory (Cargo.toml + manifest.toml) flows through the same codegen
-  pipeline as builtins. See [`docs/tiers/tier-3.md`](../tiers/tier-3.md#user-form-byo-strategy-crate).
+  pipeline as builtins. See [`docs/tiers/tier-3.md`](../tiers/tier-3.md#referencing-your-strategy-from-a-splice-config).
 - [ ] **Sync-target support in tier-3/4 codegen.** Today wit-bindgen emits sync
   `fn` Guest methods for `func` WIT signatures but `emit_method.rs` always emits
   `async fn` bodies (matching the async `TransformStrategy` / `VirtualizeStrategy`

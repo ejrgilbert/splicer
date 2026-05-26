@@ -10,13 +10,13 @@ synthesizes responses locally.
 
 Tier-4 shares tier-3's authoring model: a Rust strategy crate
 implementing a trait from
-[`splicer-tool-sdk`](../../splicer-tool-sdk/src/strategy.rs), shipped
-either embedded as a builtin or as a user-supplied directory referenced
-from the splice YAML, codegen'd into a per-target wrapper at
-splice-time. See [tier-3.md](./tier-3.md) for the strategy-crate
-layout, codegen pipeline, async-targets-only constraint, and user-form
-(`name:` + `path:` to a strategy crate root) — they apply identically
-to tier-4 (declare `tier = 4` in the manifest).
+[`splicer-tool-sdk`](../../splicer-tool-sdk/src/strategy.rs),
+codegen'd into a per-target wrapper at splice-time. See
+[tier-3.md](./tier-3.md) for the strategy-crate layout, the
+builtin / user-supplied distribution choice, codegen pipeline, and
+async-targets-only constraint — they apply identically to tier-4
+(declare `tier = 4` in the manifest, implement
+`VirtualizeStrategy` instead of `TransformStrategy`).
 
 ## How tier-4 differs from tier-3
 
