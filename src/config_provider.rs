@@ -286,8 +286,8 @@ fn find_unique_magic(bytes: &[u8]) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use builtin_protocol::wire_format::deserialize_table;
     use crate::parse::config::Injection;
+    use builtin_protocol::wire_format::deserialize_table;
 
     /// Test edge_id used by the `ensure_provider_for` helper. Pre-edge_id
     /// tests just want to know "did we validate + emit a provider"; this
