@@ -4169,6 +4169,17 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
             let v = predict_tier2_arg_inner(value)?;
             Some(wrap_anchored("list(tuple(", &format!("{k}, {v}"), "))"))
         }
+        // Runtime fast-paths `list<u8>` → `Cell::Bytes` (plan.rs:566),
+        // rendered as `bytes(len=N)`. `Shape::List(u8)` always builds a
+        // single-element vec, so len=1.
+        Shape::List(inner) if matches!(inner.as_ref(), Shape::Primitive { wit_type: "u8", .. }) => {
+            Some("bytes(len=1)".to_string())
+        }
+        Shape::ListEmpty(inner)
+            if matches!(inner.as_ref(), Shape::Primitive { wit_type: "u8", .. }) =>
+        {
+            Some("bytes(len=0)".to_string())
+        }
         Shape::List(inner) => Some(wrap_anchored(
             "list(",
             &predict_tier2_arg_inner(inner)?,
@@ -4222,10 +4233,12 @@ const ALL_ASYNC_MODES: &[AsyncMode] = &[AsyncMode::Sync, AsyncMode::Async];
 /// new bool.
 #[derive(Clone, Copy)]
 enum BailPolicy {
-    /// Tier-1: `is_expected_bail` recognizes shapes splicer legitimately
-    /// refuses (flat-rep caps, etc.).
+    /// Both tiers: `is_expected_bail` recognizes shapes splicer
+    /// legitimately refuses (flat-rep caps, etc.).
     Tier1,
-    /// Tier-2: no expected-bail path today; every refusal is a failure.
+    /// Reserved for a future tier with no expected-bail path; every
+    /// refusal is a failure.
+    #[allow(dead_code)]
     Strict,
 }
 
@@ -4374,7 +4387,7 @@ fn test_tier2_fuzz() {
     require_splicer_toolchain();
     drive_fuzz(
         "tier2-fuzz",
-        BailPolicy::Strict,
+        BailPolicy::Tier1,
         scaffold_tier2_workspace_in,
         |_root, _mode| {},
         |root, shape, mode| {

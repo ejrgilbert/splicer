@@ -385,6 +385,16 @@ pub(crate) fn require_indirect_params_supported_shape(
                 param.name,
             );
         }
+        // `build_lower_params_to_memory` allocates per-param flat
+        // wasm locals; the param's flat representation must fit.
+        if super::compat::flat_types(resolve, &param.ty, None).is_none() {
+            bail!(
+                "async function `{fn_name}` param `{}` flat representation \
+                 exceeds MAX_FLAT_PARAMS ({}).",
+                param.name,
+                super::compat::MAX_FLAT_PARAMS,
+            );
+        }
     }
     Ok(())
 }
@@ -498,14 +508,18 @@ pub(crate) fn build_lower_params_to_memory(
     // Total flat-width across all params. The wrapper's first
     // `total_flat_count` wasm locals are these flat params, in
     // canonical order — the lower-mode bindgen invariant.
-    // `flat_types(...)` panic only fires if `is_primitive_param_ty` is
-    // widened without re-bounding flat width; primitives flatten to
-    // one slot each, far below `MAX_FLAT_PARAMS`.
+    // `require_indirect_params_supported_shape` rejected any param
+    // whose flat doesn't fit before reaching here.
     let total_flat_count: u32 = param_types
         .iter()
         .map(|ty| {
             flat_types(resolve, ty, None)
-                .unwrap_or_else(|| panic!("param flat width exceeds MAX_FLAT_PARAMS"))
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "param flat width exceeds MAX_FLAT_PARAMS — \
+                                  require_indirect_params_supported_shape should reject upstream"
+                    )
+                })
                 .len() as u32
         })
         .sum();
