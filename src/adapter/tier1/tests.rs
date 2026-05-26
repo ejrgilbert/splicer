@@ -36,7 +36,7 @@ fn validate_component(bytes: &[u8]) {
 /// true vs false — are exercised by whether the target interface
 /// appears as an import or an export in the split, so we test both.
 #[derive(Clone, Copy)]
-enum SplitKind {
+pub(in crate::adapter) enum SplitKind {
     /// The split imports the target interface (middleware-style).
     /// Exercises the `handler_in_split = true` path: the adapter
     /// copies the handler import + types verbatim and aliases its
@@ -61,7 +61,7 @@ enum SplitKind {
 /// WAT and parsed with `wat::parse_str` — easier to audit than
 /// wasm_encoder for a fixture whose shape we want to match the
 /// convention a real production split uses.
-fn synth_split(
+pub(in crate::adapter) fn synth_split(
     target: &str,
     iface: &InterfaceType,
     arena: &TypeArena,

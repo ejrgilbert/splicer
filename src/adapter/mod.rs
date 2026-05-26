@@ -17,6 +17,8 @@
 use anyhow::Context;
 
 mod abi;
+#[cfg(test)]
+mod fuzz_common;
 mod indices;
 mod mem_layout;
 mod resolve;

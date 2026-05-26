@@ -8,7 +8,6 @@
 
 use super::super::build_tier2_adapter;
 
-
 /// Build a tier-2 adapter for a target with a single sync
 /// primitive function (`add(x: u32, y: u32) -> u32`-style), run
 /// it through ComponentEncoder, and validate the resulting
@@ -637,9 +636,7 @@ fn dispatch_module_with_resource_handle_param_roundtrips() {
         common_wit,
         tier2_wit,
     )
-    .expect(
-        "tier-2 adapter generation should succeed for factored-types resource handle param",
-    );
+    .expect("tier-2 adapter generation should succeed for factored-types resource handle param");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
         .validate_all(&bytes)
         .expect("emitted tier-2 adapter component should validate");
@@ -703,9 +700,7 @@ fn dispatch_module_with_resource_handle_result_roundtrips() {
         common_wit,
         tier2_wit,
     )
-    .expect(
-        "tier-2 adapter generation should succeed for factored-types resource handle result",
-    );
+    .expect("tier-2 adapter generation should succeed for factored-types resource handle result");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
         .validate_all(&bytes)
         .expect("emitted tier-2 adapter component should validate");

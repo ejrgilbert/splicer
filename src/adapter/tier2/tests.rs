@@ -5,4 +5,5 @@
 mod blob;
 mod cells;
 mod dispatch_roundtrip;
+mod fuzz;
 mod layout;

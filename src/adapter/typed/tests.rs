@@ -3,5 +3,6 @@
 //! point the matrix tests exercise.
 
 mod bindgen_contract;
+mod fuzz;
 mod matrix;
 mod pipeline;

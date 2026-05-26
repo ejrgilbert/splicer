@@ -2,9 +2,7 @@
 //! one-function wasm module and round-trips it through wasmparser to
 //! confirm the bytecode parses and validates.
 
-use super::super::cells::{
-    CellLayout, PayloadSource, EXPECTED_CELL_CASES,
-};
+use super::super::cells::{CellLayout, PayloadSource, EXPECTED_CELL_CASES};
 use wasm_encoder::{
     CodeSection, EntityType, Function, FunctionSection, ImportSection, MemoryType, Module,
     TypeSection, ValType,
@@ -344,8 +342,7 @@ fn capture_function_body(
     let bytes = module.finish();
     let mut ops = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::CodeSectionEntry(body) =
-            payload.expect("emitted module parses")
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.expect("emitted module parses")
         {
             for op in body
                 .get_operators_reader()
