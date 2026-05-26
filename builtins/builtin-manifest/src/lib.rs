@@ -61,32 +61,28 @@ pub struct Manifest {
 pub struct BuiltinMeta {
     /// One-line description shown by `splicer builtin list`.
     pub description: String,
-    /// Which splicer tier this builtin participates in. Required;
-    /// tier-3 implies forward (calls pass through to the wrapped
-    /// target), tier-4 implies virtualize (the strategy replaces
-    /// the target).
+    /// Which splicer tier this builtin participates in. Required.
     pub tier: Tier,
 }
 
-/// Splicer's tier classification. Manifest reads `tier = 1` through
-/// `tier = 4`; `try_from`/`into` `u8` keeps the on-disk form numeric
-/// while enforcing the 1..=4 range at parse time.
+/// Splicer's tier classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "u8", into = "u8")]
 pub enum Tier {
-    /// Name-only hooks (before/after, no payload). Wasm builtin.
+    /// Name-only hooks (before/after, no payload).
+    /// Provided as: Wasm component.
     Tier1,
-    /// Typed observation hooks (lifted args/result as cells). Wasm builtin.
+    /// Typed observation hooks (lifted args/result as cells).
+    /// Provided as: Wasm component.
     Tier2,
-    /// Transform strategy — typed access to the call; may mutate
-    /// args/result while forwarding to the wrapped target. Source
-    /// crate, splicer-built per target.
+    /// Transform strategy (typed access to the call); may mutate
+    /// args/result while forwarding to the wrapped target.
+    /// Provided as: Source crate, splicer-built per target.
     Tier3,
-    /// Virtualize strategy — replaces the wrapped target. Source
-    /// crate, splicer-built per target.
+    /// Virtualize strategy (replaces the wrapped target).
+    /// Provided as: Source crate, splicer-built per target.
     Tier4,
 }
-
 impl TryFrom<u8> for Tier {
     type Error = String;
     fn try_from(v: u8) -> Result<Self, Self::Error> {
@@ -99,7 +95,6 @@ impl TryFrom<u8> for Tier {
         }
     }
 }
-
 impl From<Tier> for u8 {
     fn from(t: Tier) -> u8 {
         match t {
@@ -110,11 +105,7 @@ impl From<Tier> for u8 {
         }
     }
 }
-
 impl Tier {
-    /// Human-readable single-word label suitable for `splicer
-    /// builtin` output: `"name-only"`, `"observe"`, `"transform"`,
-    /// `"virtualize"`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Tier1 => "name-only",
@@ -123,10 +114,6 @@ impl Tier {
             Self::Tier4 => "virtualize",
         }
     }
-
-    /// Whether middlewares at this tier import the target interface
-    /// (so the call can be forwarded downstream). True for Tier1–3;
-    /// false for Tier4 (virtualize), which replaces the downstream.
     pub fn imports_target(self) -> bool {
         !matches!(self, Self::Tier4)
     }
