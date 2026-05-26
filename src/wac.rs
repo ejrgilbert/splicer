@@ -1305,7 +1305,7 @@ fn source_label<'a>(source: &crate::strategies::Tier3_4Source<'a>) -> &'a str {
 fn stamp_materialized(
     inj: &Injection,
     wrapper_path: std::path::PathBuf,
-    tier: builtin_manifest::Tier,
+    tier: builtin_protocol::Tier,
 ) -> anyhow::Result<Injection> {
     let path_str = wrapper_path
         .to_str()

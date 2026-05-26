@@ -6,7 +6,7 @@ ADAPTER       := $(BUILTINS_DIR)/wasi_snapshot_preview1.reactor.wasm
 # Every dir under builtins/ that has both a Cargo.toml and a wit/
 # directory is a builtin crate; the output goes to
 # assets/builtins/<name>.wasm. Host-side helper crates (e.g.
-# builtin-manifest) live alongside but lack wit/, so they're excluded.
+# builtin-protocol) live alongside but lack wit/, so they're excluded.
 BUILTIN_NAMES := $(patsubst $(BUILTINS_DIR)/%/wit,%,$(wildcard $(BUILTINS_DIR)/*/wit))
 BUILTIN_WASMS := $(addprefix $(ASSETS_DIR)/,$(addsuffix .wasm,$(BUILTIN_NAMES)))
 

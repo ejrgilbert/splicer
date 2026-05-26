@@ -1,9 +1,9 @@
 [package]
-name = "splicer-builtin-manifest"
-version = "0.1.0"
+name = "splicer-builtin-protocol"
+version = "0.2.0"
 edition = "2021"
 authors = ["Elizabeth Gilbert"]
-description = "Internal crate for splicer. Shared schema + build.rs codegen for builtin middleware manifests; not intended for use outside the splicer ecosystem."
+description = "Internal crate for splicer. Host<->builtin wire contracts: manifest schema, section-name conventions, wire formats, and a build.rs codegen helper. Not intended for use outside the splicer ecosystem."
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/ejrgilbert/splicer"

@@ -58,21 +58,21 @@ jobs:
       - name: Login to crates.io
         run: cargo login ${{ secrets.CRATES_API_TOKEN }}
 
-      # splicer depends on builtin-manifest as a path+version dep. crates.io
-      # needs the listed version to exist before splicer can resolve. Publish
-      # builtin-manifest first; tolerate "already uploaded" so re-running this
-      # workflow against a tag that didn't bump builtin-manifest's version
-      # doesn't fail the release.
-      - name: Publish builtin-manifest (if version not yet on crates.io)
-        working-directory: builtins/builtin-manifest
+      # splicer depends on splicer-builtin-protocol as a path+version dep.
+      # crates.io needs the listed version to exist before splicer can
+      # resolve. Publish builtin-protocol first; tolerate "already uploaded"
+      # so re-running this workflow against a tag that didn't bump
+      # builtin-protocol's version doesn't fail the release.
+      - name: Publish splicer-builtin-protocol (if version not yet on crates.io)
+        working-directory: builtins/builtin-protocol
         run: |
           set -o pipefail
-          if cargo publish --locked 2>&1 | tee /tmp/builtin-manifest-publish.log; then
-            echo "builtin-manifest published"
-          elif grep -qE "already (uploaded|exists)|crate version .* is already" /tmp/builtin-manifest-publish.log; then
-            echo "builtin-manifest version already on crates.io -- skipping"
+          if cargo publish --locked 2>&1 | tee /tmp/builtin-protocol-publish.log; then
+            echo "builtin-protocol published"
+          elif grep -qE "already (uploaded|exists)|crate version .* is already" /tmp/builtin-protocol-publish.log; then
+            echo "builtin-protocol version already on crates.io -- skipping"
           else
-            echo "::error::builtin-manifest publish failed for an unexpected reason"
+            echo "::error::builtin-protocol publish failed for an unexpected reason"
             exit 1
           fi
 

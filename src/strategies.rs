@@ -20,7 +20,7 @@
 //! and `prepare_builtin_strategy` go away.
 
 use anyhow::{Context, Result};
-use builtin_manifest::{Manifest, Tier};
+use builtin_protocol::{Manifest, Tier};
 use heck::ToUpperCamelCase;
 use include_dir::{include_dir, Dir};
 use std::path::{Path, PathBuf};

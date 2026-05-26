@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod build_helper;
 pub mod typ;
+pub mod wire_format;
 
 pub use typ::{parse_wit_type, ParseError, TypeAst};
 

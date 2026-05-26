@@ -12,11 +12,11 @@ use crate::parse::config::Injection;
 // `BUILTIN_CONFIG_*` consts generated from `wit/builtin-config/world.wit`.
 include!(concat!(env!("OUT_DIR"), "/builtin_config_constants.rs"));
 
-// Wire-format constants + codec shared with the provider template.
-#[path = "../builtins/config-provider/src/wire_format.rs"]
-mod wire_format;
-
-use wire_format::{serialize_table, CAPACITY, LEN_PREFIX_BYTES, MAGIC_BYTES, MAGIC_LEN};
+// Wire-format constants + codec shared with the provider template
+// via `splicer-builtin-protocol::wire_format`.
+use builtin_protocol::wire_format::{
+    serialize_table, CAPACITY, LEN_PREFIX_BYTES, MAGIC_BYTES, MAGIC_LEN,
+};
 
 /// Provider template's `builtins/<dir>` name. Listed in
 /// `builtins::INTERNAL_BUILTINS` so it can't be referenced from YAML.
@@ -42,7 +42,7 @@ pub fn validate_config_as_wave(injection: &mut Injection) -> Result<()> {
     };
     let bytes = std::fs::read(builtin_path)
         .with_context(|| format!("Failed to read materialized builtin '{}'", builtin_path))?;
-    let scan = builtin_manifest::scan_substrate_component(&bytes).map_err(|e| {
+    let scan = builtin_protocol::scan_substrate_component(&bytes).map_err(|e| {
         anyhow::anyhow!(
             "injection '{name}': failed to scan builtin bytes: {e}",
             name = injection.name,
@@ -90,7 +90,7 @@ pub fn build_provider_for_edge(
     };
     let mut values = wave.clone();
     let edge_id_wave =
-        builtin_manifest::loose_scalar_to_wave(&toml::Value::String(edge_id.to_string()))
+        builtin_protocol::loose_scalar_to_wave(&toml::Value::String(edge_id.to_string()))
             .expect("string always encodes as WAVE");
     values.insert(crate::wac::EDGE_ID_CONFIG_KEY.to_string(), edge_id_wave);
 
@@ -126,7 +126,7 @@ pub fn build_provider_for_edge(
 fn validate_against_manifest(
     injection: &Injection,
     expected: &str,
-    all: &[(String, builtin_manifest::Manifest)],
+    all: &[(String, builtin_protocol::Manifest)],
 ) -> Result<BTreeMap<String, String>> {
     let manifest = match all.iter().find(|(n, _)| n == expected) {
         Some((_, m)) => m.clone(),
@@ -138,7 +138,7 @@ fn validate_against_manifest(
             anyhow::bail!(
                 "injection '{name}': shipped builtin '{expected}' is missing its \
                  embedded manifest, so splicer can't validate the `config:` keys \
-                 you set. Rebuild against the current builtin-manifest crate.",
+                 you set. Rebuild against the current splicer-builtin-protocol crate.",
                 name = injection.name,
             );
         }
@@ -197,7 +197,7 @@ fn validate_against_manifest(
 fn loose_encode_user_config(injection: &Injection) -> Result<BTreeMap<String, String>> {
     let mut wave = BTreeMap::new();
     for (key, value) in &injection.builtin_config {
-        let encoded = builtin_manifest::loose_scalar_to_wave(value).map_err(|e| {
+        let encoded = builtin_protocol::loose_scalar_to_wave(value).map_err(|e| {
             anyhow::anyhow!(
                 "injection '{name}': config key '{key}' (no manifest available): {e}",
                 name = injection.name,
@@ -208,12 +208,12 @@ fn loose_encode_user_config(injection: &Injection) -> Result<BTreeMap<String, St
     Ok(wave)
 }
 
-/// Thin test wrapper around [`builtin_manifest::scan_substrate_component`].
+/// Thin test wrapper around [`builtin_protocol::scan_substrate_component`].
 /// Production code path uses `scan_substrate_component` directly so it
 /// gets the manifest sections in the same wasmparser pass.
 #[cfg(test)]
 fn imports_substrate(bytes: &[u8]) -> bool {
-    builtin_manifest::scan_substrate_component(bytes)
+    builtin_protocol::scan_substrate_component(bytes)
         .map(|s| s.imports_substrate)
         .unwrap_or(false)
 }
@@ -286,7 +286,7 @@ fn find_unique_magic(bytes: &[u8]) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_provider::wire_format::deserialize_table;
+    use builtin_protocol::wire_format::deserialize_table;
     use crate::parse::config::Injection;
 
     /// Test edge_id used by the `ensure_provider_for` helper. Pre-edge_id
@@ -700,7 +700,7 @@ mod tests {
                 ))
                 (@custom "{section}" "{escaped}")
             )"#,
-            section = builtin_manifest::section_name_for(builtin_name),
+            section = builtin_protocol::section_name_for(builtin_name),
         );
         wat::parse_str(&wat).expect("wat with embedded manifest section")
     }
