@@ -1,5 +1,6 @@
 [builtin]
 description = "Record every wrapped call's lifted args + result as a binary stream of typed field-trees. Wire format: splicer-tool-sdk/wire-format.md."
+tier = 2
 
 [[key]]
 name = "sink"
