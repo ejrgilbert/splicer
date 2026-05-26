@@ -120,55 +120,230 @@ pub fn materialize(
     let manifest = read_manifest(name)?;
     let behavior = behavior_for(&manifest, name)?;
     let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
-    let path = build_and_install(splits_dir, name, behavior, &target)?;
-    Ok((path, manifest.builtin.tier))
-}
 
-fn build_and_install(
-    splits_dir: &Path,
-    name: &str,
-    behavior: Behavior,
-    target: &TargetWit,
-) -> Result<PathBuf> {
     let cache_root = typed_cache_root()?;
     let strategy_dir = cache_root.join("strategies").join(name);
     extract(name, &strategy_dir)?;
     let sdk_dir = cache_root.join("splicer-tool-sdk");
     extract_sdk(&sdk_dir)?;
-
-    let adapter_path = cache_root.join("wasi_snapshot_preview1.reactor.wasm");
-    if !adapter_path.exists() {
-        std::fs::write(&adapter_path, PREVIEW1_ADAPTER).with_context(|| {
-            format!(
-                "could not write preview1 adapter to {}",
-                adapter_path.display()
-            )
-        })?;
-    }
+    let adapter_path = ensure_preview1_adapter(&cache_root)?;
 
     let strategy_type = name.to_upper_camel_case();
-    let strategy_path_str = strategy_dir
+    let plan = BuildPlan {
+        out_name: name,
+        strategy_dir: &strategy_dir,
+        sdk_dir: &sdk_dir,
+        strategy_crate_name: name,
+        strategy_type: &strategy_type,
+        adapter_path: &adapter_path,
+        cache_root: &cache_root,
+    };
+    let path = run_codegen_build(splits_dir, &plan, behavior, &target)?;
+    Ok((path, manifest.builtin.tier))
+}
+
+/// True iff `path` looks like a user-supplied tier-3/4 strategy
+/// crate root: an existing directory containing a `manifest.toml`.
+/// The manifest check is what distinguishes a strategy crate from a
+/// stray directory the user pointed at by accident — the contents
+/// (tier 3 vs 4) are validated downstream by [`read_user_manifest`].
+pub fn is_user_typed_strategy_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("manifest.toml").is_file()
+}
+
+/// Codegen + build a user-supplied tier-3/4 wrapper from
+/// `strategy_dir`, specialized to `target_interface`. Mirrors
+/// [`materialize`] for the embedded case — same install layout
+/// (`splits_dir/builtins/<wac_name>.wasm`) and return shape.
+///
+/// `wac_name` is the YAML `name:` field (also the WAC variable);
+/// the strategy's Cargo package name + Rust struct ident are
+/// derived from its on-disk `Cargo.toml`, not from `wac_name`, so
+/// users aren't forced to align YAML and crate names.
+pub fn materialize_user(
+    splits_dir: &Path,
+    wac_name: &str,
+    strategy_dir: &Path,
+    split_bytes: &[u8],
+    target_interface: &str,
+) -> Result<(PathBuf, Tier)> {
+    let manifest = read_user_manifest(strategy_dir)?;
+    let behavior = behavior_for(&manifest, wac_name)?;
+    let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
+
+    let meta = read_user_strategy_metadata(strategy_dir)?;
+    let strategy_type = meta.crate_name.to_upper_camel_case();
+    let cache_root = typed_cache_root()?;
+    let adapter_path = ensure_preview1_adapter(&cache_root)?;
+
+    let plan = BuildPlan {
+        out_name: wac_name,
+        strategy_dir,
+        sdk_dir: &meta.sdk_dir,
+        strategy_crate_name: &meta.crate_name,
+        strategy_type: &strategy_type,
+        adapter_path: &adapter_path,
+        cache_root: &cache_root,
+    };
+    let path = run_codegen_build(splits_dir, &plan, behavior, &target)?;
+    Ok((path, manifest.builtin.tier))
+}
+
+/// Read `manifest.toml` from the user-supplied strategy directory.
+fn read_user_manifest(strategy_dir: &Path) -> Result<Manifest> {
+    let manifest_path = strategy_dir.join("manifest.toml");
+    let text = std::fs::read_to_string(&manifest_path).with_context(|| {
+        format!(
+            "could not read manifest.toml at {}; user-supplied tier-3/4 strategy crates must \
+             ship a manifest.toml at their crate root",
+            manifest_path.display()
+        )
+    })?;
+    toml::from_str(&text)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))
+}
+
+/// Cargo-side metadata read from a user-supplied strategy crate's
+/// `Cargo.toml`.
+#[derive(Debug)]
+struct UserStrategyMetadata {
+    /// `[package].name` — the dep name the wrapper's Cargo.toml
+    /// references.
+    crate_name: String,
+    /// Canonical absolute path of the strategy's
+    /// `splicer-tool-sdk` dep. Threaded into the wrapper crate's
+    /// Cargo.toml at the same path so cargo dedupes the two sources
+    /// into one crate (mismatched paths produce E0308 in the
+    /// wrapper's generated code).
+    sdk_dir: PathBuf,
+}
+
+/// Parse the user's `Cargo.toml` to extract the strategy's Cargo
+/// package name and the absolute path of its `splicer-tool-sdk`
+/// dep. The SDK path is canonicalized so the wrapper's own dep
+/// resolves to the same crate.
+///
+/// Today `splicer-tool-sdk` isn't on crates.io, so a path dep is the
+/// only supported form. Once it's published this function can be
+/// relaxed to accept registry/version deps and propagate the
+/// version into the wrapper's `Cargo.toml`.
+fn read_user_strategy_metadata(strategy_dir: &Path) -> Result<UserStrategyMetadata> {
+    let cargo_path = strategy_dir.join("Cargo.toml");
+    let cargo_text = std::fs::read_to_string(&cargo_path)
+        .with_context(|| format!("could not read {}", cargo_path.display()))?;
+    let parsed: toml::Value = toml::from_str(&cargo_text)
+        .with_context(|| format!("failed to parse {}", cargo_path.display()))?;
+
+    let crate_name = parsed
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .with_context(|| {
+            format!(
+                "{} has no [package].name; user strategy crates must declare a package name",
+                cargo_path.display()
+            )
+        })?
+        .to_string();
+
+    let sdk_rel = parsed
+        .get("dependencies")
+        .and_then(|d| d.get("splicer-tool-sdk"))
+        .and_then(|d| match d {
+            toml::Value::Table(t) => t.get("path").and_then(|p| p.as_str()),
+            _ => None,
+        })
+        .with_context(|| {
+            format!(
+                "user strategy crate at {} must declare `splicer-tool-sdk = {{ path = \"...\" }}` \
+                 in [dependencies] (registry deps will be accepted once splicer-tool-sdk is \
+                 published to crates.io)",
+                cargo_path.display()
+            )
+        })?;
+
+    let sdk_abs = strategy_dir.join(sdk_rel);
+    let sdk_dir = std::fs::canonicalize(&sdk_abs).with_context(|| {
+        format!(
+            "could not canonicalize splicer-tool-sdk path '{}' (resolved to {}) from {}",
+            sdk_rel,
+            sdk_abs.display(),
+            cargo_path.display(),
+        )
+    })?;
+
+    Ok(UserStrategyMetadata {
+        crate_name,
+        sdk_dir,
+    })
+}
+
+/// Concrete inputs to [`run_codegen_build`]: where the strategy crate
+/// lives, where the `splicer-tool-sdk` it depends on lives, and the
+/// Rust idents the wrapper crate will emit. Decoupled from the embed
+/// so both the builtin (extracted-to-cache) and user-supplied
+/// (on-disk path) tier-3/4 paths share the same cargo + install
+/// plumbing.
+struct BuildPlan<'a> {
+    /// File-name stem under `splits_dir/builtins/<>.wasm` for the
+    /// produced wrapper. Conventionally the WAC-var name.
+    out_name: &'a str,
+    /// Strategy crate's on-disk root (`Cargo.toml` + `manifest.toml`
+    /// + `src/`).
+    strategy_dir: &'a Path,
+    /// `splicer-tool-sdk` source root. MUST resolve to the SAME
+    /// canonical path the strategy crate's own `splicer-tool-sdk`
+    /// dep resolves to, or cargo treats the two as distinct crates
+    /// and the build fails on type mismatch.
+    sdk_dir: &'a Path,
+    /// Cargo `[package].name` of the strategy crate — what the
+    /// wrapper's `Cargo.toml` references in `[dependencies]`.
+    strategy_crate_name: &'a str,
+    /// PascalCase Rust ident of the strategy struct the wrapper
+    /// instantiates.
+    strategy_type: &'a str,
+    /// preview1 reactor adapter on disk (used to wrap the core
+    /// module into a component).
+    adapter_path: &'a Path,
+    /// Persistent build root passed through to `BuildConfig`. Cargo
+    /// reuses incremental state across calls keyed by this.
+    cache_root: &'a Path,
+}
+
+/// Run the wrapper-crate codegen + cargo build for `plan`, then
+/// install the produced wasm at `splits_dir/builtins/<out_name>.wasm`.
+/// All the path resolution is the caller's responsibility — this
+/// function just drives the build pipeline.
+fn run_codegen_build(
+    splits_dir: &Path,
+    plan: &BuildPlan<'_>,
+    behavior: Behavior,
+    target: &TargetWit,
+) -> Result<PathBuf> {
+    let strategy_path_str = plan
+        .strategy_dir
         .to_str()
-        .with_context(|| format!("strategy path is not UTF-8: {}", strategy_dir.display()))?;
-    let sdk_path_str = sdk_dir
+        .with_context(|| format!("strategy path is not UTF-8: {}", plan.strategy_dir.display()))?;
+    let sdk_path_str = plan
+        .sdk_dir
         .to_str()
-        .with_context(|| format!("sdk path is not UTF-8: {}", sdk_dir.display()))?;
+        .with_context(|| format!("sdk path is not UTF-8: {}", plan.sdk_dir.display()))?;
 
     let input = GenerateWrapperInput {
         target_wit: &target.wit_text,
         world_name: Some(&target.world_name),
         interface_qualified_name: &target.qualified_name,
         behavior,
-        strategy_crate_name: name,
+        strategy_crate_name: plan.strategy_crate_name,
         strategy_crate_path: strategy_path_str,
-        strategy_type: &strategy_type,
+        strategy_type: plan.strategy_type,
         splicer_tool_sdk_path: sdk_path_str,
     };
     let built = build_wrapper(
         &input,
         &BuildConfig {
-            build_root: &cache_root,
-            adapter_wasm: &adapter_path,
+            build_root: plan.cache_root,
+            adapter_wasm: plan.adapter_path,
             target: None,
         },
     )?;
@@ -176,7 +351,7 @@ fn build_and_install(
     let out_dir = splits_dir.join(BUILTIN_SUBDIR);
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("could not create {}", out_dir.display()))?;
-    let out = out_dir.join(format!("{name}.wasm"));
+    let out = out_dir.join(format!("{}.wasm", plan.out_name));
     std::fs::copy(&built, &out).with_context(|| {
         format!(
             "could not copy built wrapper {} -> {}",
@@ -185,6 +360,19 @@ fn build_and_install(
         )
     })?;
     Ok(out)
+}
+
+/// Write the embedded preview1 reactor adapter under `cache_root` if
+/// it isn't already there, returning the resolved path. Idempotent
+/// across splices.
+fn ensure_preview1_adapter(cache_root: &Path) -> Result<PathBuf> {
+    let path = cache_root.join("wasi_snapshot_preview1.reactor.wasm");
+    if !path.exists() {
+        std::fs::write(&path, PREVIEW1_ADAPTER).with_context(|| {
+            format!("could not write preview1 adapter to {}", path.display())
+        })?;
+    }
+    Ok(path)
 }
 
 fn behavior_for(manifest: &Manifest, name: &str) -> Result<Behavior> {
@@ -271,6 +459,107 @@ mod tests {
         assert!(dest.join("src/lib.rs").exists());
     }
 
+    /// Build a minimal user-form strategy directory at `dest`. Used by
+    /// the parser tests below and by the `--ignored` end-to-end test.
+    /// `sdk_path` is whatever should appear in the strategy's
+    /// `splicer-tool-sdk = { path = "..." }` line; tests use either a
+    /// real SDK source (extracted via [`extract_sdk`]) or a stub
+    /// directory.
+    #[cfg(test)]
+    fn write_user_strategy_dir(
+        dest: &Path,
+        crate_name: &str,
+        tier: u8,
+        sdk_path: &str,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(dest.join("src"))?;
+        std::fs::write(
+            dest.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\
+                 \n[workspace]\n\n[lib]\n\n[dependencies]\nsplicer-tool-sdk = {{ path = \"{sdk_path}\" }}\n"
+            ),
+        )?;
+        std::fs::write(
+            dest.join("manifest.toml"),
+            format!("[builtin]\ndescription = \"test strategy\"\ntier = {tier}\n"),
+        )?;
+        std::fs::write(dest.join("src/lib.rs"), "// stub\n")?;
+        Ok(())
+    }
+
+    #[test]
+    fn is_user_typed_strategy_dir_requires_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("strat");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"s\"\n").unwrap();
+        // Cargo.toml alone isn't enough — could be any rust crate.
+        assert!(!is_user_typed_strategy_dir(&dir));
+        std::fs::write(dir.join("manifest.toml"), "[builtin]\n").unwrap();
+        assert!(is_user_typed_strategy_dir(&dir));
+        // .wasm path is not a strategy dir.
+        let wasm = tmp.path().join("mw.wasm");
+        std::fs::write(&wasm, b"\0asm\x0d\0\0\0").unwrap();
+        assert!(!is_user_typed_strategy_dir(&wasm));
+        // Non-existent path is not a strategy dir.
+        assert!(!is_user_typed_strategy_dir(&tmp.path().join("ghost")));
+    }
+
+    #[test]
+    fn read_user_strategy_metadata_pulls_package_name_and_sdk_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Real SDK so canonicalize() succeeds — the test asserts that
+        // the resolved sdk_dir points at the same canonical path.
+        let sdk_dir = tmp.path().join("sdk");
+        extract_sdk(&sdk_dir).expect("extract sdk");
+        let strat = tmp.path().join("strat");
+        write_user_strategy_dir(&strat, "my-strategy", 3, "../sdk").unwrap();
+
+        let meta = read_user_strategy_metadata(&strat).expect("read metadata");
+        assert_eq!(meta.crate_name, "my-strategy");
+        assert_eq!(
+            meta.sdk_dir,
+            std::fs::canonicalize(&sdk_dir).expect("canonicalize sdk")
+        );
+    }
+
+    #[test]
+    fn read_user_strategy_metadata_errors_without_sdk_path_dep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let strat = tmp.path().join("strat");
+        std::fs::create_dir_all(strat.join("src")).unwrap();
+        std::fs::write(
+            strat.join("Cargo.toml"),
+            // No splicer-tool-sdk dep at all.
+            "[package]\nname = \"s\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(strat.join("manifest.toml"), "[builtin]\ntier = 3\n").unwrap();
+        let err = read_user_strategy_metadata(&strat).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("splicer-tool-sdk"),
+            "error should name the missing dep: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_user_manifest_classifies_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let strat = tmp.path().join("strat");
+        write_user_strategy_dir(&strat, "s", 4, "../sdk").unwrap();
+        let manifest = read_user_manifest(&strat).expect("read manifest");
+        assert!(matches!(manifest.builtin.tier, Tier::Tier4));
+    }
+
+    #[test]
+    fn read_user_manifest_errors_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = read_user_manifest(tmp.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("manifest.toml"));
+    }
+
     /// End-to-end materialize: synthesizes a tiny composition that
     /// exports an interface, then drives the full strategy + SDK
     /// extract → codegen → cargo → install pipeline against it.
@@ -305,5 +594,56 @@ mod tests {
         for payload in parser.parse_all(&bytes) {
             payload.expect("component payload parses");
         }
+    }
+
+    /// Mirror of `materialize_tier3_produces_a_component` for the
+    /// user-form path: extract the smoke builtin's source to a temp
+    /// dir, then drive `materialize_user` against it (so the embed
+    /// codepath never runs). Validates the parser + codegen pipeline
+    /// composes correctly from raw on-disk inputs.
+    #[test]
+    #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+    fn materialize_user_tier3_produces_a_component() {
+        use crate::adapter::typed::target_wit::test_fixture::component_from_wit;
+        const FIXTURE_WIT: &str = r#"
+            package test:demo@0.1.0;
+            interface ops {
+                add: async func(a: u32, b: u32) -> u32;
+            }
+            world demo {
+                export ops;
+            }
+        "#;
+        let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
+
+        // Stage a fake user strategy crate from the hello-tier3 embed,
+        // alongside an extracted SDK at a known relative path.
+        let tmp = tempfile::tempdir().unwrap();
+        let sdk_dir = tmp.path().join("sdk");
+        extract_sdk(&sdk_dir).expect("extract sdk");
+        let strat = tmp.path().join("hello-tier3");
+        extract("hello-tier3", &strat).expect("extract strategy");
+        // Rewrite the strategy's Cargo.toml so its splicer-tool-sdk path
+        // resolves under tmp (the embedded `../../splicer-tool-sdk`
+        // wouldn't exist here).
+        let cargo_text = std::fs::read_to_string(strat.join("Cargo.toml")).unwrap();
+        let cargo_text = cargo_text.replace("../../splicer-tool-sdk", "../sdk");
+        std::fs::write(strat.join("Cargo.toml"), cargo_text).unwrap();
+
+        let splits = tempfile::tempdir().unwrap();
+        let (out, tier) = materialize_user(
+            splits.path(),
+            "my-greeter",
+            &strat,
+            &composition,
+            "test:demo/ops@0.1.0",
+        )
+        .expect("materialize_user");
+        assert_eq!(tier, Tier::Tier3);
+        // Output file name is the YAML name (here `my-greeter`),
+        // not the Cargo package name (`hello-tier3`).
+        assert!(out.ends_with("builtins/my-greeter.wasm"));
+        let bytes = std::fs::read(&out).expect("read");
+        assert!(bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]), "wasm magic");
     }
 }

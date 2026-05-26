@@ -1211,59 +1211,128 @@ fn apply_rule_before(
     })
 }
 
-/// Codegen+build any tier-3/4 builtins in `to_inject`, stamping the
-/// produced wrapper path on a clone. Non-tier-3/4 entries pass through.
+/// Codegen+build any tier-3/4 strategies in `to_inject`, stamping
+/// the produced wrapper path on a clone. Two flavors:
+///
+/// 1. **Builtin** — `builtin:` names an embedded tier-3/4 strategy
+///    (see [`crate::builtins::typed::is_typed`]); the source is
+///    extracted from the splicer binary.
+/// 2. **User-supplied** — `path:` points at a strategy crate root
+///    on disk (a directory containing `manifest.toml` + `Cargo.toml`);
+///    splicer builds against the user's source directly.
+///
+/// Tier-1/2 entries (path is a `.wasm` or unknown builtin name)
+/// pass through untouched.
 fn materialize_tier3_4_inline(
     interface_name: &str,
     to_inject: &[Injection],
     consumer_split: Option<&str>,
     ctx: &SpliceCtx,
 ) -> anyhow::Result<Vec<Injection>> {
-    let has_tier3_4 = to_inject.iter().any(|inj| {
-        inj.builtin
+    let classify = |inj: &Injection| -> Tier3_4Kind {
+        if inj
+            .builtin
             .as_deref()
             .map(crate::builtins::typed::is_typed)
             .unwrap_or(false)
-    });
-    if !has_tier3_4 {
+        {
+            return Tier3_4Kind::Builtin;
+        }
+        if inj.builtin.is_none() {
+            if let Some(p) = inj.path.as_deref() {
+                if crate::builtins::typed::is_user_typed_strategy_dir(std::path::Path::new(p)) {
+                    return Tier3_4Kind::User;
+                }
+            }
+        }
+        Tier3_4Kind::Passthrough
+    };
+
+    let any_typed = to_inject.iter().any(|inj| !matches!(classify(inj), Tier3_4Kind::Passthrough));
+    if !any_typed {
         return Ok(to_inject.to_vec());
     }
 
+    let read_split = |label: &str| -> anyhow::Result<Vec<u8>> {
+        let split_path = consumer_split.ok_or_else(|| {
+            anyhow::anyhow!("no split for tier-3/4 '{label}' on '{interface_name}'")
+        })?;
+        std::fs::read(split_path)
+            .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))
+    };
+
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
     for inj in to_inject.iter() {
-        let Some(builtin) = inj.builtin.as_deref() else {
-            out.push(inj.clone());
-            continue;
-        };
-        if !crate::builtins::typed::is_typed(builtin) {
-            out.push(inj.clone());
-            continue;
+        match classify(inj) {
+            Tier3_4Kind::Passthrough => {
+                out.push(inj.clone());
+            }
+            Tier3_4Kind::Builtin => {
+                let builtin = inj.builtin.as_deref().expect("classified as Builtin");
+                let split_bytes = read_split(builtin)?;
+                let (wrapper_path, tier) = crate::builtins::typed::materialize(
+                    std::path::Path::new(ctx.splits_path),
+                    builtin,
+                    &split_bytes,
+                    interface_name,
+                )
+                .with_context(|| {
+                    format!("materialize tier-3/4 '{builtin}' on '{interface_name}'")
+                })?;
+                out.push(stamp_materialized(inj, wrapper_path, tier)?);
+            }
+            Tier3_4Kind::User => {
+                let strategy_dir = inj.path.as_deref().expect("classified as User");
+                let split_bytes = read_split(&inj.name)?;
+                let (wrapper_path, tier) = crate::builtins::typed::materialize_user(
+                    std::path::Path::new(ctx.splits_path),
+                    &inj.name,
+                    std::path::Path::new(strategy_dir),
+                    &split_bytes,
+                    interface_name,
+                )
+                .with_context(|| {
+                    format!(
+                        "materialize user tier-3/4 strategy '{}' (at {}) on '{interface_name}'",
+                        inj.name, strategy_dir,
+                    )
+                })?;
+                out.push(stamp_materialized(inj, wrapper_path, tier)?);
+            }
         }
-        let split_path = consumer_split.ok_or_else(|| {
-            anyhow::anyhow!("no split for tier-3/4 '{builtin}' on '{interface_name}'")
-        })?;
-        let split_bytes = std::fs::read(split_path)
-            .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))?;
-        let (wrapper_path, tier) = crate::builtins::typed::materialize(
-            std::path::Path::new(ctx.splits_path),
-            builtin,
-            &split_bytes,
-            interface_name,
-        )
-        .with_context(|| format!("materialize tier-3/4 '{builtin}' on '{interface_name}'"))?;
-        let path_str = wrapper_path
-            .to_str()
-            .ok_or_else(|| {
-                anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display())
-            })?
-            .to_string();
-        out.push(Injection {
-            path: Some(path_str),
-            tier: Some(tier),
-            ..inj.clone()
-        });
     }
     Ok(out)
+}
+
+#[allow(non_camel_case_types)]
+enum Tier3_4Kind {
+    /// Not a tier-3/4 strategy — pass through to tier-1/2 handling.
+    Passthrough,
+    /// Embedded builtin (`builtin:` referenced an entry in
+    /// [`crate::builtins::typed`]).
+    Builtin,
+    /// User-supplied strategy crate (`path:` is a directory with a
+    /// `manifest.toml`).
+    User,
+}
+
+/// Stamp the materialized wrapper path + resolved tier onto a clone
+/// of `inj` so downstream stages treat it like any other path-backed
+/// middleware.
+fn stamp_materialized(
+    inj: &Injection,
+    wrapper_path: std::path::PathBuf,
+    tier: builtin_manifest::Tier,
+) -> anyhow::Result<Injection> {
+    let path_str = wrapper_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display()))?
+        .to_string();
+    Ok(Injection {
+        path: Some(path_str),
+        tier: Some(tier),
+        ..inj.clone()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
