@@ -11,7 +11,7 @@
 //! end-to-end. Extend the matrix with sync fixtures once sync
 //! wrapping lands.
 
-use super::{generate_wrapper_crate, Behavior, GenerateWrapperInput, WrapperCrate};
+use super::super::{generate_wrapper_crate, Behavior, GenerateWrapperInput, WrapperCrate};
 
 fn generate_for_wit(
     wit: &str,

@@ -13,6 +13,6 @@
 
 mod emit;
 #[cfg(test)]
-mod tests;
+pub(in crate::adapter) mod tests;
 
 pub(super) use emit::build_adapter;
