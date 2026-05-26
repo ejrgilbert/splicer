@@ -92,7 +92,7 @@ pub fn build_provider_for_edge(
     let edge_id_wave =
         builtin_manifest::loose_scalar_to_wave(&toml::Value::String(edge_id.to_string()))
             .expect("string always encodes as WAVE");
-    values.insert(crate::edge_id::EDGE_ID_CONFIG_KEY.to_string(), edge_id_wave);
+    values.insert(crate::wac::EDGE_ID_CONFIG_KEY.to_string(), edge_id_wave);
 
     let provider_bytes = build_provider(&values).with_context(|| {
         format!(
@@ -586,14 +586,14 @@ mod tests {
         let parsed_b = parse_back(&std::fs::read(path_b).unwrap());
         assert_eq!(
             parsed_a
-                .get(crate::edge_id::EDGE_ID_CONFIG_KEY)
+                .get(crate::wac::EDGE_ID_CONFIG_KEY)
                 .map(String::as_str),
             Some("\"ns:pkg/iface@1.0.0::A->B\""),
             "WAVE-quoted edge_id baked into provider A",
         );
         assert_eq!(
             parsed_b
-                .get(crate::edge_id::EDGE_ID_CONFIG_KEY)
+                .get(crate::wac::EDGE_ID_CONFIG_KEY)
                 .map(String::as_str),
             Some("\"ns:pkg/iface@1.0.0::C->B\""),
             "WAVE-quoted edge_id baked into provider B",
@@ -636,7 +636,7 @@ mod tests {
         // Only the splicer-reserved edge_id key is present; nothing the
         // user set leaks in.
         assert_eq!(parsed.len(), 1);
-        assert!(parsed.contains_key(crate::edge_id::EDGE_ID_CONFIG_KEY));
+        assert!(parsed.contains_key(crate::wac::EDGE_ID_CONFIG_KEY));
         assert!(!parsed.contains_key("buffer"));
     }
 
