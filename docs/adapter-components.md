@@ -134,11 +134,15 @@ modification), ship them as **separate components** and chain them via
 at the configuration level rather than hidden inside one component's
 exports.
 
-A middleware that matches none of the tier shapes — doesn't export
-the target interface directly, doesn't export any `splicer:tierN/*`
-package — is injected with a warning: splicer can't confirm type
-safety, but won't block the splice in case the user knows something
-splicer doesn't.
+Three outcomes, checked in order:
+
+1. **Middleware exports the target interface directly**: fingerprint-
+   compared against the contract; match wires it in, mismatch is a
+   hard error.
+2. **Middleware exports a `splicer:tierN/*` package**: wired through the
+   tier adapter (whose signature is the contract).
+3. **Neither**: can't be wired here; splicer warns and skips the
+   injection.
 
 ### Composing middleware in a chain
 
