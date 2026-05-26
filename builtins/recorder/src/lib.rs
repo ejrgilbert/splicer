@@ -1,9 +1,7 @@
 //! Recorder: emits a binary stream of every wrapped call's lifted
 //! args + result to a configurable sink. The `file` sink is the only
 //! one safe for multi-edge splices; `stdout`/`stderr` are single-
-//! instance debug aids. Wire format and encoding live in
-//! `splicer-tool-sdk`; this crate only owns the hook state, timestamp
-//! source, and sink selection.
+//! instance debug aids.
 
 mod bindings {
     splicer_tool_sdk::wit_bindgen!({
