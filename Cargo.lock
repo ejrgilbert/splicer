@@ -2089,6 +2089,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "include_dir"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
+dependencies = [
+ "include_dir_macros",
+]
+
+[[package]]
+name = "include_dir_macros"
+version = "0.7.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4217,10 +4236,16 @@ dependencies = [
  "clap",
  "colored",
  "cviz",
+ "heck 0.5.0",
+ "include_dir",
  "oci-client",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
  "semver",
  "serde",
  "serde_yaml",
+ "syn",
  "tempfile",
  "tokio",
  "toml 0.8.23",
@@ -4236,6 +4261,7 @@ dependencies = [
  "wat",
  "wirm",
  "wit-bindgen-core 0.57.1",
+ "wit-bindgen-rust 0.57.1",
  "wit-component 0.247.0",
  "wit-parser 0.247.0",
 ]
@@ -6263,6 +6289,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen-rust"
+version = "0.57.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5007dae772945b7a5003d69d90a3a4a78929d41f19d004e980c4259a6af4484"
+dependencies = [
+ "anyhow",
+ "heck 0.5.0",
+ "indexmap 2.14.0",
+ "prettyplease",
+ "syn",
+ "wasm-metadata 0.247.0",
+ "wit-bindgen-core 0.57.1",
+ "wit-component 0.247.0",
+]
+
+[[package]]
 name = "wit-bindgen-rust-macro"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6274,7 +6316,7 @@ dependencies = [
  "quote",
  "syn",
  "wit-bindgen-core 0.51.0",
- "wit-bindgen-rust",
+ "wit-bindgen-rust 0.51.0",
 ]
 
 [[package]]
@@ -6312,6 +6354,7 @@ dependencies = [
  "wasm-encoder 0.247.0",
  "wasm-metadata 0.247.0",
  "wasmparser 0.247.0",
+ "wat",
  "wit-parser 0.247.0",
 ]
 

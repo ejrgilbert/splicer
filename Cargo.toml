@@ -41,6 +41,7 @@ wasmparser = "0.247.0"
 wasm-encoder = { version = "0.247.0", features = ["wasmparser"] }
 wit-parser = "0.247"
 wit-bindgen-core = "0.57.1"
+wit-bindgen-rust = "0.57.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wirm = "5.0.0"
@@ -54,10 +55,17 @@ wac-graph = "0.10"
 tempfile = "3"
 builtin-manifest = { path = "builtins/builtin-manifest" }
 toml = "0.8"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+prettyplease = "0.2"
+heck = "0.5"
+include_dir = "0.7"
 
 [dev-dependencies]
 wat = "1"
 arbitrary = "1"
+wit-component = { version = "0.247", features = ["dummy-module"] }
 wasmtime = { version = "44", features = ["component-model", "component-model-async", "async"] }
 wasmtime-wasi = "44"
 tokio = { version = "1", features = ["rt", "macros"] }

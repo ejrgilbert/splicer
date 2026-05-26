@@ -1,5 +1,6 @@
 [builtin]
 description = "Smoke-test tier-2 builtin: prints a greeting plus typed argument cells around each wrapped call."
+tier = 2
 
 [[key]]
 name = "greeting"

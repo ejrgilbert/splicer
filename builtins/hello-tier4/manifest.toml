@@ -1,0 +1,9 @@
+[builtin]
+description = "Smoke-test virtualize: replaces wrapped calls with `R::default()`. Requires return type to impl Default."
+tier = 4
+
+[[key]]
+name = "greeting"
+type = "string"
+default = "hello-tier4"
+doc = "Prefix printed before the synthesized return."

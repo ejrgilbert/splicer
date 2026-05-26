@@ -5,10 +5,6 @@ edition = "2021"
 publish = false
 description = "Shared schema + build.rs codegen for splicer builtin manifests."
 
-# Standalone workspace so per-builtin `cargo build --target wasm32-wasip1`
-# doesn't try to pull this in for that target. Consumed only as a
-# build-dependency by each builtin and as a regular dependency by
-# splicer; both compile it for the host target.
 [workspace]
 
 [dependencies]

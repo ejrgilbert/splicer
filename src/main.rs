@@ -189,21 +189,47 @@ fn run_builtin(name: Option<String>) -> Result<()> {
 }
 
 /// `splicer builtin` (no arg). Renders every shipped builtin's
-/// description in two columns. A builtin whose manifest can't be
-/// resolved (network error, missing section) prints a placeholder
-/// rather than aborting the whole listing.
+/// tier badge and description in three columns. A builtin whose
+/// manifest can't be resolved (network error, missing section)
+/// prints a placeholder rather than aborting the whole listing.
 fn print_builtin_list() -> Result<()> {
     let entries = builtin_info::list_with_manifests();
-    let width = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-    for (name, result) in entries {
+    let name_width = entries.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    let tier_width = entries
+        .iter()
+        .map(|(_, r)| tier_badge(r.as_ref()).len())
+        .max()
+        .unwrap_or(0);
+    for (name, result) in &entries {
+        let badge = tier_badge(result.as_ref());
         let desc = match result {
-            Ok(Some(m)) => m.builtin.description,
+            Ok(Some(m)) => m.builtin.description.clone(),
             Ok(None) => "(no embedded manifest)".to_string(),
             Err(e) => format!("(manifest unavailable: {e})"),
         };
-        println!("  {:<width$}  {}", name, desc, width = width);
+        println!(
+            "  {:<nw$}  {:<tw$}  {}",
+            name,
+            badge,
+            desc,
+            nw = name_width,
+            tw = tier_width,
+        );
     }
     Ok(())
+}
+
+/// `[tier-N label]` badge for the `builtin list` output, or `[??]`
+/// when the manifest isn't readable.
+fn tier_badge(result: Result<&Option<builtin_info::Manifest>, &anyhow::Error>) -> String {
+    match result {
+        Ok(Some(m)) => format!(
+            "[tier-{} {}]",
+            u8::from(m.builtin.tier),
+            m.builtin.tier.label()
+        ),
+        _ => "[??]".to_string(),
+    }
 }
 
 /// `splicer builtin <name>`. Resolves the named builtin, extracts its
@@ -219,6 +245,15 @@ fn print_builtin_details(name: &str) -> Result<()> {
     })?;
     println!("{}", name.bold().bright_white());
     println!("  {}", manifest.builtin.description.italic().white());
+    println!(
+        "  {}",
+        format!(
+            "tier-{} ({})",
+            u8::from(manifest.builtin.tier),
+            manifest.builtin.tier.label()
+        )
+        .purple()
+    );
     if manifest.keys.is_empty() {
         println!();
         println!("This builtin accepts no config keys.");
@@ -233,10 +268,14 @@ fn print_builtin_details(name: &str) -> Result<()> {
     );
     for key in &manifest.keys {
         for wrapped in wrap_doc(&key.doc, doc_wrap_width()) {
-            println!("  /// {}", wrapped.italic().white());
+            println!("  {}{}", "/// ".dimmed(), wrapped.italic().white().dimmed());
         }
         if key.case_insensitive {
-            println!("  /// {}", "(matched case-insensitively)".italic().white());
+            println!(
+                "  {}{}",
+                "/// ".dimmed(),
+                "(matched case-insensitively)".italic().white().dimmed()
+            );
         }
         println!(
             "  {}: {} = {};",

@@ -1,5 +1,6 @@
 [builtin]
 description = "Emit an OpenTelemetry log record on each wrapped call's return."
+tier = 1
 
 [[key]]
 name = "severity"

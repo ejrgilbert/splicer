@@ -7,10 +7,6 @@ plus the function name — and can run logic before/after the downstream
 call, or conditionally block it. It never sees the types or values of
 the function's parameters or return values.
 
-For the cross-tier framework (one-tier-per-middleware rule, async
-convention, hook-trap propagation, chain composition), see
-[`adapter-components.md`](../adapter-components.md).
-
 **WIT definition:** [`wit/tier1/world.wit`](../../wit/tier1/world.wit)
 
 A middleware is tier-1 compatible when it exports **at least one** of the

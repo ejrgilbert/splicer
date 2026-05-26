@@ -1,9 +1,6 @@
-//! Registry-backed catalogue of middleware components shipped with splicer.
-//!
-//! Each builtin is published as an OCI artifact under
-//! `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>` by the
-//! `publish-builtin.yml` workflow. At runtime, [`materialize_into`]
-//! resolves a builtin in this order:
+//! Tier-1/2 builtins: pre-built wasm components published to an OCI
+//! registry. At splice-time [`materialize_into`] resolves a builtin
+//! in this order:
 //!
 //!   1. `$SPLICER_BUILTINS_DIR/<name>.wasm` — local override, intended
 //!      for iterating on a builtin without re-publishing. `make
@@ -11,14 +8,6 @@
 //!      natural value to point this at.
 //!   2. On-disk cache at `<user-cache>/splicer/builtins/<name>@<version>.wasm`.
 //!   3. OCI pull from ghcr, populating the cache for next time.
-//!
-//! Builtins are referenced from the splice config YAML as
-//! `inject: [{ builtin: <name> }]`. The parser populates
-//! [`crate::parse::config::Injection::builtin`] with the name; the
-//! splice pipeline then calls [`materialize_into`] before contract
-//! validation runs to write the resolved bytes to disk under the
-//! splits dir, after which the rest of the pipeline treats the
-//! injection like any other path-backed middleware.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -123,27 +112,18 @@ pub fn known_names() -> Vec<&'static str> {
     names
 }
 
-/// Resolve every user-facing builtin's bytes, extract its manifest
-/// (when present), and return the pairs in `known_names()` order.
-/// Resolution errors land as `Err(...)` rather than panicking so the
-/// caller can render partial output — `splicer builtin` shouldn't
-/// crash when one OCI pull misbehaves.
-pub fn list_with_manifests() -> Vec<(&'static str, Result<Option<builtin_manifest::Manifest>>)> {
-    let mut out = Vec::new();
-    for name in known_names() {
-        let entry = (|| -> Result<Option<builtin_manifest::Manifest>> {
-            let bytes = load_resolved_bytes(name)?;
-            builtin_manifest::extract_for_builtin(&bytes, name)
-                .map_err(|e| anyhow::anyhow!("manifest extraction failed: {e}"))
-        })();
-        out.push((name, entry));
-    }
-    out
+/// Resolve a tier-1/2 builtin's bytes and extract its embedded
+/// manifest if present. `Ok(None)` for builtins that predate the
+/// manifest substrate; `Err` for resolution failures.
+pub fn manifest_for(name: &str) -> Result<Option<builtin_manifest::Manifest>> {
+    let bytes = load_resolved_bytes(name)?;
+    builtin_manifest::extract_for_builtin(&bytes, name)
+        .map_err(|e| anyhow::anyhow!("manifest extraction failed: {e}"))
 }
 
-/// Resolve a single builtin's bytes and extract its embedded manifest.
-/// Errors when the builtin name is unknown, the bytes can't be
-/// fetched, or no matching manifest section is present.
+/// Resolve a single tier-1/2 builtin's manifest. Errors when the
+/// builtin name is unknown, the bytes can't be fetched, or no
+/// matching manifest section is present.
 pub fn resolve_manifest(name: &str) -> Result<builtin_manifest::Manifest> {
     let bytes = load_resolved_bytes(name)?;
     builtin_manifest::extract_for_builtin(&bytes, name)
@@ -243,7 +223,7 @@ fn write_cache_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn cache_path_for(name: &str, version: &str) -> Result<PathBuf> {
-    let base = user_cache_dir().context(
+    let base = super::user_cache_dir().context(
         "no user cache directory available; \
          set SPLICER_BUILTINS_DIR to a directory of pre-built .wasm files",
     )?;
@@ -251,18 +231,6 @@ fn cache_path_for(name: &str, version: &str) -> Result<PathBuf> {
         .join("splicer")
         .join(BUILTIN_SUBDIR)
         .join(format!("{name}@{version}.wasm")))
-}
-
-/// User cache directory: `$XDG_CACHE_HOME` or `~/.cache` on Unix,
-/// `%LOCALAPPDATA%` on Windows.
-fn user_cache_dir() -> Option<PathBuf> {
-    if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".cache")))
-    }
 }
 
 fn oci_reference(name: &str, version: &str) -> String {

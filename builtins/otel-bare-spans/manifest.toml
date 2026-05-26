@@ -1,5 +1,6 @@
 [builtin]
 description = "Emit OpenTelemetry spans around wrapped calls."
+tier = 1
 
 [[key]]
 name = "span_kind"

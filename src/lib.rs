@@ -124,6 +124,10 @@ pub mod types {
 /// pipeline shape and may change between releases as the pipeline
 /// evolves.
 pub mod lowlevel {
+    pub use crate::adapter::typed::{
+        build_wrapper, generate_wrapper_crate, Behavior, BuildConfig, GenerateWrapperInput,
+        WrapperCrate,
+    };
     pub use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
     pub use crate::compose::build_graph_from_components;
     pub use crate::contract::{

@@ -61,6 +61,62 @@ pub struct Manifest {
 pub struct BuiltinMeta {
     /// One-line description shown by `splicer builtin list`.
     pub description: String,
+    /// Which splicer tier this builtin participates in. Required.
+    pub tier: Tier,
+}
+
+/// Splicer's tier classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub enum Tier {
+    /// Name-only hooks (before/after, no payload).
+    /// Provided as: Wasm component.
+    Tier1,
+    /// Typed observation hooks (lifted args/result as cells).
+    /// Provided as: Wasm component.
+    Tier2,
+    /// Transform strategy (typed access to the call); may mutate
+    /// args/result while forwarding to the wrapped target.
+    /// Provided as: Source crate, splicer-built per target.
+    Tier3,
+    /// Virtualize strategy (replaces the wrapped target).
+    /// Provided as: Source crate, splicer-built per target.
+    Tier4,
+}
+impl TryFrom<u8> for Tier {
+    type Error = String;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            1 => Ok(Self::Tier1),
+            2 => Ok(Self::Tier2),
+            3 => Ok(Self::Tier3),
+            4 => Ok(Self::Tier4),
+            _ => Err(format!("invalid tier {v}; expected 1, 2, 3, or 4")),
+        }
+    }
+}
+impl From<Tier> for u8 {
+    fn from(t: Tier) -> u8 {
+        match t {
+            Tier::Tier1 => 1,
+            Tier::Tier2 => 2,
+            Tier::Tier3 => 3,
+            Tier::Tier4 => 4,
+        }
+    }
+}
+impl Tier {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tier1 => "name-only",
+            Self::Tier2 => "observe",
+            Self::Tier3 => "transform",
+            Self::Tier4 => "virtualize",
+        }
+    }
+    pub fn imports_target(self) -> bool {
+        !matches!(self, Self::Tier4)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -1,0 +1,12 @@
+[package]
+name = "hello-tier3"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+
+[dependencies]
+splicer-tool-sdk = { path = "../../splicer-tool-sdk" }

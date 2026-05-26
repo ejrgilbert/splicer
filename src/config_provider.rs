@@ -678,6 +678,7 @@ mod tests {
     const SAMPLE_MANIFEST_TOML: &str = r#"
 [builtin]
 description = "test"
+tier = 1
 
 [[key]]
 name = "buffer"

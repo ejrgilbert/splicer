@@ -12,12 +12,20 @@
 //! See the crate-root `README.md` for the full `with:` boilerplate.
 
 pub mod format;
+pub mod strategy;
 pub mod types;
+pub mod wave_bridge;
 
 pub use format::{cell_to_str, format_field_tree};
+pub use strategy::{TransformStrategy, VirtualizeStrategy};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };
+pub use wave_bridge::{cells_to_typed, cells_to_value, BridgeError, WitTyped};
+
+/// Re-export wasm-wave so consumers depend on one crate and pick up
+/// the same `WasmType` / `WasmValue` traits the SDK's bridge speaks.
+pub use wasm_wave;
 
 /// Convenience wrapper around [`wit_bindgen::generate!`] that injects
 /// the SDK's canonical `with:` mappings for every type in

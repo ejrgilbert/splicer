@@ -11,3 +11,9 @@ keywords = ["wasm", "WebAssembly", "components", "splicer"]
 categories = ["wasm"]
 
 [workspace]
+
+[dependencies]
+wasm-wave = { version = "=0.249", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

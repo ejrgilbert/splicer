@@ -12,6 +12,7 @@ pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
 use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
 use crate::split::gen_split_path;
+use anyhow::Context;
 
 // chain_idx -> set of middlewares to inject AFTER
 type InjectPlan = HashMap<usize, IndexSet<Injection>>;
@@ -597,14 +598,16 @@ impl EmitPlan {
             // Simple middleware: each chain position needs its own
             // instance (independent state); pkg stays = `mdl.name`.
             let mw_var = disambiguated_var(&mut self.simple_mdl_counts, &real_pkg);
-            self.entities.insert(
-                mw_var.clone(),
-                Entity::wired(
-                    &mw_var,
-                    &real_pkg,
-                    vec![(interface.name.clone(), downstream_var.to_string())],
-                ),
-            );
+            // Tier-4 (virtualize) middlewares don't import the target
+            // (they replace the downstream instead of forwarding); the
+            // wac wire must be skipped for those.
+            let imports = if mdl.tier.is_some_and(|t| !t.imports_target()) {
+                Vec::new()
+            } else {
+                vec![(interface.name.clone(), downstream_var.to_string())]
+            };
+            self.entities
+                .insert(mw_var.clone(), Entity::wired(&mw_var, &real_pkg, imports));
             self.used_middlewares.insert(real_pkg, mdl_path);
             Ok(mw_var)
         }
@@ -836,7 +839,7 @@ pub fn generate_wac(
         }
         any_rule_matched |= any_full_match;
         if !any_full_match {
-            let iface = rule_interface(rule);
+            let iface = rule.interface();
             if !any_interface_matched {
                 // Interface name itself wasn't found — suggest close matches.
                 let available: Vec<&str> =
@@ -1147,6 +1150,61 @@ fn apply_rule_before(
     })
 }
 
+/// Codegen+build any tier-3/4 builtins in `to_inject`, stamping the
+/// produced wrapper path on a clone. Non-tier-3/4 entries pass through.
+fn materialize_tier3_4_inline(
+    interface_name: &str,
+    to_inject: &[Injection],
+    consumer_split: Option<&str>,
+    ctx: &SpliceCtx,
+) -> anyhow::Result<Vec<Injection>> {
+    let has_tier3_4 = to_inject.iter().any(|inj| {
+        inj.builtin
+            .as_deref()
+            .map(crate::builtins::typed::is_typed)
+            .unwrap_or(false)
+    });
+    if !has_tier3_4 {
+        return Ok(to_inject.to_vec());
+    }
+
+    let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
+    for inj in to_inject.iter() {
+        let Some(builtin) = inj.builtin.as_deref() else {
+            out.push(inj.clone());
+            continue;
+        };
+        if !crate::builtins::typed::is_typed(builtin) {
+            out.push(inj.clone());
+            continue;
+        }
+        let split_path = consumer_split.ok_or_else(|| {
+            anyhow::anyhow!("no split for tier-3/4 '{builtin}' on '{interface_name}'")
+        })?;
+        let split_bytes = std::fs::read(split_path)
+            .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))?;
+        let (wrapper_path, tier) = crate::builtins::typed::materialize(
+            std::path::Path::new(ctx.splits_path),
+            builtin,
+            &split_bytes,
+            interface_name,
+        )
+        .with_context(|| format!("materialize tier-3/4 '{builtin}' on '{interface_name}'"))?;
+        let path_str = wrapper_path
+            .to_str()
+            .ok_or_else(|| {
+                anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display())
+            })?
+            .to_string();
+        out.push(Injection {
+            path: Some(path_str),
+            tier: Some(tier),
+            ..inj.clone()
+        });
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_to_inject_plan(
     interface_name: &str,
@@ -1160,10 +1218,15 @@ fn add_to_inject_plan(
     ctx: &SpliceCtx,
     accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<Vec<ContractResult>> {
+    // Tier-3/4 wrappers ARE the adapter — codegen them here so
+    // validate_contract sees their exports.
+    let to_inject_materialized =
+        materialize_tier3_4_inline(interface_name, to_inject, consumer_split.as_deref(), ctx)?;
+
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
     let contract_results = validate_contract(
-        to_inject,
+        &to_inject_materialized,
         interface_name,
         contract_fingerprint,
         &mut accs.checked_middlewares,
@@ -1171,9 +1234,9 @@ fn add_to_inject_plan(
 
     // For tier-1 compatible middleware, generate a adapter component and substitute
     // the injection path so the rest of the WAC generation uses the adapter.
-    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
+    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject_materialized.len());
     let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
-    for (injection, result) in to_inject.iter().zip(contract_results) {
+    for (injection, result) in to_inject_materialized.iter().zip(contract_results) {
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
                 // `consumer_split` is the split the adapter inherits
@@ -1214,16 +1277,11 @@ fn add_to_inject_plan(
                     matched_hook_interfaces: matched_interfaces.clone(),
                 });
                 resolved.push(Injection {
-                    name: injection.name.clone(),
-                    // Keep the original middleware path; adapter_path goes in adapter_info.
-                    path: injection.path.clone(),
-                    builtin: injection.builtin.clone(),
-                    builtin_config: injection.builtin_config.clone(),
-                    config_provider_path: injection.config_provider_path.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         matched_hook_interfaces: matched_interfaces,
                     }),
+                    ..injection.clone()
                 });
                 // Tier1Compatible is fully handled here; no diagnostic needed upstream.
             }
@@ -1258,15 +1316,11 @@ fn add_to_inject_plan(
                     matched_hook_interfaces: matched_interfaces.clone(),
                 });
                 resolved.push(Injection {
-                    name: injection.name.clone(),
-                    path: injection.path.clone(),
-                    builtin: injection.builtin.clone(),
-                    builtin_config: injection.builtin_config.clone(),
-                    config_provider_path: injection.config_provider_path.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         matched_hook_interfaces: matched_interfaces,
                     }),
+                    ..injection.clone()
                 });
             }
             other => {
@@ -1295,13 +1349,6 @@ fn add_to_inject_plan(
 
     middlewares.extend(resolved);
     Ok(final_results)
-}
-
-fn rule_interface(rule: &SpliceRule) -> &str {
-    match rule {
-        SpliceRule::Before { interface, .. } => interface,
-        SpliceRule::Between { interface, .. } => interface,
-    }
 }
 
 /// Helper to get the instance name from a node
@@ -1754,6 +1801,7 @@ mod tests {
                 adapter_path,
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
+            tier: None,
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -1814,6 +1862,7 @@ mod tests {
                 adapter_path,
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
+            tier: None,
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -1915,6 +1964,7 @@ mod tests {
                 builtin_config: Default::default(),
                 config_provider_path: None,
                 adapter_info: None,
+                tier: None,
             }],
         }];
 

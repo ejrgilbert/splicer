@@ -318,6 +318,7 @@ mod tests {
         Injection {
             name: name.to_string(),
             adapter_info: None,
+            tier: None,
             builtin: None,
             builtin_config: Default::default(),
             config_provider_path: None,
@@ -639,6 +640,7 @@ mod tests {
         let inj = Injection {
             name: "mw".to_string(),
             adapter_info: None,
+            tier: None,
             builtin: None,
             builtin_config: Default::default(),
             config_provider_path: None,
@@ -684,6 +686,7 @@ mod tests {
         let inj = Injection {
             name: "mw".to_string(),
             adapter_info: None,
+            tier: None,
             builtin: None,
             builtin_config: Default::default(),
             config_provider_path: None,

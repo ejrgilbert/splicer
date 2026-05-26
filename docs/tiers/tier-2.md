@@ -7,10 +7,6 @@ and return values, and the actual data being passed, but _cannot
 modify_ any of it. The call flows through to the downstream unchanged;
 _the middleware only observes_.
 
-For the shared framework that applies to every tier (one-tier-
-per-middleware rule, async convention, hook-trap propagation,
-chain composition), see [`adapter-components.md`](../adapter-components.md).
-
 ## Payload integrity
 
 The complement to tier-1's
@@ -260,10 +256,10 @@ target. For now, multi-WIT setup is explicit.
 ### Stream / future content observation
 
 For streaming protocols where the middleware actually wants to observe
-**content** (e.g. logging an HTTP body element-by-element), tier-2 v1
-deliberately does **not** support that. It's planned as a separate
-opt-in interface (`splicer:tier2/stream-observer`) once a concrete use
-case justifies the implementation cost.
+**content** (e.g. logging an HTTP body element-by-element), tier-2
+deliberately does **not** support that today. It's planned as a
+separate opt-in interface (`splicer:tier2/stream-observer`) once a
+concrete use case justifies the implementation cost.
 
 ### `error-context` is id-only — host limitation
 
@@ -361,5 +357,5 @@ This pattern gives both worlds:
   shows up. If perf matters, drop the adapter-adapter and walk
   cells directly.
 
-Not in scope for tier-2 v1; the cell wire format is forward-compatible
-with this shim landing later.
+Not in scope today; the cell wire format is forward-compatible with
+this shim landing later.
