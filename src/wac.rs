@@ -1212,43 +1212,25 @@ fn apply_rule_before(
 }
 
 /// Codegen+build any tier-3/4 strategies in `to_inject`, stamping
-/// the produced wrapper path on a clone. Two flavors:
-///
-/// 1. **Builtin** — `builtin:` names an embedded tier-3/4 strategy
-///    (see [`crate::builtins::typed::is_typed`]); the source is
-///    extracted from the splicer binary.
-/// 2. **User-supplied** — `path:` points at a strategy crate root
-///    on disk (a directory containing `manifest.toml` + `Cargo.toml`);
-///    splicer builds against the user's source directly.
-///
-/// Tier-1/2 entries (path is a `.wasm` or unknown builtin name)
-/// pass through untouched.
+/// the produced wrapper path on a clone. The classifier
+/// ([`classify_tier3_4_source`]) decides per injection whether it's
+/// an embedded builtin, a user-supplied strategy crate, or neither;
+/// the unified [`crate::strategies::materialize_tier3_4`] handles
+/// both tier-3/4 flavors. Tier-1/2 entries pass through untouched.
 fn materialize_tier3_4_inline(
     interface_name: &str,
     to_inject: &[Injection],
     consumer_split: Option<&str>,
     ctx: &SpliceCtx,
 ) -> anyhow::Result<Vec<Injection>> {
-    let classify = |inj: &Injection| -> Option<Tier3_4Kind> {
-        if inj
-            .builtin
-            .as_deref()
-            .map(crate::builtins::typed::is_typed)
-            .unwrap_or(false)
-        {
-            return Some(Tier3_4Kind::Builtin);
-        }
-        if inj.builtin.is_none() {
-            if let Some(p) = inj.path.as_deref() {
-                if crate::builtins::typed::is_user_typed_strategy_dir(std::path::Path::new(p)) {
-                    return Some(Tier3_4Kind::User);
-                }
-            }
-        }
-        None
-    };
+    use crate::strategies::Tier3_4Source;
 
-    if !to_inject.iter().any(|inj| classify(inj).is_some()) {
+    // Classify once — the user-form branch stats the filesystem,
+    // and we'd otherwise hit it twice per injection (the short-
+    // circuit check + the dispatch loop).
+    let sources: Vec<Option<Tier3_4Source<'_>>> =
+        to_inject.iter().map(classify_tier3_4_source).collect();
+    if sources.iter().all(Option::is_none) {
         return Ok(to_inject.to_vec());
     }
 
@@ -1261,60 +1243,58 @@ fn materialize_tier3_4_inline(
     };
 
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
-    for inj in to_inject.iter() {
-        match classify(inj) {
-            None => {
-                out.push(inj.clone());
-            }
-            Some(Tier3_4Kind::Builtin) => {
-                let builtin = inj.builtin.as_deref().expect("classified as Builtin");
-                let split_bytes = read_split(builtin)?;
-                let (wrapper_path, tier) = crate::builtins::typed::materialize(
-                    std::path::Path::new(ctx.splits_path),
-                    builtin,
-                    &split_bytes,
-                    interface_name,
-                )
-                .with_context(|| {
-                    format!("materialize tier-3/4 '{builtin}' on '{interface_name}'")
-                })?;
-                out.push(stamp_materialized(inj, wrapper_path, tier)?);
-            }
-            Some(Tier3_4Kind::User) => {
-                let strategy_dir = inj.path.as_deref().expect("classified as User");
-                let split_bytes = read_split(&inj.name)?;
-                let (wrapper_path, tier) = crate::builtins::typed::materialize_user(
-                    std::path::Path::new(ctx.splits_path),
-                    &inj.name,
-                    std::path::Path::new(strategy_dir),
-                    &split_bytes,
-                    interface_name,
-                )
-                .with_context(|| {
-                    format!(
-                        "materialize user tier-3/4 strategy '{}' (at {}) on '{interface_name}'",
-                        inj.name, strategy_dir,
-                    )
-                })?;
-                out.push(stamp_materialized(inj, wrapper_path, tier)?);
-            }
-        }
+    for (inj, source) in to_inject.iter().zip(sources) {
+        let Some(source) = source else {
+            out.push(inj.clone());
+            continue;
+        };
+        let label = source_label(&source);
+        let split_bytes = read_split(label)?;
+        let (wrapper_path, tier) = crate::strategies::materialize_tier3_4(
+            std::path::Path::new(ctx.splits_path),
+            source,
+            &split_bytes,
+            interface_name,
+        )
+        .with_context(|| format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'"))?;
+        out.push(stamp_materialized(inj, wrapper_path, tier)?);
     }
     Ok(out)
 }
 
-/// Which distribution path a tier-3/4 strategy comes from. The
-/// classifier returns `Option<Tier3_4Kind>`; `None` means the
-/// injection isn't tier-3/4 and should pass through to tier-1/2
-/// handling unchanged.
-#[allow(non_camel_case_types)]
-enum Tier3_4Kind {
-    /// Embedded builtin (`builtin:` referenced an entry in
-    /// [`crate::builtins::typed`]).
-    Builtin,
-    /// User-supplied strategy crate (`path:` is a directory with a
-    /// `manifest.toml`).
-    User,
+/// Decide whether an injection should be materialized as a tier-3/4
+/// wrapper at splice time, and from which source. `None` means
+/// "not tier-3/4 — pass through". Lives here rather than as a method
+/// on [`Injection`] so the parse-layer struct doesn't have to know
+/// about the builtin registry.
+fn classify_tier3_4_source(inj: &Injection) -> Option<crate::strategies::Tier3_4Source<'_>> {
+    use crate::strategies::Tier3_4Source;
+    if let Some(b) = inj.builtin.as_deref() {
+        if crate::strategies::is_embedded_builtin(b) {
+            return Some(Tier3_4Source::Builtin(b));
+        }
+        return None;
+    }
+    if let Some(p) = inj.path.as_deref() {
+        let dir = std::path::Path::new(p);
+        if crate::strategies::is_user_strategy_dir(dir) {
+            return Some(Tier3_4Source::User {
+                wac_name: &inj.name,
+                strategy_dir: dir,
+            });
+        }
+    }
+    None
+}
+
+/// Short label for a strategy source — used to build splice-time
+/// error context and the per-source `read_split` error.
+fn source_label<'a>(source: &crate::strategies::Tier3_4Source<'a>) -> &'a str {
+    use crate::strategies::Tier3_4Source;
+    match source {
+        Tier3_4Source::Builtin(name) => name,
+        Tier3_4Source::User { wac_name, .. } => wac_name,
+    }
 }
 
 /// Stamp the materialized wrapper path + resolved tier onto a clone

@@ -85,6 +85,7 @@ mod config_provider;
 mod contract;
 mod parse;
 mod split;
+mod strategies;
 mod wac;
 
 #[cfg(test)]

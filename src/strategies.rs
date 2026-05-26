@@ -1,13 +1,23 @@
-//! Tier-3/4 builtins: Rust strategy crates embedded into the splicer
-//! binary. At splice-time the relevant builtin's source is extracted
-//! to a cache dir, fed into the [`crate::adapter::typed`] codegen +
-//! cargo build pipeline, and the resulting wrapper component is
-//! dropped under `splits_dir/builtins/<name>.wasm` so the rest of the
-//! splice pipeline treats it like any other path-backed middleware.
+//! Tier-3/4 strategy compilation. Two distribution paths flow through
+//! the same codegen pipeline:
+//!
+//! 1. **Embedded builtins** — strategy crate source compiled into the
+//!    splicer binary via `include_dir!`. At splice-time the source is
+//!    extracted to a cache dir before cargo runs.
+//! 2. **User-supplied** — strategy crate directory on disk, referenced
+//!    from the splice YAML via `name:` + `path:`. Used in place,
+//!    no extraction.
+//!
+//! Both routes converge on a [`PreparedStrategy`] and the shared
+//! [`materialize_from_prepared`] core, which feeds
+//! [`crate::adapter::typed`] (codegen primitives) + cargo to build a
+//! per-target wrapper component. The component is dropped under
+//! `splits_dir/builtins/<name>.wasm` so the rest of the splice
+//! pipeline treats it like any other path-backed middleware.
 //!
 //! TODO: publish builtins to crates.io and have generated wrappers
-//! depend on them by version. cargo handles distribution; this file
-//! goes away.
+//! depend on them by version. cargo handles distribution; the embed
+//! and `prepare_builtin_strategy` go away.
 
 use anyhow::{Context, Result};
 use builtin_manifest::{Manifest, Tier};
@@ -44,7 +54,7 @@ static EMBEDDED_SDK: Dir<'_> = include_dir!("$OUT_DIR/embedded-sdk");
 /// alongside the strategy crates so splicer doesn't need it on disk
 /// at splice-time.
 const PREVIEW1_ADAPTER: &[u8] =
-    include_bytes!("../../builtins/wasi_snapshot_preview1.reactor.wasm");
+    include_bytes!("../builtins/wasi_snapshot_preview1.reactor.wasm");
 
 /// Subdirectory of the per-process splits dir that materialized
 /// builtin wasms land in. Mirrors the constant tier-1/2 uses; kept in
@@ -57,7 +67,7 @@ pub fn names() -> Vec<&'static str> {
 }
 
 /// Whether `name` refers to an embedded tier-3/4 builtin.
-pub fn is_typed(name: &str) -> bool {
+pub fn is_embedded_builtin(name: &str) -> bool {
     EMBEDDED.iter().any(|(n, _)| *n == name)
 }
 
@@ -106,19 +116,24 @@ fn lookup(name: &str) -> Result<&'static Dir<'static>> {
         .with_context(|| format!("no embedded tier-3/4 builtin named '{name}'"))
 }
 
-/// Codegen + build the tier-3/4 wrapper specialized to
-/// `target_interface`, using the WIT from `split_bytes`. Drops the
-/// produced wasm at `splits_dir/builtins/<name>.wasm`. Returns the
-/// path and the resolved tier so the caller can cache it on the
-/// injection without re-reading the manifest.
-pub fn materialize(
-    splits_dir: &Path,
-    name: &str,
-    split_bytes: &[u8],
-    target_interface: &str,
-) -> Result<(PathBuf, Tier)> {
-    let prep = prepare_builtin_strategy(name)?;
-    materialize_from_prepared(splits_dir, prep, split_bytes, target_interface)
+/// Where a tier-3/4 strategy's source comes from at splice time.
+/// Each variant maps to one `prepare_*` step; the rest of the
+/// pipeline is source-agnostic.
+pub enum Tier3_4Source<'a> {
+    /// Embedded builtin, referenced by name. The strategy crate's
+    /// source + the SDK are extracted from the splicer binary to a
+    /// cache dir before cargo runs.
+    Builtin(&'a str),
+    /// User-supplied strategy crate on disk. `wac_name` is the YAML
+    /// `name:` field (the WAC variable identifier and the output
+    /// filename stem); `strategy_dir` is the crate root containing
+    /// `Cargo.toml` + `manifest.toml` + `src/`. The Cargo package
+    /// name and Rust struct ident are read from the on-disk
+    /// `Cargo.toml`, so YAML and crate names don't have to match.
+    User {
+        wac_name: &'a str,
+        strategy_dir: &'a Path,
+    },
 }
 
 /// True iff `path` looks like a user-supplied tier-3/4 strategy
@@ -126,27 +141,30 @@ pub fn materialize(
 /// The manifest check is what distinguishes a strategy crate from a
 /// stray directory the user pointed at by accident — the contents
 /// (tier 3 vs 4) are validated downstream by [`read_user_manifest`].
-pub fn is_user_typed_strategy_dir(path: &Path) -> bool {
+pub fn is_user_strategy_dir(path: &Path) -> bool {
     path.is_dir() && path.join("manifest.toml").is_file()
 }
 
-/// Codegen + build a user-supplied tier-3/4 wrapper from
-/// `strategy_dir`, specialized to `target_interface`. Mirrors
-/// [`materialize`] for the embedded case — same install layout
-/// (`splits_dir/builtins/<wac_name>.wasm`) and return shape.
-///
-/// `wac_name` is the YAML `name:` field (also the WAC variable);
-/// the strategy's Cargo package name + Rust struct ident are
-/// derived from its on-disk `Cargo.toml`, not from `wac_name`, so
-/// users aren't forced to align YAML and crate names.
-pub fn materialize_user(
+/// Codegen + build a tier-3/4 wrapper specialized to
+/// `target_interface`, sourcing the strategy from `source`. Drops
+/// the produced wasm at `splits_dir/builtins/<name>.wasm` (where
+/// `name` is the builtin name or the YAML `name:` field, per
+/// variant). Returns the wasm path and the resolved tier so the
+/// caller can cache it on the injection without re-reading the
+/// manifest.
+pub fn materialize_tier3_4(
     splits_dir: &Path,
-    wac_name: &str,
-    strategy_dir: &Path,
+    source: Tier3_4Source<'_>,
     split_bytes: &[u8],
     target_interface: &str,
 ) -> Result<(PathBuf, Tier)> {
-    let prep = prepare_user_strategy(wac_name, strategy_dir)?;
+    let prep = match source {
+        Tier3_4Source::Builtin(name) => prepare_builtin_strategy(name)?,
+        Tier3_4Source::User {
+            wac_name,
+            strategy_dir,
+        } => prepare_user_strategy(wac_name, strategy_dir)?,
+    };
     materialize_from_prepared(splits_dir, prep, split_bytes, target_interface)
 }
 
@@ -443,7 +461,7 @@ fn behavior_for(manifest: &Manifest, name: &str) -> Result<Behavior> {
 /// strategy crates, and the embedded SDK live here. Survives between
 /// splices so cargo's incremental compilation can warm up.
 fn typed_cache_root() -> Result<PathBuf> {
-    let base = super::user_cache_dir().context(
+    let base = crate::builtins::user_cache_dir().context(
         "no user cache directory available; \
          set XDG_CACHE_HOME or HOME to enable tier-3/4 codegen",
     )?;
@@ -462,11 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn is_typed_recognizes_embedded_names() {
-        assert!(is_typed("hello-tier3"));
-        assert!(is_typed("hello-tier4"));
-        assert!(!is_typed("hello-tier1"));
-        assert!(!is_typed("does-not-exist"));
+    fn is_embedded_builtin_recognizes_embedded_names() {
+        assert!(is_embedded_builtin("hello-tier3"));
+        assert!(is_embedded_builtin("hello-tier4"));
+        assert!(!is_embedded_builtin("hello-tier1"));
+        assert!(!is_embedded_builtin("does-not-exist"));
     }
 
     #[test]
@@ -543,21 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn is_user_typed_strategy_dir_requires_manifest() {
+    fn is_user_strategy_dir_requires_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("strat");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"s\"\n").unwrap();
         // Cargo.toml alone isn't enough — could be any rust crate.
-        assert!(!is_user_typed_strategy_dir(&dir));
+        assert!(!is_user_strategy_dir(&dir));
         std::fs::write(dir.join("manifest.toml"), "[builtin]\n").unwrap();
-        assert!(is_user_typed_strategy_dir(&dir));
+        assert!(is_user_strategy_dir(&dir));
         // .wasm path is not a strategy dir.
         let wasm = tmp.path().join("mw.wasm");
         std::fs::write(&wasm, b"\0asm\x0d\0\0\0").unwrap();
-        assert!(!is_user_typed_strategy_dir(&wasm));
+        assert!(!is_user_strategy_dir(&wasm));
         // Non-existent path is not a strategy dir.
-        assert!(!is_user_typed_strategy_dir(&tmp.path().join("ghost")));
+        assert!(!is_user_strategy_dir(&tmp.path().join("ghost")));
     }
 
     #[test]
@@ -633,9 +651,9 @@ mod tests {
         "#;
         let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
         let splits = tempfile::tempdir().unwrap();
-        let (out, tier) = materialize(
+        let (out, tier) = materialize_tier3_4(
             splits.path(),
-            "hello-tier3",
+            Tier3_4Source::Builtin("hello-tier3"),
             &composition,
             "test:demo/ops@0.1.0",
         )
@@ -652,9 +670,10 @@ mod tests {
 
     /// Mirror of `materialize_tier3_produces_a_component` for the
     /// user-form path: extract the smoke builtin's source to a temp
-    /// dir, then drive `materialize_user` against it (so the embed
-    /// codepath never runs). Validates the parser + codegen pipeline
-    /// composes correctly from raw on-disk inputs.
+    /// dir, then drive [`materialize_tier3_4`] against it with a
+    /// [`Tier3_4Source::User`] (so the embed codepath never runs).
+    /// Validates the parser + codegen pipeline composes correctly
+    /// from raw on-disk inputs.
     #[test]
     #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
     fn materialize_user_tier3_produces_a_component() {
@@ -685,14 +704,16 @@ mod tests {
         std::fs::write(strat.join("Cargo.toml"), cargo_text).unwrap();
 
         let splits = tempfile::tempdir().unwrap();
-        let (out, tier) = materialize_user(
+        let (out, tier) = materialize_tier3_4(
             splits.path(),
-            "my-greeter",
-            &strat,
+            Tier3_4Source::User {
+                wac_name: "my-greeter",
+                strategy_dir: &strat,
+            },
             &composition,
             "test:demo/ops@0.1.0",
         )
-        .expect("materialize_user");
+        .expect("materialize_tier3_4(user)");
         assert_eq!(tier, Tier::Tier3);
         // Output file name is the YAML name (here `my-greeter`),
         // not the Cargo package name (`hello-tier3`).
