@@ -321,6 +321,7 @@ mod tests {
             tier: None,
             builtin: None,
             builtin_config: Default::default(),
+            config_as_wave: None,
             config_provider_path: None,
             path: None,
         }
@@ -643,6 +644,7 @@ mod tests {
             tier: None,
             builtin: None,
             builtin_config: Default::default(),
+            config_as_wave: None,
             config_provider_path: None,
             path: None,
         };
@@ -689,6 +691,7 @@ mod tests {
             tier: None,
             builtin: None,
             builtin_config: Default::default(),
+            config_as_wave: None,
             config_provider_path: None,
             path: None,
         };

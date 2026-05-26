@@ -160,18 +160,21 @@ pub struct Injection {
     #[serde(skip)]
     pub builtin: Option<String>,
     /// YAML `builtin.config:` values, preserved with their structural
-    /// shape (scalars stay scalar, sequences stay sequence, maps stay
-    /// map) so the splice-time validator can type-check against the
+    /// shape so the splice-time validator can type-check against the
     /// builtin's declared WIT types. The final WAVE-encoded strings
-    /// are produced inside `ensure_provider_for` once the manifest
-    /// is loaded. `BTreeMap` keeps validation deterministic.
+    /// land in `config_as_wave` after validation runs.
     #[serde(skip)]
     pub builtin_config: BTreeMap<String, toml::Value>,
-    /// Stamped by `ensure_provider_for` when the builtin imports
-    /// `splicer:builtin-config/get` — points at the patched provider
-    /// alongside the materialized builtin. Not user-settable; callers
-    /// who want their own provider use a user-form (`name` + `path`)
-    /// injection instead.
+    /// WAVE-encoded form of `builtin_config`, populated by
+    /// `validate_config_as_wave` during materialization for builtins
+    /// that import `splicer:builtin-config`. `_splicer_edge_id` is
+    /// added per-edge at provider-build time inside `wac.rs`. `None`
+    /// for builtins that don't consume a config provider.
+    #[serde(skip)]
+    pub(crate) config_as_wave: Option<BTreeMap<String, String>>,
+    /// Path to the patched config provider wasm for one specific edge.
+    /// Stamped by `build_provider_for_edge` once per chain-walk match,
+    /// on a per-edge clone of the Injection.
     #[serde(skip)]
     pub(crate) config_provider_path: Option<String>,
     /// Populated at runtime by `add_to_inject_plan` when this injection
@@ -224,6 +227,7 @@ impl Injection {
             path: Some(path.into()),
             builtin: None,
             builtin_config: BTreeMap::new(),
+            config_as_wave: None,
             config_provider_path: None,
             adapter_info: None,
             tier: None,
@@ -239,6 +243,7 @@ impl Injection {
             path: None,
             builtin: None,
             builtin_config: BTreeMap::new(),
+            config_as_wave: None,
             config_provider_path: None,
             adapter_info: None,
             tier: None,
@@ -255,6 +260,7 @@ impl Injection {
             path: None,
             builtin: Some(name),
             builtin_config: BTreeMap::new(),
+            config_as_wave: None,
             config_provider_path: None,
             adapter_info: None,
             tier: None,
@@ -573,6 +579,7 @@ fn into_injection(yaml: YamlInjection) -> Injection {
         path,
         builtin: builtin_name,
         builtin_config,
+        config_as_wave: None,
         config_provider_path: None,
         adapter_info: None,
         tier: None,

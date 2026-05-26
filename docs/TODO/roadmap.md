@@ -26,12 +26,12 @@ collaborator on one stream cuts calendar time roughly in half.
 ### Stream A — finish recorder (~1-1.5 weeks)
 
 Multi-edge doc steps 2-3:
-- [ ] splicer: `edge_id` derivation (`{interface}::{from}->{to}`)
-- [ ] splicer: auto-inject `_splicer_edge_id` into builtin config substrate
-- [ ] recorder: import `wasi:filesystem`, add file sink to `<dir>/<edge_id>.bin`
-- [ ] recorder: read `_splicer_edge_id`, add `dir` config key
-- [ ] flip default sink to file; stdout/stderr stay as single-instance debug
-- [ ] end-to-end multi-edge test (two edges, two files)
+- [x] splicer: `edge_id` derivation (`{interface}::{from}->{to}`)
+- [x] splicer: auto-inject `_splicer_edge_id` into builtin config substrate
+- [x] recorder: import `wasi:filesystem`, add file sink to `<dir>/<edge_id>.bin`
+- [x] recorder: read `_splicer_edge_id`, add `dir` config key
+- [x] flip default sink to file; stdout/stderr stay as single-instance debug
+- [x] end-to-end multi-edge test (two edges, two files)
 
 ### Stream B — tier-3 substrate foundation (~2 weeks)
 
@@ -80,8 +80,8 @@ is already specced in the multi-edge doc; no design negotiation needed.
   `src/adapter/typed/matrix_tests.rs` with sync `func` fixtures so both paths
   are exercised.
 
-No Phase 3 — Phase 1's Stream C scopes `between_subgraph`, and Phase 2
-picks up the rest.
+Skipped Phase 3 — Phase 1's Stream C already covered `between_subgraph`,
+and Phase 2 picks up the rest.
 
 ## Phase 4: record + replay loop (2-3 weeks)
 

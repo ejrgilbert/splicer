@@ -1,12 +1,6 @@
-//! Splice-time patcher for the `splicer:builtin-config` provider
-//! template.
-//!
-//! `build_provider` loads the template bytes (override → cache → OCI),
-//! serializes the caller's KV map, and overwrites the bytes after the
-//! magic sentinel that `builtins/config-provider/` plants in its
-//! `static SPLICER_CONFIG_BLOB`. The data segment's total length is
-//! preserved; the in-component parser uses the length field to bound
-//! iteration so trailing padding stays inert.
+//! Two-stage builder for the `splicer:builtin-config` provider:
+//! validate YAML config at materialize time, emit a per-edge provider
+//! wasm at chain-walk time with `_splicer_edge_id` baked in.
 
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
@@ -30,19 +24,17 @@ pub(crate) const PROVIDER_BUILTIN_NAME: &str = "config-provider";
 
 const MAX_PAYLOAD: usize = CAPACITY - MAGIC_LEN - LEN_PREFIX_BYTES;
 
-/// If the materialized builtin imports `splicer:builtin-config`,
-/// build a patched provider with `injection.builtin_config` baked in,
-/// write it under `<splits_dir>/builtins/<wac_var>-config.wasm`, and
-/// stamp the resulting path onto `injection.config_provider_path`.
-/// No-ops when the injection isn't a builtin, has no materialized
-/// path yet, or already has a provider path set.
+/// Validate the YAML `config:` block against the builtin's manifest
+/// and stash the resulting WAVE-encoded strings on
+/// `injection.config_as_wave`. No wasm is written here — the provider
+/// component is built per-edge in [`build_provider_for_edge`] once
+/// the chain walk has produced an edge_id.
 ///
-/// Errors when the builtin doesn't import the substrate but the YAML
-/// still set a non-empty `config:` block — silently dropping config
-/// would hide a typo or a misrouted builtin name. An empty `config:`
-/// against a non-consumer is fine.
-pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Result<()> {
-    if injection.config_provider_path.is_some() {
+/// No-op when there's no materialized path yet or the builtin doesn't
+/// import `splicer:builtin-config` (with the usual hard error when a
+/// non-consumer has a non-empty `config:`).
+pub fn validate_config_as_wave(injection: &mut Injection) -> Result<()> {
+    if injection.config_as_wave.is_some() {
         return Ok(());
     }
     let Some(builtin_path) = injection.path.as_deref() else {
@@ -50,8 +42,6 @@ pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Resu
     };
     let bytes = std::fs::read(builtin_path)
         .with_context(|| format!("Failed to read materialized builtin '{}'", builtin_path))?;
-    // One wasmparser walk covers both questions: does the component
-    // import the substrate, and what manifest sections does it ship?
     let scan = builtin_manifest::scan_substrate_component(&bytes).map_err(|e| {
         anyhow::anyhow!(
             "injection '{name}': failed to scan builtin bytes: {e}",
@@ -77,23 +67,45 @@ pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Resu
         }
         return Ok(());
     }
-    let wave_values = validate_against_manifest(injection, &scan.manifests)?;
-    let provider_bytes = build_provider(&wave_values).with_context(|| {
+    let wave = match injection.builtin.as_deref() {
+        Some(builtin_name) => validate_against_manifest(injection, builtin_name, &scan.manifests)?,
+        None => loose_encode_user_config(injection)?,
+    };
+    injection.config_as_wave = Some(wave);
+    Ok(())
+}
+
+/// Per chain-walk match: clone the cached WAVE map, add the edge_id
+/// (WAVE-quoted), build the provider wasm, and write it under
+/// `<splits_dir>/builtins/<injection.name>-config.wasm`. The caller is
+/// responsible for having uniquified `injection.name` per edge so
+/// distinct edges don't clobber each other's provider files.
+pub fn build_provider_for_edge(
+    injection: &mut Injection,
+    edge_id: &str,
+    splits_dir: &Path,
+) -> Result<()> {
+    let Some(wave) = injection.config_as_wave.as_ref() else {
+        return Ok(());
+    };
+    let mut values = wave.clone();
+    let edge_id_wave =
+        builtin_manifest::loose_scalar_to_wave(&toml::Value::String(edge_id.to_string()))
+            .expect("string always encodes as WAVE");
+    values.insert(crate::wac::EDGE_ID_CONFIG_KEY.to_string(), edge_id_wave);
+
+    let provider_bytes = build_provider(&values).with_context(|| {
         format!(
             "Failed to build config provider for injection '{}'",
             injection.name
         )
     })?;
-
-    // create_dir_all is defensive — `materialize_into` made the dir, but
-    // a caller wiring this independently of the pipeline still works.
     let dir = splits_dir.join("builtins");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create builtins dir: {}", dir.display()))?;
     let out = dir.join(format!("{}-config.wasm", injection.name));
     std::fs::write(&out, &provider_bytes)
         .with_context(|| format!("Failed to write config provider: {}", out.display()))?;
-
     let out_str = out
         .to_str()
         .ok_or_else(|| {
@@ -107,91 +119,42 @@ pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Resu
     Ok(())
 }
 
-/// Reject YAML `config:` keys that aren't declared in the builtin's
-/// embedded manifest, or whose values won't parse as the declared
-/// type. Splice-time hard error — the silent-fallback-to-default
-/// behavior that catches typos at runtime is exactly what this
-/// substitutes for.
-///
-/// For shipped builtins (`injection.builtin == Some(name)`) the
-/// section name in the wasm must match `name` — that catches OCI
-/// misrouting (e.g. the `otel-bare-metrics` tag accidentally pointing
-/// at `hello-tier1`'s bytes) the same way it catches typos. Manifest
-/// absence on a shipped builtin is only an error when the user
-/// actually set `config:` keys.
-///
-/// For user-supplied middleware (`injection.builtin == None`) we
-/// validate against whichever single manifest the bytes carry, or
-/// skip validation if none is present (third-party authors aren't
-/// required to ship one).
+/// Strict validation for shipped builtins: the bytes must carry a
+/// manifest section named for `expected` (caught OCI misrouting), and
+/// every `config:` key must type-check against that manifest. The
+/// pre-manifest leniency stays in place when the user set no config.
 fn validate_against_manifest(
     injection: &Injection,
+    expected: &str,
     all: &[(String, builtin_manifest::Manifest)],
 ) -> Result<BTreeMap<String, String>> {
-    let manifest = match injection.builtin.as_deref() {
-        Some(expected) => {
-            if let Some((_, m)) = all.iter().find(|(n, _)| n == expected) {
-                Some(m.clone())
-            } else if all.is_empty() {
-                // Genuinely manifest-less builtin (pre-manifests build).
-                // Lenient as long as the user didn't ask for any config.
-                if injection.builtin_config.is_empty() {
-                    None
-                } else {
-                    anyhow::bail!(
-                        "injection '{name}': shipped builtin '{expected}' is missing its \
-                         embedded manifest, so splicer can't validate the `config:` keys \
-                         you set. Rebuild against the current builtin-manifest crate.",
-                        name = injection.name,
-                    );
-                }
-            } else {
-                // Bytes DO carry manifest(s), but none for the requested
-                // builtin name. That's OCI misrouting / build-tag mismatch
-                // — flag it unconditionally, config: block or not.
-                let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
-                anyhow::bail!(
-                    "injection '{name}': shipped builtin '{expected}' resolved to bytes \
-                     carrying manifest(s) for [{}] — wrong OCI tag or build mismatch.",
-                    names.join(", "),
-                    name = injection.name,
-                );
+    let manifest = match all.iter().find(|(n, _)| n == expected) {
+        Some((_, m)) => m.clone(),
+        None if all.is_empty() => {
+            // Pre-manifests builtin: lenient only when no config was set.
+            if injection.builtin_config.is_empty() {
+                return Ok(BTreeMap::new());
             }
+            anyhow::bail!(
+                "injection '{name}': shipped builtin '{expected}' is missing its \
+                 embedded manifest, so splicer can't validate the `config:` keys \
+                 you set. Rebuild against the current builtin-manifest crate.",
+                name = injection.name,
+            );
         }
-        None => match all.len() {
-            0 => None,
-            1 => Some(all[0].1.clone()),
-            _ => {
-                let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
-                anyhow::bail!(
-                    "injection '{name}': bytes carry manifests for multiple builtins \
-                     [{}] but the YAML didn't declare which one applies. Use \
-                     `builtin: <name>` instead of `name: ...` + `path: ...` to disambiguate.",
-                    names.join(", "),
-                    name = injection.name,
-                );
-            }
-        },
-    };
-    let Some(manifest) = manifest else {
-        // Lenient path: user-supplied middleware without a manifest
-        // section. We can't type-check, but we still want the config
-        // values to reach the substrate so the old "ship middleware
-        // without a manifest" workflow keeps working. Loose-encode
-        // each scalar as WAVE text; reject compounds since we can't
-        // disambiguate them without a declared type.
-        let mut wave = BTreeMap::new();
-        for (key, value) in &injection.builtin_config {
-            let encoded = builtin_manifest::loose_scalar_to_wave(value).map_err(|e| {
-                anyhow::anyhow!(
-                    "injection '{name}': config key '{key}' (no manifest available): {e}",
-                    name = injection.name,
-                )
-            })?;
-            wave.insert(key.clone(), encoded);
+        None => {
+            // Manifest(s) present but none for the requested builtin —
+            // OCI tag misrouting or build-tag mismatch.
+            let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+            anyhow::bail!(
+                "injection '{name}': shipped builtin '{expected}' resolved to bytes \
+                 carrying manifest(s) for [{}] — wrong OCI tag or build mismatch.",
+                names.join(", "),
+                name = injection.name,
+            );
         }
-        return Ok(wave);
     };
+
     let mut wave: BTreeMap<String, String> = BTreeMap::new();
     let mut unknown: Vec<&str> = Vec::new();
     let mut bad: Vec<String> = Vec::new();
@@ -210,12 +173,8 @@ fn validate_against_manifest(
     let known_keys: Vec<&str> = manifest.keys.iter().map(|k| k.name.as_str()).collect();
     let mut msg = format!(
         "injection '{name}' has invalid `config:` against its declared manifest. \
-         Run `splicer builtin {bn}` to see accepted keys.",
+         Run `splicer builtin {expected}` to see accepted keys.",
         name = injection.name,
-        bn = injection
-            .builtin
-            .as_deref()
-            .unwrap_or(injection.name.as_str()),
     );
     if !unknown.is_empty() {
         unknown.sort();
@@ -230,6 +189,23 @@ fn validate_against_manifest(
         msg.push_str(b);
     }
     anyhow::bail!(msg);
+}
+
+/// User-supplied middleware (no shipped-builtin name): no manifest
+/// lookup at all, just WAVE-encode each scalar. Compounds without a
+/// declared type are rejected by `loose_scalar_to_wave`.
+fn loose_encode_user_config(injection: &Injection) -> Result<BTreeMap<String, String>> {
+    let mut wave = BTreeMap::new();
+    for (key, value) in &injection.builtin_config {
+        let encoded = builtin_manifest::loose_scalar_to_wave(value).map_err(|e| {
+            anyhow::anyhow!(
+                "injection '{name}': config key '{key}' (no manifest available): {e}",
+                name = injection.name,
+            )
+        })?;
+        wave.insert(key.clone(), encoded);
+    }
+    Ok(wave)
 }
 
 /// Thin test wrapper around [`builtin_manifest::scan_substrate_component`].
@@ -312,6 +288,21 @@ mod tests {
     use super::*;
     use crate::config_provider::wire_format::deserialize_table;
     use crate::parse::config::Injection;
+
+    /// Test edge_id used by the `ensure_provider_for` helper. Pre-edge_id
+    /// tests just want to know "did we validate + emit a provider"; this
+    /// constant lets each test ignore the splicer-reserved key when
+    /// asserting against the parsed payload.
+    const TEST_EDGE_ID: &str = "test:iface@0.1.0::caller->provider";
+
+    /// Test shim that runs the pre-edge_id flow end-to-end: validate
+    /// config, then emit a per-edge provider with a fixed test edge_id.
+    /// Tests written against the old `ensure_provider_for` keep their
+    /// shape; new edge_id-specific behavior gets its own dedicated tests.
+    fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Result<()> {
+        validate_config_as_wave(injection)?;
+        build_provider_for_edge(injection, TEST_EDGE_ID, splits_dir)
+    }
 
     fn make_blob(payload: &[u8]) -> Vec<u8> {
         // Mimics the template's static layout: random prefix, magic,
@@ -550,6 +541,65 @@ mod tests {
         );
     }
 
+    /// `build_provider_for_edge` stamps `_splicer_edge_id` into the
+    /// patched provider as WAVE-quoted text. Distinct edge_ids produce
+    /// distinct provider wasms — the per-edge file naming follows
+    /// `<injection.name>-config.wasm`, so callers in wac.rs uniquify
+    /// `injection.name` per edge before invoking this.
+    #[test]
+    fn build_provider_for_edge_stamps_edge_id() {
+        let mut template = Vec::new();
+        template.extend_from_slice(b"\0asm\x01\x00\x00\x00fake-prefix-");
+        template.extend_from_slice(&MAGIC_BYTES);
+        template.extend_from_slice(&0u32.to_le_bytes());
+        template.extend(std::iter::repeat_n(
+            0xAA,
+            CAPACITY - MAGIC_LEN - LEN_PREFIX_BYTES,
+        ));
+
+        let consumer_bytes = wat::parse_str(CONSUMER_WAT).expect("wat");
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("recorder.wasm");
+        std::fs::write(&builtin_path, &consumer_bytes).unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        std::fs::write(override_dir.path().join("config-provider.wasm"), &template).unwrap();
+        let _guard = EnvGuard::set("SPLICER_BUILTINS_DIR", override_dir.path());
+
+        let mut inj_a = Injection::from_path("recorder-a", builtin_path.to_str().unwrap());
+        validate_config_as_wave(&mut inj_a).expect("validate");
+        build_provider_for_edge(&mut inj_a, "ns:pkg/iface@1.0.0::A->B", splits.path())
+            .expect("build A");
+
+        let mut inj_b = Injection::from_path("recorder-b", builtin_path.to_str().unwrap());
+        validate_config_as_wave(&mut inj_b).expect("validate");
+        build_provider_for_edge(&mut inj_b, "ns:pkg/iface@1.0.0::C->B", splits.path())
+            .expect("build B");
+
+        let path_a = inj_a.config_provider_path.as_deref().expect("path a");
+        let path_b = inj_b.config_provider_path.as_deref().expect("path b");
+        assert_ne!(path_a, path_b, "per-edge providers land at distinct paths");
+
+        let parsed_a = parse_back(&std::fs::read(path_a).unwrap());
+        let parsed_b = parse_back(&std::fs::read(path_b).unwrap());
+        assert_eq!(
+            parsed_a
+                .get(crate::wac::EDGE_ID_CONFIG_KEY)
+                .map(String::as_str),
+            Some("\"ns:pkg/iface@1.0.0::A->B\""),
+            "WAVE-quoted edge_id baked into provider A",
+        );
+        assert_eq!(
+            parsed_b
+                .get(crate::wac::EDGE_ID_CONFIG_KEY)
+                .map(String::as_str),
+            Some("\"ns:pkg/iface@1.0.0::C->B\""),
+            "WAVE-quoted edge_id baked into provider B",
+        );
+    }
+
     /// Empty `inj.builtin_config` against a substrate consumer still
     /// writes a provider (with `count = 0`); the user's `builtin: <name>`
     /// without any `config:` path must keep working.
@@ -583,7 +633,10 @@ mod tests {
         let path = inj.config_provider_path.as_deref().expect("provider path");
         let patched = std::fs::read(path).expect("provider written");
         let parsed = parse_back(&patched);
-        assert!(parsed.is_empty());
+        // Only the splicer-reserved edge_id key is present; nothing the
+        // user set leaks in.
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains_key(crate::wac::EDGE_ID_CONFIG_KEY));
         assert!(!parsed.contains_key("buffer"));
     }
 

@@ -11,11 +11,15 @@
 //!
 //! See the crate-root `README.md` for the full `with:` boilerplate.
 
+pub mod decode;
+pub mod encode;
 pub mod format;
 pub mod strategy;
 pub mod types;
 pub mod wave_bridge;
 
+pub use decode::{DecodeError, Event, Reader};
+pub use encode::{write_call_event, write_field_tree, write_return_event, write_stream_header};
 pub use format::{cell_to_str, format_field_tree};
 pub use strategy::{TransformStrategy, VirtualizeStrategy};
 pub use types::{

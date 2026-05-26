@@ -1,0 +1,13 @@
+package splicer:recorder@0.1.0;
+
+/// Emit a binary stream of every wrapped call's lifted args + result.
+/// Wire format documented in `recorder-format.md` (sibling file).
+world recorder-mdl {
+    import wasi:clocks/wall-clock@0.2.0;
+    import wasi:filesystem/types@0.2.0;
+    import wasi:filesystem/preopens@0.2.0;
+    import splicer:builtin-config/get@0.1.0;
+
+    export splicer:tier2/before@0.1.0;
+    export splicer:tier2/after@0.1.0;
+}

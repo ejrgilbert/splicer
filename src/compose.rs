@@ -795,6 +795,7 @@ mod tests {
                 tier: None,
                 builtin: None,
                 builtin_config: Default::default(),
+                config_as_wave: None,
                 config_provider_path: None,
                 path: None,
             }],
@@ -884,6 +885,7 @@ mod tests {
                 path: Some(mdl_path.clone()),
                 builtin: None,
                 builtin_config: Default::default(),
+                config_as_wave: None,
                 config_provider_path: None,
                 adapter_info: Some(AdapterInjectionInfo {
                     adapter_path: adapter_path.to_string(),

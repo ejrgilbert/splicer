@@ -9,6 +9,10 @@ readme = "README.md"
 repository = "https://github.com/ejrgilbert/splicer"
 keywords = ["wasm", "WebAssembly", "components", "splicer"]
 categories = ["wasm"]
+# Internal-only until tier-3 lands and the SDK contract has firmed up.
+# Flip to `publish = true` (or remove this line) when ready to ship to
+# crates.io.
+publish = false
 
 [workspace]
 

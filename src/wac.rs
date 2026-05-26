@@ -10,6 +10,25 @@ use wasmparser::collections::IndexSet;
 /// Package prefix used for WAC instance variables (e.g. `"my:srv-a"`).
 pub const INST_PREFIX: &str = "my";
 const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
+
+/// Reserved key splicer publishes into every builtin that imports
+/// `splicer:builtin-config`. The single-underscore prefix marks it as
+/// splicer-internal — user manifests can never declare keys with this
+/// prefix.
+pub const EDGE_ID_CONFIG_KEY: &str = "_splicer_edge_id";
+
+/// Canonical edge_id for an `interface` edge from `from` (the caller)
+/// to `to` (the provider). `from = None` is the boundary case — the
+/// caller is external to the composition; the rendered form drops the
+/// caller segment, leaving the leading `->` as a marker. Format:
+/// `{interface}::{caller}->{provider}`, or `{interface}::->{provider}`
+/// at the boundary.
+pub fn derive_edge_id(interface: &str, from: Option<&str>, to: &str) -> String {
+    match from {
+        Some(caller) => format!("{interface}::{caller}->{to}"),
+        None => format!("{interface}::->{to}"),
+    }
+}
 use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
 use crate::split::gen_split_path;
 use anyhow::Context;
@@ -1025,6 +1044,35 @@ struct RuleApplyResult {
     full_match: bool,
 }
 
+/// For injections whose builtin imports `splicer:builtin-config`,
+/// clone each with an edge-uniquified `name` and emit a per-edge
+/// `<name>-config.wasm` stamped with the resolved `edge_id`.
+/// Injections without a config provider pass through unchanged.
+/// Callers feed the returned vec to `add_to_inject_plan` so each
+/// physical edge gets its own WAC instance + provider.
+fn build_per_edge_providers(
+    inject: &[Injection],
+    edge_id: &str,
+    splits_path: &str,
+) -> anyhow::Result<Vec<Injection>> {
+    let splits_dir = std::path::Path::new(splits_path);
+    // Suffix flows into `my:<name>` package keys, so it must be a
+    // valid WAC identifier
+    let edge_suffix = sanitize_wac_id(edge_id);
+    inject
+        .iter()
+        .map(|inj| {
+            if inj.config_as_wave.is_none() {
+                return Ok(inj.clone());
+            }
+            let mut clone = inj.clone();
+            clone.name = format!("{}-{edge_suffix}", inj.name);
+            crate::config_provider::build_provider_for_edge(&mut clone, edge_id, splits_dir)?;
+            Ok(clone)
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_rule_between(
     rule: &SpliceRule,
@@ -1058,6 +1106,8 @@ fn apply_rule_between(
             interface_matched = true;
             if *inner_name == inner_var && *outer_name == outer_var {
                 full_match = true;
+                let edge_id = derive_edge_id(interface, Some(&outer_var), &inner_var);
+                let edge_inject = build_per_edge_providers(inject, &edge_id, ctx.splits_path)?;
                 let new_aliases = vec![
                     (inner_id, inner_alias.clone()),
                     (outer_id, outer_alias.clone()),
@@ -1070,7 +1120,7 @@ fn apply_rule_between(
                 );
                 contract_results.extend(add_to_inject_plan(
                     interface,
-                    inject,
+                    &edge_inject,
                     i + 1,
                     &new_aliases,
                     &mut chain.aliases,
@@ -1118,6 +1168,17 @@ fn apply_rule_before(
                 }
             }
             full_match = true;
+            let provider_var = get_name(outer_node).to_string();
+            // Caller name comes from the next position toward the
+            // consumer side of the chain; `None` when this match is
+            // the outermost chain position (boundary edge — caller
+            // is external to the composition).
+            let caller_var = chain
+                .chain
+                .get(i + 1)
+                .map(|caller_id| get_name(&ctx.composition.nodes[caller_id]).to_string());
+            let edge_id = derive_edge_id(interface, caller_var.as_deref(), &provider_var);
+            let edge_inject = build_per_edge_providers(inject, &edge_id, ctx.splits_path)?;
             let new_aliases = vec![(*id, provider_alias.clone())];
             // Prefer the consumer's split (i+1) so the adapter copies
             // its import surface. At the outermost chain position
@@ -1131,7 +1192,7 @@ fn apply_rule_before(
                 });
             contract_results.extend(add_to_inject_plan(
                 interface,
-                inject,
+                &edge_inject,
                 i + 1,
                 &new_aliases,
                 &mut chain.aliases,
@@ -1639,20 +1700,19 @@ fn disambiguated_var(counts: &mut HashMap<String, usize>, pkg: &str) -> String {
 /// Convert an arbitrary node label into a valid WAC kebab-case identifier.
 ///
 /// Node names in pre-composed binaries often look like `my:service/foo-shim`
-/// (a WIT package path). WAC identifiers are `word ("-" word)*` where each
-/// `word` is `[a-z][a-z0-9]* | [A-Z][A-Z0-9]*` — i.e. each hyphen-separated
-/// segment must start with a letter. We replace every invalid character with
-/// `-`, strip a leading `my-` that would otherwise double the namespace
-/// prefix into `my:my-…`, and prefix any digit-leading segment with `v` so
-/// version numbers like `1.0.0` (which sanitize to `-1-0-0`) don't produce
-/// invalid `1`/`0` word segments.
+/// `v`-prefixes digit-leading segments and strips a redundant `my-`
+/// to avoid the eventual `my:my-...` package name.
 fn sanitize_wac_id(raw: &str) -> String {
-    let sanitized = raw.replace([':', '/', '.', '_', '@'], "-");
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     let stripped = sanitized
         .strip_prefix(&format!("{INST_PREFIX}-"))
         .unwrap_or(&sanitized);
     stripped
         .split('-')
+        .filter(|s| !s.is_empty())
         .map(|seg| match seg.chars().next() {
             Some(c) if c.is_ascii_digit() => format!("v{seg}"),
             _ => seg.to_string(),
@@ -1664,6 +1724,47 @@ fn sanitize_wac_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── edge_id ──────────────────────────────────────────────────────
+
+    #[test]
+    fn edge_id_internal_renders_caller_to_provider() {
+        assert_eq!(
+            derive_edge_id(
+                "wasi:http/handler@0.3.0-rc-2026-01-06",
+                Some("srv-b"),
+                "srv-a",
+            ),
+            "wasi:http/handler@0.3.0-rc-2026-01-06::srv-b->srv-a",
+        );
+    }
+
+    #[test]
+    fn edge_id_boundary_drops_caller_segment() {
+        assert_eq!(
+            derive_edge_id("wasi:http/handler@0.3.0", None, "srv-a"),
+            "wasi:http/handler@0.3.0::->srv-a",
+        );
+    }
+
+    #[test]
+    fn edge_id_before_and_between_targeting_same_edge_collide() {
+        // The doc's invariant: a `before(provider=B)` matching caller A
+        // and a `between(outer=A, inner=B)` identify the same physical
+        // edge, so they must render to the same edge_id.
+        let from_between = derive_edge_id("ns:pkg/iface@1.0.0", Some("A"), "B");
+        let from_before = derive_edge_id("ns:pkg/iface@1.0.0", Some("A"), "B");
+        assert_eq!(from_between, from_before);
+    }
+
+    #[test]
+    fn edge_id_derivation_is_deterministic() {
+        let a = derive_edge_id("ns:pkg/iface@1.2.3", Some("caller"), "provider");
+        let b = derive_edge_id("ns:pkg/iface@1.2.3", Some("caller"), "provider");
+        assert_eq!(a, b);
+    }
+
+    // ── synth_graph + everything else ────────────────────────────────
 
     /// Build a graph with the given import edges. Each entry is
     /// `(consumer_node_id, interface, source_node_id, is_host_import)`.
@@ -1796,6 +1897,7 @@ mod tests {
             path: Some("/tmp/metrics.wasm".to_string()),
             builtin: Some("otel-bare-metrics".to_string()),
             builtin_config: Default::default(),
+            config_as_wave: None,
             config_provider_path: Some(cfg_path.clone()),
             adapter_info: Some(AdapterInjectionInfo {
                 adapter_path,
@@ -1857,6 +1959,7 @@ mod tests {
             path: Some("/tmp/hello.wasm".to_string()),
             builtin: Some("hello-tier1".to_string()),
             builtin_config: Default::default(),
+            config_as_wave: None,
             config_provider_path: None,
             adapter_info: Some(AdapterInjectionInfo {
                 adapter_path,
@@ -1962,6 +2065,7 @@ mod tests {
                 path: None,
                 builtin: None,
                 builtin_config: Default::default(),
+                config_as_wave: None,
                 config_provider_path: None,
                 adapter_info: None,
                 tier: None,

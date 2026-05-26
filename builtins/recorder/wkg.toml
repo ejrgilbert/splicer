@@ -1,0 +1,8 @@
+# Resolve splicer:* WIT packages from this repo's canonical wit/ dirs
+# instead of pulling from ghcr.io. Keeps the builtin's source build
+# offline-friendly and tracking the in-repo WIT exactly. wasi:* packages
+# resolve from ghcr.io via wkg's default WebAssembly-org namespace mapping.
+[overrides]
+"splicer:tier2" = { path = "../../wit/tier2" }
+"splicer:common" = { path = "../../wit/common" }
+"splicer:builtin-config" = { path = "../../wit/builtin-config" }
