@@ -49,7 +49,7 @@ pub fn known_names() -> Vec<&'static str> {
 /// Resolution errors land as `Err(...)` rather than panicking so the
 /// caller can render partial output — `splicer builtin` shouldn't
 /// crash when one OCI pull misbehaves.
-pub fn list_with_manifests() -> Vec<(&'static str, Result<Option<builtin_manifest::Manifest>>)> {
+pub fn list_with_manifests() -> Vec<(&'static str, Result<Option<builtin_protocol::Manifest>>)> {
     let mut out = Vec::new();
     for name in known_names() {
         let entry = if crate::strategies::is_embedded_builtin(name) {
@@ -65,7 +65,7 @@ pub fn list_with_manifests() -> Vec<(&'static str, Result<Option<builtin_manifes
 /// Resolve a single builtin's manifest. For tier-3/4 the manifest is
 /// always present (every shipped strategy ships one); for tier-1/2 a
 /// missing manifest is an error.
-pub fn resolve_manifest(name: &str) -> Result<builtin_manifest::Manifest> {
+pub fn resolve_manifest(name: &str) -> Result<builtin_protocol::Manifest> {
     if crate::strategies::is_embedded_builtin(name) {
         crate::strategies::read_manifest(name)
     } else {

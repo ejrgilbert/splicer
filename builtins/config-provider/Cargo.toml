@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = { version = "0.51.0", features = ["default"] }
+builtin-protocol = { package = "splicer-builtin-protocol", path = "../builtin-protocol", version = "0.2.0" }

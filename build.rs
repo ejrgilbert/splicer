@@ -160,7 +160,7 @@ fn main() {
 
     fs::write(&dest, &generated).unwrap();
 
-    generate_builtin_manifest(&out_dir);
+    generate_builtin_protocol(&out_dir);
     generate_builtin_config_constants(&out_dir);
     stage_sdk_embed(&out_dir);
 }
@@ -336,8 +336,8 @@ fn generate_builtin_config_constants(out_dir: &str) {
 /// a slice expression `[(name, version), ...]` that `src/builtins.rs`
 /// `include!`s as the registry of builtin name → published version.
 /// Single source of truth: each builtin's own Cargo.toml.
-fn generate_builtin_manifest(out_dir: &str) {
-    let dest = Path::new(out_dir).join("builtin_manifest.rs");
+fn generate_builtin_protocol(out_dir: &str) {
+    let dest = Path::new(out_dir).join("builtin_protocol.rs");
     let builtins_dir = Path::new("builtins");
 
     // Watch the directory itself so cargo reruns when crates are
@@ -358,7 +358,7 @@ fn generate_builtin_manifest(out_dir: &str) {
             if !cargo_toml.exists() {
                 continue;
             }
-            // Host-side helper crates (e.g. builtin-manifest) live in
+            // Host-side helper crates (e.g. builtin-protocol) live in
             // `builtins/` for path-dep convenience but aren't user-
             // facing wasm builtins — they lack a `wit/` directory. Skip
             // them so they don't pollute BUILTIN_VERSIONS.

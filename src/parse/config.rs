@@ -187,7 +187,7 @@ pub struct Injection {
     /// Cached builtin tier. Stamped when the splice pipeline resolves
     /// a builtin so downstream stages don't re-read the manifest.
     #[serde(skip)]
-    pub(crate) tier: Option<builtin_manifest::Tier>,
+    pub(crate) tier: Option<builtin_protocol::Tier>,
 }
 
 impl PartialEq for Injection {

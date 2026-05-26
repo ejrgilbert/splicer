@@ -1,28 +1,30 @@
-// Shared wire-format constants + codec between the config-provider
-// template and the splicer-side patcher. Loaded via `mod wire_format;`
-// from both crates (the splicer side uses `#[path = "…"]`).
-//
-// IMPORTANT: in the provider template, `MAGIC_BYTES` may only be
-// referenced in const-eval contexts. A runtime `&MAGIC_BYTES` forces
-// rustc/lld to emit a separately-addressable copy next to the
-// byte-identical prefix of `SPLICER_CONFIG_BLOB`, which trips the
-// patcher's "magic appears exactly once" check.
+//! Wire format for the `splicer:builtin-config` substrate's per-edge
+//! provider blob. Splicer's host-side patcher (`src/config_provider.rs`)
+//! serializes the table; the `config-provider` builtin's wasm
+//! component deserializes it at runtime. Both sides depend on this
+//! module so the format has one source of truth.
+//!
+//! IMPORTANT: in the provider template, `MAGIC_BYTES` may only be
+//! referenced in const-eval contexts. A runtime `&MAGIC_BYTES` forces
+//! rustc/lld to emit a separately-addressable copy next to the
+//! byte-identical prefix of `SPLICER_CONFIG_BLOB`, which trips the
+//! patcher's "magic appears exactly once" check.
 
-pub(crate) const MAGIC_BYTES: [u8; 29] = *b"\x00\xefSPLICER_BUILTIN_CONFIG_V1\xef\x00";
-pub(crate) const MAGIC_LEN: usize = MAGIC_BYTES.len();
+pub const MAGIC_BYTES: [u8; 29] = *b"\x00\xefSPLICER_BUILTIN_CONFIG_V1\xef\x00";
+pub const MAGIC_LEN: usize = MAGIC_BYTES.len();
 
 /// Magic + length header + serialized table + padding. Patching
 /// fails when the serialized table doesn't fit.
-pub(crate) const CAPACITY: usize = 16 * 1024;
+pub const CAPACITY: usize = 16 * 1024;
 
 /// Width of every length-prefix field (`payload_len`, `count`,
 /// `key_len`, `val_len`).
-pub(crate) const LEN_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
+pub const LEN_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 
 /// Wire format: `[u32 LE count][u32 LE key_len][key bytes][u32 LE val_len][val bytes]...`
 /// `BTreeMap` iteration order gives byte-deterministic output across
 /// runs with identical inputs.
-pub(crate) fn serialize_table(values: &std::collections::BTreeMap<String, String>) -> Vec<u8> {
+pub fn serialize_table(values: &std::collections::BTreeMap<String, String>) -> Vec<u8> {
     let count = values.len() as u32;
     let mut buf = Vec::new();
     buf.extend_from_slice(&count.to_le_bytes());
@@ -38,14 +40,10 @@ pub(crate) fn serialize_table(values: &std::collections::BTreeMap<String, String
 }
 
 /// Deserialize an on-wire payload back to a `HashMap`. Malformed
-/// framing returns an empty map — the format is splicer-internal, so
+/// framing returns an empty map -- the format is splicer-internal, so
 /// a bad table signals a build/patch bug and consumers fall back to
 /// per-builtin defaults either way.
-///
-/// `#[allow(dead_code)]` because the splicer-side `include!` of this
-/// file only calls it from tests.
-#[allow(dead_code)]
-pub(crate) fn deserialize_table(payload: &[u8]) -> std::collections::HashMap<String, String> {
+pub fn deserialize_table(payload: &[u8]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Some(count) = read_u32_le(payload, 0) else {
         return out;
@@ -85,7 +83,7 @@ pub(crate) fn deserialize_table(payload: &[u8]) -> std::collections::HashMap<Str
 
 /// Read a little-endian u32 at `off`. Returns `None` if the slice is
 /// too short.
-pub(crate) fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
+pub fn read_u32_le(buf: &[u8], off: usize) -> Option<u32> {
     let end = off.checked_add(LEN_PREFIX_BYTES)?;
     if end > buf.len() {
         return None;

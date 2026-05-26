@@ -25,11 +25,10 @@ use std::sync::OnceLock;
 use bindings::exports::splicer::builtin_config::get::Guest;
 
 // Wire-format constants + codec shared with splicer's
-// `src/config_provider.rs`. See `wire_format.rs` for the
-// "only-in-const-eval" invariant on `MAGIC_BYTES`.
-mod wire_format;
-
-use wire_format::{
+// `src/config_provider.rs`. See the module-doc on
+// `builtin_protocol::wire_format` for the "only-in-const-eval"
+// invariant on `MAGIC_BYTES`.
+use builtin_protocol::wire_format::{
     deserialize_table, read_u32_le, CAPACITY, LEN_PREFIX_BYTES, MAGIC_BYTES, MAGIC_LEN,
 };
 
