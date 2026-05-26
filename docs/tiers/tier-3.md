@@ -1,6 +1,6 @@
 # Tier 3: Transform
 
-**Status:** supported as builtins. User-form (BYO strategy crate) is planned.
+**Status:** supported as builtins and as user-supplied strategy crates.
 
 The middleware can see AND modify both the arguments going to the
 downstream and the results coming back. The downstream is still
@@ -77,19 +77,53 @@ A complete strategy crate needs:
   `[builtin] tier = 3` plus the description shown by `splicer builtin
   <name>`.
 - A `Default`-able strategy struct named in PascalCase form of the
-  builtin name (`hello-tier3` → `HelloTier3`), exported from `lib.rs`.
+  Cargo package name (`hello-tier3` → `HelloTier3`), exported from
+  `lib.rs`.
 
 The splice-time codegen pipeline assumes this layout — manifest tier,
 struct name, and trait impl together tell splicer which wrapper shape
 to emit.
 
-Reference a tier-3 builtin from a splice config the same way as any
-other builtin:
+### Referencing your strategy from a splice config
 
-```yaml
-inject:
-  - builtin: hello-tier3
+Two distribution paths, same crate layout:
+
+- **Builtin** (shipped with splicer): reference by name.
+
+  ```yaml
+  inject:
+    - builtin: hello-tier3
+  ```
+
+- **User-supplied** (BYO crate): `name:` + `path:`, where `path:` is
+  the **strategy crate's directory** (not a `.wasm` file).
+
+  ```yaml
+  inject:
+    - name: greeter             # WAC variable name
+      path: ./my-strategy       # directory: Cargo.toml + manifest.toml + src/
+  ```
+
+  Splicer detects the directory at materialize time and runs the same
+  codegen + cargo pipeline as the builtin path, against your sources.
+  The Cargo package name and PascalCase Rust ident are read from the
+  strategy's own `Cargo.toml` — the YAML `name:` is only the WAC
+  variable identifier, so it doesn't have to match the crate name.
+
+### SDK dependency (user-supplied only)
+
+Until `splicer-tool-sdk` is published to crates.io, your strategy
+crate must depend on it via a path dependency:
+
+```toml
+[dependencies]
+splicer-tool-sdk = { path = "<path to splicer's splicer-tool-sdk>" }
 ```
+
+Splicer canonicalizes that path and feeds it to the generated wrapper
+crate so cargo dedupes the two references into a single crate.
+Registry/git deps aren't supported yet and surface a clear error at
+splice time.
 
 ## Per-strategy bounds
 
@@ -117,11 +151,6 @@ narrowing.
   producing an E0053 type mismatch in the generated wrapper crate.
   Today tier-3 only wraps interfaces whose functions are declared
   `async func`. Sync-target support is on the roadmap.
-- **Builtin-only.** Tier-3 strategies must be embedded in splicer's
-  binary; there's no path yet to point splicer at your own crate path.
-  Tier-1/2's user-form (`name:` + `path:` in YAML) doesn't apply
-  because splicer needs the strategy *source* (to codegen against),
-  not bytes.
 
 ## Good for
 

@@ -330,7 +330,7 @@ fn materialize_tier1_2_builtins(
             let Some(builtin) = inj.builtin.as_deref() else {
                 continue;
             };
-            if builtins::typed::is_typed(builtin) {
+            if crate::strategies::is_embedded_builtin(builtin) {
                 continue;
             }
             let path = builtins::materialize_into(splits_dir, builtin)

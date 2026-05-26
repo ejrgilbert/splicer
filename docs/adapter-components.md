@@ -27,8 +27,8 @@ docs:
 
 - [Tier 1: Name-Only Hooks](./tiers/tier-1.md) — shipped
 - [Tier 2: Observation](./tiers/tier-2.md) — shipped
-- [Tier 3: Transform](./tiers/tier-3.md) — shipped (builtin-only)
-- [Tier 4: Virtualize](./tiers/tier-4.md) — shipped (builtin-only)
+- [Tier 3: Transform](./tiers/tier-3.md) — shipped
+- [Tier 4: Virtualize](./tiers/tier-4.md) — shipped
 
 For a low-level architecture walkthrough of the generator itself, see
 [`adapter-internals.md`](./adapter-internals.md). For broader planning

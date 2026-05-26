@@ -1211,59 +1211,111 @@ fn apply_rule_before(
     })
 }
 
-/// Codegen+build any tier-3/4 builtins in `to_inject`, stamping the
-/// produced wrapper path on a clone. Non-tier-3/4 entries pass through.
+/// Codegen+build any tier-3/4 strategies in `to_inject`, stamping
+/// the produced wrapper path on a clone. The classifier
+/// ([`classify_tier3_4_source`]) decides per injection whether it's
+/// an embedded builtin, a user-supplied strategy crate, or neither;
+/// the unified [`crate::strategies::materialize_tier3_4`] handles
+/// both tier-3/4 flavors. Tier-1/2 entries pass through untouched.
 fn materialize_tier3_4_inline(
     interface_name: &str,
     to_inject: &[Injection],
     consumer_split: Option<&str>,
     ctx: &SpliceCtx,
 ) -> anyhow::Result<Vec<Injection>> {
-    let has_tier3_4 = to_inject.iter().any(|inj| {
-        inj.builtin
-            .as_deref()
-            .map(crate::builtins::typed::is_typed)
-            .unwrap_or(false)
-    });
-    if !has_tier3_4 {
+    use crate::strategies::Tier3_4Source;
+
+    // Classify once — the user-form branch stats the filesystem,
+    // and we'd otherwise hit it twice per injection (the short-
+    // circuit check + the dispatch loop).
+    let sources: Vec<Option<Tier3_4Source<'_>>> =
+        to_inject.iter().map(classify_tier3_4_source).collect();
+    if sources.iter().all(Option::is_none) {
         return Ok(to_inject.to_vec());
     }
 
+    let read_split = |label: &str| -> anyhow::Result<Vec<u8>> {
+        let split_path = consumer_split.ok_or_else(|| {
+            anyhow::anyhow!("no split for tier-3/4 '{label}' on '{interface_name}'")
+        })?;
+        std::fs::read(split_path)
+            .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))
+    };
+
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
-    for inj in to_inject.iter() {
-        let Some(builtin) = inj.builtin.as_deref() else {
+    for (inj, source) in to_inject.iter().zip(sources) {
+        let Some(source) = source else {
             out.push(inj.clone());
             continue;
         };
-        if !crate::builtins::typed::is_typed(builtin) {
-            out.push(inj.clone());
-            continue;
-        }
-        let split_path = consumer_split.ok_or_else(|| {
-            anyhow::anyhow!("no split for tier-3/4 '{builtin}' on '{interface_name}'")
-        })?;
-        let split_bytes = std::fs::read(split_path)
-            .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))?;
-        let (wrapper_path, tier) = crate::builtins::typed::materialize(
+        let label = source_label(&source);
+        let split_bytes = read_split(label)?;
+        let (wrapper_path, tier) = crate::strategies::materialize_tier3_4(
             std::path::Path::new(ctx.splits_path),
-            builtin,
+            source,
             &split_bytes,
             interface_name,
         )
-        .with_context(|| format!("materialize tier-3/4 '{builtin}' on '{interface_name}'"))?;
-        let path_str = wrapper_path
-            .to_str()
-            .ok_or_else(|| {
-                anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display())
-            })?
-            .to_string();
-        out.push(Injection {
-            path: Some(path_str),
-            tier: Some(tier),
-            ..inj.clone()
-        });
+        .with_context(|| {
+            format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'")
+        })?;
+        out.push(stamp_materialized(inj, wrapper_path, tier)?);
     }
     Ok(out)
+}
+
+/// Decide whether an injection should be materialized as a tier-3/4
+/// wrapper at splice time, and from which source. `None` means
+/// "not tier-3/4 — pass through". Lives here rather than as a method
+/// on [`Injection`] so the parse-layer struct doesn't have to know
+/// about the builtin registry.
+fn classify_tier3_4_source(inj: &Injection) -> Option<crate::strategies::Tier3_4Source<'_>> {
+    use crate::strategies::Tier3_4Source;
+    if let Some(b) = inj.builtin.as_deref() {
+        if crate::strategies::is_embedded_builtin(b) {
+            return Some(Tier3_4Source::Builtin(b));
+        }
+        return None;
+    }
+    if let Some(p) = inj.path.as_deref() {
+        let dir = std::path::Path::new(p);
+        if crate::strategies::is_user_strategy_dir(dir) {
+            return Some(Tier3_4Source::User {
+                wac_name: &inj.name,
+                strategy_dir: dir,
+            });
+        }
+    }
+    None
+}
+
+/// Short label for a strategy source — used to build splice-time
+/// error context and the per-source `read_split` error.
+fn source_label<'a>(source: &crate::strategies::Tier3_4Source<'a>) -> &'a str {
+    use crate::strategies::Tier3_4Source;
+    match source {
+        Tier3_4Source::Builtin(name) => name,
+        Tier3_4Source::User { wac_name, .. } => wac_name,
+    }
+}
+
+/// Stamp the materialized wrapper path + resolved tier onto a clone
+/// of `inj` so downstream stages treat it like any other path-backed
+/// middleware.
+fn stamp_materialized(
+    inj: &Injection,
+    wrapper_path: std::path::PathBuf,
+    tier: builtin_manifest::Tier,
+) -> anyhow::Result<Injection> {
+    let path_str = wrapper_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display()))?
+        .to_string();
+    Ok(Injection {
+        path: Some(path_str),
+        tier: Some(tier),
+        ..inj.clone()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

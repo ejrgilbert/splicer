@@ -1,6 +1,6 @@
 # Tier 4: Virtualize
 
-**Status:** supported as builtins. User-form (BYO strategy crate) is planned.
+**Status:** supported as builtins and as user-supplied strategy crates.
 
 The middleware **replaces** the downstream entirely. There is no inner
 call; the wrapper synthesizes the return value itself from the lifted
@@ -10,11 +10,13 @@ synthesizes responses locally.
 
 Tier-4 shares tier-3's authoring model: a Rust strategy crate
 implementing a trait from
-[`splicer-tool-sdk`](../../splicer-tool-sdk/src/strategy.rs), embedded
-as a builtin, codegen'd into a per-target wrapper at splice-time. See
-[tier-3.md](./tier-3.md) for the strategy-crate layout, codegen
-pipeline, async-targets-only constraint, and builtin-only distribution
-— they apply identically to tier-4.
+[`splicer-tool-sdk`](../../splicer-tool-sdk/src/strategy.rs),
+codegen'd into a per-target wrapper at splice-time. See
+[tier-3.md](./tier-3.md) for the strategy-crate layout, the
+builtin / user-supplied distribution choice, codegen pipeline, and
+async-targets-only constraint — they apply identically to tier-4
+(declare `tier = 4` in the manifest, implement
+`VirtualizeStrategy` instead of `TransformStrategy`).
 
 ## How tier-4 differs from tier-3
 
