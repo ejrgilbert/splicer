@@ -117,29 +117,8 @@ pub fn materialize(
     split_bytes: &[u8],
     target_interface: &str,
 ) -> Result<(PathBuf, Tier)> {
-    let manifest = read_manifest(name)?;
-    let behavior = behavior_for(&manifest, name)?;
-    let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
-
-    let cache_root = typed_cache_root()?;
-    let strategy_dir = cache_root.join("strategies").join(name);
-    extract(name, &strategy_dir)?;
-    let sdk_dir = cache_root.join("splicer-tool-sdk");
-    extract_sdk(&sdk_dir)?;
-    let adapter_path = ensure_preview1_adapter(&cache_root)?;
-
-    let strategy_type = name.to_upper_camel_case();
-    let plan = BuildPlan {
-        out_name: name,
-        strategy_dir: &strategy_dir,
-        sdk_dir: &sdk_dir,
-        strategy_crate_name: name,
-        strategy_type: &strategy_type,
-        adapter_path: &adapter_path,
-        cache_root: &cache_root,
-    };
-    let path = run_codegen_build(splits_dir, &plan, behavior, &target)?;
-    Ok((path, manifest.builtin.tier))
+    let prep = prepare_builtin_strategy(name)?;
+    materialize_from_prepared(splits_dir, prep, split_bytes, target_interface)
 }
 
 /// True iff `path` looks like a user-supplied tier-3/4 strategy
@@ -167,26 +146,101 @@ pub fn materialize_user(
     split_bytes: &[u8],
     target_interface: &str,
 ) -> Result<(PathBuf, Tier)> {
-    let manifest = read_user_manifest(strategy_dir)?;
-    let behavior = behavior_for(&manifest, wac_name)?;
-    let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
+    let prep = prepare_user_strategy(wac_name, strategy_dir)?;
+    materialize_from_prepared(splits_dir, prep, split_bytes, target_interface)
+}
 
+/// Per-source inputs to the shared tier-3/4 codegen pipeline.
+/// Either an embedded builtin (`prepare_builtin_strategy`) or a
+/// user-supplied directory (`prepare_user_strategy`) yields one of
+/// these — everything downstream operates on the same shape so the
+/// two distribution paths share their entire tail.
+struct PreparedStrategy {
+    /// Manifest declares the tier (validated into [`Behavior`] by
+    /// [`behavior_for`]) and is returned to the caller via
+    /// `manifest.builtin.tier`.
+    manifest: Manifest,
+    /// File-name stem for the materialized wrapper under
+    /// `splits_dir/builtins/<out_name>.wasm`. For builtins this is
+    /// the builtin name; for user crates it's the YAML `name:` field.
+    out_name: String,
+    /// On-disk strategy crate root (`Cargo.toml` + `manifest.toml`
+    /// + `src/`).
+    strategy_dir: PathBuf,
+    /// `splicer-tool-sdk` source root the wrapper crate's
+    /// `Cargo.toml` references; must canonicalize identically to the
+    /// path the strategy crate itself uses or cargo treats them as
+    /// distinct sources.
+    sdk_dir: PathBuf,
+    /// Cargo `[package].name` of the strategy crate — the dep key
+    /// the wrapper's `Cargo.toml` uses to reference it.
+    strategy_crate_name: String,
+}
+
+/// Extract the embedded builtin's source + the embedded SDK to the
+/// per-process cache, returning the inputs the shared codegen
+/// pipeline needs. The builtin name doubles as the Cargo package
+/// name and the output filename stem (the embed convention).
+fn prepare_builtin_strategy(name: &str) -> Result<PreparedStrategy> {
+    let manifest = read_manifest(name)?;
+    let cache_root = typed_cache_root()?;
+    let strategy_dir = cache_root.join("strategies").join(name);
+    extract(name, &strategy_dir)?;
+    let sdk_dir = cache_root.join("splicer-tool-sdk");
+    extract_sdk(&sdk_dir)?;
+    Ok(PreparedStrategy {
+        manifest,
+        out_name: name.to_string(),
+        strategy_dir,
+        sdk_dir,
+        strategy_crate_name: name.to_string(),
+    })
+}
+
+/// Read the user's strategy crate metadata (manifest, Cargo package
+/// name, SDK path) and assemble the inputs the shared codegen
+/// pipeline needs. The output filename stem is the caller-supplied
+/// `wac_name` (YAML identifier), so users aren't forced to align
+/// YAML and crate names.
+fn prepare_user_strategy(wac_name: &str, strategy_dir: &Path) -> Result<PreparedStrategy> {
+    let manifest = read_user_manifest(strategy_dir)?;
     let meta = read_user_strategy_metadata(strategy_dir)?;
-    let strategy_type = meta.crate_name.to_upper_camel_case();
+    Ok(PreparedStrategy {
+        manifest,
+        out_name: wac_name.to_string(),
+        strategy_dir: strategy_dir.to_path_buf(),
+        sdk_dir: meta.sdk_dir,
+        strategy_crate_name: meta.crate_name,
+    })
+}
+
+/// Source-agnostic core of the tier-3/4 codegen pipeline. Given a
+/// fully-resolved [`PreparedStrategy`], drives the manifest → WIT →
+/// wrapper-crate → cargo build → install sequence and returns the
+/// produced wasm path + the strategy's declared tier.
+fn materialize_from_prepared(
+    splits_dir: &Path,
+    prep: PreparedStrategy,
+    split_bytes: &[u8],
+    target_interface: &str,
+) -> Result<(PathBuf, Tier)> {
+    let behavior = behavior_for(&prep.manifest, &prep.out_name)?;
+    let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
     let cache_root = typed_cache_root()?;
     let adapter_path = ensure_preview1_adapter(&cache_root)?;
+    let strategy_type = prep.strategy_crate_name.to_upper_camel_case();
 
     let plan = BuildPlan {
-        out_name: wac_name,
-        strategy_dir,
-        sdk_dir: &meta.sdk_dir,
-        strategy_crate_name: &meta.crate_name,
+        out_name: &prep.out_name,
+        strategy_dir: &prep.strategy_dir,
+        sdk_dir: &prep.sdk_dir,
+        strategy_crate_name: &prep.strategy_crate_name,
         strategy_type: &strategy_type,
         adapter_path: &adapter_path,
         cache_root: &cache_root,
     };
     let path = run_codegen_build(splits_dir, &plan, behavior, &target)?;
-    Ok((path, manifest.builtin.tier))
+    Ok((path, prep.manifest.builtin.tier))
 }
 
 /// Read `manifest.toml` from the user-supplied strategy directory.
