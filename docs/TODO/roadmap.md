@@ -63,11 +63,9 @@ is already specced in the multi-edge doc; no design negotiation needed.
 - [ ] `redact-strings` builtin (drives `TypedVisit` derive + type-predicate matcher)
 - [ ] Multi-edge step 4: `on_edge: <id>` literal selector
 - [ ] Multi-edge step 5: `splicer edges <composition>` CLI
-- [ ] **User-form tier-3/4 middleware.** Today tier-3/4 only works for shipped
-  builtins — the codegen pipeline reads strategy source from splicer's
-  `include_dir!` embed. To support BYO strategy crates, add a YAML shape that
-  points splicer at a user strategy crate path (analogue of tier-1/2's
-  `name:` + `path:`), and feed it through the same codegen pipeline.
+- [x] **User-form tier-3/4 middleware.** YAML `name:` + `path:` to a strategy
+  crate directory (Cargo.toml + manifest.toml) flows through the same codegen
+  pipeline as builtins. See [`docs/tiers/tier-3.md`](../tiers/tier-3.md#user-form-byo-strategy-crate).
 - [ ] **Sync-target support in tier-3/4 codegen.** Today wit-bindgen emits sync
   `fn` Guest methods for `func` WIT signatures but `emit_method.rs` always emits
   `async fn` bodies (matching the async `TransformStrategy` / `VirtualizeStrategy`

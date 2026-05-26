@@ -1,6 +1,6 @@
 # Tier 3: Transform
 
-**Status:** supported as builtins. User-form (BYO strategy crate) is planned.
+**Status:** supported as builtins and as user-supplied strategy crates.
 
 The middleware can see AND modify both the arguments going to the
 downstream and the results coming back. The downstream is still
@@ -91,6 +91,40 @@ inject:
   - builtin: hello-tier3
 ```
 
+## User-form: BYO strategy crate
+
+Point splicer at your own strategy crate by using the `name:` + `path:`
+form, where `path:` is the **strategy crate's directory** (not a
+`.wasm` file):
+
+```yaml
+inject:
+  - name: greeter             # WAC variable name
+    path: ./my-strategy       # directory: Cargo.toml + manifest.toml + src/
+```
+
+Splicer detects the directory at materialize time and runs the same
+codegen + cargo pipeline as the builtin path, against your sources.
+The strategy crate's layout is the one described above (Cargo.toml,
+`manifest.toml` declaring `tier = 3`, a `Default`-able strategy
+struct). The Cargo package name and PascalCase Rust ident are read
+from the strategy's own `Cargo.toml` — the YAML `name:` is only the
+WAC variable identifier.
+
+**SDK dependency.** Until `splicer-tool-sdk` is published to
+crates.io, your strategy crate must depend on it via a path
+dependency:
+
+```toml
+[dependencies]
+splicer-tool-sdk = { path = "<path to splicer's splicer-tool-sdk>" }
+```
+
+Splicer canonicalizes that path and feeds it to the generated wrapper
+crate so cargo dedupes the two references into a single crate.
+Registry/git deps aren't supported yet and surface a clear error at
+splice time.
+
 ## Per-strategy bounds
 
 The `TransformStrategy` trait itself has no bounds on `Args` or `R`.
@@ -117,11 +151,6 @@ narrowing.
   producing an E0053 type mismatch in the generated wrapper crate.
   Today tier-3 only wraps interfaces whose functions are declared
   `async func`. Sync-target support is on the roadmap.
-- **Builtin-only.** Tier-3 strategies must be embedded in splicer's
-  binary; there's no path yet to point splicer at your own crate path.
-  Tier-1/2's user-form (`name:` + `path:` in YAML) doesn't apply
-  because splicer needs the strategy *source* (to codegen against),
-  not bytes.
 
 ## Good for
 

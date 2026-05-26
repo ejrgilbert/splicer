@@ -9,19 +9,18 @@ on what hasn't been built yet.
 
 ## Middleware tier roadmap
 
-Tiers 1 and 2 are shipped. Tiers 3 and 4 have shipped for builtins;
-user-form (BYO strategy crate) support is on the roadmap. The
-user-facing taxonomy and per-tier WIT shapes live in
+All four tiers are shipped, in both builtin and user-supplied forms.
+The user-facing taxonomy and per-tier WIT shapes live in
 [`adapter-components.md`](../adapter-components.md) and the per-tier
 docs under [`tiers/`](../tiers/); this section captures only the
 open design questions that aren't settled there.
 
-| Tier | New capability                                       | Status                       |
-|------|------------------------------------------------------|------------------------------|
-| 1    | see function name                                    | **shipped**                  |
-| 2    | observe typed args / results (no modify)             | **shipped**                  |
-| 3    | modify typed args / results, downstream still called | **shipped (builtin-only)**   |
-| 4    | replace the downstream entirely (virtualize)         | **shipped (builtin-only)**   |
+| Tier | New capability                                       | Status      |
+|------|------------------------------------------------------|-------------|
+| 1    | see function name                                    | **shipped** |
+| 2    | observe typed args / results (no modify)             | **shipped** |
+| 3    | modify typed args / results, downstream still called | **shipped** |
+| 4    | replace the downstream entirely (virtualize)         | **shipped** |
 
 ### Open design questions for tier 3 / 4
 

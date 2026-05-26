@@ -182,10 +182,10 @@ inject:
     path: ./tracing.wasm    # always pass this — see below
 ```
 
-| Field  | Type   | Required             | Description                                              |
-|--------|--------|----------------------|----------------------------------------------------------|
-| `name` | string | ✅                   | WAC variable name; must be globally unique across rules. |
-| `path` | string | strongly recommended | Path to the middleware `.wasm`.                          |
+| Field  | Type   | Required             | Description                                                                                  |
+|--------|--------|----------------------|----------------------------------------------------------------------------------------------|
+| `name` | string | ✅                   | WAC variable name; must be globally unique across rules.                                     |
+| `path` | string | strongly recommended | Path to a `.wasm` (tier-1/2) **or** a tier-3/4 strategy crate directory (see [tier-3][t3]).  |
 
 **Always pass `path`.** Splicer loads the bytes to verify the
 middleware's type signature is compatible with the target interface
@@ -193,6 +193,15 @@ before composing. If you omit `path`, the type check is downgraded to
 a warning (no bytes to fingerprint) and the WAC carries a
 `/path/to/comp.wasm` placeholder you'd have to substitute by hand
 before any external `wac compose` run could resolve it.
+
+Splicer distinguishes the two `path` shapes at materialize time: a
+`.wasm` file flows through the existing tier-1/2 pipeline; a directory
+containing a `manifest.toml` is treated as a tier-3/4 strategy crate
+root and runs the codegen + cargo build described in [tier-3][t3] and
+[tier-4][t4].
+
+[t3]: ./tiers/tier-3.md#user-form-byo-strategy-crate
+[t4]: ./tiers/tier-4.md
 
 ### Builtin middleware
 
