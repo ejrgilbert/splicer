@@ -7,10 +7,10 @@ use splicer_tool_sdk::{CallId, VirtualizeStrategy};
 #[derive(Default)]
 pub struct HelloTier4;
 
-// `R: Default` narrows which target WIT shapes this strategy
-// accepts. Targets whose return types don't satisfy `Default` will
-// fail to compile the generated wrapper, with a precise error
-// pointing at this bound.
+// `R: Default` narrows which targets match. Today this surfaces as
+// a wrapper compile error; planned splice-time type predicate will
+// skip non-matching sites instead.
+// See: `docs/TODO/tier3-tier4-substrate.md`, section "Type-predicated rule matching".
 impl<Args, R: Default> VirtualizeStrategy<Args, R> for HelloTier4 {
     async fn handle(&self, call: CallId, _args: Args) -> R {
         println!(
