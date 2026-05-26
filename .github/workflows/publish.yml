@@ -58,7 +58,25 @@ jobs:
       - name: Login to crates.io
         run: cargo login ${{ secrets.CRATES_API_TOKEN }}
 
-      - name: Publish
+      # splicer depends on builtin-manifest as a path+version dep. crates.io
+      # needs the listed version to exist before splicer can resolve. Publish
+      # builtin-manifest first; tolerate "already uploaded" so re-running this
+      # workflow against a tag that didn't bump builtin-manifest's version
+      # doesn't fail the release.
+      - name: Publish builtin-manifest (if version not yet on crates.io)
+        working-directory: builtins/builtin-manifest
+        run: |
+          set -o pipefail
+          if cargo publish --locked 2>&1 | tee /tmp/builtin-manifest-publish.log; then
+            echo "builtin-manifest published"
+          elif grep -qE "already (uploaded|exists)|crate version .* is already" /tmp/builtin-manifest-publish.log; then
+            echo "builtin-manifest version already on crates.io -- skipping"
+          else
+            echo "::error::builtin-manifest publish failed for an unexpected reason"
+            exit 1
+          fi
+
+      - name: Publish splicer
         run: cargo publish --locked
 
   release:

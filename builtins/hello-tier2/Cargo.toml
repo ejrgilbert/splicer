@@ -14,4 +14,4 @@ wit-bindgen = { version = "0.51.0", features = ["default", "async-spawn", "inter
 splicer-tool-sdk = { path = "../../splicer-tool-sdk" }
 
 [build-dependencies]
-builtin-manifest = { path = "../builtin-manifest" }
+builtin-manifest = { package = "splicer-builtin-manifest", path = "../builtin-manifest", version = "0.1.0" }

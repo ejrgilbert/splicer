@@ -1,9 +1,14 @@
 [package]
-name = "builtin-manifest"
+name = "splicer-builtin-manifest"
 version = "0.1.0"
 edition = "2021"
-publish = false
-description = "Shared schema + build.rs codegen for splicer builtin manifests."
+authors = ["Elizabeth Gilbert"]
+description = "Internal crate for splicer. Shared schema + build.rs codegen for builtin middleware manifests; not intended for use outside the splicer ecosystem."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/ejrgilbert/splicer"
+categories = ["wasm"]
+keywords = ["wasm", "WebAssembly", "splicer"]
 
 [workspace]
 
