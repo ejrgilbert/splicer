@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 use splicer::lowlevel::{build_wrapper, Behavior, BuildConfig, GenerateWrapperInput};
 
+include!(concat!(env!("OUT_DIR"), "/sdk_test_version.rs"));
+
 // `async func` so wit-bindgen emits an `async fn` Guest method —
 // matches the `async fn` body our `emit_method` codegen produces.
 // Mixing sync WIT with our async-emit'd Guest impl is a real shape
@@ -67,7 +69,7 @@ fn build_and_validate(
             strategy_crate_name: strategy_dir_name,
             strategy_crate_path: strategy.to_str().unwrap(),
             strategy_type,
-            splicer_tool_sdk_version: "0.1.0",
+            splicer_tool_sdk_version: SDK_TEST_VERSION,
         },
         &BuildConfig {
             build_root: build_root.path(),

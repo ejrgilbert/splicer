@@ -292,7 +292,7 @@ mod tests {
             crate_name: "splicer_wrapper_test_pkg_ops_my_strategy",
             strategy_crate_name: "my-strategy",
             strategy_crate_path: "/abs/path/to/my-strategy",
-            splicer_tool_sdk_version: "0.1.0",
+            splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
         });
         // Parse the result as TOML to catch syntax errors.
         let parsed: toml::Value = toml::from_str(&toml).expect("Cargo.toml parses");
@@ -310,7 +310,7 @@ mod tests {
         );
         assert_eq!(
             parsed["dependencies"]["splicer-tool-sdk"].as_str(),
-            Some("0.1.0"),
+            Some(crate::test_consts::SDK_TEST_VERSION),
             "splicer-tool-sdk must be a plain registry version dep so cargo dedupes it with \
              the strategy crate's own splicer-tool-sdk dep",
         );
@@ -326,7 +326,7 @@ mod tests {
             crate_name: "wrapper",
             strategy_crate_name: "strat",
             strategy_crate_path: r#"C:\Users\me\strat-"with-quote""#,
-            splicer_tool_sdk_version: "0.1.0",
+            splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
         });
         let parsed: toml::Value =
             toml::from_str(&toml).expect("Cargo.toml with special-char paths still parses");

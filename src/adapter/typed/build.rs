@@ -191,7 +191,7 @@ mod tests {
             strategy_crate_name: "s",
             strategy_crate_path: "/p",
             strategy_type: "S",
-            splicer_tool_sdk_version: "0.1.0",
+            splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
         }
     }
 
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn build_dir_key_distinguishes_sdk_version() {
         let mut a = sample_input(Behavior::Transform);
-        a.splicer_tool_sdk_version = "0.2.0";
+        a.splicer_tool_sdk_version = "99.99.99-distinct";
         assert_ne!(
             build_dir_key(&a),
             build_dir_key(&sample_input(Behavior::Transform)),

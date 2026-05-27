@@ -91,6 +91,14 @@ mod wac;
 #[cfg(test)]
 mod tests;
 
+/// `splicer-tool-sdk` version read from `splicer-tool-sdk/Cargo.toml`
+/// at build time; threaded through wrapper-codegen test fixtures so a
+/// version bump only requires editing the SDK's own Cargo.toml.
+#[cfg(test)]
+pub(crate) mod test_consts {
+    include!(concat!(env!("OUT_DIR"), "/sdk_test_version.rs"));
+}
+
 // ── Top-level entry points ────────────────────────────────────────
 pub use api::{
     compose, compose_wac, format_wac_compose_cmd, splice, Bundle, ComponentInput, ComposeRequest,

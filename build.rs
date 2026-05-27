@@ -163,6 +163,31 @@ fn main() {
     generate_builtin_protocol(&out_dir);
     generate_builtin_config_constants(&out_dir);
     stage_embedded_strategies(&out_dir);
+    emit_sdk_test_version(&out_dir);
+}
+
+/// Read `splicer-tool-sdk/Cargo.toml` and emit its `[package].version`
+/// as a Rust constant for test fixtures to consume. The SDK Cargo.toml
+/// is stripped from the published tarball, but install-time builds
+/// don't compile test code, so the fallback path is never read.
+fn emit_sdk_test_version(out_dir: &str) {
+    let dest = Path::new(out_dir).join("sdk_test_version.rs");
+    let sdk_cargo = Path::new("splicer-tool-sdk").join("Cargo.toml");
+    let version = if sdk_cargo.is_file() {
+        println!("cargo::rerun-if-changed={}", sdk_cargo.display());
+        let src = fs::read_to_string(&sdk_cargo)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {e}", sdk_cargo.display()));
+        parse_cargo_package_version(&src, &sdk_cargo)
+    } else {
+        // Install-time path: SDK Cargo.toml stripped, but tests never
+        // compile here. Fallback keeps the file syntactically valid.
+        "0.0.0".to_string()
+    };
+    fs::write(
+        &dest,
+        format!("pub const SDK_TEST_VERSION: &str = \"{version}\";\n"),
+    )
+    .unwrap();
 }
 
 /// Stage each tier-3/4 strategy crate under
