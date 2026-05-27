@@ -14,6 +14,7 @@ on:
           - otel-bare-logs
           - otel-bare-metrics
           - otel-bare-spans
+          - recorder
       description:
         description: "Package description shown on GHCR"
         required: false
