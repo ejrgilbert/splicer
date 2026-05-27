@@ -54,7 +54,9 @@ fn build_and_validate(
     strategy_type: &str,
 ) {
     let root = workspace_root();
-    let strategy = root.join("builtins").join(strategy_dir_name);
+    let strategy = PathBuf::from(env!("OUT_DIR"))
+        .join("embedded-strategies")
+        .join(strategy_dir_name);
     let adapter = root
         .join("builtins")
         .join("wasi_snapshot_preview1.reactor.wasm");
