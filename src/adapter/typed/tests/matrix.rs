@@ -28,7 +28,7 @@ fn generate_for_wit(
         strategy_crate_name: "matrix-strategy",
         strategy_crate_path: "/abs/path/to/matrix-strategy",
         strategy_type: "MatrixStrategy",
-        splicer_tool_sdk_path: "/abs/path/to/splicer-tool-sdk",
+        splicer_tool_sdk_version: "0.1.0",
     })
     .expect("generation succeeds");
 

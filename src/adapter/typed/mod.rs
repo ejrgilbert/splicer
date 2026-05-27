@@ -78,7 +78,7 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         crate_name: &crate_name,
         strategy_crate_name: input.strategy_crate_name,
         strategy_crate_path: input.strategy_crate_path,
-        splicer_tool_sdk_path: input.splicer_tool_sdk_path,
+        splicer_tool_sdk_version: input.splicer_tool_sdk_version,
     });
 
     Ok(WrapperCrate {
@@ -105,8 +105,11 @@ pub struct GenerateWrapperInput<'a> {
     pub strategy_crate_path: &'a str,
     /// PascalCase Rust ident of the strategy type to instantiate.
     pub strategy_type: &'a str,
-    /// Filesystem path to splicer-tool-sdk (for the wrapper's Cargo.toml dep).
-    pub splicer_tool_sdk_path: &'a str,
+    /// `splicer-tool-sdk` version (from the strategy crate's own
+    /// Cargo.toml) that the wrapper's Cargo.toml depends on. Must
+    /// match the version the strategy itself declares so cargo
+    /// dedupes the two into a single source.
+    pub splicer_tool_sdk_version: &'a str,
 }
 
 /// Output of [`generate_wrapper_crate`]: the two source strings that

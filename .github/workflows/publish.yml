@@ -92,6 +92,19 @@ jobs:
             exit 1
           fi
 
+      # Each leaf Cargo.toml under builtins/ (except builtin-protocol,
+      # a real crates.io dep) triggers cargo's nested-package skip and
+      # gets the whole dir stripped from splicer's tarball. Rename
+      # transiently so build.rs can still read each dir at install
+      # time. Runner is ephemeral; no cleanup needed.
+      - name: Hide nested builtin Cargo.tomls from cargo publish
+        run: |
+          set -euo pipefail
+          for d in builtins/*/; do
+            [ "$d" = "builtins/builtin-protocol/" ] && continue
+            [ -f "${d}Cargo.toml" ] && mv "${d}Cargo.toml" "${d}Cargo.toml.embed"
+          done
+
       - name: Publish splicer
         run: cargo publish --locked
 

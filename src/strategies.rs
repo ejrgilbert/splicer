@@ -14,10 +14,6 @@
 //! per-target wrapper component. The component is dropped under
 //! `splits_dir/builtins/<name>.wasm` so the rest of the splice
 //! pipeline treats it like any other path-backed middleware.
-//!
-//! TODO: publish builtins to crates.io and have generated wrappers
-//! depend on them by version. cargo handles distribution; the embed
-//! and `prepare_builtin_strategy` go away.
 
 use anyhow::{Context, Result};
 use builtin_protocol::{Manifest, Tier};
@@ -34,20 +30,11 @@ use crate::adapter::typed::{
 static EMBEDDED: &[(&str, &Dir<'_>)] =
     &[("hello-tier3", &HELLO_TIER3), ("hello-tier4", &HELLO_TIER4)];
 
-static HELLO_TIER3: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/builtins/hello-tier3");
-static HELLO_TIER4: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/builtins/hello-tier4");
-
-/// Source tree of `splicer-tool-sdk`, embedded so generated wrapper
-/// crates can resolve their path-dep on the SDK without the user
-/// having splicer's repo on disk. `build.rs` stages a clean subset of
-/// `splicer-tool-sdk/` (just `src/`, `Cargo.toml`, `README.md`) under
-/// `$OUT_DIR/embedded-sdk/` so the SDK's `target/` dir isn't swept
-/// into the splicer binary on developer machines.
-///
-/// TODO: drop the embed once `splicer-tool-sdk` is published to
-/// crates.io and the generated `Cargo.toml` can depend on it by
-/// version.
-static EMBEDDED_SDK: Dir<'_> = include_dir!("$OUT_DIR/embedded-sdk");
+/// Each strategy is staged by `build.rs` into `$OUT_DIR/embedded-strategies/<name>/`
+/// so the embed survives `cargo publish` (see the `.embed` rename in
+/// `publish.yml`).
+static HELLO_TIER3: Dir<'_> = include_dir!("$OUT_DIR/embedded-strategies/hello-tier3");
+static HELLO_TIER4: Dir<'_> = include_dir!("$OUT_DIR/embedded-strategies/hello-tier4");
 
 /// Embedded WASI preview1 adapter, used to wrap the cargo-produced
 /// core module into a wasm component. Pulled from `builtins/`
@@ -90,21 +77,6 @@ pub fn extract(name: &str, dest_dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("could not create {}", dest_dir.display()))?;
     dir.extract(dest_dir)
         .with_context(|| format!("could not extract '{name}' into {}", dest_dir.display()))?;
-    Ok(dest_dir.to_path_buf())
-}
-
-/// Extract the embedded `splicer-tool-sdk` source tree to `dest_dir`
-/// (created if missing). Generated wrapper crates path-dep on this
-/// directory; layout matches the in-repo `splicer-tool-sdk/`.
-pub fn extract_sdk(dest_dir: &Path) -> Result<PathBuf> {
-    std::fs::create_dir_all(dest_dir)
-        .with_context(|| format!("could not create {}", dest_dir.display()))?;
-    EMBEDDED_SDK.extract(dest_dir).with_context(|| {
-        format!(
-            "could not extract splicer-tool-sdk into {}",
-            dest_dir.display()
-        )
-    })?;
     Ok(dest_dir.to_path_buf())
 }
 
@@ -184,41 +156,40 @@ struct PreparedStrategy {
     /// On-disk strategy crate root (`Cargo.toml` + `manifest.toml`
     /// + `src/`).
     strategy_dir: PathBuf,
-    /// `splicer-tool-sdk` source root the wrapper crate's
-    /// `Cargo.toml` references; must canonicalize identically to the
-    /// path the strategy crate itself uses or cargo treats them as
-    /// distinct sources.
-    sdk_dir: PathBuf,
+    /// `splicer-tool-sdk` version the strategy crate declares in its
+    /// `[dependencies]`. The wrapper's Cargo.toml gets the same
+    /// version so cargo dedupes the two into a single source.
+    sdk_version: String,
     /// Cargo `[package].name` of the strategy crate — the dep key
     /// the wrapper's `Cargo.toml` uses to reference it.
     strategy_crate_name: String,
 }
 
-/// Extract the embedded builtin's source + the embedded SDK to the
-/// per-process cache, returning the inputs the shared codegen
-/// pipeline needs. The builtin name doubles as the Cargo package
-/// name and the output filename stem (the embed convention).
+/// Extract the embedded builtin's source to the per-process cache and
+/// read its `splicer-tool-sdk` version, returning the inputs the
+/// shared codegen pipeline needs. The builtin name doubles as the
+/// Cargo package name and the output filename stem (the embed
+/// convention).
 fn prepare_builtin_strategy(name: &str) -> Result<PreparedStrategy> {
     let manifest = read_manifest(name)?;
     let cache_root = typed_cache_root()?;
     let strategy_dir = cache_root.join("strategies").join(name);
     extract(name, &strategy_dir)?;
-    let sdk_dir = cache_root.join("splicer-tool-sdk");
-    extract_sdk(&sdk_dir)?;
+    let sdk_version = read_sdk_version_from(&strategy_dir)?;
     Ok(PreparedStrategy {
         manifest,
         out_name: name.to_string(),
         strategy_dir,
-        sdk_dir,
+        sdk_version,
         strategy_crate_name: name.to_string(),
     })
 }
 
 /// Read the user's strategy crate metadata (manifest, Cargo package
-/// name, SDK path) and assemble the inputs the shared codegen
-/// pipeline needs. The output filename stem is the caller-supplied
-/// `wac_name` (YAML identifier), so users aren't forced to align
-/// YAML and crate names.
+/// name, declared SDK version) and assemble the inputs the shared
+/// codegen pipeline needs. The output filename stem is the
+/// caller-supplied `wac_name` (YAML identifier), so users aren't
+/// forced to align YAML and crate names.
 fn prepare_user_strategy(wac_name: &str, strategy_dir: &Path) -> Result<PreparedStrategy> {
     let manifest = read_user_manifest(strategy_dir)?;
     let meta = read_user_strategy_metadata(strategy_dir)?;
@@ -226,7 +197,7 @@ fn prepare_user_strategy(wac_name: &str, strategy_dir: &Path) -> Result<Prepared
         manifest,
         out_name: wac_name.to_string(),
         strategy_dir: strategy_dir.to_path_buf(),
-        sdk_dir: meta.sdk_dir,
+        sdk_version: meta.sdk_version,
         strategy_crate_name: meta.crate_name,
     })
 }
@@ -250,7 +221,7 @@ fn materialize_from_prepared(
     let plan = BuildPlan {
         out_name: &prep.out_name,
         strategy_dir: &prep.strategy_dir,
-        sdk_dir: &prep.sdk_dir,
+        sdk_version: &prep.sdk_version,
         strategy_crate_name: &prep.strategy_crate_name,
         strategy_type: &strategy_type,
         adapter_path: &adapter_path,
@@ -280,23 +251,16 @@ struct UserStrategyMetadata {
     /// `[package].name` — the dep name the wrapper's Cargo.toml
     /// references.
     crate_name: String,
-    /// Canonical absolute path of the strategy's
-    /// `splicer-tool-sdk` dep. Threaded into the wrapper crate's
-    /// Cargo.toml at the same path so cargo dedupes the two sources
-    /// into one crate (mismatched paths produce E0308 in the
-    /// wrapper's generated code).
-    sdk_dir: PathBuf,
+    /// `splicer-tool-sdk` version the strategy declares. The
+    /// wrapper's Cargo.toml uses the same value so cargo dedupes
+    /// the two SDK deps into one source.
+    sdk_version: String,
 }
 
 /// Parse the user's `Cargo.toml` to extract the strategy's Cargo
-/// package name and the absolute path of its `splicer-tool-sdk`
-/// dep. The SDK path is canonicalized so the wrapper's own dep
-/// resolves to the same crate.
-///
-/// Today `splicer-tool-sdk` isn't on crates.io, so a path dep is the
-/// only supported form. Once it's published this function can be
-/// relaxed to accept registry/version deps and propagate the
-/// version into the wrapper's `Cargo.toml`.
+/// package name and its declared `splicer-tool-sdk` version. Accepts
+/// either the plain string form (`splicer-tool-sdk = "0.1.0"`) or
+/// the table form (`splicer-tool-sdk = { version = "0.1.0", ... }`).
 fn read_user_strategy_metadata(strategy_dir: &Path) -> Result<UserStrategyMetadata> {
     let cargo_path = strategy_dir.join("Cargo.toml");
     let cargo_text = std::fs::read_to_string(&cargo_path)
@@ -316,36 +280,52 @@ fn read_user_strategy_metadata(strategy_dir: &Path) -> Result<UserStrategyMetada
         })?
         .to_string();
 
-    let sdk_rel = parsed
-        .get("dependencies")
-        .and_then(|d| d.get("splicer-tool-sdk"))
-        .and_then(|d| match d {
-            toml::Value::Table(t) => t.get("path").and_then(|p| p.as_str()),
-            _ => None,
-        })
-        .with_context(|| {
-            format!(
-                "user strategy crate at {} must declare `splicer-tool-sdk = {{ path = \"...\" }}` \
-                 in [dependencies] (registry deps will be accepted once splicer-tool-sdk is \
-                 published to crates.io)",
-                cargo_path.display()
-            )
-        })?;
-
-    let sdk_abs = strategy_dir.join(sdk_rel);
-    let sdk_dir = std::fs::canonicalize(&sdk_abs).with_context(|| {
+    let sdk_version = extract_sdk_version(&parsed).with_context(|| {
         format!(
-            "could not canonicalize splicer-tool-sdk path '{}' (resolved to {}) from {}",
-            sdk_rel,
-            sdk_abs.display(),
-            cargo_path.display(),
+            "user strategy crate at {} must declare `splicer-tool-sdk = \"<version>\"` (or the \
+             equivalent table form) in [dependencies]; the wrapper splicer synthesizes uses the \
+             same version so cargo dedupes both deps into one source",
+            cargo_path.display()
         )
     })?;
 
     Ok(UserStrategyMetadata {
         crate_name,
-        sdk_dir,
+        sdk_version,
     })
+}
+
+/// Read the `splicer-tool-sdk` version declared by the Cargo.toml at
+/// `strategy_dir`. Same matcher as the user-form path; used by the
+/// embedded-builtin route since both flow through one wrapper-build
+/// pipeline.
+fn read_sdk_version_from(strategy_dir: &Path) -> Result<String> {
+    let cargo_path = strategy_dir.join("Cargo.toml");
+    let cargo_text = std::fs::read_to_string(&cargo_path)
+        .with_context(|| format!("could not read {}", cargo_path.display()))?;
+    let parsed: toml::Value = toml::from_str(&cargo_text)
+        .with_context(|| format!("failed to parse {}", cargo_path.display()))?;
+    extract_sdk_version(&parsed).with_context(|| {
+        format!(
+            "strategy crate at {} is missing a `splicer-tool-sdk` version in [dependencies]",
+            cargo_path.display()
+        )
+    })
+}
+
+/// Pull the `splicer-tool-sdk` version out of a parsed Cargo.toml.
+/// Accepts `splicer-tool-sdk = "0.1.0"` and
+/// `splicer-tool-sdk = { version = "0.1.0", ... }`.
+fn extract_sdk_version(parsed: &toml::Value) -> Option<String> {
+    let dep = parsed.get("dependencies")?.get("splicer-tool-sdk")?;
+    match dep {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Table(t) => t
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 /// Concrete inputs to [`run_codegen_build`]: where the strategy crate
@@ -361,11 +341,10 @@ struct BuildPlan<'a> {
     /// Strategy crate's on-disk root (`Cargo.toml` + `manifest.toml`
     /// + `src/`).
     strategy_dir: &'a Path,
-    /// `splicer-tool-sdk` source root. MUST resolve to the SAME
-    /// canonical path the strategy crate's own `splicer-tool-sdk`
-    /// dep resolves to, or cargo treats the two as distinct crates
-    /// and the build fails on type mismatch.
-    sdk_dir: &'a Path,
+    /// `splicer-tool-sdk` version the strategy declares. The wrapper's
+    /// Cargo.toml uses the same version so cargo dedupes the two
+    /// SDK deps into one source.
+    sdk_version: &'a str,
     /// Cargo `[package].name` of the strategy crate — what the
     /// wrapper's `Cargo.toml` references in `[dependencies]`.
     strategy_crate_name: &'a str,
@@ -396,10 +375,6 @@ fn run_codegen_build(
             plan.strategy_dir.display()
         )
     })?;
-    let sdk_path_str = plan
-        .sdk_dir
-        .to_str()
-        .with_context(|| format!("sdk path is not UTF-8: {}", plan.sdk_dir.display()))?;
 
     let input = GenerateWrapperInput {
         target_wit: &target.wit_text,
@@ -409,7 +384,7 @@ fn run_codegen_build(
         strategy_crate_name: plan.strategy_crate_name,
         strategy_crate_path: strategy_path_str,
         strategy_type: plan.strategy_type,
-        splicer_tool_sdk_path: sdk_path_str,
+        splicer_tool_sdk_version: plan.sdk_version,
     };
     let built = build_wrapper(
         &input,
@@ -521,34 +496,25 @@ mod tests {
         assert!(err.to_string().contains("not-a-real-builtin"));
     }
 
-    #[test]
-    fn extract_sdk_writes_cargo_toml_and_lib_rs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("splicer-tool-sdk");
-        extract_sdk(&dest).expect("extract sdk succeeds");
-        assert!(dest.join("Cargo.toml").exists());
-        assert!(dest.join("src/lib.rs").exists());
-    }
-
     /// Build a minimal user-form strategy directory at `dest`. Used by
     /// the parser tests below and by the `--ignored` end-to-end test.
-    /// `sdk_path` is whatever should appear in the strategy's
-    /// `splicer-tool-sdk = { path = "..." }` line; tests use either a
-    /// real SDK source (extracted via [`extract_sdk`]) or a stub
-    /// directory.
+    /// `sdk_dep` is the raw right-hand side written after
+    /// `splicer-tool-sdk = ` in the strategy's Cargo.toml; pass either
+    /// a quoted version string (`"\"0.1.0\""`) or a table literal
+    /// (`"{ version = \"0.1.0\", path = \"../sdk\" }"`).
     #[cfg(test)]
     fn write_user_strategy_dir(
         dest: &Path,
         crate_name: &str,
         tier: u8,
-        sdk_path: &str,
+        sdk_dep: &str,
     ) -> std::io::Result<()> {
         std::fs::create_dir_all(dest.join("src"))?;
         std::fs::write(
             dest.join("Cargo.toml"),
             format!(
                 "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\
-                 \n[workspace]\n\n[lib]\n\n[dependencies]\nsplicer-tool-sdk = {{ path = \"{sdk_path}\" }}\n"
+                 \n[workspace]\n\n[lib]\n\n[dependencies]\nsplicer-tool-sdk = {sdk_dep}\n"
             ),
         )?;
         std::fs::write(
@@ -578,25 +544,34 @@ mod tests {
     }
 
     #[test]
-    fn read_user_strategy_metadata_pulls_package_name_and_sdk_path() {
+    fn read_user_strategy_metadata_accepts_string_dep() {
         let tmp = tempfile::tempdir().unwrap();
-        // Real SDK so canonicalize() succeeds — the test asserts that
-        // the resolved sdk_dir points at the same canonical path.
-        let sdk_dir = tmp.path().join("sdk");
-        extract_sdk(&sdk_dir).expect("extract sdk");
         let strat = tmp.path().join("strat");
-        write_user_strategy_dir(&strat, "my-strategy", 3, "../sdk").unwrap();
-
+        write_user_strategy_dir(&strat, "my-strategy", 3, "\"0.1.0\"").unwrap();
         let meta = read_user_strategy_metadata(&strat).expect("read metadata");
         assert_eq!(meta.crate_name, "my-strategy");
-        assert_eq!(
-            meta.sdk_dir,
-            std::fs::canonicalize(&sdk_dir).expect("canonicalize sdk")
-        );
+        assert_eq!(meta.sdk_version, "0.1.0");
     }
 
     #[test]
-    fn read_user_strategy_metadata_errors_without_sdk_path_dep() {
+    fn read_user_strategy_metadata_accepts_table_dep_with_version_and_path() {
+        // The dev-mode hybrid shape: `path` is used locally, `version`
+        // is what gets propagated into the wrapper's Cargo.toml.
+        let tmp = tempfile::tempdir().unwrap();
+        let strat = tmp.path().join("strat");
+        write_user_strategy_dir(
+            &strat,
+            "my-strategy",
+            3,
+            "{ version = \"0.1.0\", path = \"../sdk\" }",
+        )
+        .unwrap();
+        let meta = read_user_strategy_metadata(&strat).expect("read metadata");
+        assert_eq!(meta.sdk_version, "0.1.0");
+    }
+
+    #[test]
+    fn read_user_strategy_metadata_errors_without_sdk_dep() {
         let tmp = tempfile::tempdir().unwrap();
         let strat = tmp.path().join("strat");
         std::fs::create_dir_all(strat.join("src")).unwrap();
@@ -619,7 +594,7 @@ mod tests {
     fn read_user_manifest_classifies_tier() {
         let tmp = tempfile::tempdir().unwrap();
         let strat = tmp.path().join("strat");
-        write_user_strategy_dir(&strat, "s", 4, "../sdk").unwrap();
+        write_user_strategy_dir(&strat, "s", 4, "\"0.1.0\"").unwrap();
         let manifest = read_user_manifest(&strat).expect("read manifest");
         assert!(matches!(manifest.builtin.tier, Tier::Tier4));
     }
@@ -688,19 +663,13 @@ mod tests {
         "#;
         let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
 
-        // Stage a fake user strategy crate from the hello-tier3 embed,
-        // alongside an extracted SDK at a known relative path.
+        // Stage a fake user strategy crate from the hello-tier3 embed.
+        // The embed already declares the SDK as a versioned registry
+        // dep (with a dev-only path hint that build.rs strips at
+        // staging), so the extracted Cargo.toml is ready to use as-is.
         let tmp = tempfile::tempdir().unwrap();
-        let sdk_dir = tmp.path().join("sdk");
-        extract_sdk(&sdk_dir).expect("extract sdk");
         let strat = tmp.path().join("hello-tier3");
         extract("hello-tier3", &strat).expect("extract strategy");
-        // Rewrite the strategy's Cargo.toml so its splicer-tool-sdk path
-        // resolves under tmp (the embedded `../../splicer-tool-sdk`
-        // wouldn't exist here).
-        let cargo_text = std::fs::read_to_string(strat.join("Cargo.toml")).unwrap();
-        let cargo_text = cargo_text.replace("../../splicer-tool-sdk", "../sdk");
-        std::fs::write(strat.join("Cargo.toml"), cargo_text).unwrap();
 
         let splits = tempfile::tempdir().unwrap();
         let (out, tier) = materialize_tier3_4(

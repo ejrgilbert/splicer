@@ -145,7 +145,11 @@ pub struct CargoTomlInputs<'a> {
     pub crate_name: &'a str,
     pub strategy_crate_name: &'a str,
     pub strategy_crate_path: &'a str,
-    pub splicer_tool_sdk_path: &'a str,
+    /// `splicer-tool-sdk` version (from the strategy crate's own
+    /// Cargo.toml) that the wrapper depends on. Must match what the
+    /// strategy itself declares so cargo dedupes the two into one
+    /// source.
+    pub splicer_tool_sdk_version: &'a str,
 }
 
 /// Assemble the wrapper crate's Cargo.toml. Serialized through the
@@ -167,12 +171,6 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
         Value::Array(vec![Value::String("cdylib".into())]),
     );
 
-    let mut sdk_dep = Map::new();
-    sdk_dep.insert(
-        "path".into(),
-        Value::String(inputs.splicer_tool_sdk_path.into()),
-    );
-
     let mut strategy_dep = Map::new();
     strategy_dep.insert(
         "path".into(),
@@ -180,7 +178,10 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
     );
 
     let mut dependencies = Map::new();
-    dependencies.insert("splicer-tool-sdk".into(), Value::Table(sdk_dep));
+    dependencies.insert(
+        "splicer-tool-sdk".into(),
+        Value::String(inputs.splicer_tool_sdk_version.into()),
+    );
     dependencies.insert(
         inputs.strategy_crate_name.into(),
         Value::Table(strategy_dep),
@@ -291,7 +292,7 @@ mod tests {
             crate_name: "splicer_wrapper_test_pkg_ops_my_strategy",
             strategy_crate_name: "my-strategy",
             strategy_crate_path: "/abs/path/to/my-strategy",
-            splicer_tool_sdk_path: "/abs/path/to/splicer-tool-sdk",
+            splicer_tool_sdk_version: "0.1.0",
         });
         // Parse the result as TOML to catch syntax errors.
         let parsed: toml::Value = toml::from_str(&toml).expect("Cargo.toml parses");
@@ -307,7 +308,12 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("cdylib")
         );
-        assert!(parsed["dependencies"].get("splicer-tool-sdk").is_some());
+        assert_eq!(
+            parsed["dependencies"]["splicer-tool-sdk"].as_str(),
+            Some("0.1.0"),
+            "splicer-tool-sdk must be a plain registry version dep so cargo dedupes it with \
+             the strategy crate's own splicer-tool-sdk dep",
+        );
         assert!(parsed["dependencies"].get("my-strategy").is_some());
         assert!(parsed["dependencies"].get("wit-bindgen").is_some());
     }
@@ -320,17 +326,13 @@ mod tests {
             crate_name: "wrapper",
             strategy_crate_name: "strat",
             strategy_crate_path: r#"C:\Users\me\strat-"with-quote""#,
-            splicer_tool_sdk_path: r"D:\sdk\splicer-tool-sdk",
+            splicer_tool_sdk_version: "0.1.0",
         });
         let parsed: toml::Value =
             toml::from_str(&toml).expect("Cargo.toml with special-char paths still parses");
         assert_eq!(
             parsed["dependencies"]["strat"]["path"].as_str(),
             Some(r#"C:\Users\me\strat-"with-quote""#),
-        );
-        assert_eq!(
-            parsed["dependencies"]["splicer-tool-sdk"]["path"].as_str(),
-            Some(r"D:\sdk\splicer-tool-sdk"),
         );
     }
 }

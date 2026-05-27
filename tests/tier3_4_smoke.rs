@@ -52,7 +52,6 @@ fn build_and_validate(
     strategy_type: &str,
 ) {
     let root = workspace_root();
-    let sdk = root.join("splicer-tool-sdk");
     let strategy = root.join("builtins").join(strategy_dir_name);
     let adapter = root
         .join("builtins")
@@ -68,7 +67,7 @@ fn build_and_validate(
             strategy_crate_name: strategy_dir_name,
             strategy_crate_path: strategy.to_str().unwrap(),
             strategy_type,
-            splicer_tool_sdk_path: sdk.to_str().unwrap(),
+            splicer_tool_sdk_version: "0.1.0",
         },
         &BuildConfig {
             build_root: build_root.path(),

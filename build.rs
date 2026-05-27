@@ -162,50 +162,46 @@ fn main() {
 
     generate_builtin_protocol(&out_dir);
     generate_builtin_config_constants(&out_dir);
-    stage_sdk_embed(&out_dir);
+    stage_embedded_strategies(&out_dir);
 }
 
-/// Stage a clean copy of `splicer-tool-sdk` under `$OUT_DIR/embedded-sdk/`
-/// so the `include_dir!` macro in `src/builtins/typed.rs` can embed
-/// the SDK source without sweeping `splicer-tool-sdk/target/` (hundreds
-/// of MB after a local `cargo build`) into the splicer binary.
-///
-/// Copies only what the wrapper crate's path-dep needs: `src/`,
-/// `Cargo.toml`, and `README.md` if it exists. Skips `target/`,
-/// `Cargo.lock`, hidden files.
-///
-/// TODO: stop embedding once splicer-tool-sdk is published to crates.io;
-/// the generated wrapper Cargo.toml can then use a versioned dep.
-fn stage_sdk_embed(out_dir: &str) {
+/// Stage each tier-3/4 strategy crate under
+/// `$OUT_DIR/embedded-strategies/<name>/` for the `include_dir!`
+/// macros in `src/strategies.rs`. Accepts either `Cargo.toml` (dev)
+/// or `Cargo.toml.embed` (post-publish-rename) at the source and
+/// rewrites the strategy's `splicer-tool-sdk` dep to drop the
+/// dev-only `path` hint on the way into OUT_DIR.
+fn stage_embedded_strategies(out_dir: &str) {
     let manifest_dir =
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo");
-    let src_root = Path::new(&manifest_dir).join("splicer-tool-sdk");
-    let dest_root = Path::new(out_dir).join("embedded-sdk");
+    let builtins_root = Path::new(&manifest_dir).join("builtins");
+    let staged_root = Path::new(out_dir).join("embedded-strategies");
 
-    // Watch every source file under the SDK so cargo rebuilds when SDK
-    // sources change. `target/` is excluded by `should_include`.
-    rerun_for_sdk_sources(&src_root);
+    for name in ["hello-tier3", "hello-tier4"] {
+        let src_root = builtins_root.join(name);
+        let dest_root = staged_root.join(name);
+        rerun_for_strategy_sources(&src_root);
 
-    if dest_root.exists() {
-        fs::remove_dir_all(&dest_root).unwrap_or_else(|e| {
-            panic!("Failed to clean {}: {e}", dest_root.display());
+        if dest_root.exists() {
+            fs::remove_dir_all(&dest_root).unwrap_or_else(|e| {
+                panic!("Failed to clean {}: {e}", dest_root.display());
+            });
+        }
+        fs::create_dir_all(&dest_root).unwrap_or_else(|e| {
+            panic!("Failed to create {}: {e}", dest_root.display());
         });
-    }
-    fs::create_dir_all(&dest_root).unwrap_or_else(|e| {
-        panic!("Failed to create {}: {e}", dest_root.display());
-    });
 
-    copy_sdk_subtree(&src_root, &dest_root);
+        stage_strategy_dir(&src_root, &dest_root);
+    }
 }
 
-fn rerun_for_sdk_sources(src_root: &Path) {
-    // Re-run when the SDK source tree changes. Watching the root
-    // suffices for additions/removals; watching key files inside
-    // catches edits cargo wouldn't otherwise notice.
+fn rerun_for_strategy_sources(src_root: &Path) {
     println!("cargo::rerun-if-changed={}", src_root.display());
-    let cargo_toml = src_root.join("Cargo.toml");
-    if cargo_toml.exists() {
-        println!("cargo::rerun-if-changed={}", cargo_toml.display());
+    for name in ["Cargo.toml", "Cargo.toml.embed", "manifest.toml"] {
+        let p = src_root.join(name);
+        if p.exists() {
+            println!("cargo::rerun-if-changed={}", p.display());
+        }
     }
     let src_dir = src_root.join("src");
     if src_dir.is_dir() {
@@ -231,24 +227,62 @@ fn walk_for_rerun(dir: &Path) {
     }
 }
 
-fn copy_sdk_subtree(src_root: &Path, dest_root: &Path) {
-    for name in ["Cargo.toml", "README.md"] {
-        let src = src_root.join(name);
-        if src.is_file() {
-            let dest = dest_root.join(name);
-            fs::copy(&src, &dest).unwrap_or_else(|e| {
+/// Copy a strategy crate's source tree into `dest_root`, writing a
+/// normalized `Cargo.toml` (sourced from either `Cargo.toml` or
+/// `Cargo.toml.embed`). Skips `Cargo.lock`/`target/`/hidden so the
+/// staged dir is a clean source tree.
+fn stage_strategy_dir(src_root: &Path, dest_root: &Path) {
+    let cargo_src = if src_root.join("Cargo.toml").is_file() {
+        src_root.join("Cargo.toml")
+    } else if src_root.join("Cargo.toml.embed").is_file() {
+        src_root.join("Cargo.toml.embed")
+    } else {
+        panic!(
+            "Strategy crate at {} has neither Cargo.toml nor Cargo.toml.embed",
+            src_root.display()
+        );
+    };
+    let cargo_text = fs::read_to_string(&cargo_src)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", cargo_src.display()));
+    let normalized = normalize_strategy_cargo_toml(&cargo_text, &cargo_src);
+    fs::write(dest_root.join("Cargo.toml"), normalized).unwrap_or_else(|e| {
+        panic!(
+            "Failed to write staged Cargo.toml for {}: {e}",
+            src_root.display()
+        );
+    });
+
+    for entry in fs::read_dir(src_root)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", src_root.display()))
+        .filter_map(|e| e.ok())
+    {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Cargo.toml is written above. Skip lock + target + hidden +
+        // the .embed copy so the staged dir is a clean source tree.
+        if matches!(
+            name_str.as_ref(),
+            "Cargo.toml" | "Cargo.toml.embed" | "Cargo.lock" | "target"
+        ) || name_str.starts_with('.')
+        {
+            continue;
+        }
+        let src_path = entry.path();
+        let dest_path = dest_root.join(&name);
+        let ft = entry.file_type().unwrap_or_else(|e| {
+            panic!("Failed to stat {}: {e}", src_path.display());
+        });
+        if ft.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path);
+        } else if ft.is_file() {
+            fs::copy(&src_path, &dest_path).unwrap_or_else(|e| {
                 panic!(
                     "Failed to copy {} -> {}: {e}",
-                    src.display(),
-                    dest.display()
+                    src_path.display(),
+                    dest_path.display()
                 );
             });
         }
-    }
-    let src_dir = src_root.join("src");
-    if src_dir.is_dir() {
-        let dest_dir = dest_root.join("src");
-        copy_dir_recursive(&src_dir, &dest_dir);
     }
 }
 
@@ -279,6 +313,157 @@ fn copy_dir_recursive(src: &Path, dest: &Path) {
             });
         }
     }
+}
+
+/// Rewrite the strategy's `splicer-tool-sdk` dep to a plain version
+/// string, stripping the dev-only `path` hint that only resolves at
+/// the repo location (not after OUT_DIR staging).
+fn normalize_strategy_cargo_toml(src: &str, src_path: &Path) -> String {
+    let mut parsed: toml::Value = toml::from_str(src).unwrap_or_else(|e| {
+        panic!("Failed to parse {} as TOML: {e}", src_path.display());
+    });
+    let version = parsed
+        .get("dependencies")
+        .and_then(|d| d.get("splicer-tool-sdk"))
+        .and_then(|d| match d {
+            toml::Value::String(s) => Some(s.clone()),
+            toml::Value::Table(t) => t
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "Strategy {} must declare splicer-tool-sdk = \"<version>\" \
+                 (or `{{ version = \"<version>\", path = \"...\" }}`) in [dependencies]",
+                src_path.display(),
+            );
+        });
+
+    if let Some(deps) = parsed
+        .get_mut("dependencies")
+        .and_then(|d| d.as_table_mut())
+    {
+        deps.insert("splicer-tool-sdk".to_string(), toml::Value::String(version));
+    }
+    toml::to_string(&parsed).unwrap_or_else(|e| {
+        panic!(
+            "Failed to re-serialize normalized Cargo.toml for {}: {e}",
+            src_path.display()
+        );
+    })
+}
+
+/// Scan `builtins/<name>/` for shipped wasm-builtins and emit the
+/// `(name, version)` slice that `src/builtins/tier1_2.rs` `include!`s
+/// as the OCI version registry. Reads each builtin's `Cargo.toml` or
+/// `Cargo.toml.embed`, whichever survives the publish-time rename.
+fn generate_builtin_protocol(out_dir: &str) {
+    let dest = Path::new(out_dir).join("builtin_protocol.rs");
+    let builtins_dir = Path::new("builtins");
+
+    // Watch the directory itself so cargo reruns when crates are
+    // added/removed; per-Cargo.toml lines below catch content changes.
+    println!("cargo::rerun-if-changed=builtins");
+
+    let mut rows = String::new();
+    if builtins_dir.is_dir() {
+        let mut crate_dirs: Vec<_> = fs::read_dir(builtins_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+        crate_dirs.sort_by_key(|e| e.file_name());
+
+        for entry in crate_dirs {
+            let entry_path = entry.path();
+            let cargo_toml = entry_path.join("Cargo.toml");
+            let cargo_embed = entry_path.join("Cargo.toml.embed");
+            let manifest_path = if cargo_toml.is_file() {
+                cargo_toml
+            } else if cargo_embed.is_file() {
+                cargo_embed
+            } else {
+                continue;
+            };
+            // builtin-protocol is a host-side helper (no `wit/`),
+            // pulled as a regular crates.io dep; skip it.
+            if !entry_path.join("wit").is_dir() {
+                continue;
+            }
+            println!("cargo::rerun-if-changed={}", manifest_path.display());
+            for sub in ["src", "wit"] {
+                let dir = entry_path.join(sub);
+                if dir.is_dir() {
+                    walk_for_rerun(&dir);
+                }
+            }
+            let mtoml = entry_path.join("manifest.toml");
+            if mtoml.is_file() {
+                println!("cargo::rerun-if-changed={}", mtoml.display());
+            }
+            let src = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+                panic!("Failed to read {}: {e}", manifest_path.display());
+            });
+            let version = parse_cargo_package_version(&src, &manifest_path);
+            // The directory name is what users put in yaml and what the
+            // publish workflow uses as the OCI path component, so it's
+            // the canonical "builtin name" -- not Cargo.toml's `name`,
+            // even though they match by convention today.
+            let name = entry.file_name().to_string_lossy().into_owned();
+            rows.push_str(&format!("    (\"{name}\", \"{version}\"),\n"));
+        }
+    }
+
+    let content = format!(
+        "// Auto-generated by build.rs from builtins/*/Cargo.toml(.embed). Do not edit.\n&[\n{rows}]\n"
+    );
+    fs::write(&dest, content).unwrap();
+}
+
+/// Extract `version = "..."` from `[package]`. Line-based (avoids
+/// adding `toml` to this reader's path).
+fn parse_cargo_package_version(src: &str, path: &Path) -> String {
+    let mut in_package = false;
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("version") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            panic!(
+                "[package] version in {} is not a quoted string: {trimmed:?}",
+                path.display()
+            );
+        };
+        let Some(end) = rest.find('"') else {
+            panic!(
+                "[package] version in {} has unterminated quote: {trimmed:?}",
+                path.display()
+            );
+        };
+        let v = &rest[..end];
+        if v.is_empty() {
+            panic!("Empty version in [package] of {}", path.display());
+        }
+        return v.to_string();
+    }
+    panic!(
+        "No `version = \"...\"` found in [package] of {}",
+        path.display()
+    );
 }
 
 /// Emit `BUILTIN_CONFIG_*` constants for `src/config_provider.rs`
@@ -330,122 +515,6 @@ fn generate_builtin_config_constants(out_dir: &str) {
     content.push_str("];\n");
 
     fs::write(&dest, content).unwrap();
-}
-
-/// Scan `builtins/<name>/Cargo.toml` for every builtin crate and emit
-/// a slice expression `[(name, version), ...]` that `src/builtins.rs`
-/// `include!`s as the registry of builtin name → published version.
-/// Single source of truth: each builtin's own Cargo.toml.
-fn generate_builtin_protocol(out_dir: &str) {
-    let dest = Path::new(out_dir).join("builtin_protocol.rs");
-    let builtins_dir = Path::new("builtins");
-
-    // Watch the directory itself so cargo reruns when crates are
-    // added/removed; per-Cargo.toml lines below catch content changes.
-    println!("cargo::rerun-if-changed=builtins");
-
-    let mut rows = String::new();
-    if builtins_dir.is_dir() {
-        let mut crate_dirs: Vec<_> = fs::read_dir(builtins_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .collect();
-        crate_dirs.sort_by_key(|e| e.file_name());
-
-        for entry in crate_dirs {
-            let cargo_toml = entry.path().join("Cargo.toml");
-            if !cargo_toml.exists() {
-                continue;
-            }
-            // Host-side helper crates (e.g. builtin-protocol) live in
-            // `builtins/` for path-dep convenience but aren't user-
-            // facing wasm builtins — they lack a `wit/` directory. Skip
-            // them so they don't pollute BUILTIN_VERSIONS.
-            if !entry.path().join("wit").is_dir() {
-                continue;
-            }
-            println!("cargo::rerun-if-changed={}", cargo_toml.display());
-            // Recursively watch each builtin's source tree (src/, wit/,
-            // manifest.toml) so edits get picked up by the include_dir!
-            // embeds in src/builtins/typed.rs without manually bumping
-            // the Cargo.toml mtime.
-            let entry_path = entry.path();
-            for sub in ["src", "wit"] {
-                let dir = entry_path.join(sub);
-                if dir.is_dir() {
-                    walk_for_rerun(&dir);
-                }
-            }
-            let manifest = entry_path.join("manifest.toml");
-            if manifest.is_file() {
-                println!("cargo::rerun-if-changed={}", manifest.display());
-            }
-            let src = fs::read_to_string(&cargo_toml).unwrap_or_else(|e| {
-                panic!("Failed to read {}: {e}", cargo_toml.display());
-            });
-            let version = parse_cargo_package_version(&src, &cargo_toml);
-            // The directory name is what users put in yaml and what the
-            // publish workflow uses as the OCI path component, so it's
-            // the canonical "builtin name" — not Cargo.toml's `name`,
-            // even though they match by convention today.
-            let name = entry.file_name().to_string_lossy().into_owned();
-            rows.push_str(&format!("    (\"{name}\", \"{version}\"),\n"));
-        }
-    }
-
-    let content = format!(
-        "// Auto-generated by build.rs from builtins/*/Cargo.toml. Do not edit.\n&[\n{rows}]\n"
-    );
-    fs::write(&dest, content).unwrap();
-}
-
-/// Extract `version = "..."` from inside the `[package]` section of a
-/// Cargo.toml file. Line-based to keep build.rs free of a `toml` dep.
-/// Tolerant of a trailing `# comment` after the value.
-fn parse_cargo_package_version(src: &str, path: &Path) -> String {
-    let mut in_package = false;
-    for line in src.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        // Look for `version = "..."` only — `version.workspace = true`
-        // and other dotted variants are intentionally rejected by the
-        // requirement that the next non-space token after `version` be `=`.
-        let Some(rest) = trimmed.strip_prefix("version") else {
-            continue;
-        };
-        let Some(rest) = rest.trim_start().strip_prefix('=') else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('"') else {
-            panic!(
-                "[package] version in {} is not a quoted string: {trimmed:?}",
-                path.display()
-            );
-        };
-        let Some(end) = rest.find('"') else {
-            panic!(
-                "[package] version in {} has unterminated quote: {trimmed:?}",
-                path.display()
-            );
-        };
-        let v = &rest[..end];
-        if v.is_empty() {
-            panic!("Empty version in [package] of {}", path.display());
-        }
-        return v.to_string();
-    }
-    panic!(
-        "No `version = \"...\"` found in [package] of {}",
-        path.display()
-    );
 }
 
 /// Asserts that every WIT typedef / record-field / function-param
