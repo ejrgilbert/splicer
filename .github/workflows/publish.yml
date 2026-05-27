@@ -106,7 +106,7 @@ jobs:
           done
 
       - name: Publish splicer
-        run: cargo publish --locked
+        run: cargo publish --locked --allow-dirty
 
   release:
     name: Create GitHub Release
