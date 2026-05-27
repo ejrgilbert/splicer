@@ -18,23 +18,18 @@
 use anyhow::{Context, Result};
 use builtin_protocol::{Manifest, Tier};
 use heck::ToUpperCamelCase;
-use include_dir::{include_dir, Dir};
+use include_dir::Dir;
 use std::path::{Path, PathBuf};
 
 use crate::adapter::typed::{
     build_wrapper, target_wit_for_codegen, Behavior, BuildConfig, GenerateWrapperInput, TargetWit,
 };
 
-/// Each shipped tier-3/4 builtin's source tree. Add an entry when
-/// shipping a new builtin.
-static EMBEDDED: &[(&str, &Dir<'_>)] =
-    &[("hello-tier3", &HELLO_TIER3), ("hello-tier4", &HELLO_TIER4)];
-
-/// Each strategy is staged by `build.rs` into `$OUT_DIR/embedded-strategies/<name>/`
-/// so the embed survives `cargo publish` (see the `.embed` rename in
-/// `publish.yml`).
-static HELLO_TIER3: Dir<'_> = include_dir!("$OUT_DIR/embedded-strategies/hello-tier3");
-static HELLO_TIER4: Dir<'_> = include_dir!("$OUT_DIR/embedded-strategies/hello-tier4");
+// Per-builtin `Dir<'_>` statics + the `EMBEDDED` slice are generated
+// by `build.rs` from `builtins/*/manifest.toml` (any builtin
+// declaring `tier = 3` or `4`). Adding a new tier-3/4 builtin is a
+// pure source-tree edit -- no registry to touch here.
+include!(concat!(env!("OUT_DIR"), "/embedded_strategies.rs"));
 
 /// Embedded WASI preview1 adapter, used to wrap the cargo-produced
 /// core module into a wasm component. Pulled from `builtins/`
