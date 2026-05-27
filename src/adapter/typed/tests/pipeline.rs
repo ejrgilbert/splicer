@@ -24,7 +24,7 @@ fn input<'a>(behavior: Behavior) -> GenerateWrapperInput<'a> {
         strategy_crate_name: "my-strategy",
         strategy_crate_path: "/abs/path/to/my-strategy",
         strategy_type: "MyStrategy",
-        splicer_tool_sdk_path: "/abs/path/to/splicer-tool-sdk",
+        splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
     }
 }
 

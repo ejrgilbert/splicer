@@ -233,7 +233,7 @@ fn check_one(wit: &FuzzWit, behavior: Behavior) -> Result<(), String> {
         strategy_crate_name: "fuzz-strategy",
         strategy_crate_path: "/abs/path/to/fuzz-strategy",
         strategy_type: "FuzzStrategy",
-        splicer_tool_sdk_path: "/abs/path/to/splicer-tool-sdk",
+        splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
     })
     .map_err(|e| format!("{e:#}"))?;
 

@@ -49,7 +49,7 @@ fn build_dir_key(input: &GenerateWrapperInput<'_>) -> String {
     input.strategy_crate_name.hash(&mut h);
     input.strategy_crate_path.hash(&mut h);
     input.strategy_type.hash(&mut h);
-    input.splicer_tool_sdk_path.hash(&mut h);
+    input.splicer_tool_sdk_version.hash(&mut h);
     format!("{:016x}", h.finish())
 }
 
@@ -191,7 +191,7 @@ mod tests {
             strategy_crate_name: "s",
             strategy_crate_path: "/p",
             strategy_type: "S",
-            splicer_tool_sdk_path: "/sdk",
+            splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
         }
     }
 
@@ -234,9 +234,9 @@ mod tests {
     }
 
     #[test]
-    fn build_dir_key_distinguishes_sdk_path() {
+    fn build_dir_key_distinguishes_sdk_version() {
         let mut a = sample_input(Behavior::Transform);
-        a.splicer_tool_sdk_path = "/some/other/sdk";
+        a.splicer_tool_sdk_version = "99.99.99-distinct";
         assert_ne!(
             build_dir_key(&a),
             build_dir_key(&sample_input(Behavior::Transform)),
