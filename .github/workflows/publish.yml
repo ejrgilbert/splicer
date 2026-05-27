@@ -76,6 +76,22 @@ jobs:
             exit 1
           fi
 
+      # splicer's typed-codegen pipeline synthesizes wrapper crates that
+      # depend on splicer-tool-sdk. Same idempotent shape as the
+      # protocol step above.
+      - name: Publish splicer-tool-sdk (if version not yet on crates.io)
+        working-directory: splicer-tool-sdk
+        run: |
+          set -o pipefail
+          if cargo publish --locked 2>&1 | tee /tmp/splicer-tool-sdk-publish.log; then
+            echo "splicer-tool-sdk published"
+          elif grep -qE "already (uploaded|exists)|crate version .* is already" /tmp/splicer-tool-sdk-publish.log; then
+            echo "splicer-tool-sdk version already on crates.io -- skipping"
+          else
+            echo "::error::splicer-tool-sdk publish failed for an unexpected reason"
+            exit 1
+          fi
+
       - name: Publish splicer
         run: cargo publish --locked
 
