@@ -34,6 +34,7 @@ cviz = "2.0.4"
 #cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+globset = "0.4.18"
 anyhow = "1.0.86"
 semver = "1"
 clap = { version = "4.5.58", features = ["derive"] }

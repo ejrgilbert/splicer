@@ -72,6 +72,41 @@ rules:
 
 ---
 
+# Pattern matching (globs + lists)
+
+The `interface` field and every node-name field (`provider`, `inner`,
+`outer`) are **glob patterns**, and each accepts either a single pattern
+(scalar) or a **list** of patterns (matches if any one matches):
+
+```yaml
+interface: "wasi:*"                 # one glob
+interface: ["wasi:*", "my:srv/*"]   # matches either
+```
+
+Supported metacharacters: `*` (any run of characters), `?` (one
+character), `[...]` (character class). Matching is **flat** — `*` and
+`?` cross `/` and `:`, since interface names aren't file paths. So
+`wasi:*` matches `wasi:http/handler@0.3.0`, and `wasi:http/*` matches
+`wasi:http/handler@0.3.0`.
+
+A pattern with no metacharacters matches **literally**, so every
+existing exact-string config keeps working unchanged. Patterns are
+compiled when the config is parsed; an invalid glob (e.g. an unterminated
+`[`) is a config error surfaced before any composition work runs.
+
+> ⚠️ **Node-name fields match the instance (node) name, *not* the
+> interface.** `provider`/`inner`/`outer` are matched against the
+> instance's display name — for your own components that's a bare
+> service id (`auth`, `srv-b`); for host/shim-provided interfaces the
+> instance is named after the interface
+> (`wasi:http/handler@...-shim-instance`). So `inner: "wasi*"` selects
+> *wasi shim providers* by their node name — it does **not** mean "any
+> node providing a `wasi:` interface". Filtering by the provided
+> *interface's* namespace is what the `interface` field is for. Keep the
+> two axes distinct.
+
+---
+
 # Before
 
 ```yaml
@@ -80,7 +115,8 @@ version: 1
 rules:
   - before:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
-      provider_name: srv-b
+      provider:
+        name: srv-b
     inject:
       ...
 ```
@@ -101,10 +137,11 @@ M → B
 
 ## Fields
 
-| Field           | Type     | Required | Description                                                                    |
-|-----------------|----------|----------|--------------------------------------------------------------------------------|
-| `interface`     | string   | ✅       | The name of the exported function to match on.                                 |
-| `provider_name` | string   | ❌       | (if included) Constrains the match to the interface of the specified provider. |
+| Field             | Type            | Required | Description                                                                                       |
+|-------------------|-----------------|----------|---------------------------------------------------------------------------------------------------|
+| `interface`       | pattern or list | ✅       | Interface(s) to match on (glob; see [Pattern matching](#pattern-matching-globs--lists)).    |
+| `provider.name`   | pattern or list | ❌       | Constrains the match to the named provider node(s). Omitted ⇒ matches every provider.             |
+| `provider.alias`  | string          | ❌       | Rename the matched provider in the generated WAC.                                                 |
 
 ---
 
@@ -116,8 +153,10 @@ version: 1
 rules:
   - between:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
-      inner: srv-c
-      outer: srv-b
+      inner:
+        name: srv-c
+      outer:
+        name: srv-b
     inject:
       ...
 ```
@@ -136,15 +175,30 @@ Becomes:
 A → M → B
 ```
 
-Unlike `before`, `between` requires both endpoints to be explicitly specified.
+Both endpoints are **optional** — an omitted `inner`/`outer` matches any
+node on that end, which is what lets a globbed `interface` fan out across
+edges. Combined with node-name globs, this unlocks rules like:
+
+```yaml
+between: { interface: "wasi:*", outer: { name: auth } }              # every wasi edge INTO auth
+between: { interface: "*", inner: { name: "wasi*" }, outer: { name: auth } }   # auth's calls into wasi shim providers
+between: { interface: "*", inner: { name: "wasi*" }, outer: { name: "mysrv*" } } # mysrv* → wasi* edges
+```
 
 ## Fields
 
-| Field       | Type     | Required | Description                                                                                         |
-|-------------|----------|----------|-----------------------------------------------------------------------------------------------------|
-| `interface` | string   | ✅       | The name of the exported function to match on.                                                      |
-| `inner`     | string   | ✅       | The name of the _downstream_ service to match on (exports the `interface` to be called by `outer`). |
-| `outer`     | string   | ✅       | The name of the _upstream_ service to match on (calls the exported `interface` of `inner`).         |
+| Field         | Type            | Required | Description                                                                                          |
+|---------------|-----------------|----------|------------------------------------------------------------------------------------------------------|
+| `interface`   | pattern or list | ✅       | Interface(s) to match on (glob; see [Pattern matching](#pattern-matching-globs--lists)).       |
+| `inner.name`  | pattern or list | ❌       | The _downstream_ node(s) (exports the `interface` called by `outer`). Omitted ⇒ matches any.         |
+| `inner.alias` | string          | ❌       | Rename the matched inner node in the generated WAC.                                                  |
+| `outer.name`  | pattern or list | ❌       | The _upstream_ node(s) (calls the exported `interface` of `inner`). Omitted ⇒ matches any.           |
+| `outer.alias` | string          | ❌       | Rename the matched outer node in the generated WAC.                                                  |
+
+`inner` and `outer` are rejected only when both are present and are the
+**same literal pattern** — a glob may legitimately fan out over both
+ends. A fully-open `between` (`interface: "*"` with both names omitted)
+splices every edge in the composition; that's allowed, just deliberate.
 
 ---
 
@@ -305,9 +359,15 @@ The configuration will fail validation if:
 
 * `version` is missing or unsupported
 * Any required fields are missing from a rule
+* A pattern is an invalid glob (e.g. an unterminated `[`)
+* A `between` rule gives `inner` and `outer` the **same literal pattern**
 
 Note: If no matches are found in the graph using your configuration, no error will occur!
 Rather, the `wac` generated will produce an identity component (should roundtrip to an equivalent component).
+When a rule matches nothing, splicer prints a `WARN` — for an interface
+that matched no interface it suggests close names; for an interface that
+matched but whose node-name patterns excluded every edge it lists the
+concrete matched interfaces and the node names present on them.
 
 ---
 
@@ -323,13 +383,16 @@ rules:
       - tracing
   - before:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
-      provider_name: auth
+      provider:
+        name: auth
     inject:
       - encrypt
   - between:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
-      inner: auth-backend
-      outer: auth
+      inner:
+        name: auth-backend
+      outer:
+        name: auth
     inject:
       - tracing-backend
 ```

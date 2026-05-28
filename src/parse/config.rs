@@ -1,3 +1,4 @@
+use crate::select::{Constraint, Pattern, RuleMatcher, SiteKind};
 use anyhow::bail;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -7,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 pub fn parse_yaml(yaml_str: &str) -> anyhow::Result<Vec<SpliceRule>> {
     let config: ConfigFile = serde_yaml::from_str(yaml_str)?;
     config.validate()?;
-    Ok(config.into_splice_rules())
+    config.into_splice_rules()
 }
 
 /// --- YAML config structures ---
@@ -89,33 +90,51 @@ impl BuiltinSpec {
     }
 }
 
+/// A match field accepting one glob pattern (scalar) or several (a YAML
+/// list). A list matches if any of its patterns match (OR-combined).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum PatternSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl PatternSpec {
+    /// The glob patterns in this field — one for a scalar, N for a list.
+    fn patterns(&self) -> &[String] {
+        match self {
+            PatternSpec::One(s) => std::slice::from_ref(s),
+            PatternSpec::Many(v) => v,
+        }
+    }
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            PatternSpec::One(s) => vec![s],
+            PatternSpec::Many(v) => v,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct YamlStrategyBefore {
-    interface: String,
+    interface: PatternSpec,
     provider: Option<YamlProviderOpt>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct YamlStrategyBetween {
-    inner: YamlProviderReq,
-    outer: YamlProviderReq,
-    interface: String,
+    interface: PatternSpec,
+    inner: Option<YamlProviderOpt>,
+    outer: Option<YamlProviderOpt>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct YamlProviderReq {
-    // The name of the instance to match on in the component
-    // e.g.: `(instance $srv-b ...` --> "srv-b"
-    // OR  : `(instance $wasi:http/handler@0.3.0-rc-2026-01-06-shim-instance ...` --> "wasi:http/handler@0.3.0-rc-2026-01-06-shim-instance"
-    name: String,
-    // Alias the matched provider to this name in the generated wac
-    alias: Option<String>,
-}
-
+/// A node-name match field plus its alias. `name` matches the instance
+/// (node) **display name** — e.g. `srv-b`, or the shim-provider name
+/// `wasi:http/handler@...-shim-instance` for host/shim interfaces — and
+/// is a glob pattern (scalar or list). Omitting `name` matches any node.
 #[derive(Debug, Deserialize)]
 pub struct YamlProviderOpt {
-    // The name of the instance to match on in the component
-    name: Option<String>,
+    name: Option<PatternSpec>,
     // Alias the matched provider to this name in the generated wac
     alias: Option<String>,
 }
@@ -268,31 +287,27 @@ impl Injection {
     }
 }
 
-/// A validated splice rule, normalized from the YAML config.
+/// A validated splice rule, normalized from the YAML config. Matching
+/// is delegated to the compiled [`RuleMatcher`]; the variant only adds
+/// the alias bindings the effect needs for the nodes it matches.
 #[derive(Debug)]
 pub enum SpliceRule {
     /// Inject middleware before a provider on an interface edge.
     Before {
-        /// The interface to match (e.g. `"wasi:http/handler@0.3.0"`).
-        interface: String,
-        /// Optional provider name to scope the match.
-        provider_name: Option<String>,
+        /// Compiled interface + provider-name patterns.
+        matcher: RuleMatcher,
         /// Optional alias for the matched provider in the generated WAC.
         provider_alias: Option<String>,
         /// Middleware to inject (in order).
         inject: Vec<Injection>,
     },
-    /// Inject middleware between two specific components on an interface edge.
+    /// Inject middleware between two components on an interface edge.
     Between {
-        /// The interface to match.
-        interface: String,
-        /// Name of the inner (provider-side) component.
-        inner_name: String,
-        /// Optional alias for the inner component.
+        /// Compiled interface + inner/outer-name patterns.
+        matcher: RuleMatcher,
+        /// Optional alias for the inner (provider-side) component.
         inner_alias: Option<String>,
-        /// Name of the outer (consumer-side) component.
-        outer_name: String,
-        /// Optional alias for the outer component.
+        /// Optional alias for the outer (caller-side) component.
         outer_alias: Option<String>,
         /// Middleware to inject (in order).
         inject: Vec<Injection>,
@@ -300,12 +315,10 @@ pub enum SpliceRule {
 }
 
 impl SpliceRule {
-    /// The target interface this rule applies to.
-    pub fn interface(&self) -> &str {
+    /// The compiled matcher for this rule.
+    pub(crate) fn matcher(&self) -> &RuleMatcher {
         match self {
-            SpliceRule::Before { interface, .. } | SpliceRule::Between { interface, .. } => {
-                interface
-            }
+            SpliceRule::Before { matcher, .. } | SpliceRule::Between { matcher, .. } => matcher,
         }
     }
 
@@ -323,6 +336,30 @@ impl SpliceRule {
     pub fn inject_mut(&mut self) -> &mut Vec<Injection> {
         match self {
             SpliceRule::Before { inject, .. } | SpliceRule::Between { inject, .. } => inject,
+        }
+    }
+
+    /// Build a `before` rule directly from exact (single-pattern)
+    /// fields. Test-only convenience; real configs go through
+    /// [`parse_yaml`], which also handles globs and pattern lists.
+    #[cfg(test)]
+    pub(crate) fn before(
+        interface: &str,
+        provider_name: Option<&str>,
+        provider_alias: Option<String>,
+        inject: Vec<Injection>,
+    ) -> Self {
+        let interface = Pattern::compile(vec![interface.to_string()]).unwrap();
+        let mut constraints = vec![];
+        if let Some(p) = provider_name {
+            constraints.push(Constraint::Provider(
+                Pattern::compile(vec![p.to_string()]).unwrap(),
+            ));
+        }
+        SpliceRule::Before {
+            matcher: RuleMatcher::new(SiteKind::Before, interface, constraints),
+            provider_alias,
+            inject,
         }
     }
 }
@@ -344,6 +381,46 @@ fn validate_interface_name(rule_num: usize, interface: &str) -> anyhow::Result<(
         );
     }
     Ok(())
+}
+
+/// Reject empty node-name patterns. An omitted `name` (the whole
+/// provider block, or just its `name` key) means "match any" and is
+/// fine; an explicit empty string is a misconfig.
+fn check_node_name(
+    rule_num: usize,
+    field: &str,
+    provider: Option<&YamlProviderOpt>,
+) -> anyhow::Result<()> {
+    if let Some(name) = provider.and_then(|p| p.name.as_ref()) {
+        let pats = name.patterns();
+        if pats.is_empty() || pats.iter().any(|a| a.is_empty()) {
+            bail!(
+                "rule {rule_num}: '{field}' name must not be empty if specified \
+                 (omit the key to leave it unset)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Compile a [`PatternSpec`] into a [`Pattern`], wrapping a bad-glob
+/// error with rule/field context so it reads as a config error.
+fn compile_pattern(rule_num: usize, field: &str, spec: PatternSpec) -> anyhow::Result<Pattern> {
+    Pattern::compile(spec.into_vec()).map_err(|e| anyhow::anyhow!("rule {rule_num}: '{field}' {e}"))
+}
+
+/// Compile a node-name field's pattern, if its `name` is set. A missing
+/// provider block or `name` means "match any" — `None`, no constraint.
+/// Callers wrap the result in the right [`Constraint`] axis.
+fn node_name_pattern(
+    rule_num: usize,
+    field: &str,
+    provider: Option<YamlProviderOpt>,
+) -> anyhow::Result<Option<Pattern>> {
+    provider
+        .and_then(|p| p.name)
+        .map(|name| compile_pattern(rule_num, field, name))
+        .transpose()
 }
 
 impl ConfigFile {
@@ -385,10 +462,11 @@ impl ConfigFile {
                 _ => {}
             }
 
-            // Interface name must be non-empty and contain only
+            // Interface pattern(s) must be non-empty and contain only
             // characters that are safe to interpolate into a
             // synthesized WIT `import ...;` clause. Permits both
-            // fully-qualified use-paths and glob patterns.
+            // fully-qualified use-paths and glob patterns. A scalar is
+            // one pattern; a list is several (OR-combined).
             let interface = if let Some(b) = &rule.before {
                 &b.interface
             } else if let Some(bw) = &rule.between {
@@ -396,31 +474,36 @@ impl ConfigFile {
             } else {
                 unreachable!()
             };
-            if interface.is_empty() {
+            let interface_pats = interface.patterns();
+            if interface_pats.is_empty() || interface_pats.iter().any(|a| a.is_empty()) {
                 bail!("rule {rule_num}: 'interface' must not be empty");
             }
-            validate_interface_name(rule_num, interface)?;
+            for pat in interface_pats {
+                validate_interface_name(rule_num, pat)?;
+            }
 
             // before-specific checks.
             if let Some(before) = &rule.before {
-                if let Some(prov) = &before.provider {
-                    if prov.name.as_deref() == Some("") {
-                        bail!(
-                            "rule {rule_num}: provider 'name' must not be empty if specified \
-                             (omit the key to leave it unset)"
-                        );
-                    }
-                }
+                check_node_name(rule_num, "provider", before.provider.as_ref())?;
             }
 
             // between-specific checks.
             if let Some(between) = &rule.between {
-                if between.inner.name == between.outer.name {
-                    bail!(
-                        "rule {rule_num} (between): 'inner' and 'outer' must name different \
-                         instances, but both are '{}'",
-                        between.inner.name
-                    );
+                check_node_name(rule_num, "inner", between.inner.as_ref())?;
+                check_node_name(rule_num, "outer", between.outer.as_ref())?;
+                // Reject only when both names are present and identical
+                // literal patterns — a glob can legitimately fan out
+                // over both ends.
+                let inner = between.inner.as_ref().and_then(|p| p.name.as_ref());
+                let outer = between.outer.as_ref().and_then(|p| p.name.as_ref());
+                if let (Some(i), Some(o)) = (inner, outer) {
+                    if i.patterns() == o.patterns() {
+                        bail!(
+                            "rule {rule_num} (between): 'inner' and 'outer' must name different \
+                             instances, but both are '{}'",
+                            i.patterns().join(", ")
+                        );
+                    }
                 }
             }
 
@@ -504,50 +587,71 @@ impl ConfigFile {
         Ok(())
     }
 
-    /// Convert validated YAML rules into normalized [`SpliceRule`]s.
+    /// Convert validated YAML rules into normalized [`SpliceRule`]s,
+    /// compiling each rule's patterns into a [`RuleMatcher`]. A bad glob
+    /// surfaces here as a config error, before any generation.
     ///
     /// Assumes [`ConfigFile::validate`] has already been called.
-    pub fn into_splice_rules(self) -> Vec<SpliceRule> {
+    pub fn into_splice_rules(self) -> anyhow::Result<Vec<SpliceRule>> {
         self.rules
             .into_iter()
-            .map(
-                |YamlRule {
-                     before,
-                     between,
-                     inject,
-                 }| {
-                    let inject = inject.into_iter().map(into_injection).collect();
-                    if let Some(YamlStrategyBefore {
-                        interface,
-                        provider,
-                    }) = before
-                    {
-                        SpliceRule::Before {
-                            interface,
-                            provider_name: provider.as_ref().and_then(|p| p.name.clone()),
-                            provider_alias: provider.and_then(|p| p.alias),
-                            inject,
-                        }
-                    } else if let Some(YamlStrategyBetween {
-                        interface,
-                        inner,
-                        outer,
-                    }) = between
-                    {
-                        SpliceRule::Between {
-                            interface,
-                            inner_name: inner.name,
-                            inner_alias: inner.alias,
-                            outer_name: outer.name,
-                            outer_alias: outer.alias,
-                            inject,
-                        }
-                    } else {
-                        unreachable!("validate() guarantees exactly one strategy per rule")
-                    }
-                },
-            )
+            .enumerate()
+            .map(|(i, rule)| into_splice_rule(i + 1, rule))
             .collect()
+    }
+}
+
+/// Compile one validated YAML rule into a normalized [`SpliceRule`].
+/// Omitted node-name fields produce no constraint, i.e. "match any".
+fn into_splice_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<SpliceRule> {
+    let YamlRule {
+        before,
+        between,
+        inject,
+    } = rule;
+    let inject: Vec<Injection> = inject.into_iter().map(into_injection).collect();
+
+    if let Some(YamlStrategyBefore {
+        interface,
+        provider,
+    }) = before
+    {
+        let interface = compile_pattern(rule_num, "interface", interface)?;
+        let provider_alias = provider.as_ref().and_then(|p| p.alias.clone());
+        let constraints = node_name_pattern(rule_num, "provider", provider)?
+            .map(Constraint::Provider)
+            .into_iter()
+            .collect();
+        Ok(SpliceRule::Before {
+            matcher: RuleMatcher::new(SiteKind::Before, interface, constraints),
+            provider_alias,
+            inject,
+        })
+    } else if let Some(YamlStrategyBetween {
+        interface,
+        inner,
+        outer,
+    }) = between
+    {
+        let interface = compile_pattern(rule_num, "interface", interface)?;
+        let inner_alias = inner.as_ref().and_then(|p| p.alias.clone());
+        let outer_alias = outer.as_ref().and_then(|p| p.alias.clone());
+        // `inner` is provider-side, `outer` is caller-side.
+        let constraints = [
+            node_name_pattern(rule_num, "inner", inner)?.map(Constraint::Provider),
+            node_name_pattern(rule_num, "outer", outer)?.map(Constraint::Caller),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Ok(SpliceRule::Between {
+            matcher: RuleMatcher::new(SiteKind::Between, interface, constraints),
+            inner_alias,
+            outer_alias,
+            inject,
+        })
+    } else {
+        unreachable!("validate() guarantees exactly one strategy per rule")
     }
 }
 
@@ -670,16 +774,16 @@ rules:
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
         let SpliceRule::Before {
-            interface,
-            provider_name,
+            matcher,
             provider_alias,
             inject,
         } = &rules[0]
         else {
             panic!("expected Before rule");
         };
-        assert_eq!(interface, "wasi:http/handler@0.3.0");
-        assert_eq!(provider_name.as_deref(), Some("srv-b"));
+        assert_eq!(matcher.interface_raw(), ["wasi:http/handler@0.3.0"]);
+        assert!(matcher.interface_matches("wasi:http/handler@0.3.0"));
+        assert_eq!(matcher.provider_raw(), Some(&["srv-b".to_string()][..]));
         assert!(provider_alias.is_none());
         assert_eq!(inject.len(), 1);
         assert_eq!(inject[0].name, "middleware-a");
@@ -700,14 +804,15 @@ rules:
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
         let SpliceRule::Before {
-            provider_name,
+            matcher,
             provider_alias,
             ..
         } = &rules[0]
         else {
             panic!("expected Before rule");
         };
-        assert!(provider_name.is_none());
+        // No provider constraint ⇒ matches any node.
+        assert!(matcher.provider_raw().is_none());
         assert!(provider_alias.is_none());
     }
 
@@ -731,20 +836,18 @@ rules:
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
         let SpliceRule::Between {
-            interface,
-            inner_name,
+            matcher,
             inner_alias,
-            outer_name,
             outer_alias,
             inject,
         } = &rules[0]
         else {
             panic!("expected Between rule");
         };
-        assert_eq!(interface, "wasi:http/handler@0.3.0");
-        assert_eq!(inner_name, "srv-b");
+        assert_eq!(matcher.interface_raw(), ["wasi:http/handler@0.3.0"]);
+        assert_eq!(matcher.provider_raw(), Some(&["srv-b".to_string()][..]));
+        assert_eq!(matcher.caller_raw(), Some(&["srv".to_string()][..]));
         assert_eq!(inner_alias.as_deref(), Some("renamed-b"));
-        assert_eq!(outer_name, "srv");
         assert!(outer_alias.is_none());
         assert_eq!(inject.len(), 2);
         assert_eq!(inject[1].path.as_deref(), Some("/tmp/mw-b.wasm"));
@@ -937,6 +1040,82 @@ rules:
     }
 
     #[test]
+    fn parse_interface_pattern_list() {
+        // A YAML list of patterns matches if any one matches (OR).
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: ["wasi:*", "my:srv/*"]
+    inject:
+      - name: mw
+"#;
+        let rules = parse_yaml(yaml).expect("list form should parse");
+        let m = rules[0].matcher();
+        assert_eq!(m.interface_raw(), ["wasi:*", "my:srv/*"]);
+        assert!(m.interface_matches("wasi:http/handler@0.3.0"));
+        assert!(m.interface_matches("my:srv/api@1.0.0"));
+        assert!(!m.interface_matches("other:pkg/iface@1.0.0"));
+    }
+
+    #[test]
+    fn parse_between_optional_names() {
+        // `inner`/`outer` are now optional; omitting them matches any.
+        let yaml = r#"
+version: 1
+rules:
+  - between:
+      interface: "wasi:*"
+      outer:
+        name: auth
+    inject:
+      - name: mw
+"#;
+        let rules = parse_yaml(yaml).expect("optional inner should parse");
+        let SpliceRule::Between { matcher, .. } = &rules[0] else {
+            panic!("expected Between");
+        };
+        assert!(matcher.provider_raw().is_none());
+        assert_eq!(matcher.caller_raw(), Some(&["auth".to_string()][..]));
+    }
+
+    #[test]
+    fn validate_bad_glob_is_config_error() {
+        // An unterminated char class passes char-safety but fails to
+        // compile — surfaced as a config error before any generation.
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: "wasi:["
+    inject:
+      - name: mw
+"#,
+            "invalid glob pattern",
+        );
+    }
+
+    #[test]
+    fn validate_between_glob_inner_outer_allowed() {
+        // Different patterns on inner/outer are fine even though both
+        // are globs — only identical literal patterns are rejected.
+        let yaml = r#"
+version: 1
+rules:
+  - between:
+      interface: "*"
+      inner:
+        name: "wasi*"
+      outer:
+        name: "mysrv*"
+    inject:
+      - name: mw
+"#;
+        parse_yaml(yaml).expect("distinct globbed inner/outer should parse");
+    }
+
+    #[test]
     fn validate_interface_name_injection() {
         // A semicolon and a second world declaration would inject an
         // extra world if formatted into the synthesized adapter WIT.
@@ -981,7 +1160,7 @@ rules:
     inject:
       - name: mw
 "#,
-            "provider 'name' must not be empty if specified",
+            "'provider' name must not be empty if specified",
         );
     }
 

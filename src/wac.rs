@@ -30,6 +30,7 @@ pub fn derive_edge_id(interface: &str, from: Option<&str>, to: &str) -> String {
     }
 }
 use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
+use crate::select::{RuleMatcher, SpliceSite};
 use crate::split::gen_split_path;
 use anyhow::Context;
 
@@ -846,75 +847,38 @@ pub fn generate_wac(
     let mut diagnostics: Vec<ContractResult> = vec![];
     let mut any_rule_matched = false;
     for (rule_idx, rule) in rules.iter().enumerate() {
-        let mut any_interface_matched = false;
-        let mut any_full_match = false;
-        for chain in chains.iter_mut() {
-            let between = apply_rule_between(rule, chain, &ctx, &mut accs)?;
-            let before = apply_rule_before(rule, chain, &ctx, &mut accs)?;
-            any_interface_matched |= between.interface_matched | before.interface_matched;
-            any_full_match |= between.full_match | before.full_match;
-            diagnostics.extend(between.contract_results);
-            diagnostics.extend(before.contract_results);
+        let matcher = rule.matcher();
+
+        // Select: enumerate candidate sites and filter by the compiled
+        // matcher. Pure — no chain mutation or codegen in this pass. A
+        // non-empty result is the match, so there's nothing else to ask.
+        let mut sites: Vec<SpliceSite> = vec![];
+        for (chain_idx, chain) in chains.iter().enumerate() {
+            sites.extend(matcher.select(
+                chain_idx,
+                &chain.chain,
+                &chain.interface.name,
+                composition,
+            ));
         }
-        any_rule_matched |= any_full_match;
-        if !any_full_match {
-            let iface = rule.interface();
-            if !any_interface_matched {
-                // Interface name itself wasn't found — suggest close matches.
-                let available: Vec<&str> =
-                    chains.iter().map(|c| c.interface.name.as_str()).collect();
-                let iface_base = iface.split('@').next().unwrap_or(iface);
-                let possibly_intended: Vec<&str> = available
-                    .iter()
-                    .copied()
-                    .filter(|&avail| {
-                        let avail_base = avail.split('@').next().unwrap_or(avail);
-                        avail_base == iface_base
-                            || avail.starts_with(iface)
-                            || iface.starts_with(avail)
-                    })
-                    .collect();
-                let intended_msg = if possibly_intended.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\n\t  Possibly intended:    [{}]",
-                        possibly_intended.join(", ")
-                    )
-                };
-                eprintln!(
-                    "{}: rule {} — interface '{}' was not found in the composition.\n\
-                     \t  Available interfaces: [{}]{}",
-                    "WARN".yellow().bold(),
-                    rule_idx + 1,
-                    iface,
-                    available.join(", "),
-                    intended_msg
-                );
-            } else {
-                // Interface matched but node names didn't — show available node names
-                // for chains on that interface so the user can fix their config.
-                let node_names: Vec<String> = chains
-                    .iter()
-                    .filter(|c| c.interface.name == iface)
-                    .flat_map(|c| {
-                        c.chain
-                            .iter()
-                            .map(|id| get_name(&composition.nodes[id]).to_string())
-                    })
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                eprintln!(
-                    "{}: rule {} — interface '{}' matched but no node names matched.\n\
-                     \t  Nodes on that interface: [{}]\n\
-                     \t  Check the 'name' fields in your config against these exactly.",
-                    "WARN".yellow().bold(),
-                    rule_idx + 1,
-                    iface,
-                    node_names.join(", ")
-                );
-            }
+        // No match: warn and move on. Working out *why* (interface
+        // missed vs. node names missed) is a cold path, so it stays in
+        // the helper rather than the hot select loop.
+        if sites.is_empty() {
+            emit_no_match_diag(rule_idx, matcher, &chains, composition);
+            continue;
+        }
+        any_rule_matched = true;
+
+        // Effect: run the (unchanged) inject-plan path per matched site.
+        for site in &sites {
+            diagnostics.extend(apply_site(
+                rule,
+                &mut chains[site.chain_idx],
+                site,
+                &ctx,
+                &mut accs,
+            )?);
         }
     }
 
@@ -1032,18 +996,6 @@ fn log_shim_resolutions(shim_comps: &HashMap<usize, usize>) {
     }
 }
 
-/// Return value from rule application functions.
-/// Separates "interface matched" from "full rule matched (interface + node names)",
-/// so callers can emit precise diagnostics.
-struct RuleApplyResult {
-    contract_results: Vec<ContractResult>,
-    /// True if the chain's interface matched the rule's interface field (regardless
-    /// of whether the node-name conditions were also satisfied).
-    interface_matched: bool,
-    /// True if the full rule matched (interface + all node-name conditions).
-    full_match: bool,
-}
-
 /// For injections whose builtin imports `splicer:builtin-config`,
 /// clone each with an edge-uniquified `name` and emit a per-edge
 /// `<name>-config.wasm` stamped with the resolved `edge_id`.
@@ -1073,142 +1025,140 @@ fn build_per_edge_providers(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_rule_between(
+/// Run the inject-plan effect for one selected site. `before` and
+/// `between` are the same primitive here — they differ only in which
+/// nodes get aliased. The **concrete** matched interface
+/// (`chain.interface.name`) is what flows downstream into
+/// `add_to_inject_plan` and the emitted WAC; the rule's glob pattern
+/// never does.
+fn apply_site(
     rule: &SpliceRule,
     chain: &mut Chain,
+    site: &SpliceSite,
     ctx: &SpliceCtx,
     accs: &mut SpliceAccumulators,
-) -> anyhow::Result<RuleApplyResult> {
-    let mut contract_results = vec![];
-    let mut interface_matched = false;
-    let mut full_match = false;
-    if let SpliceRule::Between {
-        interface,
-        inner_name,
-        inner_alias,
-        outer_name,
-        outer_alias,
-        inject,
-    } = rule
-    {
-        for (i, window) in chain.chain.windows(2).enumerate() {
-            let inner_id = window[0];
-            let outer_id = window[1];
-            let inner_node = &ctx.composition.nodes[&inner_id];
-            let outer_node = &ctx.composition.nodes[&outer_id];
+) -> anyhow::Result<Vec<ContractResult>> {
+    let interface = chain.interface.name.as_str();
+    let provider_id = chain.chain[site.provider_idx];
+    let provider_var = get_name(&ctx.composition.nodes[&provider_id]).to_string();
+    // Caller is the next node toward the consumer side; `None` at the
+    // outermost boundary (caller is external to the composition).
+    let caller_id = chain.chain.get(site.provider_idx + 1).copied();
+    let caller_var = caller_id.map(|id| get_name(&ctx.composition.nodes[&id]).to_string());
 
-            let inner_var = get_name(inner_node).to_string();
-            let outer_var = get_name(outer_node).to_string();
-            if *interface != chain.interface.name {
-                continue;
+    let edge_id = derive_edge_id(interface, caller_var.as_deref(), &provider_var);
+    let edge_inject = build_per_edge_providers(rule.inject(), &edge_id, ctx.splits_path)?;
+
+    // Alias the matched provider; `between` also aliases the caller (outer).
+    let new_aliases: Vec<(u32, Option<String>)> = match rule {
+        SpliceRule::Before { provider_alias, .. } => vec![(provider_id, provider_alias.clone())],
+        SpliceRule::Between {
+            inner_alias,
+            outer_alias,
+            ..
+        } => {
+            let mut v = vec![(provider_id, inner_alias.clone())];
+            if let Some(cid) = caller_id {
+                v.push((cid, outer_alias.clone()));
             }
-            interface_matched = true;
-            if *inner_name == inner_var && *outer_name == outer_var {
-                full_match = true;
-                let edge_id = derive_edge_id(interface, Some(&outer_var), &inner_var);
-                let edge_inject = build_per_edge_providers(inject, &edge_id, ctx.splits_path)?;
-                let new_aliases = vec![
-                    (inner_id, inner_alias.clone()),
-                    (outer_id, outer_alias.clone()),
-                ];
-                let consumer_path = chain.consumer_split_path(
-                    i + 1,
-                    ctx.composition,
-                    ctx.splits_path,
-                    ctx.shim_comps,
-                );
-                contract_results.extend(add_to_inject_plan(
-                    interface,
-                    &edge_inject,
-                    i + 1,
-                    &new_aliases,
-                    &mut chain.aliases,
-                    &mut chain.inject_plan,
-                    &chain.interface.ty_fingerprint,
-                    consumer_path,
-                    ctx,
-                    accs,
-                )?);
-            }
+            v
         }
-    }
-    Ok(RuleApplyResult {
-        contract_results,
-        interface_matched,
-        full_match,
-    })
+    };
+
+    // Prefer the consumer's split (provider_idx + 1) so the adapter
+    // copies its import surface. At the outermost boundary there's no
+    // consumer, so fall back to the provider's own split — the adapter
+    // mirrors the provider's full import topology.
+    let consumer_path = chain
+        .consumer_split_path(
+            site.provider_idx + 1,
+            ctx.composition,
+            ctx.splits_path,
+            ctx.shim_comps,
+        )
+        .or_else(|| {
+            chain.consumer_split_path(
+                site.provider_idx,
+                ctx.composition,
+                ctx.splits_path,
+                ctx.shim_comps,
+            )
+        });
+
+    add_to_inject_plan(
+        interface,
+        &edge_inject,
+        site.provider_idx + 1,
+        &new_aliases,
+        &mut chain.aliases,
+        &mut chain.inject_plan,
+        &chain.interface.ty_fingerprint,
+        consumer_path,
+        ctx,
+        accs,
+    )
 }
 
-fn apply_rule_before(
-    rule: &SpliceRule,
-    chain: &mut Chain,
-    ctx: &SpliceCtx,
-    accs: &mut SpliceAccumulators,
-) -> anyhow::Result<RuleApplyResult> {
-    let mut contract_results = vec![];
-    let mut interface_matched = false;
-    let mut full_match = false;
-    if let SpliceRule::Before {
-        interface,
-        provider_name,
-        provider_alias,
-        inject,
-    } = rule
-    {
-        for (i, id) in chain.chain.iter().enumerate() {
-            if *interface != chain.interface.name {
-                continue;
+/// Emit a WARN for a rule that produced no full match, glob-aware:
+///
+/// - interface pattern matched **no** concrete interface → suggest close
+///   names via a glob-independent heuristic (never re-applying the glob);
+/// - interface matched but node-name patterns excluded every site → list
+///   the concrete matched interfaces and the node names present on them.
+fn emit_no_match_diag(
+    rule_idx: usize,
+    matcher: &RuleMatcher,
+    chains: &[Chain],
+    composition: &CompositionGraph,
+) {
+    let pattern = matcher.interface_raw().join(", ");
+
+    // Interfaces the pattern matched (ignoring node-name constraints),
+    // plus the node names on those chains. Empty ⇒ the interface itself
+    // matched nothing.
+    let mut matched_ifaces: Vec<&str> = vec![];
+    let mut node_names: BTreeSet<String> = BTreeSet::new();
+    for c in chains {
+        if matcher.interface_matches(&c.interface.name) {
+            let name = c.interface.name.as_str();
+            if !matched_ifaces.contains(&name) {
+                matched_ifaces.push(name);
             }
-            interface_matched = true;
-            let outer_node = &ctx.composition.nodes[id];
-            if let Some(provider) = provider_name {
-                if get_name(outer_node) != *provider {
-                    continue;
-                }
+            for id in &c.chain {
+                node_names.insert(get_name(&composition.nodes[id]).to_string());
             }
-            full_match = true;
-            let provider_var = get_name(outer_node).to_string();
-            // Caller name comes from the next position toward the
-            // consumer side of the chain; `None` when this match is
-            // the outermost chain position (boundary edge — caller
-            // is external to the composition).
-            let caller_var = chain
-                .chain
-                .get(i + 1)
-                .map(|caller_id| get_name(&ctx.composition.nodes[caller_id]).to_string());
-            let edge_id = derive_edge_id(interface, caller_var.as_deref(), &provider_var);
-            let edge_inject = build_per_edge_providers(inject, &edge_id, ctx.splits_path)?;
-            let new_aliases = vec![(*id, provider_alias.clone())];
-            // Prefer the consumer's split (i+1) so the adapter copies
-            // its import surface. At the outermost chain position
-            // there's no consumer, so fall back to the provider's own
-            // split (i) — the adapter mirrors the provider's full
-            // import topology.
-            let consumer_path = chain
-                .consumer_split_path(i + 1, ctx.composition, ctx.splits_path, ctx.shim_comps)
-                .or_else(|| {
-                    chain.consumer_split_path(i, ctx.composition, ctx.splits_path, ctx.shim_comps)
-                });
-            contract_results.extend(add_to_inject_plan(
-                interface,
-                &edge_inject,
-                i + 1,
-                &new_aliases,
-                &mut chain.aliases,
-                &mut chain.inject_plan,
-                &chain.interface.ty_fingerprint,
-                consumer_path,
-                ctx,
-                accs,
-            )?);
         }
     }
-    Ok(RuleApplyResult {
-        contract_results,
-        interface_matched,
-        full_match,
-    })
+
+    if matched_ifaces.is_empty() {
+        let available: Vec<&str> = chains.iter().map(|c| c.interface.name.as_str()).collect();
+        let suggestions = crate::select::suggest_interfaces(matcher.interface_raw(), &available);
+        let intended_msg = if suggestions.is_empty() {
+            String::new()
+        } else {
+            format!("\n\t  Possibly intended:    [{}]", suggestions.join(", "))
+        };
+        eprintln!(
+            "{}: rule {} — interface pattern '{}' matched no interfaces in the composition.\n\
+             \t  Available interfaces: [{}]{}",
+            "WARN".yellow().bold(),
+            rule_idx + 1,
+            pattern,
+            available.join(", "),
+            intended_msg
+        );
+    } else {
+        eprintln!(
+            "{}: rule {} — interface pattern '{}' matched [{}] but no node names matched.\n\
+             \t  Nodes on those interfaces: [{}]\n\
+             \t  Check the 'provider'/'inner'/'outer' patterns against these.",
+            "WARN".yellow().bold(),
+            rule_idx + 1,
+            pattern,
+            matched_ifaces.join(", "),
+            node_names.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
 }
 
 /// Codegen+build any tier-3/4 strategies in `to_inject`, stamping
@@ -1353,12 +1303,12 @@ fn add_to_inject_plan(
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
                 // `consumer_split` is the split the adapter inherits
-                // its import preamble from. Callers upstream (the chain
-                // walker in `apply_rule_before`) fall back from the
-                // consumer at `i + 1` to the provider at `i`, so this
-                // should always be `Some` for a valid composition. If
-                // it isn't, something upstream shipped us a broken
-                // chain and we can't generate a sound adapter.
+                // its import preamble from. `apply_site` falls back from
+                // the consumer at `provider_idx + 1` to the provider at
+                // `provider_idx`, so this should always be `Some` for a
+                // valid composition. If it isn't, something upstream
+                // shipped us a broken chain and we can't generate a
+                // sound adapter.
                 let consumer_split_path = consumer_split.as_deref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "No consumer/provider split available for interface '{interface_name}' \
@@ -2108,11 +2058,11 @@ mod tests {
         // `path: None` so contract validation degrades to a Warn and
         // the chain pass uses the simple `create_mdl` path (no fs /
         // adapter generation).
-        let rules = vec![SpliceRule::Before {
-            interface: "test:demo/inner".to_string(),
-            provider_name: Some("inner".to_string()),
-            provider_alias: None,
-            inject: vec![Injection {
+        let rules = vec![SpliceRule::before(
+            "test:demo/inner",
+            Some("inner"),
+            None,
+            vec![Injection {
                 name: "mw".to_string(),
                 path: None,
                 builtin: None,
@@ -2122,7 +2072,7 @@ mod tests {
                 adapter_info: None,
                 tier: None,
             }],
-        }];
+        )];
 
         let out = generate_wac(
             HashMap::new(),
@@ -2155,6 +2105,80 @@ mod tests {
              `mw` middleware (the inner `before` rule), but it doesn't. \
              middle block:\n{middle_block}\n\nFull WAC:\n{}",
             out.wac
+        );
+    }
+
+    // ── glob matching: end-to-end equivalence ────────────────────────
+
+    /// A globbed `interface` that resolves to the composition's one
+    /// concrete interface must emit byte-identical WAC to the exact
+    /// rule — globbing only changes *selection*; the matched name still
+    /// flows downstream unchanged. The YAML list form is the same.
+    #[test]
+    fn globbed_interface_yields_same_wac_as_exact() {
+        use crate::parse::config::parse_yaml;
+        const IFACE: &str = "wasi:http/handler@0.3.0";
+
+        // node-0 -> node-1 -> node-2 chain over IFACE, plus a top-level
+        // export so generation terminates normally.
+        let wac_for = |yaml: &str| {
+            let mut graph =
+                synth_graph(3, &[(1, IFACE, Some(0), false), (2, IFACE, Some(1), false)]);
+            graph.add_export("my:app/run@1.0.0".to_string(), 2, None);
+            let rules = parse_yaml(yaml).expect("config parses");
+            generate_wac(
+                HashMap::new(),
+                "/tmp/splicer-glob-splits",
+                &graph,
+                &rules,
+                None,
+                "test:glob",
+            )
+            .expect("generate_wac")
+            .wac
+        };
+
+        let exact = wac_for(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - name: mw
+"#,
+        );
+        // Sanity: the rule actually injected something.
+        assert!(
+            exact.contains("let mw = new my:mw {"),
+            "exact rule should inject mw; got:\n{exact}"
+        );
+
+        let globbed = wac_for(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: "wasi:*"
+    inject:
+      - name: mw
+"#,
+        );
+        assert_eq!(globbed, exact, "single-glob must equal exact WAC");
+
+        let pattern_list = wac_for(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: ["nope:*", "wasi:http/*"]
+    inject:
+      - name: mw
+"#,
+        );
+        assert_eq!(
+            pattern_list, exact,
+            "pattern-list glob must equal exact WAC"
         );
     }
 }

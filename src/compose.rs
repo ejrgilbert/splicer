@@ -785,11 +785,11 @@ mod tests {
         let (graph, node_paths) = build_graph_from_components(&comps)?;
 
         // Inject middleware only on the `my:providers/a@0.1.0` interface.
-        let rules = vec![SpliceRule::Before {
-            interface: "my:providers/a@0.1.0".to_string(),
-            provider_name: Some("provider-a".to_string()),
-            provider_alias: None,
-            inject: vec![Injection {
+        let rules = vec![SpliceRule::before(
+            "my:providers/a@0.1.0",
+            Some("provider-a"),
+            None,
+            vec![Injection {
                 name: "a-middleware".to_string(),
                 adapter_info: None,
                 tier: None,
@@ -799,7 +799,7 @@ mod tests {
                 config_provider_path: None,
                 path: None,
             }],
-        }];
+        )];
 
         let out = crate::wac::generate_wac(
             HashMap::new(),
@@ -876,26 +876,28 @@ mod tests {
         };
         let adapter_a_path = write_minimal("adapter-a");
         let adapter_b_path = write_minimal("adapter-b");
-        let mk_rule = |iface: &str, provider: &str, adapter_path: &str| SpliceRule::Before {
-            interface: iface.to_string(),
-            provider_name: Some(provider.to_string()),
-            provider_alias: None,
-            inject: vec![Injection {
-                name: "tracing".to_string(),
-                path: Some(mdl_path.clone()),
-                builtin: None,
-                builtin_config: Default::default(),
-                config_as_wave: None,
-                config_provider_path: None,
-                adapter_info: Some(AdapterInjectionInfo {
-                    adapter_path: adapter_path.to_string(),
-                    matched_hook_interfaces: vec![
-                        "splicer:tier1/before".to_string(),
-                        "splicer:tier1/after".to_string(),
-                    ],
-                }),
-                tier: None,
-            }],
+        let mk_rule = |iface: &str, provider: &str, adapter_path: &str| {
+            SpliceRule::before(
+                iface,
+                Some(provider),
+                None,
+                vec![Injection {
+                    name: "tracing".to_string(),
+                    path: Some(mdl_path.clone()),
+                    builtin: None,
+                    builtin_config: Default::default(),
+                    config_as_wave: None,
+                    config_provider_path: None,
+                    adapter_info: Some(AdapterInjectionInfo {
+                        adapter_path: adapter_path.to_string(),
+                        matched_hook_interfaces: vec![
+                            "splicer:tier1/before".to_string(),
+                            "splicer:tier1/after".to_string(),
+                        ],
+                    }),
+                    tier: None,
+                }],
+            )
         };
         let rules = vec![
             mk_rule("my:providers/a@0.1.0", "provider-a", &adapter_a_path),
