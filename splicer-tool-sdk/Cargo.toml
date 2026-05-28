@@ -11,9 +11,17 @@ keywords = ["wasm", "WebAssembly", "components", "splicer"]
 categories = ["wasm"]
 
 [workspace]
+members = ["derive"]
+
+[features]
+# Off by default.
+derive = ["dep:splicer-tool-sdk-derive"]
 
 [dependencies]
 wasm-wave = { version = "=0.249", default-features = false, features = ["std"] }
+splicer-tool-sdk-derive = { version = "0.1.0", path = "derive", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+splicer-tool-sdk-derive = { version = "0.1.0", path = "derive" }
+wit-bindgen = "0.51.0"

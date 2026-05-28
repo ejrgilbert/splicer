@@ -1,0 +1,19 @@
+[package]
+name = "splicer-tool-sdk-derive"
+version = "0.1.0"
+edition = "2021"
+authors = ["Elizabeth Gilbert"]
+description = "Derive macro for splicer-tool-sdk's WitTyped trait."
+license = "Apache-2.0"
+repository = "https://github.com/ejrgilbert/splicer"
+keywords = ["wasm", "WebAssembly", "components", "splicer"]
+categories = ["wasm"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+heck = "0.5"

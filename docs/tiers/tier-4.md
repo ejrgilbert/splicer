@@ -58,6 +58,14 @@ splice-time.
 `hello-tier4` won't wrap an interface whose return type contains a
 resource handle (resources can't impl `Default`).
 
+`WitTyped` is impl'd for `R` automatically: the wrapper codegen emits
+it for the types wit-bindgen generates from the target WIT, and the SDK
+hand-writes it for the WIT core types. For types you define yourself, or for a
+component you author with your own `wit_bindgen::generate!` call, derive
+it with `#[derive(splicer_tool_sdk::WitTyped)]` (enable the SDK's
+`derive` feature; the macro's rustdoc covers both usages and the shape
+mapping).
+
 ## Tier-4-specific limitation
 
 **Value-typed returns only.** Today, tier-4 can wrap interfaces whose

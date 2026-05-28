@@ -28,6 +28,13 @@ pub use types::{
 };
 pub use bridge::{args_to_typed, cells_to_typed, cells_to_value, BridgeError, WitTyped};
 
+/// Derive `WitTyped` for a user-authored struct (WIT record) or enum
+/// (WIT enum/variant). Behind the off-by-default `derive` feature.
+/// See the macro's own docs for the Rust-to-WIT shape mapping and
+/// the `#[wit(name = "...")]` override.
+#[cfg(feature = "derive")]
+pub use splicer_tool_sdk_derive::WitTyped;
+
 /// Re-export wasm-wave so consumers depend on one crate and pick up
 /// the same `WasmType` / `WasmValue` traits the SDK's bridge speaks.
 pub use wasm_wave;
