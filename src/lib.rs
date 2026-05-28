@@ -84,6 +84,7 @@ mod compose;
 mod config_provider;
 mod contract;
 mod parse;
+mod select;
 mod split;
 mod strategies;
 mod wac;
@@ -143,6 +144,7 @@ pub mod lowlevel {
         validate_contract, versioned_interface, ContractResult, TIER1_INTERFACES,
     };
     pub use crate::parse::config::{parse_yaml, Injection, SpliceRule};
+    pub use crate::select::RuleMatcher;
     pub use crate::split::{gen_split_path, split_out_composition, PATH_TO_SPLITS};
     pub use crate::wac::{generate_wac, GeneratedAdapter, WacOutput, INST_PREFIX};
 }

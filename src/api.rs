@@ -563,11 +563,11 @@ rules:
         // unknown builtin, since the registry isn't consulted at
         // parse time.
         use crate::parse::config::{Injection, SpliceRule};
-        let mut rules = vec![SpliceRule::Before {
-            interface: "wasi:logging/log@0.1.0".into(),
-            provider_name: None,
-            provider_alias: None,
-            inject: vec![Injection {
+        let mut rules = vec![SpliceRule::before(
+            "wasi:logging/log@0.1.0",
+            None,
+            None,
+            vec![Injection {
                 name: "ghost".into(),
                 path: None,
                 builtin: Some("does-not-exist".into()),
@@ -577,7 +577,7 @@ rules:
                 adapter_info: None,
                 tier: None,
             }],
-        }];
+        )];
         let tmp = tempfile::tempdir().unwrap();
         let err = materialize_tier1_2_builtins(&mut rules, tmp.path()).unwrap_err();
         let msg = format!("{err:#}");

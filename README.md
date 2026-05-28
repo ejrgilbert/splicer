@@ -195,6 +195,10 @@ rules:
       - builtin: hello-tier1
 ```
 
+`interface` and the node-name fields (`provider`/`inner`/`outer`) accept
+glob patterns like `wasi:*` and lists like `["wasi:*", "my:*"]`; the
+node-name fields are optional (omitted matches any).
+
 See [`docs/splice-config.md`](docs/splice-config.md) for the full
 specification.
 
