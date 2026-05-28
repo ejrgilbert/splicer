@@ -310,5 +310,6 @@ strategy configurations applied to `between_subgraph` boundaries.
 - `wit/common/world.wit`: cell representation that flows end-to-end.
 - `src/adapter/typed/`: shipped codegen + cargo build pipeline.
 - `splicer-tool-sdk/`: home for `TransformStrategy`,
-  `VirtualizeStrategy`, `WitTyped`, `cells_to_typed`, and the SDK
-  helpers still to land (`TypedVisit`, `TraceReader`, `#[derive(WitTyped)]`).
+  `VirtualizeStrategy`, `WitTyped`, `cells_to_typed`, `TraceReader`,
+  and `#[derive(WitTyped)]` (in `splicer-tool-sdk/derive/`, behind the
+  `derive` feature). The SDK helper still to land is `TypedVisit`.

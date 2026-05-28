@@ -6,12 +6,17 @@
 //! - **WIT core types** (this file): primitives (`bool`, ints, floats,
 //!   `char`, `String`) and generic containers (`Vec<T>`, `Option<T>`,
 //!   `Result<T, E>`). These have a fixed Rust shape, so the impls are
-//!   hand-written here and shared across every wrapper crate.
-//! - **User-defined types** (in `splicer::adapter::typed::emit_wit_typed`):
+//!   handwritten here and shared across every wrapper crate.
+//! - **Generated wrapper types** (in `splicer::adapter::typed::emit_wit_typed`):
 //!   record, enum, and variant types that a user declares in their
 //!   target WIT. Their Rust shape changes per WIT, so splicer
 //!   generates the impls per wrapper crate. The generated impls call
 //!   into the core-type impls here for field and element conversion.
+//! - **User-authored types** (via `#[derive(WitTyped)]`, behind the
+//!   `derive` feature): structs and enums a user declares directly in
+//!   a strategy crate, where there is no WIT to drive codegen. The
+//!   derive emits the same impl shape as the wrapper codegen, mapping
+//!   field/case identifiers to kebab-case WIT names.
 //!
 //! Also in this file: the lower-level [`cells_to_value`] function
 //! that turns cells (the wire format used by tier-2 hooks and
