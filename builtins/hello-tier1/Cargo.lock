@@ -148,9 +148,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hello-tier1"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
- "splicer-builtin-manifest",
+ "splicer-builtin-protocol",
  "wit-bindgen",
 ]
 
@@ -295,8 +295,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "splicer-builtin-manifest"
-version = "0.1.0"
+name = "splicer-builtin-protocol"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",

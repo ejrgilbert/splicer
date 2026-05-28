@@ -76,3 +76,31 @@ clean-builtins:
 	  [ -f "$$d/Cargo.toml" ] || continue; \
 	  rm -rf "$$d/target" "$$d/wit/deps" "$$d/wkg.lock"; \
 	done
+
+# Run every test suite in the repo. The repo is several independent
+# cargo workspaces (the root crate, splicer-tool-sdk, and each builtin),
+# so a single `cargo test` at the root reaches none of the others; this
+# target visits each. Used by CI and as the one-liner for local runs.
+.PHONY: test test-root test-sdk test-builtins
+test: test-root test-sdk test-builtins
+
+# The root crate's otel smoke tests read assets/builtins/*.wasm, so the
+# builtins are built first; build-builtins also fetches the wit/deps the
+# builtin crates need to compile at all.
+test-root: build-builtins
+	@echo "== test: root splicer crate =="
+	cargo test --locked --all-features --all-targets
+
+# `--workspace` picks up the derive proc-macro member alongside the SDK.
+test-sdk:
+	@echo "== test: splicer-tool-sdk workspace =="
+	cd splicer-tool-sdk && cargo test --locked --all-features --all-targets --workspace
+
+# Each builtin is its own workspace. Looping (rather than naming each)
+# means a builtin that gains tests later is picked up with no edit here.
+test-builtins: build-builtins
+	@for d in $(BUILTINS_DIR)/*/; do \
+	  [ -f "$$d/Cargo.toml" ] || continue; \
+	  echo "== test: $$d =="; \
+	  ( cd "$$d" && cargo test --locked --all-targets ) || exit 1; \
+	done

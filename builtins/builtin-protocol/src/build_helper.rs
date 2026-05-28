@@ -103,6 +103,10 @@ fn build_section_static(payload_len: usize, builtin_name: &str) -> TokenStream {
         #[doc = " Manifest bytes attached as a wasm custom section. Splicer finds it"]
         #[doc = " by name via `wasmparser`; the bytes never touch linear memory at"]
         #[doc = " runtime. `#[used]` keeps the linker from dropping the symbol."]
+        #[doc = ""]
+        #[doc = " Gated to wasm: only the wasm artifact carries the section, and"]
+        #[doc = " mach-o would reject this section name on a host build."]
+        #[cfg(target_arch = "wasm32")]
         #[link_section = #section]
         #[used]
         static SPLICER_BUILTIN_MANIFEST: [u8; #len] =
