@@ -101,8 +101,8 @@ pub fn cell_to_str(tree: &FieldTree, idx: u32) -> (String, String) {
     }
 }
 
-/// Convenience: format the root cell as `"type: value"`.
-pub fn format_field_tree(tree: &FieldTree) -> String {
+/// Convenience: render the root cell as `"type: value"`.
+pub fn render_field_tree(tree: &FieldTree) -> String {
     let (ty, val) = cell_to_str(tree, tree.root);
     format!("{ty}: {val}")
 }
