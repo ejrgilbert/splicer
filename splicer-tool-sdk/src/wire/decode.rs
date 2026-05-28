@@ -1,11 +1,11 @@
 //! Binary decoder for streamed `FieldTree` events. Counterpart to
-//! [`crate::encode`]; reads what the encoder writes.
+//! [`super::encode`]; reads what the encoder writes.
 //!
 //! Paired with `wire-format.md`; keep decoding logic in sync.
 
 use std::fmt;
 
-use crate::encode::{
+use super::encode::{
     Tag, MAGIC, OPTIONAL_ABSENT, OPTIONAL_PRESENT, PHASE_CALL, PHASE_RETURN, VERSION,
 };
 use crate::types::{

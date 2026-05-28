@@ -38,7 +38,7 @@ Multi-edge doc steps 2-3:
 Substrate foundation items:
 - [x] Strategy traits in `splicer-tool-sdk` (`TransformStrategy`, `VirtualizeStrategy` — split per behavior instead of one unified trait)
 - [ ] `#[derive(WitTyped)]` proc-macro for user types (codegen auto-impls it for generated wrapper types today; standalone derive is for user code)
-- [ ] `TraceReader` skeleton (no resource correlation yet)
+- [x] `TraceReader` (no resource correlation yet) — `splicer-tool-sdk/src/trace.rs`; forward cursor with typed call + return decode (`next_call`/`next_return`, `next_call_typed`/`next_return_typed` + `bridge::args_to_typed`), backing both the driver (call) and virtualize (return) paths
 - [x] Codegen template (`syn`/`quote`) at `src/adapter/typed/`
 - [x] Cargo build pipeline (persistent per-build dirs under `<user-cache>/splicer/typed-builtins/builds/` + shared `CARGO_TARGET_DIR`; cargo's incremental handles staleness, no custom wasm cache)
 - [x] `hello-tier3` + `hello-tier4` smoke builtins (end-to-end through `./run.sh --builtin-hello-tier{3,4}`)

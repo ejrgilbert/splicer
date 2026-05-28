@@ -11,21 +11,22 @@
 //!
 //! See the crate-root `README.md` for the full `with:` boilerplate.
 
-pub mod decode;
-pub mod encode;
-pub mod format;
+pub mod bridge;
+pub mod render;
 pub mod strategy;
+pub mod trace;
 pub mod types;
-pub mod wave_bridge;
+pub mod wire;
 
-pub use decode::{DecodeError, Event, Reader};
-pub use encode::{write_call_event, write_field_tree, write_return_event, write_stream_header};
-pub use format::{cell_to_str, format_field_tree};
+pub use wire::decode::{DecodeError, Event, Reader};
+pub use wire::encode::{write_call_event, write_field_tree, write_return_event, write_stream_header};
+pub use render::{cell_to_str, render_field_tree};
 pub use strategy::{TransformStrategy, VirtualizeStrategy};
+pub use trace::{TraceError, TraceReader};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };
-pub use wave_bridge::{cells_to_typed, cells_to_value, BridgeError, WitTyped};
+pub use bridge::{args_to_typed, cells_to_typed, cells_to_value, BridgeError, WitTyped};
 
 /// Re-export wasm-wave so consumers depend on one crate and pick up
 /// the same `WasmType` / `WasmValue` traits the SDK's bridge speaks.

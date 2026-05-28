@@ -118,8 +118,8 @@ Two distinct layers, deliberately separated:
   other tooling that surfaces typed values to a human or another
   toolchain speaks WAVE.
 
-The bridge between the two is [`WitTyped`](../../splicer-tool-sdk/src/wave_bridge.rs)
-+ [`cells_to_typed`](../../splicer-tool-sdk/src/wave_bridge.rs). The
+The bridge between the two is [`WitTyped`](../../splicer-tool-sdk/src/bridge.rs)
++ [`cells_to_typed`](../../splicer-tool-sdk/src/bridge.rs). The
 tier-3/4 codegen auto-impls `WitTyped` for every type wit-bindgen
 generates; `cells_to_typed::<R>(cells)` walks a cells stream and
 constructs an `R` by dispatching through the impls.

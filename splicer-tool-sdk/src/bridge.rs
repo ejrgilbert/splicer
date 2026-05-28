@@ -26,7 +26,7 @@ use std::fmt;
 use wasm_wave::value::{Type as WaveType, Value as WaveValue};
 use wasm_wave::wasm::{WasmType, WasmTypeKind, WasmValue, WasmValueError};
 
-use crate::types::{Cell, FieldTree};
+use crate::types::{Cell, Field, FieldTree};
 
 /// Carries a Rust type's WIT type info plus both conversion
 /// directions to/from [`WaveValue`].
@@ -266,6 +266,29 @@ impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 =
 pub fn cells_to_typed<T: WitTyped>(tree: &FieldTree, root: u32) -> Result<T, BridgeError> {
     let value: WaveValue = cells_to_value(tree, root, &T::wave_type())?;
     T::from_value(&value)
+}
+
+/// Decode a function-call argument list into a tuple `Args`.
+///
+/// Each argument is its own self-contained [`FieldTree`]. This walks
+/// `Args`'s tuple element types, decodes the i-th argument against the
+/// i-th element, and assembles the tuple. `Args` must be a tuple type
+/// whose arity matches `args.len()`; a zero-argument call has no tuple
+/// form, so read those from the raw event instead.
+pub fn args_to_typed<Args: WitTyped>(args: &[Field]) -> Result<Args, BridgeError> {
+    let ty = Args::wave_type();
+    let elem_types: Vec<WaveType> = ty.tuple_element_types().collect();
+    if args.len() != elem_types.len() {
+        return Err(BridgeError::ExpectedTypeShape(
+            "argument count does not match the tuple arity of Args",
+        ));
+    }
+    let elems = args
+        .iter()
+        .zip(&elem_types)
+        .map(|(f, t)| cells_to_value::<WaveValue>(&f.tree, f.tree.root, t))
+        .collect::<Result<Vec<_>, _>>()?;
+    Args::from_value(&WaveValue::make_tuple(&ty, elems)?)
 }
 
 /// Decode the cell at `root` (an index into `tree.cells`) into a
