@@ -670,6 +670,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "buffer"
@@ -705,6 +706,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "severity"
@@ -731,6 +733,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "buffer"
@@ -751,6 +754,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "denylist"
@@ -777,6 +781,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "limit"
@@ -805,6 +810,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "buffer"
@@ -838,6 +844,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "ratio"
@@ -859,6 +866,7 @@ mod tests {
         let src = r#"
             [builtin]
             description = "x"
+            tier = 1
 
             [[key]]
             name = "has space"
@@ -874,6 +882,7 @@ mod tests {
         let src = "\
             [builtin]\n\
             description = \"x\"\n\
+            tier = 1\n\
             \n\
             [[key]]\n\
             name = \"bad\\nnewline\"\n\
@@ -894,7 +903,8 @@ mod tests {
     #[test]
     fn extract_for_builtin_rejects_wrong_name() {
         let toml = r#"[builtin]
-            description = "x""#;
+            description = "x"
+            tier = 1"#;
         let wasm = module_with_custom_section(&section_name_for("hello-tier1"), toml.as_bytes());
         let err = extract_for_builtin(&wasm, "otel-bare-metrics").unwrap_err();
         assert!(err.contains("expected manifest for builtin"), "{err}");

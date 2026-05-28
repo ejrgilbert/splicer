@@ -15,17 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
-name = "builtin-manifest"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde",
- "toml",
- "wasmparser 0.247.0",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -201,9 +190,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "otel-bare-metrics"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
- "builtin-manifest",
+ "splicer-builtin-protocol",
  "wit-bindgen",
 ]
 
@@ -304,6 +293,17 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "splicer-builtin-protocol"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "toml",
+ "wasmparser 0.247.0",
+]
 
 [[package]]
 name = "syn"
