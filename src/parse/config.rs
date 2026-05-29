@@ -1,4 +1,4 @@
-use crate::select::{Constraint, Pattern, RuleMatcher, SiteKind};
+use crate::select::{Constraint, FuncPred, Pattern, RuleMatcher, SiteKind, ValueProperty};
 use anyhow::bail;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -119,6 +119,8 @@ impl PatternSpec {
 pub struct YamlStrategyBefore {
     interface: PatternSpec,
     provider: Option<YamlProviderOpt>,
+    #[serde(rename = "all-funcs")]
+    all_funcs: Option<YamlFuncPred>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +128,32 @@ pub struct YamlStrategyBetween {
     interface: PatternSpec,
     inner: Option<YamlProviderOpt>,
     outer: Option<YamlProviderOpt>,
+    #[serde(rename = "all-funcs")]
+    all_funcs: Option<YamlFuncPred>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct YamlFuncPred {
+    #[serde(rename = "async")]
+    is_async: Option<bool>,
+    args: Option<ValuePropSpec>,
+    results: Option<ValuePropSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ValuePropSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ValuePropSpec {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            ValuePropSpec::One(s) => vec![s],
+            ValuePropSpec::Many(v) => v,
+        }
+    }
 }
 
 /// A node-name match field plus its alias. `name` matches the instance
@@ -357,7 +385,7 @@ impl SpliceRule {
             ));
         }
         SpliceRule::Before {
-            matcher: RuleMatcher::new(SiteKind::Before, interface, constraints),
+            matcher: RuleMatcher::new(SiteKind::Before, interface, None, constraints),
             provider_alias,
             inject,
         }
@@ -421,6 +449,50 @@ fn node_name_pattern(
         .and_then(|p| p.name)
         .map(|name| compile_pattern(rule_num, field, name))
         .transpose()
+}
+
+fn compile_func_pred(
+    rule_num: usize,
+    pred: Option<YamlFuncPred>,
+) -> anyhow::Result<Option<FuncPred>> {
+    let Some(YamlFuncPred {
+        is_async,
+        args,
+        results,
+    }) = pred
+    else {
+        return Ok(None);
+    };
+    let args = compile_value_props(rule_num, "args", args)?;
+    let results = compile_value_props(rule_num, "results", results)?;
+    if is_async.is_none() && args.is_empty() && results.is_empty() {
+        bail!(
+            "rule {rule_num}: 'all-funcs' has no constraints — omit the key to impose no \
+             function requirement, or set 'async'/'args'/'results'"
+        );
+    }
+    Ok(Some(FuncPred::new(is_async, args, results)))
+}
+
+fn compile_value_props(
+    rule_num: usize,
+    field: &str,
+    spec: Option<ValuePropSpec>,
+) -> anyhow::Result<Vec<ValueProperty>> {
+    let Some(spec) = spec else {
+        return Ok(vec![]);
+    };
+    spec.into_vec()
+        .iter()
+        .map(|kw| match kw.as_str() {
+            "concrete" => Ok(ValueProperty::Concrete),
+            "defaultable" => Ok(ValueProperty::Defaultable),
+            other => bail!(
+                "rule {rule_num}: 'all-funcs.{field}' has unknown property '{other}' \
+                 (expected 'concrete' or 'defaultable')"
+            ),
+        })
+        .collect()
 }
 
 impl ConfigFile {
@@ -614,16 +686,18 @@ fn into_splice_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<SpliceRul
     if let Some(YamlStrategyBefore {
         interface,
         provider,
+        all_funcs,
     }) = before
     {
         let interface = compile_pattern(rule_num, "interface", interface)?;
+        let all_funcs = compile_func_pred(rule_num, all_funcs)?;
         let provider_alias = provider.as_ref().and_then(|p| p.alias.clone());
         let constraints = node_name_pattern(rule_num, "provider", provider)?
             .map(Constraint::Provider)
             .into_iter()
             .collect();
         Ok(SpliceRule::Before {
-            matcher: RuleMatcher::new(SiteKind::Before, interface, constraints),
+            matcher: RuleMatcher::new(SiteKind::Before, interface, all_funcs, constraints),
             provider_alias,
             inject,
         })
@@ -631,9 +705,11 @@ fn into_splice_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<SpliceRul
         interface,
         inner,
         outer,
+        all_funcs,
     }) = between
     {
         let interface = compile_pattern(rule_num, "interface", interface)?;
+        let all_funcs = compile_func_pred(rule_num, all_funcs)?;
         let inner_alias = inner.as_ref().and_then(|p| p.alias.clone());
         let outer_alias = outer.as_ref().and_then(|p| p.alias.clone());
         // `inner` is provider-side, `outer` is caller-side.
@@ -645,7 +721,7 @@ fn into_splice_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<SpliceRul
         .flatten()
         .collect();
         Ok(SpliceRule::Between {
-            matcher: RuleMatcher::new(SiteKind::Between, interface, constraints),
+            matcher: RuleMatcher::new(SiteKind::Between, interface, all_funcs, constraints),
             inner_alias,
             outer_alias,
             inject,
@@ -1520,6 +1596,101 @@ rules:
           alias: greeter
 "#,
             "injection name 'greeter' is used in rule 1 but was already declared in rule 1",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // all-funcs predicate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_all_funcs_scalar_and_list() {
+        // `args` scalar, `results` list — the list ANDs both properties.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: "*"
+      all-funcs:
+        async: true
+        args: concrete
+        results: [concrete, defaultable]
+    inject:
+      - name: mw
+"#;
+        let rules = parse_yaml(yaml).expect("all-funcs should parse");
+        let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
+        assert_eq!(pred.is_async(), Some(true));
+        assert_eq!(pred.args(), [ValueProperty::Concrete]);
+        assert_eq!(
+            pred.results(),
+            [ValueProperty::Concrete, ValueProperty::Defaultable]
+        );
+    }
+
+    #[test]
+    fn parse_all_funcs_async_false() {
+        // The symmetric all-sync gate.
+        let yaml = r#"
+version: 1
+rules:
+  - between:
+      interface: "wasi:*"
+      all-funcs:
+        async: false
+    inject:
+      - name: mw
+"#;
+        let rules = parse_yaml(yaml).expect("async:false should parse");
+        let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
+        assert_eq!(pred.is_async(), Some(false));
+        assert!(pred.args().is_empty() && pred.results().is_empty());
+    }
+
+    #[test]
+    fn parse_all_funcs_absent_is_none() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: "wasi:*"
+    inject:
+      - name: mw
+"#;
+        let rules = parse_yaml(yaml).expect("parse");
+        assert!(rules[0].matcher().all_funcs().is_none());
+    }
+
+    #[test]
+    fn validate_all_funcs_unknown_keyword() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: "*"
+      all-funcs:
+        results: [concrete, bogus]
+    inject:
+      - name: mw
+"#,
+            "unknown property 'bogus'",
+        );
+    }
+
+    #[test]
+    fn validate_all_funcs_empty_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: "*"
+      all-funcs: {}
+    inject:
+      - name: mw
+"#,
+            "'all-funcs' has no constraints",
         );
     }
 }

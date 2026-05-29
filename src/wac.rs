@@ -1,7 +1,9 @@
 use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
-use cviz::model::{ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection};
+use cviz::model::{
+    ComponentNode, CompositionGraph, ExportInfo, InterfaceConnection, InterfaceType, InternedId,
+};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -69,6 +71,8 @@ impl Chain {
 struct Contract {
     name: String,
     ty_fingerprint: Option<String>,
+    /// Structured signature of the matched interface
+    interface_type: Option<InterfaceType>,
 }
 
 /// One entry in [`WacOutput::generated_adapters`] — a tier-1 adapter
@@ -767,6 +771,7 @@ pub fn generate_wac(
             source_instance,
             is_host_import,
             fingerprint,
+            interface_type,
             ..
         } in node.imports.iter()
         {
@@ -799,6 +804,7 @@ pub fn generate_wac(
                     interface: Contract {
                         name: interface_name.to_string(),
                         ty_fingerprint: fingerprint.clone(),
+                        interface_type: interface_type.clone(),
                     },
                     chain,
                     aliases: HashMap::new(),
@@ -815,7 +821,7 @@ pub fn generate_wac(
         ExportInfo {
             source_instance: source_inst,
             fingerprint,
-            ..
+            ty,
         },
     ) in composition.component_exports.iter()
     {
@@ -824,10 +830,19 @@ pub fn generate_wac(
         }
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
+        // Exports carry the type as an interned id, not inline — resolve
+        // it through the arena so `all-funcs:` can read the signature.
+        let interface_type = match ty {
+            Some(InternedId::Interface(id)) => {
+                Some(composition.arena.lookup_interface(*id).clone())
+            }
+            _ => None,
+        };
         chains.push(Chain {
             interface: Contract {
                 name: interface.to_string(),
                 ty_fingerprint: fingerprint.clone(),
+                interface_type,
             },
             chain: vec![*source_inst],
             aliases: HashMap::new(),
@@ -854,12 +869,16 @@ pub fn generate_wac(
         // non-empty result is the match, so there's nothing else to ask.
         let mut sites: Vec<SpliceSite> = vec![];
         for (chain_idx, chain) in chains.iter().enumerate() {
-            sites.extend(matcher.select(
-                chain_idx,
-                &chain.chain,
-                &chain.interface.name,
-                composition,
-            ));
+            let chain_sites = matcher
+                .select(
+                    chain_idx,
+                    &chain.chain,
+                    &chain.interface.name,
+                    chain.interface.interface_type.as_ref(),
+                    composition,
+                )
+                .with_context(|| format!("rule {}", rule_idx + 1))?;
+            sites.extend(chain_sites);
         }
         // No match: warn and move on. Working out *why* (interface
         // missed vs. node names missed) is a cold path, so it stays in
@@ -1910,6 +1929,7 @@ mod tests {
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
             ty_fingerprint: None,
+            interface_type: None,
         };
         let graph = synth_graph(1, &[]);
         let mut plan = EmitPlan::new();
@@ -1972,6 +1992,7 @@ mod tests {
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
             ty_fingerprint: None,
+            interface_type: None,
         };
         let graph = synth_graph(1, &[]);
         let mut plan = EmitPlan::new();
@@ -2179,6 +2200,155 @@ rules:
         assert_eq!(
             pattern_list, exact,
             "pattern-list glob must equal exact WAC"
+        );
+    }
+
+    // ── all-funcs: end-to-end (threading + error propagation) ─────────
+
+    use cviz::model::{FuncSignature, InstanceInterface, TypeArena, ValueType};
+
+    const AF_IFACE: &str = "wasi:http/handler@0.3.0";
+
+    /// A globbed interface gated to async + concrete-result interfaces.
+    /// Scoped to `wasi:*` so it targets only the typed chain under test,
+    /// not the untyped `my:app/run` export anchor (which a bare `*` would
+    /// match and — correctly — hard-error on as undecidable).
+    const ASYNC_CONCRETE_RULE: &str = r#"
+version: 1
+rules:
+  - before:
+      interface: "wasi:*"
+      all-funcs:
+        async: true
+        results: concrete
+    inject:
+      - name: mw
+"#;
+
+    /// An instance interface with one function returning a single value.
+    fn one_func_instance(
+        arena: &mut TypeArena,
+        is_async: bool,
+        result: ValueType,
+    ) -> InterfaceType {
+        let rid = arena.intern_val(result);
+        InterfaceType::Instance(InstanceInterface {
+            functions: [(
+                "handle".to_string(),
+                FuncSignature {
+                    is_async,
+                    param_names: vec![],
+                    params: vec![],
+                    results: vec![rid],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            type_exports: Default::default(),
+        })
+    }
+
+    /// `prov(0) → cons(1)` chain over `AF_IFACE`; the import carries the
+    /// type `build`s into the graph's own arena. `None` ⇒ undecidable.
+    /// A top-level export anchors generation.
+    fn import_seeded_graph(
+        build: impl FnOnce(&mut TypeArena) -> Option<InterfaceType>,
+    ) -> CompositionGraph {
+        let mut g = CompositionGraph::new();
+        let ty = build(&mut g.arena);
+        g.add_node(0, ComponentNode::new("$prov".into(), 0, 0));
+        let mut cons = ComponentNode::new("$cons".into(), 1, 1);
+        cons.add_import(InterfaceConnection {
+            interface_name: AF_IFACE.to_string(),
+            source_instance: Some(0),
+            is_host_import: false,
+            fingerprint: None,
+            interface_type: ty,
+        });
+        g.add_node(1, cons);
+        g.add_export("my:app/run@1.0.0".to_string(), 1, None);
+        g
+    }
+
+    fn generate(graph: &CompositionGraph, yaml: &str) -> anyhow::Result<WacOutput> {
+        let rules = crate::parse::config::parse_yaml(yaml).expect("config parses");
+        generate_wac(
+            HashMap::new(),
+            "/tmp/splicer-allfuncs-splits",
+            graph,
+            &rules,
+            None,
+            "test:allfuncs",
+        )
+    }
+
+    #[test]
+    fn all_funcs_e2e_import_seeded_gates_on_shape() {
+        // async + concrete: the gate passes. That it splices (rather than
+        // hard-erroring as undecidable) proves the import-seeded chain
+        // threaded the interface type onto the Contract.
+        let g = import_seeded_graph(|a| Some(one_func_instance(a, true, ValueType::U32)));
+        let out = generate(&g, ASYNC_CONCRETE_RULE).expect("decidable");
+        assert!(out.any_rule_matched);
+        assert!(
+            out.wac.contains("let mw = new my:mw {"),
+            "async/concrete interface should be spliced; got:\n{}",
+            out.wac
+        );
+
+        // One sync function fails `async: true` → no match, no injection.
+        let g = import_seeded_graph(|a| Some(one_func_instance(a, false, ValueType::U32)));
+        let out = generate(&g, ASYNC_CONCRETE_RULE).expect("decidable");
+        assert!(!out.any_rule_matched);
+        assert!(
+            !out.wac.contains("let mw ="),
+            "sync interface must not be spliced"
+        );
+
+        // A resource result fails `concrete` even when async.
+        let g = import_seeded_graph(|a| {
+            Some(one_func_instance(
+                a,
+                true,
+                ValueType::Resource("response".into()),
+            ))
+        });
+        let out = generate(&g, ASYNC_CONCRETE_RULE).expect("decidable");
+        assert!(
+            !out.any_rule_matched,
+            "resource-bearing result must not be spliced"
+        );
+    }
+
+    #[test]
+    fn all_funcs_e2e_standalone_export_is_threaded() {
+        // A lone exported interface becomes a standalone-export chain.
+        // `add_export` interns the type; a decidable splice proves that
+        // path resolves the interned type onto the Contract too.
+        let mut g = CompositionGraph::new();
+        let ty = one_func_instance(&mut g.arena, true, ValueType::U32);
+        g.add_node(0, ComponentNode::new("$prov".into(), 0, 0));
+        g.add_export(AF_IFACE.to_string(), 0, Some(ty));
+        let out = generate(&g, ASYNC_CONCRETE_RULE).expect("decidable");
+        assert!(out.any_rule_matched, "standalone export should be spliced");
+    }
+
+    #[test]
+    fn all_funcs_e2e_undecidable_propagates_error() {
+        // all-funcs set but the interface type didn't parse ⇒ generate_wac
+        // hard-errors, naming the interface and the rule.
+        let g = import_seeded_graph(|_| None);
+        let err = generate(&g, ASYNC_CONCRETE_RULE)
+            .map(|_| ())
+            .expect_err("undecidable must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(AF_IFACE),
+            "error should name the interface; got: {msg}"
+        );
+        assert!(
+            msg.contains("rule 1"),
+            "error should name the rule; got: {msg}"
         );
     }
 }

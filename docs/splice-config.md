@@ -107,6 +107,62 @@ compiled when the config is parsed; an invalid glob (e.g. an unterminated
 
 ---
 
+# Function-shape matching (`all-funcs`)
+
+`before` and `between` accept an optional `all-funcs:` block that gates
+the match on a **property of the target interface's functions**, not just
+its name. The properties apply to **every** function of the matched
+interface:
+
+```yaml
+before:
+  interface: "*"                     # broad glob
+  all-funcs:                         # gate glob match to compatible targets
+    async: true                      # every function is `async func`
+    results: [concrete, defaultable] # every result satisfies both
+```
+
+Omitting `all-funcs:` imposes no function gate, so every name-only config
+keeps working unchanged. An empty `all-funcs: {}` is rejected — omit the
+key to mean "no requirement".
+
+## Keys
+
+| Key       | Value                       | Holds when …                                                             |
+|-----------|-----------------------------|--------------------------------------------------------------------------|
+| `async`   | bool                        | `true`: every function is `async func`; `false`: every function is sync. |
+| `args`    | keyword or list of keywords | every argument of every function satisfies the property (or properties). |
+| `results` | keyword or list of keywords | every result of every function satisfies the property (or properties).   |
+
+Value-property keywords for `args` / `results`:
+
+| Keyword       | A type has it when …                                                                                                                                                                      |
+|---------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `concrete`    | is directly-representable, self-describing data. No resource/async handle or `error-context` anywhere within it (checked recursively through containers).                                 |
+| `defaultable` | an unambiguous default can be synthesized (primitives-->zero, `string`-->`""`, `option`/`list`/`map`/`flags`-->empty, `record`/`tuple`-->iff members are). Not `result`/`variant`/`enum`. |
+
+`concrete` and `defaultable` are **independent** — neither implies the
+other. `result<u32, string>` is concrete but not defaultable;
+`option<resource>` is defaultable but not concrete.
+
+> ⚠️ **List semantics differ from `interface`.** A pattern list on
+> `interface` **ORs** (matches any). A keyword list on `args`/`results`
+> **ANDs** — every named property must hold. So `results: [concrete,
+> defaultable]` requires *both*.
+
+## Undecidable matches are an error
+
+If an `all-funcs:` rule matches an interface whose structured type
+couldn't be parsed, splicer **errors** rather than silently selecting
+nothing — the match is undecidable, and a silent skip would mask the real
+problem. The error names the rule and interface. The check only fires for
+an interface the `interface` pattern already matched, so a glob that
+excludes the untyped interface never trips it. (A bare `interface: "*"`
+therefore errors on *any* untyped interface in the composition — scope
+the glob to the interfaces you actually mean.)
+
+---
+
 # Before
 
 ```yaml
@@ -142,6 +198,7 @@ M → B
 | `interface`       | pattern or list | ✅       | Interface(s) to match on (glob; see [Pattern matching](#pattern-matching-globs--lists)).    |
 | `provider.name`   | pattern or list | ❌       | Constrains the match to the named provider node(s). Omitted ⇒ matches every provider.             |
 | `provider.alias`  | string          | ❌       | Rename the matched provider in the generated WAC.                                                 |
+| `all-funcs`       | object          | ❌       | Gate the match on the target interface's function shapes — see [Function-shape matching](#function-shape-matching-all-funcs). |
 
 ---
 
@@ -187,13 +244,14 @@ between: { interface: "*", inner: { name: "wasi*" }, outer: { name: "mysrv*" } }
 
 ## Fields
 
-| Field         | Type            | Required | Description                                                                                          |
-|---------------|-----------------|----------|------------------------------------------------------------------------------------------------------|
-| `interface`   | pattern or list | ✅       | Interface(s) to match on (glob; see [Pattern matching](#pattern-matching-globs--lists)).       |
-| `inner.name`  | pattern or list | ❌       | The _downstream_ node(s) (exports the `interface` called by `outer`). Omitted ⇒ matches any.         |
-| `inner.alias` | string          | ❌       | Rename the matched inner node in the generated WAC.                                                  |
-| `outer.name`  | pattern or list | ❌       | The _upstream_ node(s) (calls the exported `interface` of `inner`). Omitted ⇒ matches any.           |
-| `outer.alias` | string          | ❌       | Rename the matched outer node in the generated WAC.                                                  |
+| Field         | Type            | Required | Description                                                                                                                   |
+|---------------|-----------------|----------|-------------------------------------------------------------------------------------------------------------------------------|
+| `interface`   | pattern or list | ✅        | Interface(s) to match on (glob; see [Pattern matching](#pattern-matching-globs--lists)).                                      |
+| `inner.name`  | pattern or list | ❌        | The _downstream_ node(s) (exports the `interface` called by `outer`). Omitted ⇒ matches any.                                  |
+| `inner.alias` | string          | ❌        | Rename the matched inner node in the generated WAC.                                                                           |
+| `outer.name`  | pattern or list | ❌        | The _upstream_ node(s) (calls the exported `interface` of `inner`). Omitted ⇒ matches any.                                    |
+| `outer.alias` | string          | ❌        | Rename the matched outer node in the generated WAC.                                                                           |
+| `all-funcs`   | object          | ❌        | Gate the match on the target interface's function shapes — see [Function-shape matching](#function-shape-matching-all-funcs). |
 
 `inner` and `outer` are rejected only when both are present and are the
 **same literal pattern** — a glob may legitimately fan out over both

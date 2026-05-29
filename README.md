@@ -197,7 +197,13 @@ rules:
 
 `interface` and the node-name fields (`provider`/`inner`/`outer`) accept
 glob patterns like `wasi:*` and lists like `["wasi:*", "my:*"]`; the
-node-name fields are optional (omitted matches any).
+node-name fields are optional (omitted matches any). A broad glob can
+land on interfaces your middleware can't actually handle. `all-funcs:`
+lets you narrow the match by what the interface's functions look like —
+for example, only ones that are fully `async`, or that pass plain data
+rather than opaque handles — so those mismatches are skipped up front
+instead of surfacing as a confusing build error when splicer generates
+the wrapper code for them.
 
 See [`docs/splice-config.md`](docs/splice-config.md) for the full
 specification.

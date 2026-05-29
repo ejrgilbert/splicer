@@ -10,7 +10,9 @@
 //! (codegen, inject-plan mutation) lives in [`crate::wac`].
 
 use anyhow::Context;
-use cviz::model::CompositionGraph;
+use cviz::model::{
+    CompositionGraph, FuncSignature, InterfaceType, TypeArena, ValueType, ValueTypeId,
+};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 /// One match field: a set of glob patterns; matches if any one matches
@@ -121,21 +123,29 @@ pub(crate) enum SiteKind {
 }
 
 /// Compiled matcher for one rule: how to enumerate its sites, the
-/// chain-scoped `interface` pattern that gates the whole chain, and the
-/// site-scoped node `constraints` every matched site must satisfy (AND).
-/// Built once at config-validate time.
+/// chain-scoped `interface` pattern and optional `all_funcs` predicate
+/// that gate the whole chain, and the site-scoped node `constraints`
+/// every matched site must satisfy (AND). Built once at config-validate
+/// time.
 #[derive(Debug)]
 pub struct RuleMatcher {
     kind: SiteKind,
     interface: Pattern,
+    all_funcs: Option<FuncPred>,
     constraints: Vec<Constraint>,
 }
 
 impl RuleMatcher {
-    pub(crate) fn new(kind: SiteKind, interface: Pattern, constraints: Vec<Constraint>) -> Self {
+    pub(crate) fn new(
+        kind: SiteKind,
+        interface: Pattern,
+        all_funcs: Option<FuncPred>,
+        constraints: Vec<Constraint>,
+    ) -> Self {
         Self {
             kind,
             interface,
+            all_funcs,
             constraints,
         }
     }
@@ -153,23 +163,195 @@ impl RuleMatcher {
     }
 
     /// Candidate sites in this chain that satisfy the rule. The interface
-    /// gates the whole chain (it's constant across one); node constraints
-    /// are then checked per site.
+    /// and `all-funcs:` predicate gate the whole chain (both constant
+    /// across one); node constraints are then checked per site.
+    ///
+    /// Error if configuration has `all-funcs` but the interface func
+    /// sig is unknown.
     pub(crate) fn select(
         &self,
         chain_idx: usize,
         chain_nodes: &[u32],
         interface_name: &str,
+        interface_type: Option<&InterfaceType>,
         graph: &CompositionGraph,
-    ) -> Vec<SpliceSite> {
+    ) -> anyhow::Result<Vec<SpliceSite>> {
         if !self.interface.is_match(interface_name) {
-            return vec![];
+            return Ok(vec![]);
+        }
+        if let Some(pred) = &self.all_funcs {
+            let Some(ty) = interface_type else {
+                anyhow::bail!(
+                    "interface '{interface_name}' matched a rule's `all-funcs:` predicate, \
+                     but its type signature could not be parsed — the match is undecidable"
+                );
+            };
+            if !pred.holds(ty, &graph.arena) {
+                return Ok(vec![]);
+            }
         }
         let ctx = MatchCtx { graph, chain_nodes };
-        enumerate_sites(self.kind, chain_idx, chain_nodes.len())
+        Ok(enumerate_sites(self.kind, chain_idx, chain_nodes.len())
             .into_iter()
             .filter(|site| self.constraints.iter().all(|c| c.eval(site, &ctx)))
-            .collect()
+            .collect())
+    }
+}
+
+/// Chain-scoped predicate over the matched interface's function shapes,
+/// applied to **every** function of the interface.
+#[derive(Debug)]
+pub(crate) struct FuncPred {
+    is_async: Option<bool>,
+    args: Vec<ValueProperty>,
+    results: Vec<ValueProperty>,
+}
+
+/// A structural property of a single WIT value type. `Concrete` and
+/// `Defaultable` are independent — neither implies the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ValueProperty {
+    /// Directly-representable, self-describing data — no resource/async
+    /// handle or error-context anywhere within.
+    Concrete,
+    /// An unambiguous default value can be synthesized.
+    Defaultable,
+}
+
+impl FuncPred {
+    pub(crate) fn new(
+        is_async: Option<bool>,
+        args: Vec<ValueProperty>,
+        results: Vec<ValueProperty>,
+    ) -> Self {
+        Self {
+            is_async,
+            args,
+            results,
+        }
+    }
+
+    /// True iff **every** function of `ty` satisfies this predicate.
+    fn holds(&self, ty: &InterfaceType, arena: &TypeArena) -> bool {
+        funcs(ty).all(|f| self.holds_one(f, arena))
+    }
+
+    /// True iff the function satisfies the predicate.
+    fn holds_one(&self, f: &FuncSignature, arena: &TypeArena) -> bool {
+        if self.is_async.is_some_and(|want| f.is_async != want) {
+            return false;
+        }
+        self.args
+            .iter()
+            .all(|p| f.params.iter().all(|id| p.holds(*id, arena)))
+            && self
+                .results
+                .iter()
+                .all(|p| f.results.iter().all(|id| p.holds(*id, arena)))
+    }
+}
+
+impl ValueProperty {
+    fn holds(&self, id: ValueTypeId, arena: &TypeArena) -> bool {
+        match self {
+            ValueProperty::Concrete => is_concrete(id, arena),
+            ValueProperty::Defaultable => is_defaultable(id, arena),
+        }
+    }
+}
+
+#[cfg(test)]
+impl FuncPred {
+    pub(crate) fn is_async(&self) -> Option<bool> {
+        self.is_async
+    }
+    pub(crate) fn args(&self) -> &[ValueProperty] {
+        &self.args
+    }
+    pub(crate) fn results(&self) -> &[ValueProperty] {
+        &self.results
+    }
+}
+
+/// Every function of an interface — an instance's functions, or the one
+/// function of a bare-func interface.
+fn funcs(ty: &InterfaceType) -> impl Iterator<Item = &FuncSignature> {
+    let (instance, single) = match ty {
+        InterfaceType::Instance(inst) => (Some(inst.functions.values()), None),
+        InterfaceType::Func(f) => (None, Some(f)),
+    };
+    instance.into_iter().flatten().chain(single)
+}
+
+/// True iff `id` is directly-representable data — no resource/async
+/// handle and no error-context anywhere within it.
+fn is_concrete(id: ValueTypeId, arena: &TypeArena) -> bool {
+    match arena.lookup_val(id) {
+        // Abstract: opaque, runtime/host-backed values the guest can't
+        // reconstruct from self-describing bytes.
+        ValueType::Resource(_) | ValueType::AsyncHandle | ValueType::ErrorContext => false,
+        // Self-describing scalars and name-only aggregates.
+        ValueType::Bool
+        | ValueType::S8
+        | ValueType::U8
+        | ValueType::S16
+        | ValueType::U16
+        | ValueType::S32
+        | ValueType::U32
+        | ValueType::S64
+        | ValueType::U64
+        | ValueType::F32
+        | ValueType::F64
+        | ValueType::Char
+        | ValueType::String
+        | ValueType::Enum(_)
+        | ValueType::Flags(_) => true,
+        // Containers: concrete iff their contents are.
+        ValueType::List(t) | ValueType::Option(t) | ValueType::FixedSizeList(t, _) => {
+            is_concrete(*t, arena)
+        }
+        ValueType::Tuple(ts) => ts.iter().all(|t| is_concrete(*t, arena)),
+        ValueType::Record(fs) => fs.iter().all(|(_, t)| is_concrete(*t, arena)),
+        ValueType::Variant(cs) => cs
+            .iter()
+            .all(|(_, t)| t.is_none_or(|t| is_concrete(t, arena))),
+        ValueType::Result { ok, err } => [ok, err]
+            .into_iter()
+            .flatten()
+            .all(|t| is_concrete(*t, arena)),
+        ValueType::Map(k, v) => is_concrete(*k, arena) && is_concrete(*v, arena),
+    }
+}
+
+/// True iff an unambiguous default value can be synthesized.
+fn is_defaultable(id: ValueTypeId, arena: &TypeArena) -> bool {
+    match arena.lookup_val(id) {
+        // Have a canonical zero/empty default.
+        ValueType::Bool
+        | ValueType::S8
+        | ValueType::U8
+        | ValueType::S16
+        | ValueType::U16
+        | ValueType::S32
+        | ValueType::U32
+        | ValueType::S64
+        | ValueType::U64
+        | ValueType::F32
+        | ValueType::F64
+        | ValueType::Char
+        | ValueType::String
+        | ValueType::Option(_)
+        | ValueType::List(_)
+        | ValueType::Map(_, _)
+        | ValueType::Flags(_) => true,
+        // Defaultable iff their members are.
+        ValueType::FixedSizeList(t, _) => is_defaultable(*t, arena),
+        ValueType::Tuple(ts) => ts.iter().all(|t| is_defaultable(*t, arena)),
+        ValueType::Record(fs) => fs.iter().all(|(_, t)| is_defaultable(*t, arena)),
+        // No canonical case to pick.
+        ValueType::Variant(_) | ValueType::Enum(_) | ValueType::Result { .. } => false,
+        // Abstract: no synthesizable default.
+        ValueType::Resource(_) | ValueType::AsyncHandle | ValueType::ErrorContext => false,
     }
 }
 
@@ -228,12 +410,15 @@ impl RuleMatcher {
             _ => None,
         })
     }
+    pub(crate) fn all_funcs(&self) -> Option<&FuncPred> {
+        self.all_funcs.as_ref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cviz::model::{ComponentNode, CompositionGraph};
+    use cviz::model::{ComponentNode, CompositionGraph, InstanceInterface};
 
     const IFACE: &str = "wasi:http/handler@0.3.0";
 
@@ -305,7 +490,9 @@ mod tests {
         for i in 0..3u32 {
             graph.add_node(i, ComponentNode::new(format!("$node-{i}"), i, i));
         }
-        RuleMatcher::new(kind, pat(interface), constraints).select(0, &[0u32, 1, 2], IFACE, &graph)
+        RuleMatcher::new(kind, pat(interface), None, constraints)
+            .select(0, &[0u32, 1, 2], IFACE, None, &graph)
+            .expect("select without all-funcs is infallible")
     }
 
     #[test]
@@ -334,7 +521,7 @@ mod tests {
 
     #[test]
     fn interface_matches_reflects_the_pattern() {
-        let m = RuleMatcher::new(SiteKind::Before, pat(&["wasi:*"]), vec![]);
+        let m = RuleMatcher::new(SiteKind::Before, pat(&["wasi:*"]), None, vec![]);
         assert!(m.interface_matches(IFACE));
         assert!(!m.interface_matches("my:srv/api@1.0.0"));
     }
@@ -371,6 +558,276 @@ mod tests {
             vec![Constraint::Provider(pat(&["node-*"]))],
         );
         assert_eq!(sites.len(), 3);
+    }
+
+    // ── all-funcs: property helpers ──────────────────────────────────
+
+    /// Intern a function signature into `arena`. Params/results are
+    /// top-level value types (nest by interning inner ids first).
+    fn func(
+        arena: &mut TypeArena,
+        is_async: bool,
+        params: Vec<ValueType>,
+        results: Vec<ValueType>,
+    ) -> FuncSignature {
+        FuncSignature {
+            is_async,
+            param_names: vec![],
+            params: params.into_iter().map(|t| arena.intern_val(t)).collect(),
+            results: results.into_iter().map(|t| arena.intern_val(t)).collect(),
+        }
+    }
+
+    fn instance(funcs: Vec<(&str, FuncSignature)>) -> InterfaceType {
+        InterfaceType::Instance(InstanceInterface {
+            functions: funcs.into_iter().map(|(n, f)| (n.to_string(), f)).collect(),
+            type_exports: Default::default(),
+        })
+    }
+
+    #[test]
+    fn concrete_rejects_handles_and_error_context_in_every_container() {
+        let mut a = TypeArena::default();
+        for abstract_ty in [
+            ValueType::Resource("request".into()),
+            ValueType::AsyncHandle,
+            ValueType::ErrorContext,
+        ] {
+            let id = a.intern_val(abstract_ty);
+            assert!(
+                !is_concrete(id, &a),
+                "bare abstract type must not be concrete"
+            );
+            // Each container wrapping it inherits the abstractness.
+            for wrapped in [
+                ValueType::List(id),
+                ValueType::Option(id),
+                ValueType::FixedSizeList(id, 3),
+                ValueType::Tuple(vec![id]),
+                ValueType::Record(vec![("f".into(), id)]),
+                ValueType::Variant(vec![("c".into(), Some(id))]),
+                ValueType::Result {
+                    ok: Some(id),
+                    err: None,
+                },
+                ValueType::Map(id, id),
+            ] {
+                let w = a.intern_val(wrapped);
+                assert!(
+                    !is_concrete(w, &a),
+                    "container of abstract type must not be concrete"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concrete_accepts_handle_free_data() {
+        let mut a = TypeArena::default();
+        let u = a.intern_val(ValueType::U32);
+        let s = a.intern_val(ValueType::String);
+        let list = a.intern_val(ValueType::List(s));
+        let rec = a.intern_val(ValueType::Record(vec![
+            ("n".into(), u),
+            ("xs".into(), list),
+        ]));
+        assert!(is_concrete(rec, &a));
+        let en = a.intern_val(ValueType::Enum(vec!["a".into(), "b".into()]));
+        assert!(is_concrete(en, &a));
+        let fl = a.intern_val(ValueType::Flags(vec!["x".into()]));
+        assert!(is_concrete(fl, &a));
+    }
+
+    #[test]
+    fn defaultable_classification() {
+        let mut a = TypeArena::default();
+        let u = a.intern_val(ValueType::U32);
+        // result / variant / enum: no canonical default.
+        let res = a.intern_val(ValueType::Result {
+            ok: Some(u),
+            err: None,
+        });
+        assert!(!is_defaultable(res, &a));
+        let var = a.intern_val(ValueType::Variant(vec![("c".into(), None)]));
+        assert!(!is_defaultable(var, &a));
+        let en = a.intern_val(ValueType::Enum(vec!["a".into()]));
+        assert!(!is_defaultable(en, &a));
+        // option<resource>: defaults to `none` regardless of element.
+        let r = a.intern_val(ValueType::Resource("x".into()));
+        let opt = a.intern_val(ValueType::Option(r));
+        assert!(is_defaultable(opt, &a));
+        // record: defaultable iff all members are.
+        let ok_rec = a.intern_val(ValueType::Record(vec![("a".into(), u), ("b".into(), opt)]));
+        assert!(is_defaultable(ok_rec, &a));
+        let bad_rec = a.intern_val(ValueType::Record(vec![("a".into(), u), ("b".into(), res)]));
+        assert!(!is_defaultable(bad_rec, &a));
+    }
+
+    #[test]
+    fn concrete_and_defaultable_are_independent() {
+        let mut a = TypeArena::default();
+        let u = a.intern_val(ValueType::U32);
+        let s = a.intern_val(ValueType::String);
+        // result<u32, string>: concrete, not defaultable.
+        let res = a.intern_val(ValueType::Result {
+            ok: Some(u),
+            err: Some(s),
+        });
+        assert!(is_concrete(res, &a));
+        assert!(!is_defaultable(res, &a));
+        // option<resource>: defaultable, not concrete.
+        let r = a.intern_val(ValueType::Resource("h".into()));
+        let opt = a.intern_val(ValueType::Option(r));
+        assert!(!is_concrete(opt, &a));
+        assert!(is_defaultable(opt, &a));
+    }
+
+    // ── all-funcs: select gate ───────────────────────────────────────
+
+    /// A graph with a single node, whose `arena` holds the interned
+    /// value types an `all-funcs` predicate reads.
+    fn one_node_graph() -> CompositionGraph {
+        let mut graph = CompositionGraph::new();
+        graph.add_node(0, ComponentNode::new("$node-0".into(), 0, 0));
+        graph
+    }
+
+    /// Run a `before` matcher (`interface` glob + `all-funcs`) over
+    /// [`IFACE`] on `graph`'s one-node chain. `interface_type` is the
+    /// structured type the predicate inspects (`None` ⇒ undecidable).
+    fn run_pred(
+        interface: &[&str],
+        all_funcs: FuncPred,
+        interface_type: Option<&InterfaceType>,
+        graph: &CompositionGraph,
+    ) -> anyhow::Result<Vec<SpliceSite>> {
+        RuleMatcher::new(SiteKind::Before, pat(interface), Some(all_funcs), vec![]).select(
+            0,
+            &[0u32],
+            IFACE,
+            interface_type,
+            graph,
+        )
+    }
+
+    /// `run_pred` for the common case: a matching `interface`, with the
+    /// type built by `build` into the same arena `select` reads (so the
+    /// `ValueTypeId`s stay consistent).
+    fn select_with_pred(
+        all_funcs: FuncPred,
+        build: impl FnOnce(&mut TypeArena) -> InterfaceType,
+    ) -> anyhow::Result<Vec<SpliceSite>> {
+        let mut graph = one_node_graph();
+        let ty = build(&mut graph.arena);
+        run_pred(&["wasi:*"], all_funcs, Some(&ty), &graph)
+    }
+
+    #[test]
+    fn all_funcs_async_selects_all_async_rejects_a_sync() {
+        let all_async = select_with_pred(FuncPred::new(Some(true), vec![], vec![]), |a| {
+            instance(vec![
+                ("h", func(a, true, vec![], vec![ValueType::U32])),
+                ("g", func(a, true, vec![ValueType::String], vec![])),
+            ])
+        })
+        .expect("decidable");
+        assert_eq!(all_async.len(), 1);
+
+        let has_sync = select_with_pred(FuncPred::new(Some(true), vec![], vec![]), |a| {
+            instance(vec![
+                ("h", func(a, true, vec![], vec![])),
+                ("g", func(a, false, vec![], vec![])),
+            ])
+        })
+        .expect("decidable");
+        assert!(has_sync.is_empty());
+    }
+
+    #[test]
+    fn all_funcs_results_concrete_rejects_resource_accepts_primitive() {
+        let pred = || FuncPred::new(None, vec![], vec![ValueProperty::Concrete]);
+        let resource_result = select_with_pred(pred(), |a| {
+            instance(vec![(
+                "h",
+                func(a, true, vec![], vec![ValueType::Resource("r".into())]),
+            )])
+        })
+        .expect("decidable");
+        assert!(resource_result.is_empty());
+
+        let primitive_result = select_with_pred(pred(), |a| {
+            instance(vec![("h", func(a, true, vec![], vec![ValueType::U32]))])
+        })
+        .expect("decidable");
+        assert_eq!(primitive_result.len(), 1);
+    }
+
+    #[test]
+    fn all_funcs_property_list_ands() {
+        let pred = || {
+            FuncPred::new(
+                None,
+                vec![],
+                vec![ValueProperty::Concrete, ValueProperty::Defaultable],
+            )
+        };
+        // result<u32,string> is concrete but NOT defaultable → AND fails.
+        let concrete_not_defaultable = select_with_pred(pred(), |a| {
+            let u = a.intern_val(ValueType::U32);
+            let s = a.intern_val(ValueType::String);
+            let res = a.intern_val(ValueType::Result {
+                ok: Some(u),
+                err: Some(s),
+            });
+            InterfaceType::Func(FuncSignature {
+                is_async: true,
+                param_names: vec![],
+                params: vec![],
+                results: vec![res],
+            })
+        })
+        .expect("decidable");
+        assert!(concrete_not_defaultable.is_empty());
+
+        // A bare u32 satisfies both.
+        let both = select_with_pred(pred(), |a| {
+            instance(vec![("h", func(a, true, vec![], vec![ValueType::U32]))])
+        })
+        .expect("decidable");
+        assert_eq!(both.len(), 1);
+    }
+
+    #[test]
+    fn all_funcs_undecidable_errors_naming_the_interface() {
+        let graph = one_node_graph();
+        let err = run_pred(
+            &["wasi:*"],
+            FuncPred::new(Some(true), vec![], vec![]),
+            None,
+            &graph,
+        )
+        .expect_err("missing type under all-funcs is undecidable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(IFACE),
+            "error should name the interface; got: {msg}"
+        );
+        assert!(msg.contains("undecidable"), "got: {msg}");
+    }
+
+    #[test]
+    fn all_funcs_missing_type_is_fine_when_interface_excluded() {
+        // The undecidable error only fires for a chain that passed the
+        // interface glob; a non-matching interface short-circuits first.
+        let graph = one_node_graph();
+        let sites = run_pred(
+            &["my:*"],
+            FuncPred::new(Some(true), vec![], vec![]),
+            None,
+            &graph,
+        )
+        .expect("excluded interface never reaches the predicate");
+        assert!(sites.is_empty());
     }
 
     // ── suggest_interfaces ───────────────────────────────────────────
