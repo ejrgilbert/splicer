@@ -128,11 +128,30 @@ key to mean "no requirement".
 
 ## Keys
 
-| Key       | Value                       | Holds when …                                                             |
-|-----------|-----------------------------|--------------------------------------------------------------------------|
-| `async`   | bool                        | `true`: every function is `async func`; `false`: every function is sync. |
-| `args`    | keyword or list of keywords | every argument of every function satisfies the property (or properties). |
-| `results` | keyword or list of keywords | every result of every function satisfies the property (or properties).   |
+| Key       | Value                       | Holds when …                                                                                |
+|-----------|-----------------------------|---------------------------------------------------------------------------------------------|
+| `async`   | bool                        | `true`: every function is `async func`; `false`: every function is sync.                    |
+| `scope`   | keyword or list of keywords | a function's WIT-tree surface matches any listed scope. Defaults to `interface` if omitted. |
+| `args`    | keyword or list of keywords | every argument of every function satisfies the property (or properties).                    |
+| `results` | keyword or list of keywords | every result of every function satisfies the property (or properties).                      |
+
+Scope keywords (control *which* functions the rest of the predicate
+applies to — surfaces not listed are skipped, not failed):
+
+| Keyword     | A function has it when …                                                                                                                          |
+|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| `interface` | it's a WIT-level free function (name doesn't start with `[`). The common case; this is the default.                                               |
+| `resource`  | it's a component-model resource surface (`[constructor]r`, `[method]r.f`, `[static]r.f`). **Forward-compat seam — see callout below.**            |
+
+> ⚠️ **`scope: resource` is not yet implemented.** Splicer's adapter
+> codegen can't currently wrap resource constructor/method/static
+> surfaces, so any rule that opts into `scope: resource` will panic at
+> selection time with a pointer to the implementation site. The keyword
+> exists today so configs targeting future resource-surface interposition
+> stay forward-compatible. The default `scope: interface` skips resource
+> surfaces — so a broad glob (`interface: "*"`) over a composition that
+> happens to contain a types-only interface (only resource surfaces, no
+> free functions) doesn't accidentally select it.
 
 Value-property keywords for `args` / `results`:
 

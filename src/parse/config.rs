@@ -1,4 +1,6 @@
-use crate::select::{Constraint, FuncPred, Pattern, RuleMatcher, SiteKind, ValueProperty};
+use crate::select::{
+    Constraint, FuncPred, FuncScope, Pattern, RuleMatcher, SiteKind, ValueProperty,
+};
 use anyhow::bail;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -90,30 +92,30 @@ impl BuiltinSpec {
     }
 }
 
-/// A match field accepting one glob pattern (scalar) or several (a YAML
-/// list). A list matches if any of its patterns match (OR-combined).
+/// A YAML field accepting either a single scalar or a list of them.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
-pub enum PatternSpec {
-    One(String),
-    Many(Vec<String>),
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
 }
 
-impl PatternSpec {
-    /// The glob patterns in this field — one for a scalar, N for a list.
-    fn patterns(&self) -> &[String] {
+impl<T> OneOrMany<T> {
+    fn as_slice(&self) -> &[T] {
         match self {
-            PatternSpec::One(s) => std::slice::from_ref(s),
-            PatternSpec::Many(v) => v,
+            OneOrMany::One(s) => std::slice::from_ref(s),
+            OneOrMany::Many(v) => v,
         }
     }
-    fn into_vec(self) -> Vec<String> {
+    fn into_vec(self) -> Vec<T> {
         match self {
-            PatternSpec::One(s) => vec![s],
-            PatternSpec::Many(v) => v,
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
         }
     }
 }
+
+pub type PatternSpec = OneOrMany<String>;
 
 #[derive(Debug, Deserialize)]
 pub struct YamlStrategyBefore {
@@ -136,30 +138,11 @@ pub struct YamlStrategyBetween {
 pub struct YamlFuncPred {
     #[serde(rename = "async")]
     is_async: Option<bool>,
-    args: Option<ValuePropSpec>,
-    results: Option<ValuePropSpec>,
+    scope: Option<OneOrMany<String>>,
+    args: Option<OneOrMany<String>>,
+    results: Option<OneOrMany<String>>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ValuePropSpec {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl ValuePropSpec {
-    fn into_vec(self) -> Vec<String> {
-        match self {
-            ValuePropSpec::One(s) => vec![s],
-            ValuePropSpec::Many(v) => v,
-        }
-    }
-}
-
-/// A node-name match field plus its alias. `name` matches the instance
-/// (node) **display name** — e.g. `srv-b`, or the shim-provider name
-/// `wasi:http/handler@...-shim-instance` for host/shim interfaces — and
-/// is a glob pattern (scalar or list). Omitting `name` matches any node.
 #[derive(Debug, Deserialize)]
 pub struct YamlProviderOpt {
     name: Option<PatternSpec>,
@@ -168,7 +151,7 @@ pub struct YamlProviderOpt {
 }
 
 /// Extra information stored on an [`Injection`] when it has been resolved as a
-/// tier-1 adapter by `add_to_inject_plan`.  Not present in the YAML config.
+/// tier-1 adapter by `add_to_inject_plan`. Not present in the YAML config.
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AdapterInjectionInfo {
     /// Path to the generated adapter `.wasm` file.
@@ -183,13 +166,6 @@ pub struct AdapterInjectionInfo {
 /// A middleware to inject at a splice point. Constructed from the YAML
 /// config `inject` list or programmatically via [`Injection::from_path`]
 /// / [`Injection::from_name`].
-///
-/// `Eq`/`Hash`/`Ord` are implemented manually to skip the transient
-/// `builtin_config` / `adapter_info` fields, both because `toml::Value`
-/// isn't `Hash` (floats) and because identity for the deduplicating
-/// `IndexSet<Injection>` is semantically the (name, path, builtin)
-/// triple — config values are derived from the YAML and don't
-/// distinguish injections at WAC-emit time.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Injection {
     /// The middleware's logical name (used as the WAC variable).
@@ -420,7 +396,7 @@ fn check_node_name(
     provider: Option<&YamlProviderOpt>,
 ) -> anyhow::Result<()> {
     if let Some(name) = provider.and_then(|p| p.name.as_ref()) {
-        let pats = name.patterns();
+        let pats = name.as_slice();
         if pats.is_empty() || pats.iter().any(|a| a.is_empty()) {
             bail!(
                 "rule {rule_num}: '{field}' name must not be empty if specified \
@@ -457,27 +433,30 @@ fn compile_func_pred(
 ) -> anyhow::Result<Option<FuncPred>> {
     let Some(YamlFuncPred {
         is_async,
+        scope,
         args,
         results,
     }) = pred
     else {
         return Ok(None);
     };
-    let args = compile_value_props(rule_num, "args", args)?;
-    let results = compile_value_props(rule_num, "results", results)?;
-    if is_async.is_none() && args.is_empty() && results.is_empty() {
+
+    if is_async.is_none() && scope.is_none() && args.is_none() && results.is_none() {
         bail!(
             "rule {rule_num}: 'all-funcs' has no constraints — omit the key to impose no \
-             function requirement, or set 'async'/'args'/'results'"
+             function requirement, or set 'async'/'scope'/'args'/'results'"
         );
     }
-    Ok(Some(FuncPred::new(is_async, args, results)))
+    let scopes = compile_scopes(rule_num, scope)?;
+    let args = compile_value_props(rule_num, "args", args)?;
+    let results = compile_value_props(rule_num, "results", results)?;
+    Ok(Some(FuncPred::new(is_async, scopes, args, results)))
 }
 
 fn compile_value_props(
     rule_num: usize,
     field: &str,
-    spec: Option<ValuePropSpec>,
+    spec: Option<OneOrMany<String>>,
 ) -> anyhow::Result<Vec<ValueProperty>> {
     let Some(spec) = spec else {
         return Ok(vec![]);
@@ -491,6 +470,30 @@ fn compile_value_props(
                 "rule {rule_num}: 'all-funcs.{field}' has unknown property '{other}' \
                  (expected 'concrete' or 'defaultable')"
             ),
+        })
+        .collect()
+}
+
+fn compile_scopes(
+    rule_num: usize,
+    spec: Option<OneOrMany<String>>,
+) -> anyhow::Result<Vec<FuncScope>> {
+    let Some(spec) = spec else {
+        // default to `interface` scope (common case)
+        return Ok(vec![FuncScope::Interface]);
+    };
+    let raw = spec.into_vec();
+    if raw.is_empty() {
+        bail!("rule {rule_num}: 'all-funcs.scope' must list at least one value");
+    }
+    raw.iter()
+        .map(|kw| {
+            FuncScope::from_keyword(kw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rule {rule_num}: 'all-funcs.scope' has unknown value '{kw}' \
+                     (expected 'interface' or 'resource')"
+                )
+            })
         })
         .collect()
 }
@@ -546,7 +549,7 @@ impl ConfigFile {
             } else {
                 unreachable!()
             };
-            let interface_pats = interface.patterns();
+            let interface_pats = interface.as_slice();
             if interface_pats.is_empty() || interface_pats.iter().any(|a| a.is_empty()) {
                 bail!("rule {rule_num}: 'interface' must not be empty");
             }
@@ -569,11 +572,11 @@ impl ConfigFile {
                 let inner = between.inner.as_ref().and_then(|p| p.name.as_ref());
                 let outer = between.outer.as_ref().and_then(|p| p.name.as_ref());
                 if let (Some(i), Some(o)) = (inner, outer) {
-                    if i.patterns() == o.patterns() {
+                    if i.as_slice() == o.as_slice() {
                         bail!(
                             "rule {rule_num} (between): 'inner' and 'outer' must name different \
                              instances, but both are '{}'",
-                            i.patterns().join(", ")
+                            i.as_slice().join(", ")
                         );
                     }
                 }
@@ -1620,10 +1623,10 @@ rules:
 "#;
         let rules = parse_yaml(yaml).expect("all-funcs should parse");
         let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
-        assert_eq!(pred.is_async(), Some(true));
-        assert_eq!(pred.args(), [ValueProperty::Concrete]);
+        assert_eq!(pred.is_async, Some(true));
+        assert_eq!(pred.args, [ValueProperty::Concrete]);
         assert_eq!(
-            pred.results(),
+            pred.results,
             [ValueProperty::Concrete, ValueProperty::Defaultable]
         );
     }
@@ -1643,8 +1646,8 @@ rules:
 "#;
         let rules = parse_yaml(yaml).expect("async:false should parse");
         let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
-        assert_eq!(pred.is_async(), Some(false));
-        assert!(pred.args().is_empty() && pred.results().is_empty());
+        assert_eq!(pred.is_async, Some(false));
+        assert!(pred.args.is_empty() && pred.results.is_empty());
     }
 
     #[test]
@@ -1691,6 +1694,65 @@ rules:
       - name: mw
 "#,
             "'all-funcs' has no constraints",
+        );
+    }
+
+    #[test]
+    fn parse_all_funcs_scope_scalar_and_list() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: "*"
+      all-funcs:
+        scope: interface
+    inject:
+      - name: mw
+  - before:
+      interface: "*"
+      all-funcs:
+        scope: [interface, resource]
+    inject:
+      - name: mw2
+"#;
+        let rules = parse_yaml(yaml).expect("scope should parse");
+        let scalar = rules[0].matcher().all_funcs().expect("all_funcs present");
+        assert_eq!(scalar.scopes, [FuncScope::Interface]);
+        let list = rules[1].matcher().all_funcs().expect("all_funcs present");
+        assert_eq!(list.scopes, [FuncScope::Interface, FuncScope::Resource]);
+    }
+
+    #[test]
+    fn parse_all_funcs_scope_absent_defaults_to_interface() {
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: "*"
+      all-funcs:
+        async: true
+    inject:
+      - name: mw
+"#;
+        let rules = parse_yaml(yaml).expect("parse");
+        let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
+        assert_eq!(pred.scopes, [FuncScope::Interface]);
+    }
+
+    #[test]
+    fn validate_all_funcs_scope_unknown_value() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: "*"
+      all-funcs:
+        scope: bogus
+    inject:
+      - name: mw
+"#,
+            "unknown value 'bogus'",
         );
     }
 }

@@ -199,12 +199,31 @@ impl RuleMatcher {
 }
 
 /// Chain-scoped predicate over the matched interface's function shapes,
-/// applied to **every** function of the interface.
+/// applied to **every** function of the interface (after the `scopes`
+/// filter).
 #[derive(Debug)]
 pub(crate) struct FuncPred {
-    is_async: Option<bool>,
-    args: Vec<ValueProperty>,
-    results: Vec<ValueProperty>,
+    pub(crate) is_async: Option<bool>,
+    pub(crate) scopes: Vec<FuncScope>,
+    pub(crate) args: Vec<ValueProperty>,
+    pub(crate) results: Vec<ValueProperty>,
+}
+
+/// Which WIT-tree surface a function lives on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FuncScope {
+    Interface,
+    /// (e.g. `[constructor]*`, `[method]*`, `[static]*`)
+    Resource,
+}
+impl FuncScope {
+    pub(crate) fn from_keyword(s: &str) -> Option<Self> {
+        match s {
+            "interface" => Some(Self::Interface),
+            "resource" => Some(Self::Resource),
+            _ => None,
+        }
+    }
 }
 
 /// A structural property of a single WIT value type. `Concrete` and
@@ -221,19 +240,29 @@ pub(crate) enum ValueProperty {
 impl FuncPred {
     pub(crate) fn new(
         is_async: Option<bool>,
+        scopes: Vec<FuncScope>,
         args: Vec<ValueProperty>,
         results: Vec<ValueProperty>,
     ) -> Self {
         Self {
             is_async,
+            scopes,
             args,
             results,
         }
     }
 
-    /// True iff **every** function of `ty` satisfies this predicate.
+    /// True iff `ty` has at least one function matching the configured
+    /// `scopes` and **every** such function satisfies this predicate.
     fn holds(&self, ty: &InterfaceType, arena: &TypeArena) -> bool {
-        funcs(ty).all(|f| self.holds_one(f, arena))
+        let mut iter =
+            funcs(ty).filter(|(name, _)| self.scopes.iter().any(|s| matches_scope(name, *s)));
+        let Some((_, first)) = iter.next() else {
+            // Ensure there's at least one in-scope function on the
+            // interface (if not, there's nothing to interpose on).
+            return false;
+        };
+        self.holds_one(first, arena) && iter.all(|(_, f)| self.holds_one(f, arena))
     }
 
     /// True iff the function satisfies the predicate.
@@ -260,27 +289,29 @@ impl ValueProperty {
     }
 }
 
-#[cfg(test)]
-impl FuncPred {
-    pub(crate) fn is_async(&self) -> Option<bool> {
-        self.is_async
-    }
-    pub(crate) fn args(&self) -> &[ValueProperty] {
-        &self.args
-    }
-    pub(crate) fn results(&self) -> &[ValueProperty] {
-        &self.results
-    }
-}
-
-/// Every function of an interface — an instance's functions, or the one
-/// function of a bare-func interface.
-fn funcs(ty: &InterfaceType) -> impl Iterator<Item = &FuncSignature> {
+/// Every function of an interface.
+fn funcs(ty: &InterfaceType) -> impl Iterator<Item = (&str, &FuncSignature)> {
     let (instance, single) = match ty {
-        InterfaceType::Instance(inst) => (Some(inst.functions.values()), None),
-        InterfaceType::Func(f) => (None, Some(f)),
+        InterfaceType::Instance(inst) => (
+            Some(inst.functions.iter().map(|(n, f)| (n.as_str(), f))),
+            None,
+        ),
+        InterfaceType::Func(f) => (None, Some(("", f))),
     };
     instance.into_iter().flatten().chain(single)
+}
+
+fn matches_scope(name: &str, scope: FuncScope) -> bool {
+    match scope {
+        FuncScope::Interface => !name.starts_with('['),
+        FuncScope::Resource => todo!(
+            "scope: resource — splicer's adapter codegen doesn't yet \
+             handle resource constructor/method/static surfaces. \
+             Implement here (`name.starts_with('[')`) and extend the \
+             wrapper-component logic in `src/adapter/abi/emit.rs` to \
+             carry resource handles across the wrap."
+        ),
+    }
 }
 
 /// True iff `id` is directly-representable data — no resource/async
@@ -585,6 +616,15 @@ mod tests {
         })
     }
 
+    fn one_func_instance(
+        a: &mut TypeArena,
+        is_async: bool,
+        args: Vec<ValueType>,
+        results: Vec<ValueType>,
+    ) -> InterfaceType {
+        instance(vec![("h", func(a, is_async, args, results))])
+    }
+
     #[test]
     fn concrete_rejects_handles_and_error_context_in_every_container() {
         let mut a = TypeArena::default();
@@ -722,9 +762,19 @@ mod tests {
         run_pred(&["wasi:*"], all_funcs, Some(&ty), &graph)
     }
 
+    /// Default-scope predicate (`[Interface]`) — matches what
+    /// `compile_func_pred` produces when `scope:` is omitted.
+    fn iface_pred(
+        is_async: Option<bool>,
+        args: Vec<ValueProperty>,
+        results: Vec<ValueProperty>,
+    ) -> FuncPred {
+        FuncPred::new(is_async, vec![FuncScope::Interface], args, results)
+    }
+
     #[test]
     fn all_funcs_async_selects_all_async_rejects_a_sync() {
-        let all_async = select_with_pred(FuncPred::new(Some(true), vec![], vec![]), |a| {
+        let all_async = select_with_pred(iface_pred(Some(true), vec![], vec![]), |a| {
             instance(vec![
                 ("h", func(a, true, vec![], vec![ValueType::U32])),
                 ("g", func(a, true, vec![ValueType::String], vec![])),
@@ -733,7 +783,7 @@ mod tests {
         .expect("decidable");
         assert_eq!(all_async.len(), 1);
 
-        let has_sync = select_with_pred(FuncPred::new(Some(true), vec![], vec![]), |a| {
+        let has_sync = select_with_pred(iface_pred(Some(true), vec![], vec![]), |a| {
             instance(vec![
                 ("h", func(a, true, vec![], vec![])),
                 ("g", func(a, false, vec![], vec![])),
@@ -745,18 +795,15 @@ mod tests {
 
     #[test]
     fn all_funcs_results_concrete_rejects_resource_accepts_primitive() {
-        let pred = || FuncPred::new(None, vec![], vec![ValueProperty::Concrete]);
+        let pred = || iface_pred(None, vec![], vec![ValueProperty::Concrete]);
         let resource_result = select_with_pred(pred(), |a| {
-            instance(vec![(
-                "h",
-                func(a, true, vec![], vec![ValueType::Resource("r".into())]),
-            )])
+            one_func_instance(a, true, vec![], vec![ValueType::Resource("r".into())])
         })
         .expect("decidable");
         assert!(resource_result.is_empty());
 
         let primitive_result = select_with_pred(pred(), |a| {
-            instance(vec![("h", func(a, true, vec![], vec![ValueType::U32]))])
+            one_func_instance(a, true, vec![], vec![ValueType::U32])
         })
         .expect("decidable");
         assert_eq!(primitive_result.len(), 1);
@@ -765,7 +812,7 @@ mod tests {
     #[test]
     fn all_funcs_property_list_ands() {
         let pred = || {
-            FuncPred::new(
+            iface_pred(
                 None,
                 vec![],
                 vec![ValueProperty::Concrete, ValueProperty::Defaultable],
@@ -791,7 +838,7 @@ mod tests {
 
         // A bare u32 satisfies both.
         let both = select_with_pred(pred(), |a| {
-            instance(vec![("h", func(a, true, vec![], vec![ValueType::U32]))])
+            one_func_instance(a, true, vec![], vec![ValueType::U32])
         })
         .expect("decidable");
         assert_eq!(both.len(), 1);
@@ -802,7 +849,7 @@ mod tests {
         let graph = one_node_graph();
         let err = run_pred(
             &["wasi:*"],
-            FuncPred::new(Some(true), vec![], vec![]),
+            iface_pred(Some(true), vec![], vec![]),
             None,
             &graph,
         )
@@ -822,12 +869,82 @@ mod tests {
         let graph = one_node_graph();
         let sites = run_pred(
             &["my:*"],
-            FuncPred::new(Some(true), vec![], vec![]),
+            iface_pred(Some(true), vec![], vec![]),
             None,
             &graph,
         )
         .expect("excluded interface never reaches the predicate");
         assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn all_funcs_rejects_empty_interface() {
+        // An interface with no functions has nothing to interpose on, so
+        // `all-funcs:` must reject it (overrides the vacuous ∀). This is
+        // what stops a broad glob from accidentally matching an
+        // inline-resource types interface.
+        let sites = select_with_pred(
+            iface_pred(None, vec![], vec![ValueProperty::Concrete]),
+            |_| instance(vec![]),
+        )
+        .expect("decidable");
+        assert!(sites.is_empty(), "function-free interface must not match");
+    }
+
+    // ── scope: axis ──────────────────────────────────────────────────
+
+    /// Resource-surface name: by convention, anything starting with
+    /// `[constructor]` / `[method]` / `[static]`.
+    const RES_CTOR: &str = "[constructor]r";
+    const RES_METHOD: &str = "[method]r.f";
+    const RES_STATIC: &str = "[static]r.g";
+
+    #[test]
+    fn default_scope_filters_out_resource_only_interface() {
+        // A types-only interface whose `functions` map carries only
+        // resource surfaces — default `scope: interface` post-filters
+        // them all away, so the empty-set rejection fires.
+        let sites = select_with_pred(iface_pred(None, vec![], vec![]), |a| {
+            instance(vec![
+                (RES_CTOR, func(a, false, vec![], vec![])),
+                (RES_METHOD, func(a, false, vec![], vec![])),
+                (RES_STATIC, func(a, false, vec![], vec![])),
+            ])
+        })
+        .expect("decidable");
+        assert!(
+            sites.is_empty(),
+            "resource-only interface must be filtered out by default scope"
+        );
+    }
+
+    #[test]
+    fn default_scope_accepts_free_funcs_alongside_resource_surfaces() {
+        // A mixed interface — the resource surfaces are filtered out by
+        // the default scope, leaving only the free function `h`, which
+        // satisfies the predicate.
+        let sites = select_with_pred(iface_pred(Some(true), vec![], vec![]), |a| {
+            instance(vec![
+                ("h", func(a, true, vec![], vec![ValueType::U32])),
+                (RES_CTOR, func(a, false, vec![], vec![])),
+            ])
+        })
+        .expect("decidable");
+        assert_eq!(sites.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "scope: resource")]
+    fn scope_resource_is_a_todo_for_now() {
+        // `scope: resource` is the forward-compat seam: splicer's
+        // adapter codegen can't yet wrap resource surfaces, so
+        // `matches_scope` for `FuncScope::Resource` panics with a
+        // pointer to the implementation site. Replace this test (and
+        // lift the `todo!()`) when resource-surface codegen lands.
+        let pred = FuncPred::new(None, vec![FuncScope::Resource], vec![], vec![]);
+        let _ = select_with_pred(pred, |a| {
+            instance(vec![(RES_CTOR, func(a, false, vec![], vec![]))])
+        });
     }
 
     // ── suggest_interfaces ───────────────────────────────────────────
