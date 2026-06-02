@@ -195,15 +195,16 @@ rules:
       - builtin: hello-tier1
 ```
 
-`interface` and the node-name fields (`provider`/`inner`/`outer`) accept
-glob patterns like `wasi:*` and lists like `["wasi:*", "my:*"]`; the
-node-name fields are optional (omitted matches any).
+Rules can match on three independent axes (mix and match as needed):
+
+| Axis           | Field                             | What it gates                                                                                            |
+|----------------|-----------------------------------|----------------------------------------------------------------------------------------------------------|
+| Interface name | `interface:`                      | The target interface's name (glob or list, required).                                                    |
+| Node name      | `provider:` / `inner:` / `outer:` | The instance's display name on the provider/inner/outer side (glob or list, optional).                   |
+| Function shape | `all-funcs:`                      | The matched interface's function shapes — async, scope, arg/result properties (optional).                |
 
 See [`docs/splice-config.md`](docs/splice-config.md) for the full
 specification.
-
-`splicer` is a multi-subcommand CLI; run `splicer --help` to see
-what's available.
 
 ---
 

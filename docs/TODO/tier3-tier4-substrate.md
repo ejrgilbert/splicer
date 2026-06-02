@@ -81,27 +81,38 @@ home for them.
 ## Type-predicated rule matching
 
 Walking strategies need to be wired only to interfaces that have the
-relevant types. The substrate stays unchanged; what we add is a
-type-predicate filter at splice-time rule matching:
+relevant types. The substrate stays unchanged; the filter lives at
+splice-time rule matching.
+
+**v1 framework — landed.** `all-funcs:` on a `before`/`between` rule
+gates the chain on properties of every function of the matched
+interface: `async`, `scope`, and the `args` / `results` value-property
+predicates `concrete` / `defaultable`. Evaluated once per chain in
+`select`; composes with the interface glob and node-name constraints.
+See [`docs/splice-config.md`](../splice-config.md#function-shape-matching-all-funcs)
+for the surface, vocabulary, and semantics.
 
 ```yaml
+between:
+  interface: "*"
+  all-funcs:
+    async: true
+    results: [concrete, defaultable]
 inject:
   - builtin: redact-strings
-    match:
-      contains-type: string
-    config:
-      patterns: ["email", "ssn"]
 ```
 
-Predicates are static WIT walkers (`contains-type: string`,
-`returns-result`, `has-option`, `has-numeric`, etc.). Evaluated once at
-splice time. They decide which interfaces a builtin gets wired to; the
-strategy itself assumes the predicate held. Walking happens at runtime
-via `TypedVisit` derives.
+**Aspirational extensions** (not built; add as use cases arise):
+property-name walkers like `contains-type: string`, `returns-result`,
+`has-option`, `has-numeric`, `no-resources-anywhere`. The v1 framework
+adds them as new `ValueProperty` variants (concrete keyword → variant
+in `src/select.rs`); no new architecture, just vocabulary growth.
 
-Type-predicate matching also helps non-walking strategies. `retry`
-matches only `returns-result`; `memoize` matches
-`no-resources-anywhere`. Composable with existing name-based matching.
+Type-predicate matching helps non-walking strategies too — `retry`
+matches `returns-result`, `memoize` matches `no-resources-anywhere`.
+Composable with existing name-based matching today; runtime walking via
+`TypedVisit` derives is still future work and pairs with the
+property-name extensions above.
 
 ## Wire format vs user-facing format
 

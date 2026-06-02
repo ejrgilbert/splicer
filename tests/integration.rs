@@ -221,6 +221,12 @@ fn integration_fanin_all_n() {
 
 #[test]
 #[ignore]
+fn integration_fanin_filter() {
+    run_config("fanin-filter");
+}
+
+#[test]
+#[ignore]
 fn integration_block1() {
     run_config("block1");
 }
