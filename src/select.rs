@@ -14,6 +14,7 @@ use cviz::model::{
     CompositionGraph, FuncSignature, InterfaceType, TypeArena, ValueType, ValueTypeId,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::str::FromStr;
 
 /// One match field: a set of glob patterns; matches if any one matches
 /// (OR-combined). Keeps the raw strings for diagnostics.
@@ -122,11 +123,6 @@ pub(crate) enum SiteKind {
     Between,
 }
 
-/// Compiled matcher for one rule: how to enumerate its sites, the
-/// chain-scoped `interface` pattern and optional `all_funcs` predicate
-/// that gate the whole chain, and the site-scoped node `constraints`
-/// every matched site must satisfy (AND). Built once at config-validate
-/// time.
 #[derive(Debug)]
 pub struct RuleMatcher {
     kind: SiteKind,
@@ -165,7 +161,6 @@ impl RuleMatcher {
     /// Candidate sites in this chain that satisfy the rule. The interface
     /// and `all-funcs:` predicate gate the whole chain (both constant
     /// across one); node constraints are then checked per site.
-    ///
     /// Error if configuration has `all-funcs` but the interface func
     /// sig is unknown.
     pub(crate) fn select(
@@ -198,9 +193,6 @@ impl RuleMatcher {
     }
 }
 
-/// Chain-scoped predicate over the matched interface's function shapes,
-/// applied to **every** function of the interface (after the `scopes`
-/// filter).
 #[derive(Debug)]
 pub(crate) struct FuncPred {
     pub(crate) is_async: Option<bool>,
@@ -216,25 +208,32 @@ pub(crate) enum FuncScope {
     /// (e.g. `[constructor]*`, `[method]*`, `[static]*`)
     Resource,
 }
-impl FuncScope {
-    pub(crate) fn from_keyword(s: &str) -> Option<Self> {
+impl FromStr for FuncScope {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "interface" => Some(Self::Interface),
-            "resource" => Some(Self::Resource),
-            _ => None,
+            "interface" => Ok(Self::Interface),
+            "resource" => Ok(Self::Resource),
+            _ => Err(()),
         }
     }
 }
 
-/// A structural property of a single WIT value type. `Concrete` and
-/// `Defaultable` are independent — neither implies the other.
+/// A structural property of a single WIT value type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ValueProperty {
-    /// Directly-representable, self-describing data — no resource/async
-    /// handle or error-context anywhere within.
     Concrete,
-    /// An unambiguous default value can be synthesized.
     Defaultable,
+}
+impl FromStr for ValueProperty {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "concrete" => Ok(Self::Concrete),
+            "defaultable" => Ok(Self::Defaultable),
+            _ => Err(()),
+        }
+    }
 }
 
 impl FuncPred {
@@ -252,17 +251,18 @@ impl FuncPred {
         }
     }
 
-    /// True iff `ty` has at least one function matching the configured
-    /// `scopes` and **every** such function satisfies this predicate.
+    /// True iff `ty` has at least one function and **every** function is
+    /// in one of the configured `scopes` and satisfies this predicate.
     fn holds(&self, ty: &InterfaceType, arena: &TypeArena) -> bool {
-        let mut iter =
-            funcs(ty).filter(|(name, _)| self.scopes.iter().any(|s| matches_scope(name, *s)));
-        let Some((_, first)) = iter.next() else {
-            // Ensure there's at least one in-scope function on the
-            // interface (if not, there's nothing to interpose on).
+        let mut iter = funcs(ty);
+        let Some((first_name, first)) = iter.next() else {
+            // Empty interfaces have nothing to interpose on.
             return false;
         };
-        self.holds_one(first, arena) && iter.all(|(_, f)| self.holds_one(f, arena))
+        let in_scope_and_passes = |name: &str, f: &FuncSignature| {
+            self.scopes.iter().any(|s| matches_scope(name, *s)) && self.holds_one(f, arena)
+        };
+        in_scope_and_passes(first_name, first) && iter.all(|(name, f)| in_scope_and_passes(name, f))
     }
 
     /// True iff the function satisfies the predicate.
@@ -919,10 +919,11 @@ mod tests {
     }
 
     #[test]
-    fn default_scope_accepts_free_funcs_alongside_resource_surfaces() {
-        // A mixed interface — the resource surfaces are filtered out by
-        // the default scope, leaving only the free function `h`, which
-        // satisfies the predicate.
+    fn default_scope_rejects_mixed_interface() {
+        // Splicer interposes on whole interfaces — a mixed interface
+        // (free fn + inline resource surface) under `scope: interface`
+        // is rejected because the resource surface is out of scope and
+        // there's no way to interpose on only the free function.
         let sites = select_with_pred(iface_pred(Some(true), vec![], vec![]), |a| {
             instance(vec![
                 ("h", func(a, true, vec![], vec![ValueType::U32])),
@@ -930,7 +931,10 @@ mod tests {
             ])
         })
         .expect("decidable");
-        assert_eq!(sites.len(), 1);
+        assert!(
+            sites.is_empty(),
+            "mixed interface must be rejected by default scope"
+        );
     }
 
     #[test]
