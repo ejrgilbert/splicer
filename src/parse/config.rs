@@ -115,11 +115,9 @@ impl<T> OneOrMany<T> {
     }
 }
 
-pub type PatternSpec = OneOrMany<String>;
-
 #[derive(Debug, Deserialize)]
 pub struct YamlStrategyBefore {
-    interface: PatternSpec,
+    interface: OneOrMany<String>,
     provider: Option<YamlProviderOpt>,
     #[serde(rename = "all-funcs")]
     all_funcs: Option<YamlFuncPred>,
@@ -127,7 +125,7 @@ pub struct YamlStrategyBefore {
 
 #[derive(Debug, Deserialize)]
 pub struct YamlStrategyBetween {
-    interface: PatternSpec,
+    interface: OneOrMany<String>,
     inner: Option<YamlProviderOpt>,
     outer: Option<YamlProviderOpt>,
     #[serde(rename = "all-funcs")]
@@ -145,7 +143,7 @@ pub struct YamlFuncPred {
 
 #[derive(Debug, Deserialize)]
 pub struct YamlProviderOpt {
-    name: Option<PatternSpec>,
+    name: Option<OneOrMany<String>>,
     // Alias the matched provider to this name in the generated wac
     alias: Option<String>,
 }
@@ -407,9 +405,13 @@ fn check_node_name(
     Ok(())
 }
 
-/// Compile a [`PatternSpec`] into a [`Pattern`], wrapping a bad-glob
+/// Compile a [`OneOrMany<String>`] into a [`Pattern`], wrapping a bad-glob
 /// error with rule/field context so it reads as a config error.
-fn compile_pattern(rule_num: usize, field: &str, spec: PatternSpec) -> anyhow::Result<Pattern> {
+fn compile_pattern(
+    rule_num: usize,
+    field: &str,
+    spec: OneOrMany<String>,
+) -> anyhow::Result<Pattern> {
     Pattern::compile(spec.into_vec()).map_err(|e| anyhow::anyhow!("rule {rule_num}: '{field}' {e}"))
 }
 
