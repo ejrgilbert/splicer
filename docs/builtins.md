@@ -23,10 +23,10 @@ Per-builtin config keys are covered in
 Tier-1/2 and tier-3/4 builtins ship differently, so their resolution
 paths differ:
 
-| Tier  | What ships                                                                   | Resolution order at splice time                                                                                                                                                                                                             |
-|-------|------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 1 / 2 | Pre-built `.wasm` component bytes, published to an OCI registry.             | 1. `$SPLICER_BUILTINS_DIR/<name>.wasm` **local cache override**. <br>2. On-disk cache: `<user-cache>/splicer/builtins/<name>@<version>.wasm`. <br>3. OCI pull from `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>` (pulls to cache). |
-| 3 / 4 | Strategy crate **source**, embedded inside the splicer binary at build time. | 1. Look up `<name>` in the embedded set (no disk or network). <br>2. Extract the source tree to a cache dir. <br>3. cargo codegen + build → a wrapper wasm specialized to the target interface.                                             |
+| Tier  | What ships                                                                   | Resolution order at splice time                                                                                                                                                                                                            |
+|-------|------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 & 2 | Pre-built `.wasm` component bytes, published to an OCI registry.             | 1. Local cache override: `$SPLICER_BUILTINS_DIR/<name>.wasm`. <br>2. On-disk cache: `<user-cache>/splicer/builtins/<name>@<version>.wasm`. <br>3. OCI pull from `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>` (pulls into cache). |
+| 3 & 4 | Strategy crate **source**, embedded inside the splicer binary at build time. | 1. Look up `<name>` in the embedded set (no disk or network). <br>2. Extract the source tree to a cache dir. <br>3. cargo codegen + build → a wrapper wasm specialized to the target interface.                                            |
 
 Why they differ: tier-1/2 builtins are reusable components — one wasm
 fits every target interface, so an OCI registry is natural. Tier-3/4
