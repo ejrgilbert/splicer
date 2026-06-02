@@ -463,13 +463,13 @@ fn compile_value_props(
     };
     spec.into_vec()
         .iter()
-        .map(|kw| match kw.as_str() {
-            "concrete" => Ok(ValueProperty::Concrete),
-            "defaultable" => Ok(ValueProperty::Defaultable),
-            other => bail!(
-                "rule {rule_num}: 'all-funcs.{field}' has unknown property '{other}' \
-                 (expected 'concrete' or 'defaultable')"
-            ),
+        .map(|kw| {
+            kw.parse::<ValueProperty>().map_err(|()| {
+                anyhow::anyhow!(
+                    "rule {rule_num}: 'all-funcs.{field}' has unknown property '{kw}' \
+                     (expected 'concrete' or 'defaultable')"
+                )
+            })
         })
         .collect()
 }
@@ -488,7 +488,7 @@ fn compile_scopes(
     }
     raw.iter()
         .map(|kw| {
-            FuncScope::from_keyword(kw).ok_or_else(|| {
+            kw.parse::<FuncScope>().map_err(|()| {
                 anyhow::anyhow!(
                     "rule {rule_num}: 'all-funcs.scope' has unknown value '{kw}' \
                      (expected 'interface' or 'resource')"
