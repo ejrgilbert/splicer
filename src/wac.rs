@@ -830,8 +830,7 @@ pub fn generate_wac(
         }
         // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
         // this is just a single exported service func.
-        // Exports carry the type as an interned id, not inline — resolve
-        // it through the arena so `all-funcs:` can read the signature.
+
         let interface_type = match ty {
             Some(InternedId::Interface(id)) => {
                 Some(composition.arena.lookup_interface(*id).clone())
