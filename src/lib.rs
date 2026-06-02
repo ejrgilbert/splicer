@@ -84,6 +84,7 @@ mod compose;
 mod config_provider;
 mod contract;
 mod parse;
+mod preview;
 mod select;
 mod split;
 mod strategies;
@@ -105,6 +106,7 @@ pub use api::{
     compose, compose_wac, format_wac_compose_cmd, splice, Bundle, ComponentInput, ComposeRequest,
     SpliceRequest,
 };
+pub use preview::{preview, preview_with_graph, PreviewOutput, PreviewRequest};
 
 /// Re-export so consumers pick up the exact cviz version splicer
 /// links against, avoiding version-skew on shared types.

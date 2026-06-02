@@ -2,11 +2,15 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
+use splicer::cviz::output::graph::{generate_graph_ascii, GraphRenderOpts};
+use splicer::cviz::output::{mermaid::generate_mermaid, Direction};
 use splicer::types::ContractResult;
 use splicer::{
-    builtin_info, compose, splice, Bundle, ComponentInput, ComposeRequest, SpliceRequest,
+    builtin_info, compose, preview, splice, Bundle, ComponentInput, ComposeRequest, PreviewRequest,
+    SpliceRequest,
 };
 
 const DEFAULT_PKG: &str = "example:composition";
@@ -119,6 +123,50 @@ enum Command {
         package: String,
     },
 
+    /// Visualize which edges each splice rule would touch.
+    ///
+    /// Runs the rules' `select` pass against the composition without
+    /// mutating anything, then renders the composition as ASCII (or
+    /// Mermaid) with matched edges highlighted and tagged by rule
+    /// number.  Useful for sanity-checking a config — overbroad globs,
+    /// unintended overlap, type-predicate gaps — at a glance.
+    Preview {
+        /// Path to the splice configuration in YAML format.
+        #[arg(value_name = "SPLICE_CFG")]
+        splice_cfg_file: PathBuf,
+
+        /// Pre-composed Wasm component binary to render.
+        #[arg(value_name = "COMP_WASM")]
+        comp_wasm: PathBuf,
+
+        /// Output file. Defaults to stdout.
+        #[arg(short = 'o', long = "output", value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Rendering format.
+        #[arg(short = 'f', long = "format", default_value = "ascii", value_enum)]
+        format: PreviewFormat,
+
+        /// Only render highlights for rule N (1-based). Other rules
+        /// are still parsed (so their YAML errors surface) but their
+        /// matches are not painted.
+        #[arg(long = "rule", value_name = "N")]
+        rule: Option<usize>,
+
+        /// Hide WIT type signatures on interface connections.
+        #[arg(long = "no-types", action = clap::ArgAction::SetTrue)]
+        no_types: bool,
+
+        /// Mermaid diagram direction (Mermaid format only).
+        #[arg(short = 'd', long = "direction", default_value = "lr", value_enum)]
+        direction: Direction,
+
+        /// Force ANSI color (auto-detected by default). Only affects
+        /// ASCII output to stdout.
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
+    },
+
     /// Inspect builtin middleware shipped with this splicer.
     ///
     /// With no argument, lists every builtin and its one-line
@@ -177,8 +225,112 @@ fn main() -> Result<()> {
             package,
         } => run_compose(wasms, output, emit_wac, plan, package),
 
+        Command::Preview {
+            splice_cfg_file,
+            comp_wasm,
+            output,
+            format,
+            rule,
+            no_types,
+            direction,
+            color,
+        } => run_preview(
+            splice_cfg_file,
+            comp_wasm,
+            output,
+            format,
+            rule,
+            no_types,
+            direction,
+            color,
+        ),
+
         Command::Builtin { name } => run_builtin(name),
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum PreviewFormat {
+    #[default]
+    Ascii,
+    Mermaid,
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_preview(
+    splice_cfg_file: PathBuf,
+    comp_wasm: PathBuf,
+    output: Option<PathBuf>,
+    format: PreviewFormat,
+    rule: Option<usize>,
+    no_types: bool,
+    direction: Direction,
+    color: ColorMode,
+) -> Result<()> {
+    let rules_yaml = fs::read_to_string(&splice_cfg_file)
+        .with_context(|| format!("Failed to read: {}", splice_cfg_file.display()))?;
+
+    let result = preview(PreviewRequest {
+        composition_wasm: comp_wasm,
+        rules_yaml,
+        only_rule: rule,
+    })?;
+
+    let opts = GraphRenderOpts::default();
+    let show_types = !no_types;
+    let to_file = output.is_some();
+    let use_color = match color {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => !to_file && std::io::stdout().is_terminal(),
+    };
+
+    let rendered = match format {
+        PreviewFormat::Ascii => {
+            let out = generate_graph_ascii(
+                &result.graph,
+                &opts,
+                show_types,
+                None,
+                Some(&result.highlights),
+                use_color,
+            );
+            out.ascii
+        }
+        PreviewFormat::Mermaid => generate_mermaid(
+            &result.graph,
+            &opts,
+            direction,
+            show_types,
+            Some(&result.highlights),
+        ),
+    };
+
+    if let Some(path) = output {
+        fs::write(&path, &rendered)
+            .with_context(|| format!("Failed to write preview: {}", path.display()))?;
+        eprintln!("Preview written to: {}", path.display());
+    } else {
+        println!("{}", rendered);
+    }
+
+    for rule_num in &result.unmatched_rules {
+        eprintln!(
+            "{}: rule {} matched no edges",
+            "WARN".yellow().bold(),
+            rule_num,
+        );
+    }
+
+    Ok(())
 }
 
 fn run_builtin(name: Option<String>) -> Result<()> {
