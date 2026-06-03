@@ -107,7 +107,7 @@ There's no config-level way to restrict which functions are wrapped yet
 policy, measurable overhead on ignored calls), **please [open an
 issue](https://github.com/ejrgilbert/splicer/issues)** with details. A
 config-level `funcs: [...]` filter is on the roadmap (see
-[`docs/TODO/adapter-comp-planning.md`](../TODO/adapter-comp-planning.md))
+[`docs/TODO/per-function-interposition-filter.md`](../TODO/per-function-interposition-filter.md))
 and real use cases drive the priority.
 
 ## What the generated adapter does

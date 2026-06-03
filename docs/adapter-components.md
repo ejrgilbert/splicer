@@ -31,9 +31,7 @@ docs:
 - [Tier 4: Virtualize](./tiers/tier-4.md) — shipped
 
 For a low-level architecture walkthrough of the generator itself, see
-[`adapter-internals.md`](./adapter-internals.md). For broader planning
-notes on tier work, see
-[`docs/TODO/adapter-comp-planning.md`](./TODO/adapter-comp-planning.md).
+[`adapter-internals.md`](./adapter-internals.md).
 
 ## Middleware Tiers
 

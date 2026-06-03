@@ -10,8 +10,7 @@
 //! classification to diverge.
 //!
 //! See `docs/tiers/tier-3.md` and `docs/tiers/tier-4.md` for the
-//! tier definitions; `docs/TODO/tier3-tier4-substrate.md` for the
-//! substrate design.
+//! tier definitions.
 
 use crate::types::CallId;
 

@@ -75,7 +75,7 @@ handles). Targets whose returns contain resource handles (e.g.
 `wasi:http/handler` returning `Response`) aren't supported yet —
 those need a resource walker + `MockedResource` pattern +
 types-interface composition wiring; see
-[`docs/TODO/tier3-tier4-substrate.md`](../TODO/tier3-tier4-substrate.md).
+[`docs/TODO/tier3-tier4-builtins.md`](../TODO/tier3-tier4-builtins.md).
 
 ## Good for
 
