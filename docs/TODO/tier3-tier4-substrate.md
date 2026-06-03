@@ -1,7 +1,7 @@
 # Tier-3 / Tier-4 substrate: forward-looking design
 
 Forward-looking design for tier-3/4 — strategy taxonomy, type
-predicates, cells wire format, `between_subgraph` integration,
+predicates, cells wire format, `on_subgraph` integration,
 resource path. The substrate (strategy traits, codegen template,
 cargo build pipeline, hello-tier3 / hello-tier4 smoke builtins) has
 landed; this doc no longer tracks shipped checkboxes — see
@@ -181,7 +181,7 @@ to resources at all.
 5. Trace format already supports `cell::resource-handle` cells from
    tier-2; no v1 changes needed.
 
-## `between_subgraph`: how this substrate consumes it
+## `on_subgraph`: how this substrate consumes it
 
 The multi-edge selector vocabulary and `edge_id` mechanism are
 documented in
@@ -192,7 +192,7 @@ primitives.
 **Example YAML:**
 
 ```yaml
-- between_subgraph:
+- on_subgraph:
     nodes: [billing-frontend, billing-core, billing-db-shim]
     direction: inbound   # or "outbound" or "both"
   inject:
@@ -201,13 +201,13 @@ primitives.
         dir: ./recordings/billing/
 ```
 
-`between_subgraph` expands at parse time to a set of per-edge rules,
+`on_subgraph` expands at parse time to a set of per-edge rules,
 one per boundary edge. The runtime primitive stays per-edge. From the
 typed-wrapper substrate's perspective this is just "the rule layer
 produced N target edges, generate wrappers for each unique WIT among
 them and wire them in."
 
-**Modes the substrate enables on top of `between_subgraph`:**
+**Modes the substrate enables on top of `on_subgraph`:**
 
 | Mode               | What gets wired                                              | Useful for                                                |
 |--------------------|--------------------------------------------------------------|-----------------------------------------------------------|
@@ -223,7 +223,7 @@ semantic weirdness: the subgraph is the SUT, the rest of the graph
 does not exist during fuzz, the fuzz driver is the only caller.
 Standard fuzzing semantics scoped to an arbitrary subgraph.
 
-**Single-component is a special case** of `between_subgraph: { nodes:
+**Single-component is a special case** of `on_subgraph: { nodes:
 [target], direction: both }`, equivalent to `on_node: target`. The
 selector vocabulary handles single-node and multi-node uniformly.
 
@@ -243,20 +243,20 @@ selector vocabulary handles single-node and multi-node uniformly.
 work in the same splice config. Apply `redact-strings` to every
 `wasi:http/handler` edge via per-interface targeting (`before` /
 `between`), and apply `record` to the billing subgraph's boundary via
-`between_subgraph` in the same YAML. Different rules, different
+`on_subgraph` in the same YAML. Different rules, different
 mechanics, both valid. The substrate handles both uniformly because both
 reduce to "wire wrappers on some set of edges."
 
 **Sequencing.** The substrate doc's v1 ship presupposes recorder doc
 steps 2-5 (edge_id auto-injection, file-sink, `on_node` selector,
-`between_subgraph` selector). The replay strategies of *this* doc
+`on_subgraph` selector). The replay strategies of *this* doc
 correspond to recorder doc step 7 (replayer as tier-4 virtualize).
-`between_subgraph` (recorder doc step 5) is the prerequisite for the
+`on_subgraph` (recorder doc step 5) is the prerequisite for the
 differential-testing capstone.
 
 ## Use cases that drop out of the substrate
 
-The substrate plus `between_subgraph` combine to enable several
+The substrate plus `on_subgraph` combine to enable several
 high-value capabilities beyond the explicit builtins. Each is mostly
 reuse of pieces already planned plus a small piece of new glue.
 
@@ -269,7 +269,7 @@ version-B's outbound calls; compare the version-B outbound trace to
 the version-A outbound trace. Differences flag behavioral regressions
 introduced by the refactor.
 
-**Pieces reused:** `between_subgraph` selector (recorder doc step 5),
+**Pieces reused:** `on_subgraph` selector (recorder doc step 5),
 recorder writing cells keyed by `edge_id`, value-typed replayer driving
 the subgraph with recorded inbound inputs (recorder doc step 7).
 
@@ -295,7 +295,7 @@ Dependency isolation testing, bounded chaos engineering, subgraph
 extraction / decomposition, scoped observability, capability
 attenuation at trust boundaries, behavioral diff between versions,
 scoped profiling. All compose the same substrate pieces with different
-strategy configurations applied to `between_subgraph` boundaries.
+strategy configurations applied to `on_subgraph` boundaries.
 
 ## Open questions
 

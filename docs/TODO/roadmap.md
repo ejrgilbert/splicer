@@ -12,7 +12,7 @@ detail; this doc is the calendar overlay.
 
 | Phase | Calendar | What lands |
 |-------|----------|------------|
-| 1     | ~2 weeks | 3 streams in parallel: finish recorder, tier-3 substrate foundation, `between_subgraph` selector |
+| 1     | ~2 weeks | 3 streams in parallel: finish recorder, tier-3 substrate foundation, `on_subgraph` selector |
 | 2     | 1-2 weeks| `fuzz-input`, `redact-strings`, smoke tests, multi-edge UX (`on_edge` + `splicer edges` CLI) |
 | 4     | 2-3 weeks| Record + replay loop (multi-edge step 7 + record/replay strategies) |
 | 5     | ~1 week  | Trace diff CLI + differential-testing demo (v1 paper demo) |
@@ -46,11 +46,11 @@ Substrate foundation items:
 ### Stream C — subgraph selection (~1-1.5 weeks)
 
 Multi-edge doc steps 4-5:
-- [ ] YAML grammar: `on_node`, `between_subgraph` selectors
+- [ ] YAML grammar: `on_node`, `on_subgraph` selectors
 - [ ] `on_node` desugars at parse time to `before` / `between` rules
   with the named node as the inner or outer constraint (no graph
   needed — the existing chain walk already finds matching edges).
-- [ ] `between_subgraph` resolves against the composition graph
+- [ ] `on_subgraph` resolves against the composition graph
   (boundary = "exactly one endpoint in the set"; globs can't express
   set negation, so this step needs the graph).
 - [ ] Filter blocks (narrow by interface glob).
@@ -85,7 +85,7 @@ key + auto-injected config substrate); it never appears in user YAML.
   are exercised.
 
 Skipped Phase 3 — Phase 1's Stream C already covered `on_node` and
-`between_subgraph`, and Phase 2 picks up the rest.
+`on_subgraph`, and Phase 2 picks up the rest.
 
 ## Phase 4: record + replay loop (2-3 weeks)
 

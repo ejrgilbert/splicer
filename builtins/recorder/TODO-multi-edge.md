@@ -44,7 +44,7 @@ Each layer owns exactly one concern. Nothing crosses lanes.
      is the caller side (`outer`); both = the union. Desugars at
      parse time to one or two `before`/`between` rules with the
      node name as the inner or outer constraint.
-   - `between_subgraph`: every edge crossing the boundary of a set
+   - `on_subgraph`: every edge crossing the boundary of a set
      of nodes. A subgraph is a set of nodes plus its internal edges;
      its boundary is "edges with exactly one endpoint in the set."
      Internal edges stay untouched and run live during replay, so
@@ -69,7 +69,7 @@ Each layer owns exactly one concern. Nothing crosses lanes.
    Example YAML for subgraph-level recording:
 
    ```yaml
-   - between_subgraph:
+   - on_subgraph:
        nodes: [B, C, D]
        direction: inbound
      inject:
@@ -135,7 +135,7 @@ Properties this format must hold:
   change with a major version bump — they appear in recording
   filenames and in the auto-injected `_splicer_edge_id` builtin
   config. They do **not** appear in user YAML; the higher-level
-  selectors (`on_node`, `between_subgraph`) and the existing
+  selectors (`on_node`, `on_subgraph`) and the existing
   `before` / `between` are the only edge-naming surface operators
   see.
 
@@ -155,7 +155,7 @@ logic, or the encode/decode contracts.
 | 2    | Splicer auto-injects `_splicer_edge_id` into every spliced builtin's config.     | **done**            |
 | 3    | Recorder reads `_splicer_edge_id`; file-sink lands; default sink switches to file (one file per edge). Stdout/stderr documented as single-instance-only. | **done**    |
 | 4    | `on_node: { name, direction }` YAML selector. Desugars at parse time to one or two `before`/`between` rules. Optional `filter: { interface: <glob> }`. | not started |
-| 5    | `between_subgraph: { nodes, direction }` YAML selector. Resolves against the composition graph (boundary = "exactly one endpoint in the set"). Optional `filter: { interface: <glob> }`. | not started |
+| 5    | `on_subgraph: { nodes, direction }` YAML selector. Resolves against the composition graph (boundary = "exactly one endpoint in the set"). Optional `filter: { interface: <glob> }`. | not started |
 | 6    | `splicer edges <composition>` CLI subcommand listing each edge with its canonical id and the equivalent `between` block. Discovery aid for reading recorder output and writing matching replay rules. Splicer also logs matched edge_ids during `splice` runs. | not started |
 | 7    | Replayer builtin (tier-4 virtualize). Consumes steps 2-5; the same structural rule the recorder used (re-derives the matching edge_id). Subset replay (virtualize some boundary edges, leave the rest live) falls out of step 5's filter block. See [`docs/TODO/tier3-tier4-substrate.md`](../../docs/TODO/tier3-tier4-substrate.md) for the `WrapperStrategy` + codegen template architecture that lands here. | not started |
 
