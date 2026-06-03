@@ -4,12 +4,12 @@ use anyhow::{Context, Result};
 use cviz::canonical_edge_id;
 use cviz::model::CompositionGraph;
 use cviz::parse::component::parse_component;
-use cviz::{Highlights, Selection};
+use cviz::{HighlightColor, Highlights, Selection};
 
 use crate::parse::config::{parse_yaml, SpliceRule};
 use crate::resolve::resolve_rules;
-use crate::select::{FuncPred, FuncScope, ValueProperty};
-use crate::wac::build_chain_skeletons;
+use crate::select::{FuncPred, FuncScope, Pattern, ValueProperty};
+use crate::wac::{build_chain_skeletons, ChainSkeleton};
 
 #[derive(Debug, Clone)]
 pub struct PreviewRequest {
@@ -52,56 +52,64 @@ pub fn preview_with_graph(
     rules_yaml: &str,
     only_rule: Option<usize>,
 ) -> Result<PreviewOutput> {
-    let rules = parse_yaml(rules_yaml).context("Failed to parse splice rules YAML")?;
-    // Resolve graph-dependent selectors (on_subgraph) into
-    // per-edge Before/Between rules before walking.
-    let rules = resolve_rules(rules, &graph)?;
-
+    let parsed = parse_yaml(rules_yaml).context("Failed to parse splice rules YAML")?;
     let (skeletons, _handled) = build_chain_skeletons(&graph);
 
     let mut highlights = Highlights::default();
     let mut unmatched_rules: Vec<usize> = Vec::new();
 
-    for (idx, rule) in rules.iter().enumerate() {
-        let rule_num = idx + 1;
+    for (idx, parsed_rule) in parsed.into_iter().enumerate() {
+        let rule_num = (idx + 1) as u32;
         if let Some(only) = only_rule {
-            if only != rule_num {
+            if only as u32 != rule_num {
                 continue;
             }
         }
 
-        let desc = rule_description(rule_num, rule);
+        let desc = rule_description(idx + 1, &parsed_rule);
         highlights
-            .register_tag(rule_num as u32, &desc)
+            .register_tag(rule_num, &desc)
             .with_context(|| format!("registering tag for rule {rule_num}"))?;
 
-        let matcher = rule.matcher();
+        // Structural overlay: paint nodes / internal edges in context
+        // colors BEFORE the per-edge walk, so "last write wins" lets
+        // matched edges override context where they overlap.
+        match &parsed_rule {
+            SpliceRule::OnNode { name, .. } => {
+                paint_on_node_overlay(rule_num, name, &graph, &mut highlights);
+            }
+            SpliceRule::OnSubgraph { nodes, .. } => {
+                paint_on_subgraph_overlay(rule_num, nodes, &graph, &skeletons, &mut highlights);
+            }
+            _ => {}
+        }
+
+        // Resolve this one user rule into per-edge rules and walk for
+        // edge highlights. All emitted rules share `rule_num` because
+        // they came from this iteration's user rule.
+        let resolved = resolve_rules(vec![parsed_rule], &graph)?;
         let mut any_match = false;
-        for (chain_idx, sk) in skeletons.iter().enumerate() {
-            let sites = matcher
-                .select(
-                    chain_idx,
-                    &sk.chain,
-                    &sk.interface_name,
-                    sk.interface_type.as_ref(),
-                    &graph,
-                )
-                .with_context(|| format!("rule {rule_num}"))?;
-            for site in &sites {
-                any_match = true;
-                let provider_id = sk.chain[site.provider_idx];
-                let caller_label = site.has_caller.then(|| {
-                    let cid = sk.chain[site.provider_idx + 1];
-                    graph.nodes[&cid].canonical_id().to_string()
-                });
-                let provider_label = graph.nodes[&provider_id].canonical_id();
-                let edge_id =
-                    canonical_edge_id(&sk.interface_name, caller_label.as_deref(), provider_label);
-                highlights.mark(Selection::edge(edge_id).tag(rule_num as u32));
+        for rule in &resolved {
+            let matcher = rule.matcher();
+            for (chain_idx, sk) in skeletons.iter().enumerate() {
+                let sites = matcher
+                    .select(
+                        chain_idx,
+                        &sk.chain,
+                        &sk.interface_name,
+                        sk.interface_type.as_ref(),
+                        &graph,
+                    )
+                    .with_context(|| format!("rule {rule_num}"))?;
+                for site in &sites {
+                    any_match = true;
+                    let edge_id = chain_edge_id(sk, site.provider_idx, site.has_caller, &graph);
+                    highlights.mark(Selection::edge(edge_id).tag(rule_num));
+                }
             }
         }
         if !any_match {
-            unmatched_rules.push(rule_num);
+            unmatched_rules.push(rule_num as usize);
         }
     }
 
@@ -112,45 +120,127 @@ pub fn preview_with_graph(
     })
 }
 
+/// Context color shared by all structural overlays — sits beneath any
+/// matched-edge marks the per-edge walk lays down later.
+const OVERLAY_COLOR: HighlightColor = HighlightColor::Green;
+
+/// Build the canonical edge id for the edge at `provider_idx` in `sk`.
+/// `has_caller=true` looks up the caller at `provider_idx + 1`; `false`
+/// produces a boundary-edge id (no in-chain caller).
+fn chain_edge_id(
+    sk: &ChainSkeleton,
+    provider_idx: usize,
+    has_caller: bool,
+    graph: &CompositionGraph,
+) -> String {
+    let provider = graph.nodes[&sk.chain[provider_idx]].canonical_id();
+    let caller = has_caller.then(|| graph.nodes[&sk.chain[provider_idx + 1]].canonical_id());
+    canonical_edge_id(&sk.interface_name, caller, provider)
+}
+
+/// Mark every graph node whose display label satisfies `matches` in
+/// the overlay color. Used by both on_node and on_subgraph overlays.
+fn mark_nodes_where(
+    rule_num: u32,
+    graph: &CompositionGraph,
+    highlights: &mut Highlights,
+    matches: impl Fn(&str) -> bool,
+) {
+    for node in graph.nodes.values() {
+        if matches(node.display_label()) {
+            highlights.mark(
+                Selection::node(node.canonical_id().to_string())
+                    .color(OVERLAY_COLOR)
+                    .tag(rule_num),
+            );
+        }
+    }
+}
+
+/// Paint every graph node whose display label matches `name` (a glob).
+fn paint_on_node_overlay(
+    rule_num: u32,
+    name: &Pattern,
+    graph: &CompositionGraph,
+    highlights: &mut Highlights,
+) {
+    mark_nodes_where(rule_num, graph, highlights, |label| name.is_match(label));
+}
+
+/// Paint every node listed in `nodes` plus every edge between two of
+/// those nodes (internal edges) in the overlay color. Boundary edges
+/// are NOT painted here — they get the default color from the per-edge
+/// walk via "last write wins".
+fn paint_on_subgraph_overlay(
+    rule_num: u32,
+    nodes: &[String],
+    graph: &CompositionGraph,
+    skeletons: &[ChainSkeleton],
+    highlights: &mut Highlights,
+) {
+    use std::collections::BTreeSet;
+    let subgraph: BTreeSet<&str> = nodes.iter().map(String::as_str).collect();
+    mark_nodes_where(rule_num, graph, highlights, |label| {
+        subgraph.contains(label)
+    });
+    for sk in skeletons {
+        for i in 0..sk.chain.len().saturating_sub(1) {
+            let provider_label = graph.nodes[&sk.chain[i]].display_label();
+            let caller_label = graph.nodes[&sk.chain[i + 1]].display_label();
+            if subgraph.contains(provider_label) && subgraph.contains(caller_label) {
+                let edge_id = chain_edge_id(sk, i, true, graph);
+                highlights.mark(Selection::edge(edge_id).color(OVERLAY_COLOR).tag(rule_num));
+            }
+        }
+    }
+}
+
 /// One-line legend string for `rule`: `#N <kind> <field>=<value> ...`.
 /// `inject:` is never rendered since it's the *effect*, not the *selection*.
 pub fn rule_description(idx: usize, rule: &SpliceRule) -> String {
     let mut parts: Vec<String> = vec![format!("#{idx}")];
+    let glob = |key: &str, raw: &[String]| format!("{key}={}", quoted_globs(raw));
+    let funcs = |p: Option<&FuncPred>| p.map(|f| format!("all-funcs={}", render_func_pred(f)));
+
     match rule {
         SpliceRule::Before { matcher, .. } => {
-            parts.push("before".to_string());
-            parts.push(format!(
-                "interface={}",
-                quoted_globs(matcher.interface_raw())
-            ));
-            if let Some(p) = matcher.provider_raw() {
-                parts.push(format!("provider={}", quoted_globs(p)));
-            }
-            if let Some(f) = matcher.all_funcs() {
-                parts.push(format!("all-funcs={}", render_func_pred(f)));
-            }
+            parts.push("before".into());
+            parts.push(glob("interface", matcher.interface_raw()));
+            parts.extend(matcher.provider_raw().map(|p| glob("provider", p)));
+            parts.extend(funcs(matcher.all_funcs()));
         }
         SpliceRule::Between { matcher, .. } => {
-            parts.push("between".to_string());
-            parts.push(format!(
-                "interface={}",
-                quoted_globs(matcher.interface_raw())
-            ));
-
-            if let Some(p) = matcher.provider_raw() {
-                parts.push(format!("inner={}", quoted_globs(p)));
-            }
-            if let Some(c) = matcher.caller_raw() {
-                parts.push(format!("outer={}", quoted_globs(c)));
-            }
-            if let Some(f) = matcher.all_funcs() {
-                parts.push(format!("all-funcs={}", render_func_pred(f)));
-            }
+            parts.push("between".into());
+            parts.push(glob("interface", matcher.interface_raw()));
+            parts.extend(matcher.provider_raw().map(|p| glob("inner", p)));
+            parts.extend(matcher.caller_raw().map(|c| glob("outer", c)));
+            parts.extend(funcs(matcher.all_funcs()));
         }
-        SpliceRule::OnSubgraph { .. } => {
-            // OnSubgraph is expected to be resolved before preview
-            // walks rules.
-            panic!("OnSubgraph must be resolved before rule_description")
+        SpliceRule::OnNode {
+            name,
+            direction,
+            interface,
+            all_funcs,
+            ..
+        } => {
+            parts.push("on_node".into());
+            parts.push(glob("name", name.raw()));
+            parts.push(format!("direction={direction}"));
+            parts.push(glob("interface", interface.raw()));
+            parts.extend(funcs(all_funcs.as_ref()));
+        }
+        SpliceRule::OnSubgraph {
+            nodes,
+            direction,
+            interface,
+            all_funcs,
+            ..
+        } => {
+            parts.push("on_subgraph".into());
+            parts.push(format!("nodes=[{}]", nodes.join(",")));
+            parts.push(format!("direction={direction}"));
+            parts.push(glob("interface", interface.raw()));
+            parts.extend(funcs(all_funcs.as_ref()));
         }
     }
     parts.join(" ")

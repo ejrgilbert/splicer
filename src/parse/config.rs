@@ -148,6 +148,15 @@ pub enum Direction {
     #[default]
     Both,
 }
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Direction::Inbound => "inbound",
+            Direction::Outbound => "outbound",
+            Direction::Both => "both",
+        })
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct YamlFuncPred {
@@ -282,6 +291,20 @@ pub enum SpliceRule {
         /// Middleware to inject (in order).
         inject: Vec<Injection>,
     },
+    /// Unresolved `on_node` selector.
+    OnNode {
+        /// Compiled node-name pattern.
+        name: Pattern,
+        direction: Direction,
+        /// Compiled interface pattern (defaults to `"*"`).
+        interface: Pattern,
+        /// Compiled `all-funcs:` predicate, threaded onto each emitted rule.
+        all_funcs: Option<FuncPred>,
+        /// Optional WAC-var rename, propagated to both emitted rules.
+        alias: Option<String>,
+        /// Middleware to inject (in order).
+        inject: Vec<Injection>,
+    },
     /// Unresolved `on_subgraph` selector.
     OnSubgraph {
         /// Literal node names forming the subgraph.
@@ -297,13 +320,13 @@ pub enum SpliceRule {
 }
 
 impl SpliceRule {
-    /// The compiled matcher for this rule. Panics on `OnSubgraph`,
-    /// that variant must be resolved before any matcher walk.
+    /// The compiled matcher for this rule. Panics on the unresolved
+    /// variants (`OnNode`, `OnSubgraph`); those must be expanded first.
     pub(crate) fn matcher(&self) -> &RuleMatcher {
         match self {
             SpliceRule::Before { matcher, .. } | SpliceRule::Between { matcher, .. } => matcher,
-            SpliceRule::OnSubgraph { .. } => {
-                panic!("OnSubgraph must be resolved via resolve_rules() before .matcher()")
+            SpliceRule::OnNode { .. } | SpliceRule::OnSubgraph { .. } => {
+                panic!("unresolved variant: call resolve_rules() before .matcher()")
             }
         }
     }
@@ -313,6 +336,7 @@ impl SpliceRule {
         match self {
             SpliceRule::Before { inject, .. }
             | SpliceRule::Between { inject, .. }
+            | SpliceRule::OnNode { inject, .. }
             | SpliceRule::OnSubgraph { inject, .. } => inject,
         }
     }
@@ -323,6 +347,7 @@ impl SpliceRule {
         match self {
             SpliceRule::Before { inject, .. }
             | SpliceRule::Between { inject, .. }
+            | SpliceRule::OnNode { inject, .. }
             | SpliceRule::OnSubgraph { inject, .. } => inject,
         }
     }
@@ -697,7 +722,7 @@ fn desugar_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<Vec<SpliceRul
     match (before, between, on_node, on_subgraph) {
         (Some(s), None, None, None) => Ok(vec![compile_before(rule_num, s, inject)?]),
         (None, Some(s), None, None) => Ok(vec![compile_between(rule_num, s, inject)?]),
-        (None, None, Some(s), None) => compile_on_node(rule_num, s, inject),
+        (None, None, Some(s), None) => Ok(vec![compile_on_node(rule_num, s, inject)?]),
         (None, None, None, Some(s)) => Ok(vec![compile_on_subgraph(rule_num, s, inject)?]),
         _ => unreachable!("validate() guarantees exactly one strategy per rule"),
     }
@@ -757,16 +782,13 @@ fn compile_between(
     })
 }
 
-/// Desugar `on_node` into per-direction rules by synthesizing the
-/// equivalent `before`/`between` YAML shapes and delegating. Inbound =
-/// X is the provider; uses `Before` so the chain-boundary position
-/// (X exposed as a top-level export) is included alongside internal
-/// positions. Outbound = X is the caller; uses `Between`.
+/// Compile `on_node` into the unresolved [`SpliceRule::OnNode`] variant.
+/// Expansion happens later.
 fn compile_on_node(
     rule_num: usize,
     spec: YamlStrategyOnNode,
     inject: Vec<Injection>,
-) -> anyhow::Result<Vec<SpliceRule>> {
+) -> anyhow::Result<SpliceRule> {
     let YamlStrategyOnNode {
         name,
         direction,
@@ -775,36 +797,17 @@ fn compile_on_node(
         all_funcs,
     } = spec;
     let interface = interface.unwrap_or_else(|| OneOrMany::One("*".to_string()));
-    let node = YamlProviderOpt {
-        name: Some(OneOrMany::One(name)),
+    let interface = compile_pattern(rule_num, "interface", interface)?;
+    let name = compile_pattern(rule_num, "on_node.name", OneOrMany::One(name))?;
+    let all_funcs = compile_func_pred(rule_num, all_funcs)?;
+    Ok(SpliceRule::OnNode {
+        name,
+        direction,
+        interface,
+        all_funcs,
         alias,
-    };
-
-    let mut rules = Vec::with_capacity(2);
-    if matches!(direction, Direction::Inbound | Direction::Both) {
-        rules.push(compile_before(
-            rule_num,
-            YamlStrategyBefore {
-                interface: interface.clone(),
-                provider: Some(node.clone()),
-                all_funcs: all_funcs.clone(),
-            },
-            inject.clone(),
-        )?);
-    }
-    if matches!(direction, Direction::Outbound | Direction::Both) {
-        rules.push(compile_between(
-            rule_num,
-            YamlStrategyBetween {
-                interface,
-                inner: None,
-                outer: Some(node),
-                all_funcs,
-            },
-            inject,
-        )?);
-    }
-    Ok(rules)
+        inject,
+    })
 }
 
 fn compile_on_subgraph(
@@ -1880,10 +1883,25 @@ rules:
     // on_node selector
     // -----------------------------------------------------------------------
 
+    /// Helper: assert `rules` has one `OnNode` and return its fields by
+    /// reference. Keeps the per-test pattern-matching boilerplate down.
+    fn one_on_node(rules: &[SpliceRule]) -> (&Pattern, Direction, &Pattern, Option<&str>) {
+        assert_eq!(rules.len(), 1, "on_node should parse to one OnNode variant");
+        let SpliceRule::OnNode {
+            name,
+            direction,
+            interface,
+            alias,
+            ..
+        } = &rules[0]
+        else {
+            panic!("expected OnNode, got {:?}", rules[0]);
+        };
+        (name, *direction, interface, alias.as_deref())
+    }
+
     #[test]
-    fn parse_on_node_default_direction_fans_out_to_two_rules() {
-        // `direction:` omitted ⇒ Both ⇒ one Before (inbound, X as provider)
-        // and one Between (outbound, X as outer).
+    fn parse_on_node_default_direction_is_both() {
         let yaml = r#"
 version: 1
 rules:
@@ -1894,22 +1912,14 @@ rules:
         path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("on_node should parse");
-        assert_eq!(rules.len(), 2, "Both ⇒ inbound + outbound");
-        let SpliceRule::Before { matcher: m_in, .. } = &rules[0] else {
-            panic!("first rule should be Before (inbound)");
-        };
-        assert_eq!(m_in.interface_raw(), ["*"]);
-        assert_eq!(m_in.provider_raw(), Some(&["srv-b".to_string()][..]));
-        let SpliceRule::Between { matcher: m_out, .. } = &rules[1] else {
-            panic!("second rule should be Between (outbound)");
-        };
-        assert_eq!(m_out.interface_raw(), ["*"]);
-        assert_eq!(m_out.caller_raw(), Some(&["srv-b".to_string()][..]));
-        assert!(m_out.provider_raw().is_none());
+        let (name, direction, interface, _) = one_on_node(&rules);
+        assert_eq!(direction, Direction::Both);
+        assert_eq!(name.raw(), &["srv-b".to_string()]);
+        assert_eq!(interface.raw(), &["*".to_string()]);
     }
 
     #[test]
-    fn parse_on_node_inbound_single_before_rule() {
+    fn parse_on_node_inbound() {
         let yaml = r#"
 version: 1
 rules:
@@ -1921,15 +1931,11 @@ rules:
         path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("inbound should parse");
-        assert_eq!(rules.len(), 1);
-        let SpliceRule::Before { matcher, .. } = &rules[0] else {
-            panic!("inbound desugars to Before");
-        };
-        assert_eq!(matcher.provider_raw(), Some(&["srv-b".to_string()][..]));
+        assert_eq!(one_on_node(&rules).1, Direction::Inbound);
     }
 
     #[test]
-    fn parse_on_node_outbound_single_between_rule() {
+    fn parse_on_node_outbound() {
         let yaml = r#"
 version: 1
 rules:
@@ -1941,18 +1947,11 @@ rules:
         path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("outbound should parse");
-        assert_eq!(rules.len(), 1);
-        let SpliceRule::Between { matcher, .. } = &rules[0] else {
-            panic!("outbound desugars to Between");
-        };
-        assert_eq!(matcher.caller_raw(), Some(&["srv-b".to_string()][..]));
-        assert!(matcher.provider_raw().is_none());
+        assert_eq!(one_on_node(&rules).1, Direction::Outbound);
     }
 
     #[test]
     fn parse_on_node_interface_narrows_match() {
-        // `interface` becomes the desugared rule's interface pattern
-        // (defaults to "*" when omitted).
         let yaml = r#"
 version: 1
 rules:
@@ -1965,18 +1964,14 @@ rules:
         path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("interface should parse");
-        let SpliceRule::Before { matcher, .. } = &rules[0] else {
-            panic!("inbound desugars to Before");
-        };
-        assert_eq!(matcher.interface_raw(), ["wasi:*"]);
-        assert!(matcher.interface_matches("wasi:http/handler@0.3.0"));
-        assert!(!matcher.interface_matches("my:srv/api@1.0.0"));
+        let (_, _, interface, _) = one_on_node(&rules);
+        assert_eq!(interface.raw(), &["wasi:*".to_string()]);
+        assert!(interface.is_match("wasi:http/handler@0.3.0"));
+        assert!(!interface.is_match("my:srv/api@1.0.0"));
     }
 
     #[test]
     fn parse_on_node_name_accepts_glob() {
-        // Node-name globs already work for before/between; on_node
-        // inherits the behavior via the same compile path.
         let yaml = r#"
 version: 1
 rules:
@@ -1988,10 +1983,10 @@ rules:
         path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("glob name should parse");
-        let SpliceRule::Before { matcher, .. } = &rules[0] else {
-            panic!("inbound desugars to Before");
-        };
-        assert_eq!(matcher.provider_raw(), Some(&["srv-*".to_string()][..]));
+        let (name, _, _, _) = one_on_node(&rules);
+        assert_eq!(name.raw(), &["srv-*".to_string()]);
+        assert!(name.is_match("srv-x"));
+        assert!(!name.is_match("auth"));
     }
 
     #[test]
@@ -2060,27 +2055,13 @@ rules:
         path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("alias should parse");
-        assert_eq!(rules.len(), 2);
-        let SpliceRule::Before { provider_alias, .. } = &rules[0] else {
-            panic!("first rule should be Before");
-        };
-        assert_eq!(provider_alias.as_deref(), Some("renamed-b"));
-        let SpliceRule::Between {
-            inner_alias,
-            outer_alias,
-            ..
-        } = &rules[1]
-        else {
-            panic!("second rule should be Between");
-        };
-        assert!(inner_alias.is_none(), "inner is the unknown side");
-        assert_eq!(outer_alias.as_deref(), Some("renamed-b"));
+        assert_eq!(one_on_node(&rules).3, Some("renamed-b"));
     }
 
     #[test]
-    fn parse_on_node_all_funcs_gates_both_directions() {
-        // all-funcs is interface-scoped; both desugared rules carry it
-        // so the predicate fires uniformly regardless of direction.
+    fn parse_on_node_all_funcs() {
+        // all-funcs is interface-scoped; resolved rules inherit it
+        // uniformly (verified in the resolve tests).
         let yaml = r#"
 version: 1
 rules:
@@ -2093,11 +2074,12 @@ rules:
         path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("all-funcs should parse");
-        assert_eq!(rules.len(), 2);
-        let pred_in = rules[0].matcher().all_funcs().expect("inbound predicate");
-        assert_eq!(pred_in.is_async, Some(true));
-        let pred_out = rules[1].matcher().all_funcs().expect("outbound predicate");
-        assert_eq!(pred_out.is_async, Some(true));
+        assert_eq!(rules.len(), 1);
+        let SpliceRule::OnNode { all_funcs, .. } = &rules[0] else {
+            panic!("expected OnNode");
+        };
+        let pred = all_funcs.as_ref().expect("predicate present");
+        assert_eq!(pred.is_async, Some(true));
     }
 
     #[test]

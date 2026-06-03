@@ -1092,10 +1092,10 @@ fn apply_site(
             }
             v
         }
-        SpliceRule::OnSubgraph { .. } => {
+        SpliceRule::OnNode { .. } | SpliceRule::OnSubgraph { .. } => {
             anyhow::bail!(
-                "splicer bug: OnSubgraph reached apply_site; \
-                 must resolve_rules() first"
+                "splicer bug: unresolved variant reached apply_site; \
+                 caller must run resolve_rules() first"
             )
         }
     };

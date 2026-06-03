@@ -15,7 +15,8 @@ struct Unresolved<'a> {
     inject: &'a [Injection],
 }
 
-/// Resolve graph-dependent selectors against the composition graph.
+/// Resolve unresolved selectors (`OnNode`, `OnSubgraph`) into per-edge
+/// `Before`/`Between` rules. Already-resolved variants pass through.
 pub fn resolve_rules(
     rules: Vec<SpliceRule>,
     graph: &CompositionGraph,
@@ -24,6 +25,16 @@ pub fn resolve_rules(
     let mut out: Vec<SpliceRule> = Vec::with_capacity(rules.len());
     for rule in rules {
         match rule {
+            SpliceRule::OnNode {
+                name,
+                direction,
+                interface,
+                all_funcs,
+                alias,
+                inject,
+            } => expand_on_node(
+                name, direction, interface, all_funcs, alias, inject, &mut out,
+            ),
             SpliceRule::OnSubgraph {
                 nodes,
                 direction,
@@ -48,6 +59,46 @@ pub fn resolve_rules(
         }
     }
     Ok(out)
+}
+
+/// Expand `OnNode` into one or two `Before`/`Between` rules. Inbound =
+/// node is the provider; uses `Before` so the chain-boundary position
+/// (node exposed as a top-level export) is included alongside internal
+/// positions. Outbound = node is the caller; uses `Between`.
+fn expand_on_node(
+    name: Pattern,
+    direction: Direction,
+    interface: Pattern,
+    all_funcs: Option<FuncPred>,
+    alias: Option<String>,
+    inject: Vec<Injection>,
+    out: &mut Vec<SpliceRule>,
+) {
+    if matches!(direction, Direction::Inbound | Direction::Both) {
+        out.push(SpliceRule::Before {
+            matcher: RuleMatcher::new(
+                SiteKind::Before,
+                interface.clone(),
+                all_funcs.clone(),
+                vec![Constraint::Provider(name.clone())],
+            ),
+            provider_alias: alias.clone(),
+            inject: inject.clone(),
+        });
+    }
+    if matches!(direction, Direction::Outbound | Direction::Both) {
+        out.push(SpliceRule::Between {
+            matcher: RuleMatcher::new(
+                SiteKind::Between,
+                interface,
+                all_funcs,
+                vec![Constraint::Caller(name)],
+            ),
+            inner_alias: None,
+            outer_alias: alias,
+            inject,
+        });
+    }
 }
 
 /// Walk every chain in the composition; for each boundary edge of
@@ -256,8 +307,8 @@ rules:
                     interface: first_raw(Some(matcher.interface_raw())),
                     provider: first_raw(matcher.provider_raw()),
                 }),
-                SpliceRule::OnSubgraph { .. } => {
-                    panic!("resolve_rules should have expanded OnSubgraph")
+                SpliceRule::OnNode { .. } | SpliceRule::OnSubgraph { .. } => {
+                    panic!("resolve_rules should have expanded unresolved variants")
                 }
             }
         }
@@ -332,7 +383,7 @@ rules:
     }
 
     #[test]
-    fn resolve_passthrough_for_non_subgraph_rules() {
+    fn resolve_passthrough_for_already_resolved_rules() {
         // resolve_rules is a no-op for Before/Between rules.
         let g = chain_a_b_c();
         let yaml = r#"
@@ -348,5 +399,111 @@ rules:
         let resolved = resolve_rules(rules, &g).unwrap();
         assert_eq!(resolved.len(), 1);
         assert!(matches!(resolved[0], SpliceRule::Before { .. }));
+    }
+
+    // ── OnNode expansion ─────────────────────────────────────────────
+
+    fn yaml_on_node(name: &str, direction: &str) -> String {
+        format!(
+            r#"
+version: 1
+rules:
+  - on_node:
+      name: {name}
+      direction: {direction}
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#
+        )
+    }
+
+    #[test]
+    fn resolve_on_node_inbound_emits_one_before() {
+        // direction: inbound ⇒ one Before rule with name as the provider.
+        let g = chain_a_b_c();
+        let rules = parse_yaml(&yaml_on_node("B", "inbound")).unwrap();
+        let resolved = resolve_rules(rules, &g).unwrap();
+        assert_eq!(resolved.len(), 1);
+        let SpliceRule::Before { matcher, .. } = &resolved[0] else {
+            panic!("expected Before");
+        };
+        assert_eq!(matcher.provider_raw(), Some(&["B".to_string()][..]));
+    }
+
+    #[test]
+    fn resolve_on_node_outbound_emits_one_between() {
+        let g = chain_a_b_c();
+        let rules = parse_yaml(&yaml_on_node("B", "outbound")).unwrap();
+        let resolved = resolve_rules(rules, &g).unwrap();
+        assert_eq!(resolved.len(), 1);
+        let SpliceRule::Between { matcher, .. } = &resolved[0] else {
+            panic!("expected Between");
+        };
+        assert_eq!(matcher.caller_raw(), Some(&["B".to_string()][..]));
+        assert!(matcher.provider_raw().is_none());
+    }
+
+    #[test]
+    fn resolve_on_node_both_emits_inbound_and_outbound() {
+        let g = chain_a_b_c();
+        let rules = parse_yaml(&yaml_on_node("B", "both")).unwrap();
+        let resolved = resolve_rules(rules, &g).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert!(matches!(resolved[0], SpliceRule::Before { .. }));
+        assert!(matches!(resolved[1], SpliceRule::Between { .. }));
+    }
+
+    #[test]
+    fn resolve_on_node_alias_propagates() {
+        let g = chain_a_b_c();
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: B
+      alias: renamed-b
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        let resolved = resolve_rules(rules, &g).unwrap();
+        let SpliceRule::Before { provider_alias, .. } = &resolved[0] else {
+            panic!("expected Before");
+        };
+        assert_eq!(provider_alias.as_deref(), Some("renamed-b"));
+        let SpliceRule::Between {
+            inner_alias,
+            outer_alias,
+            ..
+        } = &resolved[1]
+        else {
+            panic!("expected Between");
+        };
+        assert!(inner_alias.is_none());
+        assert_eq!(outer_alias.as_deref(), Some("renamed-b"));
+    }
+
+    #[test]
+    fn resolve_on_node_all_funcs_propagates() {
+        let g = chain_a_b_c();
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: B
+      all-funcs:
+        async: true
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).unwrap();
+        let resolved = resolve_rules(rules, &g).unwrap();
+        for r in &resolved {
+            let pred = r.matcher().all_funcs().expect("predicate present");
+            assert_eq!(pred.is_async, Some(true));
+        }
     }
 }
