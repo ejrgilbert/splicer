@@ -1,20 +1,8 @@
-//! End-to-end integration test for `splicer::preview_with_graph`.
-//!
-//! Builds a small composition graph by hand (so the test doesn't depend
-//! on composed wasm fixtures), runs a few rules through `preview_with_graph`,
-//! and asserts that the resulting [`Highlights`] map carries the
-//! expected (edge_id, rule_tag) pairs.  Edge IDs are the canonical
-//! `iface::caller->provider` form produced by `cviz::canonical_edge_id`.
-
 use splicer::cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
 use splicer::preview_with_graph;
 
 const IFACE: &str = "wasi:http/handler@0.3.0";
 
-/// Three-node chain over [`IFACE`]: `$srv` (innermost) → `$mw-a` →
-/// `$mw-b` (outermost, faces the host).  Returns the graph alongside
-/// the canonical edge IDs for both internal edges, in chain-position
-/// order (provider_idx 0 first).
 fn three_node_chain() -> (CompositionGraph, [String; 3]) {
     let mut graph = CompositionGraph::new();
 
@@ -50,7 +38,7 @@ fn three_node_chain() -> (CompositionGraph, [String; 3]) {
 
     graph.add_export(IFACE.into(), 3, None);
 
-    // chain is innermost → outermost: [srv, mw-a, mw-b]
+    // chain is innermost -> outermost: [srv, mw-a, mw-b]
     let edge_srv_under_mwa = format!("{IFACE}::mw-a->srv");
     let edge_mwa_under_mwb = format!("{IFACE}::mw-b->mw-a");
     let edge_mwb_boundary = format!("{IFACE}::->mw-b");
@@ -62,8 +50,6 @@ fn three_node_chain() -> (CompositionGraph, [String; 3]) {
 
 #[test]
 fn before_provider_glob_highlights_every_position() {
-    // `before` with no provider constraint hits every chain position
-    // including the outermost boundary site (caller-less).
     let (graph, [e0, e1, e2]) = three_node_chain();
     let yaml = r#"
 version: 1
@@ -86,8 +72,7 @@ rules:
 
 #[test]
 fn between_inner_outer_only_picks_internal_edge() {
-    // `between(inner=srv, outer=mw-a)` matches exactly one edge.
-    let (graph, [internal_low, _internal_high, _boundary]) = three_node_chain();
+    let (graph, [internal_low, internal_high, boundary]) = three_node_chain();
     let yaml = r#"
 version: 1
 rules:
@@ -103,8 +88,8 @@ rules:
 "#;
     let out = preview_with_graph(graph, yaml, None).expect("preview ok");
     assert!(out.highlights.is_edge_highlighted(&internal_low));
-    assert!(!out.highlights.is_edge_highlighted(&_internal_high));
-    assert!(!out.highlights.is_edge_highlighted(&_boundary));
+    assert!(!out.highlights.is_edge_highlighted(&internal_high));
+    assert!(!out.highlights.is_edge_highlighted(&boundary));
     assert!(out.unmatched_rules.is_empty());
 }
 
