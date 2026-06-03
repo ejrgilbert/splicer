@@ -6,17 +6,16 @@ detail; this doc is the calendar overlay.
 
 **Detail lives in:**
 - `docs/TODO/tier3-tier4-substrate.md` — substrate (trait, codegen, SDK).
-- `builtins/recorder/TODO-multi-edge.md` — multi-edge mechanics, edge_id, selectors.
 
 ## Timeline at a glance
 
-| Phase | Calendar | What lands |
-|-------|----------|------------|
-| 1     | ~2 weeks | 3 streams in parallel: finish recorder, tier-3 substrate foundation, `on_subgraph` selector |
-| 2     | 1-2 weeks| `fuzz-input`, `redact-strings`, smoke tests, multi-edge UX (`on_edge` + `splicer edges` CLI) |
-| 4     | 2-3 weeks| Record + replay loop (multi-edge step 7 + record/replay strategies) |
-| 5     | ~1 week  | Trace diff CLI + differential-testing demo (v1 paper demo) |
-| 6     | 2-3 weeks| v2 resource support → HTTP record/replay (v2 paper demo if needed) |
+| Phase | Calendar  | What lands                                                                                  |
+|-------|-----------|---------------------------------------------------------------------------------------------|
+| 1     | ~2 weeks  | 3 streams in parallel: finish recorder, tier-3 substrate foundation, `on_subgraph` selector |
+| 2     | 1-2 weeks | `fuzz-input`, `redact-strings`, smoke tests                                                 |
+| 4     | 2-3 weeks | Record + replay loop (replayer builtin + record/replay strategies)                          |
+| 5     | ~1 week   | Trace diff CLI + differential-testing demo (v1 paper demo)                                  |
+| 6     | 2-3 weeks | v2 resource support → HTTP record/replay (v2 paper demo if needed)                          |
 
 **v1 demo at ~8 weeks. v2 (HTTP) at ~11 weeks.** Solo, focused. A
 collaborator on one stream cuts calendar time roughly in half.
@@ -25,7 +24,6 @@ collaborator on one stream cuts calendar time roughly in half.
 
 ### Stream A — finish recorder (~1-1.5 weeks)
 
-Multi-edge doc steps 2-3:
 - [x] splicer: `edge_id` derivation (`{interface}::{from}->{to}`)
 - [x] splicer: auto-inject `_splicer_edge_id` into builtin config substrate
 - [x] recorder: import `wasi:filesystem`, add file sink to `<dir>/<edge_id>.bin`
@@ -45,15 +43,16 @@ Substrate foundation items:
 
 ### Stream C — subgraph selection (~1-1.5 weeks)
 
-Multi-edge doc steps 4-5:
-- [ ] YAML grammar: `on_node`, `on_subgraph` selectors
-- [ ] `on_node` desugars at parse time to `before` / `between` rules
-  with the named node as the inner or outer constraint (no graph
-  needed — the existing chain walk already finds matching edges).
-- [ ] `on_subgraph` resolves against the composition graph
-  (boundary = "exactly one endpoint in the set"; globs can't express
-  set negation, so this step needs the graph).
-- [ ] `interface:` narrowing on `on_node` / `on_subgraph` (glob).
+- [x] YAML grammar: `on_node`, `on_subgraph` selectors
+- [x] `on_node` survives parse as `SpliceRule::OnNode`; `resolve_rules`
+  expands into one or two `before`/`between` rules. Preview overlays
+  the matched node in a context color.
+- [x] `on_subgraph` resolves against the composition graph (boundary =
+  "exactly one endpoint in the set"). Missing-node and
+  disconnected-set checks reject at splice time.
+- [x] `interface:` narrowing on `on_node` / `on_subgraph` (glob).
+- [x] `splicer preview` paints subgraph nodes + internal edges (context
+  color) and matched boundary edges (default color).
 
 `on_edge` and `on_interface` were earlier candidates but offered no
 expressive delta — `on_edge` is a fully-specified `between`, and
@@ -65,10 +64,6 @@ key + auto-injected config substrate); it never appears in user YAML.
 
 - [ ] `fuzz-input` builtin (drives `Args: Arbitrary` + `wit-bindgen additional_derives`)
 - [ ] `redact-strings` builtin (drives `TypedVisit` derive + type-predicate matcher)
-- [ ] `splicer edges <composition>` CLI — optional discovery aid that
-  lists each composition edge with its canonical id and the equivalent
-  `between` block. Not a primitive; just helps operators read recorder
-  output and write matching replay rules.
 - [x] **User-form tier-3/4 middleware.** YAML `name:` + `path:` to a strategy
   crate directory (Cargo.toml + manifest.toml) flows through the same codegen
   pipeline as builtins. See [`docs/tiers/tier-3.md`](../tiers/tier-3.md#referencing-your-strategy-from-a-splice-config).
@@ -89,7 +84,7 @@ Skipped Phase 3 — Phase 1's Stream C already covered `on_node` and
 
 ## Phase 4: record + replay loop (2-3 weeks)
 
-- [ ] Multi-edge step 7: replayer builtin (tier-4 virtualize)
+- [ ] Replayer builtin (tier-4 virtualize)
 - [ ] `record` strategy (cells to sink)
 - [ ] `replay` strategy (cells → typed values, value-typed targets)
 

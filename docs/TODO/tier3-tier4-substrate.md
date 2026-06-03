@@ -14,8 +14,9 @@ framework rules see
 [`docs/adapter-components.md`](../adapter-components.md). Sibling
 planning notes:
 [`adapter-comp-planning.md`](./adapter-comp-planning.md). Multi-edge
-mechanics, `edge_id`, and selectors:
-[`builtins/recorder/TODO-multi-edge.md`](../../builtins/recorder/TODO-multi-edge.md).
+selectors (`on_node`, `on_subgraph`) and `edge_id` derivation have
+shipped — see [`docs/splice-config.md`](../splice-config.md) for the
+user surface and `cviz::canonical_edge_id` for the format.
 
 Mantra: **design with resources, ship without.**
 
@@ -183,10 +184,9 @@ to resources at all.
 
 ## `on_subgraph`: how this substrate consumes it
 
-The multi-edge selector vocabulary and `edge_id` mechanism are
-documented in
-[`builtins/recorder/TODO-multi-edge.md`](../../builtins/recorder/TODO-multi-edge.md).
-This section just notes how the typed-wrapper substrate consumes those
+The `on_subgraph` selector and `edge_id` derivation have shipped — see
+[`docs/splice-config.md`](../splice-config.md) for the user surface.
+This section notes how the typed-wrapper substrate consumes those
 primitives.
 
 **Example YAML:**
@@ -236,8 +236,9 @@ selector vocabulary handles single-node and multi-node uniformly.
    replayer, fuzzer, ...). Strategies are target-agnostic; the codegen
    monomorphizes them per-target.
 3. **Wire format**: cells trace keyed by `edge_id`. The
-   `_splicer_edge_id` config substrate from the recorder doc threads
-   identity through; SDK `TraceReader` keys reads and writes by it.
+   `_splicer_edge_id` config substrate (auto-injected by splicer into
+   every spliced builtin) threads identity through; SDK `TraceReader`
+   keys reads and writes by it.
 
 **Coexistence with per-interface targeting.** Both selector families
 work in the same splice config. Apply `redact-strings` to every
@@ -247,12 +248,12 @@ work in the same splice config. Apply `redact-strings` to every
 mechanics, both valid. The substrate handles both uniformly because both
 reduce to "wire wrappers on some set of edges."
 
-**Sequencing.** The substrate doc's v1 ship presupposes recorder doc
-steps 2-5 (edge_id auto-injection, file-sink, `on_node` selector,
-`on_subgraph` selector). The replay strategies of *this* doc
-correspond to recorder doc step 7 (replayer as tier-4 virtualize).
-`on_subgraph` (recorder doc step 5) is the prerequisite for the
-differential-testing capstone.
+**Sequencing.** The substrate doc's v1 ship presupposes the shipped
+recorder pieces (edge_id auto-injection, file-sink, `on_node` and
+`on_subgraph` selectors). The replay strategies of *this* doc map
+onto the still-pending replayer builtin (tier-4 virtualize).
+`on_subgraph` is the prerequisite for the differential-testing
+capstone.
 
 ## Use cases that drop out of the substrate
 
@@ -269,16 +270,16 @@ version-B's outbound calls; compare the version-B outbound trace to
 the version-A outbound trace. Differences flag behavioral regressions
 introduced by the refactor.
 
-**Pieces reused:** `on_subgraph` selector (recorder doc step 5),
-recorder writing cells keyed by `edge_id`, value-typed replayer driving
-the subgraph with recorded inbound inputs (recorder doc step 7).
+**Pieces reused:** `on_subgraph` selector (shipped), recorder writing
+cells keyed by `edge_id` (shipped), value-typed replayer driving the
+subgraph with recorded inbound inputs (pending replayer builtin).
 
 **Pieces new:** a cells **trace diff** (read two cells streams in
 parallel, compare call-by-call, report differences with paths into the
 cell trees). Implemented as a library in `splicer-tool-sdk` plus a CLI
 surface (`splicer trace diff <old.cells> <new.cells>`).
 
-**Roadmap slot:** after recorder doc step 7 (replayer) and substrate
+**Roadmap slot:** after the replayer builtin and substrate
 doc step 6 (value-typed replay) land. Drops out cheaply because the
 heavy machinery is already shipped; the diff itself is tens to
 low-hundreds of lines.

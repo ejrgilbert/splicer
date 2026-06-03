@@ -237,6 +237,11 @@ call that crosses into or out of the set. Calls that stay inside the set
 (between two nodes both in `nodes`) are left alone, there's no boundary
 to wrap.
 
+The set must be connected: each pair of nodes must be reachable
+through edges whose endpoints are both in the set. Paths can't pass
+through nodes outside the set. Disconnected sets are rejected; use
+one `on_subgraph` rule per subsystem.
+
 Example effect with `nodes: [B, C], direction: both`:
 
 ```

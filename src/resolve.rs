@@ -2,7 +2,7 @@ use crate::parse::config::{Direction, Injection, SpliceRule};
 use crate::select::{Constraint, FuncPred, Pattern, RuleMatcher, SiteKind};
 use crate::wac::ChainSkeleton;
 use cviz::model::CompositionGraph;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The unresolved-selector payload that flows into [`expand_subgraph`].
 /// Borrowed from a [`SpliceRule::OnSubgraph`] variant — no ownership
@@ -44,6 +44,7 @@ pub fn resolve_rules(
                 inject,
             } => {
                 check_subgraph_nodes_exist(rule_num, &nodes, graph)?;
+                check_subgraph_connected(rule_num, &nodes, graph)?;
                 expand_subgraph(
                     graph,
                     &skeletons,
@@ -80,6 +81,78 @@ fn check_subgraph_nodes_exist(
         anyhow::bail!(
             "rule {rule_num} (on_subgraph): node(s) not present in the composition: [{}]",
             missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Bail if the subgraph's nodes aren't connected (treat imports as undirected).
+/// Assumes [`check_subgraph_nodes_exist`] already ran. Walks
+/// `graph.nodes` directly rather than chain skeletons to avoid the
+/// interface-name dedup in `build_chain_skeletons`.
+fn check_subgraph_connected(
+    rule_num: usize,
+    nodes: &[String],
+    graph: &CompositionGraph,
+) -> anyhow::Result<()> {
+    if nodes.len() <= 1 {
+        return Ok(()); // single node is trivially connected
+    }
+    let subgraph: BTreeSet<&str> = nodes.iter().map(String::as_str).collect();
+
+    // Build undirected adjacency restricted to subgraph nodes. Each
+    // import becomes an edge between the importer (caller side) and
+    // the source's display label (provider side); host imports and
+    // imports whose source isn't in the subgraph are skipped.
+    let mut adj: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for node in graph.nodes.values() {
+        let importer = node.display_label();
+        if !subgraph.contains(importer) {
+            continue;
+        }
+        for conn in &node.imports {
+            if conn.is_host_import {
+                continue;
+            }
+            let Some(src_id) = conn.source_instance else {
+                continue;
+            };
+            let Some(src_node) = graph.nodes.get(&src_id) else {
+                continue;
+            };
+            let provider = src_node.display_label();
+            if !subgraph.contains(provider) {
+                continue;
+            }
+            adj.entry(importer).or_default().insert(provider);
+            adj.entry(provider).or_default().insert(importer);
+        }
+    }
+
+    // BFS from arbitrary subgraph node; count connected components.
+    let mut unvisited: BTreeSet<&str> = subgraph.iter().copied().collect();
+    let mut components = 0usize;
+    while let Some(&start) = unvisited.iter().next() {
+        components += 1;
+        let mut queue: Vec<&str> = vec![start];
+        while let Some(n) = queue.pop() {
+            if !unvisited.remove(n) {
+                continue;
+            }
+            if let Some(neighbors) = adj.get(n) {
+                for neighbor in neighbors {
+                    if unvisited.contains(neighbor) {
+                        queue.push(neighbor);
+                    }
+                }
+            }
+        }
+    }
+    if components > 1 {
+        anyhow::bail!(
+            "rule {rule_num} (on_subgraph): nodes [{}] aren't a connected subgraph; \
+             use `on_node` for individual nodes, or one `on_subgraph` per connected subset",
+            nodes.join(", ")
         );
     }
     Ok(())
@@ -404,6 +477,47 @@ rules:
         let s = summarize_rules(&resolve_rules(rules, &g).unwrap());
         assert_eq!(s.betweens, vec![between("A", "B")]);
         assert_eq!(s.befores, vec![before("C")]);
+    }
+
+    #[test]
+    fn resolve_on_subgraph_disconnected_rejected() {
+        // In chain_a_b_c, the import edges are B→A and C→B. Subgraph
+        // [A, C] has no internal edge (A only connects to B, C only
+        // connects to B; B isn't in the set) → two components → error.
+        let g = chain_a_b_c();
+        let rules = parse_yaml(&yaml_subgraph(&["A", "C"], "both")).unwrap();
+        let err = resolve_rules(rules, &g).unwrap_err().to_string();
+        assert!(
+            err.contains("aren't a connected subgraph"),
+            "expected disconnected error, got: {err}"
+        );
+        assert!(
+            err.contains("on_node"),
+            "should hint at on_node, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_on_subgraph_missing_nodes_rejected() {
+        // [A, B, Z] — Z doesn't exist in chain_a_b_c. The
+        // missing-nodes check fires before connectivity.
+        let g = chain_a_b_c();
+        let rules = parse_yaml(&yaml_subgraph(&["A", "B", "Z"], "both")).unwrap();
+        let err = resolve_rules(rules, &g).unwrap_err().to_string();
+        assert!(
+            err.contains("not present in the composition"),
+            "expected missing-node error, got: {err}"
+        );
+        assert!(err.contains("Z"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_on_subgraph_single_node_trivially_connected() {
+        // Sanity check: a single-node subgraph isn't rejected by the
+        // connectivity check (it's trivially one component).
+        let g = chain_a_b_c();
+        let rules = parse_yaml(&yaml_subgraph(&["B"], "both")).unwrap();
+        resolve_rules(rules, &g).expect("single-node subgraph should resolve");
     }
 
     #[test]
