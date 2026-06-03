@@ -1,22 +1,17 @@
-# Tier-3 / Tier-4 substrate: forward-looking design
+# Tier-3 / Tier-4 builtins: forward-looking design
 
-Forward-looking design for tier-3/4 — strategy taxonomy, type
-predicates, cells wire format, `on_subgraph` integration,
-resource path. The substrate (strategy traits, codegen template,
-cargo build pipeline, hello-tier3 / hello-tier4 smoke builtins) has
-landed; this doc no longer tracks shipped checkboxes — see
-[`roadmap.md`](./roadmap.md) for the calendar overlay.
+Forward-looking design for tier-3/4 builtins — strategy catalog,
+resource handling, type predicates, cells wire format, `on_subgraph`
+composition. The substrate they ride on (strategy traits, codegen
+template, cargo build pipeline, hello-tier3 / hello-tier4 smoke
+builtins) has shipped; see [`roadmap.md`](./roadmap.md) for the
+calendar overlay.
 
 For the user-facing tier definitions see
 [`docs/tiers/tier-3.md`](../tiers/tier-3.md) and
 [`docs/tiers/tier-4.md`](../tiers/tier-4.md). For the splicer
 framework rules see
-[`docs/adapter-components.md`](../adapter-components.md). Sibling
-planning notes:
-[`adapter-comp-planning.md`](./adapter-comp-planning.md). Multi-edge
-selectors (`on_node`, `on_subgraph`) and `edge_id` derivation have
-shipped — see [`docs/splice-config.md`](../splice-config.md) for the
-user surface and `cviz::canonical_edge_id` for the format.
+[`docs/adapter-components.md`](../adapter-components.md).
 
 Mantra: **design with resources, ship without.**
 
@@ -103,18 +98,6 @@ inject:
   - builtin: redact-strings
 ```
 
-**Aspirational extensions** (not built; add as use cases arise):
-property-name walkers like `contains-type: string`, `returns-result`,
-`has-option`, `has-numeric`, `no-resources-anywhere`. The v1 framework
-adds them as new `ValueProperty` variants (concrete keyword → variant
-in `src/select.rs`); no new architecture, just vocabulary growth.
-
-Type-predicate matching helps non-walking strategies too — `retry`
-matches `returns-result`, `memoize` matches `no-resources-anywhere`.
-Composable with existing name-based matching today; runtime walking via
-`TypedVisit` derives is still future work and pairs with the
-property-name extensions above.
-
 ## Wire format vs user-facing format
 
 Two distinct layers, deliberately separated:
@@ -149,19 +132,8 @@ surface.
 
 ## v2 scope (resource support)
 
-The value-typed path is a clean subset of the resource path. Driven by
-HTTP record/replay as the forcing function:
-
-- WIT walker detects resources.
-- `wrapped-` namespace WIT rewriting.
-- Conversion interface generation (`get-mock-X(handle: u32) -> X`).
-- `MockedResource { handle, name }` pattern + emitted `GuestResource`
-  impls.
-- Correlation map plumbing in `TraceReader`.
-- `WitTyped` impls for `Resource<T>`.
-- wac composition wiring for the types interface (full virt).
-- Target: wasi:http first, then wasi:keyvalue (where WIT permits),
-  wasi:filesystem (where WIT permits).
+The value-typed path is a clean subset of the resource path; v2 work
+items are tracked in [`roadmap.md`](./roadmap.md) Phase 6.
 
 Record/replay is the only tier-3/4 use case that genuinely needs the
 resource machinery; everything else (retry, timeout, chaos-err, etc.)
@@ -255,13 +227,11 @@ onto the still-pending replayer builtin (tier-4 virtualize).
 `on_subgraph` is the prerequisite for the differential-testing
 capstone.
 
-## Use cases that drop out of the substrate
+## Subgraph differential testing across refactors
 
-The substrate plus `on_subgraph` combine to enable several
-high-value capabilities beyond the explicit builtins. Each is mostly
-reuse of pieces already planned plus a small piece of new glue.
-
-### Subgraph differential testing across refactors
+The substrate plus `on_subgraph` combine to enable this capstone beyond
+the explicit builtins; mostly reuse of pieces already planned plus a
+small piece of new glue.
 
 Workflow: record both directions at a subgraph's boundary on version A
 of the composition; refactor internals to produce version B; replay
@@ -290,14 +260,6 @@ maps onto a one-rule splice config plus one diff invocation. Clean
 story for the paper's "scoped composition-level interposition"
 contribution.
 
-### Other use cases enabled
-
-Dependency isolation testing, bounded chaos engineering, subgraph
-extraction / decomposition, scoped observability, capability
-attenuation at trust boundaries, behavioral diff between versions,
-scoped profiling. All compose the same substrate pieces with different
-strategy configurations applied to `on_subgraph` boundaries.
-
 ## Open questions
 
 - **v1 demo target.** If the research paper deadline requires a
@@ -309,9 +271,6 @@ strategy configurations applied to `on_subgraph` boundaries.
 
 ## References
 
-- [`adapter-comp-planning.md`](./adapter-comp-planning.md): sibling
-  planning, in particular the "one-per-signature case" section that
-  originally framed the typed-codegen approach.
 - [`tier2-generic-resource-handles.md`](./tier2-generic-resource-handles.md):
   the dual-of-this constraint at tier-2 (cell-array vs resource-wrapper
   ergonomics).

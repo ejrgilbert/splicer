@@ -5,7 +5,7 @@ replayer work. Cross-references the design docs that contain the
 detail; this doc is the calendar overlay.
 
 **Detail lives in:**
-- `docs/TODO/tier3-tier4-substrate.md` — substrate (trait, codegen, SDK).
+- `docs/TODO/tier3-tier4-builtins.md` — builtin design (strategy catalog, resources, type predicates, `on_subgraph` composition).
 
 ## Timeline at a glance
 
@@ -111,10 +111,10 @@ proxy-component is the blueprint; adapt with cells in place of WAVE:
 Defer until post-paper, no blocking impact:
 - `tier2-should-call.md` (tier-2 hook gap, no committed consumer)
 - `tier2-generic-resource-handles.md` (long-term design)
-- `tier2-nested-list-cabi-realloc-batching.md` (perf)
 - `tier2-list-compound-elements.md` (only items with concrete demand)
 - `sync-wit-suspend-limit.md` (bug fix on demand)
-- Open questions in `adapter-comp-planning.md`
+- `per-function-interposition-filter.md` (UX, gated on real demand)
+- `canonical-abi-gaps.md` (real `bail!`s; fix when a user hits them)
 
 ## Risk points
 

@@ -247,11 +247,7 @@ To observe what's *inside* a resource, you have three paths:
    breaker that only cares about call shape and handle correlation
    doesn't need to peer inside.
 
-A future UX improvement (tracked in
-[`docs/TODO/adapter-comp-planning.md`](../TODO/adapter-comp-planning.md))
-is an `instrument-resources: true` rule modifier that auto-attaches
-the same middleware to the resource-defining interface alongside the
-target. For now, multi-WIT setup is explicit.
+For now, multi-WIT setup is explicit.
 
 ### Stream / future content observation
 

@@ -840,6 +840,10 @@ pub(crate) fn emit_cabi_realloc_call(
 /// mul + add against silent mod-2^32 wrap that would slip past
 /// [`emit_cabi_realloc_call_runtime`]'s own size check and
 /// under-allocate the cells slab.
+//
+// TODO(debuggability): if the opaque `UnreachableCodeReached` here ever
+// bites a user, route this trap (and `emit_cabi_realloc_call_runtime`'s)
+// through a named `() -> ()` stub so wasmtime's backtrace surfaces it.
 pub(crate) fn emit_trap_if_list_overflows_cell_slab(
     f: &mut Function,
     len_local: u32,

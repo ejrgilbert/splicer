@@ -1415,6 +1415,12 @@ fn nested_at(outer_ll: &ListEmitLocals, cell_pos: u32) -> &NestedListLocals {
 /// Nested-list pre-pass: top-level entry from `emit_list_pre_pass`.
 /// Seeds all sibling cursors (aliased — one seed per kind suffices),
 /// loads outer's data pointer, then dispatches to the recursive walker.
+//
+// TODO(perf): if profiling shows nested-list lifting is hot, batch the
+// per-iter `cabi_realloc`s in `emit_list_of_arm` (indices_ptr,
+// char_scratch, tuple_idx_buf) into a pre-pass accumulator sized by
+// Σ inner.len; split the per-call alloc out of `emit_list_of_arm` so
+// the nested caller skips it.
 fn emit_nested_list_pre_pass(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,

@@ -7,10 +7,8 @@ use splicer_tool_sdk::{CallId, VirtualizeStrategy};
 #[derive(Default)]
 pub struct HelloTier4;
 
-// `R: Default` narrows which targets match. Today this surfaces as
-// a wrapper compile error; planned splice-time type predicate will
-// skip non-matching sites instead.
-// See: `docs/TODO/tier3-tier4-substrate.md`, section "Type-predicated rule matching".
+// `R: Default` narrows which targets match.
+// Use splicer type predication to constrain to `concrete` results.
 impl<Args, R: Default> VirtualizeStrategy<Args, R> for HelloTier4 {
     async fn handle(&self, call: CallId, _args: Args) -> R {
         println!(

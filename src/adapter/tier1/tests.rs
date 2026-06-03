@@ -948,12 +948,10 @@ fn test_adapter_enum_async_result() {
 
 // ── Tier 1: shape-matrix coverage ────────────────────────────────────
 //
-// Targeted tests for shapes called out in
-// docs/TODO/test-with-real-compositions.md that aren't exercised by
-// the wasi:http / primitives / subword coverage above. Each uses an
-// async result so the value flows through
-// `build_task_return_loads` → `lift_from_memory` — the code path most
-// exposed to canonical-ABI subtleties.
+// Targeted tests for shapes not exercised by the wasi:http / primitives
+// / subword coverage above. Each uses an async result so the value
+// flows through `build_task_return_loads` → `lift_from_memory` — the
+// code path most exposed to canonical-ABI subtleties.
 
 /// Record result with every alignment boundary represented: 1-byte,
 /// 4-byte, 2-byte, 8-byte fields in an order that forces each field
