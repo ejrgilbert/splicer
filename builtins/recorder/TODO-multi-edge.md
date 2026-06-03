@@ -61,10 +61,10 @@ Each layer owns exactly one concern. Nothing crosses lanes.
    internal addressing scheme (filename key + auto-injected config
    substrate), and `on_interface` is just `before: { interface: ... }`.
 
-   Higher-level selectors accept an optional `filter: { interface:
-   <glob> }` block that narrows the set by interface — useful when a
-   subgraph spans many interfaces and the operator only wants to
-   wrap, e.g., the HTTP boundary.
+   Higher-level selectors accept an optional `interface: <glob>` field
+   that narrows the set by interface — useful when a subgraph spans
+   many interfaces and the operator only wants to wrap, e.g., the HTTP
+   boundary.
 
    Example YAML for subgraph-level recording:
 
@@ -80,8 +80,8 @@ Each layer owns exactly one concern. Nothing crosses lanes.
 
    Expands to one per-edge rule per boundary edge of {B, C, D}. Same
    edge_id format, same file-per-edge sink convention. Replaying the
-   same subgraph uses the same selector with the replayer; matching
-   `filter:` blocks let the operator virtualize only a subset of the
+   same subgraph uses the same selector with the replayer; an
+   `interface:` glob lets the operator virtualize only a subset of the
    boundary (e.g. mock the slow external service, leave in-process
    peers live).
 
@@ -154,10 +154,10 @@ logic, or the encode/decode contracts.
 | 1    | Recorder ships as-is (single-edge, single-sink).                                 | **done**            |
 | 2    | Splicer auto-injects `_splicer_edge_id` into every spliced builtin's config.     | **done**            |
 | 3    | Recorder reads `_splicer_edge_id`; file-sink lands; default sink switches to file (one file per edge). Stdout/stderr documented as single-instance-only. | **done**    |
-| 4    | `on_node: { name, direction }` YAML selector. Desugars at parse time to one or two `before`/`between` rules. Optional `filter: { interface: <glob> }`. | not started |
-| 5    | `on_subgraph: { nodes, direction }` YAML selector. Resolves against the composition graph (boundary = "exactly one endpoint in the set"). Optional `filter: { interface: <glob> }`. | not started |
+| 4    | `on_node: { name, direction }` YAML selector. Desugars at parse time to one or two `before`/`between` rules. Optional `interface: <glob>`. | not started |
+| 5    | `on_subgraph: { nodes, direction }` YAML selector. Resolves against the composition graph (boundary = "exactly one endpoint in the set"). Optional `interface: <glob>`. | not started |
 | 6    | `splicer edges <composition>` CLI subcommand listing each edge with its canonical id and the equivalent `between` block. Discovery aid for reading recorder output and writing matching replay rules. Splicer also logs matched edge_ids during `splice` runs. | not started |
-| 7    | Replayer builtin (tier-4 virtualize). Consumes steps 2-5; the same structural rule the recorder used (re-derives the matching edge_id). Subset replay (virtualize some boundary edges, leave the rest live) falls out of step 5's filter block. See [`docs/TODO/tier3-tier4-substrate.md`](../../docs/TODO/tier3-tier4-substrate.md) for the `WrapperStrategy` + codegen template architecture that lands here. | not started |
+| 7    | Replayer builtin (tier-4 virtualize). Consumes steps 2-5; the same structural rule the recorder used (re-derives the matching edge_id). Subset replay (virtualize some boundary edges, leave the rest live) falls out of step 5's `interface:` narrowing. See [`docs/TODO/tier3-tier4-substrate.md`](../../docs/TODO/tier3-tier4-substrate.md) for the `WrapperStrategy` + codegen template architecture that lands here. | not started |
 
 Steps 2 and 3 unlock the recorder for multi-edge use. Steps 4 and 5
 unlock the higher-level selectors that make multi-edge rules ergonomic.
@@ -200,8 +200,9 @@ Step 6 is a discovery aid. Step 7 is the actual replay implementation.
   computation, different output medium. Two flows pay off immediately:
   `cviz comp.wasm --highlight A,B,C` for visual selection, and
   `cviz comp.wasm --from-yaml splice.yaml` to see what a draft YAML
-  would actually touch before running splicer. Picks up filter blocks
-  and subgraph selectors cleanly (greyed-out vs. selected edges).
+  would actually touch before running splicer. Picks up `interface:`
+  narrowing and subgraph selectors cleanly (greyed-out vs. selected
+  edges).
   Contiguity gaps in a chosen node-set become self-evident from the
   picture, surfacing misconfigurations earlier than splicer's own
   warning would.

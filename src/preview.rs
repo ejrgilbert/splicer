@@ -7,6 +7,7 @@ use cviz::parse::component::parse_component;
 use cviz::{Highlights, Selection};
 
 use crate::parse::config::{parse_yaml, SpliceRule};
+use crate::resolve::resolve_rules;
 use crate::select::{FuncPred, FuncScope, ValueProperty};
 use crate::wac::build_chain_skeletons;
 
@@ -52,6 +53,9 @@ pub fn preview_with_graph(
     only_rule: Option<usize>,
 ) -> Result<PreviewOutput> {
     let rules = parse_yaml(rules_yaml).context("Failed to parse splice rules YAML")?;
+    // Resolve graph-dependent selectors (on_subgraph) into
+    // per-edge Before/Between rules before walking.
+    let rules = resolve_rules(rules, &graph)?;
 
     let (skeletons, _handled) = build_chain_skeletons(&graph);
 
@@ -142,6 +146,11 @@ pub fn rule_description(idx: usize, rule: &SpliceRule) -> String {
             if let Some(f) = matcher.all_funcs() {
                 parts.push(format!("all-funcs={}", render_func_pred(f)));
             }
+        }
+        SpliceRule::OnSubgraph { .. } => {
+            // OnSubgraph is expected to be resolved before preview
+            // walks rules.
+            panic!("OnSubgraph must be resolved before rule_description")
         }
     }
     parts.join(" ")

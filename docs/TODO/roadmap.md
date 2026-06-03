@@ -53,7 +53,7 @@ Multi-edge doc steps 4-5:
 - [ ] `on_subgraph` resolves against the composition graph
   (boundary = "exactly one endpoint in the set"; globs can't express
   set negation, so this step needs the graph).
-- [ ] Filter blocks (narrow by interface glob).
+- [ ] `interface:` narrowing on `on_node` / `on_subgraph` (glob).
 
 `on_edge` and `on_interface` were earlier candidates but offered no
 expressive delta — `on_edge` is a fully-specified `between`, and

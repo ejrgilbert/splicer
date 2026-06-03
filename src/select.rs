@@ -193,8 +193,8 @@ impl RuleMatcher {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct FuncPred {
+#[derive(Clone, Debug)]
+pub struct FuncPred {
     pub(crate) is_async: Option<bool>,
     pub(crate) scopes: Vec<FuncScope>,
     pub(crate) args: Vec<ValueProperty>,

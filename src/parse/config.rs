@@ -25,6 +25,7 @@ pub struct YamlRule {
     before: Option<YamlStrategyBefore>,
     between: Option<YamlStrategyBetween>,
     on_node: Option<YamlStrategyOnNode>,
+    on_subgraph: Option<YamlStrategyOnSubgraph>,
     inject: Vec<YamlInjection>,
 }
 
@@ -119,17 +120,20 @@ pub struct YamlStrategyOnNode {
     #[serde(default)]
     direction: Direction,
     alias: Option<String>,
-    filter: Option<YamlSelectorFilter>,
+    interface: Option<OneOrMany<String>>,
     #[serde(rename = "all-funcs")]
     all_funcs: Option<YamlFuncPred>,
 }
 
-/// Refinement filters shared across higher-level selectors. Today only
-/// `interface:` is supported; future filters (e.g. explicit edge_id
-/// list, scope qualifiers) join here.
+/// `on_subgraph` selector: every boundary edge of a node set.
 #[derive(Debug, Deserialize)]
-pub struct YamlSelectorFilter {
+pub struct YamlStrategyOnSubgraph {
+    nodes: Vec<String>,
+    #[serde(default)]
+    direction: Direction,
     interface: Option<OneOrMany<String>>,
+    #[serde(rename = "all-funcs")]
+    all_funcs: Option<YamlFuncPred>,
 }
 
 /// Which side of the edge the named node sits on.
@@ -278,21 +282,38 @@ pub enum SpliceRule {
         /// Middleware to inject (in order).
         inject: Vec<Injection>,
     },
+    /// Unresolved `on_subgraph` selector.
+    OnSubgraph {
+        /// Literal node names forming the subgraph.
+        nodes: Vec<String>,
+        direction: Direction,
+        /// Compiled interface filter (defaults to `"*"`).
+        interface: Pattern,
+        /// Compiled `all-funcs:` predicate, threaded onto each emitted rule.
+        all_funcs: Option<FuncPred>,
+        /// Middleware to inject (in order).
+        inject: Vec<Injection>,
+    },
 }
 
 impl SpliceRule {
-    /// The compiled matcher for this rule.
+    /// The compiled matcher for this rule. Panics on `OnSubgraph`,
+    /// that variant must be resolved before any matcher walk.
     pub(crate) fn matcher(&self) -> &RuleMatcher {
         match self {
             SpliceRule::Before { matcher, .. } | SpliceRule::Between { matcher, .. } => matcher,
+            SpliceRule::OnSubgraph { .. } => {
+                panic!("OnSubgraph must be resolved via resolve_rules() before .matcher()")
+            }
         }
     }
 
-    /// The injection list for this rule. Both variants always carry
-    /// one — only the matching strategy around it differs.
+    /// The injection list for this rule.
     pub fn inject(&self) -> &[Injection] {
         match self {
-            SpliceRule::Before { inject, .. } | SpliceRule::Between { inject, .. } => inject,
+            SpliceRule::Before { inject, .. }
+            | SpliceRule::Between { inject, .. }
+            | SpliceRule::OnSubgraph { inject, .. } => inject,
         }
     }
 
@@ -300,7 +321,9 @@ impl SpliceRule {
     /// paths on builtin / tier-3-4 entries).
     pub fn inject_mut(&mut self) -> &mut Vec<Injection> {
         match self {
-            SpliceRule::Before { inject, .. } | SpliceRule::Between { inject, .. } => inject,
+            SpliceRule::Before { inject, .. }
+            | SpliceRule::Between { inject, .. }
+            | SpliceRule::OnSubgraph { inject, .. } => inject,
         }
     }
 
@@ -495,63 +518,35 @@ impl ConfigFile {
         for (i, rule) in self.rules.iter().enumerate() {
             let rule_num = i + 1;
 
-            // Strategy must be exactly one of before/between/on_node.
+            // Must be exactly one strategy.
             let strategy_count = [
                 rule.before.is_some(),
                 rule.between.is_some(),
                 rule.on_node.is_some(),
+                rule.on_subgraph.is_some(),
             ]
             .iter()
             .filter(|x| **x)
             .count();
             match strategy_count {
-                0 => bail!(
-                    "rule {rule_num}: a rule must specify one of 'before', 'between', or 'on_node'"
-                ),
+                0 => bail!("rule {rule_num}: a rule must specify one strategy"),
                 1 => {}
-                _ => bail!(
-                    "rule {rule_num}: a rule may specify only one of 'before', 'between', or 'on_node'"
-                ),
+                _ => bail!("rule {rule_num}: a rule may specify only one strategy"),
             }
 
-            // Interface pattern(s) must be non-empty and contain only
-            // characters that are safe to interpolate into a
-            // synthesized WIT `import ...;` clause. Permits both
-            // fully-qualified use-paths and glob patterns. A scalar is
-            // one pattern; a list is several (OR-combined). For
-            // `on_node`, the interface lives in the optional `filter:`
-            // block (default "*" means "any interface").
+            // Strategy-specific checks.
             if let Some(b) = &rule.before {
                 validate_interface_field(rule_num, &b.interface)?;
+                check_node_name(rule_num, "provider", b.provider.as_ref())?;
             }
             if let Some(bw) = &rule.between {
                 validate_interface_field(rule_num, &bw.interface)?;
-            }
-            if let Some(on) = &rule.on_node {
-                if on.name.is_empty() {
-                    bail!("rule {rule_num} (on_node): 'name' must not be empty");
-                }
-                if let Some(filter) = &on.filter {
-                    if let Some(iface) = &filter.interface {
-                        validate_interface_field(rule_num, iface)?;
-                    }
-                }
-            }
-
-            // before-specific checks.
-            if let Some(before) = &rule.before {
-                check_node_name(rule_num, "provider", before.provider.as_ref())?;
-            }
-
-            // between-specific checks.
-            if let Some(between) = &rule.between {
-                check_node_name(rule_num, "inner", between.inner.as_ref())?;
-                check_node_name(rule_num, "outer", between.outer.as_ref())?;
+                check_node_name(rule_num, "inner", bw.inner.as_ref())?;
+                check_node_name(rule_num, "outer", bw.outer.as_ref())?;
                 // Reject only when both names are present and identical
-                // literal patterns — a glob can legitimately fan out
-                // over both ends.
-                let inner = between.inner.as_ref().and_then(|p| p.name.as_ref());
-                let outer = between.outer.as_ref().and_then(|p| p.name.as_ref());
+                // literal patterns.
+                let inner = bw.inner.as_ref().and_then(|p| p.name.as_ref());
+                let outer = bw.outer.as_ref().and_then(|p| p.name.as_ref());
                 if let (Some(i), Some(o)) = (inner, outer) {
                     if i.as_slice() == o.as_slice() {
                         bail!(
@@ -560,6 +555,31 @@ impl ConfigFile {
                             i.as_slice().join(", ")
                         );
                     }
+                }
+            }
+            if let Some(on) = &rule.on_node {
+                if on.name.is_empty() {
+                    bail!("rule {rule_num} (on_node): 'name' must not be empty");
+                }
+                if let Some(iface) = &on.interface {
+                    validate_interface_field(rule_num, iface)?;
+                }
+            }
+            if let Some(sub) = &rule.on_subgraph {
+                if sub.nodes.is_empty() {
+                    bail!("rule {rule_num} (on_subgraph): 'nodes' must list at least one entry");
+                }
+                let mut seen: HashMap<&str, ()> = HashMap::new();
+                for n in &sub.nodes {
+                    if n.is_empty() {
+                        bail!("rule {rule_num} (on_subgraph): 'nodes' entries must not be empty");
+                    }
+                    if seen.insert(n.as_str(), ()).is_some() {
+                        bail!("rule {rule_num} (on_subgraph): 'nodes' contains duplicate '{n}'");
+                    }
+                }
+                if let Some(iface) = &sub.interface {
+                    validate_interface_field(rule_num, iface)?;
                 }
             }
 
@@ -572,9 +592,6 @@ impl ConfigFile {
                 let inj_num = j + 1;
 
                 // user form vs builtin form are mutually exclusive.
-                // Builtin form scopes its WAC-var override and (later)
-                // its config inside the `builtin:` map, so top-level
-                // `name`/`path` next to `builtin:` is a misconfig.
                 match (&inj.builtin, &inj.name, &inj.path) {
                     (None, None, _) => {
                         bail!("rule {rule_num}, injection {inj_num}: missing 'name' or 'builtin'")
@@ -664,25 +681,25 @@ impl ConfigFile {
 }
 
 /// Compile one validated YAML rule into one or more normalized
-/// [`SpliceRule`]s. `before`/`between` produce one each; `on_node`
-/// fans out to one or two depending on `direction`.
+/// [`SpliceRule`]s. `before`/`between`/`on_subgraph` produce one each;
+/// `on_node` fans out to one or two depending on `direction`. The
+/// tuple match is exhaustive: a new strategy field on `YamlRule` won't
+/// compile until a matching arm is added here.
 fn desugar_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<Vec<SpliceRule>> {
     let YamlRule {
         before,
         between,
         on_node,
+        on_subgraph,
         inject,
     } = rule;
     let inject: Vec<Injection> = inject.into_iter().map(into_injection).collect();
-
-    if let Some(b) = before {
-        Ok(vec![compile_before(rule_num, b, inject)?])
-    } else if let Some(b) = between {
-        Ok(vec![compile_between(rule_num, b, inject)?])
-    } else if let Some(on) = on_node {
-        compile_on_node(rule_num, on, inject)
-    } else {
-        unreachable!("validate() guarantees exactly one strategy per rule")
+    match (before, between, on_node, on_subgraph) {
+        (Some(s), None, None, None) => Ok(vec![compile_before(rule_num, s, inject)?]),
+        (None, Some(s), None, None) => Ok(vec![compile_between(rule_num, s, inject)?]),
+        (None, None, Some(s), None) => compile_on_node(rule_num, s, inject),
+        (None, None, None, Some(s)) => Ok(vec![compile_on_subgraph(rule_num, s, inject)?]),
+        _ => unreachable!("validate() guarantees exactly one strategy per rule"),
     }
 }
 
@@ -754,12 +771,10 @@ fn compile_on_node(
         name,
         direction,
         alias,
-        filter,
+        interface,
         all_funcs,
     } = spec;
-    let interface = filter
-        .and_then(|f| f.interface)
-        .unwrap_or_else(|| OneOrMany::One("*".to_string()));
+    let interface = interface.unwrap_or_else(|| OneOrMany::One("*".to_string()));
     let node = YamlProviderOpt {
         name: Some(OneOrMany::One(name)),
         alias,
@@ -790,6 +805,29 @@ fn compile_on_node(
         )?);
     }
     Ok(rules)
+}
+
+fn compile_on_subgraph(
+    rule_num: usize,
+    spec: YamlStrategyOnSubgraph,
+    inject: Vec<Injection>,
+) -> anyhow::Result<SpliceRule> {
+    let YamlStrategyOnSubgraph {
+        nodes,
+        direction,
+        interface,
+        all_funcs,
+    } = spec;
+    let iface_pats = interface.unwrap_or_else(|| OneOrMany::One("*".to_string()));
+    let interface = compile_pattern(rule_num, "interface", iface_pats)?;
+    let all_funcs = compile_func_pred(rule_num, all_funcs)?;
+    Ok(SpliceRule::OnSubgraph {
+        nodes,
+        direction,
+        interface,
+        all_funcs,
+        inject,
+    })
 }
 
 /// Assumes [`ConfigFile::validate`] ran.
@@ -1067,7 +1105,7 @@ rules:
       - name: mw
         path: ./mw.wasm
 "#,
-            "only one of 'before', 'between', or 'on_node'",
+            "may specify only one strategy",
         );
     }
 
@@ -1081,7 +1119,7 @@ rules:
       - name: mw
         path: ./mw.wasm
 "#,
-            "must specify one of 'before', 'between', or 'on_node'",
+            "must specify one strategy",
         );
     }
 
@@ -1862,10 +1900,7 @@ rules:
         };
         assert_eq!(m_in.interface_raw(), ["*"]);
         assert_eq!(m_in.provider_raw(), Some(&["srv-b".to_string()][..]));
-        let SpliceRule::Between {
-            matcher: m_out, ..
-        } = &rules[1]
-        else {
+        let SpliceRule::Between { matcher: m_out, .. } = &rules[1] else {
             panic!("second rule should be Between (outbound)");
         };
         assert_eq!(m_out.interface_raw(), ["*"]);
@@ -1915,22 +1950,21 @@ rules:
     }
 
     #[test]
-    fn parse_on_node_filter_narrows_interface() {
-        // `filter.interface` becomes the desugared rule's interface
-        // pattern (otherwise default "*").
+    fn parse_on_node_interface_narrows_match() {
+        // `interface` becomes the desugared rule's interface pattern
+        // (defaults to "*" when omitted).
         let yaml = r#"
 version: 1
 rules:
   - on_node:
       name: srv-b
       direction: inbound
-      filter:
-        interface: "wasi:*"
+      interface: "wasi:*"
     inject:
       - name: mw
         path: ./mw.wasm
 "#;
-        let rules = parse_yaml(yaml).expect("filter should parse");
+        let rules = parse_yaml(yaml).expect("interface should parse");
         let SpliceRule::Before { matcher, .. } = &rules[0] else {
             panic!("inbound desugars to Before");
         };
@@ -2006,7 +2040,7 @@ rules:
       - name: mw
         path: ./mw.wasm
 "#,
-            "only one of 'before', 'between', or 'on_node'",
+            "may specify only one strategy",
         );
     }
 
@@ -2076,13 +2110,132 @@ version: 1
 rules:
   - on_node:
       name: srv-b
-      filter:
-        interface: "wasi:["
+      interface: "wasi:["
     inject:
       - name: mw
         path: ./mw.wasm
 "#,
             "invalid glob pattern",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // on_subgraph selector
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_on_subgraph_produces_unresolved_variant() {
+        // `on_subgraph` is graph-dependent; parse produces the
+        // OnSubgraph variant for resolve_rules to expand later.
+        let yaml = r#"
+version: 1
+rules:
+  - on_subgraph:
+      nodes: [A, B, C]
+      direction: inbound
+      interface: "wasi:*"
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("on_subgraph should parse");
+        assert_eq!(rules.len(), 1);
+        let SpliceRule::OnSubgraph {
+            nodes,
+            direction,
+            interface,
+            ..
+        } = &rules[0]
+        else {
+            panic!("expected OnSubgraph variant");
+        };
+        assert_eq!(nodes, &["A", "B", "C"]);
+        assert_eq!(*direction, Direction::Inbound);
+        assert!(interface.is_match("wasi:http/handler@0.3.0"));
+        assert!(!interface.is_match("my:srv/api@1.0.0"));
+    }
+
+    #[test]
+    fn parse_on_subgraph_default_direction_is_both() {
+        let yaml = r#"
+version: 1
+rules:
+  - on_subgraph:
+      nodes: [A]
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("default direction should parse");
+        let SpliceRule::OnSubgraph { direction, .. } = &rules[0] else {
+            panic!("expected OnSubgraph");
+        };
+        assert_eq!(*direction, Direction::Both);
+    }
+
+    #[test]
+    fn validate_on_subgraph_empty_nodes_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - on_subgraph:
+      nodes: []
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#,
+            "must list at least one entry",
+        );
+    }
+
+    #[test]
+    fn validate_on_subgraph_empty_node_name_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - on_subgraph:
+      nodes: [A, "", B]
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#,
+            "'nodes' entries must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_on_subgraph_duplicate_nodes_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - on_subgraph:
+      nodes: [A, B, A]
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#,
+            "'nodes' contains duplicate 'A'",
+        );
+    }
+
+    #[test]
+    fn validate_on_subgraph_with_on_node_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - on_node:
+      name: X
+    on_subgraph:
+      nodes: [A, B]
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#,
+            "may specify only one strategy",
         );
     }
 }

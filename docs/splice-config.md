@@ -55,7 +55,7 @@ rules:
 version: 1
 
 rules:
-- before | between | on_node:
+- before | between | on_node | on_subgraph:
     ...
   inject:
     ...
@@ -63,10 +63,10 @@ rules:
 
 ## Fields
 
-| Field                              | Type         | Required | Description                                                                                           |
-|------------------------------------|--------------|----------|-------------------------------------------------------------------------------------------------------|
-| `before` OR `between` OR `on_node` | object       | ✅        | The matching strategy of the rule. See [Before](#before) / [Between](#between) / [On_Node](#on_node). |
-| `inject`                           | list<object> | ✅        | The middleware(s) to inject at the match site. See [Inject](#inject).                                 |
+| Field                                               | Type         | Required | Description                                                                                                                         |
+|-----------------------------------------------------|--------------|----------|-------------------------------------------------------------------------------------------------------------------------------------|
+| `before` OR `between` OR `on_node` OR `on_subgraph` | object       | ✅        | The matching strategy of the rule. See [Before](#before) / [Between](#between) / [On_Node](#on_node) / [On_Subgraph](#on_subgraph). |
+| `inject`                                            | list<object> | ✅        | The middleware(s) to inject at the match site. See [Inject](#inject).                                                               |
 
 ---
 
@@ -176,8 +176,7 @@ rules:
   - on_node:
       name: srv-b
       direction: both       # defaults to `both`
-      filter:
-        interface: "wasi:*"
+      interface: "wasi:*"
     inject:
       ...
 ```
@@ -214,8 +213,65 @@ mechanism behind the desugaring:
 | `name`             | pattern                         | ✅        | The node whose edges to wrap (glob; see [Pattern matching](#pattern-matching-globs--lists)).                                                                                 |
 | `direction`        | `inbound` / `outbound` / `both` | ❌        | Which sides of `name`'s edges to match. Defaults to `both`.                                                                                                                  |
 | `alias`            | string                          | ❌        | Rename the matched node in the generated WAC. Propagates to both desugared rules so the rename is consistent.                                                                |
-| `filter.interface` | pattern or list (OR)            | ❌        | Narrow the matched edges to specific interface(s). Defaults to `*` (every interface).                                                                                        |
+| `interface`        | pattern or list (OR)            | ❌        | Narrow the matched edges to specific interface(s). Defaults to `*` (every interface).                                                                                        |
 | `all-funcs`        | object                          | ❌        | Gate the match on the matched interface's function shapes — see [Function-shape matching](#function-shape-matching-all-funcs). Applies uniformly to both desugared rules.    |
+
+---
+
+# On_Subgraph
+
+```yaml
+version: 1
+
+rules:
+  - on_subgraph:
+      nodes: [A, B, C]
+      direction: both       # defaults to `both`
+      interface: "wasi:*"
+    inject:
+      ...
+```
+
+The `on_subgraph` field treats a set of nodes as a unit and wraps every
+call that crosses into or out of the set. Calls that stay inside the set
+(between two nodes both in `nodes`) are left alone, there's no boundary
+to wrap.
+
+Example effect with `nodes: [B, C], direction: both`:
+
+```
+a → B → C → d
+```
+
+Becomes:
+
+```
+a → M → B → C → M → d
+```
+
+The `a → B` call is _inbound_ (a is outside, B is inside) --> wrapped.
+`B → C` is between two nodes both in the set --> left alone.
+`C → d` call is _outbound_ (C is inside, d is outside) --> wrapped.
+
+`direction` picks which side of the boundary gets wrapped:
+
+| `direction` | What gets wrapped                       |
+|-------------|-----------------------------------------|
+| `inbound`   | calls coming into the set               |
+| `outbound`  | calls going out of the set              |
+| `both`      | both                                    |
+
+A single-node `on_subgraph: { nodes: [X] }` is the same as
+`on_node: { name: X }`.
+
+## Fields
+
+| Field              | Type                            | Required | Description                                                                                                                                              |
+|--------------------|---------------------------------|----------|----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `nodes`            | list<string>                    | ✅        | Literal node names forming the subgraph. Globs are not supported (use multiple `on_subgraph` rules instead). Duplicates are rejected.                    |
+| `direction`        | `inbound` / `outbound` / `both` | ❌        | Which boundary direction qualifies. Defaults to `both`.                                                                                                  |
+| `interface`        | pattern or list (OR)            | ❌        | Narrow the matched edges to specific interface(s). Defaults to `*`.                                                                                      |
+| `all-funcs`        | object                          | ❌        | Gate the match on the matched interface's function shapes — see [Function-shape matching](#function-shape-matching-all-funcs). Applies per emitted rule. |
 
 ---
 
@@ -225,14 +281,14 @@ mechanism behind the desugaring:
 version: 1
 
 rules:
-  - before | between | on_node:
+  - before | between | on_node | on_subgraph:
     ...
     inject:
       - middleware-a
       - middleware-b
 ```
 
-The middleware(s) to inject at the match site identified by the rule's strategy (`before`, `between`, or `on_node`).
+The middleware(s) to inject at the match site identified by the rule's strategy (`before`, `between`, `on_node`, or `on_subgraph`).
 The order of the middleware in this list will follow the order of invocation on the chain.
 
 For example, the above `yaml` will produce the following chain if matching between A and B (middleware-a gets invoked first):
