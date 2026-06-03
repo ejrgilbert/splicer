@@ -2,11 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::fs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use splicer::cviz::output::graph::{generate_graph_ascii, GraphRenderOpts};
-use splicer::cviz::output::{mermaid::generate_mermaid, Direction};
+use splicer::cviz::output::{mermaid::generate_mermaid, terminal_columns, ColorMode, Direction};
 use splicer::types::ContractResult;
 use splicer::{
     builtin_info, compose, preview, splice, Bundle, ComponentInput, ComposeRequest, PreviewRequest,
@@ -123,23 +122,21 @@ enum Command {
         package: String,
     },
 
-    /// Visualize which edges each splice rule would touch.
+    /// Render the composition with each rule's matched edges highlighted.
     ///
-    /// Runs the rules' `select` pass against the composition without
-    /// mutating anything, then renders the composition as ASCII (or
-    /// Mermaid) with matched edges highlighted and tagged by rule
-    /// number.  Useful for sanity-checking a config — overbroad globs,
-    /// unintended overlap, type-predicate gaps — at a glance.
+    /// Runs the rules' `select` pass without mutating anything. The
+    /// diagram's legend pairs each tag bracket with the rule that
+    /// matched it.
     Preview {
-        /// Path to the splice configuration in YAML format.
+        /// Splice configuration in YAML format.
         #[arg(value_name = "SPLICE_CFG")]
         splice_cfg_file: PathBuf,
 
-        /// Pre-composed Wasm component binary to render.
+        /// Pre-composed Wasm component to render.
         #[arg(value_name = "COMP_WASM")]
         comp_wasm: PathBuf,
 
-        /// Output file. Defaults to stdout.
+        /// Output file (default: stdout).
         #[arg(short = 'o', long = "output", value_name = "PATH")]
         output: Option<PathBuf>,
 
@@ -147,22 +144,19 @@ enum Command {
         #[arg(short = 'f', long = "format", default_value = "ascii", value_enum)]
         format: PreviewFormat,
 
-        /// Only render highlights for rule N (1-based). Other rules
-        /// are still parsed (so their YAML errors surface) but their
-        /// matches are not painted.
+        /// Only highlight rule N (1-based).
         #[arg(long = "rule", value_name = "N")]
         rule: Option<usize>,
 
-        /// Hide WIT type signatures on interface connections.
+        /// Hide WIT type signatures.
         #[arg(long = "no-types", action = clap::ArgAction::SetTrue)]
         no_types: bool,
 
-        /// Mermaid diagram direction (Mermaid format only).
+        /// Mermaid diagram direction (Mermaid only).
         #[arg(short = 'd', long = "direction", default_value = "lr", value_enum)]
         direction: Direction,
 
-        /// Force ANSI color (auto-detected by default). Only affects
-        /// ASCII output to stdout.
+        /// Force ANSI color (auto-detected by default).
         #[arg(long, default_value = "auto")]
         color: ColorMode,
     },
@@ -256,14 +250,6 @@ enum PreviewFormat {
     Mermaid,
 }
 
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
-enum ColorMode {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_preview(
     splice_cfg_file: PathBuf,
@@ -286,23 +272,21 @@ fn run_preview(
 
     let opts = GraphRenderOpts::default();
     let show_types = !no_types;
-    let to_file = output.is_some();
-    let use_color = match color {
-        ColorMode::Always => true,
-        ColorMode::Never => false,
-        ColorMode::Auto => !to_file && std::io::stdout().is_terminal(),
-    };
+    let use_color = color.resolve_for_stdout(output.is_some());
 
+    let mut condensed = false;
     let rendered = match format {
         PreviewFormat::Ascii => {
+            let max_w = terminal_columns();
             let out = generate_graph_ascii(
                 &result.graph,
                 &opts,
                 show_types,
-                None,
+                max_w,
                 Some(&result.highlights),
                 use_color,
             );
+            condensed = out.condensed;
             out.ascii
         }
         PreviewFormat::Mermaid => generate_mermaid(
@@ -320,6 +304,13 @@ fn run_preview(
         eprintln!("Preview written to: {}", path.display());
     } else {
         println!("{}", rendered);
+    }
+
+    if condensed {
+        eprintln!();
+        eprintln!(
+            "note: the diagram was condensed to fit; rerun with `-f mermaid` for a wider view."
+        );
     }
 
     for rule_num in &result.unmatched_rules {
