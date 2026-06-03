@@ -422,10 +422,8 @@ pub(crate) fn suggest_interfaces<'a>(raw: &[String], available: &[&'a str]) -> V
     out
 }
 
-#[cfg(test)]
 impl RuleMatcher {
-    /// Raw provider patterns, if the rule constrains the provider-side
-    /// node. Test-only introspection.
+    /// Raw provider patterns, if the rule constrains the provider-side node.
     pub(crate) fn provider_raw(&self) -> Option<&[String]> {
         self.constraints.iter().find_map(|c| match c {
             Constraint::Provider(p) => Some(p.raw()),
@@ -434,13 +432,14 @@ impl RuleMatcher {
     }
 
     /// Raw caller patterns, if the rule constrains the caller-side node.
-    /// Test-only introspection.
     pub(crate) fn caller_raw(&self) -> Option<&[String]> {
         self.constraints.iter().find_map(|c| match c {
             Constraint::Caller(p) => Some(p.raw()),
             _ => None,
         })
     }
+
+    /// The compiled `all-funcs:` predicate, if any.
     pub(crate) fn all_funcs(&self) -> Option<&FuncPred> {
         self.all_funcs.as_ref()
     }

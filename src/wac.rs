@@ -19,18 +19,8 @@ const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
 /// prefix.
 pub const EDGE_ID_CONFIG_KEY: &str = "_splicer_edge_id";
 
-/// Canonical edge_id for an `interface` edge from `from` (the caller)
-/// to `to` (the provider). `from = None` is the boundary case — the
-/// caller is external to the composition; the rendered form drops the
-/// caller segment, leaving the leading `->` as a marker. Format:
-/// `{interface}::{caller}->{provider}`, or `{interface}::->{provider}`
-/// at the boundary.
-pub fn derive_edge_id(interface: &str, from: Option<&str>, to: &str) -> String {
-    match from {
-        Some(caller) => format!("{interface}::{caller}->{to}"),
-        None => format!("{interface}::->{to}"),
-    }
-}
+use cviz::canonical_edge_id;
+
 use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
 use crate::select::{RuleMatcher, SpliceSite};
 use crate::split::gen_split_path;
@@ -712,6 +702,105 @@ impl EmitPlan {
     }
 }
 
+/// One interface-edge chain in **innermost -> outermost** request-flow order.
+#[derive(Debug, Clone)]
+pub(crate) struct ChainSkeleton {
+    pub(crate) interface_name: String,
+    pub(crate) ty_fingerprint: Option<String>,
+    pub(crate) interface_type: Option<InterfaceType>,
+    pub(crate) chain: Vec<u32>,
+}
+
+/// Enumerate every interface-edge chain in `composition`, plus the set
+/// of interfaces those chains cover.
+///
+/// Standalone exported interfaces (no inter-component importers) get a
+/// one-node chain so a rule can still match the provider as a boundary
+/// site.
+pub(crate) fn build_chain_skeletons(
+    composition: &CompositionGraph,
+) -> (Vec<ChainSkeleton>, HashSet<String>) {
+    let mut handled_interfaces: HashSet<String> = HashSet::new();
+    let mut skeletons: Vec<ChainSkeleton> = vec![];
+
+    // Start from the largest instance ids so the longest chains form
+    // first (and the dedup on `handled_interfaces` keeps them).
+    let mut ordered_node_ids = composition.nodes.keys().collect::<Vec<_>>();
+    ordered_node_ids.sort_by_key(|id| Reverse(**id));
+    for outer_node_id in ordered_node_ids {
+        let node = &composition.nodes[outer_node_id];
+        for InterfaceConnection {
+            interface_name,
+            source_instance,
+            is_host_import,
+            fingerprint,
+            interface_type,
+            ..
+        } in node.imports.iter()
+        {
+            if *is_host_import {
+                continue;
+            }
+            let mut chain = vec![*outer_node_id, source_instance.unwrap()];
+            let mut current_id = source_instance.unwrap();
+            while let Some(node) = composition.nodes.get(&current_id) {
+                if let Some(conn) = node
+                    .imports
+                    .iter()
+                    .find(|c| c.interface_name == *interface_name)
+                {
+                    if !conn.is_host_import {
+                        let src_id = conn.source_instance.unwrap();
+                        chain.push(src_id);
+                        current_id = src_id;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if !handled_interfaces.contains(interface_name) && chain.len() > 1 {
+                chain.reverse();
+                skeletons.push(ChainSkeleton {
+                    interface_name: interface_name.clone(),
+                    ty_fingerprint: fingerprint.clone(),
+                    interface_type: interface_type.clone(),
+                    chain,
+                });
+            }
+            handled_interfaces.insert(interface_name.clone());
+        }
+    }
+
+    // Standalone exports (no inter-component importer) become one-node chains.
+    for (
+        interface,
+        ExportInfo {
+            source_instance: source_inst,
+            fingerprint,
+            ty,
+        },
+    ) in composition.component_exports.iter()
+    {
+        if handled_interfaces.contains(interface) {
+            continue;
+        }
+        let interface_type = match ty {
+            Some(InternedId::Interface(id)) => {
+                Some(composition.arena.lookup_interface(*id).clone())
+            }
+            _ => None,
+        };
+        skeletons.push(ChainSkeleton {
+            interface_name: interface.clone(),
+            ty_fingerprint: fingerprint.clone(),
+            interface_type,
+            chain: vec![*source_inst],
+        });
+    }
+
+    (skeletons, handled_interfaces)
+}
+
 /// Read-only state shared across every rule + chain pass of a single
 /// `generate_wac` run.
 struct SpliceCtx<'a> {
@@ -720,10 +809,7 @@ struct SpliceCtx<'a> {
     shim_comps: &'a HashMap<usize, usize>,
 }
 
-/// Mutable per-run state accumulated as rules apply: contract-export
-/// memos, generated adapters, and decode-result caches for the
-/// sync-target / async-middleware preflight (so the same `.wasm` is
-/// only decoded once per `generate_wac` run, not per injection).
+/// Mutable per-run state accumulated as rules apply.
 #[derive(Default)]
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
@@ -751,103 +837,22 @@ pub fn generate_wac(
     pkg_name: &str,
 ) -> anyhow::Result<WacOutput> {
     // Emit the "shim split defaulting" WARN(s) exactly once up-front.
-    // Without this, the notice would fire twice — once from the adapter
-    // generator's `consumer_split_path` lookup, once from the wac-dep
-    // map — because both paths call `resolve_shim` for the same shim.
     log_shim_resolutions(&shim_comps);
 
-    let mut handled_interfaces = HashSet::new();
-
-    let mut chains = vec![];
-    let mut ordered_node_ids = composition.nodes.keys().collect::<Vec<_>>();
-    ordered_node_ids.sort_by_key(|id| Reverse(**id));
-    for outer_node_id in ordered_node_ids {
-        let node = &composition.nodes[outer_node_id];
-
-        // construct all the chains in the component
-        // must do so by starting at largest instance IDs to smallest to get the largest chain!
-        for InterfaceConnection {
-            interface_name,
-            source_instance,
-            is_host_import,
-            fingerprint,
-            interface_type,
-            ..
-        } in node.imports.iter()
-        {
-            let mut chain = vec![*outer_node_id];
-            if *is_host_import {
-                continue;
-            }
-            let mut current_id = source_instance.unwrap();
-
-            chain.push(source_instance.unwrap());
-            while let Some(node) = composition.nodes.get(&current_id) {
-                if let Some(conn) = node
-                    .imports
-                    .iter()
-                    .find(|c| c.interface_name == *interface_name)
-                {
-                    if !conn.is_host_import {
-                        let src_id = conn.source_instance.unwrap();
-                        chain.push(src_id);
-                        current_id = src_id;
-                        continue;
-                    }
-                }
-                break;
-            }
-
-            if !handled_interfaces.contains(interface_name) && chain.len() > 1 {
-                chain.reverse();
-                chains.push(Chain {
-                    interface: Contract {
-                        name: interface_name.to_string(),
-                        ty_fingerprint: fingerprint.clone(),
-                        interface_type: interface_type.clone(),
-                    },
-                    chain,
-                    aliases: HashMap::new(),
-                    inject_plan: HashMap::new(),
-                });
-            }
-            handled_interfaces.insert(interface_name.to_string());
-        }
-    }
-
-    // handle standalone exported interfaces!
-    for (
-        interface,
-        ExportInfo {
-            source_instance: source_inst,
-            fingerprint,
-            ty,
-        },
-    ) in composition.component_exports.iter()
-    {
-        if handled_interfaces.contains(interface) {
-            continue;
-        }
-        // if we've reached this point, it's guaranteed to not be a chain (chains were handled above)
-        // this is just a single exported service func.
-
-        let interface_type = match ty {
-            Some(InternedId::Interface(id)) => {
-                Some(composition.arena.lookup_interface(*id).clone())
-            }
-            _ => None,
-        };
-        chains.push(Chain {
+    let (skeletons, handled_interfaces) = build_chain_skeletons(composition);
+    let mut chains: Vec<Chain> = skeletons
+        .into_iter()
+        .map(|sk| Chain {
             interface: Contract {
-                name: interface.to_string(),
-                ty_fingerprint: fingerprint.clone(),
-                interface_type,
+                name: sk.interface_name,
+                ty_fingerprint: sk.ty_fingerprint,
+                interface_type: sk.interface_type,
             },
-            chain: vec![*source_inst],
+            chain: sk.chain,
             aliases: HashMap::new(),
             inject_plan: HashMap::new(),
-        });
-    }
+        })
+        .collect();
 
     let ctx = SpliceCtx {
         composition,
@@ -1064,7 +1069,7 @@ fn apply_site(
     let caller_id = chain.chain.get(site.provider_idx + 1).copied();
     let caller_var = caller_id.map(|id| get_name(&ctx.composition.nodes[&id]).to_string());
 
-    let edge_id = derive_edge_id(interface, caller_var.as_deref(), &provider_var);
+    let edge_id = canonical_edge_id(interface, caller_var.as_deref(), &provider_var);
     let edge_inject = build_per_edge_providers(rule.inject(), &edge_id, ctx.splits_path)?;
 
     // Alias the matched provider; `between` also aliases the caller (outer).
@@ -1748,40 +1753,10 @@ mod tests {
     // ── edge_id ──────────────────────────────────────────────────────
 
     #[test]
-    fn edge_id_internal_renders_caller_to_provider() {
-        assert_eq!(
-            derive_edge_id(
-                "wasi:http/handler@0.3.0-rc-2026-01-06",
-                Some("srv-b"),
-                "srv-a",
-            ),
-            "wasi:http/handler@0.3.0-rc-2026-01-06::srv-b->srv-a",
-        );
-    }
-
-    #[test]
-    fn edge_id_boundary_drops_caller_segment() {
-        assert_eq!(
-            derive_edge_id("wasi:http/handler@0.3.0", None, "srv-a"),
-            "wasi:http/handler@0.3.0::->srv-a",
-        );
-    }
-
-    #[test]
     fn edge_id_before_and_between_targeting_same_edge_collide() {
-        // The doc's invariant: a `before(provider=B)` matching caller A
-        // and a `between(outer=A, inner=B)` identify the same physical
-        // edge, so they must render to the same edge_id.
-        let from_between = derive_edge_id("ns:pkg/iface@1.0.0", Some("A"), "B");
-        let from_before = derive_edge_id("ns:pkg/iface@1.0.0", Some("A"), "B");
+        let from_between = canonical_edge_id("ns:pkg/iface@1.0.0", Some("A"), "B");
+        let from_before = canonical_edge_id("ns:pkg/iface@1.0.0", Some("A"), "B");
         assert_eq!(from_between, from_before);
-    }
-
-    #[test]
-    fn edge_id_derivation_is_deterministic() {
-        let a = derive_edge_id("ns:pkg/iface@1.2.3", Some("caller"), "provider");
-        let b = derive_edge_id("ns:pkg/iface@1.2.3", Some("caller"), "provider");
-        assert_eq!(a, b);
     }
 
     // ── synth_graph + everything else ────────────────────────────────

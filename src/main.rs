@@ -4,9 +4,12 @@ use colored::Colorize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use splicer::cviz::output::graph::{generate_graph_ascii, GraphRenderOpts};
+use splicer::cviz::output::{mermaid::generate_mermaid, terminal_columns, ColorMode, Direction};
 use splicer::types::ContractResult;
 use splicer::{
-    builtin_info, compose, splice, Bundle, ComponentInput, ComposeRequest, SpliceRequest,
+    builtin_info, compose, preview, splice, Bundle, ComponentInput, ComposeRequest, PreviewRequest,
+    SpliceRequest,
 };
 
 const DEFAULT_PKG: &str = "example:composition";
@@ -119,6 +122,45 @@ enum Command {
         package: String,
     },
 
+    /// Render the composition with each rule's matched edges highlighted.
+    ///
+    /// Runs the rules' `select` pass without mutating anything. The
+    /// diagram's legend pairs each tag bracket with the rule that
+    /// matched it.
+    Preview {
+        /// Splice configuration in YAML format.
+        #[arg(value_name = "SPLICE_CFG")]
+        splice_cfg_file: PathBuf,
+
+        /// Pre-composed Wasm component to render.
+        #[arg(value_name = "COMP_WASM")]
+        comp_wasm: PathBuf,
+
+        /// Output file (default: stdout).
+        #[arg(short = 'o', long = "output", value_name = "PATH")]
+        output: Option<PathBuf>,
+
+        /// Rendering format.
+        #[arg(short = 'f', long = "format", default_value = "ascii", value_enum)]
+        format: PreviewFormat,
+
+        /// Only highlight rule N (1-based).
+        #[arg(long = "rule", value_name = "N")]
+        rule: Option<usize>,
+
+        /// Hide WIT type signatures.
+        #[arg(long = "no-types", action = clap::ArgAction::SetTrue)]
+        no_types: bool,
+
+        /// Mermaid diagram direction (Mermaid only).
+        #[arg(short = 'd', long = "direction", default_value = "lr", value_enum)]
+        direction: Direction,
+
+        /// Force ANSI color (auto-detected by default).
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
+    },
+
     /// Inspect builtin middleware shipped with this splicer.
     ///
     /// With no argument, lists every builtin and its one-line
@@ -177,8 +219,109 @@ fn main() -> Result<()> {
             package,
         } => run_compose(wasms, output, emit_wac, plan, package),
 
+        Command::Preview {
+            splice_cfg_file,
+            comp_wasm,
+            output,
+            format,
+            rule,
+            no_types,
+            direction,
+            color,
+        } => run_preview(
+            splice_cfg_file,
+            comp_wasm,
+            output,
+            format,
+            rule,
+            no_types,
+            direction,
+            color,
+        ),
+
         Command::Builtin { name } => run_builtin(name),
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum PreviewFormat {
+    #[default]
+    Ascii,
+    Mermaid,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_preview(
+    splice_cfg_file: PathBuf,
+    comp_wasm: PathBuf,
+    output: Option<PathBuf>,
+    format: PreviewFormat,
+    rule: Option<usize>,
+    no_types: bool,
+    direction: Direction,
+    color: ColorMode,
+) -> Result<()> {
+    let rules_yaml = fs::read_to_string(&splice_cfg_file)
+        .with_context(|| format!("Failed to read: {}", splice_cfg_file.display()))?;
+
+    let result = preview(PreviewRequest {
+        composition_wasm: comp_wasm,
+        rules_yaml,
+        only_rule: rule,
+    })?;
+
+    let opts = GraphRenderOpts::default();
+    let show_types = !no_types;
+    let use_color = color.resolve_for_stdout(output.is_some());
+
+    let mut condensed = false;
+    let rendered = match format {
+        PreviewFormat::Ascii => {
+            let max_w = terminal_columns();
+            let out = generate_graph_ascii(
+                &result.graph,
+                &opts,
+                show_types,
+                max_w,
+                Some(&result.highlights),
+                use_color,
+            );
+            condensed = out.condensed;
+            out.ascii
+        }
+        PreviewFormat::Mermaid => generate_mermaid(
+            &result.graph,
+            &opts,
+            direction,
+            show_types,
+            Some(&result.highlights),
+        ),
+    };
+
+    if let Some(path) = output {
+        fs::write(&path, &rendered)
+            .with_context(|| format!("Failed to write preview: {}", path.display()))?;
+        eprintln!("Preview written to: {}", path.display());
+    } else {
+        println!("{}", rendered);
+    }
+
+    if condensed {
+        eprintln!();
+        eprintln!(
+            "note: the diagram was condensed to fit; rerun with `-f mermaid` for a wider view."
+        );
+    }
+
+    for rule_num in &result.unmatched_rules {
+        eprintln!(
+            "{}: rule {} matched no edges",
+            "WARN".yellow().bold(),
+            rule_num,
+        );
+    }
+
+    Ok(())
 }
 
 fn run_builtin(name: Option<String>) -> Result<()> {
