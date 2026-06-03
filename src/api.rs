@@ -15,6 +15,7 @@ use crate::builtins;
 use crate::compose::{build_graph_from_components, filename_from_path};
 use crate::contract::ContractResult;
 use crate::parse::config::{parse_yaml, SpliceRule};
+use crate::resolve::resolve_rules;
 use crate::split::split_out_composition;
 use crate::wac::{generate_wac, GeneratedAdapter};
 
@@ -186,6 +187,10 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
     // Tier-3/4 builtins skip this pass — they're codegen'd lazily in
     // `generate_wac`, per matched rule, against the rule's target.
     materialize_tier1_2_builtins(&mut cfg, std::path::Path::new(&splits_path))?;
+
+    // Resolve graph-dependent selectors (on_subgraph) before
+    // generate_wac walks rules.
+    let cfg = resolve_rules(cfg, &graph)?;
 
     let out = generate_wac(shim_comps, &splits_path, &graph, &cfg, None, &package_name)?;
 

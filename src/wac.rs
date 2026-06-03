@@ -1077,6 +1077,8 @@ fn apply_site(
     let edge_inject = build_per_edge_providers(rule.inject(), &edge_id, ctx.splits_path)?;
 
     // Alias the matched provider; `between` also aliases the caller (outer).
+    // OnSubgraph is expected to be resolved before generate_wac runs,
+    // so it should never reach this site.
     let new_aliases: Vec<(u32, Option<String>)> = match rule {
         SpliceRule::Before { provider_alias, .. } => vec![(provider_id, provider_alias.clone())],
         SpliceRule::Between {
@@ -1089,6 +1091,12 @@ fn apply_site(
                 v.push((cid, outer_alias.clone()));
             }
             v
+        }
+        SpliceRule::OnNode { .. } | SpliceRule::OnSubgraph { .. } => {
+            anyhow::bail!(
+                "splicer bug: unresolved variant reached apply_site; \
+                 caller must run resolve_rules() first"
+            )
         }
     };
 

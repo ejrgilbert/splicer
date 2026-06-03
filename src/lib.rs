@@ -85,6 +85,7 @@ mod config_provider;
 mod contract;
 mod parse;
 mod preview;
+mod resolve;
 mod select;
 mod split;
 mod strategies;

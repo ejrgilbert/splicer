@@ -23,6 +23,7 @@ use std::str::FromStr;
 /// aren't file paths), so `wasi:*` matches `wasi:http/handler@0.3.0`.
 /// This is globset's default (`literal_separator` off); a unit test
 /// pins it.
+#[derive(Clone)]
 pub struct Pattern {
     raw: Vec<String>,
     set: GlobSet,
@@ -193,8 +194,8 @@ impl RuleMatcher {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct FuncPred {
+#[derive(Clone, Debug)]
+pub struct FuncPred {
     pub(crate) is_async: Option<bool>,
     pub(crate) scopes: Vec<FuncScope>,
     pub(crate) args: Vec<ValueProperty>,

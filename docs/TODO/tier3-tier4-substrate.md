@@ -1,7 +1,7 @@
 # Tier-3 / Tier-4 substrate: forward-looking design
 
 Forward-looking design for tier-3/4 — strategy taxonomy, type
-predicates, cells wire format, `between_subgraph` integration,
+predicates, cells wire format, `on_subgraph` integration,
 resource path. The substrate (strategy traits, codegen template,
 cargo build pipeline, hello-tier3 / hello-tier4 smoke builtins) has
 landed; this doc no longer tracks shipped checkboxes — see
@@ -14,8 +14,9 @@ framework rules see
 [`docs/adapter-components.md`](../adapter-components.md). Sibling
 planning notes:
 [`adapter-comp-planning.md`](./adapter-comp-planning.md). Multi-edge
-mechanics, `edge_id`, and selectors:
-[`builtins/recorder/TODO-multi-edge.md`](../../builtins/recorder/TODO-multi-edge.md).
+selectors (`on_node`, `on_subgraph`) and `edge_id` derivation have
+shipped — see [`docs/splice-config.md`](../splice-config.md) for the
+user surface and `cviz::canonical_edge_id` for the format.
 
 Mantra: **design with resources, ship without.**
 
@@ -181,18 +182,17 @@ to resources at all.
 5. Trace format already supports `cell::resource-handle` cells from
    tier-2; no v1 changes needed.
 
-## `between_subgraph`: how this substrate consumes it
+## `on_subgraph`: how this substrate consumes it
 
-The multi-edge selector vocabulary and `edge_id` mechanism are
-documented in
-[`builtins/recorder/TODO-multi-edge.md`](../../builtins/recorder/TODO-multi-edge.md).
-This section just notes how the typed-wrapper substrate consumes those
+The `on_subgraph` selector and `edge_id` derivation have shipped — see
+[`docs/splice-config.md`](../splice-config.md) for the user surface.
+This section notes how the typed-wrapper substrate consumes those
 primitives.
 
 **Example YAML:**
 
 ```yaml
-- between_subgraph:
+- on_subgraph:
     nodes: [billing-frontend, billing-core, billing-db-shim]
     direction: inbound   # or "outbound" or "both"
   inject:
@@ -201,13 +201,13 @@ primitives.
         dir: ./recordings/billing/
 ```
 
-`between_subgraph` expands at parse time to a set of per-edge rules,
+`on_subgraph` expands at parse time to a set of per-edge rules,
 one per boundary edge. The runtime primitive stays per-edge. From the
 typed-wrapper substrate's perspective this is just "the rule layer
 produced N target edges, generate wrappers for each unique WIT among
 them and wire them in."
 
-**Modes the substrate enables on top of `between_subgraph`:**
+**Modes the substrate enables on top of `on_subgraph`:**
 
 | Mode               | What gets wired                                              | Useful for                                                |
 |--------------------|--------------------------------------------------------------|-----------------------------------------------------------|
@@ -223,7 +223,7 @@ semantic weirdness: the subgraph is the SUT, the rest of the graph
 does not exist during fuzz, the fuzz driver is the only caller.
 Standard fuzzing semantics scoped to an arbitrary subgraph.
 
-**Single-component is a special case** of `between_subgraph: { nodes:
+**Single-component is a special case** of `on_subgraph: { nodes:
 [target], direction: both }`, equivalent to `on_node: target`. The
 selector vocabulary handles single-node and multi-node uniformly.
 
@@ -236,27 +236,28 @@ selector vocabulary handles single-node and multi-node uniformly.
    replayer, fuzzer, ...). Strategies are target-agnostic; the codegen
    monomorphizes them per-target.
 3. **Wire format**: cells trace keyed by `edge_id`. The
-   `_splicer_edge_id` config substrate from the recorder doc threads
-   identity through; SDK `TraceReader` keys reads and writes by it.
+   `_splicer_edge_id` config substrate (auto-injected by splicer into
+   every spliced builtin) threads identity through; SDK `TraceReader`
+   keys reads and writes by it.
 
 **Coexistence with per-interface targeting.** Both selector families
 work in the same splice config. Apply `redact-strings` to every
 `wasi:http/handler` edge via per-interface targeting (`before` /
 `between`), and apply `record` to the billing subgraph's boundary via
-`between_subgraph` in the same YAML. Different rules, different
+`on_subgraph` in the same YAML. Different rules, different
 mechanics, both valid. The substrate handles both uniformly because both
 reduce to "wire wrappers on some set of edges."
 
-**Sequencing.** The substrate doc's v1 ship presupposes recorder doc
-steps 2-5 (edge_id auto-injection, file-sink, `on_edge` selector,
-`splicer edges` CLI). v1 step 5 (`record`) and step 6 (`replay`,
-value-typed) of *this* doc correspond to recorder doc step 7
-(replayer as tier-4 virtualize). `between_subgraph` (recorder doc
-step 6) is the prerequisite for the differential-testing capstone.
+**Sequencing.** The substrate doc's v1 ship presupposes the shipped
+recorder pieces (edge_id auto-injection, file-sink, `on_node` and
+`on_subgraph` selectors). The replay strategies of *this* doc map
+onto the still-pending replayer builtin (tier-4 virtualize).
+`on_subgraph` is the prerequisite for the differential-testing
+capstone.
 
 ## Use cases that drop out of the substrate
 
-The substrate plus `between_subgraph` combine to enable several
+The substrate plus `on_subgraph` combine to enable several
 high-value capabilities beyond the explicit builtins. Each is mostly
 reuse of pieces already planned plus a small piece of new glue.
 
@@ -269,16 +270,16 @@ version-B's outbound calls; compare the version-B outbound trace to
 the version-A outbound trace. Differences flag behavioral regressions
 introduced by the refactor.
 
-**Pieces reused:** `between_subgraph` selector (recorder doc step 6),
-recorder writing cells keyed by `edge_id`, value-typed replayer driving
-the subgraph with recorded inbound inputs (recorder doc step 7).
+**Pieces reused:** `on_subgraph` selector (shipped), recorder writing
+cells keyed by `edge_id` (shipped), value-typed replayer driving the
+subgraph with recorded inbound inputs (pending replayer builtin).
 
 **Pieces new:** a cells **trace diff** (read two cells streams in
 parallel, compare call-by-call, report differences with paths into the
 cell trees). Implemented as a library in `splicer-tool-sdk` plus a CLI
 surface (`splicer trace diff <old.cells> <new.cells>`).
 
-**Roadmap slot:** after recorder doc step 7 (replayer) and substrate
+**Roadmap slot:** after the replayer builtin and substrate
 doc step 6 (value-typed replay) land. Drops out cheaply because the
 heavy machinery is already shipped; the diff itself is tens to
 low-hundreds of lines.
@@ -295,7 +296,7 @@ Dependency isolation testing, bounded chaos engineering, subgraph
 extraction / decomposition, scoped observability, capability
 attenuation at trust boundaries, behavioral diff between versions,
 scoped profiling. All compose the same substrate pieces with different
-strategy configurations applied to `between_subgraph` boundaries.
+strategy configurations applied to `on_subgraph` boundaries.
 
 ## Open questions
 
