@@ -702,12 +702,7 @@ impl EmitPlan {
     }
 }
 
-/// One interface-edge chain produced by [`build_chain_skeletons`].
-/// In **innermost → outermost** request-flow order — `chain[0]` is the
-/// final provider, `chain[chain.len()-1]` is the outermost consumer
-/// whose import side faces the host. This is the ordering that
-/// [`crate::select::RuleMatcher::select`] reads, so the same `SpliceSite`
-/// positions line up across `generate_wac` and `preview`.
+/// One interface-edge chain in **innermost -> outermost** request-flow order.
 #[derive(Debug, Clone)]
 pub(crate) struct ChainSkeleton {
     pub(crate) interface_name: String,
@@ -717,8 +712,7 @@ pub(crate) struct ChainSkeleton {
 }
 
 /// Enumerate every interface-edge chain in `composition`, plus the set
-/// of interfaces those chains cover.  Chains are returned in
-/// innermost → outermost order (see [`ChainSkeleton`]).
+/// of interfaces those chains cover.
 ///
 /// Standalone exported interfaces (no inter-component importers) get a
 /// one-node chain so a rule can still match the provider as a boundary
@@ -777,8 +771,7 @@ pub(crate) fn build_chain_skeletons(
         }
     }
 
-    // Standalone exports (no inter-component importer) become one-node
-    // chains — a rule's `before` boundary site can still match them.
+    // Standalone exports (no inter-component importer) become one-node chains.
     for (
         interface,
         ExportInfo {
@@ -816,10 +809,7 @@ struct SpliceCtx<'a> {
     shim_comps: &'a HashMap<usize, usize>,
 }
 
-/// Mutable per-run state accumulated as rules apply: contract-export
-/// memos, generated adapters, and decode-result caches for the
-/// sync-target / async-middleware preflight (so the same `.wasm` is
-/// only decoded once per `generate_wac` run, not per injection).
+/// Mutable per-run state accumulated as rules apply.
 #[derive(Default)]
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
@@ -847,9 +837,6 @@ pub fn generate_wac(
     pkg_name: &str,
 ) -> anyhow::Result<WacOutput> {
     // Emit the "shim split defaulting" WARN(s) exactly once up-front.
-    // Without this, the notice would fire twice — once from the adapter
-    // generator's `consumer_split_path` lookup, once from the wac-dep
-    // map — because both paths call `resolve_shim` for the same shim.
     log_shim_resolutions(&shim_comps);
 
     let (skeletons, handled_interfaces) = build_chain_skeletons(composition);
@@ -1765,13 +1752,6 @@ mod tests {
 
     // ── edge_id ──────────────────────────────────────────────────────
 
-    /// Splicer-side invariant on top of cviz's edge format: a
-    /// `before(provider=B)` matching caller A and a `between(outer=A,
-    /// inner=B)` identify the same physical edge, so both must render
-    /// to the same string.  cviz pins the format itself (see
-    /// `cviz::canonical_id::tests::edge_format_is_stable_contract`);
-    /// this test pins that splicer's two rule shapes agree on which
-    /// edge they're naming.
     #[test]
     fn edge_id_before_and_between_targeting_same_edge_collide() {
         let from_between = canonical_edge_id("ns:pkg/iface@1.0.0", Some("A"), "B");
