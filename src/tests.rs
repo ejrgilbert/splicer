@@ -1,7 +1,45 @@
+use crate::parse::config::SpliceRule;
 use crate::{parse, wac};
 use cviz::model::CompositionGraph;
 use cviz::parse::json;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Absolute path to a minimal empty-component wasm written to a temp
+/// dir on first use.
+pub(crate) fn test_mw_path() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("splicer-test-mws");
+        std::fs::create_dir_all(&dir).expect("create splicer-test-mws tmp dir");
+        let path = dir.join("empty-mw.wasm");
+        let bytes = wat::parse_str("(component)").expect("empty component WAT must parse");
+        std::fs::write(&path, &bytes).expect("write empty middleware wasm");
+        path.to_string_lossy().into_owned()
+    })
+}
+
+/// Substitute every `{{MW_PATH}}` token with the test middleware path
+/// (see [`test_mw_path`]) and parse the result as a YAML splice config.
+pub(crate) fn parse_test_yaml(yaml: &str) -> anyhow::Result<Vec<SpliceRule>> {
+    let substituted = yaml.replace("{{MW_PATH}}", test_mw_path());
+    parse::config::parse_yaml(&substituted)
+}
+
+/// Parse `yaml` with [`parse_test_yaml`] and run `generate_wac` against
+/// `graph` with the standard test-side knobs (placeholder splits dir,
+/// no node-paths, fixed package name).
+fn gen_wac_for(yaml: &str, graph: &CompositionGraph) -> anyhow::Result<wac::WacOutput> {
+    let cfg = parse_test_yaml(yaml)?;
+    wac::generate_wac(
+        HashMap::new(),
+        "placeholder",
+        graph,
+        &cfg,
+        None,
+        "example:composition",
+    )
+}
 
 #[test]
 fn before_on_all() -> anyhow::Result<()> {
@@ -109,18 +147,10 @@ rules:
         name: app
     inject:
       - name: http-middleware
+        path: {{MW_PATH}}
 "#;
-    let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let out = wac::generate_wac(
-        HashMap::new(),
-        "placeholder",
-        &graph,
-        &cfg,
-        None,
-        "example:composition",
-    )?;
-    let wac = out.wac;
+    let wac = gen_wac_for(yaml, &graph)?.wac;
 
     // http-middleware is injected for the http chain
     assert!(
@@ -156,18 +186,10 @@ rules:
         name: http-provider
     inject:
       - name: http-middleware
+        path: {{MW_PATH}}
 "#;
-    let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_multi_interface_node())?;
-    let out = wac::generate_wac(
-        HashMap::new(),
-        "placeholder",
-        &graph,
-        &cfg,
-        None,
-        "example:composition",
-    )?;
-    let wac = out.wac;
+    let wac = gen_wac_for(yaml, &graph)?.wac;
 
     // http-middleware inserted before http-provider
     assert!(
@@ -206,18 +228,10 @@ rules:
         name: log-provider
     inject:
       - name: log-middleware
+        path: {{MW_PATH}}
 "#;
-    let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let out = wac::generate_wac(
-        HashMap::new(),
-        "placeholder",
-        &graph,
-        &cfg,
-        None,
-        "example:composition",
-    )?;
-    let wac = out.wac;
+    let wac = gen_wac_for(yaml, &graph)?.wac;
 
     let expected = r#"
 package example:composition;
@@ -255,18 +269,10 @@ rules:
         name: log-provider
     inject:
       - name: log-middleware
+        path: {{MW_PATH}}
 "#;
-    let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_long_chain())?;
-    let out = wac::generate_wac(
-        HashMap::new(),
-        "placeholder",
-        &graph,
-        &cfg,
-        None,
-        "example:composition",
-    )?;
-    let wac = out.wac;
+    let wac = gen_wac_for(yaml, &graph)?.wac;
 
     let expected = r#"
 package example:composition;
@@ -306,18 +312,10 @@ rules:
       interface: wasi:http/handler@0.3.0-rc-2026-01-06
     inject:
       - name: http-middleware
+        path: {{MW_PATH}}
 "#;
-    let cfg = parse::config::parse_yaml(yaml)?;
     let graph = json::parse_json_str(testcases::json_log_short_chain())?;
-    let out = wac::generate_wac(
-        HashMap::new(),
-        "placeholder",
-        &graph,
-        &cfg,
-        None,
-        "example:composition",
-    )?;
-    let wac = out.wac;
+    let wac = gen_wac_for(yaml, &graph)?.wac;
 
     assert!(
         !wac.contains("http-middleware"),
@@ -334,12 +332,12 @@ rules:
     Ok(())
 }
 
-// --- Typed-graph tests (priority 4 from test-plan.md) ---
-// These use the same YAML configs and expected WAC outputs as the untyped
-// variants, but the parsed graphs are post-processed to carry a fake
-// fingerprint on the `wasi:http/handler` chain.  The middleware has no
-// path (path: None), so `validate_contract` emits a Warn and proceeds;
-// the generated WAC must be identical to the untyped result.
+// --- Typed-graph tests ---
+// Same YAML configs and expected WAC as the untyped variants above;
+// the graphs are post-processed via `add_chain_fingerprint` to carry a
+// fake fingerprint on the `wasi:http/handler` chain. The middleware
+// bytes (the shared empty-component fixture) don't export that
+// interface, so `validate_contract` emits a Warn and proceeds.
 
 #[test]
 fn before_on_all_typed() -> anyhow::Result<()> {
@@ -363,9 +361,6 @@ fn splice_on_all_typed() -> anyhow::Result<()> {
 
 #[test]
 fn warn_is_non_blocking_and_wac_still_generated() -> anyhow::Result<()> {
-    // Typed graph + middleware with path: None.
-    // validate_contract produces one Warn per middleware (can't verify without a path),
-    // but the plan still proceeds and the WAC is emitted.
     let yaml = r#"
 version: 1
 rules:
@@ -375,20 +370,13 @@ rules:
         name: log-provider
     inject:
       - name: log-middleware
+        path: {{MW_PATH}}
       - name: log-middleware-2
+        path: {{MW_PATH}}
 "#;
-    let cfg = parse::config::parse_yaml(yaml)?;
     let mut graph = json::parse_json_str(testcases::json_log_short_chain())?;
     add_chain_fingerprint(&mut graph, "wasi:logging/log@0.1.0", "fake-fp-xyz");
-
-    let out = wac::generate_wac(
-        HashMap::new(),
-        "placeholder",
-        &graph,
-        &cfg,
-        None,
-        "example:composition",
-    )?;
+    let out = gen_wac_for(yaml, &graph)?;
 
     // WAC is still generated — the Warn is advisory only
     assert!(
@@ -402,7 +390,8 @@ rules:
         "second middleware must also be injected"
     );
 
-    // One Warn per middleware injection (2 middlewares, no paths → 2 Warns)
+    // One Warn per middleware injection (2 middlewares, neither
+    // exports the contracted interface → 2 Warns).
     let warns: Vec<_> = out
         .diagnostics
         .iter()
@@ -411,7 +400,7 @@ rules:
     assert_eq!(
         warns.len(),
         2,
-        "expected one Warn per middleware without a path, got: {:?}",
+        "expected one Warn per non-exporting middleware, got: {:?}",
         out.diagnostics
     );
 
@@ -424,36 +413,6 @@ rules:
         out.diagnostics
     );
 
-    Ok(())
-}
-
-fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
-    let cfg = parse::config::parse_yaml(yaml)?;
-
-    let mut graphs = HashMap::new();
-    let all_json = testcases::get_all_json();
-    for (name, json) in all_json {
-        graphs.insert(name.clone(), json::parse_json_str(&json)?);
-    }
-
-    for (name, graph) in graphs.iter() {
-        let out = wac::generate_wac(
-            HashMap::new(),
-            "placeholder",
-            graph,
-            &cfg,
-            None,
-            "example:composition",
-        )?;
-        let wac = out.wac;
-        let exp_wac = exp.get(name).unwrap_or_else(|| {
-            panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
-        });
-
-        assert_eq!(wac.trim(), exp_wac.trim(),
-            "Failed on test '{name}', for the following config:\n{yaml}\nGot the following result:\n{wac}"
-        );
-    }
     Ok(())
 }
 
@@ -473,33 +432,18 @@ fn add_chain_fingerprint(graph: &mut CompositionGraph, interface_name: &str, fin
     }
 }
 
-fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
-    let cfg = parse::config::parse_yaml(yaml)?;
-    const IFACE: &str = "wasi:http/handler@0.3.0-rc-2026-01-06";
-    const FP: &str = "fake-fingerprint-abc123";
-
-    let mut graphs = HashMap::new();
-    let all_json = testcases::get_all_json();
-    for (name, json_str) in all_json {
-        let mut graph = json::parse_json_str(&json_str)?;
-        add_chain_fingerprint(&mut graph, IFACE, FP);
-        graphs.insert(name.clone(), graph);
-    }
-
-    for (name, graph) in graphs.iter() {
-        let out = wac::generate_wac(
-            HashMap::new(),
-            "placeholder",
-            graph,
-            &cfg,
-            None,
-            "example:composition",
-        )?;
-        let wac = out.wac;
+/// Run `yaml` against every graph in `graphs` and assert the emitted
+/// WAC matches the matching entry in `exp`.
+fn run_against_graphs(
+    yaml: &str,
+    graphs: &HashMap<String, CompositionGraph>,
+    exp: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    for (name, graph) in graphs {
+        let wac = gen_wac_for(yaml, graph)?.wac;
         let exp_wac = exp.get(name).unwrap_or_else(|| {
             panic!("Test setup incorrect, should be able to find expected result for name '{name}'")
         });
-
         assert_eq!(
             wac.trim(),
             exp_wac.trim(),
@@ -507,6 +451,26 @@ fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()>
         );
     }
     Ok(())
+}
+
+fn run_all(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
+    let mut graphs = HashMap::new();
+    for (name, json_str) in testcases::get_all_json() {
+        graphs.insert(name.clone(), json::parse_json_str(&json_str)?);
+    }
+    run_against_graphs(yaml, &graphs, &exp)
+}
+
+fn run_all_typed(yaml: &str, exp: HashMap<String, String>) -> anyhow::Result<()> {
+    const IFACE: &str = "wasi:http/handler@0.3.0-rc-2026-01-06";
+    const FP: &str = "fake-fingerprint-abc123";
+    let mut graphs = HashMap::new();
+    for (name, json_str) in testcases::get_all_json() {
+        let mut graph = json::parse_json_str(&json_str)?;
+        add_chain_fingerprint(&mut graph, IFACE, FP);
+        graphs.insert(name.clone(), graph);
+    }
+    run_against_graphs(yaml, &graphs, &exp)
 }
 
 // ── Shim roundtrip test ───────────────────────────────────────────────────────
@@ -1194,7 +1158,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv-b
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     fn yaml_before_on_one_exp() -> &'static str {
@@ -1292,7 +1258,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
           interface: wasi:http/handler@0.3.0-rc-2026-01-06
         inject:
         - name: middleware-a
+          path: {{MW_PATH}}
         - name: middleware-b
+          path: {{MW_PATH}}
     "#
     }
     fn yaml_before_noprov_on_one_exp() -> &'static str {
@@ -1428,7 +1396,9 @@ export middleware-a-2["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv-c
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     fn yaml_before_long_on_one_exp() -> &'static str {
@@ -1490,7 +1460,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv-NA
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     pub fn yaml_before_nomatch_all_exp() -> HashMap<String, String> {
@@ -1510,7 +1482,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     fn yaml_splice_on_one_exp() -> &'static str {
@@ -1594,7 +1568,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv-b
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
 
         "#
     }
@@ -1659,7 +1635,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     pub fn yaml_splice_nomatch_all_exp() -> HashMap<String, String> {
@@ -1674,13 +1652,16 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
           - before:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
               provider:
                 name: srv-b
             inject:
             - name: middleware-b
+              path: {{MW_PATH}}
             - name: middleware-c
+              path: {{MW_PATH}}
           - between:
               interface: wasi:http/handler@0.3.0-rc-2026-01-06
               inner:
@@ -1689,7 +1670,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv-b
             inject:
             - name: middleware-d
+              path: {{MW_PATH}}
             - name: middleware-e
+              path: {{MW_PATH}}
         "#
     }
     fn yaml_multi_rule_on_one_exp() -> &'static str {
@@ -1833,7 +1816,9 @@ export middleware-a-2["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 alias: other-name
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     fn yaml_alias_in_before_on_one_exp() -> &'static str {
@@ -1944,7 +1929,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 name: srv
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     fn alias_in_between_inner_on_one_exp() -> &'static str {
@@ -2037,7 +2024,9 @@ export srv["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 alias: other
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     fn alias_in_between_outer_on_one_exp() -> &'static str {
@@ -2131,7 +2120,9 @@ export other["wasi:http/handler@0.3.0-rc-2026-01-06"];
                 alias: other
             inject:
             - name: middleware-a
+              path: {{MW_PATH}}
             - name: middleware-b
+              path: {{MW_PATH}}
         "#
     }
     fn alias_in_between_inner_and_outer_on_one_exp() -> &'static str {

@@ -8,19 +8,20 @@
 //!
 //! ## Phase 1 — Basic splice
 //! Shows WAC generation for `before` and `between` rules on a simple
-//! log-interface chain (no type information required).
+//! log-interface chain.
 //!
-//! ## Phase 2 — Type-compatibility checking
-//! Demonstrates all three `ContractResult` outcomes:
-//!   Warn  — middleware has no path; type safety unconfirmed but injection proceeds
-//!   Ok    — fingerprints match; injection confirmed safe
-//!   Error — fingerprints differ; types are structurally incompatible
+//! ## Phase 2 — Type-compatibility checking (strict)
+//! Demonstrates the three contract outcomes once a middleware is loaded
+//! and the chain carries a fingerprint:
+//! - Ok:     fingerprints match; injection confirmed safe
+//! - Error:  fingerprints differ; types are structurally incompatible
+//! - Error:  splicer couldn't recover fingerprints
 //!
 //! ## Phase 3 — Full pipeline with real WAT
 //! Compiles WAT middleware sources from `demo/wat/`, writes them to temp files,
 //! and calls `validate_contract` via the real `discover_middleware_exports` path:
-//!   Ok    — compatible WAT middleware (same `log` signature as chain)
-//!   Error — incompatible WAT middleware (different `log` signature)
+//! - Ok:     compatible WAT middleware (same `log` signature as chain)
+//! - Error:  incompatible WAT middleware (different `log` signature)
 
 use cviz::model::ExportInfo;
 use cviz::parse::component::parse_component;
@@ -28,6 +29,19 @@ use cviz::parse::json::parse_json_str;
 use splicer::lowlevel::{generate_wac, parse_yaml, validate_contract, Injection};
 use splicer::types::ContractResult;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
+
+/// Lazily write a minimal empty-component wasm to a temp file and
+/// return its absolute path.
+fn demo_mw_path() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join("splicer-demo-empty-mw.wasm");
+        let bytes = wat::parse_str("(component)").expect("compile empty component");
+        std::fs::write(&path, bytes).expect("write empty middleware wasm");
+        path.to_string_lossy().into_owned()
+    })
+}
 
 // ─── JSON graph fixtures ──────────────────────────────────────────────────
 // Two-node log chain:  log-provider  →  app
@@ -79,7 +93,9 @@ const LOG_IFACE: &str = "wasi:logging/log@0.1.0";
 
 /// 1a: inject `mw-a` before `log-provider` in a two-node chain.
 pub fn scenario_1a_before_on_short_chain() -> String {
-    let yaml = r#"
+    let mw = demo_mw_path();
+    let yaml = format!(
+        r#"
 version: 1
 rules:
   - before:
@@ -88,8 +104,10 @@ rules:
         name: log-provider
     inject:
       - name: mw-a
-"#;
-    let cfg = parse_yaml(yaml).unwrap();
+        path: {mw}
+"#
+    );
+    let cfg = parse_yaml(&yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_SHORT).unwrap();
     generate_wac(
         HashMap::new(),
@@ -105,7 +123,9 @@ rules:
 
 /// 1b: inject `mw-a` before `log-provider-inner` (the deepest node) in a three-node chain.
 pub fn scenario_1b_before_on_long_chain() -> String {
-    let yaml = r#"
+    let mw = demo_mw_path();
+    let yaml = format!(
+        r#"
 version: 1
 rules:
   - before:
@@ -114,8 +134,10 @@ rules:
         name: log-provider-inner
     inject:
       - name: mw-a
-"#;
-    let cfg = parse_yaml(yaml).unwrap();
+        path: {mw}
+"#
+    );
+    let cfg = parse_yaml(&yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
     generate_wac(
         HashMap::new(),
@@ -131,7 +153,9 @@ rules:
 
 /// 1c: inject `mw-a` and `mw-b` between `log-provider-inner` and `log-provider`.
 pub fn scenario_1c_between_on_long_chain() -> String {
-    let yaml = r#"
+    let mw = demo_mw_path();
+    let yaml = format!(
+        r#"
 version: 1
 rules:
   - between:
@@ -142,9 +166,12 @@ rules:
         name: log-provider
     inject:
       - name: mw-a
+        path: {mw}
       - name: mw-b
-"#;
-    let cfg = parse_yaml(yaml).unwrap();
+        path: {mw}
+"#
+    );
+    let cfg = parse_yaml(&yaml).unwrap();
     let graph = parse_json_str(JSON_LOG_LONG).unwrap();
     generate_wac(
         HashMap::new(),
@@ -162,17 +189,20 @@ rules:
 
 const CHAIN_FP: &str = "sha256-abc123-fake-fingerprint";
 
+/// Build an injection whose `path` points at the demo's empty-component
+/// fixture — every injection that reaches `validate_contract` must
+/// carry a path.
 fn injection(name: &str) -> Injection {
-    Injection::from_name(name)
+    Injection::from_path(name, demo_mw_path())
 }
 
-fn cache_with_fp(mw: &str, fp: &str) -> HashMap<String, BTreeMap<String, ExportInfo>> {
+fn cache_with_fp(mw: &str, fp: Option<&str>) -> HashMap<String, BTreeMap<String, ExportInfo>> {
     let mut exports = BTreeMap::new();
     exports.insert(
         LOG_IFACE.to_string(),
         ExportInfo {
             source_instance: 0,
-            fingerprint: Some(fp.to_string()),
+            fingerprint: fp.map(str::to_string),
             ty: None,
         },
     );
@@ -183,37 +213,42 @@ fn cache_with_fp(mw: &str, fp: &str) -> HashMap<String, BTreeMap<String, ExportI
 
 // ─── Phase 2 scenario functions ───────────────────────────────────────────
 
-/// 2a: Warn — middleware has no path; discovery returns empty; cannot validate.
-pub fn scenario_2a_warn_no_path() -> Vec<ContractResult> {
-    let mut cache = HashMap::new();
+/// 2a: Error — middleware loads but cviz couldn't fingerprint the
+/// contracted interface on the middleware side. Strict mode flags
+/// this as a contract error.
+pub fn scenario_2a_error_missing_fingerprint() -> Vec<ContractResult> {
+    let mut cache = cache_with_fp("mw", None);
     validate_contract(
         &[injection("mw")],
         LOG_IFACE,
         &Some(CHAIN_FP.to_string()),
         &mut cache,
     )
+    .expect("validate_contract")
 }
 
 /// 2b: Ok — middleware exports the interface with a matching fingerprint.
 pub fn scenario_2b_ok_compatible() -> Vec<ContractResult> {
-    let mut cache = cache_with_fp("mw", CHAIN_FP);
+    let mut cache = cache_with_fp("mw", Some(CHAIN_FP));
     validate_contract(
         &[injection("mw")],
         LOG_IFACE,
         &Some(CHAIN_FP.to_string()),
         &mut cache,
     )
+    .expect("validate_contract")
 }
 
 /// 2c: Error — middleware exports the interface but with an incompatible fingerprint.
 pub fn scenario_2c_error_incompatible() -> Vec<ContractResult> {
-    let mut cache = cache_with_fp("mw", "sha256-zzz999-different-type");
+    let mut cache = cache_with_fp("mw", Some("sha256-zzz999-different-type"));
     validate_contract(
         &[injection("mw")],
         LOG_IFACE,
         &Some(CHAIN_FP.to_string()),
         &mut cache,
     )
+    .expect("validate_contract")
 }
 
 // ─── Phase 3 helpers ─────────────────────────────────────────────────────
@@ -251,7 +286,7 @@ fn run_type_check_full(mw_wat: &str, temp_name: &str) -> Vec<ContractResult> {
     let inj = Injection::from_path("mw", tmp_path.to_str().unwrap());
 
     let mut cache = HashMap::new();
-    validate_contract(&[inj], LOG_IFACE, &chain_fp, &mut cache)
+    validate_contract(&[inj], LOG_IFACE, &chain_fp, &mut cache).expect("validate_contract")
 }
 
 // ─── Phase 3 scenario functions ───────────────────────────────────────────
@@ -315,8 +350,8 @@ fn main() {
     println!();
     println!("  Chain fingerprint: {CHAIN_FP}");
 
-    subheader("2a · Warn — middleware has no path; cannot validate type safety");
-    for r in scenario_2a_warn_no_path() {
+    subheader("2a · Error — middleware loaded but missing a fingerprint for the interface");
+    for r in scenario_2a_error_missing_fingerprint() {
         show_contract_result(&r);
     }
 
@@ -411,12 +446,12 @@ fn test_1c_two_middlewares_between_nodes() {
 }
 
 #[test]
-fn test_2a_produces_warn() {
-    let results = scenario_2a_warn_no_path();
+fn test_2a_produces_error() {
+    let results = scenario_2a_error_missing_fingerprint();
     assert_eq!(results.len(), 1);
     assert!(
-        matches!(results[0], ContractResult::Warn(_)),
-        "expected Warn, got {:?}",
+        matches!(results[0], ContractResult::Error(_)),
+        "expected Error (missing fingerprint), got {:?}",
         results[0]
     );
 }

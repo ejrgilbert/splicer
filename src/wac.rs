@@ -11,7 +11,6 @@ use wasmparser::collections::IndexSet;
 
 /// Package prefix used for WAC instance variables (e.g. `"my:srv-a"`).
 pub const INST_PREFIX: &str = "my";
-const PATH_PLACEHOLDER: &str = "/path/to/comp.wasm";
 
 /// Reserved key splicer publishes into every builtin that imports
 /// `splicer:builtin-config`. The single-underscore prefix marks it as
@@ -517,11 +516,13 @@ impl EmitPlan {
         };
 
         let real_pkg = mdl.name.clone();
-        let mdl_path = mdl
-            .path
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| PATH_PLACEHOLDER.to_string());
+        let mdl_path = mdl.path.as_ref().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "middleware '{}' has no path at WAC emission; splicer bug ({})",
+                mdl.name,
+                crate::contract::ISSUE_URL,
+            )
+        })?;
 
         if let Some(adapter_info) = &mdl.adapter_info {
             let adapter_pkg = format!("{}-adapter-{}", mdl.name, sanitize_wac_id(&interface.name));
@@ -924,7 +925,7 @@ pub fn generate_wac(
         &plan.used_comp_nodes,
         &plan.used_middlewares,
         node_paths,
-    );
+    )?;
 
     Ok(WacOutput {
         wac,
@@ -946,16 +947,19 @@ fn gen_wac_args(
     used_comps: &HashMap<u32, String>,
     used_mdls: &BTreeMap<String, String>,
     node_paths: Option<&HashMap<u32, PathBuf>>,
-) -> BTreeMap<String, PathBuf> {
+) -> anyhow::Result<BTreeMap<String, PathBuf>> {
     let mut deps: BTreeMap<String, PathBuf> = BTreeMap::new();
 
     for (inst_id, name) in used_comps.iter() {
         let comp_path: PathBuf = if let Some(paths) = node_paths {
             // Multi-component mode: use the original wasm path directly.
-            paths
-                .get(inst_id)
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from(PATH_PLACEHOLDER))
+            paths.get(inst_id).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "node {inst_id} ('{name}') has no path in multi-component mode; splicer \
+                     bug ({})",
+                    crate::contract::ISSUE_URL,
+                )
+            })?
         } else {
             // Single-component mode: derive path from the split directory.
             let split_to_use = resolved_split_num(*inst_id, graph, &shim_comps);
@@ -968,7 +972,7 @@ fn gen_wac_args(
         deps.insert(format!("{INST_PREFIX}:{mw_name}"), PathBuf::from(mw_path));
     }
 
-    deps
+    Ok(deps)
 }
 
 /// Pure: follow the shim chain until landing on a non-shim split.
@@ -1316,7 +1320,7 @@ fn add_to_inject_plan(
         interface_name,
         contract_fingerprint,
         &mut accs.checked_middlewares,
-    );
+    )?;
 
     // For tier-1 compatible middleware, generate a adapter component and substitute
     // the injection path so the rest of the WAC generation uses the adapter.
@@ -1552,15 +1556,10 @@ fn preflight_sync_target_async_middleware(
         return Ok(());
     };
     anyhow::bail!(
-        "Cannot splice middleware '{middleware_name}' onto SYNC-WIT target \
-         interface '{target_interface}': the middleware imports '{offender}', \
-         which is `async func` from a peer component. Awaiting a peer-component \
-         async call inside a hook body wedges the wasm task at runtime — splicer's \
-         generated adapter has to lift `{target_interface}` as sync-WIT (matching \
-         the target's contract), and sync-WIT-rooted tasks cannot suspend. \
-         Splice this middleware on an `async func` target interface, or rewrite \
-         the middleware to read its substrate inline (no `.await`). \
-         See docs/TODO/sync-wit-suspend-limit.md.",
+        "cannot splice '{middleware_name}' onto sync-WIT target '{target_interface}': \
+         middleware imports async-peer '{offender}', which would suspend a sync-WIT \
+         task at runtime. Target an `async func` interface, or drop the `.await` \
+         from the middleware.",
     );
 }
 
@@ -2050,16 +2049,16 @@ mod tests {
         // something for `generate_wac` to terminate normally.
         graph.add_export("test:demo/outer".to_string(), 2, None);
 
-        // `path: None` so contract validation degrades to a Warn and
-        // the chain pass uses the simple `create_mdl` path (no fs /
-        // adapter generation).
+        // Point the middleware at the shared empty-component fixture
+        // so contract validation reads real bytes and falls through to
+        // a Warn (the empty component doesn't export `test:demo/inner`).
         let rules = vec![SpliceRule::before(
             "test:demo/inner",
             Some("inner"),
             None,
             vec![Injection {
                 name: "mw".to_string(),
-                path: None,
+                path: Some(crate::tests::test_mw_path().to_string()),
                 builtin: None,
                 builtin_config: Default::default(),
                 config_as_wave: None,
@@ -2111,7 +2110,7 @@ mod tests {
     /// flows downstream unchanged. The YAML list form is the same.
     #[test]
     fn globbed_interface_yields_same_wac_as_exact() {
-        use crate::parse::config::parse_yaml;
+        use crate::tests::parse_test_yaml;
         const IFACE: &str = "wasi:http/handler@0.3.0";
 
         // node-0 -> node-1 -> node-2 chain over IFACE, plus a top-level
@@ -2120,7 +2119,7 @@ mod tests {
             let mut graph =
                 synth_graph(3, &[(1, IFACE, Some(0), false), (2, IFACE, Some(1), false)]);
             graph.add_export("my:app/run@1.0.0".to_string(), 2, None);
-            let rules = parse_yaml(yaml).expect("config parses");
+            let rules = parse_test_yaml(yaml).expect("config parses");
             generate_wac(
                 HashMap::new(),
                 "/tmp/splicer-glob-splits",
@@ -2141,6 +2140,7 @@ rules:
       interface: wasi:http/handler@0.3.0
     inject:
       - name: mw
+        path: {{MW_PATH}}
 "#,
         );
         // Sanity: the rule actually injected something.
@@ -2157,6 +2157,7 @@ rules:
       interface: "wasi:*"
     inject:
       - name: mw
+        path: {{MW_PATH}}
 "#,
         );
         assert_eq!(globbed, exact, "single-glob must equal exact WAC");
@@ -2169,6 +2170,7 @@ rules:
       interface: ["nope:*", "wasi:http/*"]
     inject:
       - name: mw
+        path: {{MW_PATH}}
 "#,
         );
         assert_eq!(
@@ -2197,6 +2199,7 @@ rules:
         results: concrete
     inject:
       - name: mw
+        path: {{MW_PATH}}
 "#;
 
     /// An instance interface with one function returning a single value.
@@ -2245,7 +2248,7 @@ rules:
     }
 
     fn generate(graph: &CompositionGraph, yaml: &str) -> anyhow::Result<WacOutput> {
-        let rules = crate::parse::config::parse_yaml(yaml).expect("config parses");
+        let rules = crate::tests::parse_test_yaml(yaml).expect("config parses");
         generate_wac(
             HashMap::new(),
             "/tmp/splicer-allfuncs-splits",

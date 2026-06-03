@@ -198,20 +198,13 @@ exclusive:
 ```yaml
 inject:
   - name: tracing
-    path: ./tracing.wasm    # recommended to always pass this, see below
+    path: ./tracing.wasm
 ```
 
-| Field  | Type   | Required             | Description                                                                                 |
-|--------|--------|----------------------|---------------------------------------------------------------------------------------------|
-| `name` | string | ✅                    | WAC variable name; must be globally unique across rules.                                    |
-| `path` | string | strongly recommended | Path to a `.wasm` (tier-1/2) **or** a tier-3/4 strategy crate directory (see [tier-3][t3]). |
-
-**Always pass `path`.** Splicer loads the bytes to verify the
-middleware's type signature is compatible with the target interface
-before composing. If you omit `path`, the type check is downgraded to
-a warning (no bytes to fingerprint) and the WAC carries a
-`/path/to/comp.wasm` placeholder you'd have to substitute by hand
-before any external `wac compose` run could resolve it.
+| Field  | Type   | Required | Description                                                                                 |
+|--------|--------|----------|---------------------------------------------------------------------------------------------|
+| `name` | string | ✅        | WAC variable name; must be globally unique across rules.                                    |
+| `path` | string | ✅        | Path to a `.wasm` (tier-1/2) **or** a tier-3/4 strategy crate directory (see [tier-3][t3]). |
 
 Splicer distinguishes the two `path` shapes at materialize time: a
 `.wasm` file flows through the existing tier-1/2 pipeline; a directory
