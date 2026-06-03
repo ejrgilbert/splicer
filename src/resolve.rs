@@ -23,7 +23,8 @@ pub fn resolve_rules(
 ) -> anyhow::Result<Vec<SpliceRule>> {
     let (skeletons, _) = crate::wac::build_chain_skeletons(graph);
     let mut out: Vec<SpliceRule> = Vec::with_capacity(rules.len());
-    for rule in rules {
+    for (idx, rule) in rules.into_iter().enumerate() {
+        let rule_num = idx + 1;
         match rule {
             SpliceRule::OnNode {
                 name,
@@ -42,6 +43,7 @@ pub fn resolve_rules(
                 all_funcs,
                 inject,
             } => {
+                check_subgraph_nodes_exist(rule_num, &nodes, graph)?;
                 expand_subgraph(
                     graph,
                     &skeletons,
@@ -59,6 +61,28 @@ pub fn resolve_rules(
         }
     }
     Ok(out)
+}
+
+/// Bail if any of the subgraph's named nodes doesn't exist in the
+/// composition, surface missing as a config error before any expansion runs.
+fn check_subgraph_nodes_exist(
+    rule_num: usize,
+    nodes: &[String],
+    graph: &CompositionGraph,
+) -> anyhow::Result<()> {
+    let present: BTreeSet<&str> = graph.nodes.values().map(|n| n.display_label()).collect();
+    let missing: Vec<&str> = nodes
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !present.contains(*n))
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "rule {rule_num} (on_subgraph): node(s) not present in the composition: [{}]",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Expand `OnNode` into one or two `Before`/`Between` rules. Inbound =
