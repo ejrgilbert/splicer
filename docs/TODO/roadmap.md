@@ -45,24 +45,30 @@ Substrate foundation items:
 
 ### Stream C — subgraph selection (~1-1.5 weeks)
 
-Multi-edge doc step 6:
-- [ ] YAML grammar: `between_subgraph`, `on_node`, `on_interface` selectors
-- [ ] Parse-time expansion to per-edge rules
-- [ ] Composition graph walk (reuses splicer's existing wac graph)
-- [ ] Filter blocks (narrow by interface name or explicit edge_id list)
+Multi-edge doc steps 4-5:
+- [ ] YAML grammar: `on_node`, `between_subgraph` selectors
+- [ ] `on_node` desugars at parse time to `before` / `between` rules
+  with the named node as the inner or outer constraint (no graph
+  needed — the existing chain walk already finds matching edges).
+- [ ] `between_subgraph` resolves against the composition graph
+  (boundary = "exactly one endpoint in the set"; globs can't express
+  set negation, so this step needs the graph).
+- [ ] Filter blocks (narrow by interface glob).
 
-### Coordination
-
-`edge_id` derivation is shared between Stream A and Stream C. Place it
-once (e.g. `src/edge_id.rs`), both streams consume it. Canonical format
-is already specced in the multi-edge doc; no design negotiation needed.
+`on_edge` and `on_interface` were earlier candidates but offered no
+expressive delta — `on_edge` is a fully-specified `between`, and
+`on_interface` is `before`/`between` with no node constraint. The
+recorder's `edge_id` stays a purely internal addressing scheme (filename
+key + auto-injected config substrate); it never appears in user YAML.
 
 ## Phase 2: smoke + first builtins + UX (1-2 weeks)
 
 - [ ] `fuzz-input` builtin (drives `Args: Arbitrary` + `wit-bindgen additional_derives`)
 - [ ] `redact-strings` builtin (drives `TypedVisit` derive + type-predicate matcher)
-- [ ] Multi-edge step 4: `on_edge: <id>` literal selector
-- [ ] Multi-edge step 5: `splicer edges <composition>` CLI
+- [ ] `splicer edges <composition>` CLI — optional discovery aid that
+  lists each composition edge with its canonical id and the equivalent
+  `between` block. Not a primitive; just helps operators read recorder
+  output and write matching replay rules.
 - [x] **User-form tier-3/4 middleware.** YAML `name:` + `path:` to a strategy
   crate directory (Cargo.toml + manifest.toml) flows through the same codegen
   pipeline as builtins. See [`docs/tiers/tier-3.md`](../tiers/tier-3.md#referencing-your-strategy-from-a-splice-config).
@@ -78,8 +84,8 @@ is already specced in the multi-edge doc; no design negotiation needed.
   `src/adapter/typed/matrix_tests.rs` with sync `func` fixtures so both paths
   are exercised.
 
-Skipped Phase 3 — Phase 1's Stream C already covered `between_subgraph`,
-and Phase 2 picks up the rest.
+Skipped Phase 3 — Phase 1's Stream C already covered `on_node` and
+`between_subgraph`, and Phase 2 picks up the rest.
 
 ## Phase 4: record + replay loop (2-3 weeks)
 

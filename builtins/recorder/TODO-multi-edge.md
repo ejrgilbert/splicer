@@ -35,24 +35,36 @@ Each layer owns exactly one concern. Nothing crosses lanes.
    graph-position context gets the same key for free.
 
 4. **YAML grammar** owns "let the operator describe what to wrap."
-   `on_edge: "<id>"` becomes a first-class selector alongside
-   `between` and `before`. Higher-level selectors (`on_node`,
-   `on_interface`, `between_subgraph`) expand to a set of per-edge
-   rules at parse time, so operators can think in components or
-   subsystems while the runtime primitive stays per-edge. Higher-level
-   selectors accept optional refinement filters (specific interfaces
-   or edge_ids to include/exclude) so the operator can wrap a subset
-   of a unit's edges; default is "all edges in the unit."
+   The existing `before` and `between` already address one specific
+   edge by (interface, provider, caller); the new selectors are
+   structural shorthands that resolve to a set of per-edge rules:
 
-   The selector vocabulary forms a clean generalization:
-
-   - `between` / `on_edge`: one specific edge.
    - `on_node`: every edge touching one node (in a given direction).
-   - `between_subgraph`: every edge crossing the boundary of a set of
-     nodes. A subgraph is a set of nodes plus its internal edges; its
-     boundary is "edges with exactly one endpoint in the set." Internal
-     edges stay untouched and run live during replay, so the subgraph's
-     guts execute for real with recorded boundary inputs.
+     Inbound = node is the provider side (`inner`); outbound = node
+     is the caller side (`outer`); both = the union. Desugars at
+     parse time to one or two `before`/`between` rules with the
+     node name as the inner or outer constraint.
+   - `between_subgraph`: every edge crossing the boundary of a set
+     of nodes. A subgraph is a set of nodes plus its internal edges;
+     its boundary is "edges with exactly one endpoint in the set."
+     Internal edges stay untouched and run live during replay, so
+     the subgraph's guts execute for real with recorded boundary
+     inputs. This one needs the composition graph to resolve (set
+     negation isn't expressible as a glob), so it expands during a
+     graph-aware resolve pass after `parse_yaml`.
+
+   `on_edge: "<id>"` and `on_interface: <name>` were earlier candidates
+   but offered no expressive delta over what `between` / `before` already
+   provide. `on_edge` is a fully-specified `between` with the structure
+   flattened into an opaque string; `on_interface` is `before`/`between`
+   with no node constraint. Neither shipped — `edge_id` stays a purely
+   internal addressing scheme (filename key + auto-injected config
+   substrate), and `on_interface` is just `before: { interface: ... }`.
+
+   Higher-level selectors accept an optional `filter: { interface:
+   <glob> }` block that narrows the set by interface — useful when a
+   subgraph spans many interfaces and the operator only wants to
+   wrap, e.g., the HTTP boundary.
 
    Example YAML for subgraph-level recording:
 
@@ -87,16 +99,19 @@ The round-trip becomes:
 
 ```
 Record phase:  user writes structural rule (between/on_node/...)
-            -> splicer derives edge_id, splices recorder, auto-injects edge_id
+            -> splicer derives edge_id per matched edge, splices recorder
             -> recorder writes recordings/{edge_id}.bin
 
-Replay phase:  user writes on_edge: "<edge_id>" rule
-            -> splicer finds that edge in the composition, splices replayer
-            -> replayer auto-receives the same edge_id, reads recordings/{edge_id}.bin
+Replay phase:  user writes the same structural rule with the replayer
+            -> splicer re-derives the same edge_id deterministically
+            -> replayer auto-receives the edge_id, reads recordings/{edge_id}.bin
 ```
 
-Same identity (`edge_id`) flows in both directions; the SDK never sees
-it.
+`edge_id` derivation is deterministic on (interface, from, to), so the
+record and replay rules don't have to be textually identical — any rule
+that matches the same edge produces the same id. The SDK never sees the
+id directly; it reaches builtins via the auto-injected
+`_splicer_edge_id` config substrate.
 
 ## Canonical edge_id format
 
@@ -117,8 +132,12 @@ Properties this format must hold:
   unrelated nodes, etc. should not change the id.
 - **Unique within a composition.** Two distinct edges never collide.
 - **Public contract.** Once published, the derivation rules can only
-  change with a major version bump because they appear in user YAMLs
-  and recording filenames.
+  change with a major version bump — they appear in recording
+  filenames and in the auto-injected `_splicer_edge_id` builtin
+  config. They do **not** appear in user YAML; the higher-level
+  selectors (`on_node`, `between_subgraph`) and the existing
+  `before` / `between` are the only edge-naming surface operators
+  see.
 
 Recording filenames use a filesystem-sanitized form of the id (`:` and
 `/` and `>` are not portable across all OSes). The recording file's
@@ -135,14 +154,14 @@ logic, or the encode/decode contracts.
 | 1    | Recorder ships as-is (single-edge, single-sink).                                 | **done**            |
 | 2    | Splicer auto-injects `_splicer_edge_id` into every spliced builtin's config.     | **done**            |
 | 3    | Recorder reads `_splicer_edge_id`; file-sink lands; default sink switches to file (one file per edge). Stdout/stderr documented as single-instance-only. | **done**    |
-| 4    | `on_edge: "<id>"` YAML selector. Splicer enumerates composition edges, derives ids, matches against the literal. Error message lists available edges when no match. | not started |
-| 5    | `splicer edges <composition>` CLI subcommand for enumeration. Splicer also logs matched edge_ids during `splice` runs so operators can copy them from output. | not started |
-| 6    | Higher-level selectors (`on_node`, `on_interface`, `between_subgraph`). Expand to multi per-edge rules at parse time. Default is "all edges in the unit"; optional `filter:` block narrows to a subset by interface name or explicit edge_id list. | not started |
-| 7    | Replayer builtin (tier-4 virtualize). Consumes steps 2-6; no new primitives. Subset replay (virtualize some boundary edges, leave the rest live) falls out of step 6's filter block. See [`docs/TODO/tier3-tier4-substrate.md`](../../docs/TODO/tier3-tier4-substrate.md) for the `WrapperStrategy` + codegen template architecture that lands here. | not started |
+| 4    | `on_node: { name, direction }` YAML selector. Desugars at parse time to one or two `before`/`between` rules. Optional `filter: { interface: <glob> }`. | not started |
+| 5    | `between_subgraph: { nodes, direction }` YAML selector. Resolves against the composition graph (boundary = "exactly one endpoint in the set"). Optional `filter: { interface: <glob> }`. | not started |
+| 6    | `splicer edges <composition>` CLI subcommand listing each edge with its canonical id and the equivalent `between` block. Discovery aid for reading recorder output and writing matching replay rules. Splicer also logs matched edge_ids during `splice` runs. | not started |
+| 7    | Replayer builtin (tier-4 virtualize). Consumes steps 2-5; the same structural rule the recorder used (re-derives the matching edge_id). Subset replay (virtualize some boundary edges, leave the rest live) falls out of step 5's filter block. See [`docs/TODO/tier3-tier4-substrate.md`](../../docs/TODO/tier3-tier4-substrate.md) for the `WrapperStrategy` + codegen template architecture that lands here. | not started |
 
 Steps 2 and 3 unlock the recorder for multi-edge use. Steps 4 and 5
-unlock the replayer's user-facing config. Step 6 is pure UX polish on
-top. Step 7 is the actual replay implementation.
+unlock the higher-level selectors that make multi-edge rules ergonomic.
+Step 6 is a discovery aid. Step 7 is the actual replay implementation.
 
 ## Known gaps / future work
 
