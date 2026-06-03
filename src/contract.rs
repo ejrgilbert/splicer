@@ -477,13 +477,8 @@ mod tests {
         // doesn't carry one — error, since splicer can't verify
         // compatibility.
         let mut cache = cache_with("mw", "wasi:http/handler", Some("fp-a"));
-        let results = validate_contract(
-            &[injection("mw")],
-            "wasi:http/handler",
-            &None,
-            &mut cache,
-        )
-        .expect("validate_contract should succeed");
+        let results = validate_contract(&[injection("mw")], "wasi:http/handler", &None, &mut cache)
+            .expect("validate_contract should succeed");
         assert_eq!(results.len(), 1);
         let ContractResult::Error(msg) = &results[0] else {
             panic!("expected Error, got {:?}", results[0]);
@@ -499,13 +494,8 @@ mod tests {
         // Strict mode: even when neither side fingerprints, we error
         // rather than vacuously accepting.
         let mut cache = cache_with("mw", "wasi:http/handler", None);
-        let results = validate_contract(
-            &[injection("mw")],
-            "wasi:http/handler",
-            &None,
-            &mut cache,
-        )
-        .expect("validate_contract should succeed");
+        let results = validate_contract(&[injection("mw")], "wasi:http/handler", &None, &mut cache)
+            .expect("validate_contract should succeed");
         assert!(matches!(results[0], ContractResult::Error(_)));
     }
 
