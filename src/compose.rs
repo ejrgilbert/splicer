@@ -797,7 +797,7 @@ mod tests {
                 builtin_config: Default::default(),
                 config_as_wave: None,
                 config_provider_path: None,
-                path: None,
+                path: Some(crate::tests::test_mw_path().to_string()),
             }],
         )];
 
@@ -863,7 +863,7 @@ mod tests {
         // interfaces. The adapter wasm is read for resource-bearing
         // imports during planning, so each path must point at a real
         // (minimal) component.
-        let mdl_path = "/tmp/tracing.wasm".to_string();
+        let mdl_path = crate::tests::test_mw_path().to_string();
         let write_minimal = |name: &str| -> String {
             let bytes = wat::parse_str("(component)").expect("compile minimal component");
             let path = std::env::temp_dir().join(format!(

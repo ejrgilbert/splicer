@@ -27,15 +27,6 @@ pub struct YamlRule {
     inject: Vec<YamlInjection>,
 }
 
-/// Raw YAML shape of an `inject` entry. Either:
-///
-/// - **user form** — `name: <wac-var>` plus optional `path` to a `.wasm`,
-/// - **builtin form** — `builtin:` set to either a scalar name or a map
-///   with `{ name: <builtin>, alias: <wac-var> }` (and, later,
-///   `config: {...}`).
-///
-/// The two forms are mutually exclusive; validation rejects mixed
-/// shapes. Mapped to [`Injection`] after validation.
 #[derive(Debug, Deserialize)]
 pub struct YamlInjection {
     pub name: Option<String>,
@@ -43,27 +34,13 @@ pub struct YamlInjection {
     pub builtin: Option<BuiltinSpec>,
 }
 
-/// `inject: [{ builtin: ... }]` payload. Two shapes — short scalar
-/// (just the builtin's name) or a long-form map with optional extras
-/// including a `config:` block sealed into the builtin's
-/// `splicer:builtin-config` provider at splice time.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum BuiltinSpec {
-    /// `builtin: hello-tier1`
     Name(String),
-    /// `builtin: { name: hello-tier1, alias: greeter, config: { ... } }`
     Detailed {
-        /// Name of the builtin in the splicer registry.
         name: String,
-        /// Optional override for the WAC variable name. Defaults to
-        /// `name` when omitted.
         alias: Option<String>,
-        /// Sealed into the `splicer:builtin-config` provider at
-        /// splice time. Structure (scalars, sequences, maps) is
-        /// preserved through to `ensure_provider_for`, which
-        /// type-checks against the builtin's declared WIT types and
-        /// re-emits as canonical WAVE text.
         #[serde(default)]
         config: BTreeMap<String, serde_yaml::Value>,
     },
@@ -148,65 +125,35 @@ pub struct YamlProviderOpt {
     alias: Option<String>,
 }
 
-/// Extra information stored on an [`Injection`] when it has been resolved as a
-/// tier-1 adapter by `add_to_inject_plan`. Not present in the YAML config.
+/// Stamped on an [`Injection`] by `add_to_inject_plan` when it resolves
+/// to a tier-1 adapter. Not part of the YAML config.
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AdapterInjectionInfo {
-    /// Path to the generated adapter `.wasm` file.
     pub adapter_path: String,
-    /// Hook interfaces the middleware exports (e.g.
-    /// `"splicer:tier1/before"` or `"splicer:tier2/before"`).
-    /// Unversioned; the version is derived from the package prefix
-    /// at WAC-generation time.
     pub matched_hook_interfaces: Vec<String>,
 }
 
-/// A middleware to inject at a splice point. Constructed from the YAML
-/// config `inject` list or programmatically via [`Injection::from_path`]
-/// / [`Injection::from_name`].
+/// A middleware to inject at a splice point. From the YAML `inject`
+/// list, or programmatically via [`Injection::from_path`].
 #[derive(Clone, Debug, Deserialize)]
 pub struct Injection {
-    /// The middleware's logical name (used as the WAC variable).
+    /// WAC variable name for this injection.
     pub name: String,
-    /// Path to the middleware `.wasm` file on disk. `None` when the
-    /// middleware is referenced by name only (contract checks will
-    /// produce a warning instead of a definitive result).
+    /// Path to the middleware `.wasm` on disk. Required for user-form;
+    /// builtin / tier-3-4 entries start `None` and get stamped during
+    /// materialization.
     pub path: Option<String>,
-    /// Name of a splicer-shipped builtin middleware (see
-    /// [`crate::builtins`]). Set by the YAML parser when an inject
-    /// entry uses `builtin: <name>`. The splice pipeline materializes
-    /// the embedded bytes to disk and populates [`Injection::path`]
-    /// before contract validation runs, so downstream stages don't
-    /// need to know about builtins.
+    /// Splicer-shipped builtin name.
     #[serde(skip)]
     pub builtin: Option<String>,
-    /// YAML `builtin.config:` values, preserved with their structural
-    /// shape so the splice-time validator can type-check against the
-    /// builtin's declared WIT types. The final WAVE-encoded strings
-    /// land in `config_as_wave` after validation runs.
     #[serde(skip)]
     pub builtin_config: BTreeMap<String, toml::Value>,
-    /// WAVE-encoded form of `builtin_config`, populated by
-    /// `validate_config_as_wave` during materialization for builtins
-    /// that import `splicer:builtin-config`. `_splicer_edge_id` is
-    /// added per-edge at provider-build time inside `wac.rs`. `None`
-    /// for builtins that don't consume a config provider.
     #[serde(skip)]
     pub(crate) config_as_wave: Option<BTreeMap<String, String>>,
-    /// Path to the patched config provider wasm for one specific edge.
-    /// Stamped by `build_provider_for_edge` once per chain-walk match,
-    /// on a per-edge clone of the Injection.
     #[serde(skip)]
     pub(crate) config_provider_path: Option<String>,
-    /// Populated at runtime by `add_to_inject_plan` when this injection
-    /// is resolved as a tier-1 adapter. Not part of the YAML config and
-    /// not user-settable — use the `generated_adapters` field on
-    /// [`crate::api::Bundle`] for the structured view of which
-    /// adapters splicer wrote.
     #[serde(skip)]
     pub(crate) adapter_info: Option<AdapterInjectionInfo>,
-    /// Cached builtin tier. Stamped when the splice pipeline resolves
-    /// a builtin so downstream stages don't re-read the manifest.
     #[serde(skip)]
     pub(crate) tier: Option<builtin_protocol::Tier>,
 }
@@ -255,22 +202,6 @@ impl Injection {
         }
     }
 
-    /// Construct an [`Injection`] referencing a middleware by name
-    /// only — useful for the limited subset of contract checks that
-    /// can run without loading the middleware bytes.
-    pub fn from_name(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            path: None,
-            builtin: None,
-            builtin_config: BTreeMap::new(),
-            config_as_wave: None,
-            config_provider_path: None,
-            adapter_info: None,
-            tier: None,
-        }
-    }
-
     /// Construct an [`Injection`] referencing a splicer-shipped builtin
     /// by name. The splice pipeline materializes the embedded bytes
     /// before contract validation runs.
@@ -289,9 +220,6 @@ impl Injection {
     }
 }
 
-/// A validated splice rule, normalized from the YAML config. Matching
-/// is delegated to the compiled [`RuleMatcher`]; the variant only adds
-/// the alias bindings the effect needs for the nodes it matches.
 #[derive(Debug)]
 pub enum SpliceRule {
     /// Inject middleware before a provider on an interface edge.
@@ -332,18 +260,14 @@ impl SpliceRule {
         }
     }
 
-    /// Mutable view of the injection list, for callers that need to
-    /// rewrite entries in place (e.g. resolving builtins to disk
-    /// paths).
+    /// Mutable view of the injection list (used to stamp materialized
+    /// paths on builtin / tier-3-4 entries).
     pub fn inject_mut(&mut self) -> &mut Vec<Injection> {
         match self {
             SpliceRule::Before { inject, .. } | SpliceRule::Between { inject, .. } => inject,
         }
     }
 
-    /// Build a `before` rule directly from exact (single-pattern)
-    /// fields. Test-only convenience; real configs go through
-    /// [`parse_yaml`], which also handles globs and pattern lists.
     #[cfg(test)]
     pub(crate) fn before(
         interface: &str,
@@ -366,12 +290,10 @@ impl SpliceRule {
     }
 }
 
-/// Reject characters that could close out an `import ...;` clause
-/// and inject new WIT declarations when the value is interpolated
-/// into a synthesized adapter world. Permissive enough to admit
-/// fully-qualified use-paths (`pkg:ns/iface@ver`) and glob patterns
-/// (`wasi*`, `wasi:http/*`) alike — finer-grained shape checks
-/// happen downstream.
+/// Reject characters that could close an `import ...;` clause or
+/// inject new WIT declarations when interpolated into a synthesized
+/// adapter world. Permits fully-qualified use-paths and glob patterns;
+/// shape checks happen downstream.
 fn validate_interface_name(rule_num: usize, interface: &str) -> anyhow::Result<()> {
     let safe = |c: char| {
         c.is_ascii_alphanumeric()
@@ -385,9 +307,6 @@ fn validate_interface_name(rule_num: usize, interface: &str) -> anyhow::Result<(
     Ok(())
 }
 
-/// Reject empty node-name patterns. An omitted `name` (the whole
-/// provider block, or just its `name` key) means "match any" and is
-/// fine; an explicit empty string is a misconfig.
 fn check_node_name(
     rule_num: usize,
     field: &str,
@@ -508,7 +427,8 @@ impl ConfigFile {
     /// 2. Each rule specifies exactly one strategy (`before` XOR `between`).
     /// 3. Each rule's `inject` list is non-empty.
     /// 4. Each injection name is non-empty.
-    /// 5. Each injection `path`, when present, is non-empty.
+    /// 5. User-form injections carry a non-empty `path` (builtin form
+    ///    fills it in at splice time).
     /// 6. Interface names are non-empty.
     /// 7. `before` provider `name`, when present, is non-empty.
     /// 8. `between` `inner` and `outer` must name different instances.
@@ -614,9 +534,12 @@ impl ConfigFile {
                     bail!("rule {rule_num}, injection {inj_num}: injection name must not be empty");
                 }
                 if inj.path.as_deref() == Some("") {
+                    bail!("rule {rule_num}, injection {inj_num}: 'path' must not be empty");
+                }
+                if inj.builtin.is_none() && inj.path.is_none() {
                     bail!(
-                        "rule {rule_num}, injection {inj_num}: 'path' must not be empty if \
-                         specified (omit the key to leave it unset)"
+                        "rule {rule_num}, injection {inj_num}: user-form injection requires \
+                         'path' (splicer needs the bytes to fingerprint the middleware)"
                     );
                 }
                 if let Some(spec) = &inj.builtin {
@@ -736,11 +659,7 @@ fn into_splice_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<SpliceRul
     }
 }
 
-/// Map a validated [`YamlInjection`] to the canonical [`Injection`].
-/// `validate()` has already enforced that exactly one form (user vs
-/// builtin) is set with non-empty names. The builtin form's `alias`
-/// (if any) becomes the WAC variable name; otherwise the builtin's
-/// own name is reused.
+/// Assumes [`ConfigFile::validate`] ran.
 fn into_injection(yaml: YamlInjection) -> Injection {
     let YamlInjection {
         name,
@@ -771,22 +690,6 @@ fn into_injection(yaml: YamlInjection) -> Injection {
     }
 }
 
-/// Convert a YAML config map to a TOML-valued map. Splicer carries
-/// the YAML structure forward (scalars, arrays, tables) so
-/// splice-time validation can type-check against the builtin's
-/// manifest-declared WIT types. Canonical WAVE encoding happens
-/// inside `ensure_provider_for`, once the manifest is in hand.
-///
-/// Nulls + YAML tags are still rejected — both flatten ambiguously
-/// and the substrate has no representation for them. The TOML
-/// translation is faithful enough that `toml::Value` distinguishes
-/// integers from floats, which is what the manifest-side validator
-/// needs to disambiguate `1` (u32) from `1.0` (f64).
-///
-/// Index-free by design: callers that want rule/injection context in
-/// the error wrap the result with their own `.map_err(...)`. The
-/// `into_injection` path runs this again after `validate()` already
-/// accepted it and `.expect()`s success.
 fn yaml_config_to_toml(
     values: &BTreeMap<String, serde_yaml::Value>,
 ) -> anyhow::Result<BTreeMap<String, toml::Value>> {
@@ -798,10 +701,6 @@ fn yaml_config_to_toml(
     Ok(out)
 }
 
-/// Recursive YAML → TOML value translation. Diverging types are
-/// surfaced as user-facing errors. Mapping keys must be strings —
-/// YAML allows non-string mapping keys but the substrate's WIT only
-/// understands record/table with string field names.
 fn yaml_to_toml(v: &serde_yaml::Value) -> anyhow::Result<toml::Value> {
     use serde_yaml::Value as Y;
     Ok(match v {
@@ -851,6 +750,7 @@ rules:
         name: srv-b
     inject:
       - name: middleware-a
+        path: ./middleware-a.wasm
 "#;
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
@@ -868,7 +768,7 @@ rules:
         assert!(provider_alias.is_none());
         assert_eq!(inject.len(), 1);
         assert_eq!(inject[0].name, "middleware-a");
-        assert!(inject[0].path.is_none());
+        assert_eq!(inject[0].path.as_deref(), Some("./middleware-a.wasm"));
     }
 
     #[test]
@@ -881,6 +781,7 @@ rules:
       interface: wasi:http/handler@0.3.0
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 1);
@@ -911,6 +812,7 @@ rules:
         name: srv
     inject:
       - name: mw-a
+        path: /tmp/mw-a.wasm
       - name: mw-b
         path: /tmp/mw-b.wasm
 "#;
@@ -943,6 +845,7 @@ rules:
       interface: wasi:http/handler@0.3.0
     inject:
       - name: first
+        path: /tmp/first.wasm
   - between:
       interface: wasi:http/handler@0.3.0
       inner:
@@ -951,6 +854,7 @@ rules:
         name: srv
     inject:
       - name: second
+        path: /tmp/second.wasm
 "#;
         let rules = parse_yaml(yaml).unwrap();
         assert_eq!(rules.len(), 2);
@@ -978,6 +882,7 @@ rules:
         name: srv-b
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let result = parse_yaml(yaml);
         assert!(
@@ -1027,6 +932,7 @@ rules:
         name: b
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "'before' or 'between', not both",
         );
@@ -1040,6 +946,7 @@ version: 1
 rules:
   - inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "either 'before' or 'between'",
         );
@@ -1086,7 +993,24 @@ rules:
       - name: mw
         path: ""
 "#,
-            "'path' must not be empty if specified",
+            "'path' must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_missing_injection_path() {
+        // User-form injection without `path:` is a config error —
+        // splicer needs the bytes on disk to verify type signatures.
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler
+    inject:
+      - name: mw
+"#,
+            "user-form injection requires 'path'",
         );
     }
 
@@ -1100,6 +1024,7 @@ rules:
       interface: ""
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "'interface' must not be empty",
         );
@@ -1116,6 +1041,7 @@ rules:
       interface: "wasi:http/*"
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         parse_yaml(yaml).expect("glob pattern should parse cleanly");
     }
@@ -1130,6 +1056,7 @@ rules:
       interface: ["wasi:*", "my:srv/*"]
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("list form should parse");
         let m = rules[0].matcher();
@@ -1151,6 +1078,7 @@ rules:
         name: auth
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("optional inner should parse");
         let SpliceRule::Between { matcher, .. } = &rules[0] else {
@@ -1172,6 +1100,7 @@ rules:
       interface: "wasi:["
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "invalid glob pattern",
         );
@@ -1192,6 +1121,7 @@ rules:
         name: "mysrv*"
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         parse_yaml(yaml).expect("distinct globbed inner/outer should parse");
     }
@@ -1207,6 +1137,7 @@ rules:
       interface: \"foo;\\nworld evil { import bar/baz; }\\n\"
     inject:
       - name: mw
+        path: ./mw.wasm
 ",
             "disallowed character",
         );
@@ -1223,6 +1154,7 @@ rules:
       interface: \"wasi : http / handler\"
     inject:
       - name: mw
+        path: ./mw.wasm
 ",
             "disallowed character",
         );
@@ -1240,6 +1172,7 @@ rules:
         name: ""
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "'provider' name must not be empty if specified",
         );
@@ -1259,6 +1192,7 @@ rules:
         name: srv
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "'inner' and 'outer' must name different instances",
         );
@@ -1274,10 +1208,12 @@ rules:
       interface: wasi:http/handler
     inject:
       - name: mw-a
+        path: ./mw-a.wasm
   - before:
       interface: wasi:logging/log
     inject:
       - name: mw-a
+        path: ./mw-a.wasm
 "#,
             "injection name 'mw-a' is used in rule 2 but was already declared in rule 1",
         );
@@ -1293,7 +1229,9 @@ rules:
       interface: wasi:http/handler
     inject:
       - name: mw-a
+        path: ./mw-a.wasm
       - name: mw-a
+        path: ./mw-a.wasm
 "#,
             "injection name 'mw-a' is used in rule 1 but was already declared in rule 1",
         );
@@ -1622,6 +1560,7 @@ rules:
         results: [concrete, defaultable]
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("all-funcs should parse");
         let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
@@ -1645,6 +1584,7 @@ rules:
         async: false
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("async:false should parse");
         let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
@@ -1661,6 +1601,7 @@ rules:
       interface: "wasi:*"
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("parse");
         assert!(rules[0].matcher().all_funcs().is_none());
@@ -1678,6 +1619,7 @@ rules:
         results: [concrete, bogus]
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "unknown property 'bogus'",
         );
@@ -1694,6 +1636,7 @@ rules:
       all-funcs: {}
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "'all-funcs' has no constraints",
         );
@@ -1710,12 +1653,14 @@ rules:
         scope: interface
     inject:
       - name: mw
+        path: ./mw.wasm
   - before:
       interface: "*"
       all-funcs:
         scope: [interface, resource]
     inject:
       - name: mw2
+        path: ./mw2.wasm
 "#;
         let rules = parse_yaml(yaml).expect("scope should parse");
         let scalar = rules[0].matcher().all_funcs().expect("all_funcs present");
@@ -1735,6 +1680,7 @@ rules:
         async: true
     inject:
       - name: mw
+        path: ./mw.wasm
 "#;
         let rules = parse_yaml(yaml).expect("parse");
         let pred = rules[0].matcher().all_funcs().expect("all_funcs present");
@@ -1753,6 +1699,7 @@ rules:
         scope: bogus
     inject:
       - name: mw
+        path: ./mw.wasm
 "#,
             "unknown value 'bogus'",
         );
