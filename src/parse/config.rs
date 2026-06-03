@@ -24,6 +24,7 @@ pub struct ConfigFile {
 pub struct YamlRule {
     before: Option<YamlStrategyBefore>,
     between: Option<YamlStrategyBetween>,
+    on_node: Option<YamlStrategyOnNode>,
     inject: Vec<YamlInjection>,
 }
 
@@ -109,7 +110,42 @@ pub struct YamlStrategyBetween {
     all_funcs: Option<YamlFuncPred>,
 }
 
+/// `on_node` selector: every edge touching the named node in a given
+/// direction. Desugars at parse time to one or two `before`/`between`
+/// `SpliceRule`s; never reaches downstream code as its own variant.
 #[derive(Debug, Deserialize)]
+pub struct YamlStrategyOnNode {
+    name: String,
+    #[serde(default)]
+    direction: Direction,
+    alias: Option<String>,
+    filter: Option<YamlSelectorFilter>,
+    #[serde(rename = "all-funcs")]
+    all_funcs: Option<YamlFuncPred>,
+}
+
+/// Refinement filters shared across higher-level selectors. Today only
+/// `interface:` is supported; future filters (e.g. explicit edge_id
+/// list, scope qualifiers) join here.
+#[derive(Debug, Deserialize)]
+pub struct YamlSelectorFilter {
+    interface: Option<OneOrMany<String>>,
+}
+
+/// Which side of the edge the named node sits on.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    /// Node is the provider (exporter) side.
+    Inbound,
+    /// Node is the caller (importer) side.
+    Outbound,
+    /// Union: splicer wraps every edge touching the node.
+    #[default]
+    Both,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct YamlFuncPred {
     #[serde(rename = "async")]
     is_async: Option<bool>,
@@ -118,7 +154,7 @@ pub struct YamlFuncPred {
     results: Option<OneOrMany<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct YamlProviderOpt {
     name: Option<OneOrMany<String>>,
     // Alias the matched provider to this name in the generated wac
@@ -307,6 +343,17 @@ fn validate_interface_name(rule_num: usize, interface: &str) -> anyhow::Result<(
     Ok(())
 }
 
+fn validate_interface_field(rule_num: usize, iface: &OneOrMany<String>) -> anyhow::Result<()> {
+    let pats = iface.as_slice();
+    if pats.is_empty() || pats.iter().any(|a| a.is_empty()) {
+        bail!("rule {rule_num}: 'interface' must not be empty");
+    }
+    for pat in pats {
+        validate_interface_name(rule_num, pat)?;
+    }
+    Ok(())
+}
+
 fn check_node_name(
     rule_num: usize,
     field: &str,
@@ -448,35 +495,47 @@ impl ConfigFile {
         for (i, rule) in self.rules.iter().enumerate() {
             let rule_num = i + 1;
 
-            // Strategy must be exactly one of before/between.
-            match (&rule.before, &rule.between) {
-                (Some(_), Some(_)) => {
-                    bail!("rule {rule_num}: a rule may specify 'before' or 'between', not both")
-                }
-                (None, None) => {
-                    bail!("rule {rule_num}: a rule must specify either 'before' or 'between'")
-                }
-                _ => {}
+            // Strategy must be exactly one of before/between/on_node.
+            let strategy_count = [
+                rule.before.is_some(),
+                rule.between.is_some(),
+                rule.on_node.is_some(),
+            ]
+            .iter()
+            .filter(|x| **x)
+            .count();
+            match strategy_count {
+                0 => bail!(
+                    "rule {rule_num}: a rule must specify one of 'before', 'between', or 'on_node'"
+                ),
+                1 => {}
+                _ => bail!(
+                    "rule {rule_num}: a rule may specify only one of 'before', 'between', or 'on_node'"
+                ),
             }
 
             // Interface pattern(s) must be non-empty and contain only
             // characters that are safe to interpolate into a
             // synthesized WIT `import ...;` clause. Permits both
             // fully-qualified use-paths and glob patterns. A scalar is
-            // one pattern; a list is several (OR-combined).
-            let interface = if let Some(b) = &rule.before {
-                &b.interface
-            } else if let Some(bw) = &rule.between {
-                &bw.interface
-            } else {
-                unreachable!()
-            };
-            let interface_pats = interface.as_slice();
-            if interface_pats.is_empty() || interface_pats.iter().any(|a| a.is_empty()) {
-                bail!("rule {rule_num}: 'interface' must not be empty");
+            // one pattern; a list is several (OR-combined). For
+            // `on_node`, the interface lives in the optional `filter:`
+            // block (default "*" means "any interface").
+            if let Some(b) = &rule.before {
+                validate_interface_field(rule_num, &b.interface)?;
             }
-            for pat in interface_pats {
-                validate_interface_name(rule_num, pat)?;
+            if let Some(bw) = &rule.between {
+                validate_interface_field(rule_num, &bw.interface)?;
+            }
+            if let Some(on) = &rule.on_node {
+                if on.name.is_empty() {
+                    bail!("rule {rule_num} (on_node): 'name' must not be empty");
+                }
+                if let Some(filter) = &on.filter {
+                    if let Some(iface) = &filter.interface {
+                        validate_interface_field(rule_num, iface)?;
+                    }
+                }
             }
 
             // before-specific checks.
@@ -591,72 +650,146 @@ impl ConfigFile {
     /// compiling each rule's patterns into a [`RuleMatcher`]. A bad glob
     /// surfaces here as a config error, before any generation.
     ///
+    /// Higher-level selectors (`on_node`) fan out to multiple per-edge
+    /// rules here, so one YAML rule may produce >1 `SpliceRule`.
     /// Assumes [`ConfigFile::validate`] has already been called.
     pub fn into_splice_rules(self) -> anyhow::Result<Vec<SpliceRule>> {
         self.rules
             .into_iter()
             .enumerate()
-            .map(|(i, rule)| into_splice_rule(i + 1, rule))
-            .collect()
+            .map(|(i, rule)| desugar_rule(i + 1, rule))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map(|nested| nested.into_iter().flatten().collect())
     }
 }
 
-/// Compile one validated YAML rule into a normalized [`SpliceRule`].
-/// Omitted node-name fields produce no constraint, i.e. "match any".
-fn into_splice_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<SpliceRule> {
+/// Compile one validated YAML rule into one or more normalized
+/// [`SpliceRule`]s. `before`/`between` produce one each; `on_node`
+/// fans out to one or two depending on `direction`.
+fn desugar_rule(rule_num: usize, rule: YamlRule) -> anyhow::Result<Vec<SpliceRule>> {
     let YamlRule {
         before,
         between,
+        on_node,
         inject,
     } = rule;
     let inject: Vec<Injection> = inject.into_iter().map(into_injection).collect();
 
-    if let Some(YamlStrategyBefore {
+    if let Some(b) = before {
+        Ok(vec![compile_before(rule_num, b, inject)?])
+    } else if let Some(b) = between {
+        Ok(vec![compile_between(rule_num, b, inject)?])
+    } else if let Some(on) = on_node {
+        compile_on_node(rule_num, on, inject)
+    } else {
+        unreachable!("validate() guarantees exactly one strategy per rule")
+    }
+}
+
+fn compile_before(
+    rule_num: usize,
+    spec: YamlStrategyBefore,
+    inject: Vec<Injection>,
+) -> anyhow::Result<SpliceRule> {
+    let YamlStrategyBefore {
         interface,
         provider,
         all_funcs,
-    }) = before
-    {
-        let interface = compile_pattern(rule_num, "interface", interface)?;
-        let all_funcs = compile_func_pred(rule_num, all_funcs)?;
-        let provider_alias = provider.as_ref().and_then(|p| p.alias.clone());
-        let constraints = node_name_pattern(rule_num, "provider", provider)?
-            .map(Constraint::Provider)
-            .into_iter()
-            .collect();
-        Ok(SpliceRule::Before {
-            matcher: RuleMatcher::new(SiteKind::Before, interface, all_funcs, constraints),
-            provider_alias,
-            inject,
-        })
-    } else if let Some(YamlStrategyBetween {
+    } = spec;
+    let interface = compile_pattern(rule_num, "interface", interface)?;
+    let all_funcs = compile_func_pred(rule_num, all_funcs)?;
+    let provider_alias = provider.as_ref().and_then(|p| p.alias.clone());
+    let constraints = node_name_pattern(rule_num, "provider", provider)?
+        .map(Constraint::Provider)
+        .into_iter()
+        .collect();
+    Ok(SpliceRule::Before {
+        matcher: RuleMatcher::new(SiteKind::Before, interface, all_funcs, constraints),
+        provider_alias,
+        inject,
+    })
+}
+
+fn compile_between(
+    rule_num: usize,
+    spec: YamlStrategyBetween,
+    inject: Vec<Injection>,
+) -> anyhow::Result<SpliceRule> {
+    let YamlStrategyBetween {
         interface,
         inner,
         outer,
         all_funcs,
-    }) = between
-    {
-        let interface = compile_pattern(rule_num, "interface", interface)?;
-        let all_funcs = compile_func_pred(rule_num, all_funcs)?;
-        let inner_alias = inner.as_ref().and_then(|p| p.alias.clone());
-        let outer_alias = outer.as_ref().and_then(|p| p.alias.clone());
-        // `inner` is provider-side, `outer` is caller-side.
-        let constraints = [
-            node_name_pattern(rule_num, "inner", inner)?.map(Constraint::Provider),
-            node_name_pattern(rule_num, "outer", outer)?.map(Constraint::Caller),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        Ok(SpliceRule::Between {
-            matcher: RuleMatcher::new(SiteKind::Between, interface, all_funcs, constraints),
-            inner_alias,
-            outer_alias,
-            inject,
-        })
-    } else {
-        unreachable!("validate() guarantees exactly one strategy per rule")
+    } = spec;
+    let interface = compile_pattern(rule_num, "interface", interface)?;
+    let all_funcs = compile_func_pred(rule_num, all_funcs)?;
+    let inner_alias = inner.as_ref().and_then(|p| p.alias.clone());
+    let outer_alias = outer.as_ref().and_then(|p| p.alias.clone());
+    let constraints = [
+        node_name_pattern(rule_num, "inner", inner)?.map(Constraint::Provider),
+        node_name_pattern(rule_num, "outer", outer)?.map(Constraint::Caller),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Ok(SpliceRule::Between {
+        matcher: RuleMatcher::new(SiteKind::Between, interface, all_funcs, constraints),
+        inner_alias,
+        outer_alias,
+        inject,
+    })
+}
+
+/// Desugar `on_node` into per-direction rules by synthesizing the
+/// equivalent `before`/`between` YAML shapes and delegating. Inbound =
+/// X is the provider; uses `Before` so the chain-boundary position
+/// (X exposed as a top-level export) is included alongside internal
+/// positions. Outbound = X is the caller; uses `Between`.
+fn compile_on_node(
+    rule_num: usize,
+    spec: YamlStrategyOnNode,
+    inject: Vec<Injection>,
+) -> anyhow::Result<Vec<SpliceRule>> {
+    let YamlStrategyOnNode {
+        name,
+        direction,
+        alias,
+        filter,
+        all_funcs,
+    } = spec;
+    let interface = filter
+        .and_then(|f| f.interface)
+        .unwrap_or_else(|| OneOrMany::One("*".to_string()));
+    let node = YamlProviderOpt {
+        name: Some(OneOrMany::One(name)),
+        alias,
+    };
+
+    let mut rules = Vec::with_capacity(2);
+    if matches!(direction, Direction::Inbound | Direction::Both) {
+        rules.push(compile_before(
+            rule_num,
+            YamlStrategyBefore {
+                interface: interface.clone(),
+                provider: Some(node.clone()),
+                all_funcs: all_funcs.clone(),
+            },
+            inject.clone(),
+        )?);
     }
+    if matches!(direction, Direction::Outbound | Direction::Both) {
+        rules.push(compile_between(
+            rule_num,
+            YamlStrategyBetween {
+                interface,
+                inner: None,
+                outer: Some(node),
+                all_funcs,
+            },
+            inject,
+        )?);
+    }
+    Ok(rules)
 }
 
 /// Assumes [`ConfigFile::validate`] ran.
@@ -934,7 +1067,7 @@ rules:
       - name: mw
         path: ./mw.wasm
 "#,
-            "'before' or 'between', not both",
+            "only one of 'before', 'between', or 'on_node'",
         );
     }
 
@@ -948,7 +1081,7 @@ rules:
       - name: mw
         path: ./mw.wasm
 "#,
-            "either 'before' or 'between'",
+            "must specify one of 'before', 'between', or 'on_node'",
         );
     }
 
@@ -1702,6 +1835,254 @@ rules:
         path: ./mw.wasm
 "#,
             "unknown value 'bogus'",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // on_node selector
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_on_node_default_direction_fans_out_to_two_rules() {
+        // `direction:` omitted ⇒ Both ⇒ one Before (inbound, X as provider)
+        // and one Between (outbound, X as outer).
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("on_node should parse");
+        assert_eq!(rules.len(), 2, "Both ⇒ inbound + outbound");
+        let SpliceRule::Before { matcher: m_in, .. } = &rules[0] else {
+            panic!("first rule should be Before (inbound)");
+        };
+        assert_eq!(m_in.interface_raw(), ["*"]);
+        assert_eq!(m_in.provider_raw(), Some(&["srv-b".to_string()][..]));
+        let SpliceRule::Between {
+            matcher: m_out, ..
+        } = &rules[1]
+        else {
+            panic!("second rule should be Between (outbound)");
+        };
+        assert_eq!(m_out.interface_raw(), ["*"]);
+        assert_eq!(m_out.caller_raw(), Some(&["srv-b".to_string()][..]));
+        assert!(m_out.provider_raw().is_none());
+    }
+
+    #[test]
+    fn parse_on_node_inbound_single_before_rule() {
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+      direction: inbound
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("inbound should parse");
+        assert_eq!(rules.len(), 1);
+        let SpliceRule::Before { matcher, .. } = &rules[0] else {
+            panic!("inbound desugars to Before");
+        };
+        assert_eq!(matcher.provider_raw(), Some(&["srv-b".to_string()][..]));
+    }
+
+    #[test]
+    fn parse_on_node_outbound_single_between_rule() {
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+      direction: outbound
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("outbound should parse");
+        assert_eq!(rules.len(), 1);
+        let SpliceRule::Between { matcher, .. } = &rules[0] else {
+            panic!("outbound desugars to Between");
+        };
+        assert_eq!(matcher.caller_raw(), Some(&["srv-b".to_string()][..]));
+        assert!(matcher.provider_raw().is_none());
+    }
+
+    #[test]
+    fn parse_on_node_filter_narrows_interface() {
+        // `filter.interface` becomes the desugared rule's interface
+        // pattern (otherwise default "*").
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+      direction: inbound
+      filter:
+        interface: "wasi:*"
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("filter should parse");
+        let SpliceRule::Before { matcher, .. } = &rules[0] else {
+            panic!("inbound desugars to Before");
+        };
+        assert_eq!(matcher.interface_raw(), ["wasi:*"]);
+        assert!(matcher.interface_matches("wasi:http/handler@0.3.0"));
+        assert!(!matcher.interface_matches("my:srv/api@1.0.0"));
+    }
+
+    #[test]
+    fn parse_on_node_name_accepts_glob() {
+        // Node-name globs already work for before/between; on_node
+        // inherits the behavior via the same compile path.
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: "srv-*"
+      direction: inbound
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("glob name should parse");
+        let SpliceRule::Before { matcher, .. } = &rules[0] else {
+            panic!("inbound desugars to Before");
+        };
+        assert_eq!(matcher.provider_raw(), Some(&["srv-*".to_string()][..]));
+    }
+
+    #[test]
+    fn validate_on_node_empty_name_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - on_node:
+      name: ""
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#,
+            "(on_node): 'name' must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_on_node_unknown_direction_rejected() {
+        // serde catches the bad keyword at deserialize time.
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+      direction: sideways
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        assert!(parse_yaml(yaml).is_err(), "bogus direction should error");
+    }
+
+    #[test]
+    fn validate_on_node_with_before_rejected() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: "*"
+    on_node:
+      name: srv-b
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#,
+            "only one of 'before', 'between', or 'on_node'",
+        );
+    }
+
+    #[test]
+    fn parse_on_node_alias_propagates_to_both_directions() {
+        // alias becomes `provider_alias` on the inbound Before AND
+        // `outer_alias` on the outbound Between, so the rename is
+        // consistent across both desugared rules.
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+      alias: renamed-b
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("alias should parse");
+        assert_eq!(rules.len(), 2);
+        let SpliceRule::Before { provider_alias, .. } = &rules[0] else {
+            panic!("first rule should be Before");
+        };
+        assert_eq!(provider_alias.as_deref(), Some("renamed-b"));
+        let SpliceRule::Between {
+            inner_alias,
+            outer_alias,
+            ..
+        } = &rules[1]
+        else {
+            panic!("second rule should be Between");
+        };
+        assert!(inner_alias.is_none(), "inner is the unknown side");
+        assert_eq!(outer_alias.as_deref(), Some("renamed-b"));
+    }
+
+    #[test]
+    fn parse_on_node_all_funcs_gates_both_directions() {
+        // all-funcs is interface-scoped; both desugared rules carry it
+        // so the predicate fires uniformly regardless of direction.
+        let yaml = r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+      all-funcs:
+        async: true
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#;
+        let rules = parse_yaml(yaml).expect("all-funcs should parse");
+        assert_eq!(rules.len(), 2);
+        let pred_in = rules[0].matcher().all_funcs().expect("inbound predicate");
+        assert_eq!(pred_in.is_async, Some(true));
+        let pred_out = rules[1].matcher().all_funcs().expect("outbound predicate");
+        assert_eq!(pred_out.is_async, Some(true));
+    }
+
+    #[test]
+    fn validate_on_node_bad_filter_glob() {
+        // `[` is in the char-safety allowlist but doesn't compile as a
+        // glob; the per-pattern glob compile catches it.
+        assert_err(
+            r#"
+version: 1
+rules:
+  - on_node:
+      name: srv-b
+      filter:
+        interface: "wasi:["
+    inject:
+      - name: mw
+        path: ./mw.wasm
+"#,
+            "invalid glob pattern",
         );
     }
 }

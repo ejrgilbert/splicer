@@ -55,7 +55,7 @@ rules:
 version: 1
 
 rules:
-- before | between:
+- before | between | on_node:
     ...
   inject:
     ...
@@ -63,10 +63,10 @@ rules:
 
 ## Fields
 
-| Field                 | Type         | Required | Description                                                                     |
-|-----------------------|--------------|----------|---------------------------------------------------------------------------------|
-| `before` OR `between` | object       | ✅        | The matching strategy of the rule. See [Before](#before) / [Between](#between). |
-| `inject`              | list<object> | ✅        | The middleware(s) to inject at the match site. See [Inject](#inject).           |
+| Field                              | Type         | Required | Description                                                                                           |
+|------------------------------------|--------------|----------|-------------------------------------------------------------------------------------------------------|
+| `before` OR `between` OR `on_node` | object       | ✅        | The matching strategy of the rule. See [Before](#before) / [Between](#between) / [On_Node](#on_node). |
+| `inject`                           | list<object> | ✅        | The middleware(s) to inject at the match site. See [Inject](#inject).                                 |
 
 ---
 
@@ -167,20 +167,72 @@ splices every edge in the composition; that's allowed, just deliberate.
 
 ---
 
+# On_Node
+
+```yaml
+version: 1
+
+rules:
+  - on_node:
+      name: srv-b
+      direction: both       # defaults to `both`
+      filter:
+        interface: "wasi:*"
+    inject:
+      ...
+```
+
+The `on_node` field is shorthand for "wrap every edge touching one
+node." At parse time splicer expands it into one or two
+`before`/`between` rules.
+
+Example effect with `direction: both` on node _b_:
+
+```
+a → b → c
+```
+
+Becomes:
+
+```
+a → M → b → M → c
+```
+
+`direction` picks which sides of `name`'s edges to match, and is the
+mechanism behind the desugaring:
+
+| `direction` | Edges matched                                | Desugars to                                |
+|-------------|----------------------------------------------|--------------------------------------------|
+| `inbound`   | calls _into_ the node (node is the provider) | `before { interface, provider: { name } }` |
+| `outbound`  | calls _from_ the node (node is the caller)   | `between { interface, outer: { name } }`   |
+| `both`      | union of inbound + outbound                  | one of each above                          |
+
+## Fields
+
+| Field              | Type                            | Required | Description                                                                                                                                                                  |
+|--------------------|---------------------------------|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `name`             | pattern                         | ✅        | The node whose edges to wrap (glob; see [Pattern matching](#pattern-matching-globs--lists)).                                                                                 |
+| `direction`        | `inbound` / `outbound` / `both` | ❌        | Which sides of `name`'s edges to match. Defaults to `both`.                                                                                                                  |
+| `alias`            | string                          | ❌        | Rename the matched node in the generated WAC. Propagates to both desugared rules so the rename is consistent.                                                                |
+| `filter.interface` | pattern or list (OR)            | ❌        | Narrow the matched edges to specific interface(s). Defaults to `*` (every interface).                                                                                        |
+| `all-funcs`        | object                          | ❌        | Gate the match on the matched interface's function shapes — see [Function-shape matching](#function-shape-matching-all-funcs). Applies uniformly to both desugared rules.    |
+
+---
+
 # Inject
 
 ```yaml
 version: 1
 
 rules:
-  - before | between:
+  - before | between | on_node:
     ...
     inject:
       - middleware-a
       - middleware-b
 ```
 
-The middleware(s) to inject at the specified match location (`before` or `between` some interface function invocation).
+The middleware(s) to inject at the match site identified by the rule's strategy (`before`, `between`, or `on_node`).
 The order of the middleware in this list will follow the order of invocation on the chain.
 
 For example, the above `yaml` will produce the following chain if matching between A and B (middleware-a gets invoked first):
@@ -258,8 +310,10 @@ technical details.
 # Pattern matching (globs + lists)
 
 The `interface` field and every node-name field (`provider`, `inner`,
-`outer`) are **glob patterns**, and each accepts either a single pattern
-(scalar) or a **list** of patterns (`OR` semantic, matches if any one matches):
+`outer`, `on_node.name`) are **glob patterns**. The `interface` and
+node-name fields on `before` / `between` accept either a single pattern
+(scalar) or a **list** of patterns (`OR` semantic, matches if any one
+matches); `on_node.name` is a single pattern:
 
 ```yaml
 interface: "wasi:*"                 # one glob
