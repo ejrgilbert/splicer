@@ -1,10 +1,3 @@
-//! `splicer preview` — visualize which edges each rule would touch,
-//! without performing the splice.
-//!
-//! Feeds the matched sites into a [`cviz::Highlights`] keyed by canonical
-//! edge id, tagged with the rule's index + a one-line description.  The
-//! caller renders the result through any cviz output (ASCII, Mermaid).
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -17,33 +10,20 @@ use crate::parse::config::{parse_yaml, SpliceRule};
 use crate::select::{FuncPred, FuncScope, ValueProperty};
 use crate::wac::build_chain_skeletons;
 
-/// Inputs to [`preview`].
 #[derive(Debug, Clone)]
 pub struct PreviewRequest {
-    /// Path to the composed Wasm component to inspect.
     pub composition_wasm: PathBuf,
-    /// Splice rules in YAML format.
     pub rules_yaml: String,
-    /// When `Some(n)`, only rule #n (1-based) contributes highlights.
+    /// Only renders specified rule's targets
     pub only_rule: Option<usize>,
 }
 
-/// Output of [`preview`].
 pub struct PreviewOutput {
-    /// The parsed composition graph, ready to feed to a cviz renderer.
     pub graph: CompositionGraph,
-    /// Per-edge highlights; tag id = 1-based rule index, tag ctx = the
-    /// rendered rule description.
     pub highlights: Highlights,
-    /// 1-based indices of rules that selected no sites.  Filtered to
-    /// only rules that actually ran (so `--rule N` only ever reports
-    /// rule N here, if at all).
     pub unmatched_rules: Vec<usize>,
 }
 
-/// Plan which edges each rule in `req.rules_yaml` would touch on
-/// `req.composition_wasm` and return them as a [`Highlights`] map.
-/// Does not mutate anything on disk.
 pub fn preview(req: PreviewRequest) -> Result<PreviewOutput> {
     let PreviewRequest {
         composition_wasm,
@@ -66,10 +46,6 @@ pub fn preview(req: PreviewRequest) -> Result<PreviewOutput> {
     preview_with_graph(graph, &rules_yaml, only_rule)
 }
 
-/// Lower-level [`preview`] variant that consumes a pre-parsed
-/// [`CompositionGraph`]. Useful for callers that already have a graph
-/// in hand (e.g. they parsed it through cviz directly) and want to
-/// skip the bytes-from-disk step. Also the integration-test seam.
 pub fn preview_with_graph(
     graph: CompositionGraph,
     rules_yaml: &str,
@@ -91,9 +67,8 @@ pub fn preview_with_graph(
         }
 
         let desc = rule_description(rule_num, rule);
-        let tag_id = rule_num as u32;
         highlights
-            .register_tag(tag_id, &desc)
+            .register_tag(rule_num as u32, &desc)
             .with_context(|| format!("registering tag for rule {rule_num}"))?;
 
         let matcher = rule.matcher();
@@ -118,7 +93,7 @@ pub fn preview_with_graph(
                 let provider_label = graph.nodes[&provider_id].canonical_id();
                 let edge_id =
                     canonical_edge_id(&sk.interface_name, caller_label.as_deref(), provider_label);
-                highlights.mark(Selection::edge(edge_id).tag(tag_id));
+                highlights.mark(Selection::edge(edge_id).tag(rule_num as u32));
             }
         }
         if !any_match {
@@ -133,22 +108,8 @@ pub fn preview_with_graph(
     })
 }
 
-/// Render `rule` as the one-line legend string preview attaches to
-/// every edge it matches.  Format:
-///
-/// `#N <kind> <field>=<value> ...`
-///
-/// where kind is `before` | `between`, the always-present field is
-/// `interface=`, and the variant-specific selection fields appear in a
-/// fixed order:
-///
-/// - `before`: optional `provider=...`
-/// - `between`: optional `inner=...` / `outer=...`
-/// - both: optional `all-funcs=...`
-///
-/// `inject:` is never rendered — it describes the *effect*, not the
-/// *selection*.  See `docs/TODO/preview-subcommand.md` for the full
-/// rationale.
+/// One-line legend string for `rule`: `#N <kind> <field>=<value> ...`.
+/// `inject:` is never rendered since it's the *effect*, not the *selection*.
 pub fn rule_description(idx: usize, rule: &SpliceRule) -> String {
     let mut parts: Vec<String> = vec![format!("#{idx}")];
     match rule {
@@ -171,9 +132,7 @@ pub fn rule_description(idx: usize, rule: &SpliceRule) -> String {
                 "interface={}",
                 quoted_globs(matcher.interface_raw())
             ));
-            // `inner` mirrors `Constraint::Provider`; `outer` mirrors
-            // `Constraint::Caller`. Order: inner, then outer — matches
-            // the way the YAML reads ("inject between inner and outer").
+
             if let Some(p) = matcher.provider_raw() {
                 parts.push(format!("inner={}", quoted_globs(p)));
             }
@@ -188,20 +147,12 @@ pub fn rule_description(idx: usize, rule: &SpliceRule) -> String {
     parts.join(" ")
 }
 
-/// Render one rule field's glob list. Single-pattern lists drop the
-/// `|`; multi-pattern lists `|`-join.  Always quoted so a glob with
-/// shell metacharacters round-trips into a copy-paste-safe legend.
 fn quoted_globs(globs: &[String]) -> String {
     format!("\"{}\"", globs.join("|"))
 }
 
-/// Render an `all-funcs:` predicate as its `+`-joined shorthand. Each
-/// piece is either a bare keyword (`async`, `sync`) or `key=val[,val]`.
-/// Default scope (`[interface]`) is omitted; non-default scopes use
-/// pipe-joined values (`scope=interface|resource`) because the YAML
-/// semantics are OR (match any). args/results use comma joins
-/// (`args=concrete,defaultable`) because their semantics are AND
-/// (every listed property must hold).
+/// `+`-joined shorthand for `all-funcs:`. Each piece is `async`/`sync`
+/// or `key=val[,val]`; default scope is omitted.
 fn render_func_pred(p: &FuncPred) -> String {
     let mut pieces: Vec<String> = Vec::new();
     if let Some(is_async) = p.is_async {
@@ -305,8 +256,6 @@ mod tests {
         FuncPred::new(is_async, vec![FuncScope::Interface], args, results)
     }
 
-    // ── rule_description: structure ──────────────────────────────────
-
     #[test]
     fn before_minimal_renders_kind_and_interface() {
         let r = before_rule(&["wasi:*"], None, None);
@@ -319,8 +268,6 @@ mod tests {
         assert_eq!(rule_description(2, &r), r#"#2 between interface="wasi:*""#);
     }
 
-    // ── glob list joining ────────────────────────────────────────────
-
     #[test]
     fn single_glob_drops_pipe() {
         let r = before_rule(&["wasi:*"], None, None);
@@ -332,8 +279,6 @@ mod tests {
         let r = before_rule(&["wasi:*", "my:srv/*"], None, None);
         assert!(rule_description(1, &r).contains(r#"interface="wasi:*|my:srv/*""#));
     }
-
-    // ── provider / inner / outer fields ──────────────────────────────
 
     #[test]
     fn before_provider_rendered_when_set() {
@@ -359,8 +304,6 @@ mod tests {
         assert!(rule_description(2, &r).contains(r#"inner="auth""#));
         assert!(!rule_description(2, &r).contains("outer="));
     }
-
-    // ── all-funcs shorthand ──────────────────────────────────────────
 
     #[test]
     fn all_funcs_async_renders_as_bare_keyword() {
@@ -427,7 +370,6 @@ mod tests {
     fn all_funcs_multi_property_plus_joined() {
         let pred = iface_only_pred(Some(true), vec![], vec![ValueProperty::Concrete]);
         let r = before_rule(&["*"], None, Some(pred));
-        // `async+results=concrete`
         assert!(
             rule_description(1, &r).contains("all-funcs=async+results=concrete"),
             "{}",
@@ -437,9 +379,6 @@ mod tests {
 
     #[test]
     fn full_kitchen_sink_example_matches_design_doc() {
-        // From the design doc:
-        //   #4  before  interface="wasi:*|my:*"  provider="srv-*"
-        //        all-funcs=async+scope=interface|resource
         let pred = FuncPred::new(
             Some(true),
             vec![FuncScope::Interface, FuncScope::Resource],
