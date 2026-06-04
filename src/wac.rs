@@ -1353,7 +1353,7 @@ fn add_to_inject_plan(
                     )
                 })?;
                 if let Some(mw_path) = injection.path.as_deref() {
-                    preflight_sync_target_async_middleware(
+                    bail_if_bridge_required(
                         &injection.name,
                         mw_path,
                         interface_name,
@@ -1392,7 +1392,7 @@ fn add_to_inject_plan(
                     )
                 })?;
                 if let Some(mw_path) = injection.path.as_deref() {
-                    preflight_sync_target_async_middleware(
+                    bail_if_bridge_required(
                         &injection.name,
                         mw_path,
                         interface_name,
@@ -1524,51 +1524,61 @@ fn factored_types_to_wire(
     Ok(out)
 }
 
-/// Preflight: refuse to splice a middleware that imports any
-/// `async func` peer-component interface (non-`wasi:*`) onto a target
-/// interface that has any `func` (sync at WIT) function. The runtime
-/// wedge that combination produces is documented in
-/// `docs/TODO/sync-wit-suspend-limit.md`: a sync-WIT-rooted wasm task
-/// cannot suspend, so any canon-async wait inside the middleware's
-/// hook body — driving an async peer-component import — traps with
-/// `cannot block a synchronous task before returning`.
-///
-/// This is a conservative check: it only catches imports that are
-/// `async func` at the middleware's WIT level. A middleware that
-/// declares a sync-WIT import but still ends up canon-lower-async'ing
-/// it (e.g. via `wit_bindgen::generate!({ async: true })` without
-/// per-import filtering) would slip through, but those cases tend to
-/// be authored by builtin maintainers who follow the documented
-/// pattern. Wasm-bytecode-level scan would be more complete; deferred.
-fn preflight_sync_target_async_middleware(
-    middleware_name: &str,
+/// Whether a tier-1/2 splice site needs the sync→async bridge to
+/// mediate between a sync-WIT target and a suspending hook body.
+enum SyncWitTreatment {
+    NotNeeded,
+    /// Carries the offending `async func` peer-component import for
+    /// diagnostics.
+    BridgeRequired { offender: String },
+}
+
+/// Conservative — only catches imports that are `async func` at the
+/// middleware's WIT level. Middleware that declares a sync-WIT import
+/// but canon-lower-async's it slips through.
+fn classify_bridge_need(
     middleware_path: &str,
     target_interface: &str,
     target_split_path: &str,
     accs: &mut SpliceAccumulators,
-) -> anyhow::Result<()> {
+) -> SyncWitTreatment {
     let target_key = (target_split_path.to_string(), target_interface.to_string());
     let has_sync = *accs
         .target_has_sync_cache
         .entry(target_key)
         .or_insert_with(|| target_interface_has_sync_func(target_interface, target_split_path));
     if !has_sync {
-        return Ok(());
+        return SyncWitTreatment::NotNeeded;
     }
     let offender = accs
         .middleware_first_async_peer_cache
         .entry(middleware_path.to_string())
         .or_insert_with(|| first_async_peer_import(middleware_path))
         .clone();
-    let Some(offender) = offender else {
-        return Ok(());
-    };
-    anyhow::bail!(
-        "cannot splice '{middleware_name}' onto sync-WIT target '{target_interface}': \
-         middleware imports async-peer '{offender}', which would suspend a sync-WIT \
-         task at runtime. Target an `async func` interface, or drop the `.await` \
-         from the middleware.",
-    );
+    match offender {
+        Some(offender) => SyncWitTreatment::BridgeRequired { offender },
+        None => SyncWitTreatment::NotNeeded,
+    }
+}
+
+fn bail_if_bridge_required(
+    middleware_name: &str,
+    middleware_path: &str,
+    target_interface: &str,
+    target_split_path: &str,
+    accs: &mut SpliceAccumulators,
+) -> anyhow::Result<()> {
+    if let SyncWitTreatment::BridgeRequired { offender } =
+        classify_bridge_need(middleware_path, target_interface, target_split_path, accs)
+    {
+        anyhow::bail!(
+            "cannot splice '{middleware_name}' onto sync-WIT target '{target_interface}': \
+             middleware imports async-peer '{offender}', which would suspend a sync-WIT \
+             task at runtime. Target an `async func` interface, or drop the `.await` \
+             from the middleware.",
+        );
+    }
+    Ok(())
 }
 
 /// True iff `target_interface` (resolved via the component at
