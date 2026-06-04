@@ -569,10 +569,6 @@ pub(crate) struct ParamLiftFromMemory {
 /// flips to pointer-form (sync >16 flat, async >16 flat) — `local 0`
 /// is the only wasm-level param, so the hook lift can't read flat
 /// wrapper locals and needs synth ones instead.
-///
-/// Per-param flat width is bounded by tier-2's `check_layout_budget`
-/// (`MAX_FLAT_SLOTS_PER_FN = 1 << 16`); the local cap here is
-/// defense-in-depth.
 pub(crate) fn build_lift_params_from_memory(
     resolve: &Resolve,
     sizes: &SizeAlign,
