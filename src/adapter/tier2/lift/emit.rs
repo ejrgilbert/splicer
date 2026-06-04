@@ -1009,10 +1009,12 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         bindgen.into_instructions()
     });
 
-    // Indirect-params lower: only the asymmetric flip (handler
-    // pointer-form, wrapper still flat — async-stackful 5..16) needs
-    // a lower-from-flat-locals pass. Symmetric flips pass local 0
-    // through directly; see [`FuncDispatch::params_record_offset`].
+    // `params_lower_seq` copies the wrapper's flat params into a
+    // memory record so the handler can take a pointer. Only the
+    // asymmetric flip needs this: handler wants a pointer but the
+    // wrapper still has flat locals — async-stackful 5..=16-flat,
+    // where the import caps at 4 and export at 16. Symmetric flips
+    // (sync >16, async >16) skip it: local 0 already IS the pointer.
     let asymmetric_indirect = fd.import_sig.indirect_params && !fd.export_sig.indirect_params;
     let params_lower_seq: Option<Vec<Instruction<'static>>> = asymmetric_indirect.then(|| {
         let base = fd
@@ -1027,14 +1029,12 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         )
     });
 
-    // Symmetric-indirect lift: wrapper has only `local 0` (the host's
-    // params pointer), so hook-record lift cannot read flat wrapper
-    // locals. Build a per-param lift-from-memory sequence that drops
-    // each param's flat values into freshly allocated synth locals,
-    // and feed those as `local_base` to `emit_lift_plan`.
-    // Only the before-hook lift consumes `params_lift_seqs`; gate on
-    // `has_before_hook` so after-only wrappers don't burn locals +
-    // code bytes on a sequence that's never played.
+    // `params_lift_seqs` materializes flat param values from memory
+    // into synth locals when the wrapper has only `local 0` (the
+    // host's params pointer) — the symmetric flip (sync >16, async
+    // >16). Each per-param sequence loads at its field offset into
+    // fresh synth locals that `emit_lift_plan` reads. Gated on
+    // `has_before_hook` since after-only wrappers wouldn't play it.
     let params_lift_seqs: Option<Vec<super::super::super::abi::emit::ParamLiftFromMemory>> =
         if fd.export_sig.indirect_params && has_before_hook {
             Some(
