@@ -368,12 +368,9 @@ pub(in crate::adapter::tier2) struct FuncDispatch {
     pub retptr_offset: Option<i32>,
     /// Indirect-params record buffer; `Some` iff the canonical-ABI
     /// flip is asymmetric (`import_sig.indirect_params &&
-    /// !export_sig.indirect_params`) — the async-stackful 5..16-flat
-    /// corner where the handler wants a pointer but the wrapper still
-    /// receives flat params. Symmetric flips (sync >16, async >16)
-    /// pass `local 0` straight to the handler; no buffer needed.
-    /// Inherits bump's single-active-call assumption — concurrent
-    /// invocations would clobber it.
+    /// !export_sig.indirect_params` — async-stackful 5..=16 flat).
+    /// Symmetric flips pass `local 0` straight through. Inherits
+    /// bump's single-active-call assumption.
     pub params_record_offset: Option<i32>,
     /// `None` for void or compound returns we don't yet lift.
     pub result_lift: Option<lift::ResultLayout>,
