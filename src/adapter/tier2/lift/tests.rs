@@ -769,6 +769,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         id_local,
         task_return_loads: None,
         params_lower_seq: None,
+        params_lift_seqs: None,
         saved_bump,
         param_list_locals: Vec::new(),
     };

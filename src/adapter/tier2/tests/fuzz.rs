@@ -228,9 +228,35 @@ fn fuzz_structural_shapes() {
         let mut arena = TypeArena::default();
         let mut need_export: Vec<ValueTypeId> = Vec::new();
 
+        // Randomize is_async AND param count to cover the four
+        // canonical-ABI corners: sync flat / sync indirect-params
+        // (>16) / async flat / async asymmetric- and symmetric-
+        // indirect. Param count 0..=8 with depth-2 shapes lands a
+        // healthy spread across the caps.
+        let is_async =
+            bool::arbitrary(&mut u).map_err(|_| "ran out of random bytes".to_string())?;
+        let nparams: usize = u
+            .int_in_range(0..=8)
+            .map_err(|_| "ran out of random bytes".to_string())?;
+        let mut param_ids: Vec<ValueTypeId> = Vec::with_capacity(nparams);
+        for _ in 0..nparams {
+            let pid = fuzz_value_type(&mut u, &mut arena, FUZZ_MAX_DEPTH, &mut need_export)
+                .map_err(|_| "ran out of random bytes".to_string())?;
+            param_ids.push(pid);
+        }
         let result_id = fuzz_value_type(&mut u, &mut arena, FUZZ_MAX_DEPTH, &mut need_export)
             .map_err(|_| "ran out of random bytes".to_string())?;
-        let shape = arena.canonical_val(result_id);
+        let param_names: Vec<String> = (0..nparams).map(|i| format!("p{i}")).collect();
+        let param_name_refs: Vec<&str> = param_names.iter().map(|s| s.as_str()).collect();
+        let result_shape = arena.canonical_val(result_id);
+        let params_shape: Vec<String> = param_ids
+            .iter()
+            .map(|id| arena.canonical_val(*id))
+            .collect();
+        let shape = format!(
+            "{}fn(params={params_shape:?}, result={result_shape})",
+            if is_async { "async " } else { "" }
+        );
 
         let type_exports: BTreeMap<String, ValueTypeId> = need_export
             .iter()
@@ -240,7 +266,7 @@ fn fuzz_structural_shapes() {
         let iface = InterfaceType::Instance(InstanceInterface {
             functions: BTreeMap::from([(
                 "get".to_string(),
-                sig(true, &[], vec![], vec![result_id]),
+                sig(is_async, &param_name_refs, param_ids, vec![result_id]),
             )]),
             type_exports,
         });

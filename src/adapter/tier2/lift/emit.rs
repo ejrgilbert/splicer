@@ -78,9 +78,15 @@ pub(crate) struct WrapperLocals {
     /// Pre-built bindgen load sequence for async `task.return`.
     /// Stored here so every local the bindgen needed is in `FrozenLocals`.
     pub task_return_loads: Option<Vec<Instruction<'static>>>,
-    /// Pre-built bindgen lower for async indirect_params. Same
-    /// FrozenLocals rationale as `task_return_loads`.
+    /// Pre-built bindgen lower for the asymmetric-indirect corner
+    /// (handler pointer-form, wrapper still flat).
     pub params_lower_seq: Option<Vec<Instruction<'static>>>,
+    /// Per-param lift-from-memory sequences for the symmetric-
+    /// indirect corner (wrapper `local 0` is the host's params
+    /// pointer); played in before-hook phase 1. `Some` iff
+    /// `fd.export_sig.indirect_params && has_before_hook`; length =
+    /// `fd.params.len()`.
+    pub params_lift_seqs: Option<Vec<super::super::super::abi::emit::ParamLiftFromMemory>>,
     /// Bump snapshot at wrapper entry; restored at exit.
     pub saved_bump: u32,
     /// Active plan's cells slab base; rewritten per plan.
@@ -846,7 +852,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     mut builder: LocalsBuilder,
     fd: &'a FuncDispatch,
     func: &wit_parser::Function,
-) -> (WrapperLocals, ResultEmitPlan<'a>, FrozenLocals) {
+    has_before_hook: bool,
+) -> anyhow::Result<(WrapperLocals, ResultEmitPlan<'a>, FrozenLocals)> {
     let addr = builder.alloc_local(ValType::I32);
     let st = builder.alloc_local(ValType::I32);
     let ws = builder.alloc_local(ValType::I32);
@@ -1002,21 +1009,46 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         bindgen.into_instructions()
     });
 
-    // Indirect-params lower (async overflowed MAX_FLAT_ASYNC_PARAMS);
-    // driven through the same builder so scratch lands in `frozen`.
-    let params_lower_seq: Option<Vec<Instruction<'static>>> =
-        fd.import_sig.indirect_params.then(|| {
-            let base = fd
-                .params_record_offset
-                .expect("indirect_params → params_record_offset reserved");
-            super::super::super::abi::emit::build_lower_params_to_memory(
-                resolve,
-                size_align,
-                &mut builder,
-                func,
-                base,
+    // `params_lower_seq` copies the wrapper's flat params into a
+    // memory record so the handler can take a pointer. Only the
+    // asymmetric flip needs this: handler wants a pointer but the
+    // wrapper still has flat locals — async-stackful 5..=16-flat,
+    // where the import caps at 4 and export at 16. Symmetric flips
+    // (sync >16, async >16) skip it: local 0 already IS the pointer.
+    let asymmetric_indirect = fd.import_sig.indirect_params && !fd.export_sig.indirect_params;
+    let params_lower_seq: Option<Vec<Instruction<'static>>> = asymmetric_indirect.then(|| {
+        let base = fd
+            .params_record_offset
+            .expect("asymmetric indirect → params_record_offset reserved");
+        super::super::super::abi::emit::build_lower_params_to_memory(
+            resolve,
+            size_align,
+            &mut builder,
+            func,
+            base,
+        )
+    });
+
+    // `params_lift_seqs` materializes flat param values from memory
+    // into synth locals when the wrapper has only `local 0` (the
+    // host's params pointer) — the symmetric flip (sync >16, async
+    // >16). Each per-param sequence loads at its field offset into
+    // fresh synth locals that `emit_lift_plan` reads. Gated on
+    // `has_before_hook` since after-only wrappers wouldn't play it.
+    let params_lift_seqs: Option<Vec<super::super::super::abi::emit::ParamLiftFromMemory>> =
+        if fd.export_sig.indirect_params && has_before_hook {
+            Some(
+                super::super::super::abi::emit::build_lift_params_from_memory(
+                    resolve,
+                    size_align,
+                    &mut builder,
+                    func,
+                    0, // wrapper's local 0 is the params pointer
+                )?,
             )
-        });
+        } else {
+            None
+        };
 
     let id_local = builder.alloc_local(ValType::I64);
     let saved_bump = builder.alloc_local(ValType::I32);
@@ -1032,7 +1064,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let next_variant_idx = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
 
     let frozen = builder.freeze();
-    (
+    Ok((
         WrapperLocals {
             addr,
             st,
@@ -1068,6 +1100,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             id_local,
             task_return_loads,
             params_lower_seq,
+            params_lift_seqs,
             saved_bump,
             cells_base,
             next_cell_idx,
@@ -1083,7 +1116,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         },
         result_emit,
         frozen,
-    )
+    ))
 }
 
 /// Emit the wasm that lifts one plan into its cells slab. Walks

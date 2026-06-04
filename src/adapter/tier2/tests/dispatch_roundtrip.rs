@@ -1704,3 +1704,234 @@ fn async_dispatch_shapes_indirect_params_validates() {
         .validate_all(&bytes)
         .expect("emitted tier-2 adapter component should validate");
 }
+
+// ── Tier 2: sync indirect-params (symmetric pointer-form flip) ──
+//
+// Sync funcs whose params overflow `MAX_FLAT_PARAMS` (16) flip the
+// export sig to `(i32) -> ...` (host writes the params record into
+// our memory, hands us the pointer). With hooks wired, tier-2 must
+// materialize each param's flat representation into synth locals
+// via `build_lift_params_from_memory` — otherwise the hook-record
+// lift would index nonexistent flat wrapper locals. Covers the
+// function-boundary sync half of `docs/TODO/canonical-abi-gaps.md`.
+
+/// 17×u32 sync + before/after hooks. Smallest shape that forces
+/// `export_sig.indirect_params = true` and exercises the new
+/// lift-from-memory path. Without it the hook record-build at
+/// phase 1 emits `local.get` on indices 1..16 — invalid wasm.
+#[test]
+fn sync_17_u32_params_with_hooks_validates() {
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func
+                (param "a" u32) (param "b" u32) (param "c" u32)
+                (param "d" u32) (param "e" u32) (param "f" u32)
+                (param "g" u32) (param "h" u32) (param "i" u32)
+                (param "j" u32) (param "k" u32) (param "l" u32)
+                (param "m" u32) (param "n" u32) (param "o" u32)
+                (param "p" u32) (param "q" u32)))
+            (export "wide" (func (type 0)))
+        ))
+        (import "test:pkg/wide@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+    let bytes = build_tier2_adapter(
+        "test:pkg/wide@1.0.0",
+        true,
+        true,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 adapter must succeed for 17×u32 sync params with hooks");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}
+
+/// Mixed primitive widths overflowing 16 + hooks. Exercises
+/// per-param `lift_from_memory` across i32/i64/f32/f64/i8(bool)/
+/// i32(char) flat widths inside synth-local materialization.
+#[test]
+fn sync_mixed_primitives_indirect_params_with_hooks_validates() {
+    // 9×u64 + u32 + f32 + f64 + bool + char = 19 flat slots.
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func
+                (param "a" u64) (param "b" u64) (param "c" u64)
+                (param "d" u64) (param "e" u64) (param "f" u64)
+                (param "g" u64) (param "h" u64) (param "i" u64)
+                (param "j" u32) (param "k" f32) (param "l" f64)
+                (param "m" bool) (param "n" char)))
+            (export "mixed" (func (type 0)))
+        ))
+        (import "test:pkg/sync-mixed@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+    let bytes = build_tier2_adapter(
+        "test:pkg/sync-mixed@1.0.0",
+        true,
+        true,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 adapter must succeed for mixed-primitive sync indirect params");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}
+
+/// Wide aggregate params (record + tuple + enum + flags) overflowing
+/// 16 + hooks. Drives each aggregate's bindgen walk inside the
+/// per-param lift-from-memory sequence, then through `emit_lift_plan`
+/// reading from per-param synth locals.
+#[test]
+fn sync_wide_aggregates_indirect_params_with_hooks_validates() {
+    // 5×u32 record + 5-element tuple + enum + flags + 6×u32 ≥ 17 flat.
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (record
+                (field "a" u32) (field "b" u32) (field "c" u32)
+                (field "d" u32) (field "e" u32)))
+            (export "rec5" (type (eq 0)))
+            (type (;2;) (tuple u32 u64 f32 f64 bool))
+            (type (;3;) (enum "red" "green" "blue"))
+            (export "color" (type (eq 3)))
+            (type (;5;) (flags "read" "write" "exec"))
+            (export "perms" (type (eq 5)))
+            (type (;7;) (func
+                (param "r" 1) (param "t" 2) (param "c" 4) (param "f" 6)
+                (param "u0" u32) (param "u1" u32) (param "u2" u32)
+                (param "u3" u32) (param "u4" u32) (param "u5" u32)))
+            (export "many" (func (type 7)))
+        ))
+        (import "test:pkg/sync-agg@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+    let bytes = build_tier2_adapter(
+        "test:pkg/sync-agg@1.0.0",
+        true,
+        true,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 adapter must succeed for wide aggregate sync indirect params");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}
+
+/// 9 strings (18 flat slots) + hooks. Each string lifts as a
+/// `(ptr, len)` pair from the host's params record, then the hook
+/// record-build runs `cabi_realloc` + memcpy through `emit_lift_plan`.
+#[test]
+fn sync_string_list_indirect_params_with_hooks_validates() {
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func
+                (param "s0" string) (param "s1" string) (param "s2" string)
+                (param "s3" string) (param "s4" string) (param "s5" string)
+                (param "s6" string) (param "s7" string) (param "s8" string)))
+            (export "many" (func (type 0)))
+        ))
+        (import "test:pkg/sync-strs@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+    let bytes = build_tier2_adapter(
+        "test:pkg/sync-strs@1.0.0",
+        true,
+        true,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 adapter must succeed for 9-string sync indirect params");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}
+
+/// 17×u32 *async* + hooks. Async-stackful export caps at 16-flat,
+/// so 17 params flips BOTH `import_sig.indirect_params` AND
+/// `export_sig.indirect_params` (the symmetric corner — wrapper has
+/// only `local 0`, handler also wants a pointer). The same
+/// passthrough as sync >16, but the export sig is
+/// `GuestExportAsyncStackful`. Pins that the symmetric-indirect
+/// plumbing covers async too, not just sync.
+#[test]
+fn async_17_u32_params_symmetric_indirect_validates() {
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func async
+                (param "a" u32) (param "b" u32) (param "c" u32)
+                (param "d" u32) (param "e" u32) (param "f" u32)
+                (param "g" u32) (param "h" u32) (param "i" u32)
+                (param "j" u32) (param "k" u32) (param "l" u32)
+                (param "m" u32) (param "n" u32) (param "o" u32)
+                (param "p" u32) (param "q" u32)))
+            (export "wide" (func (type 0)))
+        ))
+        (import "test:pkg/async-sym@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+    let bytes = build_tier2_adapter(
+        "test:pkg/async-sym@1.0.0",
+        true,
+        true,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 adapter must succeed for 17×u32 async symmetric-indirect");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}
+
+/// 17×u32 sync + after-hook only. Phase 1 (before-hook param lift)
+/// is skipped, so the new `params_lift_seqs` machinery doesn't fire;
+/// pins that the gate-flip alone works through the handler-call
+/// passthrough plus phase 3's result-side lift.
+#[test]
+fn sync_17_u32_params_after_only_validates() {
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func
+                (param "a" u32) (param "b" u32) (param "c" u32)
+                (param "d" u32) (param "e" u32) (param "f" u32)
+                (param "g" u32) (param "h" u32) (param "i" u32)
+                (param "j" u32) (param "k" u32) (param "l" u32)
+                (param "m" u32) (param "n" u32) (param "o" u32)
+                (param "p" u32) (param "q" u32)))
+            (export "wide" (func (type 0)))
+        ))
+        (import "test:pkg/wide-after@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+    let bytes = build_tier2_adapter(
+        "test:pkg/wide-after@1.0.0",
+        false,
+        true,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 adapter must succeed for 17×u32 sync params with after-hook only");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}

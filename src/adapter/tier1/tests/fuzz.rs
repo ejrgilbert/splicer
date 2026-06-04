@@ -297,6 +297,204 @@ fn test_adapter_async_variant_option_result_indirect_params_validates() {
     validate_component(&bytes);
 }
 
+// ── Tier 1: sync indirect-params (function-boundary pointer-form) ──
+//
+// Sync funcs whose params overflow `MAX_FLAT_PARAMS` (16) collapse
+// to a single `(i32) -> ...` signature: the host writes the lowered
+// params into our linear memory and hands us the pointer. Both
+// import and export flip together, so the wrapper just passes `local
+// 0` straight to the handler (no static buffer, no re-lower). Result
+// overflow (`MAX_FLAT_RESULTS = 1` on wasm32) similarly switches to
+// a retptr on the import side (caller-allocates) + a retptr return
+// on the export side (callee-returns). The doc this exercises is
+// `docs/TODO/canonical-abi-gaps.md` (function-boundary pointer-form
+// gap, sync half).
+
+/// 17×u32 params: smallest shape that overflows MAX_FLAT_PARAMS.
+/// No hooks → exercises the pure validation-gate flip + the
+/// pass-through handler call.
+#[test]
+fn test_adapter_sync_17_u32_params_no_hooks_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let names: Vec<String> = (0..17).map(|i| format!("p{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let iface = make_iface(vec![(
+        "wide",
+        sig(false, &name_refs, vec![u32_id; 17], vec![]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/sync-wide@1.0.0",
+        &[],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// 17×u32 + before/after hooks. Tier-1 hooks pass only a call-id,
+/// so this still exercises just the pass-through, but with hooks in
+/// the wrapper body it confirms the bump-save/restore + hook calls
+/// don't interfere with the params-pointer local.
+#[test]
+fn test_adapter_sync_17_u32_params_with_hooks_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let names: Vec<String> = (0..17).map(|i| format!("p{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let iface = make_iface(vec![(
+        "wide",
+        sig(false, &name_refs, vec![u32_id; 17], vec![]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/sync-wide-hook@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Mixed widths overflowing MAX_FLAT_PARAMS — exercises inter-field
+/// alignment padding inside the host-built params record. The
+/// adapter never touches the contents (pure pass-through), so this
+/// catches any misalignment in the supported-type predicate or in
+/// the dispatch-module type section.
+#[test]
+fn test_adapter_sync_mixed_primitives_indirect_params_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let f32_id = arena.intern_val(ValueType::F32);
+    let f64_id = arena.intern_val(ValueType::F64);
+    let bool_id = arena.intern_val(ValueType::Bool);
+    let char_id = arena.intern_val(ValueType::Char);
+    // 9×u64 + 1×u32 + ... = 19 flat slots → indirect_params.
+    let params = vec![
+        u64_id, u64_id, u64_id, u64_id, u64_id, u64_id, u64_id, u64_id, u64_id, u32_id, f32_id,
+        f64_id, bool_id, char_id,
+    ];
+    let names: Vec<String> = (0..params.len()).map(|i| format!("p{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let iface = make_iface(vec![("wide", sig(false, &name_refs, params, vec![]))]);
+    let bytes = gen_adapter(
+        "test:pkg/sync-mixed-wide@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Single record param with 17 u32 fields — aggregate in indirect-
+/// params position. Same flat width as the 17×u32 case, but the
+/// canonical-ABI lowering nests inside the record.
+#[test]
+fn test_adapter_sync_wide_record_param_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let fields: Vec<(String, ValueTypeId)> = (0..17).map(|i| (format!("f{i}"), u32_id)).collect();
+    let record = arena.intern_val(ValueType::Record(fields));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("wide".to_string(), sig(false, &["r"], vec![record], vec![]))]),
+        type_exports: BTreeMap::from([("rec17".to_string(), record)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/sync-rec17@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Result `record { a: u64, b: u64, c: u32 }` flattens to 5 i32 slots
+/// → `export_sig.retptr = true`. Wrapper signature flips to
+/// `() -> i32` (callee-returns retptr); handler is `(i32) -> ()`
+/// (caller-allocates). Confirms the result-overflow half already
+/// works without changes.
+#[test]
+fn test_adapter_sync_wide_result_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let record = arena.intern_val(ValueType::Record(vec![
+        ("a".into(), u64_id),
+        ("b".into(), u64_id),
+        ("c".into(), u32_id),
+    ]));
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([("wide".to_string(), sig(false, &[], vec![], vec![record]))]),
+        type_exports: BTreeMap::from([("rec3".to_string(), record)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/sync-result-wide@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// Both overflows: 17×u32 params AND a wide record result. Pins the
+/// combined handler shape `(i32, i32) -> ()` (params_ptr, retptr).
+#[test]
+fn test_adapter_sync_both_overflow_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let u64_id = arena.intern_val(ValueType::U64);
+    let result_record = arena.intern_val(ValueType::Record(vec![
+        ("a".into(), u64_id),
+        ("b".into(), u64_id),
+    ]));
+    let names: Vec<String> = (0..17).map(|i| format!("p{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let iface = InterfaceType::Instance(InstanceInterface {
+        functions: BTreeMap::from([(
+            "wide".to_string(),
+            sig(false, &name_refs, vec![u32_id; 17], vec![result_record]),
+        )]),
+        type_exports: BTreeMap::from([("rec2".to_string(), result_record)]),
+    });
+    let bytes = gen_adapter(
+        "test:pkg/sync-both-wide@1.0.0",
+        &["splicer:tier1/before", "splicer:tier1/after"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
+/// 17×u32 params + blocking hook + void result. Tier-1 blocking is
+/// only legal on void-returning functions; confirms the
+/// `should-block` retptr scratch interleaves cleanly with the
+/// params-pointer local.
+#[test]
+fn test_adapter_sync_indirect_params_with_blocking_hook_validates() {
+    let mut arena = TypeArena::default();
+    let u32_id = arena.intern_val(ValueType::U32);
+    let names: Vec<String> = (0..17).map(|i| format!("p{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let iface = make_iface(vec![(
+        "wide",
+        sig(false, &name_refs, vec![u32_id; 17], vec![]),
+    )]);
+    let bytes = gen_adapter(
+        "test:pkg/sync-wide-blocking@1.0.0",
+        &["splicer:tier1/blocking"],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+    validate_component(&bytes);
+}
+
 #[test]
 fn test_adapter_record_with_list_field_repro() {
     let mut arena = TypeArena::default();
@@ -440,10 +638,15 @@ fn fuzz_value_type(
 /// An error message matching one of these prefixes is an expected
 /// bail — the adapter correctly refused a shape outside its current
 /// support envelope. Anything else is a real failure.
+///
+/// Note: `"exceeds 16"` (sync indirect-params overflow) was removed
+/// when sync function-boundary pointer-form landed — those shapes
+/// now validate. `"flat representation"` covers the remaining async
+/// per-param flat-fits-in-16 check inside
+/// `require_indirect_params_supported_shape`.
 fn fuzz_is_expected_bail(msg: &str) -> bool {
     msg.contains("flat parameter values")
         || msg.contains("flat representation")
-        || msg.contains("exceeds 16") // "flattens to N core values (exceeds 16..."
         || msg.contains("results; only 0 or 1 results")
         || msg.contains("not yet implemented")
 }
@@ -455,9 +658,36 @@ fn fuzz_structural_shapes() {
         let mut arena = TypeArena::default();
         let mut need_export: Vec<ValueTypeId> = Vec::new();
 
+        // Randomize is_async AND param count to cover all four
+        // canonical-ABI corners: sync flat (≤16), sync indirect-
+        // params (>16), async flat (≤4), async asymmetric-indirect
+        // (5..16) plus the rare async-symmetric (>16). Param count
+        // 0..=8 with up-to-depth-2 shapes typically lands 0..~24
+        // flat slots — a healthy mix of all caps.
+        let is_async =
+            bool::arbitrary(&mut u).map_err(|_| "ran out of random bytes".to_string())?;
+        let nparams: usize = u
+            .int_in_range(0..=8)
+            .map_err(|_| "ran out of random bytes".to_string())?;
+        let mut param_ids: Vec<ValueTypeId> = Vec::with_capacity(nparams);
+        for _ in 0..nparams {
+            let pid = fuzz_value_type(&mut u, &mut arena, FUZZ_MAX_DEPTH, &mut need_export)
+                .map_err(|_| "ran out of random bytes".to_string())?;
+            param_ids.push(pid);
+        }
         let result_id = fuzz_value_type(&mut u, &mut arena, FUZZ_MAX_DEPTH, &mut need_export)
             .map_err(|_| "ran out of random bytes".to_string())?;
-        let shape = arena.canonical_val(result_id);
+        let param_names: Vec<String> = (0..nparams).map(|i| format!("p{i}")).collect();
+        let param_name_refs: Vec<&str> = param_names.iter().map(|s| s.as_str()).collect();
+        let result_shape = arena.canonical_val(result_id);
+        let params_shape: Vec<String> = param_ids
+            .iter()
+            .map(|id| arena.canonical_val(*id))
+            .collect();
+        let shape = format!(
+            "{}fn(params={params_shape:?}, result={result_shape})",
+            if is_async { "async " } else { "" }
+        );
 
         let type_exports: BTreeMap<String, ValueTypeId> = need_export
             .iter()
@@ -467,7 +697,7 @@ fn fuzz_structural_shapes() {
         let iface = InterfaceType::Instance(InstanceInterface {
             functions: BTreeMap::from([(
                 "get".to_string(),
-                sig(true, &[], vec![], vec![result_id]),
+                sig(is_async, &param_name_refs, param_ids, vec![result_id]),
             )]),
             type_exports,
         });

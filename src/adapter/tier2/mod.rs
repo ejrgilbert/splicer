@@ -103,7 +103,7 @@ pub(super) fn build_tier2_adapter(
     let (per_func, plan) = lay_out_static_memory(classified, &funcs, &schema, names, iface_name)?;
 
     let mut core_module =
-        build_dispatch_module(&resolve, &schema, &per_func, &funcs, plan, iface_name);
+        build_dispatch_module(&resolve, &schema, &per_func, &funcs, plan, iface_name)?;
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
         .context("embed_component_metadata")?;
 
@@ -122,13 +122,20 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
         bail!("interface has no functions");
     }
     require_no_inline_resources(resolve, target_iface)?;
-    // Async indirect-params path is scoped to scalar primitives (mirrors tier-1).
+    // Indirect-params path covers the supported value-type space
+    // (mirrors tier-1). Fires for async params >4 flat AND sync
+    // params >16 flat — both flip the wrapper / handler to
+    // pass-by-record on the import side.
     for (name, func) in &iface.functions {
-        if func.kind.is_async() {
-            let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
-            if import_sig.indirect_params {
-                require_indirect_params_supported_shape(resolve, name, func)?;
-            }
+        let is_async = func.kind.is_async();
+        let variant = if is_async {
+            AbiVariant::GuestImportAsync
+        } else {
+            AbiVariant::GuestImport
+        };
+        let import_sig = resolve.wasm_signature(variant, func);
+        if import_sig.indirect_params {
+            require_indirect_params_supported_shape(resolve, name, func, is_async)?;
         }
     }
     Ok(())
@@ -155,7 +162,7 @@ fn build_dispatch_module(
     funcs: &[&WitFunction],
     plan: layout::StaticDataPlan,
     iface_name: BlobSlice,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut module = Module::new();
     let type_idx = emit_type_section(
         &mut module,
@@ -220,9 +227,9 @@ fn build_dispatch_module(
         &func_idx,
         &wrapper_ctx,
         &globals,
-    );
+    )?;
     emit_data_section(&mut module, &plan.data_segments);
-    module.finish()
+    Ok(module.finish())
 }
 
 // ─── Phase data shared across submodules ──────────────────────────
@@ -359,10 +366,11 @@ pub(in crate::adapter::tier2) struct FuncDispatch {
     /// caller-allocates retptr but the export sig returns the pointer
     /// directly.
     pub retptr_offset: Option<i32>,
-    /// Indirect-params record buffer; `Some` iff async +
-    /// `import_sig.indirect_params` (canon-lower-async overflowed
-    /// `MAX_FLAT_ASYNC_PARAMS = 4`). Inherits bump's single-active-call
-    /// assumption — concurrent invocations would clobber it.
+    /// Indirect-params record buffer; `Some` iff the canonical-ABI
+    /// flip is asymmetric (`import_sig.indirect_params &&
+    /// !export_sig.indirect_params` — async-stackful 5..=16 flat).
+    /// Symmetric flips pass `local 0` straight through. Inherits
+    /// bump's single-active-call assumption.
     pub params_record_offset: Option<i32>,
     /// `None` for void or compound returns we don't yet lift.
     pub result_lift: Option<lift::ResultLayout>,

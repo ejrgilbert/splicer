@@ -66,7 +66,13 @@ const MAX_FAILURES_SHOWN: usize = 20;
 const TUPLE_ARITY: std::ops::RangeInclusive<usize> = 2..=3;
 /// `list<T, N>` (canon-ABI fixed-length).
 const FIXED_LIST_LEN: std::ops::RangeInclusive<u32> = 1..=4;
-const RECORD_FIELD_NAMES: &[&str] = &["a", "b", "c"];
+/// Sized to span both sides of `MAX_FLAT_PARAMS = 16`: records with
+/// ≥17 i32-flat fields trip sync indirect-params at the function
+/// boundary, exercising `build_lift_params_from_memory` end-to-end.
+const RECORD_FIELD_NAMES: &[&str] = &[
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t",
+];
 /// Pool size caps the distinct records per generated shape tree
 /// (further draws fall back to a primitive to keep names unique).
 /// Same pattern for the variant / enum / flags pools below.
@@ -4778,7 +4784,6 @@ fn panic_msg(payload: &(dyn std::any::Any + Send)) -> String {
 fn is_expected_bail(msg: &str) -> bool {
     msg.contains("flat parameter values")
         || msg.contains("flat representation")
-        || msg.contains("exceeds 16")
         || msg.contains("results; only 0 or 1 results")
         || msg.contains("not yet implemented")
 }

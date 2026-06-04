@@ -126,19 +126,24 @@ fn require_supported_case(
                  a return value when the call is blocked."
             );
         }
-        // Async funcs whose params overflow `Resolve::MAX_FLAT_ASYNC_PARAMS`
-        // canon-lower with `indirect_params = true` — the handler takes a
-        // single params-pointer instead of flat values. The wrapper export
-        // (`GuestExportAsyncStackful`, capped at `Resolve::MAX_FLAT_PARAMS`)
-        // still receives flat, so [`build_lower_params_to_memory`] writes
-        // them into a static params record before the handler call.
-        // `require_indirect_params_supported_shape` rejects param shapes
-        // the lower-mode bindgen doesn't cover (today: just `map<K, V>`).
-        if func.kind.is_async() {
-            let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
-            if import_sig.indirect_params {
-                require_indirect_params_supported_shape(resolve, name, func)?;
-            }
+        // Funcs whose params overflow the indirect-params cap (4 for
+        // async, 16 for sync) canon-lower with `indirect_params = true`
+        // — the handler takes a single params-pointer instead of flat
+        // values. The wrapper export sees the same flip on its side
+        // (sync) or stays flat (async-stackful is capped at
+        // `MAX_FLAT_PARAMS = 16`), so [`build_lower_params_to_memory`]
+        // writes the lowered record before the handler call.
+        // `require_indirect_params_supported_shape` rejects param
+        // shapes the lower-mode bindgen doesn't cover.
+        let is_async = func.kind.is_async();
+        let variant = if is_async {
+            AbiVariant::GuestImportAsync
+        } else {
+            AbiVariant::GuestImport
+        };
+        let import_sig = resolve.wasm_signature(variant, func);
+        if import_sig.indirect_params {
+            require_indirect_params_supported_shape(resolve, name, func, is_async)?;
         }
     }
     Ok(())
@@ -207,13 +212,18 @@ struct FuncDispatch {
     fn_name_len: i32,
     /// Offset of the retptr scratch buffer; set iff `import_sig.retptr`.
     retptr_offset: Option<i32>,
-    /// Offset of the indirect-params record buffer; set iff async +
-    /// `import_sig.indirect_params` (canon-lower-async overflowed
-    /// `Resolve::MAX_FLAT_ASYNC_PARAMS = 4` and switched to pass-by-
-    /// record). The wrapper lowers its flat function params into this
-    /// slot and passes the slot's pointer to the handler. Inherits
-    /// `retptr_offset` / bump's single-active-call assumption: two
-    /// concurrent invocations of the same wrapper would clobber it.
+    /// Offset of the indirect-params record buffer; set iff the
+    /// canonical-ABI flip is asymmetric — `import_sig.indirect_params
+    /// && !export_sig.indirect_params`. This is the async-stackful
+    /// 5..16-flat corner where the handler wants a pointer but the
+    /// wrapper still receives flat params. The wrapper lowers its
+    /// flat locals into this buffer, then passes the pointer.
+    ///
+    /// The symmetric flips (sync at >16 flat, async at >16 flat —
+    /// where wrapper and handler both want a pointer) need no buffer:
+    /// the wrapper's local 0 holds the host's pointer and is passed
+    /// straight through. Inherits bump's single-active-call assumption
+    /// — concurrent invocations would clobber it.
     params_record_offset: Option<i32>,
     /// `(flat_param_idx, resource_type_id)` for each top-level
     /// `borrow<R>` param. The runtime requires us to drop the borrow
@@ -498,11 +508,14 @@ fn compute_func_dispatches(
             let align = sizes.align(result_ty).align_wasm32() as u32;
             layout.alloc_aligned(size, align) as i32
         });
-        // Async indirect-params: reserve the canonical-ABI params
-        // record. Size + align come from `SizeAlign::record` over the
-        // param type list — same shape canon-lower-async expects to
-        // read on the import side.
-        let params_record_offset = (is_async && import_sig.indirect_params).then(|| {
+        // Indirect-params record: needed only when the import sig is
+        // by-pointer but the export sig is still flat — i.e. the
+        // async-stackful 5..16 corner where the wrapper has flat
+        // locals to lower. Sync (and async >16) flip both sides at
+        // the same cap, so the wrapper's local 0 already holds the
+        // host's params pointer and is passed through directly.
+        let asymmetric_indirect = import_sig.indirect_params && !export_sig.indirect_params;
+        let params_record_offset = asymmetric_indirect.then(|| {
             let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
             let info = sizes.record(&param_types);
             let size = info.size.size_wasm32() as u32;
@@ -1085,13 +1098,16 @@ fn emit_async_wrapper_body(
     // Build the params lower-to-memory sequence BEFORE freezing locals,
     // for the same reason as task_return_loads — the bindgen allocates
     // an addr local + per-ValType store scratch through `locals`. Only
-    // populated when canon-lower-async expects a single params-pointer
-    // (`indirect_params = true`).
-    let params_lower_seq: Option<Vec<wasm_encoder::Instruction<'static>>> =
-        fd.import_sig.indirect_params.then(|| {
+    // populated when the asymmetric flip applies: handler wants a
+    // pointer (`import_sig.indirect_params`) but the wrapper still has
+    // flat locals (`!export_sig.indirect_params`). Async-stackful
+    // exports cap at 16-flat, so this is the 5..16 corner.
+    let asymmetric_indirect = fd.import_sig.indirect_params && !fd.export_sig.indirect_params;
+    let params_lower_seq: Option<Vec<wasm_encoder::Instruction<'static>>> = asymmetric_indirect
+        .then(|| {
             let base = fd
                 .params_record_offset
-                .expect("indirect_params → params_record_offset reserved");
+                .expect("asymmetric indirect → params_record_offset reserved");
             build_lower_params_to_memory(resolve, sizes, &mut locals, func, base)
         });
     // i64 call-id local + per-callsite bundle; both gated on hook wired.
@@ -1370,6 +1386,31 @@ mod tests {
         );
         require_supported_case(&resolve, iface_id, false)
             .expect("record / tuple / enum / flags in indirect-params should be accepted");
+    }
+
+    /// Sync indirect-params (params >16 flat). After the gate-flip,
+    /// `require_supported_case` must validate without bailing — the
+    /// adapter passes the host's params pointer through unchanged,
+    /// so the same supported-type predicate applies for sync as for
+    /// async.
+    #[test]
+    fn require_supported_case_accepts_sync_indirect_params() {
+        let (resolve, iface_id) = iface_from_wit(
+            r#"
+            package my:shape@1.0.0;
+            interface api {
+                wide: func(
+                    a: u32, b: u32, c: u32, d: u32, e: u32, f: u32,
+                    g: u32, h: u32, i: u32, j: u32, k: u32, l: u32,
+                    m: u32, n: u32, o: u32, p: u32, q: u32
+                );
+            }
+            "#,
+            "my:shape",
+            "api@1.0.0",
+        );
+        require_supported_case(&resolve, iface_id, false)
+            .expect("17×u32 sync func should be accepted (params overflow MAX_FLAT_PARAMS)");
     }
 
     /// Lists, strings, fixed-length-lists, variants, options, results,
