@@ -151,6 +151,12 @@ narrowing.
   producing an E0053 type mismatch in the generated wrapper crate.
   Today tier-3 only wraps interfaces whose functions are declared
   `async func`. Sync-target support is on the roadmap.
+- **Value-typed positions only.** Targets whose function signatures
+  mention resource handles, futures, streams, or `error-context`
+  aren't supported yet. The `concrete` predicate in
+  [`splice-config.md`](../splice-config.md#function-shape-matching-all-funcs)
+  filters them out at match time. Handle support is tracked in
+  [`docs/TODO/tier3-tier4-builtins.md`](../TODO/tier3-tier4-builtins.md).
 
 ## Good for
 

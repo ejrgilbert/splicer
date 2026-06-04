@@ -70,11 +70,14 @@ mapping).
 
 **Value-typed returns only.** Today, tier-4 can wrap interfaces whose
 return types are value-typed (primitives, records, variants, lists,
-options, results — anything wit-bindgen lowers without resource
+options, results — anything wit-bindgen lowers without correlation
 handles). Targets whose returns contain resource handles (e.g.
-`wasi:http/handler` returning `Response`) aren't supported yet —
-those need a resource walker + `MockedResource` pattern +
-types-interface composition wiring; see
+`wasi:http/handler` returning `Response`), futures, streams, or
+`error-context` aren't supported yet. Resources have the clearest path
+forward via a resource walker + `MockedResource` pattern +
+types-interface composition wiring; future/stream synthesis would need
+host primitives splicer doesn't have, and error-context awaits a
+wasmtime cross-component lift fix. See
 [`docs/TODO/tier3-tier4-builtins.md`](../TODO/tier3-tier4-builtins.md).
 
 ## Good for

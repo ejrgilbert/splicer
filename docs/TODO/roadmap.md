@@ -15,7 +15,7 @@ detail; this doc is the calendar overlay.
 | 2     | 1-2 weeks | `fuzz-input`, `redact-strings`, smoke tests                                                 |
 | 4     | 2-3 weeks | Record + replay loop (replayer builtin + record/replay strategies)                          |
 | 5     | ~1 week   | Trace diff CLI + differential-testing demo (v1 paper demo)                                  |
-| 6     | 2-3 weeks | v2 resource support → HTTP record/replay (v2 paper demo if needed)                          |
+| 6     | 2-3 weeks | v2 handle support (resources, error-context, future, stream); HTTP record/replay demo       |
 
 **v1 demo at ~8 weeks. v2 (HTTP) at ~11 weeks.** Solo, focused. A
 collaborator on one stream cuts calendar time roughly in half.
@@ -95,9 +95,16 @@ Skipped Phase 3 — Phase 1's Stream C already covered `on_node` and
 - [ ] Pick value-typed service WIT for non-HTTP eval leg
 - [ ] End-to-end differential-testing demo runnable from one splice config
 
-## Phase 6: v2 resource support (2-3 weeks, if needed for paper)
+## Phase 6: v2 handle support (2-3 weeks for resources; non-resource handles land per kind)
 
-proxy-component is the blueprint; adapt with cells in place of WAVE:
+Tier-3/4 currently bails on every correlation handle (resource, future,
+stream, error-context). v2 lifts those bails. Resources are the paper
+demo path; the other three share the SDK-decode and codegen-IR plumbing
+but have their own synthesis story (or lack of one).
+
+**Resource branch (paper demo path).** proxy-component is the
+blueprint; local PoC at `../../research/proxy-component`. Adapt with
+cells in place of WAVE:
 - [ ] WIT walker detects resources
 - [ ] `wrapped-` namespace WIT rewriting
 - [ ] `MockedResource { handle, name }` pattern + `GuestResource` impls
@@ -105,6 +112,13 @@ proxy-component is the blueprint; adapt with cells in place of WAVE:
 - [ ] `WitTyped` impls for `Resource<T>`
 - [ ] wac composition wiring for types interfaces (full virt)
 - [ ] HTTP record/replay demo
+
+**Non-resource handle branches** (pass-through unblocks
+redact-strings/timeout/retry on interfaces that mention these types;
+return-synthesis is the harder step):
+- [ ] `error-context`: SDK `decode_cell` + tier-3/4 codegen IR mapping; synthesis blocked on wasmtime cross-component lift bug (track upstream)
+- [ ] `future`: SDK + codegen IR mapping for pass-through; return-synthesis deferred pending host primitives
+- [ ] `stream`: SDK + codegen IR mapping for pass-through; return-synthesis deferred pending host primitives
 
 ## Back-burner
 
@@ -119,6 +133,6 @@ Defer until post-paper, no blocking impact:
 
 Where the calendar can slip:
 1. **`wasi:filesystem` integration in recorder** (Stream A, step 3). Resource-heavy API.
-2. **`WitTyped` derive for resources** (Phase 6). Trickiest derive corner.
+2. **`WitTyped` derive for handles** (Phase 6). Trickiest derive corner; resources are the headline case, but the SDK + codegen plumbing has to land for all four handle kinds.
 3. **wac composition rewriting for full virt** (Phase 6). May need splicer's WAC emitter restructuring.
 4. **Cells binary on-disk format** (Phase 1 Stream A / 4). Framing, versioning, edge_id tagging details.

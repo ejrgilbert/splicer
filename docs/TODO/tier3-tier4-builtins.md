@@ -15,35 +15,42 @@ framework rules see
 
 Mantra: **design with resources, ship without.**
 
-## Resource semantics
+## Correlation-handle semantics
 
-Cells (the tier-2 wire format) lift resources as opaque
-`resource-handle(id)` correlation cells. The middleware sees the
-type-name and an opaque u64; it cannot call methods on the resource,
+Cells (the tier-2 wire format) lifts four kinds of handles as opaque
+correlation cells: `resource-handle`, `future-handle`, `stream-handle`,
+and `error-context-handle`. In each case the middleware sees a
+type-name and an opaque u64; it cannot call methods on the handle,
 read its state, or fabricate a new one. That shapes how the substrate
-handles resources at tier-3 / tier-4:
+handles all four at tier-3 / tier-4:
 
 - **Value-typed return synthesis** (tier-4 builtins such as replay,
   fuzz, mock, chaos): the strategy returns a typed Rust value;
   wit-bindgen handles canonical-ABI lowering. Works directly out of
   the substrate.
-- **Resource return synthesis** (replay/mock returning a `Response`,
-  etc.): the wrapper exports the target's types interface and hosts
-  the resource implementation itself. Mints `Resource::new(
-  MockedResource { handle, name })` for each recorded correlation id.
-  Requires per-target codegen that emits `GuestResource` impls for
-  every resource the WIT references. proxy-component established this
-  pattern; splicer's tier-4 resource support adopts it with cells as
-  the wire format instead of WAVE strings.
-- **Resource state mutation** (e.g., HTTP header injection via
-  `request.headers().append(...)`): requires importing the resource's
+- **Handle return synthesis** (replay/mock returning a `Response`, a
+  `future`, a `stream`, etc.): the wrapper exports the target's types
+  interface and hosts the implementation itself. For **resources**,
+  mints `Resource::new(MockedResource { handle, name })` for each
+  recorded correlation id and requires per-target codegen that emits
+  `GuestResource` impls for every resource the WIT references.
+  proxy-component established this pattern; splicer's tier-4 resource
+  support adopts it with cells as the wire format instead of WAVE
+  strings (local PoC at `../../research/proxy-component`). For
+  **futures and streams**, there is no user-space mint primitive
+  today; synthesis would need host help and is likely indefinitely
+  deferred. For **error-context**, synthesis is blocked on the
+  wasmtime cross-component lift bug noted in
+  [`wit/common/world.wit`](../../wit/common/world.wit).
+- **Handle state mutation** (e.g., HTTP header injection via
+  `request.headers().append(...)`): requires importing the handle's
   types interface and dispatching to its methods. Target-specific user
   code, not substrate territory. Users write a wit-bindgen wrapper
   component directly and splicer composes it in.
 - **Subset replay** (replay the operation interface, leave the types
-  interface host-owned): does not reproduce original behavior;
-  resource methods on the returned handle hit the real host, not the
-  trace. Resource virt is full-virt or nothing.
+  interface host-owned): does not reproduce original behavior; methods
+  on the returned handle hit the real host, not the trace. Handle
+  virt is full-virt or nothing.
 
 ## Strategies and what each needs
 
@@ -88,6 +95,13 @@ predicates `concrete` / `defaultable`. Evaluated once per chain in
 See [`docs/splice-config.md`](../splice-config.md#function-shape-matching-all-funcs)
 for the surface, vocabulary, and semantics.
 
+`concrete` is a user-facing filter, not the substrate's contract. The
+substrate intends to grow coverage over the correlation-handle family
+(resources, futures, streams, `error-context`); `concrete` lets a user
+opt out of the parts that don't yet have substrate support. Treat the
+`concrete` predicate as a configuration affordance, not a statement
+about what tier-3/4 will ever handle.
+
 ```yaml
 between:
   interface: "*"
@@ -130,29 +144,68 @@ proxy-component as prior art for the `wrapped-` namespace +
 for the **trace wire format** — WAVE remains the user-facing typed
 surface.
 
-## v2 scope (resource support)
+## v2 scope (handle support)
 
-The value-typed path is a clean subset of the resource path; v2 work
+The value-typed path is a clean subset of the handle path; v2 work
 items are tracked in [`roadmap.md`](./roadmap.md) Phase 6.
 
 Record/replay is the only tier-3/4 use case that genuinely needs the
-resource machinery; everything else (retry, timeout, chaos-err, etc.)
-either works on resources without the machinery or does not generalize
-to resources at all.
+handle-return-synthesis machinery; everything else (retry, timeout,
+chaos-err, redact-strings, normalize-strings, ...) either works on
+handles without it (pass-through in args) or does not generalize to
+handles at all.
+
+**Coverage gaps by handle kind:**
+
+| Handle kind     | Tier-2 cells   | SDK decode | Tier-3/4 codegen | Synthesis (mock/replay return)                     |
+|-----------------|----------------|------------|------------------|----------------------------------------------------|
+| `resource`      | shipped        | bails      | bails            | proxy-component `MockedResource` pattern           |
+| `error-context` | shipped (id)   | bails      | bails            | blocked on wasmtime cross-component lift bug       |
+| `future`        | shipped        | bails      | bails            | needs host primitive; likely indefinitely deferred |
+| `stream`        | shipped        | bails      | bails            | needs host primitive; likely indefinitely deferred |
+
+Tier-2 cells ships all four; the gap is at the SDK bridge and the
+typed-builtin codegen. Pass-through use cases (handle appears in args,
+flows through the wrapper to the inner call) unblock first; synthesis
+is the harder branch and lands per handle kind on its own timeline.
+
+**Implementation touch points:**
+
+- **SDK bridge** ([`splicer-tool-sdk/src/bridge.rs`](../../splicer-tool-sdk/src/bridge.rs)):
+  extend `decode_cell` to map `ResourceHandle` / `FutureHandle` /
+  `StreamHandle` / `ErrorContextHandle` cells to user-facing Rust
+  types; today they hit a catch-all
+  `BridgeError::Unsupported("non-value-typed shape")`. Add `WitTyped`
+  impl paths for the new shapes.
+- **Tier-3/4 codegen** ([`src/adapter/typed/ir.rs`](../../src/adapter/typed/ir.rs)):
+  replace the bail sites for `TypeDefKind::Resource` / `Handle` /
+  `Future` / `Stream` and `Type::ErrorContext` (top-level and
+  field-position) with mappings to generated Rust shim types.
+- **Strategy synthesis**: pass-through (handle in args, propagated to
+  the inner call) unblocks the walking strategies (redact-strings,
+  normalize-strings) and the result-typed strategies (retry, timeout)
+  on interfaces that mention handles. Synthesis (mock/replay returning
+  a fresh handle) is the harder path; for resources, port the local
+  proxy-component PoC at `../../research/proxy-component`, swapping
+  WAVE for cells. Future/stream synthesis would need host primitives;
+  error-context synthesis awaits the wasmtime cross-component lift
+  fix.
 
 **Design discipline for v1 to keep v2 additive:**
 
 1. Trait bounds on the strategy traits stay minimal (no `Clone`, no
    `Hash`). Per-strategy bounds go on impl where-clauses.
-2. The `WitTyped` derive (planned) is designed to accommodate resource
+2. The `WitTyped` derive (planned) is designed to accommodate handle
    types even if the value-typed substrate emits no impls for them.
 3. Codegen template iterates over `(interfaces, functions)` AND
-   `(interfaces, resources, methods)` from v1, with the resource list
+   `(interfaces, handles, methods)` from v1, with the handles list
    always empty. v2 fills it.
 4. Composition wiring treats "interfaces to rewire" as a list-of-one
    in v1, list-of-many in v2.
-5. Trace format already supports `cell::resource-handle` cells from
-   tier-2; no v1 changes needed.
+5. Trace format already supports `cell::resource-handle`,
+   `cell::future-handle`, `cell::stream-handle`, and
+   `cell::error-context-handle` cells from tier-2; no v1 changes
+   needed.
 
 ## `on_subgraph`: how this substrate consumes it
 
@@ -277,7 +330,9 @@ contribution.
 - [proxy-component](https://github.com/chenyan2002/proxy-component):
   prior art. Uses WAVE wire format and `wrapped-` namespace +
   `MockedResource` pattern. splicer adopts the structural approach,
-  switches wire to cells.
+  switches wire to cells. Local PoC checkout at
+  `../../research/proxy-component` (relative to the splicer repo) is
+  the runnable reference when porting the pattern.
 - `wit/common/world.wit`: cell representation that flows end-to-end.
 - `src/adapter/typed/`: shipped codegen + cargo build pipeline.
 - `splicer-tool-sdk/`: home for `TransformStrategy`,
