@@ -120,15 +120,86 @@ service-comp.handle (async-WIT, suspendable)
 
 The sync→async bridge is the only sync-lifted component. Its body
 does `canon lower` (sync, no async modifier) onto the async-WIT
-mirror — the canon ABI defines this as the caller blocking while
-wasmtime's stackful-async runtime drives the callee on a fiber.
-The bridge never tries to canon-async-wait, so no sync-task
+async mirror — the canon ABI defines this as the caller blocking
+while wasmtime's stackful-async runtime drives the callee on a
+fiber. The bridge never tries to canon-async-wait, so no sync-task
 suspension is ever attempted. The middleware adapter is async-WIT
 lifted, so its hook bodies can suspend freely.
 
 Cost: a week. Adds one extra component per spliced sync-WIT site,
 plus the codegen template for the bridge. Splicer's "any
 middleware on any interface" claim becomes true again.
+
+#### Resource-bearing sync targets
+
+The async-WIT mirror synthesizer pushes a new package whose
+interface redeclares each function as `async func` and shares
+named types from the original via `use orig.{...}`. That covers
+freestanding sync functions on records, variants, lists, etc.
+It does **not** cover resource-bound functions (methods, statics,
+constructors) on the target interface, for two reasons:
+
+1. WIT syntax requires methods/constructors/statics inside a
+   `resource { … }` block — they can't be redeclared as
+   freestanding `[method]foo.bar: async func(...)` at the
+   interface level.
+2. Redeclaring the resource in the async mirror's `resource { … }`
+   block creates a **new** resource type with its own identity.
+   Runtime handle traffic between the bridge (which sees
+   `host::foo`) and the adapter (which sees `wrapped::foo`) would
+   be rejected — the same wedge `require_no_inline_resources`
+   already guards against at `src/adapter/abi/emit.rs`.
+
+The async mirror synth bails on resource-bound functions with a
+message pointing here.
+
+A working recipe exists in [`research/proxy-component`][proxy]: it
+wraps a whole component with a sync record/replay/fuzz proxy and
+mediates resource identity across the boundary by:
+
+- Cloning the entire target package into a `wrapped-<ns>:<pkg>`
+  namespace via `WitPrinter::print_package` after renaming
+  `package_names` and every `pkg.name.namespace` in a Resolve clone
+  (no hand-written WIT text — methods/constructors/statics inside
+  `resource { … }` blocks come along for free).
+- Synthesizing a `proxy:conversion/conversion` interface declaring
+  one `wrap-<R>` and one `unwrap-<R>` per resource type that
+  appears in target signatures:
+
+  ```wit
+  package proxy:conversion;
+  interface conversion {
+      use wasi:foo/bar.{client as host-client};
+      use wrapped-wasi:foo/bar.{client as wrapped-client};
+      get-wrapped-client: func(x: host-client) -> wrapped-client;
+      get-host-client:    func(x: wrapped-client) -> host-client;
+  }
+  ```
+
+- Implementing the conversion functions as **no-op handle
+  reinterprets**. Resource handles are u32 indices at the canon
+  ABI; the "type" is purely a static-typing decoration, so a
+  function that takes `host-client` and returns `wrapped-client`
+  lowers to `func(i32) -> i32` with body `local.get 0; return`.
+  The canon ABI carries the identity bookkeeping; the wasm body
+  is trivial.
+
+Porting this into the bridge would mean:
+
+1. Replace the function-by-function WIT-text async mirror in
+   `src/adapter/abi/async_mirror.rs` with a `WitPrinter`-based
+   whole-package clone-and-rename.
+2. Have the bridge component additionally import the conversion
+   interface and emit one trivial passthrough body per
+   `wrap-<R>` / `unwrap-<R>`.
+3. Wire the conversion interface as a self-export so the bridge
+   satisfies its own import.
+
+Roughly doubles the surface the bridge covers (resource-bearing
+sync targets join the supported set) at a cost of one extra
+WIT-clone helper plus per-resource wasm passthroughs in the bridge.
+
+[proxy]: https://github.com/chenyan2002/proxy-component
 
 ### Option 3 — make wasmtime allow sync to suspend
 
