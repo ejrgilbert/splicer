@@ -17,6 +17,7 @@
 use anyhow::Context;
 
 mod abi;
+mod async_mirror;
 #[cfg(test)]
 mod fuzz_common;
 mod indices;

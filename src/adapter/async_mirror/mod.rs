@@ -1,11 +1,7 @@
-//! Synthesize an async-WIT mirror of a sync-WIT target interface.
-//!
-//! The async mirror lives in a fresh `splicer:async-mirror-<hash>`
-//! package and shares the original interface's named types via `use`.
-//! Every function from the original interface is re-declared as
-//! `async func` (same params, same result). The async mirror is the
-//! WIT surface that the sync→async bridge component lowers onto, and
-//! that async-mirror-lifted adapters lift from.
+//! Async-WIT mirror synthesis and the sync→async bridge component
+//! that uses it.
+
+pub(crate) mod bridge;
 
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::WitPrinter;
@@ -67,7 +63,7 @@ pub(crate) fn synthesize_async_mirror(
 
     let type_names: Vec<String> = resolve.interfaces[iface_id].types.keys().cloned().collect();
 
-    let mirror_pkg_name = format!("splicer:async-mirror-{}@0.0.1", short_hash_8hex(&qualified));
+    let mirror_pkg_name = format!("splicer:async-mirror-{}@0.0.1", short_hash_hex(&qualified));
     let mut wit = format!("package {mirror_pkg_name};\n\n");
     wit.push_str(&format!("interface {iface_name} {{\n"));
     if !type_names.is_empty() {
@@ -112,13 +108,12 @@ pub(crate) fn synthesize_async_mirror(
     Ok((mirror_iface_id, mirror_qualified))
 }
 
-#[allow(dead_code)]
-fn short_hash_8hex(s: &str) -> String {
+pub(crate) fn short_hash_hex(s: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
-    format!("{:08x}", h.finish() as u32)
+    format!("{:016x}", h.finish())
 }
 
 #[cfg(test)]

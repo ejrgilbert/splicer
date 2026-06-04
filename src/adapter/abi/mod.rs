@@ -16,7 +16,6 @@
 //!   pointer global, `cabi_realloc`, `_initialize`, type
 //!   conversions). Used by both tier-1 and tier-2 emit modules.
 
-pub(super) mod async_mirror;
 mod bindgen;
 pub(super) mod canon_async;
 mod compat;
