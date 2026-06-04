@@ -34,7 +34,7 @@ use super::super::abi::emit::{
     emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc,
     emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
     emit_populate_call_id, emit_resource_drop_imports, emit_wrapper_return, empty_function,
-    find_imported_hook, func_has_top_level_handle_param, require_indirect_params_supported_shape,
+    find_imported_hook, require_gate_compatible_func, require_indirect_params_supported_shape,
     require_no_inline_resources, synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset,
     CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
@@ -119,23 +119,8 @@ fn require_supported_case(
     }
     require_no_inline_resources(resolve, target_iface)?;
     for (name, func) in &iface.functions {
-        if has_gate && func.result.is_some() {
-            bail!(
-                "Function '{name}' returns a value but the middleware exports \
-                 `should-call`. Tier-1 `gate` is only supported for \
-                 void-returning functions because the adapter cannot synthesize \
-                 a return value when the call is skipped."
-            );
-        }
-        if has_gate && func_has_top_level_handle_param(resolve, func) {
-            bail!(
-                "Function '{name}' has a resource-handle parameter, but the \
-                 middleware exports `should-call`. Tier-1 `gate` is not \
-                 supported for functions with `own<R>` / `borrow<R>` params \
-                 today: the skip path would leak owned handles and violate \
-                 the canon-ABI's borrow-drop invariant. Drop the `gate` \
-                 hook for this interface, or remove the handle params."
-            );
+        if has_gate {
+            require_gate_compatible_func(resolve, name, func, "1")?;
         }
         // Funcs whose params overflow the indirect-params cap (4 for
         // async, 16 for sync) canon-lower with `indirect_params = true`

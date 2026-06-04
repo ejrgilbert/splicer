@@ -1145,13 +1145,7 @@ pub(crate) fn collect_borrow_drops(resolve: &Resolve, func: &WitFunction) -> Vec
 /// True iff any top-level param of `func` is a resource handle
 /// (`own<R>` or `borrow<R>`), after following type aliases. Mirrors
 /// the top-level-only scope of [`collect_borrow_drops`].
-///
-/// Used by the `gate` precondition: when the gate hook skips the
-/// downstream call, owned handles would leak and borrows would
-/// violate the canon-ABI's "every lifted borrow is dropped on
-/// exit" invariant. The simplest sound fix is to refuse the
-/// pairing.
-pub(crate) fn func_has_top_level_handle_param(resolve: &Resolve, func: &WitFunction) -> bool {
+fn func_has_top_level_handle_param(resolve: &Resolve, func: &WitFunction) -> bool {
     func.params
         .iter()
         .any(|p| top_level_is_handle(resolve, &p.ty))
@@ -1166,6 +1160,29 @@ fn top_level_is_handle(resolve: &Resolve, ty: &Type) -> bool {
         TypeDefKind::Type(inner) => top_level_is_handle(resolve, inner),
         _ => false,
     }
+}
+
+/// Per-function `gate` precondition.
+pub(crate) fn require_gate_compatible_func(
+    resolve: &Resolve,
+    name: &str,
+    func: &WitFunction,
+    tier_label: &str,
+) -> Result<()> {
+    if func.result.is_some() {
+        bail!(
+            "Tier-{tier_label} `gate` requires void-returning functions; \
+             '{name}' has a result. The skip path can't synthesize one."
+        );
+    }
+    if func_has_top_level_handle_param(resolve, func) {
+        bail!(
+            "Tier-{tier_label} `gate` doesn't support resource-handle params; \
+             '{name}' has one. Skipping would leak owned handles or violate \
+             the canon-ABI borrow-drop rule."
+        );
+    }
+    Ok(())
 }
 
 /// Follow `TypeDefKind::Type` aliases to the underlying definition

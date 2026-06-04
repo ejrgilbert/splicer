@@ -25,7 +25,7 @@ use wit_parser::{
 
 use super::abi::emit::{
     collect_borrow_drops, emit_data_section, emit_export_section, emit_memory_and_globals,
-    func_has_top_level_handle_param, require_indirect_params_supported_shape,
+    require_gate_compatible_func, require_indirect_params_supported_shape,
     require_no_inline_resources, synthesize_adapter_world_wit, BlobSlice,
 };
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
@@ -135,21 +135,8 @@ fn require_supported_case(
     // params >16 flat — both flip the wrapper / handler to
     // pass-by-record on the import side.
     for (name, func) in &iface.functions {
-        // Mirrors tier-1: a `gate` hook that skips the downstream call
-        // leaves the adapter holding the question of what to return.
-        // Refuse the pairing instead of synthesizing a value.
-        if has_gate && func.result.is_some() {
-            bail!(
-                "Tier-2 `gate` requires void-returning functions; '{name}' \
-                 has a result. The skip path can't synthesize one."
-            );
-        }
-        if has_gate && func_has_top_level_handle_param(resolve, func) {
-            bail!(
-                "Tier-2 `gate` doesn't support resource-handle params; '{name}' \
-                 has one. Skipping would leak owned handles or violate the \
-                 canon-ABI borrow-drop rule."
-            );
+        if has_gate {
+            require_gate_compatible_func(resolve, name, func, "2")?;
         }
         let is_async = func.kind.is_async();
         let variant = if is_async {
