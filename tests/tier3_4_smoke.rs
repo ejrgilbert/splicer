@@ -41,6 +41,23 @@ const TIER3_TARGET_WIT: &str = r#"
     }
 "#;
 
+// Tier-3 with an `error-context` arg: exercises handle pass-
+// through. The IR carries the arg as
+// `WitTypeRef::Handle(HandleRef::ErrorContext)`, the args struct
+// renders an `ErrorContext` field, and emit_wit_typed suppresses
+// the args-struct `WitTyped` impl. Pass-through hello-tier3 has no
+// `Args: WitTyped` bound, so the wrapper compiles end-to-end.
+const TIER3_EC_TARGET_WIT: &str = r#"
+    package smoke:tier3-ec@0.1.0;
+    interface ops {
+        process: async func(ec: error-context);
+    }
+    world tier3-ec-smoke {
+        export ops;
+        import ops;
+    }
+"#;
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -117,6 +134,23 @@ fn hello_tier3_builds_to_a_valid_component() {
         TIER3_TARGET_WIT,
         "tier3-smoke",
         "smoke:tier3/ops@0.1.0",
+        Behavior::Transform,
+        "hello-tier3",
+        "HelloTier3",
+    );
+}
+
+#[test]
+#[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+fn hello_tier3_with_error_context_arg_builds_to_a_valid_component() {
+    // Compile-only bar: cross-component `error-context` lift is
+    // broken in wasmtime <=44, so a fully-spliced runtime run isn't
+    // expected to work yet. What this test catches is that the wrapper
+    // crate codegen + cargo build remain green for handle-typed args.
+    build_and_validate(
+        TIER3_EC_TARGET_WIT,
+        "tier3-ec-smoke",
+        "smoke:tier3-ec/ops@0.1.0",
         Behavior::Transform,
         "hello-tier3",
         "HelloTier3",

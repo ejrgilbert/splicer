@@ -314,6 +314,44 @@ fn matrix_virtualize_behavior() {
 }
 
 #[test]
+fn matrix_error_context_arg_pass_through() {
+    // `error-context` in arg position lifts through the IR as
+    // `WitTypeRef::Handle(HandleRef::ErrorContext)`, renders to the
+    // wit-bindgen async-support `ErrorContext` Rust type, and
+    // suppresses the args-struct `WitTyped` impl (handles aren't
+    // `WitTyped`). Pass-through Transform strategies still work
+    // because their dispatch doesn't bound `Args: WitTyped`.
+    let out = generate_for_wit(
+        r#"
+            package matrix:ec@0.1.0;
+            interface ops {
+                process: async func(ec: error-context);
+            }
+            world w { export ops; }
+        "#,
+        "w",
+        "matrix:ec/ops@0.1.0",
+        "bindings::matrix::ec::ops::process",
+        Behavior::Transform,
+    );
+    assert!(
+        out.lib_rs.contains("ErrorContext"),
+        "expected ErrorContext-typed field in args struct:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        out.lib_rs.contains("pub struct OpsProcessArgs"),
+        "expected OpsProcessArgs struct decl:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !out.lib_rs.contains("WitTyped for OpsProcessArgs"),
+        "args struct with handle-typed field must NOT get a WitTyped impl:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
 fn matrix_multiple_exported_interfaces() {
     // Two exported interfaces in one world. Exercises the per-Guest
     // loop in `emit_guest` and the multi-impl assembly in

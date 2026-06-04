@@ -36,17 +36,24 @@ use quote::quote;
 
 use super::ir::{EnumCase, FlagMember, NamedKind, NamedType, RecordField, VariantCase};
 
-/// Emit one `WitTyped` impl block per [`NamedType`].
+/// Emit one `WitTyped` impl block per [`NamedType`]. Args records
+/// carrying a handle-typed field emit no impl: handles aren't `WitTyped`,
+/// so the impl couldn't compile.
 pub fn emit_wit_typed_impls(types: &[NamedType]) -> Vec<TokenStream> {
-    types.iter().map(emit_one).collect()
+    types.iter().filter_map(emit_one).collect()
 }
 
-fn emit_one(t: &NamedType) -> TokenStream {
+fn emit_one(t: &NamedType) -> Option<TokenStream> {
     match &t.kind {
-        NamedKind::Record { fields } => emit_record(t, fields),
-        NamedKind::Variant { cases } => emit_variant(t, cases),
-        NamedKind::Enum { cases } => emit_enum(t, cases),
-        NamedKind::Flags { members } => emit_flags(t, members),
+        NamedKind::Record { fields } => {
+            if fields.iter().any(|f| f.ty.contains_handle()) {
+                return None;
+            }
+            Some(emit_record(t, fields))
+        }
+        NamedKind::Variant { cases } => Some(emit_variant(t, cases)),
+        NamedKind::Enum { cases } => Some(emit_enum(t, cases)),
+        NamedKind::Flags { members } => Some(emit_flags(t, members)),
     }
 }
 

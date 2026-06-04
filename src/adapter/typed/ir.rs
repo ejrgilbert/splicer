@@ -6,9 +6,6 @@
 //! [`BindingsIndex`]. Per-method args structs are synthesized into
 //! the same IR so the emitter dispatches on a single [`NamedKind`]
 //! match.
-//!
-//! Scope is value-typed WIT — resources, futures, streams, and
-//! handles get rejected loudly at build time.
 
 use std::collections::HashSet;
 
@@ -201,7 +198,33 @@ pub enum WitTypeRef {
     },
     Tuple(Vec<WitTypeRef>),
     Named(NamedRef),
+    Handle(HandleRef),
 }
+
+/// Categorizes the four canonical-ABI handle kinds.
+#[allow(dead_code)]
+pub enum HandleRef {
+    ErrorContext,
+    Future(Box<WitTypeRef>),
+    Stream(Box<WitTypeRef>),
+    ResourceOwn(NamedRef),
+    ResourceBorrow(NamedRef),
+}
+
+impl HandleRef {
+    fn to_tokens(&self) -> TokenStream {
+        match self {
+            HandleRef::ErrorContext => quote!(::wit_bindgen::rt::async_support::ErrorContext),
+            HandleRef::Future(_)
+            | HandleRef::Stream(_)
+            | HandleRef::ResourceOwn(_)
+            | HandleRef::ResourceBorrow(_) => {
+                unreachable!("handle kind not yet supported")
+            }
+        }
+    }
+}
+
 impl WitTypeRef {
     /// Render as Rust source. E.g. `u32`, `Vec<u32>`,
     /// `Option<String>`, `Result<u32, String>`, `(u32, String)`,
@@ -240,6 +263,24 @@ impl WitTypeRef {
             WitTypeRef::Named(NamedRef { path, rust_ident }) => {
                 bindings_path_tokens(path, Some(rust_ident))
             }
+            WitTypeRef::Handle(h) => h.to_tokens(),
+        }
+    }
+
+    /// True if this type tree mentions any [`HandleRef`]. Used by
+    /// the emitter to suppress `WitTyped` impl emission when a
+    /// synthesized args struct carries a handle (handles aren't
+    /// `WitTyped`).
+    pub fn contains_handle(&self) -> bool {
+        match self {
+            WitTypeRef::Primitive(_) | WitTypeRef::Named(_) => false,
+            WitTypeRef::Handle(_) => true,
+            WitTypeRef::List(inner) | WitTypeRef::Option(inner) => inner.contains_handle(),
+            WitTypeRef::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| t.contains_handle())
+                    || err.as_ref().is_some_and(|t| t.contains_handle())
+            }
+            WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_handle()),
         }
     }
 }
@@ -444,7 +485,7 @@ fn type_to_ref(resolve: &Resolve, ifaces: &[IfaceEntry], ty: &Type) -> Result<Wi
         Type::F64 => WitTypeRef::Primitive(Prim::F64),
         Type::Char => WitTypeRef::Primitive(Prim::Char),
         Type::String => WitTypeRef::Primitive(Prim::String),
-        Type::ErrorContext => bail!("error-context type not supported"),
+        Type::ErrorContext => WitTypeRef::Handle(HandleRef::ErrorContext),
         Type::Id(id) => {
             let td = &resolve.types[*id];
             // Structural composites are rendered inline; named WIT
