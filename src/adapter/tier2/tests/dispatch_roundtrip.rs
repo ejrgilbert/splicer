@@ -2073,7 +2073,7 @@ fn dispatch_module_with_gate_and_nonvoid_bails() {
     .expect_err("gate on a non-void fn must bail");
     let msg = err.to_string();
     assert!(
-        msg.contains("should-call"),
+        msg.contains("`gate`"),
         "bail should call out the gate hook; got: {msg}",
     );
     assert!(

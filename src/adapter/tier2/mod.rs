@@ -140,20 +140,15 @@ fn require_supported_case(
         // Refuse the pairing instead of synthesizing a value.
         if has_gate && func.result.is_some() {
             bail!(
-                "Function '{name}' returns a value but the middleware exports \
-                 `should-call`. Tier-2 `gate` is only supported for \
-                 void-returning functions because the adapter cannot synthesize \
-                 a return value when the call is skipped."
+                "Tier-2 `gate` requires void-returning functions; '{name}' \
+                 has a result. The skip path can't synthesize one."
             );
         }
         if has_gate && func_has_top_level_handle_param(resolve, func) {
             bail!(
-                "Function '{name}' has a resource-handle parameter, but the \
-                 middleware exports `should-call`. Tier-2 `gate` is not \
-                 supported for functions with `own<R>` / `borrow<R>` params \
-                 today: the skip path would leak owned handles and violate \
-                 the canon-ABI's borrow-drop invariant. Drop the `gate` \
-                 hook for this interface, or remove the handle params."
+                "Tier-2 `gate` doesn't support resource-handle params; '{name}' \
+                 has one. Skipping would leak owned handles or violate the \
+                 canon-ABI borrow-drop rule."
             );
         }
         let is_async = func.kind.is_async();
