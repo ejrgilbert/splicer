@@ -25,10 +25,10 @@ emit a WebAssembly Component binary that:
 - Re-exports the target interface unchanged (drop-in replacement for
   the upstream caller).
 - Imports the target interface from a handler-providing component.
-- Imports the middleware's hooks (`before` / `after` / `blocking`
-  for tier-1; `before` / `after` for tier-2).
+- Imports the middleware's hooks (`before` / `after` / `gate` for
+  tier-1 or tier-2).
 - For each function in the target interface, wraps it with the
-  hooks' before/after/blocking phases, handling the canonical-ABI
+  hooks' before/after/gate phases, handling the canonical-ABI
   lift/lower and async machinery transparently.
 
 There are two generators with the same outer shape but different
@@ -200,7 +200,7 @@ and the handler import share the same flat sig (same
 lower, no copy through memory for the payload. Static memory holds
 only call-identity bookkeeping (interface + function names, call-id
 buffer), retptr scratch per function whose result needs one, and
-hook plumbing (canon-async event slot, should-block retptr). Hooks
+hook plumbing (canon-async event slot, should-call retptr). Hooks
 observe call-id metadata only — they never see param or result
 values.
 

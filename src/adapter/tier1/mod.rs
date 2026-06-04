@@ -1,5 +1,5 @@
 //! Tier-1 adapter generator: wraps a middleware component with
-//! before/after/blocking hooks and re-exports the wrapped handler's
+//! before/after/gate hooks and re-exports the wrapped handler's
 //! target interface.
 //!
 //! Cross-tier infrastructure (canonical-ABI compat helpers, shared

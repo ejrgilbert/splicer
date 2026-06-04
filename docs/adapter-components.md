@@ -101,7 +101,7 @@ separate sync code path.
 ### Adapter behavior when a middleware hook traps
 
 If a middleware's hook (any tier's `on-call`, `on-return`,
-`should-block`, etc.) itself traps — e.g. the middleware panics,
+`should-call`, etc.) itself traps — e.g. the middleware panics,
 dereferences out-of-bounds memory, or otherwise hits an unrecoverable
 error — the trap propagates as a wasm trap through the adapter and
 on up to the host. The adapter does nothing special; the runtime's
@@ -120,7 +120,7 @@ justifies it.
 A given middleware component must implement **exactly one tier**.
 Within that tier, any non-empty subset of the tier's interfaces is
 fine (e.g. a tier-1 middleware can export any combination of `before` /
-`after` / `blocking`), but exporting interfaces from multiple tier
+`after` / `gate`), but exporting interfaces from multiple tier
 packages is rejected at splice time.
 
 This is by design, not a missing feature. Higher tiers strictly subsume

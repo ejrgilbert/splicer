@@ -30,6 +30,11 @@ use super::{AfterSetup, FuncClassified, FuncDispatch};
 const EVENT_SLOT_SIZE: u32 = 8;
 const EVENT_SLOT_ALIGN: u32 = 4;
 
+/// Bool retptr slot for `gate::should-call`. Canonical ABI lowers
+/// `bool` as i32; the wrapper reads it via `i32.load`.
+const GATE_RESULT_SIZE: u32 = 4;
+const GATE_RESULT_ALIGN: u32 = 4;
+
 // ─── Layout-phase size budget ─────────────────────────────────────
 //
 // Wasm encodes static-data offsets as `i32.const`, so every offset
@@ -138,8 +143,13 @@ fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideDa
 pub(super) struct StaticDataPlan {
     pub(super) bump_start: u32,
     pub(super) event_ptr: i32,
-    /// On-call indirect-params scratch; `Some` iff before-hook is wired.
+    /// Args-shape indirect-params scratch; `Some` iff `before` or
+    /// `gate` is wired. Both hooks share the same `{ call, args }`
+    /// record layout, so a single buffer serves both call sites.
     pub(super) hook_params_ptr: Option<u32>,
+    /// Bool retptr slot for `gate::should-call`; `Some` iff gate is
+    /// wired.
+    pub(super) gate_result_ptr: Option<i32>,
     pub(super) data_segments: Vec<(u32, Vec<u8>)>,
 }
 
@@ -495,12 +505,18 @@ pub(super) fn lay_out_static_memory(
             None => vec![None; n_funcs],
         };
 
-    // Scratch slots: event record + on-call indirect-params buffer.
+    // Scratch slots: event record + args-shape indirect-params buffer
+    // (shared by before + gate) + gate result-ptr bool slot.
     let event_ptr = layout.reserve_scratch(EVENT_SLOT_ALIGN, EVENT_SLOT_SIZE) as i32;
     let hook_params_ptr = schema
         .before_hook
         .as_ref()
+        .or(schema.gate_hook.as_ref())
         .map(|h| layout.reserve_scratch(h.params_layout.align, h.params_layout.size));
+    let gate_result_ptr = schema
+        .gate_hook
+        .as_ref()
+        .map(|_| layout.reserve_scratch(GATE_RESULT_ALIGN, GATE_RESULT_SIZE) as i32);
 
     // Per-fn retptr scratch (only when sig uses one).
     let retptr_offsets: Vec<Option<i32>> = per_func
@@ -663,6 +679,7 @@ pub(super) fn lay_out_static_memory(
             bump_start,
             event_ptr,
             hook_params_ptr,
+            gate_result_ptr,
             data_segments,
         },
     ))

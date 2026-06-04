@@ -34,9 +34,9 @@ use super::super::abi::emit::{
     emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc,
     emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
     emit_populate_call_id, emit_resource_drop_imports, emit_wrapper_return, empty_function,
-    find_imported_hook, require_indirect_params_supported_shape, require_no_inline_resources,
-    synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset, CallIdLayout, GlobalIndices,
-    HookImport, WrapperExport,
+    find_imported_hook, func_has_top_level_handle_param, require_indirect_params_supported_shape,
+    require_no_inline_resources, synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset,
+    CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, LocalsBuilder};
@@ -52,7 +52,7 @@ pub(crate) fn build_adapter(
     target_interface: &str,
     has_before: bool,
     has_after: bool,
-    has_blocking: bool,
+    has_gate: bool,
     split_bytes: &[u8],
     common_world_wit: &str,
     tier1_world_wit: &str,
@@ -60,7 +60,7 @@ pub(crate) fn build_adapter(
     let mut resolve = decode_input_resolve(split_bytes)?;
     let target_iface = find_target_interface(&resolve, target_interface)?;
 
-    require_supported_case(&resolve, target_iface, has_blocking)?;
+    require_supported_case(&resolve, target_iface, has_gate)?;
 
     resolve
         .push_str("splicer-common.wit", common_world_wit)
@@ -75,7 +75,7 @@ pub(crate) fn build_adapter(
                 ADAPTER_WORLD_PACKAGE,
                 ADAPTER_WORLD_NAME,
                 target_interface,
-                &tier1_hook_imports(has_before, has_after, has_blocking),
+                &tier1_hook_imports(has_before, has_after, has_gate),
             ),
         )
         .context("parse synthesized adapter world WIT")?;
@@ -90,7 +90,7 @@ pub(crate) fn build_adapter(
         target_interface,
         has_before,
         has_after,
-        has_blocking,
+        has_gate,
     )?;
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
         .context("embed_component_metadata")?;
@@ -104,13 +104,14 @@ pub(crate) fn build_adapter(
 }
 
 /// Bail on cases the new path doesn't yet handle. Resource-bound
-/// functions need a different dispatch shape; tier-1 blocking on a
-/// non-void func is impossible (the adapter can't synthesize a return
-/// value when the call is skipped) — same constraint legacy enforces.
+/// functions need a different dispatch shape; the tier-1 `gate` hook
+/// on a non-void func is impossible (the adapter can't synthesize a
+/// return value when the call is skipped) — same constraint legacy
+/// enforces.
 fn require_supported_case(
     resolve: &Resolve,
     target_iface: InterfaceId,
-    has_blocking: bool,
+    has_gate: bool,
 ) -> Result<()> {
     let iface = &resolve.interfaces[target_iface];
     if iface.functions.is_empty() {
@@ -118,12 +119,22 @@ fn require_supported_case(
     }
     require_no_inline_resources(resolve, target_iface)?;
     for (name, func) in &iface.functions {
-        if has_blocking && func.result.is_some() {
+        if has_gate && func.result.is_some() {
             bail!(
                 "Function '{name}' returns a value but the middleware exports \
-                 `should-block`. Tier-1 blocking is only supported for \
+                 `should-call`. Tier-1 `gate` is only supported for \
                  void-returning functions because the adapter cannot synthesize \
-                 a return value when the call is blocked."
+                 a return value when the call is skipped."
+            );
+        }
+        if has_gate && func_has_top_level_handle_param(resolve, func) {
+            bail!(
+                "Function '{name}' has a resource-handle parameter, but the \
+                 middleware exports `should-call`. Tier-1 `gate` is not \
+                 supported for functions with `own<R>` / `borrow<R>` params \
+                 today: the skip path would leak owned handles and violate \
+                 the canon-ABI's borrow-drop invariant. Drop the `gate` \
+                 hook for this interface, or remove the handle params."
             );
         }
         // Funcs whose params overflow the indirect-params cap (4 for
@@ -151,10 +162,10 @@ fn require_supported_case(
 
 /// List the active tier-1 hook interfaces as fully-qualified
 /// versioned names (e.g. `"splicer:tier1/before@0.2.0"`), in
-/// before/after/blocking order.
-fn tier1_hook_imports(has_before: bool, has_after: bool, has_blocking: bool) -> Vec<String> {
+/// before/after/gate order.
+fn tier1_hook_imports(has_before: bool, has_after: bool, has_gate: bool) -> Vec<String> {
     use crate::contract::{
-        versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
+        versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_GATE, TIER1_VERSION,
     };
     let mut out = Vec::new();
     if has_before {
@@ -163,8 +174,8 @@ fn tier1_hook_imports(has_before: bool, has_after: bool, has_blocking: bool) -> 
     if has_after {
         out.push(versioned_interface(TIER1_AFTER, TIER1_VERSION));
     }
-    if has_blocking {
-        out.push(versioned_interface(TIER1_BLOCKING, TIER1_VERSION));
+    if has_gate {
+        out.push(versioned_interface(TIER1_GATE, TIER1_VERSION));
     }
     out
 }
@@ -258,9 +269,9 @@ struct TypeIndices {
     task_return_ty: Vec<Option<u32>>,
     /// Before/after hook sig: `(ptr, len) -> i32`.
     hook_ty: u32,
-    /// Blocking hook sig: `(ptr, len, retptr) -> i32`. `Some` iff
-    /// blocking is active.
-    block_hook_ty: Option<u32>,
+    /// Gate hook sig: `(ptr, len, retptr) -> i32`. `Some` iff `gate`
+    /// is active.
+    gate_hook_ty: Option<u32>,
     init_ty: u32,
     cabi_post_ty: u32,
     cabi_realloc_ty: u32,
@@ -277,8 +288,8 @@ struct FuncIndices {
     imp_handler: Vec<u32>,
     imp_before: Option<u32>,
     imp_after: Option<u32>,
-    /// `should-block` import; `Some` iff blocking is active.
-    imp_block: Option<u32>,
+    /// `should-call` import; `Some` iff `gate` is active.
+    imp_gate: Option<u32>,
     imp_task_return: Vec<Option<u32>>,
     wrapper_base: u32,
     init: u32,
@@ -286,9 +297,9 @@ struct FuncIndices {
     cabi_post: Vec<Option<u32>>,
     /// Always `Some` — `cabi_realloc` is unconditionally exported.
     cabi_realloc: Option<u32>,
-    /// Memory offset of the bool slot `should-block` writes its
-    /// retptr into. `Some` iff blocking is active.
-    block_result_ptr: Option<i32>,
+    /// Memory offset of the bool slot `should-call` writes its retptr
+    /// into. `Some` iff `gate` is active.
+    gate_result_ptr: Option<i32>,
     async_runtime: Option<AsyncFuncs>,
     /// `[resource-drop]<R>` import per resource referenced by a borrow
     /// param across `per_func`.
@@ -305,7 +316,7 @@ fn build_dispatch_module(
     target_interface_name: &str,
     has_before: bool,
     has_after: bool,
-    has_blocking: bool,
+    has_gate: bool,
 ) -> Result<Vec<u8>> {
     let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
         .functions
@@ -314,8 +325,8 @@ fn build_dispatch_module(
     // Any hook OR any async target needs the canon-async builtins
     // to await its subtask handle.
     let any_async_target = funcs.iter().any(|f| f.kind.is_async());
-    let needs_async_runtime = has_before || has_after || has_blocking || any_async_target;
-    let any_hook = has_before || has_after || has_blocking;
+    let needs_async_runtime = has_before || has_after || has_gate || any_async_target;
+    let any_hook = has_before || has_after || has_gate;
     let mut sizes = SizeAlign::default();
     sizes.fill(resolve);
     // The [`CallIdLayout`] is needed iff any hook is wired (to populate
@@ -332,11 +343,11 @@ fn build_dispatch_module(
         &funcs,
         SlotReservations {
             needs_async_runtime,
-            has_blocking,
+            has_gate,
             callid_layout,
         },
     )?;
-    let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after, has_blocking);
+    let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after, has_gate);
     let mut idx = DispatchIndices::new();
 
     let mut module = Module::new();
@@ -348,7 +359,7 @@ fn build_dispatch_module(
         &type_idx,
         &hook_imports,
         plan.event_ptr,
-        plan.block_result_ptr,
+        plan.gate_result_ptr,
         resolve,
     );
     let func_idx =
@@ -403,8 +414,8 @@ struct DispatchPlan {
     name_blob: Vec<u8>,
     /// `Some` iff `SlotReservations::needs_async_runtime`.
     event_ptr: Option<i32>,
-    /// `Some` iff `SlotReservations::has_blocking`.
-    block_result_ptr: Option<i32>,
+    /// `Some` iff `SlotReservations::has_gate`.
+    gate_result_ptr: Option<i32>,
     /// `Some` iff any hook is wired (i.e. `callid_layout` is `Some`).
     call_id_buf: Option<CallIdBuf>,
     bump_start: u32,
@@ -417,9 +428,9 @@ struct SlotReservations {
     /// Reserve the canon-async event record. Set when any hook is
     /// wired or the target has any async function.
     needs_async_runtime: bool,
-    /// Reserve the block-result scratch. Set when the target has any
-    /// blocking function.
-    has_blocking: bool,
+    /// Reserve the gate-result scratch. Set when the middleware
+    /// exports the tier-1 `gate` interface.
+    has_gate: bool,
     /// `Some` iff any hook is wired — drives the call-id buffer's
     /// size + alignment.
     callid_layout: Option<CallIdLayout>,
@@ -552,9 +563,7 @@ fn compute_func_dispatches(
     let event_ptr = slots
         .needs_async_runtime
         .then(|| layout.alloc_event_slot() as i32);
-    let block_result_ptr = slots
-        .has_blocking
-        .then(|| layout.alloc_block_result() as i32);
+    let gate_result_ptr = slots.has_gate.then(|| layout.alloc_gate_result() as i32);
     let call_id_buf = slots.callid_layout.map(|callid_layout| {
         let offset = layout.alloc_aligned(callid_layout.size(), callid_layout.align()) as i32;
         CallIdBuf {
@@ -570,24 +579,24 @@ fn compute_func_dispatches(
         per_func,
         name_blob,
         event_ptr,
-        block_result_ptr,
+        gate_result_ptr,
         call_id_buf,
         bump_start,
     })
 }
 
 /// Active tier-1 hook imports. `before` / `after` share a common sig
-/// (`(ptr) -> i32`); `blocking` has a retptr param for the bool
+/// (`(ptr) -> i32`); `gate` has a retptr param for the bool
 /// result (`(ptr, retptr) -> i32`).
 struct HookImports {
     before: Option<HookImport>,
     after: Option<HookImport>,
-    blocking: Option<HookImport>,
+    gate: Option<HookImport>,
 }
 
 impl HookImports {
     fn any(&self) -> bool {
-        self.before.is_some() || self.after.is_some() || self.blocking.is_some()
+        self.before.is_some() || self.after.is_some() || self.gate.is_some()
     }
 }
 
@@ -599,10 +608,10 @@ fn collect_hook_imports(
     world_id: wit_parser::WorldId,
     has_before: bool,
     has_after: bool,
-    has_blocking: bool,
+    has_gate: bool,
 ) -> HookImports {
     use crate::contract::{
-        versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_BLOCKING, TIER1_VERSION,
+        versioned_interface, TIER1_AFTER, TIER1_BEFORE, TIER1_GATE, TIER1_VERSION,
     };
     let pick = |active: bool, iface: &str| -> Option<HookImport> {
         active
@@ -618,7 +627,7 @@ fn collect_hook_imports(
     HookImports {
         before: pick(has_before, TIER1_BEFORE),
         after: pick(has_after, TIER1_AFTER),
-        blocking: pick(has_blocking, TIER1_BLOCKING),
+        gate: pick(has_gate, TIER1_GATE),
     }
 }
 
@@ -676,9 +685,9 @@ fn emit_type_section(
     );
     let cabi_realloc_ty = idx.alloc_ty();
 
-    // Blocking hook sig — sourced from the WIT (`should-block:
+    // Gate hook sig — sourced from the WIT (`should-call:
     // async func(name: string) -> bool` lowered → `(ptr, len, retptr) -> i32`).
-    let block_hook_ty = hook_imports.blocking.as_ref().map(|h| {
+    let gate_hook_ty = hook_imports.gate.as_ref().map(|h| {
         types
             .ty()
             .function(val_types(&h.sig.params), val_types(&h.sig.results));
@@ -711,7 +720,7 @@ fn emit_type_section(
         wrapper_ty,
         task_return_ty,
         hook_ty,
-        block_hook_ty,
+        gate_hook_ty,
         init_ty,
         cabi_post_ty,
         cabi_realloc_ty,
@@ -733,7 +742,7 @@ fn emit_imports_section(
     type_idx: &TypeIndices,
     hook_imports: &HookImports,
     event_ptr: Option<i32>,
-    block_result_ptr: Option<i32>,
+    gate_result_ptr: Option<i32>,
     resolve: &Resolve,
 ) -> FuncIndices {
     let mut imports = ImportSection::new();
@@ -765,10 +774,10 @@ fn emit_imports_section(
     };
     let imp_before = hook_imports.before.as_ref().map(&mut import_hook);
     let imp_after = hook_imports.after.as_ref().map(&mut import_hook);
-    let imp_block = hook_imports.blocking.as_ref().map(|hook| {
+    let imp_gate = hook_imports.gate.as_ref().map(|hook| {
         let ty = type_idx
-            .block_hook_ty
-            .expect("block_hook_ty allocated when blocking is active");
+            .gate_hook_ty
+            .expect("gate_hook_ty allocated when gate is active");
         imports.import(&hook.module, &hook.name, EntityType::Function(ty));
         idx.alloc_func()
     });
@@ -795,13 +804,13 @@ fn emit_imports_section(
         imp_handler,
         imp_before,
         imp_after,
-        imp_block,
+        imp_gate,
         imp_task_return,
         wrapper_base: 0,
         init: 0,
         cabi_post: vec![None; per_func.len()],
         cabi_realloc: None,
-        block_result_ptr,
+        gate_result_ptr,
         async_runtime,
         resource_drop,
     }
@@ -862,14 +871,13 @@ fn emit_code_section(
         funcs.len(),
         "FuncDispatch list and WitFunction list must be index-aligned",
     );
-    let blocking =
-        func_idx
-            .imp_block
-            .zip(func_idx.block_result_ptr)
-            .map(|(import_fn, result_ptr)| BlockingConfig {
-                import_fn,
-                result_ptr,
-            });
+    let gate = func_idx
+        .imp_gate
+        .zip(func_idx.gate_result_ptr)
+        .map(|(import_fn, result_ptr)| GateConfig {
+            import_fn,
+            result_ptr,
+        });
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
         if fd.is_async {
@@ -882,7 +890,7 @@ fn emit_code_section(
                 func_idx.imp_handler[i],
                 func_idx.imp_before,
                 func_idx.imp_after,
-                blocking.as_ref(),
+                gate.as_ref(),
                 func_idx.imp_task_return[i].expect("async func must have task.return import"),
                 func_idx
                     .async_runtime
@@ -899,7 +907,7 @@ fn emit_code_section(
                 func_idx.imp_handler[i],
                 func_idx.imp_before,
                 func_idx.imp_after,
-                blocking.as_ref(),
+                gate.as_ref(),
                 func_idx.async_runtime.as_ref(),
                 &func_idx.resource_drop,
                 call_id_wiring,
@@ -917,9 +925,9 @@ fn emit_code_section(
     module.section(&code);
 }
 
-/// `should-block` runtime bundle — the import fn index plus the
+/// `should-call` runtime bundle — the import fn index plus the
 /// memory offset its retptr writes the bool result into.
-struct BlockingConfig {
+struct GateConfig {
     import_fn: u32,
     result_ptr: i32,
 }
@@ -934,7 +942,7 @@ fn emit_wrapper_body(
     imp_handler: u32,
     imp_before: Option<u32>,
     imp_after: Option<u32>,
-    blocking: Option<&BlockingConfig>,
+    gate: Option<&GateConfig>,
     async_runtime: Option<&AsyncFuncs>,
     resource_drop: &HashMap<TypeId, u32>,
     call_id_wiring: Option<CallIdWiring<'_>>,
@@ -948,7 +956,7 @@ fn emit_wrapper_body(
     };
     let result_local = direct_return_type(&fd.export_sig).map(|t| locals.alloc_local(t));
     // Wait-loop scratch (subtask + waitable-set handles); shared
-    // across on-call / on-return / blocking awaits.
+    // across on-call / on-return / gate awaits.
     let wait_locals = async_runtime.map(|_| {
         let st = locals.alloc_local(ValType::I32);
         let ws = locals.alloc_local(ValType::I32);
@@ -966,14 +974,17 @@ fn emit_wrapper_body(
 
     if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
         emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
+        // Buffer contents (iface/fn name + id) are identical across
+        // before / gate / after — populate once up front.
+        populate_hook_call_id(&mut f, &site);
     }
     if let Some(idx) = imp_before {
         emit_hook_call(&mut f, idx, async_runtime, wait_locals, hook_site.unwrap());
     }
-    if let Some(blk) = blocking {
-        emit_blocking_phase(
+    if let Some(g) = gate {
+        emit_gate_phase(
             &mut f,
-            blk,
+            g,
             async_runtime,
             wait_locals,
             None,
@@ -1001,7 +1012,7 @@ fn emit_wrapper_body(
     code.function(&f);
 }
 
-/// Per-callsite bundle for [`emit_hook_call`] / [`emit_blocking_phase`].
+/// Per-callsite bundle for [`emit_hook_call`] / [`emit_gate_phase`].
 #[derive(Clone, Copy)]
 struct HookSite<'a> {
     fd: &'a FuncDispatch,
@@ -1009,34 +1020,42 @@ struct HookSite<'a> {
     id_local: u32,
 }
 
-/// Between on-call and the handler call: populate the call-id buffer,
-/// call `should-block(call_ptr, retptr)`, await, and `return` early
-/// if it's true. Async wrappers call `task.return` first
-/// (`task_return_for_async`); sync void just returns. Non-void
-/// blocking is rejected upstream.
-fn emit_blocking_phase(
+/// Between on-call and the handler call: call
+/// `should-call(call_ptr, retptr)`, await, and `return` early if
+/// it's false (skip the downstream call). The shared call-id buffer
+/// is populated by the wrapper body once before any hook fires; this
+/// helper just pushes the args and awaits. Async wrappers call
+/// `task.return` first (`task_return_for_async`); sync void just
+/// returns. Non-void targets paired with `gate` are rejected upstream.
+fn emit_gate_phase(
     f: &mut Function,
-    blk: &BlockingConfig,
+    gate: &GateConfig,
     async_runtime: Option<&AsyncFuncs>,
     wait_locals: Option<(u32, u32)>,
     task_return_for_async: Option<u32>,
     site: HookSite<'_>,
     bump_reset: BumpReset,
 ) {
-    populate_hook_call_id(f, &site);
     f.instructions().i32_const(site.buf.offset);
-    f.instructions().i32_const(blk.result_ptr);
-    f.instructions().call(blk.import_fn);
-    let art = async_runtime.expect("async_runtime active when blocking is");
+    f.instructions().i32_const(gate.result_ptr);
+    f.instructions().call(gate.import_fn);
+    let art = async_runtime.expect("async_runtime active when gate is");
     let (st, ws) = wait_locals.expect("wait_locals allocated alongside async_runtime");
     f.instructions().local_set(st);
     canon_async::emit_wait_loop(f, st, ws, art);
-    f.instructions().i32_const(blk.result_ptr);
-    f.instructions().i32_load(wasm_encoder::MemArg {
+    f.instructions().i32_const(gate.result_ptr);
+    // Canonical-ABI bool is 1 byte; the slot is i32-sized scratch but
+    // only byte 0 carries the value. Use a byte-load to keep the load
+    // width consistent with the type and the alignment honest.
+    f.instructions().i32_load8_u(wasm_encoder::MemArg {
         offset: 0,
         align: 0,
         memory_index: 0,
     });
+    // `true` (nonzero) → call downstream (fall through). `false` (0)
+    // → skip and return; `i32.eqz` inverts so the `if` arm fires on
+    // the skip path.
+    f.instructions().i32_eqz();
     f.instructions().if_(BlockType::Empty);
     if let Some(tr_fn) = task_return_for_async {
         f.instructions().call(tr_fn);
@@ -1059,7 +1078,7 @@ fn emit_async_wrapper_body(
     imp_handler: u32,
     imp_before: Option<u32>,
     imp_after: Option<u32>,
-    blocking: Option<&BlockingConfig>,
+    gate: Option<&GateConfig>,
     imp_task_return: u32,
     async_runtime: &AsyncFuncs,
     resource_drop: &HashMap<TypeId, u32>,
@@ -1123,6 +1142,9 @@ fn emit_async_wrapper_body(
 
     if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
         emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
+        // Buffer contents (iface/fn name + id) are identical across
+        // before / gate / after — populate once up front.
+        populate_hook_call_id(&mut f, &site);
     }
     if let Some(idx) = imp_before {
         emit_hook_call(
@@ -1133,13 +1155,13 @@ fn emit_async_wrapper_body(
             hook_site.unwrap(),
         );
     }
-    if let Some(blk) = blocking {
-        // Async-with-result + blocking is rejected upstream — reaching
+    if let Some(g) = gate {
+        // Async-with-result + gate is rejected upstream — reaching
         // here means async-void, so `task.return` runs before the early
         // return.
-        emit_blocking_phase(
+        emit_gate_phase(
             &mut f,
-            blk,
+            g,
             Some(async_runtime),
             wait_locals,
             Some(imp_task_return),
@@ -1217,8 +1239,10 @@ fn emit_async_wrapper_body(
     code.function(&f);
 }
 
-/// Populate the shared call-id buffer, push its address, call the
-/// hook (`indirect_params = true`), and await.
+/// Push the shared call-id buffer address, call the hook
+/// (`indirect_params = true`), and await. Caller is responsible for
+/// populating the buffer once up front — its contents are identical
+/// across before / gate / after callsites.
 fn emit_hook_call(
     f: &mut Function,
     hook_idx: u32,
@@ -1226,7 +1250,6 @@ fn emit_hook_call(
     wait_locals: Option<(u32, u32)>,
     site: HookSite<'_>,
 ) {
-    populate_hook_call_id(f, &site);
     f.instructions().i32_const(site.buf.offset);
     let art = async_runtime.expect("async_runtime set when hook imported");
     let (st, ws) = wait_locals.expect("wait_locals allocated with async_runtime");

@@ -7,8 +7,8 @@
 /// observe the lifted values but cannot modify them.
 ///
 /// Any non-empty subset is valid: you can export just `before`, just
-/// `after`, or both.
-package splicer:tier2@0.1.0;
+/// `after`, just `gate`, or any combination.
+package splicer:tier2@0.2.0;
 
 interface before {
     use splicer:common/types@0.2.0.{call-id, field};
@@ -26,7 +26,17 @@ interface after {
     on-return: async func(call: call-id, %result: option<field-tree>);
 }
 
+interface gate {
+    use splicer:common/types@0.2.0.{call-id, field};
+    /// Called before the invocation, with the function's parameters
+    /// lifted into a `list<field>` so policy decisions can inspect them.
+    /// Return `true` to invoke downstream; `false` to skip the call.
+    /// Only supported for void-returning functions today.
+    should-call: async func(call: call-id, args: list<field>) -> bool;
+}
+
 world tier2-middleware {
     export before;
     export after;
+    export gate;
 }

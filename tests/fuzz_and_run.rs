@@ -31,7 +31,7 @@
 //! TODO — composition topology gaps the type-driven fuzzer doesn't reach:
 //!   - fanin over non-trivial result types (current fanin: primitives/strings)
 //!   - mixed sync/async middleware on a single provider
-//!   - blocking middleware (`should-block`) with a non-void handler (rejection path)
+//!   - gate middleware (`should-call`) with a non-void handler (rejection path)
 //!   - adapter chain >3 deep
 //!   - multiple splicer rules on overlapping interface sets
 //!   - middleware targeting subword types or variant-heavy interfaces

@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use wasm_encoder::{
     CodeSection, EntityType, FunctionSection, ImportSection, Module, TypeSection, ValType,
 };
-use wit_parser::abi::WasmSignature;
 use wit_parser::{Function as WitFunction, Resolve, TypeId};
 
 use super::super::abi::canon_async;
@@ -24,6 +23,9 @@ pub(super) struct TypeIndices {
     pub(super) wrapper_ty: Vec<u32>,
     pub(super) before_hook_ty: Option<u32>,
     pub(super) after_hook_ty: Option<u32>,
+    /// Gate-hook sig (`(params_ptr, retptr) -> i32`); `Some` iff gate
+    /// is wired.
+    pub(super) gate_hook_ty: Option<u32>,
     pub(super) init_ty: u32,
     pub(super) cabi_post_ty: u32,
     pub(super) cabi_realloc_ty: u32,
@@ -38,8 +40,7 @@ pub(super) struct TypeIndices {
 pub(super) fn emit_type_section(
     module: &mut Module,
     per_func: &[FuncDispatch],
-    before_hook_sig: Option<&WasmSignature>,
-    after_hook_sig: Option<&WasmSignature>,
+    hooks: &HookImports<'_>,
 ) -> TypeIndices {
     let mut types = TypeSection::new();
     let mut next_ty: u32 = 0;
@@ -72,10 +73,27 @@ pub(super) fn emit_type_section(
         })
         .collect();
 
-    let before_hook_ty = before_hook_sig
-        .map(|sig| alloc_one(&mut types, val_types(&sig.params), val_types(&sig.results)));
-    let after_hook_ty = after_hook_sig
-        .map(|sig| alloc_one(&mut types, val_types(&sig.params), val_types(&sig.results)));
+    let before_hook_ty = hooks.before.map(|h| {
+        alloc_one(
+            &mut types,
+            val_types(&h.sig.params),
+            val_types(&h.sig.results),
+        )
+    });
+    let after_hook_ty = hooks.after.map(|h| {
+        alloc_one(
+            &mut types,
+            val_types(&h.sig.params),
+            val_types(&h.sig.results),
+        )
+    });
+    let gate_hook_ty = hooks.gate.map(|h| {
+        alloc_one(
+            &mut types,
+            val_types(&h.sig.params),
+            val_types(&h.sig.results),
+        )
+    });
     let init_ty = alloc_one(&mut types, vec![], vec![]);
     let cabi_post_ty = alloc_one(&mut types, vec![ValType::I32], vec![]);
     let cabi_realloc_ty = alloc_one(
@@ -115,6 +133,7 @@ pub(super) fn emit_type_section(
         wrapper_ty,
         before_hook_ty,
         after_hook_ty,
+        gate_hook_ty,
         init_ty,
         cabi_post_ty,
         cabi_realloc_ty,
@@ -128,6 +147,8 @@ pub(super) struct FuncIndices {
     pub(super) handler_imp_base: u32,
     pub(super) before_hook_idx: Option<u32>,
     pub(super) after_hook_idx: Option<u32>,
+    /// `gate::should-call` import; `Some` iff gate is wired.
+    pub(super) gate_hook_idx: Option<u32>,
     pub(super) async_funcs: canon_async::AsyncFuncs,
     pub(super) task_return_idx: Vec<Option<u32>>,
     pub(super) wrapper_base: u32,
@@ -137,13 +158,21 @@ pub(super) struct FuncIndices {
     pub(super) resource_drop: HashMap<TypeId, u32>,
 }
 
+/// Optional hook-import descriptors, bundled to keep the
+/// `emit_imports_and_funcs` / `emit_type_section` signatures from
+/// growing one parameter per hook.
+pub(super) struct HookImports<'a> {
+    pub(super) before: Option<&'a HookImport>,
+    pub(super) after: Option<&'a HookImport>,
+    pub(super) gate: Option<&'a HookImport>,
+}
+
 pub(super) fn emit_imports_and_funcs(
     module: &mut Module,
     resolve: &Resolve,
     per_func: &[FuncDispatch],
     ty: &TypeIndices,
-    before_hook: Option<&HookImport>,
-    after_hook: Option<&HookImport>,
+    hooks: HookImports<'_>,
     event_ptr: i32,
 ) -> FuncIndices {
     let mut imports = ImportSection::new();
@@ -169,7 +198,7 @@ pub(super) fn emit_imports_and_funcs(
         || idx.alloc_func(),
     );
 
-    let before_hook_idx = before_hook.map(|h| {
+    let before_hook_idx = hooks.before.map(|h| {
         imports.import(
             &h.module,
             &h.name,
@@ -177,11 +206,22 @@ pub(super) fn emit_imports_and_funcs(
         );
         idx.alloc_func()
     });
-    let after_hook_idx = after_hook.map(|h| {
+    let after_hook_idx = hooks.after.map(|h| {
         imports.import(
             &h.module,
             &h.name,
             EntityType::Function(ty.after_hook_ty.unwrap()),
+        );
+        idx.alloc_func()
+    });
+    let gate_hook_idx = hooks.gate.map(|h| {
+        imports.import(
+            &h.module,
+            &h.name,
+            EntityType::Function(
+                ty.gate_hook_ty
+                    .expect("gate_hook_ty allocated when gate is active"),
+            ),
         );
         idx.alloc_func()
     });
@@ -233,6 +273,7 @@ pub(super) fn emit_imports_and_funcs(
         handler_imp_base,
         before_hook_idx,
         after_hook_idx,
+        gate_hook_idx,
         async_funcs,
         task_return_idx,
         wrapper_base,

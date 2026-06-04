@@ -195,7 +195,7 @@ pub(crate) fn emit_bump_save(f: &mut Function, br: BumpReset) {
 }
 
 /// Restore bump from the snapshot taken by [`emit_bump_save`]. Run
-/// at every exit path (natural end, async pre-`task.return`, blocking
+/// at every exit path (natural end, async pre-`task.return`, gate
 /// early `return_()`, etc.) once the last wrapper-body allocation has
 /// been consumed.
 pub(crate) fn emit_bump_restore(f: &mut Function, br: BumpReset) {
@@ -1140,6 +1140,32 @@ pub(crate) fn collect_borrow_drops(resolve: &Resolve, func: &WitFunction) -> Vec
         flat_idx += flat.to_vec().len() as u32;
     }
     out
+}
+
+/// True iff any top-level param of `func` is a resource handle
+/// (`own<R>` or `borrow<R>`), after following type aliases. Mirrors
+/// the top-level-only scope of [`collect_borrow_drops`].
+///
+/// Used by the `gate` precondition: when the gate hook skips the
+/// downstream call, owned handles would leak and borrows would
+/// violate the canon-ABI's "every lifted borrow is dropped on
+/// exit" invariant. The simplest sound fix is to refuse the
+/// pairing.
+pub(crate) fn func_has_top_level_handle_param(resolve: &Resolve, func: &WitFunction) -> bool {
+    func.params
+        .iter()
+        .any(|p| top_level_is_handle(resolve, &p.ty))
+}
+
+fn top_level_is_handle(resolve: &Resolve, ty: &Type) -> bool {
+    let Type::Id(tid) = ty else {
+        return false;
+    };
+    match &resolve.types[*tid].kind {
+        TypeDefKind::Handle(_) => true,
+        TypeDefKind::Type(inner) => top_level_is_handle(resolve, inner),
+        _ => false,
+    }
 }
 
 /// Follow `TypeDefKind::Type` aliases to the underlying definition

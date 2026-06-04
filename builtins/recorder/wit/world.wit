@@ -8,6 +8,6 @@ world recorder-mdl {
     import wasi:filesystem/preopens@0.2.0;
     import splicer:builtin-config/get@0.1.0;
 
-    export splicer:tier2/before@0.1.0;
-    export splicer:tier2/after@0.1.0;
+    export splicer:tier2/before@0.2.0;
+    export splicer:tier2/after@0.2.0;
 }

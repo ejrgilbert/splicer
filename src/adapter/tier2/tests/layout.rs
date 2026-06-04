@@ -75,7 +75,7 @@ fn env_with(has_before: bool, has_after: bool) -> LayoutEnv {
         .functions
         .values()
         .collect();
-    let schema = compute_schema(&resolve, world_id, has_before, has_after).unwrap();
+    let schema = compute_schema(&resolve, world_id, has_before, has_after, false).unwrap();
     let mut names = NameInterner::new();
     let iface_name = names.intern(TARGET_IFACE);
     let classified =
@@ -219,7 +219,7 @@ fn try_lay_out(target_wit: &str, target_iface_qname: &str) -> Result<()> {
         .functions
         .values()
         .collect();
-    let schema = compute_schema(&resolve, world_id, true, true).unwrap();
+    let schema = compute_schema(&resolve, world_id, true, true, false).unwrap();
     let mut names = NameInterner::new();
     let iface_name = names.intern(&target_versioned);
     let classified =

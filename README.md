@@ -55,16 +55,17 @@ composition time.
 | Tier       | Data access         | Calls downstream? | Capability                                                                              | Contract                                                    | Status        |
 |------------|---------------------|-------------------|-----------------------------------------------------------------------------------------|-------------------------------------------------------------|---------------|
 | **Tier 1** | none (call-id only) | yes _(skippable)_ | **Hooks**: middleware sees the call identity but _not types or data_                    | [`wit/tier1/world.wit`](wit/tier1/world.wit)                | **Supported** |
-| **Tier 2** | read-only           | yes               | **Observe**: middleware sees the typed values flowing through; _cannot modify_          | [`wit/tier2/world.wit`](wit/tier2/world.wit)                | **Supported** |
+| **Tier 2** | read-only           | yes _(skippable)_ | **Observe**: middleware sees the typed values flowing through; _cannot modify_          | [`wit/tier2/world.wit`](wit/tier2/world.wit)                | **Supported** |
 | **Tier 3** | read + write        | yes               | **Transform**: middleware sees AND modifies the values; _downstream is still called_    | [`splicer_tool_sdk::TransformStrategy`](splicer-tool-sdk/)  | **Supported** |
 | **Tier 4** | read + write        | no                | **Virtualize**: middleware _replaces the downstream_ entirely (mocks, virts, replayers) | [`splicer_tool_sdk::VirtualizeStrategy`](splicer-tool-sdk/) | **Supported** |
 
 Each tier strictly adds one capability. Middleware written for a lower tier
 works unchanged when higher tiers become available.
 
-"Skippable" (tier 1) vs "no" (tier 4) are different things. With
-`should-block` the adapter still **generates** the downstream call and
-asks the middleware at runtime whether to invoke it. It's a per-call gate.
+"Skippable" (tier 1 / tier 2) vs "no" (tier 4) are different things.
+With `gate::should-call` the adapter still **generates** the
+downstream call and asks the middleware at runtime whether to invoke
+it. It's a per-call gate.
 With virtualization the downstream call **is not in the adapter at
 all**; it cannot be reached, regardless of runtime state.
 

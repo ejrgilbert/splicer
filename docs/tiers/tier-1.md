@@ -41,7 +41,7 @@ it's a **structural security property**: the middleware never sees
 the call's payload bytes, and can't. Two reinforcing reasons:
 
 1. **The WIT contract.** The tier-1 hooks
-   (`on-call(call)`, `on-return(call)`, `should-block(call)`) take
+   (`on-call(call)`, `on-return(call)`, `should-call(call)`) take
    *only* `call-id`. There's no parameter shape that could carry
    the args or the result into the middleware.
 2. **Shared-nothing memory.** Even if a middleware tried to peek,
@@ -94,7 +94,7 @@ discriminator — one middleware, N functions.
 ### If your middleware only cares about some of the functions
 
 Because the adapter invokes every hook your middleware exports on every
-wrapped call, **you pay the before/after/block round-trip uniformly**,
+wrapped call, **you pay the before/after/gate round-trip uniformly**,
 even for the calls your middleware will immediately no-op. For a
 4-function interface where your logging middleware only cares about one,
 `on-call` still fires 4 × per mixed workload and you filter by name
@@ -115,9 +115,9 @@ and real use cases drive the priority.
 For each function in the target interface, the adapter:
 
 1. Calls `on-call(call_id)` if the middleware exports `splicer:tier1/before`
-2. Calls `should-block(call_id)` if the middleware exports
-   `splicer:tier1/blocking`; skips the downstream invocation when it
-   returns `true` (void functions only)
+2. Calls `should-call(call_id)` if the middleware exports
+   `splicer:tier1/gate`; skips the downstream invocation when it
+   returns `false` (void functions only)
 3. Forwards the call to the handler with all arguments and return values
    passed through unchanged
 4. Calls `on-return(call_id)` if the middleware exports `splicer:tier1/after`
@@ -133,7 +133,7 @@ signature.
 ## Writing a Tier-1 Middleware
 
 A tier-1 middleware is a standard WebAssembly component that exports one
-or more of the `splicer:tier1/{before,after,blocking}` interfaces.
+or more of the `splicer:tier1/{before,after,gate}` interfaces.
 Here's a minimal example in Rust (using `wit-bindgen`):
 
 ```rust
@@ -145,7 +145,7 @@ wit_bindgen::generate!({
 
 use bindings::exports::splicer::tier1::before::Guest as BeforeGuest;
 use bindings::exports::splicer::tier1::after::Guest as AfterGuest;
-use bindings::exports::splicer::tier1::blocking::Guest as BlockGuest;
+use bindings::exports::splicer::tier1::gate::Guest as GateGuest;
 use bindings::splicer::common::types::CallId;
 
 pub struct MyMiddleware;
@@ -164,11 +164,12 @@ impl AfterGuest for MyMiddleware {
     }
 }
 
-impl BlockGuest for MyMiddleware {
-    async fn should_block(call: CallId) -> bool {
-        println!("[middleware] blocking {}#{}",
+impl GateGuest for MyMiddleware {
+    async fn should_call(call: CallId) -> bool {
+        println!("[middleware] gating {}#{}",
                  call.interface_name, call.function_name);
-        true
+        // `true` = invoke downstream; `false` = skip the call.
+        false
     }
 }
 
@@ -181,9 +182,9 @@ The middleware's WIT world declares both packages as exports/deps:
 package my:middleware@1.0.0;
 
 world type-erased-middleware {
-    export splicer:tier1/before@0.2.0;
-    export splicer:tier1/after@0.2.0;
-    export splicer:tier1/blocking@0.2.0;
+    export splicer:tier1/before@0.4.0;
+    export splicer:tier1/after@0.4.0;
+    export splicer:tier1/gate@0.4.0;
 }
 ```
 

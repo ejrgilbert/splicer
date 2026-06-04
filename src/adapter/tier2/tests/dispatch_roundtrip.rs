@@ -44,6 +44,7 @@ fn dispatch_module_roundtrips_through_component_encoder() {
         "my:math/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -86,6 +87,7 @@ fn dispatch_module_with_tuple_param_roundtrips() {
         "my:tup/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -128,6 +130,7 @@ fn dispatch_module_with_option_param_roundtrips() {
         "my:opt/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -169,6 +172,7 @@ fn dispatch_module_with_single_slot_tuple_result_lifts_from_flat() {
         "my:tup1/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -224,6 +228,7 @@ fn dispatch_module_with_tuple_result_roundtrips() {
         "my:tup-ret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -280,6 +285,7 @@ fn dispatch_module_with_option_result_roundtrips() {
         "my:opt-ret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -327,6 +333,7 @@ fn dispatch_module_with_flags_param_roundtrips() {
         "my:fl/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -370,6 +377,7 @@ fn dispatch_module_with_flags_param_and_flags_result_roundtrips() {
         "my:flio/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -411,6 +419,7 @@ fn dispatch_module_with_char_param_roundtrips() {
         "my:ch/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -460,6 +469,7 @@ fn dispatch_module_with_char_list_param_roundtrips() {
         "my:lc/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -507,6 +517,7 @@ fn dispatch_module_with_variant_param_roundtrips() {
         "my:vt/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -547,6 +558,7 @@ fn dispatch_module_with_inline_resource_bails() {
         "my:rh/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -632,6 +644,7 @@ fn dispatch_module_with_resource_handle_param_roundtrips() {
         "my:rh/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -696,6 +709,7 @@ fn dispatch_module_with_resource_handle_result_roundtrips() {
         "my:rhret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -761,6 +775,7 @@ fn dispatch_module_with_handle_param_and_handle_result_roundtrips() {
         "my:rhio/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -803,6 +818,7 @@ fn dispatch_module_with_char_result_roundtrips() {
         "my:chret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -845,6 +861,7 @@ fn dispatch_module_with_error_context_param_roundtrips() {
         "my:ec/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -885,6 +902,7 @@ fn dispatch_module_with_error_context_result_roundtrips() {
         "my:ecret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -944,6 +962,7 @@ fn dispatch_module_with_variant_result_roundtrips() {
         "my:vtret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1002,6 +1021,7 @@ fn dispatch_module_with_list_result_roundtrips() {
         "my:listret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1049,6 +1069,7 @@ fn dispatch_module_with_option_list_param_roundtrips() {
         "my:lo/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1095,6 +1116,7 @@ fn dispatch_module_with_result_list_param_roundtrips() {
         "my:lr/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1142,6 +1164,7 @@ fn dispatch_module_with_tuple_list_param_roundtrips() {
         "my:lt/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1202,6 +1225,7 @@ fn dispatch_module_with_char_list_result_roundtrips() {
         "my:lcret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1246,6 +1270,7 @@ fn dispatch_module_with_single_slot_variant_result_lifts_from_flat() {
         "my:vt1/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1291,6 +1316,7 @@ fn dispatch_module_with_flags_result_roundtrips() {
         "my:flret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1335,6 +1361,7 @@ fn dispatch_module_with_result_param_roundtrips() {
         "my:res/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1378,6 +1405,7 @@ fn dispatch_module_with_widening_result_param_roundtrips() {
         "my:res/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1424,6 +1452,7 @@ fn dispatch_module_with_widening_variant_param_roundtrips() {
         "my:vt/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1481,6 +1510,7 @@ fn dispatch_module_with_result_result_roundtrips() {
         "my:res-ret/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1523,6 +1553,7 @@ fn dispatch_module_with_single_slot_result_result_lifts_from_flat() {
         "my:res1/api@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1566,6 +1597,7 @@ fn async_5_u32_params_validates() {
         "test:pkg/many@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1602,6 +1634,7 @@ fn async_mixed_primitives_indirect_params_validates() {
         "test:pkg/mixed-async@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1648,6 +1681,7 @@ fn async_aggregates_indirect_params_validates() {
         "test:pkg/agg-async@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1694,6 +1728,7 @@ fn async_dispatch_shapes_indirect_params_validates() {
         "test:pkg/disp-async@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1741,6 +1776,7 @@ fn sync_17_u32_params_with_hooks_validates() {
         "test:pkg/wide@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1776,6 +1812,7 @@ fn sync_mixed_primitives_indirect_params_with_hooks_validates() {
         "test:pkg/sync-mixed@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1819,6 +1856,7 @@ fn sync_wide_aggregates_indirect_params_with_hooks_validates() {
         "test:pkg/sync-agg@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1851,6 +1889,7 @@ fn sync_string_list_indirect_params_with_hooks_validates() {
         "test:pkg/sync-strs@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1890,6 +1929,7 @@ fn async_17_u32_params_symmetric_indirect_validates() {
         "test:pkg/async-sym@1.0.0",
         true,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1926,6 +1966,7 @@ fn sync_17_u32_params_after_only_validates() {
         "test:pkg/wide-after@1.0.0",
         false,
         true,
+        false,
         &split_bytes,
         common_wit,
         tier2_wit,
@@ -1934,4 +1975,109 @@ fn sync_17_u32_params_after_only_validates() {
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
         .validate_all(&bytes)
         .expect("emitted tier-2 adapter component should validate");
+}
+
+// ── Tier-2 `gate` hook (`should-call`) ───────────────────────────────
+
+/// `gate` alone (no before/after) on a void async fn with a string
+/// param: the lift code that previously only ran under `before` must
+/// now fire for `gate`-only, populate the shared args buffer, and
+/// branch on the bool result. Validates structurally.
+#[test]
+fn dispatch_module_with_gate_only_void_async_roundtrips() {
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func async (param "msg" string)))
+            (export "fire" (func (type 0)))
+        ))
+        (import "test:pkg/gate-only@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let bytes = build_tier2_adapter(
+        "test:pkg/gate-only@1.0.0",
+        false, // has_before
+        false, // has_after
+        true,  // has_gate
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 gate-only adapter generation should succeed");
+
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}
+
+/// `gate` + `before` + `after` together. Exercises the shared args
+/// buffer (both `before` and `gate` reuse the same `{ call, args }`
+/// indirect-params slot) and threads the bool branch through the
+/// wrapper body.
+#[test]
+fn dispatch_module_with_gate_and_full_hooks_roundtrips() {
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func async (param "msg" string)))
+            (export "fire" (func (type 0)))
+        ))
+        (import "test:pkg/gate-all@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let bytes = build_tier2_adapter(
+        "test:pkg/gate-all@1.0.0",
+        true, // has_before
+        true, // has_after
+        true, // has_gate
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect("tier-2 gate+before+after adapter generation should succeed");
+
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("emitted tier-2 adapter component should validate");
+}
+
+/// `gate` on a non-void target is rejected upstream — the adapter
+/// can't synthesize a return value when the call is skipped (same
+/// constraint tier-1 enforces).
+#[test]
+fn dispatch_module_with_gate_and_nonvoid_bails() {
+    let wat = r#"(component
+        (type (;0;) (instance
+            (type (;0;) (func async (param "x" u32) (result u32)))
+            (export "compute" (func (type 0)))
+        ))
+        (import "test:pkg/gate-nonvoid@1.0.0" (instance (type 0)))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let err = build_tier2_adapter(
+        "test:pkg/gate-nonvoid@1.0.0",
+        false,
+        false,
+        true,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+    )
+    .expect_err("gate on a non-void fn must bail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("should-call"),
+        "bail should call out the gate hook; got: {msg}",
+    );
+    assert!(
+        msg.contains("void-returning"),
+        "bail should explain the void-only constraint; got: {msg}",
+    );
 }
