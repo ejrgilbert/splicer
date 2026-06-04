@@ -1,3 +1,4 @@
+use crate::adapter::async_mirror::bridge::generate_sync_async_bridge;
 use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
@@ -823,6 +824,10 @@ struct SpliceAccumulators {
     /// non-`wasi:*` peer import declared `async func`, or `None` if
     /// no offender.
     middleware_first_async_peer_cache: HashMap<String, Option<String>>,
+    /// `(target_split_path, target_interface)` → `(bridge_wasm_path,
+    /// async_mirror_qualified_name)`. One bridge per distinct target
+    /// across the run; shared by every site that needs it.
+    bridges: HashMap<(String, String), (String, String)>,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
@@ -1358,6 +1363,7 @@ fn add_to_inject_plan(
                         mw_path,
                         interface_name,
                         consumer_split_path,
+                        ctx.splits_path,
                         accs,
                     )?;
                 }
@@ -1397,6 +1403,7 @@ fn add_to_inject_plan(
                         mw_path,
                         interface_name,
                         consumer_split_path,
+                        ctx.splits_path,
                         accs,
                     )?;
                 }
@@ -1530,7 +1537,9 @@ enum SyncWitTreatment {
     NotNeeded,
     /// Carries the offending `async func` peer-component import for
     /// diagnostics.
-    BridgeRequired { offender: String },
+    BridgeRequired {
+        offender: String,
+    },
 }
 
 /// Conservative — only catches imports that are `async func` at the
@@ -1566,19 +1575,43 @@ fn bail_if_bridge_required(
     middleware_path: &str,
     target_interface: &str,
     target_split_path: &str,
+    splits_output_path: &str,
     accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<()> {
-    if let SyncWitTreatment::BridgeRequired { offender } =
+    let SyncWitTreatment::BridgeRequired { offender } =
         classify_bridge_need(middleware_path, target_interface, target_split_path, accs)
-    {
-        anyhow::bail!(
-            "cannot splice '{middleware_name}' onto sync-WIT target '{target_interface}': \
-             middleware imports async-peer '{offender}', which would suspend a sync-WIT \
-             task at runtime. Target an `async func` interface, or drop the `.await` \
-             from the middleware.",
-        );
+    else {
+        return Ok(());
+    };
+    // Generate (cached) so the bridge component is on disk and its
+    // path + async-mirror name are recorded in `accs.bridges`.
+    ensure_bridge(target_interface, target_split_path, splits_output_path, accs)
+        .with_context(|| format!("generating sync→async bridge for `{target_interface}`"))?;
+    anyhow::bail!(
+        "cannot splice '{middleware_name}' onto sync-WIT target '{target_interface}': \
+         middleware imports async-peer '{offender}', which would suspend a sync-WIT \
+         task at runtime. Target an `async func` interface, or drop the `.await` \
+         from the middleware.",
+    );
+}
+
+/// Cached bridge generation. Returns the bridge's `.wasm` path and
+/// the async-mirror interface's fully-qualified name; both are also
+/// stored on `accs.bridges` for re-use by later sites + later
+/// EmitPlan routing (Slice 3d).
+fn ensure_bridge(
+    target_interface: &str,
+    target_split_path: &str,
+    splits_output_path: &str,
+    accs: &mut SpliceAccumulators,
+) -> anyhow::Result<(String, String)> {
+    let key = (target_split_path.to_string(), target_interface.to_string());
+    if let Some(entry) = accs.bridges.get(&key) {
+        return Ok(entry.clone());
     }
-    Ok(())
+    let entry = generate_sync_async_bridge(target_interface, splits_output_path, target_split_path)?;
+    accs.bridges.insert(key, entry.clone());
+    Ok(entry)
 }
 
 /// True iff `target_interface` (resolved via the component at
