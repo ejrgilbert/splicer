@@ -287,7 +287,7 @@ pub(super) fn emit_wrapper_function(
     i: usize,
     fd: &FuncDispatch,
     func: &WitFunction,
-) {
+) -> anyhow::Result<()> {
     let async_funcs = &func_idx.async_funcs;
     let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
@@ -301,7 +301,8 @@ pub(super) fn emit_wrapper_function(
         builder,
         fd,
         func,
-    );
+        ctx.before_hook.is_some(),
+    )?;
 
     let mut f = Function::new_with_locals_types(frozen.locals);
 
@@ -330,15 +331,40 @@ pub(super) fn emit_wrapper_function(
 
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before) = ctx.before_hook.as_ref() {
+        // Symmetric-indirect (sync >16 flat): wrapper has only `local
+        // 0` (the host's params pointer), so we materialize each
+        // param's flat representation into synth locals up front by
+        // playing the per-param lift-from-memory sequences. Phase 1
+        // then reads from `synth_base[i]` instead of cumulative-flat.
+        if let Some(seqs) = lcl.params_lift_seqs.as_ref() {
+            debug_assert_eq!(
+                seqs.len(),
+                fd.params.len(),
+                "params_lift_seqs length must match fd.params",
+            );
+            for seq in seqs {
+                for inst in &seq.instructions {
+                    f.instruction(inst);
+                }
+            }
+        }
         // Cumulative `local_base` threads plan-relative slots into
-        // absolute wasm-locals.
-        let mut local_base: u32 = 0;
+        // absolute wasm-locals; only used in the flat-param path.
+        let mut flat_local_base: u32 = 0;
         let cells_slice_off = field_tree_slice_off(schema, TREE_CELLS);
         let handle_infos_slice_off = field_tree_slice_off(schema, TREE_HANDLE_INFOS);
         let flags_infos_slice_off = field_tree_slice_off(schema, TREE_FLAGS_INFOS);
         let record_infos_slice_off = field_tree_slice_off(schema, TREE_RECORD_INFOS);
         let variant_infos_slice_off = field_tree_slice_off(schema, TREE_VARIANT_INFOS);
         for (i, p) in fd.params.iter().enumerate() {
+            let local_base = match lcl.params_lift_seqs.as_ref() {
+                Some(seqs) => seqs[i].synth_base,
+                None => {
+                    let base = flat_local_base;
+                    flat_local_base += p.lift.plan.flat_slot_count;
+                    base
+                }
+            };
             let field_off = i as u32 * schema.field_layout.size;
             let list_locals = &lcl.param_list_locals[i];
             emit_alloc_cells_for_plan(
@@ -399,7 +425,6 @@ pub(super) fn emit_wrapper_function(
                 &lcl,
                 list_locals,
             );
-            local_base += p.lift.plan.flat_slot_count;
         }
         let nargs = fd.params.len() as u32;
         let args_off = if nargs == 0 { 0 } else { fd.fields_buf_offset };
@@ -645,6 +670,7 @@ pub(super) fn emit_wrapper_function(
     }
     f.instructions().end();
     code.function(&f);
+    Ok(())
 }
 
 /// Async tail. Three shapes: void (no args); indirect_params (push

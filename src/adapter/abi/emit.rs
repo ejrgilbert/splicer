@@ -364,32 +364,45 @@ pub(crate) fn emit_handler_call(
     f.instructions().call(handler_idx);
 }
 
-/// Bail when an indirect-params async fn carries a param shape the
-/// lower-mode bindgen doesn't handle. Today the bindgen covers the
+/// Bail when an indirect-params fn carries a param shape the
+/// lift/lower bindgen doesn't handle. Today the bindgen covers the
 /// full canonical-ABI value-type space; this gate exists so a future
 /// spec addition (or a `TypeDefKind::Resource` slipping through as a
 /// bare param, which canon-ABI forbids) fails loud rather than
 /// emitting broken wasm.
+///
+/// `is_async` selects the diagnostic wording + the boundary cap.
+/// Async ties the canonical-ABI flip to the lower-to-memory pass
+/// (which requires per-param flat ≤ 16 for its `param_flat_locals`
+/// slice); sync passes the host's pointer straight through, so the
+/// per-param cap doesn't apply.
 pub(crate) fn require_indirect_params_supported_shape(
     resolve: &Resolve,
     fn_name: &str,
     func: &WitFunction,
+    is_async: bool,
 ) -> Result<()> {
+    let (kind, cap) = if is_async {
+        ("async", Resolve::MAX_FLAT_ASYNC_PARAMS)
+    } else {
+        ("sync", Resolve::MAX_FLAT_PARAMS)
+    };
     for param in &func.params {
         if !is_supported_indirect_params_ty(resolve, &param.ty) {
             bail!(
-                "async function `{fn_name}` has params that overflow \
-                 MAX_FLAT_ASYNC_PARAMS ({}) AND param `{}` carries an \
+                "{kind} function `{fn_name}` has params that overflow the \
+                 indirect-params cap ({cap}) AND param `{}` carries an \
                  unsupported type.",
-                Resolve::MAX_FLAT_ASYNC_PARAMS,
                 param.name,
             );
         }
-        // `build_lower_params_to_memory` allocates per-param flat
-        // wasm locals; the param's flat representation must fit.
-        if super::compat::flat_types(resolve, &param.ty, None).is_none() {
+        // Async funcs hit `build_lower_params_to_memory`, which
+        // allocates per-param flat wasm locals — the param's flat
+        // representation must fit. Sync passes the host's pointer
+        // through unchanged; per-param flat can be arbitrarily wide.
+        if is_async && super::compat::flat_types(resolve, &param.ty, None).is_none() {
             bail!(
-                "async function `{fn_name}` param `{}` flat representation \
+                "{kind} function `{fn_name}` param `{}` flat representation \
                  exceeds MAX_FLAT_PARAMS ({}).",
                 param.name,
                 super::compat::MAX_FLAT_PARAMS,
@@ -538,6 +551,97 @@ pub(crate) fn build_lower_params_to_memory(
         lower_to_memory(resolve, &mut bg, (), (), ty);
     }
     bg.into_instructions()
+}
+
+/// One param's lift-from-memory recipe: contiguous synth locals plus
+/// the instruction sequence that populates them. Plan slot N maps to
+/// `synth_base + N`; LIFO `local.set`s pop the wasm stack values into
+/// the synth slice.
+pub(crate) struct ParamLiftFromMemory {
+    pub synth_base: u32,
+    pub instructions: Vec<wasm_encoder::Instruction<'static>>,
+}
+
+/// Lift-from-memory mirror of [`build_lower_params_to_memory`].
+/// Reads each WIT param out of the host-provided params record at
+/// runtime base `params_ptr_local` and drops the flat representation
+/// into contiguous synth locals. Used when the wrapper's export sig
+/// flips to pointer-form (sync >16 flat, async >16 flat) — `local 0`
+/// is the only wasm-level param, so the hook lift can't read flat
+/// wrapper locals and needs synth ones instead.
+///
+/// Per-param flat width is bounded by tier-2's `check_layout_budget`
+/// (`MAX_FLAT_SLOTS_PER_FN = 1 << 16`); the local cap here is
+/// defense-in-depth.
+pub(crate) fn build_lift_params_from_memory(
+    resolve: &Resolve,
+    sizes: &SizeAlign,
+    indices: &mut super::super::indices::LocalsBuilder,
+    func: &WitFunction,
+    params_ptr_local: u32,
+) -> Result<Vec<ParamLiftFromMemory>> {
+    use wasm_encoder::Instruction;
+    use wit_bindgen_core::abi::lift_from_memory;
+
+    const PER_PARAM_FLAT_CAP: usize = 1 << 16;
+
+    let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
+    let field_offsets = sizes.field_offsets(&param_types);
+    // One addr local shared across params — rewritten per param via
+    // the `local.get / i32.add / local.set` prefix.
+    let addr_local = indices.alloc_local(ValType::I32);
+
+    field_offsets
+        .iter()
+        .zip(&param_types)
+        .zip(&func.params)
+        .map(|(((field_off, _field_size), ty), param)| {
+            let flat = super::compat::flat_types(resolve, ty, Some(PER_PARAM_FLAT_CAP))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "param `{}` flat width exceeds PER_PARAM_FLAT_CAP ({PER_PARAM_FLAT_CAP}) \
+                         — upstream `check_layout_budget` should have rejected this shape",
+                        param.name,
+                    )
+                })?;
+            let synth_locals: Vec<u32> = flat
+                .iter()
+                .map(|wt| indices.alloc_local(wasm_type_to_val(*wt)))
+                .collect();
+            debug_assert!(
+                synth_locals.windows(2).all(|w| w[1] == w[0] + 1),
+                "synth_locals must be contiguous (plan slot N = synth_locals[0] + N)",
+            );
+            let synth_base = synth_locals[0];
+
+            // Per-param bindgen (widening + block bookkeeping scoped
+            // to one type); reuses `addr_local`.
+            let mut bg = super::WasmEncoderBindgen::new(sizes, addr_local, indices);
+            lift_from_memory(resolve, &mut bg, (), ty);
+            let loads = bg.into_instructions();
+
+            // `field_off` is bounded by the params record's size,
+            // itself ≤ LAYOUT_SIZE_BUDGET = i32::MAX.
+            let off = field_off.size_wasm32() as i32;
+            let mut instructions: Vec<Instruction<'static>> =
+                Vec::with_capacity(4 + loads.len() + synth_locals.len());
+            instructions.push(Instruction::LocalGet(params_ptr_local));
+            if off != 0 {
+                instructions.push(Instruction::I32Const(off));
+                instructions.push(Instruction::I32Add);
+            }
+            instructions.push(Instruction::LocalSet(addr_local));
+            instructions.extend(loads);
+            for &local in synth_locals.iter().rev() {
+                instructions.push(Instruction::LocalSet(local));
+            }
+
+            Ok(ParamLiftFromMemory {
+                synth_base,
+                instructions,
+            })
+        })
+        .collect()
 }
 
 /// Push either the direct-return local, or the static retptr (when

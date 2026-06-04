@@ -273,7 +273,7 @@ pub(super) fn emit_code_section(
     func_idx: &FuncIndices,
     ctx: &WrapperCtx<'_>,
     globals: &GlobalIndices,
-) {
+) -> anyhow::Result<()> {
     debug_assert_eq!(
         per_func.len(),
         funcs.len(),
@@ -281,7 +281,7 @@ pub(super) fn emit_code_section(
     );
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
-        emit_wrapper_function(&mut code, func_idx, ctx, i, fd, funcs[i]);
+        emit_wrapper_function(&mut code, func_idx, ctx, i, fd, funcs[i])?;
     }
     code.function(&empty_function());
     for fd in per_func {
@@ -291,4 +291,5 @@ pub(super) fn emit_code_section(
     }
     emit_cabi_realloc(&mut code, globals.bump);
     module.section(&code);
+    Ok(())
 }

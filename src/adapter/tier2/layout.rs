@@ -22,7 +22,7 @@ use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
     TREE_FLAGS_INFOS, TREE_HANDLE_INFOS, TREE_RECORD_INFOS, TREE_ROOT, TREE_VARIANT_INFOS,
 };
-use super::{AfterSetup, FuncClassified, FuncDispatch, FuncShape};
+use super::{AfterSetup, FuncClassified, FuncDispatch};
 
 // ─── ABI-anchored constants (not WIT-schema-derivable) ────────────
 
@@ -520,13 +520,17 @@ pub(super) fn lay_out_static_memory(
         })
         .collect();
 
-    // Async indirect-params scratch (canon-lower-async overflowed
-    // MAX_FLAT_ASYNC_PARAMS).
+    // Indirect-params scratch: only the asymmetric flip needs a
+    // buffer — async-stackful 5..16 flat, where the handler wants a
+    // pointer but the wrapper still has flat locals to lower. The
+    // symmetric flips (sync >16, async >16) pass the host's pointer
+    // through unchanged.
     let params_record_offsets: Vec<Option<i32>> = per_func
         .iter()
         .zip(funcs.iter())
         .map(|(fd, func)| {
-            if !(matches!(fd.shape, FuncShape::Async(_)) && fd.import_sig.indirect_params) {
+            let asymmetric = fd.import_sig.indirect_params && !fd.export_sig.indirect_params;
+            if !asymmetric {
                 return None;
             }
             let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
