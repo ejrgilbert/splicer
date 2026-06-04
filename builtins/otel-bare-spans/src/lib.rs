@@ -19,8 +19,8 @@ mod bindings {
     wit_bindgen::generate!({
         world: "otel-bare-spans-mdl",
         async: [
-            "export:splicer:tier1/before@0.3.0#on-call",
-            "export:splicer:tier1/after@0.3.0#on-return",
+            "export:splicer:tier1/before@0.4.0#on-call",
+            "export:splicer:tier1/after@0.4.0#on-return",
         ],
         generate_all,
     });

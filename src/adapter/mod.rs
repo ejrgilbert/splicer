@@ -54,7 +54,7 @@ const COMMON_WORLD_WIT: &str = include_str!("../../wit/common/world.wit");
 /// - Imports the middleware via the tier-1 hook interfaces (the
 ///   subset matched in `middleware_interfaces`).
 /// - For each function in `target_interface`: calls `on-call` →
-///   `should-block` (early-return when true; void funcs only) →
+///   `should-call` (early-return when false; void funcs only) →
 ///   the handler → `on-return`.
 ///
 /// Returns the path to the generated `.wasm`.
@@ -67,9 +67,7 @@ pub fn generate_tier1_adapter(
 ) -> anyhow::Result<String> {
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
-    let has_blocking = middleware_interfaces
-        .iter()
-        .any(|i| i.contains("/blocking"));
+    let has_gate = middleware_interfaces.iter().any(|i| i.contains("/gate"));
 
     write_adapter(
         middleware_name,
@@ -82,7 +80,7 @@ pub fn generate_tier1_adapter(
                 target_interface,
                 has_before,
                 has_after,
-                has_blocking,
+                has_gate,
                 split_bytes,
                 COMMON_WORLD_WIT,
                 TIER1_WORLD_WIT,
@@ -107,6 +105,7 @@ pub fn generate_tier2_adapter(
 ) -> anyhow::Result<String> {
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
+    let has_gate = middleware_interfaces.iter().any(|i| i.contains("/gate"));
 
     write_adapter(
         middleware_name,
@@ -119,6 +118,7 @@ pub fn generate_tier2_adapter(
                 target_interface,
                 has_before,
                 has_after,
+                has_gate,
                 split_bytes,
                 COMMON_WORLD_WIT,
                 TIER2_WORLD_WIT,

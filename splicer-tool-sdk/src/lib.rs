@@ -56,8 +56,8 @@ pub use wasm_wave;
 ///     splicer_tool_sdk::wit_bindgen!({
 ///         world: "my-middleware-mdl",
 ///         async: [
-///             "export:splicer:tier2/before@0.1.0#on-call",
-///             "export:splicer:tier2/after@0.1.0#on-return",
+///             "export:splicer:tier2/before@0.2.0#on-call",
+///             "export:splicer:tier2/after@0.2.0#on-return",
 ///         ],
 ///         generate_all,
 ///     });

@@ -665,16 +665,29 @@ fn validate_schema_names(wit_dir: &Path) {
     require_typedef(&common_src, &common_path, "variant", "cell");
 
     let tier2_path = wit_dir.join("tier2").join("world.wit");
-    if !tier2_path.exists() {
-        return;
+    if tier2_path.exists() {
+        let tier2_src = fs::read_to_string(&tier2_path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {e}", tier2_path.display()));
+        // Mirrors `ON_CALL_*` / `ON_RET_*` in `src/adapter/tier2/emit.rs`.
+        // `result` is a WIT keyword and shows up as `%result` in the WIT
+        // source; the validator strips the `%` before comparison.
+        require_func_params(&tier2_src, &tier2_path, "on-call", &["call", "args"]);
+        require_func_params(&tier2_src, &tier2_path, "on-return", &["call", "result"]);
+        // Tier-2 `gate::should-call` reuses the same `ON_CALL_*` layout
+        // constants; a rename here would silently shift offsets.
+        require_func_params(&tier2_src, &tier2_path, "should-call", &["call", "args"]);
     }
-    let tier2_src = fs::read_to_string(&tier2_path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", tier2_path.display()));
-    // Mirrors `ON_CALL_*` / `ON_RET_*` in `src/adapter/tier2/emit.rs`.
-    // `result` is a WIT keyword and shows up as `%result` in the WIT
-    // source; the validator strips the `%` before comparison.
-    require_func_params(&tier2_src, &tier2_path, "on-call", &["call", "args"]);
-    require_func_params(&tier2_src, &tier2_path, "on-return", &["call", "result"]);
+
+    let tier1_path = wit_dir.join("tier1").join("world.wit");
+    if tier1_path.exists() {
+        let tier1_src = fs::read_to_string(&tier1_path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {e}", tier1_path.display()));
+        // Tier-1 hooks all take a single `call` param; codegen pins
+        // the name when populating the indirect-params buffer.
+        require_func_params(&tier1_src, &tier1_path, "on-call", &["call"]);
+        require_func_params(&tier1_src, &tier1_path, "on-return", &["call"]);
+        require_func_params(&tier1_src, &tier1_path, "should-call", &["call"]);
+    }
 }
 
 fn require_typedef(src: &str, path: &Path, kind: &str, name: &str) {

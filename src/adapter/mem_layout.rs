@@ -2,8 +2,8 @@
 //!
 //! Every slot the adapter reserves in the dispatch module's memory —
 //! function-name bytes, async and sync-complex result buffers, the
-//! `waitable-set.wait` event record, the `should-block` bool
-//! slot, and the start of the bump allocator — goes through
+//! `waitable-set.wait` event record, the `should-call` bool slot, and
+//! the start of the bump allocator — goes through
 //! [`MemoryLayoutBuilder`]. Centralizing the math in one place keeps
 //! the extraction phase (which assigns per-func offsets) and the
 //! build phase (which assigns the fixed post-func slots and the
@@ -18,7 +18,7 @@
 //!                                  - async results pack contiguously
 //!                                  - sync-complex results re-align to i32
 //! [… .. +sum(EVENT_RECORD_SHAPE)) event slot (if has_async_machinery)
-//! [… .. +sum(BLOCK_RESULT_SHAPE)) block slot (if has_blocking)
+//! [… .. +sum(GATE_RESULT_SHAPE))  gate-result slot (if has_gate)
 //! i64-aligned upward             bump_start (consumed on finish)
 //! ```
 //!
@@ -26,7 +26,7 @@
 //! post-name region, so callers must allocate in the order sections
 //! appear above. [`super::func::extract_adapter_funcs`] handles the
 //! name + per-func result passes; [`super::component`] finishes the
-//! layout with the event / block / bump calls.
+//! layout with the event / gate / bump calls.
 
 use wasm_encoder::ValType;
 
@@ -65,12 +65,12 @@ fn align_to_val(offset: u32, align: u32) -> u32 {
 /// `event_ptr + 0` and `event_ptr + 4`.
 const EVENT_RECORD_SHAPE: &[ValType] = &[ValType::I32, ValType::I32];
 
-/// Flat shape of the bool slot `should-block` writes. The
-/// canonical ABI stores a bool as an i32; the blocking phase
-/// (see `super::dispatch::emit_blocking_phase`) reads it via
-/// `i32.load` at `block_result_ptr + 0` and branches on zero /
+/// Flat shape of the bool slot `should-call` writes. The
+/// canonical ABI stores a bool as an i32; the gate phase
+/// (see `super::dispatch::emit_gate_phase`) reads it via
+/// `i32.load` at `gate_result_ptr + 0` and branches on zero /
 /// non-zero.
-const BLOCK_RESULT_SHAPE: &[ValType] = &[ValType::I32];
+const GATE_RESULT_SHAPE: &[ValType] = &[ValType::I32];
 
 /// Byte-offset bookkeeper for the dispatch module's linear memory.
 /// See the module docs for the overall layout and call-ordering rules.
@@ -88,7 +88,7 @@ pub(crate) struct MemoryLayoutBuilder {
 impl MemoryLayoutBuilder {
     pub fn new(total_name_bytes: u32) -> Self {
         // i32 is the narrowest slot we load from in the post-name
-        // region (block-result bool, event-record fields, canon-lift
+        // region (gate-result bool, event-record fields, canon-lift
         // result pointers), so everything must start on that
         // boundary at minimum.
         let post_name_align = val_type_byte_size(&ValType::I32);
@@ -113,10 +113,10 @@ impl MemoryLayoutBuilder {
         self.alloc_record(EVENT_RECORD_SHAPE)
     }
 
-    /// Reserve the bool-result slot written by `should_block_call`.
-    /// Size and alignment fall out of [`BLOCK_RESULT_SHAPE`].
-    pub fn alloc_block_result(&mut self) -> u32 {
-        self.alloc_record(BLOCK_RESULT_SHAPE)
+    /// Reserve the bool-result slot written by `should-call`.
+    /// Size and alignment fall out of [`GATE_RESULT_SHAPE`].
+    pub fn alloc_gate_result(&mut self) -> u32 {
+        self.alloc_record(GATE_RESULT_SHAPE)
     }
 
     /// Finalize the layout and return the first free byte for the

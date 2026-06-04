@@ -20,8 +20,8 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-pub const SPLICER_BEFORE: &str = "splicer:tier1/before@0.3.0";
-pub const SPLICER_AFTER: &str = "splicer:tier1/after@0.3.0";
+pub const SPLICER_BEFORE: &str = "splicer:tier1/before@0.4.0";
+pub const SPLICER_AFTER: &str = "splicer:tier1/after@0.4.0";
 pub const SPLICER_BUILTIN_CONFIG_GET: &str = "splicer:builtin-config/get@0.1.0";
 
 pub const TARGET_IFACE: &str = "wasi:http/handler@0.3.0";
@@ -108,7 +108,7 @@ where
         let instance = linker.instantiate_async(&mut store, &component).await?;
 
         // Tier-1 builtins may export any non-empty subset of
-        // {before, after, blocking}. Drive whichever this builtin
+        // {before, after, gate}. Drive whichever this builtin
         // actually exports; downstream assertions will catch a
         // degenerate component that exports nothing useful.
         let on_call = instance

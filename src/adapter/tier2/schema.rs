@@ -72,6 +72,9 @@ pub(super) struct SchemaLayouts {
     pub(super) record_field_tuple_layout: RecordLayout,
     pub(super) before_hook: Option<HookSchema>,
     pub(super) after_hook: Option<HookSchema>,
+    /// Gate hook; uses the same params record as `before_hook` (call
+    /// + args) but with an extra retptr param for the bool result.
+    pub(super) gate_hook: Option<HookSchema>,
     /// Offset of `option<field-tree>` payload inside the option variant.
     pub(super) option_payload_off: u32,
 }
@@ -90,6 +93,7 @@ pub(super) fn compute_schema(
     world_id: WorldId,
     has_before: bool,
     has_after: bool,
+    has_gate: bool,
 ) -> Result<SchemaLayouts> {
     let mut size_align = SizeAlign::default();
     size_align.fill(resolve);
@@ -139,6 +143,13 @@ pub(super) fn compute_schema(
             params_layout: RecordLayout::for_named_fields(&size_align, &import.params),
             import,
         });
+    let gate_hook = has_gate
+        .then(|| find_should_call_hook(resolve, world_id))
+        .transpose()?
+        .map(|import| HookSchema {
+            params_layout: RecordLayout::for_named_fields(&size_align, &import.params),
+            import,
+        });
 
     let option_payload_off = option_payload_offset(&size_align, &Type::Id(field_tree_ty_id));
 
@@ -157,6 +168,7 @@ pub(super) fn compute_schema(
         record_field_tuple_layout,
         before_hook,
         after_hook,
+        gate_hook,
         option_payload_off,
     })
 }
@@ -171,6 +183,13 @@ fn find_on_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport>
 fn find_on_return_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
     use crate::contract::{TIER2_AFTER, TIER2_VERSION};
     let qname = format!("{TIER2_AFTER}@{TIER2_VERSION}");
+    find_imported_hook(resolve, world_id, &qname)
+        .ok_or_else(|| anyhow!("synthesized adapter world is missing import of `{qname}`"))
+}
+
+fn find_should_call_hook(resolve: &Resolve, world_id: WorldId) -> Result<HookImport> {
+    use crate::contract::{TIER2_GATE, TIER2_VERSION};
+    let qname = format!("{TIER2_GATE}@{TIER2_VERSION}");
     find_imported_hook(resolve, world_id, &qname)
         .ok_or_else(|| anyhow!("synthesized adapter world is missing import of `{qname}`"))
 }

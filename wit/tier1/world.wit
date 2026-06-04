@@ -8,8 +8,8 @@
 /// return types/values.
 ///
 /// Any non-empty subset is valid: you can export just `before`, just
-/// `after`, just `blocking`, or any combination.
-package splicer:tier1@0.3.0;
+/// `after`, just `gate`, or any combination.
+package splicer:tier1@0.4.0;
 
 interface before {
     use splicer:common/types@0.2.0.{call-id};
@@ -23,16 +23,16 @@ interface after {
     on-return: async func(call: call-id);
 }
 
-interface blocking {
+interface gate {
     use splicer:common/types@0.2.0.{call-id};
-    /// Called before the invocation; if it returns `true`, the
-    /// downstream call is skipped entirely. Only supported for
-    /// void-returning functions today.
-    should-block: async func(call: call-id) -> bool;
+    /// Called before the invocation. Return `true` to invoke
+    /// downstream; `false` to skip the call entirely. Only supported
+    /// for void-returning functions today.
+    should-call: async func(call: call-id) -> bool;
 }
 
 world tier1-middleware {
     export before;
     export after;
-    export blocking;
+    export gate;
 }

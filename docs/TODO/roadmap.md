@@ -109,7 +109,6 @@ proxy-component is the blueprint; adapt with cells in place of WAVE:
 ## Back-burner
 
 Defer until post-paper, no blocking impact:
-- `tier2-should-call.md` (tier-2 hook gap, no committed consumer)
 - `tier2-generic-resource-handles.md` (long-term design)
 - `tier2-list-compound-elements.md` (only items with concrete demand)
 - `sync-wit-suspend-limit.md` (bug fix on demand)

@@ -25,8 +25,8 @@ use wit_parser::{
 
 use super::abi::emit::{
     collect_borrow_drops, emit_data_section, emit_export_section, emit_memory_and_globals,
-    require_indirect_params_supported_shape, require_no_inline_resources,
-    synthesize_adapter_world_wit, BlobSlice,
+    require_gate_compatible_func, require_indirect_params_supported_shape,
+    require_no_inline_resources, synthesize_adapter_world_wit, BlobSlice,
 };
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use blob::NameInterner;
@@ -36,8 +36,10 @@ use lift::{
     ResultLift,
 };
 use schema::compute_schema;
-use section_emit::{emit_code_section, emit_imports_and_funcs, emit_type_section, wrapper_exports};
-use wrapper_body::{AfterHook, BeforeHook, WrapperCtx};
+use section_emit::{
+    emit_code_section, emit_imports_and_funcs, emit_type_section, wrapper_exports, HookImports,
+};
+use wrapper_body::{AfterHook, BeforeHook, GateHook, WrapperCtx};
 
 const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
 const TIER2_ADAPTER_WORLD_NAME: &str = "adapter";
@@ -47,21 +49,23 @@ pub(super) fn build_tier2_adapter(
     target_interface: &str,
     has_before: bool,
     has_after: bool,
+    has_gate: bool,
     split_bytes: &[u8],
     common_wit: &str,
     tier2_wit: &str,
 ) -> Result<Vec<u8>> {
-    if !has_before && !has_after {
+    if !has_before && !has_after && !has_gate {
         bail!(
             "tier-2 adapter generation requires the middleware to export at least \
-             one of `splicer:tier2/before` or `splicer:tier2/after` — `trap`-only \
-             middleware is planned for a follow-up slice."
+             one of `splicer:tier2/before`, `splicer:tier2/after`, or \
+             `splicer:tier2/gate` — `trap`-only middleware is planned for a \
+             follow-up slice."
         );
     }
 
     let mut resolve = decode_input_resolve(split_bytes)?;
     let target_iface = find_target_interface(&resolve, target_interface)?;
-    require_supported_case(&resolve, target_iface)?;
+    require_supported_case(&resolve, target_iface, has_gate)?;
 
     resolve
         .push_str("splicer-common.wit", common_wit)
@@ -76,7 +80,7 @@ pub(super) fn build_tier2_adapter(
                 TIER2_ADAPTER_WORLD_PACKAGE,
                 TIER2_ADAPTER_WORLD_NAME,
                 target_interface,
-                &tier2_hook_imports(has_before, has_after),
+                &tier2_hook_imports(has_before, has_after, has_gate),
             ),
         )
         .context("parse synthesized tier-2 adapter world WIT")?;
@@ -93,7 +97,7 @@ pub(super) fn build_tier2_adapter(
         .functions
         .values()
         .collect();
-    let schema = compute_schema(&resolve, world_id, has_before, has_after)?;
+    let schema = compute_schema(&resolve, world_id, has_before, has_after, has_gate)?;
 
     let mut names = NameInterner::new();
     let iface_name = names.intern(target_interface);
@@ -116,7 +120,11 @@ pub(super) fn build_tier2_adapter(
 }
 
 /// Bail on cases that fail before the lift codegen even runs.
-fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Result<()> {
+fn require_supported_case(
+    resolve: &Resolve,
+    target_iface: InterfaceId,
+    has_gate: bool,
+) -> Result<()> {
     let iface = &resolve.interfaces[target_iface];
     if iface.functions.is_empty() {
         bail!("interface has no functions");
@@ -127,6 +135,9 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
     // params >16 flat — both flip the wrapper / handler to
     // pass-by-record on the import side.
     for (name, func) in &iface.functions {
+        if has_gate {
+            require_gate_compatible_func(resolve, name, func, "2")?;
+        }
         let is_async = func.kind.is_async();
         let variant = if is_async {
             AbiVariant::GuestImportAsync
@@ -142,14 +153,19 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
 }
 
 /// Active tier-2 hook interfaces as fully-qualified versioned names.
-fn tier2_hook_imports(has_before: bool, has_after: bool) -> Vec<String> {
-    use crate::contract::{versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_VERSION};
+fn tier2_hook_imports(has_before: bool, has_after: bool, has_gate: bool) -> Vec<String> {
+    use crate::contract::{
+        versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_GATE, TIER2_VERSION,
+    };
     let mut out = Vec::new();
     if has_before {
         out.push(versioned_interface(TIER2_BEFORE, TIER2_VERSION));
     }
     if has_after {
         out.push(versioned_interface(TIER2_AFTER, TIER2_VERSION));
+    }
+    if has_gate {
+        out.push(versioned_interface(TIER2_GATE, TIER2_VERSION));
     }
     out
 }
@@ -164,19 +180,18 @@ fn build_dispatch_module(
     iface_name: BlobSlice,
 ) -> Result<Vec<u8>> {
     let mut module = Module::new();
-    let type_idx = emit_type_section(
-        &mut module,
-        per_func,
-        schema.before_hook.as_ref().map(|h| &h.import.sig),
-        schema.after_hook.as_ref().map(|h| &h.import.sig),
-    );
+    let hooks = HookImports {
+        before: schema.before_hook.as_ref().map(|h| &h.import),
+        after: schema.after_hook.as_ref().map(|h| &h.import),
+        gate: schema.gate_hook.as_ref().map(|h| &h.import),
+    };
+    let type_idx = emit_type_section(&mut module, per_func, &hooks);
     let func_idx = emit_imports_and_funcs(
         &mut module,
         resolve,
         per_func,
         &type_idx,
-        schema.before_hook.as_ref().map(|h| &h.import),
-        schema.after_hook.as_ref().map(|h| &h.import),
+        hooks,
         plan.event_ptr,
     );
     let globals = emit_memory_and_globals(&mut module, plan.bump_start);
@@ -188,19 +203,22 @@ fn build_dispatch_module(
         func_idx.init_idx,
         func_idx.cabi_realloc_idx,
     );
-    // Zip hook pieces into one `Option<BeforeHook>` / `Option<AfterHook>`;
-    // the unreachable arms encode the "wired together or not at all" contract.
+    // The args-shape buffer (`hook_params_ptr`) is shared between
+    // before + gate; either wired side latches onto it. The
+    // unreachable arms encode the "wired together or not at all"
+    // contract per hook.
+    let hook_params_ptr = plan.hook_params_ptr.map(|p| p as i32);
     let before_hook = match (
         schema.before_hook.as_ref(),
         func_idx.before_hook_idx,
-        plan.hook_params_ptr,
+        hook_params_ptr,
     ) {
         (Some(h), Some(idx), Some(params_ptr)) => Some(BeforeHook {
             idx,
             layout: &h.params_layout,
-            params_ptr: params_ptr as i32,
+            params_ptr,
         }),
-        (None, None, None) => None,
+        (None, None, _) => None,
         _ => unreachable!("before-hook schema, import idx, and params-ptr wired in lockstep"),
     };
     let after_hook = match (schema.after_hook.as_ref(), func_idx.after_hook_idx) {
@@ -211,12 +229,30 @@ fn build_dispatch_module(
         (None, None) => None,
         _ => unreachable!("after-hook schema and import idx wired in lockstep"),
     };
+    let gate_hook = match (
+        schema.gate_hook.as_ref(),
+        func_idx.gate_hook_idx,
+        hook_params_ptr,
+        plan.gate_result_ptr,
+    ) {
+        (Some(h), Some(idx), Some(params_ptr), Some(result_ptr)) => Some(GateHook {
+            idx,
+            layout: &h.params_layout,
+            params_ptr,
+            result_ptr,
+        }),
+        (None, None, _, None) => None,
+        _ => unreachable!(
+            "gate-hook schema, import idx, params-ptr, and result-ptr wired in lockstep"
+        ),
+    };
     let wrapper_ctx = WrapperCtx {
         schema,
         resolve,
         iface_name,
         before_hook,
         after_hook,
+        gate_hook,
         call_id_counter_global: globals.call_id_counter,
         bump_global: globals.bump,
     };

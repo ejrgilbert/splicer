@@ -6,7 +6,7 @@
 //! per-shape combinations the tier-1 generator has to produce: sync
 //! primitives, async-void with strings, async with resource types
 //! (the wasi:http/handler shape), multiple functions per interface,
-//! before-only / after-only / blocking, and no-hooks.
+//! before-only / after-only / gate, and no-hooks.
 
 use crate::adapter::generate_tier1_adapter;
 use cviz::model::{
@@ -620,7 +620,7 @@ fn sig(
 
 /// The hooks every test would otherwise pass. Spelled out as a constant
 /// so the four tests that exercise other hook arrangements
-/// (before-only, after-only, blocking, no-hooks) read as deliberate.
+/// (before-only, after-only, gate, no-hooks) read as deliberate.
 const DEFAULT_HOOKS: &[&str] = &["splicer:tier1/before", "splicer:tier1/after"];
 
 /// Generate the adapter and validate the resulting bytes — the pairing
@@ -1319,10 +1319,10 @@ fn test_adapter_after_only() {
     );
 }
 
-// ── Tier 1: blocking hook (void async only) ──────────────────────────
+// ── Tier 1: gate hook (void async only) ──────────────────────────────
 
 #[test]
-fn test_adapter_blocking() {
+fn test_adapter_gate() {
     let mut arena = TypeArena::default();
     let string = arena.intern_val(ValueType::String);
     let iface = make_iface(vec![("fire", sig(true, &["msg"], vec![string], vec![]))]);
@@ -1330,9 +1330,28 @@ fn test_adapter_blocking() {
         "test:pkg/fire@1.0.0",
         &[
             "splicer:tier1/before",
-            "splicer:tier1/blocking",
+            "splicer:tier1/gate",
             "splicer:tier1/after",
         ],
+        &iface,
+        &arena,
+        SplitKind::Consumer,
+    );
+}
+
+/// Gate-only on a void async target — no `before`/`after` exported.
+/// Structurally distinct from `test_adapter_gate`: the call-id
+/// populate now runs because gate alone is the only hook, exercising
+/// the wrapper-body path where the hoisted populate fires without
+/// any other hook ahead of it.
+#[test]
+fn test_adapter_gate_only() {
+    let mut arena = TypeArena::default();
+    let string = arena.intern_val(ValueType::String);
+    let iface = make_iface(vec![("fire", sig(true, &["msg"], vec![string], vec![]))]);
+    gen_and_validate_with(
+        "test:pkg/fire@1.0.0",
+        &["splicer:tier1/gate"],
         &iface,
         &arena,
         SplitKind::Consumer,

@@ -27,7 +27,7 @@ upstream macro.
 ```rust
 splicer_tool_sdk::wit_bindgen!({
     world: "my-middleware-mdl",
-    async: ["export:splicer:tier2/before@0.1.0#on-call"],
+    async: ["export:splicer:tier2/before@0.2.0#on-call"],
     generate_all,
 });
 ```
