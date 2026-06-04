@@ -14,8 +14,8 @@ use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use wit_parser::{
-    Function, Handle, Interface, InterfaceId, Resolve, Type, TypeDefKind, TypeId, TypeOwner,
-    WorldId, WorldItem,
+    Function, FunctionKind, Handle, Interface, InterfaceId, Resolve, Type, TypeDefKind, TypeId,
+    TypeOwner, WorldId, WorldItem,
 };
 
 use super::bindings_index::{bindings_path_tokens, BindingsItem, BindingsPath, WrapperBindings};
@@ -69,10 +69,28 @@ pub fn build_ir(
     // a type referenced from multiple interfaces that wit-bindgen
     // `pub use`s under the same Rust path emits once.
     let mut types: Vec<NamedType> = Vec::new();
+    let mut resources: Vec<ResourceInfo> = Vec::new();
     let mut seen: HashSet<(BindingsPath, String)> = HashSet::new();
+    let mut seen_resources: HashSet<(BindingsPath, String)> = HashSet::new();
     for entry in &ifaces {
         let iface = &resolve.interfaces[entry.id];
         for (wit_name, type_id) in &iface.types {
+            let td = &resolve.types[*type_id];
+            if matches!(td.kind, TypeDefKind::Resource) {
+                // Resources don't get a `WitTyped` impl, but the
+                // codegen still needs to emit a per-resource newtype
+                // and GuestBucket-trait impl. Track them separately.
+                let rust_ident_str = wit_name.to_upper_camel_case();
+                let key = (entry.path.clone(), rust_ident_str.clone());
+                if seen_resources.insert(key) {
+                    resources.push(ResourceInfo {
+                        iface_path: entry.path.clone(),
+                        wit_name: wit_name.clone(),
+                        rust_ident: syn::Ident::new(&rust_ident_str, Span::call_site()),
+                    });
+                }
+                continue;
+            }
             let nt = build_named_type(resolve, &ifaces, *type_id, wit_name, &entry.path, bindings)?;
             if let Some(nt) = nt {
                 let key = (
@@ -89,10 +107,14 @@ pub fn build_ir(
         }
     }
 
-    // Synthesize one args record per exported method. The Rust ident
-    // must match the args struct decl emit_method later produces so
-    // the WitTyped impl lines up with the struct it impls.
+    // Synthesize one args record per exported function. Freestanding
+    // funcs get `<IfacePascal><FnPascal>Args` (matching what the
+    // method emitter looks up); resource methods/constructors/statics
+    // get `<ResourcePascal><FnPascal>Args` so the same resource on
+    // two interfaces won't collide on a shared interface prefix.
     let mut args_records: Vec<NamedType> = Vec::new();
+    let mut fn_sigs: std::collections::HashMap<String, ExportFnSig> =
+        std::collections::HashMap::new();
     for entry in ifaces.iter().filter(|e| e.is_export) {
         let iface = &resolve.interfaces[entry.id];
         let iface_pascal = iface
@@ -101,24 +123,133 @@ pub fn build_ir(
             .ok_or_else(|| anyhow!("exported interface has no name"))?
             .to_upper_camel_case();
         for (fn_name, func) in &iface.functions {
-            let args = synth_args_record(resolve, &iface_pascal, fn_name, func, &ifaces)?;
+            let prefix = match &func.kind {
+                FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {
+                    iface_pascal.clone()
+                }
+                FunctionKind::Method(id)
+                | FunctionKind::AsyncMethod(id)
+                | FunctionKind::Static(id)
+                | FunctionKind::AsyncStatic(id)
+                | FunctionKind::Constructor(id) => resource_pascal(resolve, *id)?,
+            };
+            // wit-parser names resource fns with the canonical-ABI
+            // mangling (e.g. `[method]bucket.get`,
+            // `[constructor]bucket`); wit-bindgen emits the Rust
+            // trait method without that prefix and with constructors
+            // renamed to `new`. The IR pins the wit-bindgen-emitted
+            // name as the args-ident source so the two walks line up.
+            let rust_method_name = rust_method_name_for(func, fn_name);
+            let args = synth_args_record(resolve, &prefix, &rust_method_name, func, &ifaces)?;
+            let args_ident = args_struct_ident(&prefix, &rust_method_name);
+            let return_ty = func
+                .result
+                .as_ref()
+                .map(|t| type_to_ref(resolve, &ifaces, t))
+                .transpose()?;
+            let kind = ExportFnKind::from(&func.kind);
+            fn_sigs.insert(args_ident.to_string(), ExportFnSig { return_ty, kind });
             args_records.push(args);
         }
     }
 
     Ok(WrapperIR {
         types,
+        resources,
         args_records,
+        fn_sigs,
     })
+}
+
+fn resource_pascal(resolve: &Resolve, type_id: TypeId) -> Result<String> {
+    let td = &resolve.types[type_id];
+    let name = td
+        .name
+        .as_ref()
+        .ok_or_else(|| anyhow!("resource type has no name"))?;
+    Ok(name.to_upper_camel_case())
+}
+
+/// Map a wit-parser function name to the Rust method name
+/// wit-bindgen-rust emits for it:
+///
+/// - `Freestanding` / `AsyncFreestanding`: name is already the WIT
+///   ident (e.g. `"open"`).
+/// - `Constructor`: wit-bindgen renames every constructor to `new`.
+/// - `Method` / `Static` (sync + async): the wit-parser name carries
+///   a `[method]<resource>.` or `[static]<resource>.` mangling
+///   prefix; strip it to recover the WIT method ident.
+fn rust_method_name_for(func: &Function, fallback_name: &str) -> String {
+    match &func.kind {
+        FunctionKind::Constructor(_) => "new".to_string(),
+        FunctionKind::Method(_) | FunctionKind::AsyncMethod(_) => fallback_name
+            .rsplit_once('.')
+            .map(|(_, m)| m.to_string())
+            .unwrap_or_else(|| fallback_name.to_string()),
+        FunctionKind::Static(_) | FunctionKind::AsyncStatic(_) => fallback_name
+            .rsplit_once('.')
+            .map(|(_, m)| m.to_string())
+            .unwrap_or_else(|| fallback_name.to_string()),
+        FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => fallback_name.to_string(),
+    }
 }
 
 /// The complete IR for one wrapper crate.
 pub struct WrapperIR {
     /// User-declared WIT types reachable from the world. Type
-    /// aliases are transparent and not listed.
+    /// aliases are transparent and not listed; resources are tracked
+    /// separately via [`Self::resources`].
     pub types: Vec<NamedType>,
-    /// One synthesized args record per exported Guest method.
+    /// WIT resources declared in exported interfaces. The codegen
+    /// emits one wrapper newtype + `GuestBucket`-style impl per
+    /// entry; resources do NOT get `WitTyped` impls.
+    pub resources: Vec<ResourceInfo>,
+    /// One synthesized args record per exported function (freestanding
+    /// or resource method/constructor/static).
     pub args_records: Vec<NamedType>,
+    /// Per-fn return type + WIT kind, keyed by the synth args struct
+    /// ident's string form. Carries enough wit-parser info downstream
+    /// so emit_method can branch on the *authoritative* kind instead
+    /// of re-deriving from Rust method names.
+    pub fn_sigs: std::collections::HashMap<String, ExportFnSig>,
+}
+
+pub struct ExportFnSig {
+    pub return_ty: Option<WitTypeRef>,
+    pub kind: ExportFnKind,
+}
+
+/// wit-parser's `FunctionKind` collapsed to what the emitter actually
+/// branches on. `Async*` variants fold into their sync counterparts;
+/// the async-ness is already encoded in the trait method's syn sig.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ExportFnKind {
+    Freestanding,
+    Method,
+    Constructor,
+    Static,
+}
+
+impl From<&FunctionKind> for ExportFnKind {
+    fn from(k: &FunctionKind) -> Self {
+        match k {
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => Self::Freestanding,
+            FunctionKind::Method(_) | FunctionKind::AsyncMethod(_) => Self::Method,
+            FunctionKind::Static(_) | FunctionKind::AsyncStatic(_) => Self::Static,
+            FunctionKind::Constructor(_) => Self::Constructor,
+        }
+    }
+}
+
+/// A WIT resource declared in an exported interface.
+pub struct ResourceInfo {
+    /// `bindings::exports::...::store` (the interface module path).
+    pub iface_path: BindingsPath,
+    /// Kebab-case WIT name, e.g. `"bucket"`.
+    #[allow(dead_code)]
+    pub wit_name: String,
+    /// PascalCase Rust ident wit-bindgen emits for the resource type.
+    pub rust_ident: syn::Ident,
 }
 
 /// A named entity that gets a `WitTyped` impl: either a WIT-declared
@@ -215,11 +346,14 @@ impl HandleRef {
     fn to_tokens(&self) -> TokenStream {
         match self {
             HandleRef::ErrorContext => quote!(::wit_bindgen::rt::async_support::ErrorContext),
-            HandleRef::Future(_)
-            | HandleRef::Stream(_)
-            | HandleRef::ResourceOwn(_)
-            | HandleRef::ResourceBorrow(_) => {
-                unreachable!("handle kind not yet supported")
+            // Resources render to the wit-bindgen-emitted `Bucket`
+            // struct path — same path for own and borrow at the IR
+            // level
+            HandleRef::ResourceOwn(nr) | HandleRef::ResourceBorrow(nr) => {
+                bindings_path_tokens(&nr.path, Some(&nr.rust_ident))
+            }
+            HandleRef::Future(_) | HandleRef::Stream(_) => {
+                unreachable!("future/stream handle kind not yet supported")
             }
         }
     }
@@ -430,8 +564,14 @@ fn build_named_type(
         // alias, let `<Alias as WitTyped>::…` resolve through the
         // underlying impl.
         TypeDefKind::Type(_) => return Ok(None),
-        TypeDefKind::Resource | TypeDefKind::Handle(_) => {
-            bail!("resource and handle types are not supported (encountered {wit_name:?})")
+        // Resources don't emit a `NamedType`/`WitTyped` impl — the
+        // codegen tracks them via [`WrapperIR::resources`] instead.
+        TypeDefKind::Resource => return Ok(None),
+        // `Handle(Own/Borrow)` references can show up here only when
+        // a type alias names one explicitly (e.g. `type b = bucket;`).
+        // We don't currently emit aliases that name handles.
+        TypeDefKind::Handle(_) => {
+            bail!("handle-type aliases are not supported (encountered {wit_name:?})")
         }
         TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
             bail!("future and stream types are not supported (encountered {wit_name:?})")
@@ -524,10 +664,21 @@ fn type_to_ref(resolve: &Resolve, ifaces: &[IfaceEntry], ty: &Type) -> Result<Wi
                     let (path, rust_ident) = named_ref_for(resolve, ifaces, *id)?;
                     WitTypeRef::Named(NamedRef { path, rust_ident })
                 }
-                TypeDefKind::Resource
-                | TypeDefKind::Handle(Handle::Own(_))
-                | TypeDefKind::Handle(Handle::Borrow(_)) => {
-                    bail!("resource/handle in field position not supported")
+                TypeDefKind::Handle(Handle::Own(rid)) => {
+                    let (path, rust_ident) = named_ref_for(resolve, ifaces, *rid)?;
+                    WitTypeRef::Handle(HandleRef::ResourceOwn(NamedRef { path, rust_ident }))
+                }
+                TypeDefKind::Handle(Handle::Borrow(rid)) => {
+                    let (path, rust_ident) = named_ref_for(resolve, ifaces, *rid)?;
+                    WitTypeRef::Handle(HandleRef::ResourceBorrow(NamedRef { path, rust_ident }))
+                }
+                // A bare `Resource` TypeDefKind can appear only when
+                // a freestanding type position references the resource
+                // declaration itself — not the canonical Own/Borrow
+                // handle. WIT parsing wraps every use-site in a
+                // Handle(_), so this should be unreachable.
+                TypeDefKind::Resource => {
+                    bail!("bare resource type reference outside Handle wrapper not supported")
                 }
                 TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
                     bail!("future/stream in field position not supported")
@@ -618,10 +769,24 @@ fn synth_args_record(
     ifaces: &[IfaceEntry],
 ) -> Result<NamedType> {
     let rust_ident = args_struct_ident(iface_pascal, fn_name);
+    // Resource methods carry an implicit `self: borrow<R>` as their
+    // first wit-parser param; wit-bindgen-rust emits it as the trait
+    // method's `&self` receiver and drops it from the explicit param
+    // list. Mirror that here so the args struct matches the receiver-less
+    // signature the codegen will reference.
+    let skip_first = matches!(
+        func.kind,
+        FunctionKind::Method(_) | FunctionKind::AsyncMethod(_)
+    );
+    let params: Vec<_> = if skip_first {
+        func.params.iter().skip(1).collect()
+    } else {
+        func.params.iter().collect()
+    };
     let fields = record_fields_from(
         resolve,
         ifaces,
-        func.params.iter().map(|p| (p.name.as_str(), p.ty)),
+        params.into_iter().map(|p| (p.name.as_str(), p.ty)),
     )?;
     Ok(NamedType {
         location: TypeLocation::TopLevel,
@@ -897,26 +1062,45 @@ mod tests {
     }
 
     #[test]
-    fn resources_are_rejected_loudly() {
+    fn resources_lift_into_resources_field_with_handle_returns() {
         let wit = r#"
             package test:pkg@0.1.0;
             interface ops {
                 resource thing { }
                 make: func() -> thing;
+                make-maybe: func() -> result<thing, string>;
             }
             world w { export ops; }
         "#;
-        let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
-        let bindings = build_bindings_index(&src).unwrap();
-        let err = match build_ir(&resolve, world_id, &bindings) {
-            Ok(_) => panic!("expected resource rejection"),
-            Err(e) => e,
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("resource"),
-            "expected resource rejection; got: {msg}"
-        );
+        let ir = build(wit, "w");
+        // The resource itself surfaces in `resources`, not `types`,
+        // and does not get a `NamedType` entry.
+        assert_eq!(ir.resources.len(), 1);
+        let r = &ir.resources[0];
+        assert_eq!(r.wit_name, "thing");
+        assert_eq!(r.rust_ident, "Thing");
+        assert!(!ir.types.iter().any(|t| t.rust_ident == "Thing"));
+
+        // `make: -> thing` synthesizes args record + lifts return as
+        // a ResourceOwn handle. `make-maybe: -> result<thing, ...>`
+        // lifts as `Result { ok: ResourceOwn, ... }`.
+        let make_args = ir
+            .args_records
+            .iter()
+            .find(|t| t.rust_ident == "OpsMakeArgs")
+            .expect("OpsMakeArgs in args_records");
+        match &make_args.kind {
+            NamedKind::Record { fields } => assert!(fields.is_empty()),
+            _ => panic!("args should be Records"),
+        }
+        // Quick spot-check that args walked without error for the
+        // result-shaped return — the test passes through `build()`
+        // which would have panicked at IR construction otherwise.
+        let _ = ir
+            .args_records
+            .iter()
+            .find(|t| t.rust_ident == "OpsMakeMaybeArgs")
+            .expect("OpsMakeMaybeArgs in args_records");
     }
 
     #[test]

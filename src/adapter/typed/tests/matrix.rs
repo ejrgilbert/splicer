@@ -352,6 +352,101 @@ fn matrix_error_context_arg_pass_through() {
 }
 
 #[test]
+fn matrix_resource_pass_through() {
+    // Resource exercise: method calls on a resource (`&self` is the
+    // implicit borrow) dispatch through a per-resource GuestBucket
+    // impl on a wrapper newtype. Interface-level fns returning a
+    // resource (`open`) round-trip through the wrapper newtype as
+    // the strategy R, then re-wrap to the export-side resource at
+    // the boundary. `open-maybe -> result<bucket, string>` exercises
+    // the Result<resource, E> compound shape.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-bucket@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    get: async func(key: string) -> option<list<u8>>;
+                    put: async func(key: string, val: list<u8>);
+                }
+                open: async func(name: string) -> bucket;
+                open-maybe: async func(name: string) -> result<bucket, string>;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-bucket/store@0.1.0",
+        "bindings::matrix::res_bucket::store::open",
+        Behavior::Transform,
+    );
+    // prettyplease wraps long expressions across lines; collapse to
+    // single-line form before substring-matching the codegen shape.
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Wrapper newtype is emitted as `WrapperBucket(pub <import-path>::Bucket)`.
+    assert!(
+        oneline.contains("pub struct WrapperBucket")
+            && oneline.contains("bindings::matrix::res_bucket::store::Bucket"),
+        "expected WrapperBucket newtype over import-side Bucket:\n{}",
+        out.lib_rs,
+    );
+    // Interface-level Guest impl declares `type Bucket = WrapperBucket;`.
+    assert!(
+        oneline.contains("type Bucket = WrapperBucket"),
+        "expected `type Bucket = WrapperBucket` assoc type in Guest impl:\n{}",
+        out.lib_rs,
+    );
+    // Per-resource GuestBucket impl is emitted on the wrapper newtype.
+    assert!(
+        oneline.contains("GuestBucket for WrapperBucket"),
+        "expected per-resource GuestBucket impl on WrapperBucket:\n{}",
+        out.lib_rs,
+    );
+    // Per-resource args structs use the resource name as prefix.
+    for ident in ["BucketGetArgs", "BucketPutArgs", "BucketNewArgs"] {
+        assert!(
+            oneline.contains(ident),
+            "expected resource-prefixed args struct `{ident}`:\n{}",
+            out.lib_rs,
+        );
+    }
+    // The closure body for `open` constructs the intermediate via
+    // `WrapperBucket(<import>::open(...))` and the final wrap calls
+    // `<export>::Bucket::new(intermediate)`.
+    assert!(
+        oneline.contains("WrapperBucket( bindings::matrix::res_bucket::store::open")
+            || oneline.contains("WrapperBucket(bindings::matrix::res_bucket::store::open"),
+        "expected closure to wrap import-side open() into WrapperBucket:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("bindings::exports::matrix::res_bucket::store::Bucket::new(intermediate)"),
+        "expected outer wrap to re-wrap intermediate into export-side Bucket:\n{}",
+        out.lib_rs,
+    );
+    // result<bucket, _> compound: closure maps Ok arm to
+    // WrapperBucket; outer maps it back to export-side Bucket::new.
+    assert!(
+        oneline.contains(".map(WrapperBucket)"),
+        "expected closure to `.map(WrapperBucket)` for the Ok arm:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains(".map(bindings::exports::matrix::res_bucket::store::Bucket::new)"),
+        "expected outer wrap to `.map(Bucket::new)` for the Ok arm:\n{}",
+        out.lib_rs,
+    );
+    // Per-resource methods dispatch through TransformStrategy; the
+    // closure body uses the captured `self` (the wrapper newtype),
+    // not an args-struct field for the receiver.
+    assert!(
+        oneline.contains("self.0.get(args.key)"),
+        "expected GuestBucket::get closure body to call self.0.get(args.key):\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
 fn matrix_multiple_exported_interfaces() {
     // Two exported interfaces in one world. Exercises the per-Guest
     // loop in `emit_guest` and the multi-impl assembly in

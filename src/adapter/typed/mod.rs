@@ -17,7 +17,7 @@ pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, Wrappe
 pub use bindgen::run_wit_bindgen_rust;
 pub use bindings_index::build_bindings_index;
 pub use build::{build_wrapper, BuildConfig};
-pub use emit_method::{emit_guest, EmittedGuest};
+pub use emit_method::{emit_guest, emit_resource_newtypes, EmittedGuest};
 pub use emit_wit_typed::emit_wit_typed_impls;
 #[allow(unused_imports)]
 pub use ir::{build_ir, NamedKind, NamedType, WitTypeRef, WrapperIR};
@@ -62,11 +62,13 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         .iter()
         .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior, &ir))
         .collect();
+    let resource_newtypes = emit_resource_newtypes(&ir);
 
     let lib_rs = assemble_lib_rs(&WrapperCrateInputs {
         bindings_src: &bindings_src,
         witty_impls: &witty_impls,
         guests: &guests,
+        resource_newtypes: &resource_newtypes,
         behavior: input.behavior,
         strategy_crate_name: input.strategy_crate_name,
         strategy_type: input.strategy_type,

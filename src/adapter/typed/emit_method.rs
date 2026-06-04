@@ -35,11 +35,14 @@
 //! `VirtualizeStrategy::handle` instead.
 
 use heck::ToUpperCamelCase;
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 
-use super::bindings_index::{bindings_path_tokens, GuestMethod, GuestTrait};
-use super::ir::{args_struct_ident, NamedKind, NamedType, RecordField, TypeLocation, WrapperIR};
+use super::bindings_index::{bindings_path_tokens, GuestMethod, GuestTrait, GuestTraitKind};
+use super::ir::{
+    args_struct_ident, ExportFnKind, HandleRef, NamedKind, NamedRef, NamedType, RecordField,
+    ResourceInfo, TypeLocation, WitTypeRef, WrapperIR,
+};
 use super::Behavior;
 
 /// What [`emit_guest`] produces for a single Guest trait.
@@ -51,10 +54,20 @@ pub struct EmittedGuest {
     pub guest_impl: TokenStream,
 }
 
-/// Emit the args structs and Guest impl for one exported interface.
+/// Emit the args structs and trait impl for one Guest-flavored trait.
 ///
 /// `interface_qualified_name` is the `"package:ns/iface@ver"` form
 /// of the wrapped interface; it goes into each emitted `CallId`.
+///
+/// Interface-level (`GuestTraitKind::Interface`) emissions add a
+/// `type <Resource> = Wrapper<Resource>;` assoc-type line for every
+/// resource declared in the same interface, and rewrap
+/// resource-returning fns through the per-resource wrapper newtype.
+///
+/// Resource-level (`GuestTraitKind::Resource`) emissions dispatch
+/// through the strategy for each method, capturing `&self` by
+/// reference in the closure so the args struct stays free of
+/// handle-typed fields.
 pub fn emit_guest(
     g: &GuestTrait,
     interface_qualified_name: &str,
@@ -69,11 +82,20 @@ pub fn emit_guest(
         .expect("Guest trait module path is empty")
         .to_upper_camel_case();
 
+    // For interface-level Guest, the args prefix is `<IfacePascal>`
+    // (matching the per-fn `<IfacePascal><FnPascal>Args` synth). For
+    // per-resource GuestBucket, it's `<ResourcePascal>` so two
+    // resources with the same method name don't collide.
+    let args_prefix = match &g.kind {
+        GuestTraitKind::Interface => interface_pascal.clone(),
+        GuestTraitKind::Resource(ident) => ident.to_string(),
+    };
+
     let mut args_structs = Vec::with_capacity(g.methods.len());
     let mut method_bodies = Vec::with_capacity(g.methods.len());
 
     for method in &g.methods {
-        let args_ident = args_struct_ident(&interface_pascal, &method.ident.to_string());
+        let args_ident = args_struct_ident(&args_prefix, &method.ident.to_string());
         let args_record = find_args_record(ir, &args_ident);
 
         args_structs.push(emit_args_struct(&args_ident, args_record));
@@ -84,12 +106,43 @@ pub fn emit_guest(
             interface_qualified_name,
             behavior,
             &g.module_path,
+            &g.kind,
+            ir,
         ));
     }
 
+    let trait_ident = &g.trait_ident;
     let trait_path = build_module_path(&g.module_path);
+    let impl_target = match &g.kind {
+        GuestTraitKind::Interface => quote!(Wrapper),
+        GuestTraitKind::Resource(id) => {
+            let wrap = wrapper_ident_for(id);
+            quote!(#wrap)
+        }
+    };
+
+    // The interface-level Guest impl carries `type <Resource> =
+    // Wrapper<Resource>;` for every resource declared in this iface;
+    // wit-bindgen requires the associated type, and the wrapper
+    // newtype is what wires the export-side resource table to our
+    // per-method dispatch.
+    let assoc_types = match &g.kind {
+        GuestTraitKind::Interface => ir
+            .resources
+            .iter()
+            .filter(|r| r.iface_path == g.module_path)
+            .map(|r| {
+                let res = &r.rust_ident;
+                let wrap = wrapper_ident_for(&r.rust_ident);
+                quote!(type #res = #wrap;)
+            })
+            .collect::<Vec<_>>(),
+        GuestTraitKind::Resource(_) => Vec::new(),
+    };
+
     let guest_impl = quote! {
-        impl #trait_path::Guest for Wrapper {
+        impl #trait_path::#trait_ident for #impl_target {
+            #(#assoc_types)*
             #(#method_bodies)*
         }
     };
@@ -97,6 +150,45 @@ pub fn emit_guest(
     EmittedGuest {
         args_structs,
         guest_impl,
+    }
+}
+
+/// Emit one `pub struct Wrapper<Resource>(pub bindings::<import>::<Resource>);`
+/// newtype per resource declared in any exported interface. The inner
+/// field holds the import-side resource handle that the wrapper
+/// forwards method calls to.
+pub fn emit_resource_newtypes(ir: &WrapperIR) -> Vec<TokenStream> {
+    ir.resources.iter().map(emit_one_resource_newtype).collect()
+}
+
+fn emit_one_resource_newtype(r: &ResourceInfo) -> TokenStream {
+    let wrap = wrapper_ident_for(&r.rust_ident);
+    let import_path = import_resource_path_tokens(r);
+    quote! {
+        pub struct #wrap(pub #import_path);
+    }
+}
+
+/// `Wrapper<Pascal>` — e.g. `WrapperBucket`. This is the wrapper-crate-local
+/// newtype that wraps the import-side resource handle.
+fn wrapper_ident_for(resource_pascal: &syn::Ident) -> syn::Ident {
+    syn::Ident::new(&format!("Wrapper{resource_pascal}"), Span::call_site())
+}
+
+/// Import-side Rust path for the resource: the wrapper world always
+/// imports + exports the same interface in Transform mode, so the
+/// import-side `Bucket` lives at the same module path with the
+/// leading `exports::` segment dropped.
+fn import_resource_path_tokens(r: &ResourceInfo) -> TokenStream {
+    let import_segs = strip_exports_prefix(&r.iface_path);
+    bindings_path_tokens(&import_segs, Some(&r.rust_ident))
+}
+
+fn strip_exports_prefix(segs: &[String]) -> Vec<String> {
+    if segs.first().map(String::as_str) == Some("exports") {
+        segs[1..].to_vec()
+    } else {
+        segs.to_vec()
     }
 }
 
@@ -135,6 +227,7 @@ fn emit_args_struct(args_ident: &syn::Ident, args_record: &NamedType) -> TokenSt
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_method_body(
     method: &GuestMethod,
     args_ident: &syn::Ident,
@@ -142,13 +235,16 @@ fn emit_method_body(
     interface_qualified_name: &str,
     behavior: Behavior,
     guest_module_path: &[String],
+    trait_kind: &GuestTraitKind,
+    ir: &WrapperIR,
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
     let sig_inputs = &method.sig.inputs;
     let sig_output = &method.sig.output;
-    let return_ty = return_type(&method.sig);
+    let nominal_return_ty = return_type(&method.sig);
     let fields = args_fields(args_record);
+    let is_async = method.sig.asyncness.is_some();
 
     // Both sides of the pairing come from the same kebab→snake mirror,
     // so positional indexing is sound by construction.
@@ -168,14 +264,89 @@ fn emit_method_body(
     });
     let args_construct = quote! { #args_ident { #(#inits),* } };
 
-    // Transform strategies forward to the wrapped target via the
-    // closure; virtualize strategies replace the target and never
-    // call into it. `.await` only if the Guest method is async.
-    let target_call = build_target_call(method_ident, fields, guest_module_path);
-    let target_call = if method.sig.asyncness.is_some() {
+    // Authoritative WIT-side kind for this fn (the IR pinned it from
+    // wit-parser's FunctionKind).
+    let fn_kind = ir
+        .fn_sigs
+        .get(&args_ident.to_string())
+        .map(|s| s.kind)
+        .unwrap_or(ExportFnKind::Freestanding);
+
+    // Where the closure body's call lands: interface-level Guest fns
+    // forward to the import-side iface module; per-resource methods
+    // forward via the captured `&self` (instance method) or the
+    // resource's import-side type (constructor / static).
+    let target_call = match (trait_kind, fn_kind) {
+        (GuestTraitKind::Interface, _) => {
+            build_target_call(method_ident, fields, guest_module_path)
+        }
+        (GuestTraitKind::Resource(_), ExportFnKind::Method) => {
+            build_self_call(method_ident, fields)
+        }
+        (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Constructor) => {
+            // Constructors return `Self` in the trait; their import-side
+            // call returns the import Bucket which we wrap into the
+            // wrapper newtype to satisfy the `-> Self` signature.
+            let import_resource = build_import_resource_path(resource_pascal, guest_module_path);
+            let call = build_static_call(&import_resource, method_ident, fields);
+            let wrap = wrapper_ident_for(resource_pascal);
+            // Constructor is always sync per the WIT spec, but
+            // guard the await branch defensively in case the spec
+            // grows async constructors later.
+            if is_async {
+                quote!(#wrap(#call.await))
+            } else {
+                quote!(#wrap(#call))
+            }
+        }
+        (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Static) => {
+            // Static methods dispatch through the import-side type
+            // surface and return whatever the WIT declared — no
+            // automatic wrap. Static methods that themselves return
+            // the resource would need the same resource-wrap helper
+            // the interface-level emit uses; deferred until a fixture
+            // exercises it.
+            let import_resource = build_import_resource_path(resource_pascal, guest_module_path);
+            build_static_call(&import_resource, method_ident, fields)
+        }
+        (GuestTraitKind::Resource(_), ExportFnKind::Freestanding) => {
+            unreachable!("freestanding fn appeared in a per-resource Guest trait")
+        }
+    };
+    // Constructor's wrap-with-await is already inlined above; other
+    // calls get the standard sync/async suffix here.
+    let constructor_already_handled = matches!(
+        (trait_kind, fn_kind),
+        (GuestTraitKind::Resource(_), ExportFnKind::Constructor)
+    );
+    let target_call = if constructor_already_handled {
+        target_call
+    } else if is_async {
         quote! { #target_call.await }
     } else {
         target_call
+    };
+
+    // Resource-returning interface-level fns route through an
+    // intermediate type (the wrapper newtype) inside the strategy,
+    // then re-wrap to the export-side resource at the boundary.
+    let resource_wrap = match trait_kind {
+        GuestTraitKind::Interface => {
+            let ret = ir
+                .fn_sigs
+                .get(&args_ident.to_string())
+                .and_then(|s| s.return_ty.as_ref());
+            ret.and_then(detect_resource_wrap)
+        }
+        GuestTraitKind::Resource(_) => None,
+    };
+    let (strategy_r_ty, closure_body, final_wrap) = match &resource_wrap {
+        Some(rw) => (
+            rw.intermediate_ty.clone(),
+            (rw.wrap_to)(&target_call),
+            Some((rw.wrap_from)(quote!(intermediate))),
+        ),
+        None => (nominal_return_ty.clone(), target_call, None),
     };
 
     let dispatch = match behavior {
@@ -184,17 +355,17 @@ fn emit_method_body(
             // `<_ as Trait<…>>::handle` dispatch doesn't propagate
             // into closure inference (E0282).
             quote! {
-                <_ as ::splicer_tool_sdk::TransformStrategy<#args_ident, #return_ty>>::handle(
+                <_ as ::splicer_tool_sdk::TransformStrategy<#args_ident, #strategy_r_ty>>::handle(
                     s,
                     call,
                     args,
-                    |args: #args_ident| async move { #target_call },
+                    |args: #args_ident| async move { #closure_body },
                 )
             }
         }
         Behavior::Virtualize => {
             quote! {
-                <_ as ::splicer_tool_sdk::VirtualizeStrategy<#args_ident, #return_ty>>::handle(
+                <_ as ::splicer_tool_sdk::VirtualizeStrategy<#args_ident, #strategy_r_ty>>::handle(
                     s,
                     call,
                     args,
@@ -203,8 +374,19 @@ fn emit_method_body(
         }
     };
 
-    quote! {
-        async fn #method_ident(#sig_inputs) #sig_output {
+    let body = match final_wrap {
+        Some(wrap) => quote! {
+            let call = ::splicer_tool_sdk::CallId {
+                interface_name: #interface_qualified_name.into(),
+                function_name: #method_name.into(),
+                id: 0,
+            };
+            let args = #args_construct;
+            let s = strategy();
+            let intermediate = #dispatch.await;
+            #wrap
+        },
+        None => quote! {
             let call = ::splicer_tool_sdk::CallId {
                 interface_name: #interface_qualified_name.into(),
                 function_name: #method_name.into(),
@@ -213,8 +395,151 @@ fn emit_method_body(
             let args = #args_construct;
             let s = strategy();
             #dispatch.await
+        },
+    };
+
+    // Match the wit-bindgen-emitted signature's async-ness; sync WIT
+    // methods get sync wrapper bodies. Sync bodies still expand the
+    // async `dispatch.await` — but the surrounding `strategy()` call
+    // is sync, so the only `.await` is on a future returned by
+    // TransformStrategy::handle (also async). Sync wrappers therefore
+    // can only host async strategies — which works because the host
+    // executor is the wasm runtime, not the wrapper's frame.
+    if is_async {
+        quote! {
+            async fn #method_ident(#sig_inputs) #sig_output {
+                #body
+            }
+        }
+    } else {
+        quote! {
+            fn #method_ident(#sig_inputs) #sig_output {
+                #body
+            }
         }
     }
+}
+
+/// Build the closure body that forwards a per-resource method call to
+/// `self.0.<method>(args.x)` — the import-side handle held by the
+/// wrapper newtype is what the strategy ultimately reaches.
+fn build_self_call(method_ident: &syn::Ident, fields: &[RecordField]) -> TokenStream {
+    let arg_exprs = fields.iter().map(|f| {
+        let name = &f.rust_ident;
+        quote! { args.#name }
+    });
+    quote! { self.0.#method_ident(#(#arg_exprs),*) }
+}
+
+/// Build the closure body for a constructor / static method:
+/// `<import>::<Resource>::<method>(args.x)`.
+fn build_static_call(
+    import_resource: &TokenStream,
+    method_ident: &syn::Ident,
+    fields: &[RecordField],
+) -> TokenStream {
+    let arg_exprs = fields.iter().map(|f| {
+        let name = &f.rust_ident;
+        quote! { args.#name }
+    });
+    quote! { #import_resource::#method_ident(#(#arg_exprs),*) }
+}
+
+/// Resolve the import-side resource type path from the GuestBucket
+/// trait's module path: `bindings::exports::test::resz::store` →
+/// `bindings::test::resz::store::Bucket`.
+fn build_import_resource_path(
+    resource_pascal: &syn::Ident,
+    guest_module_path: &[String],
+) -> TokenStream {
+    assert_eq!(
+        guest_module_path.first().map(String::as_str),
+        Some("exports"),
+        "GuestBucket trait module path must start with `exports`; got {guest_module_path:?}",
+    );
+    let import_segs: Vec<String> = guest_module_path[1..].to_vec();
+    bindings_path_tokens(&import_segs, Some(resource_pascal))
+}
+
+/// Recognizes resource-bearing return shapes that the interface-level
+/// Guest emitter must rewrap. Covers:
+///
+/// - bare `own<R>` returns (wrap → `WrapperR`)
+/// - `result<own<R>, E>` (wrap → `Result<WrapperR, E>`)
+///
+/// Other compound shapes (`option<R>`, `tuple<…, R, …>`, `list<R>`)
+/// would need per-shape closures; deferred until a test fixture
+/// exercises them.
+fn detect_resource_wrap(ret: &WitTypeRef) -> Option<ResourceWrap> {
+    match ret {
+        WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => Some(make_own_wrap(nr)),
+        WitTypeRef::Result {
+            ok: Some(inner),
+            err,
+        } => match inner.as_ref() {
+            WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => {
+                Some(make_result_own_wrap(nr, err.as_deref()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn make_own_wrap(nr: &NamedRef) -> ResourceWrap {
+    let export_path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
+    let wrap_ident = wrapper_ident_for(&nr.rust_ident);
+    let intermediate_ty = quote!(#wrap_ident);
+    let wrap_ident_for_to = wrap_ident.clone();
+    let export_path_for_from = export_path.clone();
+    ResourceWrap {
+        intermediate_ty,
+        wrap_to: Box::new(move |inner: &TokenStream| {
+            let wrap = &wrap_ident_for_to;
+            quote!(#wrap(#inner))
+        }),
+        wrap_from: Box::new(move |intermediate: TokenStream| {
+            let p = &export_path_for_from;
+            quote!(#p::new(#intermediate))
+        }),
+    }
+}
+
+fn make_result_own_wrap(nr: &NamedRef, err: Option<&WitTypeRef>) -> ResourceWrap {
+    let export_path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
+    let wrap_ident = wrapper_ident_for(&nr.rust_ident);
+    let err_ty = match err {
+        Some(t) => t.to_tokens(),
+        None => quote!(()),
+    };
+    let intermediate_ty = quote!(::core::result::Result<#wrap_ident, #err_ty>);
+    let wrap_ident_for_to = wrap_ident.clone();
+    let export_path_for_from = export_path.clone();
+    ResourceWrap {
+        intermediate_ty,
+        wrap_to: Box::new(move |inner: &TokenStream| {
+            let wrap = &wrap_ident_for_to;
+            // `.map(WrapperBucket)` reuses the newtype's tuple-struct
+            // call-form as a function pointer over the Ok arm.
+            quote!((#inner).map(#wrap))
+        }),
+        wrap_from: Box::new(move |intermediate: TokenStream| {
+            let p = &export_path_for_from;
+            quote!((#intermediate).map(#p::new))
+        }),
+    }
+}
+
+struct ResourceWrap {
+    intermediate_ty: TokenStream,
+    /// Converts the import-side call's result into the strategy R
+    /// intermediate (e.g. `WrapperBucket(<call>)` or
+    /// `<call>.map(WrapperBucket)`).
+    wrap_to: Box<dyn Fn(&TokenStream) -> TokenStream>,
+    /// Converts the strategy-returned intermediate back into the
+    /// nominal Guest return type (e.g.
+    /// `bindings::exports::iface::Bucket::new(intermediate)`).
+    wrap_from: Box<dyn Fn(TokenStream) -> TokenStream>,
 }
 
 fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {

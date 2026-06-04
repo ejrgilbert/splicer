@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use heck::ToUpperCamelCase;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{Item, ItemMacro, ItemMod, ItemTrait, TraitItem, TraitItemFn};
@@ -42,10 +43,26 @@ pub struct WrapperBindings {
     pub guest_traits: Vec<GuestTrait>,
 }
 
-/// A `Guest` trait the wrapper must implement.
+/// A `Guest`-flavored trait the wrapper must implement: either the
+/// interface-level `Guest` (covers freestanding fns + a `type Bucket
+/// = …;` line per resource) or a per-resource `GuestBucket` (covers
+/// constructor + methods + statics of one resource).
 pub struct GuestTrait {
     pub module_path: BindingsPath,
+    /// Trait ident verbatim from wit-bindgen (`Guest` or
+    /// `Guest<ResourcePascal>`)
+    pub trait_ident: syn::Ident,
+    pub kind: GuestTraitKind,
     pub methods: Vec<GuestMethod>,
+}
+
+pub enum GuestTraitKind {
+    /// `pub trait Guest { ... }`.
+    Interface,
+    /// `pub trait Guest<R> { ... }`; the ident is just the resource
+    /// PascalCase (`Bucket`), used to derive `WrapperBucket` and
+    /// `type Bucket = WrapperBucket;`.
+    Resource(syn::Ident),
 }
 
 pub struct GuestMethod {
@@ -104,11 +121,15 @@ fn walk_items(
                 walk_items(inner_items, path, index, guests);
                 path.pop();
             }
-            Item::Trait(t) if is_guest_trait(t) => {
-                guests.push(GuestTrait {
-                    module_path: path.clone(),
-                    methods: trait_methods(t),
-                });
+            Item::Trait(t) => {
+                if let Some(kind) = classify_guest_trait(t) {
+                    guests.push(GuestTrait {
+                        module_path: path.clone(),
+                        trait_ident: t.ident.clone(),
+                        kind,
+                        methods: trait_methods(t),
+                    });
+                }
             }
             Item::Struct(s) => {
                 if matches!(s.fields, syn::Fields::Named(_)) {
@@ -140,15 +161,39 @@ fn walk_items(
     }
 }
 
-fn is_guest_trait(t: &ItemTrait) -> bool {
-    t.ident == "Guest"
+/// Returns `Some(kind)` for `Guest` and for `Guest<ResourcePascal>`
+/// traits; `None` for everything else. The PascalCase suffix carries
+/// the resource's wit-bindgen ident, matching the `type Bucket = ...;`
+/// associated type in the interface-level `Guest` trait.
+fn classify_guest_trait(t: &ItemTrait) -> Option<GuestTraitKind> {
+    let ident = t.ident.to_string();
+    if ident == "Guest" {
+        return Some(GuestTraitKind::Interface);
+    }
+    let suffix = ident.strip_prefix("Guest").filter(|s| !s.is_empty())?;
+    // wit-bindgen names per-resource traits as `Guest<PascalCase>`;
+    // round-trip through heck to confirm the suffix matches the form
+    // (rejects accidental matches like a user-defined `GuestX_y`).
+    if suffix.to_upper_camel_case() != suffix {
+        return None;
+    }
+    Some(GuestTraitKind::Resource(syn::Ident::new(
+        suffix,
+        Span::call_site(),
+    )))
 }
 
 fn trait_methods(t: &ItemTrait) -> Vec<GuestMethod> {
     t.items
         .iter()
         .filter_map(|i| match i {
-            TraitItem::Fn(TraitItemFn { sig, .. }) => Some(GuestMethod {
+            // Skip provided (default-bodied) methods like wit-bindgen's
+            // hidden `_resource_new` / `_resource_rep` on a
+            // `GuestBucket` trait — only the required methods are
+            // user-facing.
+            TraitItem::Fn(TraitItemFn {
+                sig, default: None, ..
+            }) => Some(GuestMethod {
                 ident: sig.ident.clone(),
                 sig: sig.clone(),
             }),
@@ -228,12 +273,66 @@ mod tests {
         let bindings = build_bindings_index(&src).unwrap();
         assert_eq!(bindings.guest_traits.len(), 1);
         let g = &bindings.guest_traits[0];
+        assert!(matches!(g.kind, GuestTraitKind::Interface));
         let methods: Vec<String> = g.methods.iter().map(|m| m.ident.to_string()).collect();
         assert!(
             methods.iter().any(|s| s == "add"),
             "Guest methods: {methods:?}"
         );
         assert_eq!(g.module_path.last().map(String::as_str), Some("ops"));
+    }
+
+    const RESOURCE_WIT: &str = r#"
+        package test:resz@0.1.0;
+        interface store {
+            resource bucket {
+                constructor(name: string);
+                get: func(key: string) -> option<list<u8>>;
+                put: func(key: string, val: list<u8>);
+            }
+            open: func(name: string) -> bucket;
+        }
+        world w { export store; }
+    "#;
+
+    #[test]
+    fn extracts_interface_and_per_resource_guest_traits() {
+        let (_, _, src) = run_wit_bindgen_rust(RESOURCE_WIT, Some("w")).unwrap();
+        let bindings = build_bindings_index(&src).unwrap();
+        // Two Guest traits: the interface-level one (with `open`) and
+        // the per-resource `GuestBucket`.
+        let iface = bindings
+            .guest_traits
+            .iter()
+            .find(|g| matches!(g.kind, GuestTraitKind::Interface))
+            .expect("interface-level Guest");
+        let iface_method_names: Vec<String> =
+            iface.methods.iter().map(|m| m.ident.to_string()).collect();
+        assert!(
+            iface_method_names.iter().any(|s| s == "open"),
+            "interface Guest methods: {iface_method_names:?}"
+        );
+
+        let bucket = bindings
+            .guest_traits
+            .iter()
+            .find(|g| matches!(&g.kind, GuestTraitKind::Resource(id) if id == "Bucket"))
+            .expect("GuestBucket trait");
+        let bucket_method_names: Vec<String> =
+            bucket.methods.iter().map(|m| m.ident.to_string()).collect();
+        for required in ["new", "get", "put"] {
+            assert!(
+                bucket_method_names.iter().any(|s| s == required),
+                "expected `{required}` on GuestBucket; got: {bucket_method_names:?}"
+            );
+        }
+        // Hidden helpers (`_resource_new`, `_resource_rep`) ship
+        // with default impls; the trait_methods filter should skip
+        // them so the wrapper isn't asked to re-implement them.
+        assert!(
+            !bucket_method_names.iter().any(|s| s.starts_with('_')),
+            "default-bodied `_resource_*` methods should be filtered: {bucket_method_names:?}"
+        );
     }
 
     #[test]

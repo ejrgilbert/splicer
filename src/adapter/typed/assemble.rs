@@ -50,6 +50,8 @@ pub struct WrapperCrateInputs<'a> {
     pub witty_impls: &'a [TokenStream],
     /// Per-Guest emissions from [`super::emit_method::emit_guest`].
     pub guests: &'a [EmittedGuest],
+    /// Per-resource wrapper newtypes
+    pub resource_newtypes: &'a [TokenStream],
     pub behavior: Behavior,
     /// The strategy crate's Cargo package name (kebab- or snake-case).
     pub strategy_crate_name: &'a str,
@@ -81,6 +83,7 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
     };
 
     let witty_impls = inputs.witty_impls;
+    let resource_newtypes = inputs.resource_newtypes;
     let args_structs: Vec<&TokenStream> = inputs
         .guests
         .iter()
@@ -105,8 +108,12 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         #strategy_trait_use
 
         // Args record decls (top-level structs), then `WitTyped`
-        // impls for user types and args records alike.
+        // impls for user types and args records alike. Resource
+        // wrapper newtypes (Wrapper<R>) live alongside and back the
+        // export-side resource table via the impl<GuestR for WrapperR>
+        // blocks emitted below.
         #(#args_structs)*
+        #(#resource_newtypes)*
         #(#witty_impls)*
 
         // One shared strategy instance for the whole wrapper. Stored
@@ -233,6 +240,7 @@ mod tests {
             bindings_src: &bindings_src,
             witty_impls: &witty_impls,
             guests: &guests,
+            resource_newtypes: &[],
             behavior,
             strategy_crate_name: "my-strategy",
             strategy_type: "MyStrategy",
