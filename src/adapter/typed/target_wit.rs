@@ -50,9 +50,8 @@ pub fn target_wit_for_codegen(
     let mirror_qname = match mirror_export_name {
         Some(expected) => {
             let (_mirror_iface_id, synthesized) =
-                synthesize_async_mirror(&mut resolve, target_iface_id).with_context(|| {
-                    format!("synthesize async mirror for `{target_interface}`")
-                })?;
+                synthesize_async_mirror(&mut resolve, target_iface_id)
+                    .with_context(|| format!("synthesize async mirror for `{target_interface}`"))?;
             if synthesized != expected {
                 bail!(
                     "{MIRROR_NAME_MISMATCH_PREFIX} for `{target_interface}`: \
@@ -149,8 +148,9 @@ mod tests {
     #[test]
     fn transform_wraps_target_with_export_and_import() {
         let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
-        let target = target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform, None)
-            .expect("extract");
+        let target =
+            target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform, None)
+                .expect("extract");
         assert_eq!(target.world_name, WRAPPER_WORLD);
         assert_eq!(target.qualified_name, "test:demo/ops@0.1.0");
         let wit = &target.wit_text;
@@ -166,9 +166,13 @@ mod tests {
     #[test]
     fn virtualize_omits_downstream_import() {
         let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
-        let target =
-            target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Virtualize, None)
-                .expect("extract");
+        let target = target_wit_for_codegen(
+            &component,
+            "test:demo/ops@0.1.0",
+            Behavior::Virtualize,
+            None,
+        )
+        .expect("extract");
         let wit = &target.wit_text;
         assert!(wit.contains("export test:demo/ops@0.1.0;"), "{wit}");
         assert!(!wit.contains("import test:demo/ops@0.1.0;"), "{wit}");
@@ -181,8 +185,9 @@ mod tests {
         // round-trip regressions and synthetic-world syntax bugs.
         use crate::adapter::typed::run_wit_bindgen_rust;
         let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
-        let target = target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform, None)
-            .expect("extract");
+        let target =
+            target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform, None)
+                .expect("extract");
         let (_resolve, _world, src) =
             run_wit_bindgen_rust(&target.wit_text, Some(&target.world_name))
                 .expect("wit-bindgen accepts extracted WIT");
@@ -192,8 +197,9 @@ mod tests {
     #[test]
     fn unknown_target_interface_errors() {
         let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
-        let err = target_wit_for_codegen(&component, "no:such/iface@0.1.0", Behavior::Transform, None)
-            .unwrap_err();
+        let err =
+            target_wit_for_codegen(&component, "no:such/iface@0.1.0", Behavior::Transform, None)
+                .unwrap_err();
         assert!(err.to_string().contains("no:such/iface"));
     }
 
@@ -236,7 +242,10 @@ mod tests {
             .unwrap_or(target);
         // Mirror package is always `@0.0.1` regardless of the target's version.
         let iface = iface_at_ver.split('@').next().unwrap_or(iface_at_ver);
-        format!("splicer:async-mirror-{}/{iface}@0.0.1", short_hash_hex(target))
+        format!(
+            "splicer:async-mirror-{}/{iface}@0.0.1",
+            short_hash_hex(target)
+        )
     }
 
     #[test]
@@ -244,13 +253,9 @@ mod tests {
         let component = component_from_wit(TINY_SYNC_WIT, "demo").expect("synthesize fixture");
         let target_iface = "test:demo/ops@0.1.0";
         let mirror = expected_mirror_name(target_iface);
-        let target = target_wit_for_codegen(
-            &component,
-            target_iface,
-            Behavior::Transform,
-            Some(&mirror),
-        )
-        .expect("extract bridged tier-3 target");
+        let target =
+            target_wit_for_codegen(&component, target_iface, Behavior::Transform, Some(&mirror))
+                .expect("extract bridged tier-3 target");
         // user-facing qualified_name stays as the original target so
         // runtime CallId.interface_name reflects what the YAML says.
         assert_eq!(target.qualified_name, target_iface);
@@ -314,13 +319,9 @@ mod tests {
         let component = component_from_wit(TINY_SYNC_WIT, "demo").expect("synthesize fixture");
         let target_iface = "test:demo/ops@0.1.0";
         let mirror = expected_mirror_name(target_iface);
-        let target = target_wit_for_codegen(
-            &component,
-            target_iface,
-            Behavior::Transform,
-            Some(&mirror),
-        )
-        .expect("extract");
+        let target =
+            target_wit_for_codegen(&component, target_iface, Behavior::Transform, Some(&mirror))
+                .expect("extract");
         let (_resolve, _world, src) =
             run_wit_bindgen_rust(&target.wit_text, Some(&target.world_name))
                 .expect("wit-bindgen accepts bridged WIT");

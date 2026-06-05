@@ -121,10 +121,7 @@ pub(super) fn build_tier2_adapter(
 
     // Iterate the lift side — those become wrapper exports. In the
     // bridged path the lift's funcs are async by construction.
-    let lift_funcs: Vec<&WitFunction> = resolve.interfaces[lift_iface]
-        .functions
-        .values()
-        .collect();
+    let lift_funcs: Vec<&WitFunction> = resolve.interfaces[lift_iface].functions.values().collect();
     let schema = compute_schema(&resolve, world_id, has_before, has_after, has_gate)?;
 
     let mut names = NameInterner::new();

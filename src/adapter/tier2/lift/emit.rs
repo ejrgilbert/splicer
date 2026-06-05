@@ -897,8 +897,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     // Bridged direct-return (export async, import sync direct) needs
     // its own derivation: the async-stackful export sig has no flat
     // result, so type comes from the import side instead.
-    let result = if !fd.shape.is_import_async() && !fd.import_sig.retptr && fd.result_ty.is_some()
-    {
+    let result = if !fd.shape.is_import_async() && !fd.import_sig.retptr && fd.result_ty.is_some() {
         let flat_ty = *fd
             .import_sig
             .results

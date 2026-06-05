@@ -79,9 +79,15 @@ fn env_with(has_before: bool, has_after: bool) -> LayoutEnv {
     let schema = compute_schema(&resolve, world_id, has_before, has_after, false).unwrap();
     let mut names = NameInterner::new();
     let iface_name = names.intern(TARGET_IFACE);
-    let classified =
-        build_per_func_classified(&resolve, target_iface, target_iface, &funcs, &mut names, &map_aliases)
-            .unwrap();
+    let classified = build_per_func_classified(
+        &resolve,
+        target_iface,
+        target_iface,
+        &funcs,
+        &mut names,
+        &map_aliases,
+    )
+    .unwrap();
     let (dispatches, plan) =
         lay_out_static_memory(classified, &funcs, &schema, names, iface_name).unwrap();
     LayoutEnv {
@@ -224,8 +230,14 @@ fn try_lay_out(target_wit: &str, target_iface_qname: &str) -> Result<()> {
     let schema = compute_schema(&resolve, world_id, true, true, false).unwrap();
     let mut names = NameInterner::new();
     let iface_name = names.intern(&target_versioned);
-    let classified =
-        build_per_func_classified(&resolve, target_iface, target_iface, &funcs, &mut names, &map_aliases)?;
+    let classified = build_per_func_classified(
+        &resolve,
+        target_iface,
+        target_iface,
+        &funcs,
+        &mut names,
+        &map_aliases,
+    )?;
     lay_out_static_memory(classified, &funcs, &schema, names, iface_name).map(|_| ())
 }
 

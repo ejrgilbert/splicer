@@ -298,7 +298,6 @@ impl EmitPlan {
         shim_comps: &HashMap<usize, usize>,
         bridges: &HashMap<(String, String), (String, String)>,
     ) -> anyhow::Result<Self> {
-        let _ = bridges;
         for Chain {
             interface,
             chain,
@@ -306,6 +305,10 @@ impl EmitPlan {
             ..
         } in chains
         {
+            let bridge_entry = bridges
+                .iter()
+                .find(|((_, target), _)| target == &interface.name)
+                .map(|(_, v)| v.clone());
             let mut prev_var: Option<String> = None;
             for i in 0..chain.len() {
                 let id = chain[i];
@@ -315,10 +318,6 @@ impl EmitPlan {
                          with_node_vars must run before with_chain_routing"
                     )
                 })?;
-                // Routing keys store the shim-resolved id so the
-                // `with_exports` lookup matches; otherwise an export
-                // sourced from a shim wouldn't find the wiring stored
-                // under the raw chain id.
                 let routing_id = resolve_shim_node(id, composition, shim_comps);
 
                 if i > 0 {
@@ -328,31 +327,43 @@ impl EmitPlan {
                              chain construction produced an inconsistent ordering"
                         )
                     })?;
-                    let current = self.fold_inject_middlewares(
+                    let middleware_var = self.fold_inject_middlewares(
                         upstream,
                         inject_plan.get(&i),
                         interface,
                         composition,
                         shim_comps,
                     )?;
+                    let current = match bridge_entry.as_ref() {
+                        Some((path, mirror)) => {
+                            self.add_bridge_entity(&interface.name, mirror, path, &middleware_var)
+                        }
+                        None => middleware_var,
+                    };
                     self.routing
                         .insert((routing_id, interface.name.clone()), current);
                 }
-                // The current node consumes from the wrapped source above
-                // and re-provides the iface through itself; the next
-                // iteration's source is the node, not the wrapped input.
                 prev_var = Some(node_var.clone());
 
                 if i == chain.len() - 1 {
                     if let Some(top) = inject_plan.get(&(i + 1)) {
                         if !top.is_empty() {
-                            let current = self.fold_inject_middlewares(
+                            let middleware_var = self.fold_inject_middlewares(
                                 node_var.clone(),
                                 Some(top),
                                 interface,
                                 composition,
                                 shim_comps,
                             )?;
+                            let current = match bridge_entry.as_ref() {
+                                Some((path, mirror)) => self.add_bridge_entity(
+                                    &interface.name,
+                                    mirror,
+                                    path,
+                                    &middleware_var,
+                                ),
+                                None => middleware_var,
+                            };
                             self.export_routing
                                 .insert((routing_id, interface.name.clone()), current);
                         }
@@ -644,7 +655,6 @@ impl EmitPlan {
     /// Multiple calls with the same `target_interface` share one
     /// `wac_deps` pkg entry but get distinct vars (`-1`, `-2`, …) so
     /// each chain's bridge instance carries its own downstream wiring.
-    #[allow(dead_code)]
     fn add_bridge_entity(
         &mut self,
         target_interface: &str,
@@ -1263,12 +1273,10 @@ fn materialize_tier3_4_inline(
     to_inject: &[Injection],
     consumer_split: Option<&str>,
     ctx: &SpliceCtx,
+    accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<Vec<Injection>> {
     use crate::strategies::Tier3_4Source;
 
-    // Classify once — the user-form branch stats the filesystem,
-    // and we'd otherwise hit it twice per injection (the short-
-    // circuit check + the dispatch loop).
     let sources: Vec<Option<Tier3_4Source<'_>>> =
         to_inject.iter().map(classify_tier3_4_source).collect();
     if sources.iter().all(Option::is_none) {
@@ -1281,6 +1289,33 @@ fn materialize_tier3_4_inline(
         })?;
         std::fs::read(split_path)
             .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))
+    };
+
+    // Tier-3/4 wrappers are async-only by construction, so any
+    // sync-WIT target forces the bridged path. Detect once + cache
+    // the bridge before each materialization so the wrapper crate
+    // gets the mirror name to lift against.
+    let mirror_for_target = if !sources.iter().any(Option::is_some) {
+        None
+    } else {
+        let consumer_split_path = consumer_split.ok_or_else(|| {
+            anyhow::anyhow!("no split for tier-3/4 sync-WIT detection on '{interface_name}'")
+        })?;
+        let target_key = (consumer_split_path.to_string(), interface_name.to_string());
+        let has_sync = *accs
+            .target_has_sync_cache
+            .entry(target_key)
+            .or_insert_with(|| target_interface_has_sync_func(interface_name, consumer_split_path));
+        if has_sync {
+            let (_path, mirror_qname) =
+                ensure_bridge(interface_name, consumer_split_path, ctx.splits_path, accs)
+                    .with_context(|| {
+                        format!("ensure bridge for tier-3/4 site on `{interface_name}`")
+                    })?;
+            Some(mirror_qname)
+        } else {
+            None
+        }
     };
 
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
@@ -1296,6 +1331,7 @@ fn materialize_tier3_4_inline(
             source,
             &split_bytes,
             interface_name,
+            mirror_for_target.as_deref(),
         )
         .with_context(|| {
             format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'")
@@ -1374,8 +1410,13 @@ fn add_to_inject_plan(
 ) -> anyhow::Result<Vec<ContractResult>> {
     // Tier-3/4 wrappers ARE the adapter — codegen them here so
     // validate_contract sees their exports.
-    let to_inject_materialized =
-        materialize_tier3_4_inline(interface_name, to_inject, consumer_split.as_deref(), ctx)?;
+    let to_inject_materialized = materialize_tier3_4_inline(
+        interface_name,
+        to_inject,
+        consumer_split.as_deref(),
+        ctx,
+        accs,
+    )?;
 
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
@@ -1645,7 +1686,6 @@ fn bail_if_bridge_required(
 /// the async-mirror interface's fully-qualified name; both are also
 /// stored on `accs.bridges` so later sites + EmitPlan routing share
 /// the same generated component.
-#[allow(dead_code)]
 fn ensure_bridge(
     target_interface: &str,
     target_split_path: &str,

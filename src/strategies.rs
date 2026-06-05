@@ -123,6 +123,7 @@ pub fn materialize_tier3_4(
     source: Tier3_4Source<'_>,
     split_bytes: &[u8],
     target_interface: &str,
+    mirror_export_name: Option<&str>,
 ) -> Result<(PathBuf, Tier)> {
     let prep = match source {
         Tier3_4Source::Builtin(name) => prepare_builtin_strategy(name)?,
@@ -131,7 +132,13 @@ pub fn materialize_tier3_4(
             strategy_dir,
         } => prepare_user_strategy(wac_name, strategy_dir)?,
     };
-    materialize_from_prepared(splits_dir, prep, split_bytes, target_interface)
+    materialize_from_prepared(
+        splits_dir,
+        prep,
+        split_bytes,
+        target_interface,
+        mirror_export_name,
+    )
 }
 
 /// Per-source inputs to the shared tier-3/4 codegen pipeline.
@@ -206,9 +213,11 @@ fn materialize_from_prepared(
     prep: PreparedStrategy,
     split_bytes: &[u8],
     target_interface: &str,
+    mirror_export_name: Option<&str>,
 ) -> Result<(PathBuf, Tier)> {
     let behavior = behavior_for(&prep.manifest, &prep.out_name)?;
-    let target = target_wit_for_codegen(split_bytes, target_interface, behavior, None)?;
+    let target =
+        target_wit_for_codegen(split_bytes, target_interface, behavior, mirror_export_name)?;
     let cache_root = typed_cache_root()?;
     let adapter_path = ensure_preview1_adapter(&cache_root)?;
     let strategy_type = prep.strategy_crate_name.to_upper_camel_case();
@@ -625,6 +634,7 @@ mod tests {
             Tier3_4Source::Builtin("hello-tier3"),
             &composition,
             "test:demo/ops@0.1.0",
+            None,
         )
         .expect("materialize");
         assert_eq!(tier, Tier::Tier3);
@@ -675,6 +685,7 @@ mod tests {
             },
             &composition,
             "test:demo/ops@0.1.0",
+            None,
         )
         .expect("materialize_tier3_4(user)");
         assert_eq!(tier, Tier::Tier3);
