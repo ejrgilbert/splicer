@@ -154,12 +154,8 @@ fn require_supported_case(
         if has_gate {
             require_gate_compatible_func(resolve, name, lift_func, "1")?;
         }
-        // The indirect-params shape is determined by the IMPORT (handler
-        // canon-lower) side — that's the bindgen path that
-        // `build_lower_params_to_memory` drives. Lift and lower share
-        // param/result types by construction (mirror differs only in
-        // async-ness), but the cap differs by variant so we check the
-        // lower func.
+        // Indirect-params cap is variant-dependent; check the lower
+        // (import / canon-lower) side that drives the bindgen pass.
         let lower_func = lower
             .functions
             .get(name)
@@ -219,16 +215,10 @@ struct FuncDispatch {
     /// Wrapper export name — `<iface>#<fn>` (sync) or
     /// `[async-lift-stackful]<iface>#<fn>` (async).
     export_name: String,
-    /// True iff the lift (export) side is `async func` — drives the
-    /// wrapper body shape (sync vs async-stackful). In the bridged
-    /// path the lift side is the async mirror, so this is `true` even
-    /// when the lower (handler) side is sync.
+    /// Lift-side async-ness; drives sync vs async-stackful wrapper body.
     export_is_async: bool,
-    /// True iff the lower (handler) side is `async func` — drives
-    /// whether the wrapper body wraps the handler call in a wait loop
-    /// (canon-lower-async) or treats it as a direct call (sync).
-    /// Differs from `export_is_async` only in the bridged path, where
-    /// the lift is async (mirror) but the handler is sync (target).
+    /// Handler-side async-ness; drives wait-loop vs direct call.
+    /// Diverges from `export_is_async` only on the bridged path.
     import_is_async: bool,
     /// Wrapper export sig (`GuestExport` / `GuestExportAsyncStackful`).
     export_sig: WasmSignature,
@@ -508,9 +498,7 @@ fn compute_func_dispatches(
             .get(&lift_func.name)
             .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
 
-        // Per-side async-ness drives variant + mangling independently.
-        // In the bridged path the lift (mirror) is async and the lower
-        // (target) is sync; in the NotNeeded path both agree.
+        // Variant + mangling per side; sides diverge on bridged path.
         let export_is_async = lift_func.kind.is_async();
         let import_is_async = lower_func.kind.is_async();
         let export_variant = if export_is_async {
@@ -524,10 +512,7 @@ fn compute_func_dispatches(
             AbiVariant::GuestImport
         };
 
-        // Mangling is computed per side — in the bridged path the
-        // import (sync canon-lower) and export (async-stackful
-        // canon-lift) live in different ABI namespaces and get
-        // different `[…]` prefixes.
+        // Per-side mangling — ABI namespaces diverge on bridged path.
         let (import_module, import_field) = resolve.wasm_import_name(
             dispatch_mangling(import_is_async),
             WasmImport::Func {
@@ -548,13 +533,8 @@ fn compute_func_dispatches(
         let fn_name_offset = layout.alloc_name(lift_func.name.len() as u32) as i32;
         name_blob.extend_from_slice(lift_func.name.as_bytes());
 
-        // Async-stackful wrappers always retptr the result (the value
-        // gets written to memory and handed to `task.return` from
-        // there), so any non-void async lift needs a scratch buffer
-        // regardless of the handler's variant — same buffer also
-        // backs canon-lower-async retptr when both sides are async.
-        // Sync wrappers only need a buffer when the sync export sig
-        // itself retptr's the result (compound types).
+        // Async-stackful lifts always retptr through memory for
+        // `task.return`; sync lifts only when the export sig says so.
         let retptr_needed = if export_is_async {
             lift_func.result.is_some()
         } else {
@@ -577,8 +557,6 @@ fn compute_func_dispatches(
             let align = info.align.align_wasm32() as u32;
             layout.alloc_aligned(size, align) as i32
         });
-        // task.return is the lift-side intrinsic for async-stackful
-        // wrappers; sourced from the lift func + world key.
         let task_return = export_is_async.then(|| {
             let (module, name, sig) =
                 lift_func.task_return_import(resolve, Some(&lift_world_key), Mangling::Legacy);
@@ -1112,15 +1090,8 @@ fn emit_gate_phase(
     f.instructions().end();
 }
 
-/// Emit one async-stackful wrapper body. Result is delivered via
-/// `task.return` (not the wrapper's return); arg loads come from
-/// [`lift_from_memory`] driven by [`WasmEncoderBindgen`].
-#[allow(clippy::too_many_arguments)]
-/// Store a single flat wasm value (top-of-stack) at the address
-/// underneath it on the stack, using the canonical natural alignment
-/// for the type. Used by the bridged direct-return path to spill the
-/// sync handler's return value into the `retptr_offset` buffer that
-/// the async lift's `task.return` then reads.
+/// Store a flat wasm value (top-of-stack) at the address underneath
+/// it, with canonical natural alignment for the type.
 fn emit_store_flat_value(f: &mut Function, ty: WasmType) {
     match ty {
         WasmType::I32 | WasmType::Pointer | WasmType::Length => {
@@ -1154,6 +1125,8 @@ fn emit_store_flat_value(f: &mut Function, ty: WasmType) {
     }
 }
 
+/// Async-stackful wrapper body. Result delivered via `task.return`;
+/// arg loads come from [`lift_from_memory`] via [`WasmEncoderBindgen`].
 #[allow(clippy::too_many_arguments)]
 fn emit_async_wrapper_body(
     code: &mut CodeSection,
@@ -1181,14 +1154,10 @@ fn emit_async_wrapper_body(
     let st = locals.alloc_local(ValType::I32);
     let ws = locals.alloc_local(ValType::I32);
     let wait_locals = Some((st, ws));
-    // Bridged direct-return spill: when the wrapper is async-lifted but
-    // the handler is sync canon-lower with a single flat result, the
-    // call leaves that result on the stack. We can't feed it into
-    // `task.return`'s flat-load path directly (which reads from
-    // `retptr_offset`), so spill to a typed local and store into
-    // `retptr_offset` before the task.return logic runs. Sync retptr
-    // handlers wrote to `retptr_offset` themselves; sync void
-    // handlers leave nothing on the stack — neither needs a spill.
+    // Bridged direct-return: handler leaves a flat result on the stack
+    // that we spill to memory at `retptr_offset` for the task.return
+    // flat-load path. Sync retptr handlers already wrote there; sync
+    // void leaves nothing — neither needs a spill local.
     let bridged_direct_return_spill =
         (!fd.import_is_async && !fd.import_sig.retptr && fd.result_ty.is_some()).then(|| {
             let ty = wasm_type_to_val(fd.import_sig.results[0]);
@@ -1296,15 +1265,11 @@ fn emit_async_wrapper_body(
     }
     f.instructions().call(imp_handler);
     if fd.import_is_async {
-        // Canon-lower-async returns a packed (handle << 4) | status —
-        // wait until the subtask resolves before reading the result
-        // from the retptr buffer.
+        // canon-lower-async leaves packed (handle << 4) | status; await.
         f.instructions().local_set(st);
         canon_async::emit_wait_loop(&mut f, st, ws, async_runtime);
     } else if let Some(spill_local) = bridged_direct_return_spill {
-        // Bridged direct-return: sync canon-lower left a single flat
-        // result on the stack. The task.return path expects to read
-        // from `retptr_offset`, so spill the value there.
+        // Spill stack result to `retptr_offset` so task.return reads it.
         let result_wasm_ty = fd.import_sig.results[0];
         f.instructions().local_set(spill_local);
         f.instructions().i32_const(
@@ -1314,9 +1279,8 @@ fn emit_async_wrapper_body(
         f.instructions().local_get(spill_local);
         emit_store_flat_value(&mut f, result_wasm_ty);
     }
-    // The remaining bridged cases — sync retptr handler (wrote to
-    // retptr_offset itself) and sync void handler (no result) — need
-    // nothing here; the task.return logic below picks them up.
+    // Sync retptr / sync void handlers need no extra step here; the
+    // task.return logic below reads from `retptr_offset` directly.
 
     if let Some(idx) = imp_after {
         emit_hook_call(

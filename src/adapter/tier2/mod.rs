@@ -177,9 +177,8 @@ fn require_supported_case(
         if has_gate {
             require_gate_compatible_func(resolve, name, lift_func, "2")?;
         }
-        // Indirect-params is decided by the IMPORT (handler canon-lower)
-        // side — that's what drives the bindgen-built lower-to-memory
-        // pass. Lift and lower share param/result types by construction.
+        // Indirect-params cap is variant-dependent; check the lower
+        // (import / canon-lower) side that drives the bindgen pass.
         let lower_func = lower
             .functions
             .get(name)
@@ -326,19 +325,13 @@ pub(in crate::adapter::tier2) struct TaskReturnImport {
     pub sig: WasmSignature,
 }
 
-/// Per-side sync/async of one target function. In the common
-/// (`NotNeeded`) path both flags agree and `task_return` is `Some`
-/// iff both are true. In the bridged path the lift is the async
-/// mirror and the lower is the real sync target, so `export_is_async`
-/// is true while `import_is_async` is false; `task_return` is still
-/// populated because the wrapper still emits task.return.
+/// Per-side sync/async. Flags can disagree on the bridged path
+/// (async lift, sync lower); they always agree otherwise.
 pub(in crate::adapter::tier2) struct FuncShape {
     export_is_async: bool,
     import_is_async: bool,
-    /// Populated iff `export_is_async` — async lifts deliver results
-    /// via `task.return`, sync lifts don't have one. The invariant is
-    /// enforced by the constructors below; the field is private so
-    /// callers can't violate it by struct-literal construction.
+    /// `Some` iff `export_is_async` (invariant enforced by
+    /// constructors; field private to prevent struct-literal misuse).
     task_return: Option<TaskReturnImport>,
 }
 
@@ -363,9 +356,8 @@ impl FuncShape {
         }
     }
 
-    /// All-sync stub (export sync, import sync, no `task_return`).
-    /// Used by lift-layer unit tests that need a minimal `FuncShape`
-    /// without standing up a full `Resolve` for `classify`.
+    /// All-sync stub for unit tests that don't want to build a full
+    /// `Resolve` for `classify`.
     #[cfg(test)]
     pub(in crate::adapter::tier2) fn sync_stub() -> Self {
         Self {
@@ -408,20 +400,14 @@ impl FuncShape {
         (import, export)
     }
 
-    /// Wrapper export needs a `cabi_post_*` companion iff the lift is
-    /// sync AND its export sig caller-allocates the retptr. Async
-    /// lifts deliver results through `task.return`, so no post-return.
+    /// `cabi_post_*` companion: only sync-lift retptr exports.
+    /// Async lifts deliver via `task.return`.
     fn needs_cabi_post(&self, export_sig: &WasmSignature) -> bool {
         !self.export_is_async && export_sig.retptr
     }
 
-    /// Whether the result lives in `retptr_offset` memory (vs. a
-    /// direct-return wasm local). Both sides collapse to
-    /// `import_sig.retptr`: canon-lower-async always sets retptr on
-    /// non-void results, and sync canon-lower sets it iff the WIT
-    /// shape requires caller-allocates. Sync direct-return leaves
-    /// the value on the stack for the wrapper to capture into
-    /// `lcl.result`.
+    /// Result in `retptr_offset` memory (true) vs. a direct-return
+    /// local (false) — driven by the import side.
     fn result_at_retptr(&self, import_sig: &WasmSignature) -> bool {
         import_sig.retptr
     }
@@ -526,16 +512,12 @@ fn build_per_func_classified(
             .get(&lift_func.name)
             .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
 
-        // Param lifting reads the shape from `lift_func`, which has
-        // identical params to `lower_func` by construction.
+        // Lift and lower share params by construction; classify on lift.
         let params_lift = classify_func_params(resolve, lift_func, names, map_aliases)?;
         let shape = FuncShape::classify(resolve, &lift_world_key, lift_func, lower_func);
         let (import_variant, export_variant) = shape.abi_variants();
 
-        // Mangling is computed per side — in the bridged path the
-        // import (sync canon-lower) and export (async-stackful
-        // canon-lift) use different ABI namespaces, so they get
-        // different `[…]` prefixes.
+        // Per-side mangling — ABI namespaces diverge on bridged path.
         let (import_module, import_field) = resolve.wasm_import_name(
             dispatch_mangling(shape.is_import_async()),
             WasmImport::Func {

@@ -3,11 +3,10 @@
 
 pub(crate) mod bridge;
 
-/// Prefix of the bail emitted when an adapter's `synthesize_async_mirror`
-/// produces a different qualified name than the caller-supplied
-/// `mirror_export_name`. Both must derive the same hash; a mismatch
-/// is a splicer bug, not a user error. Tests assert against this
-/// prefix instead of the full free-form sentence.
+/// Shared prefix for the bail when caller-supplied vs synthesized
+/// mirror names disagree. Both sides derive the same hash, so a
+/// mismatch is a splicer bug. Pulled into a constant so tests can
+/// assert without pinning the full sentence.
 pub(crate) const MIRROR_NAME_MISMATCH_PREFIX: &str = "async mirror name mismatch";
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -115,11 +114,9 @@ pub(crate) fn synthesize_async_mirror(
     Ok((mirror_iface_id, mirror_qualified))
 }
 
-/// 16-hex-char prefix of `sha2::Sha256(s)`. Stable across Rust
-/// versions and processes — bridge codegen and adapter codegen
-/// independently derive the same mirror package name, so the hash
-/// has to agree across an arbitrary toolchain split. 64 bits keeps
-/// collision probability negligible.
+/// 16-hex-char (64-bit) sha256 prefix. Stable across Rust versions
+/// and processes — bridge and adapter sides derive the same mirror
+/// name independently, so the hash must agree across toolchains.
 pub(crate) fn short_hash_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(s.as_bytes());

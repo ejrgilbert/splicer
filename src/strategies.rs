@@ -208,7 +208,7 @@ fn materialize_from_prepared(
     target_interface: &str,
 ) -> Result<(PathBuf, Tier)> {
     let behavior = behavior_for(&prep.manifest, &prep.out_name)?;
-    let target = target_wit_for_codegen(split_bytes, target_interface, behavior)?;
+    let target = target_wit_for_codegen(split_bytes, target_interface, behavior, None)?;
     let cache_root = typed_cache_root()?;
     let adapter_path = ensure_preview1_adapter(&cache_root)?;
     let strategy_type = prep.strategy_crate_name.to_upper_camel_case();

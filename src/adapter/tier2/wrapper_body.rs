@@ -512,15 +512,11 @@ pub(super) fn emit_wrapper_function(
         );
     }
     if fd.shape.is_import_async() {
-        // canon-lower-async leaves a packed (handle << 4) | status on
-        // the stack — wait for the subtask to resolve before reading.
+        // canon-lower-async leaves packed (handle << 4) | status; await.
         f.instructions().local_set(lcl.st);
         canon_async::emit_wait_loop(&mut f, lcl.st, lcl.ws, async_funcs);
     } else if let Some(local) = lcl.result {
-        // Sync direct-return handler — capture the flat result so the
-        // tail (sync wrapper return OR async task.return) can read it.
-        // Sync retptr handler returns nothing on the stack (wrote to
-        // retptr_offset), so no spill needed.
+        // Sync direct-return: capture flat result for the tail to read.
         f.instructions().local_set(local);
     }
 
@@ -743,17 +739,9 @@ fn emit_gate_skip_branch(
     f.instructions().end();
 }
 
-/// Emit the `task.return` call that completes an async-lift export.
-/// Five paths, picked by result shape × import side:
-/// - **void**: result_ty is None → call with no args.
-/// - **indirect compound**: `tr.sig.indirect_params` → push
-///   `retptr_offset` and call. Source is memory (sync handler wrote
-///   there, or canon-lower-async wrote there for all-async funcs).
-/// - **flat / bridged direct-return**: import sync + direct-return →
-///   result was captured to `lcl.result` in Phase 2; push the local
-///   and call. Bypasses the memory roundtrip.
-/// - **flat / all-async or bridged retptr**: load from `retptr_offset`
-///   via the pre-built `lift_from_memory` sequence, then call.
+/// `task.return` paths: void (no args), indirect (push retptr), flat
+/// from `lcl.result` (bridged direct-return), flat from retptr memory
+/// (all-async or bridged retptr).
 fn emit_task_return(
     f: &mut Function,
     fd: &FuncDispatch,
@@ -780,13 +768,8 @@ fn emit_task_return(
         f.instructions().call(imp_task_return);
         return;
     }
-    // Flat task.return — single-value source depends on where the
-    // handler put the result.
-    //
-    // Bridged direct-return: sync canon-lower left a flat value on
-    // the stack which Phase 2 captured into `lcl.result`. The flat-load
-    // path through `retptr_offset` doesn't apply (nothing in memory).
-    // Push the local and call directly.
+    // Bridged direct-return: result was captured to `lcl.result` in
+    // Phase 2; nothing in `retptr_offset` memory to load from.
     if !fd.shape.is_import_async() && !fd.import_sig.retptr {
         let result_local = lcl
             .result
@@ -795,10 +778,7 @@ fn emit_task_return(
         f.instructions().call(imp_task_return);
         return;
     }
-    // Standard flat task.return — load the result from retptr_offset
-    // memory via the pre-built `lift_from_memory` instruction
-    // sequence. This covers both all-async (canon-lower-async wrote
-    // there) and bridged-retptr (sync handler wrote there) cases.
+    // All-async or bridged retptr: result is in `retptr_offset`.
     let addr_local = lcl.tr_addr.expect("flat loads → tr_addr local");
     let task_return_loads = lcl
         .task_return_loads
