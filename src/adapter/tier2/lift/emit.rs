@@ -893,20 +893,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
     let variant_slot_addr = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
     let variant_payload_idx = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
-    // `lcl.result` captures the handler's direct-return flat value.
-    // Bridged direct-return (export async, import sync direct) needs
-    // its own derivation: the async-stackful export sig has no flat
-    // result, so type comes from the import side instead.
-    let result = if !fd.shape.is_import_async() && !fd.import_sig.retptr && fd.result_ty.is_some() {
-        let flat_ty = *fd
-            .import_sig
-            .results
-            .first()
-            .expect("canon-ABI: sync direct-return → exactly one flat slot");
-        Some(builder.alloc_local(wasm_type_to_val(flat_ty)))
-    } else {
-        direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t))
-    };
+    let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Non-retptr-passthrough async task.return: i32 addr drives
     // `lift_from_memory` flat-load out of the retptr scratch.
     let tr_uses_flat_loads = fd

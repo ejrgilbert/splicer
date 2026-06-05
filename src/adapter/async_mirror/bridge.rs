@@ -12,12 +12,13 @@
 
 use anyhow::{Context, Result};
 
+use super::super::abi::canon_async::{self, AsyncFuncs};
 use super::super::abi::emit::{
     emit_cabi_realloc, emit_cabi_realloc_call, emit_export_section, emit_memory_and_globals,
     empty_function, val_types, WrapperExport,
 };
 use super::super::indices::{DispatchIndices, LocalsBuilder};
-use super::super::resolve::{decode_input_resolve, find_target_interface};
+use super::super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use super::{short_hash_hex, synthesize_async_mirror};
 use crate::adapter::sanitize_name;
 use wasm_encoder::{
@@ -25,9 +26,9 @@ use wasm_encoder::{
     ValType,
 };
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
-use wit_parser::abi::WasmSignature;
+use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
 use wit_parser::{
-    Function as WitFunction, InterfaceId, LiftLowerAbi, ManglingAndAbi, Resolve, SizeAlign,
+    Function as WitFunction, InterfaceId, LiftLowerAbi, ManglingAndAbi, Resolve, SizeAlign, Type,
     WasmExport, WasmExportKind, WasmImport, WorldKey,
 };
 
@@ -91,13 +92,18 @@ fn build_bridge_bytes(target_interface: &str, split_bytes: &[u8]) -> Result<(Vec
 const BRIDGE_WORLD_PACKAGE: &str = "splicer:bridge@0.0.1";
 const BRIDGE_WORLD_NAME: &str = "bridge";
 
-/// Memory layout: word 0 (4 bytes) is reserved as the saved-bump
-/// snapshot used by retptr-returning wrappers (saved at entry,
-/// restored from `cabi_post_<fn>`). The bump allocator starts above
-/// that, at 8 (i32-aligned room for future static slots).
+/// Static memory layout:
+///   - `[0..4)`  saved bump snapshot for retptr exports (`cabi_post_<fn>`
+///     restores from here).
+///   - `[4..16)` event scratch — `[waitable-set-wait]` writes the
+///     `(event_kind, handle, retval)` triple here. 12 bytes is the
+///     canonical width.
+///
+/// The bump allocator starts at [`BUMP_START`].
 const SAVED_BUMP_OFFSET: u64 = 0;
+const EVENT_PTR_OFFSET: i32 = 4;
 const I32_STORE_LOG2_ALIGN: u32 = 2;
-const BUMP_START: u32 = 8;
+const BUMP_START: u32 = 16;
 
 fn synthesize_bridge_world_wit(target_interface: &str, mirror_qualified: &str) -> String {
     format!(
@@ -109,19 +115,29 @@ fn synthesize_bridge_world_wit(target_interface: &str, mirror_qualified: &str) -
     )
 }
 
-/// Per-function plan — sigs, mangled names, and retptr size/align
-/// (when the export uses callee-allocates retptr). Drives both the
-/// type-section build and the body emit.
+/// Per-function plan — sigs, mangled names, and result-buffer
+/// size/align used by both the type-section build and the body emit.
+///
+/// The export side is sync canon-lift (caller sees a normal sync call);
+/// the import side is async canon-lower against the mirror, so the
+/// import sig always returns a packed `(handle << 4) | status` i32 and
+/// — for any function with a result — appends a retptr param the
+/// callee writes into.
 struct FuncPlan {
     export_name: String,
     import_module: String,
     import_field: String,
     export_sig: WasmSignature,
     import_sig: WasmSignature,
-    /// `Some` iff `export_sig.retptr` — `(size, align)` of the result
-    /// type's canonical-ABI layout, used to `cabi_realloc` the result
-    /// buffer at runtime in the wrapper body.
+    /// `Some((size, align))` whenever the function has a result type;
+    /// the bridge `cabi_realloc`s a buffer of this layout to pass as
+    /// the async-lower import's retptr. `None` for void async funcs.
     result_size_align: Option<(u32, u32)>,
+    /// Target's WIT result type — drives the flat-load instruction
+    /// pick in the non-retptr export path (`u8` vs `s8` etc.). `None`
+    /// for void; `Some` for any function with a result, regardless of
+    /// whether the export is retptr.
+    result_ty: Option<Type>,
 }
 
 fn gather_func_plans(
@@ -129,7 +145,14 @@ fn gather_func_plans(
     target_iface_id: InterfaceId,
     mirror_iface_id: InterfaceId,
 ) -> Result<Vec<FuncPlan>> {
-    let mangling = ManglingAndAbi::Legacy(LiftLowerAbi::Sync);
+    let export_mangling = ManglingAndAbi::Legacy(LiftLowerAbi::Sync);
+    // Async-stackful mangling at the import: tier-1/2 use the same
+    // for their downstream dispatch. wit-component reads the name
+    // prefix to decide what canon-lower variant to emit at the
+    // component boundary; pairing this with `GuestImportAsync` (below)
+    // produces the packed-status return + retptr param shape the
+    // `emit_call_and_wait` helper expects.
+    let import_mangling = dispatch_mangling(true);
     let target_key = WorldKey::Interface(target_iface_id);
     let mirror_key = WorldKey::Interface(mirror_iface_id);
 
@@ -156,10 +179,10 @@ fn gather_func_plans(
         .iter()
         .zip(&mirror_funcs)
         .map(|(tfunc, mfunc)| {
-            let export_sig = resolve.wasm_signature(mangling.export_variant(), tfunc);
-            let import_sig = resolve.wasm_signature(mangling.import_variant(), mfunc);
+            let export_sig = resolve.wasm_signature(export_mangling.export_variant(), tfunc);
+            let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, mfunc);
             let export_name = resolve.wasm_export_name(
-                mangling,
+                export_mangling,
                 WasmExport::Func {
                     interface: Some(&target_key),
                     func: tfunc,
@@ -167,27 +190,18 @@ fn gather_func_plans(
                 },
             );
             let (import_module, import_field) = resolve.wasm_import_name(
-                mangling,
+                import_mangling,
                 WasmImport::Func {
                     interface: Some(&mirror_key),
                     func: mfunc,
                 },
             );
-            let result_size_align = if export_sig.retptr {
-                let result_ty = tfunc.result.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "retptr=true on `{}` but func.result is None — \
-                         wit-parser invariant broken",
-                        tfunc.name,
-                    )
-                })?;
-                Some((
+            let result_size_align = tfunc.result.as_ref().map(|result_ty| {
+                (
                     sizes.size(result_ty).size_wasm32() as u32,
                     sizes.align(result_ty).align_wasm32() as u32,
-                ))
-            } else {
-                None
-            };
+                )
+            });
             Ok(FuncPlan {
                 export_name,
                 import_module,
@@ -195,6 +209,7 @@ fn gather_func_plans(
                 export_sig,
                 import_sig,
                 result_size_align,
+                result_ty: tfunc.result,
             })
         })
         .collect()
@@ -238,6 +253,7 @@ fn build_bridge_module(
             cabi_post_ty.push(None);
         }
     }
+    let async_types = canon_async::emit_types(&mut types, || idx.alloc_ty());
     types.ty().function(std::iter::empty(), std::iter::empty());
     let init_ty = idx.alloc_ty();
     types.ty().function(
@@ -258,6 +274,10 @@ fn build_bridge_module(
         );
         imp_idx.push(idx.alloc_func());
     }
+    let async_funcs =
+        canon_async::import_intrinsics(&mut imports, &async_types, EVENT_PTR_OFFSET, || {
+            idx.alloc_func()
+        });
     module.section(&imports);
 
     // ── Function section ──
@@ -305,23 +325,7 @@ fn build_bridge_module(
     // ── Code section ──
     let mut code = CodeSection::new();
     for (i, p) in plans.iter().enumerate() {
-        let body = if p.export_sig.retptr {
-            build_retptr_wrapper_body(
-                p.export_sig.params.len() as u32,
-                imp_idx[i],
-                cabi_realloc_idx,
-                p.result_size_align
-                    .expect("result_size_align populated whenever retptr=true"),
-                globals.bump,
-            )
-        } else {
-            build_non_retptr_wrapper_body(
-                p.export_sig.params.len() as u32,
-                imp_idx[i],
-                p.export_sig.results.len() as u32,
-                globals.bump,
-            )
-        };
+        let body = build_async_lower_body(p, imp_idx[i], cabi_realloc_idx, globals.bump, &async_funcs);
         code.function(&body);
     }
     code.function(&empty_function());
@@ -336,81 +340,154 @@ fn build_bridge_module(
     Ok(module.finish())
 }
 
-/// Body for the non-retptr export wrapper: result (if any) is on the
-/// wasm stack with no memory lifetime past the wrapper's return.
-/// Save bump into a local at entry, restore at exit. The restore
-/// pushes the saved value then consumes it via `global.set`, leaving
-/// the import's flat result on top of the stack as the wasm-level
-/// return value.
-fn build_non_retptr_wrapper_body(
-    n_params: u32,
+/// Body for the bridge's exported sync wrapper. Does async canon-lower
+/// onto the mirror import, blocks on the resulting subtask, then
+/// delivers the result through the export's sync canon-lift shape:
+///
+/// 1. Save bump — into a local for non-retptr exports (restore inline
+///    before flat return), into the static `SAVED_BUMP_OFFSET` slot
+///    for retptr exports (`cabi_post_<fn>` restores).
+/// 2. If the function has a result, `cabi_realloc` a retptr buffer of
+///    the canonical result size/align and pass it tail-position to the
+///    async-lower import.
+/// 3. Call the import — it returns a packed `(handle << 4) | status_tag`
+///    i32. `emit_wait_loop` drains the subtask via the `$root` async
+///    intrinsics; after it returns the result buffer is populated.
+/// 4. For retptr exports return the buffer pointer (host reads then
+///    invokes `cabi_post_<fn>`). For non-retptr exports load the flat
+///    result from the buffer using a load instruction matched to the
+///    target's WIT type (so sub-byte signedness is preserved), then
+///    restore bump.
+fn build_async_lower_body(
+    p: &FuncPlan,
     imp_idx: u32,
-    _n_results: u32,
+    cabi_realloc_idx: u32,
     bump_global: u32,
+    art: &AsyncFuncs,
 ) -> Function {
-    let mut locals = LocalsBuilder::new(n_params);
-    let saved_bump = locals.alloc_local(ValType::I32);
+    let n_export_params = p.export_sig.params.len() as u32;
+    let export_retptr = p.export_sig.retptr;
+    let mut locals = LocalsBuilder::new(n_export_params);
+    // For non-retptr exports the bump restore happens inline; for
+    // retptr exports `cabi_post_<fn>` reads from the static slot.
+    let saved_bump_local = (!export_retptr).then(|| locals.alloc_local(ValType::I32));
+    let retptr_local = locals.alloc_local(ValType::I32);
+    let st = locals.alloc_local(ValType::I32);
+    let ws = locals.alloc_local(ValType::I32);
     let mut f = Function::new_with_locals_types(locals.freeze().locals);
-    f.instructions().global_get(bump_global);
-    f.instructions().local_set(saved_bump);
-    for p in 0..n_params {
-        f.instructions().local_get(p);
+
+    // (1) Save bump.
+    if let Some(sb) = saved_bump_local {
+        f.instructions().global_get(bump_global);
+        f.instructions().local_set(sb);
+    } else {
+        f.instructions().i32_const(SAVED_BUMP_OFFSET as i32);
+        f.instructions().global_get(bump_global);
+        f.instructions().i32_store(MemArg {
+            offset: 0,
+            align: I32_STORE_LOG2_ALIGN,
+            memory_index: 0,
+        });
     }
-    f.instructions().call(imp_idx);
-    f.instructions().local_get(saved_bump);
-    f.instructions().global_set(bump_global);
+
+    // (2) Allocate the retptr buffer if there's a result.
+    if let Some((size, align)) = p.result_size_align {
+        emit_cabi_realloc_call(&mut f, cabi_realloc_idx, align, size, retptr_local);
+    }
+
+    // (3) Push params (+ retptr) and call the async-lower import.
+    for px in 0..n_export_params {
+        f.instructions().local_get(px);
+    }
+    if p.result_size_align.is_some() {
+        f.instructions().local_get(retptr_local);
+    }
+    canon_async::emit_call_and_wait(&mut f, imp_idx, st, ws, art);
+
+    // (4) Deliver the result through the export's shape.
+    if export_retptr {
+        f.instructions().local_get(retptr_local);
+    } else if let Some(result_ty) = p.result_ty.as_ref() {
+        let load_kind = flat_load_kind(result_ty, p.export_sig.results.first().copied())
+            .expect("non-retptr export with result → primitive flat-load shape");
+        f.instructions().local_get(retptr_local);
+        emit_flat_load(&mut f, load_kind);
+        let sb = saved_bump_local.expect("non-retptr → saved_bump_local");
+        f.instructions().local_get(sb);
+        f.instructions().global_set(bump_global);
+    } else {
+        let sb = saved_bump_local.expect("non-retptr → saved_bump_local");
+        f.instructions().local_get(sb);
+        f.instructions().global_set(bump_global);
+    }
     f.instructions().end();
     f
 }
 
-/// Body for the retptr export wrapper. Sync canon-lift uses
-/// callee-allocates (the function returns a pointer it allocated);
-/// sync canon-lower uses caller-allocates (we pass a retptr param
-/// the import writes into). Bridge:
-///
-/// 1. Save bump into the static saved-bump slot — `cabi_post_<fn>`
-///    will restore from it, freeing the result buffer plus any
-///    transient args the host's canon-lift allocated.
-/// 2. `cabi_realloc` a result buffer sized to the result type.
-/// 3. Pass `(orig_params, retptr)` to the sync canon-lower import.
-/// 4. Return the retptr — the export's callee-allocates result.
-fn build_retptr_wrapper_body(
-    n_export_params: u32,
-    imp_idx: u32,
-    cabi_realloc_idx: u32,
-    result_size_align: (u32, u32),
-    bump_global: u32,
-) -> Function {
-    let (result_size, result_align) = result_size_align;
-    let mut locals = LocalsBuilder::new(n_export_params);
-    let retptr_local = locals.alloc_local(ValType::I32);
-    let mut f = Function::new_with_locals_types(locals.freeze().locals);
+/// Load-instruction selector for the non-retptr export path. Picks
+/// the narrowest typed load that matches the target's WIT result type
+/// so canonical-ABI sub-byte sign/zero extension is preserved at the
+/// bridge's wasm-level return.
+#[derive(Clone, Copy)]
+enum FlatLoad {
+    I32,
+    I32Load8U,
+    I32Load8S,
+    I32Load16U,
+    I32Load16S,
+    I64,
+    F32,
+    F64,
+}
 
-    // mem[SAVED_BUMP_OFFSET..+4] = bump
-    f.instructions().i32_const(0);
-    f.instructions().global_get(bump_global);
-    f.instructions().i32_store(MemArg {
-        offset: SAVED_BUMP_OFFSET,
-        align: I32_STORE_LOG2_ALIGN,
+fn flat_load_kind(result_ty: &Type, flat: Option<WasmType>) -> Result<FlatLoad> {
+    let load = match (result_ty, flat) {
+        (Type::Bool | Type::U8, Some(WasmType::I32)) => FlatLoad::I32Load8U,
+        (Type::S8, Some(WasmType::I32)) => FlatLoad::I32Load8S,
+        (Type::U16, Some(WasmType::I32)) => FlatLoad::I32Load16U,
+        (Type::S16, Some(WasmType::I32)) => FlatLoad::I32Load16S,
+        (Type::U32 | Type::S32 | Type::Char, Some(WasmType::I32)) => FlatLoad::I32,
+        (Type::U64 | Type::S64, Some(WasmType::I64)) => FlatLoad::I64,
+        (Type::F32, Some(WasmType::F32)) => FlatLoad::F32,
+        (Type::F64, Some(WasmType::F64)) => FlatLoad::F64,
+        _ => anyhow::bail!(
+            "bridge non-retptr load not supported for result_ty={result_ty:?}, flat={flat:?}"
+        ),
+    };
+    Ok(load)
+}
+
+fn emit_flat_load(f: &mut Function, kind: FlatLoad) {
+    let arg0 = MemArg {
+        offset: 0,
+        align: 0,
         memory_index: 0,
-    });
-
-    emit_cabi_realloc_call(
-        &mut f,
-        cabi_realloc_idx,
-        result_align,
-        result_size,
-        retptr_local,
-    );
-
-    for p in 0..n_export_params {
-        f.instructions().local_get(p);
-    }
-    f.instructions().local_get(retptr_local);
-    f.instructions().call(imp_idx);
-    f.instructions().local_get(retptr_local);
-    f.instructions().end();
-    f
+    };
+    let arg1 = MemArg {
+        offset: 0,
+        align: 1,
+        memory_index: 0,
+    };
+    let arg2 = MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    };
+    let arg3 = MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    };
+    match kind {
+        FlatLoad::I32Load8U => f.instructions().i32_load8_u(arg0),
+        FlatLoad::I32Load8S => f.instructions().i32_load8_s(arg0),
+        FlatLoad::I32Load16U => f.instructions().i32_load16_u(arg1),
+        FlatLoad::I32Load16S => f.instructions().i32_load16_s(arg1),
+        FlatLoad::I32 => f.instructions().i32_load(arg2),
+        FlatLoad::I64 => f.instructions().i64_load(arg3),
+        FlatLoad::F32 => f.instructions().f32_load(arg2),
+        FlatLoad::F64 => f.instructions().f64_load(arg3),
+    };
 }
 
 /// `cabi_post_<fn>` body: restore bump from the static saved-bump

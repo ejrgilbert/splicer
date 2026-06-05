@@ -29,7 +29,7 @@ use super::schema::{
     TREE_FLAGS_INFOS, TREE_HANDLE_INFOS, TREE_RECORD_INFOS, TREE_VARIANT_INFOS,
 };
 use super::section_emit::FuncIndices;
-use super::FuncDispatch;
+use super::{FuncDispatch, FuncShape};
 
 /// Static context the wrapper-body emitter reads from the layout phase.
 pub(super) struct WrapperCtx<'a> {
@@ -511,13 +511,16 @@ pub(super) fn emit_wrapper_function(
             handler_imp_idx,
         );
     }
-    if fd.shape.is_import_async() {
-        // canon-lower-async leaves packed (handle << 4) | status; await.
-        f.instructions().local_set(lcl.st);
-        canon_async::emit_wait_loop(&mut f, lcl.st, lcl.ws, async_funcs);
-    } else if let Some(local) = lcl.result {
-        // Sync direct-return: capture flat result for the tail to read.
-        f.instructions().local_set(local);
+    match &fd.shape {
+        FuncShape::Async(_) => {
+            f.instructions().local_set(lcl.st);
+            canon_async::emit_wait_loop(&mut f, lcl.st, lcl.ws, async_funcs);
+        }
+        FuncShape::Sync => {
+            if let Some(local) = lcl.result {
+                f.instructions().local_set(local);
+            }
+        }
     }
 
     // ── Phase 3: on-return (only if after-hook wired) ──
@@ -691,11 +694,14 @@ pub(super) fn emit_wrapper_function(
 
     emit_bump_restore(&mut f, bump_reset);
 
-    // ── Phase 4: tail (async lift: task.return; sync lift: direct return).
-    if fd.shape.is_export_async() {
-        emit_task_return(&mut f, fd, func_idx, i, &lcl);
-    } else {
-        emit_wrapper_return(&mut f, lcl.result, fd.export_sig.retptr, fd.retptr_offset);
+    // ── Phase 4: tail (async: task.return; sync: direct return).
+    match &fd.shape {
+        FuncShape::Async(_) => {
+            emit_task_return(&mut f, fd, func_idx, i, &lcl);
+        }
+        FuncShape::Sync => {
+            emit_wrapper_return(&mut f, lcl.result, fd.export_sig.retptr, fd.retptr_offset);
+        }
     }
     f.instructions().end();
     code.function(&f);
@@ -729,7 +735,7 @@ fn emit_gate_skip_branch(
     // the skip path.
     f.instructions().i32_eqz();
     f.instructions().if_(wasm_encoder::BlockType::Empty);
-    if fd.shape.is_export_async() {
+    if let FuncShape::Async(_) = &fd.shape {
         let imp_task_return = func_idx.task_return_idx[func_i]
             .expect("async target with gate hook must have task.return import");
         f.instructions().call(imp_task_return);
@@ -739,9 +745,8 @@ fn emit_gate_skip_branch(
     f.instructions().end();
 }
 
-/// `task.return` paths: void (no args), indirect (push retptr), flat
-/// from `lcl.result` (bridged direct-return), flat from retptr memory
-/// (all-async or bridged retptr).
+/// Async tail. Three shapes: void (no args); indirect_params (push
+/// retptr scratch); flat (replay `lift_from_memory` loads).
 fn emit_task_return(
     f: &mut Function,
     fd: &FuncDispatch,
@@ -751,46 +756,31 @@ fn emit_task_return(
 ) {
     let imp_task_return =
         func_idx.task_return_idx[i].expect("async func must have task.return import");
-    let tr = fd
-        .shape
-        .task_return()
-        .expect("emit_task_return called only for async-lift funcs");
+    let FuncShape::Async(tr) = &fd.shape else {
+        unreachable!("emit_task_return called only for async funcs")
+    };
     if fd.result_ty.is_none() {
         f.instructions().call(imp_task_return);
-        return;
-    }
-    if tr.sig.indirect_params {
-        // Compound task.return — push the retptr buffer pointer.
+    } else if tr.sig.indirect_params {
         f.instructions().i32_const(
             fd.retptr_offset
                 .expect("async non-void result → retptr_offset"),
         );
         f.instructions().call(imp_task_return);
-        return;
-    }
-    // Bridged direct-return: result was captured to `lcl.result` in
-    // Phase 2; nothing in `retptr_offset` memory to load from.
-    if !fd.shape.is_import_async() && !fd.import_sig.retptr {
-        let result_local = lcl
-            .result
-            .expect("bridged direct-return → lcl.result allocated");
-        f.instructions().local_get(result_local);
+    } else {
+        let addr_local = lcl.tr_addr.expect("flat loads → tr_addr local");
+        let task_return_loads = lcl
+            .task_return_loads
+            .as_deref()
+            .expect("flat loads → instruction sequence");
+        f.instructions().i32_const(
+            fd.retptr_offset
+                .expect("async non-void result → retptr_offset"),
+        );
+        f.instructions().local_set(addr_local);
+        for inst in task_return_loads {
+            f.instruction(inst);
+        }
         f.instructions().call(imp_task_return);
-        return;
     }
-    // All-async or bridged retptr: result is in `retptr_offset`.
-    let addr_local = lcl.tr_addr.expect("flat loads → tr_addr local");
-    let task_return_loads = lcl
-        .task_return_loads
-        .as_deref()
-        .expect("flat loads → instruction sequence");
-    f.instructions().i32_const(
-        fd.retptr_offset
-            .expect("async non-void result → retptr_offset"),
-    );
-    f.instructions().local_set(addr_local);
-    for inst in task_return_loads {
-        f.instruction(inst);
-    }
-    f.instructions().call(imp_task_return);
 }

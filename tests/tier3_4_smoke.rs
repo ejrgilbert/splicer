@@ -72,6 +72,7 @@ fn build_and_validate(
             strategy_crate_path: strategy.to_str().unwrap(),
             strategy_type,
             splicer_tool_sdk_version: SDK_TEST_VERSION,
+            bridged_sync_target: false,
         },
         &BuildConfig {
             build_root: build_root.path(),

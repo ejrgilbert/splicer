@@ -877,10 +877,6 @@ struct SpliceAccumulators {
     /// at least one sync (non-async) function declared on that
     /// interface.
     target_has_sync_cache: HashMap<(String, String), bool>,
-    /// Decode-cache: `middleware_path` → qualified name of the first
-    /// non-`wasi:*` peer import declared `async func`, or `None` if
-    /// no offender.
-    middleware_first_async_peer_cache: HashMap<String, Option<String>>,
     /// `(target_split_path, target_interface)` →
     /// `(bridge_wasm_path, async_mirror_qualified_name)`. One bridge
     /// per distinct provider+interface across the run; shared by every
@@ -1449,23 +1445,12 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
-                let mirror_export_name = match injection.path.as_deref() {
-                    Some(mw_path) => ensure_bridge_if_needed(
-                        mw_path,
-                        interface_name,
-                        consumer_split_path,
-                        ctx.splits_path,
-                        accs,
-                    )?,
-                    None => None,
-                };
                 let adapter_path = generate_tier1_adapter(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
                     ctx.splits_path,
                     consumer_split_path,
-                    mirror_export_name.as_deref(),
                 )?;
                 accs.generated_adapters.push(GeneratedAdapter {
                     adapter_path: adapter_path.clone(),
@@ -1490,23 +1475,12 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
-                let mirror_export_name = match injection.path.as_deref() {
-                    Some(mw_path) => ensure_bridge_if_needed(
-                        mw_path,
-                        interface_name,
-                        consumer_split_path,
-                        ctx.splits_path,
-                        accs,
-                    )?,
-                    None => None,
-                };
                 let adapter_path = generate_tier2_adapter(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
                     ctx.splits_path,
                     consumer_split_path,
-                    mirror_export_name.as_deref(),
                 )?;
                 accs.generated_adapters.push(GeneratedAdapter {
                     adapter_path: adapter_path.clone(),
@@ -1625,66 +1599,6 @@ fn factored_types_to_wire(
     Ok(out)
 }
 
-/// Whether a tier-1/2 splice site needs the sync→async bridge to
-/// mediate between a sync-WIT target and a suspending hook body.
-enum SyncWitTreatment {
-    NotNeeded,
-    BridgeRequired,
-}
-
-/// Conservative — only catches imports that are `async func` at the
-/// middleware's WIT level. Middleware that declares a sync-WIT import
-/// but canon-lower-async's it slips through.
-fn classify_bridge_need(
-    middleware_path: &str,
-    target_interface: &str,
-    target_split_path: &str,
-    accs: &mut SpliceAccumulators,
-) -> SyncWitTreatment {
-    let target_key = (target_split_path.to_string(), target_interface.to_string());
-    let has_sync = *accs
-        .target_has_sync_cache
-        .entry(target_key)
-        .or_insert_with(|| target_interface_has_sync_func(target_interface, target_split_path));
-    if !has_sync {
-        return SyncWitTreatment::NotNeeded;
-    }
-    let offender = accs
-        .middleware_first_async_peer_cache
-        .entry(middleware_path.to_string())
-        .or_insert_with(|| first_async_peer_import(middleware_path));
-    match offender {
-        Some(_) => SyncWitTreatment::BridgeRequired,
-        None => SyncWitTreatment::NotNeeded,
-    }
-}
-
-/// If a tier-1/2 site needs the sync→async bridge, generate (cache)
-/// the bridge component and return the mirror's qualified name for
-/// the adapter to lift against. `None` means the site is the inline
-/// path — adapter codegen runs unchanged.
-fn ensure_bridge_if_needed(
-    middleware_path: &str,
-    target_interface: &str,
-    target_split_path: &str,
-    splits_output_path: &str,
-    accs: &mut SpliceAccumulators,
-) -> anyhow::Result<Option<String>> {
-    if matches!(
-        classify_bridge_need(middleware_path, target_interface, target_split_path, accs),
-        SyncWitTreatment::NotNeeded,
-    ) {
-        return Ok(None);
-    }
-    let (_path, mirror_qname) = ensure_bridge(
-        target_interface,
-        target_split_path,
-        splits_output_path,
-        accs,
-    )?;
-    Ok(Some(mirror_qname))
-}
-
 /// Cached bridge generation. Returns the bridge's `.wasm` path and
 /// the async-mirror interface's fully-qualified name; both are also
 /// stored on `accs.bridges` so later sites + EmitPlan routing share
@@ -1746,44 +1660,6 @@ fn target_interface_has_sync_func(target_interface: &str, target_split_path: &st
         }
     }
     false
-}
-
-/// Return the qualified name of the first import in the middleware's
-/// world that is `async func` and belongs to a non-`wasi:*` package
-/// (so it's a peer component, not a host import). `None` if no such
-/// import exists.
-fn first_async_peer_import(middleware_path: &str) -> Option<String> {
-    let bytes = std::fs::read(middleware_path).ok()?;
-    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wit_component::decode(&bytes)
-    }))
-    .ok()?
-    .ok()?;
-    let wit_component::DecodedWasm::Component(resolve, world_id) = decoded else {
-        return None;
-    };
-    let world = &resolve.worlds[world_id];
-    for (_key, item) in &world.imports {
-        let wit_parser::WorldItem::Interface { id, .. } = item else {
-            continue;
-        };
-        let Some(qname) = resolve.id_of(*id) else {
-            continue;
-        };
-        // wasi:* is host-provided; the wasmtime runtime drives those
-        // suspends correctly even from a sync-rooted task because the
-        // host owns the scheduler. Peer components don't.
-        if qname.starts_with("wasi:") {
-            continue;
-        }
-        let iface = &resolve.interfaces[*id];
-        for (fn_name, func) in &iface.functions {
-            if func.kind.is_async() {
-                return Some(format!("{qname}#{fn_name}"));
-            }
-        }
-    }
-    None
 }
 
 /// Qualified names of the component's interface imports whose

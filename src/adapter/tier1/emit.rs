@@ -17,12 +17,12 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use wasm_encoder::{
-    BlockType, CodeSection, EntityType, Function, FunctionSection, ImportSection, MemArg, Module,
+    BlockType, CodeSection, EntityType, Function, FunctionSection, ImportSection, Module,
     TypeSection, ValType,
 };
 use wit_bindgen_core::abi::lift_from_memory;
 use wit_component::{embed_component_metadata, ComponentEncoder, StringEncoding};
-use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
+use wit_parser::abi::{AbiVariant, WasmSignature};
 use wit_parser::{
     Function as WitFunction, InterfaceId, Mangling, Resolve, SizeAlign, Type, TypeId, WasmExport,
     WasmExportKind, WasmImport, WorldKey,
@@ -35,11 +35,10 @@ use super::super::abi::emit::{
     emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
     emit_populate_call_id, emit_resource_drop_imports, emit_wrapper_return, empty_function,
     find_imported_hook, require_gate_compatible_func, require_indirect_params_supported_shape,
-    require_no_inline_resources, synthesize_adapter_world_wit, val_types, wasm_type_to_val,
-    BlobSlice, BumpReset, CallIdLayout, GlobalIndices, HookImport, WrapperExport,
+    require_no_inline_resources, synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset,
+    CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
-use super::super::async_mirror::{synthesize_async_mirror, MIRROR_NAME_MISMATCH_PREFIX};
 use super::super::indices::{DispatchIndices, LocalsBuilder};
 use super::super::mem_layout::MemoryLayoutBuilder;
 use super::super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
@@ -58,34 +57,11 @@ pub(crate) fn build_adapter(
     split_bytes: &[u8],
     common_world_wit: &str,
     tier1_world_wit: &str,
-    mirror_export_name: Option<&str>,
 ) -> Result<Vec<u8>> {
     let mut resolve = decode_input_resolve(split_bytes)?;
     let target_iface = find_target_interface(&resolve, target_interface)?;
 
-    // Bridged path: synthesize the async mirror once into our resolve
-    // and lift against it. Lower side stays on the real sync target,
-    // so the deepest downstream import wires to the unchanged provider.
-    let (lift_iface, lift_interface_name) = match mirror_export_name {
-        Some(expected) => {
-            let (mirror_id, mirror_qname) = synthesize_async_mirror(&mut resolve, target_iface)
-                .with_context(|| format!("synthesize async mirror for `{target_interface}`"))?;
-            if mirror_qname != expected {
-                bail!(
-                    "{MIRROR_NAME_MISMATCH_PREFIX} for `{target_interface}`: \
-                     wac wiring expected `{expected}` but tier-1 adapter \
-                     synthesized `{mirror_qname}` — both sides should derive \
-                     the same hash",
-                );
-            }
-            (mirror_id, mirror_qname)
-        }
-        None => (target_iface, target_interface.to_string()),
-    };
-    let lower_iface = target_iface;
-    let lower_interface_name = target_interface;
-
-    require_supported_case(&resolve, lift_iface, lower_iface, has_gate)?;
+    require_supported_case(&resolve, target_iface, has_gate)?;
 
     resolve
         .push_str("splicer-common.wit", common_world_wit)
@@ -99,8 +75,7 @@ pub(crate) fn build_adapter(
             &synthesize_adapter_world_wit(
                 ADAPTER_WORLD_PACKAGE,
                 ADAPTER_WORLD_NAME,
-                &lift_interface_name,
-                lower_interface_name,
+                target_interface,
                 &tier1_hook_imports(has_before, has_after, has_gate),
             ),
         )
@@ -112,9 +87,8 @@ pub(crate) fn build_adapter(
     let mut core_module = build_dispatch_module(
         &resolve,
         world_id,
-        lift_iface,
-        lower_iface,
-        lower_interface_name,
+        target_iface,
+        target_interface,
         has_before,
         has_after,
         has_gate,
@@ -137,38 +111,36 @@ pub(crate) fn build_adapter(
 /// enforces.
 fn require_supported_case(
     resolve: &Resolve,
-    lift_iface: InterfaceId,
-    lower_iface: InterfaceId,
+    target_iface: InterfaceId,
     has_gate: bool,
 ) -> Result<()> {
-    let lift = &resolve.interfaces[lift_iface];
-    if lift.functions.is_empty() {
+    let iface = &resolve.interfaces[target_iface];
+    if iface.functions.is_empty() {
         bail!("interface has no functions");
     }
-    require_no_inline_resources(resolve, lift_iface)?;
-    if lower_iface != lift_iface {
-        require_no_inline_resources(resolve, lower_iface)?;
-    }
-    let lower = &resolve.interfaces[lower_iface];
-    for (name, lift_func) in &lift.functions {
+    require_no_inline_resources(resolve, target_iface)?;
+    for (name, func) in &iface.functions {
         if has_gate {
-            require_gate_compatible_func(resolve, name, lift_func, "1")?;
+            require_gate_compatible_func(resolve, name, func, "1")?;
         }
-        // Indirect-params cap is variant-dependent; check the lower
-        // (import / canon-lower) side that drives the bindgen pass.
-        let lower_func = lower
-            .functions
-            .get(name)
-            .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
-        let import_is_async = lower_func.kind.is_async();
-        let import_variant = if import_is_async {
+        // Funcs whose params overflow the indirect-params cap (4 for
+        // async, 16 for sync) canon-lower with `indirect_params = true`
+        // — the handler takes a single params-pointer instead of flat
+        // values. The wrapper export sees the same flip on its side
+        // (sync) or stays flat (async-stackful is capped at
+        // `MAX_FLAT_PARAMS = 16`), so [`build_lower_params_to_memory`]
+        // writes the lowered record before the handler call.
+        // `require_indirect_params_supported_shape` rejects param
+        // shapes the lower-mode bindgen doesn't cover.
+        let is_async = func.kind.is_async();
+        let variant = if is_async {
             AbiVariant::GuestImportAsync
         } else {
             AbiVariant::GuestImport
         };
-        let import_sig = resolve.wasm_signature(import_variant, lower_func);
+        let import_sig = resolve.wasm_signature(variant, func);
         if import_sig.indirect_params {
-            require_indirect_params_supported_shape(resolve, name, lower_func, import_is_async)?;
+            require_indirect_params_supported_shape(resolve, name, func, is_async)?;
         }
     }
     Ok(())
@@ -215,11 +187,7 @@ struct FuncDispatch {
     /// Wrapper export name — `<iface>#<fn>` (sync) or
     /// `[async-lift-stackful]<iface>#<fn>` (async).
     export_name: String,
-    /// Lift-side async-ness; drives sync vs async-stackful wrapper body.
-    export_is_async: bool,
-    /// Handler-side async-ness; drives wait-loop vs direct call.
-    /// Diverges from `export_is_async` only on the bridged path.
-    import_is_async: bool,
+    is_async: bool,
     /// Wrapper export sig (`GuestExport` / `GuestExportAsyncStackful`).
     export_sig: WasmSignature,
     /// Handler import sig (`GuestImport` / `GuestImportAsync`).
@@ -327,37 +295,38 @@ struct FuncIndices {
 /// Build the dispatch core module — phase orchestrator. `cabi_realloc` + the bump global
 /// are emitted unconditionally (matches `wit_component::dummy_module`);
 /// the ~30-byte cost is cheaper than a "does any type transitively contain a string/list?" walker.
-#[allow(clippy::too_many_arguments)]
 fn build_dispatch_module(
     resolve: &Resolve,
     world_id: wit_parser::WorldId,
-    lift_iface: InterfaceId,
-    lower_iface: InterfaceId,
-    lower_interface_name: &str,
+    target_iface: InterfaceId,
+    target_interface_name: &str,
     has_before: bool,
     has_after: bool,
     has_gate: bool,
 ) -> Result<Vec<u8>> {
-    // Iterate the lift side — that's the iface the wrapper exports,
-    // and the per-side async-ness on the lift drives every "needs
-    // async runtime?" decision. In the NotNeeded path, lift == lower
-    // so the same funcs come out either way.
-    let lift_funcs: Vec<&WitFunction> = resolve.interfaces[lift_iface].functions.values().collect();
-    let any_async_lift = lift_funcs.iter().any(|f| f.kind.is_async());
-    let needs_async_runtime = has_before || has_after || has_gate || any_async_lift;
+    let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
+        .functions
+        .values()
+        .collect();
+    // Any hook OR any async target needs the canon-async builtins
+    // to await its subtask handle.
+    let any_async_target = funcs.iter().any(|f| f.kind.is_async());
+    let needs_async_runtime = has_before || has_after || has_gate || any_async_target;
     let any_hook = has_before || has_after || has_gate;
     let mut sizes = SizeAlign::default();
     sizes.fill(resolve);
+    // The [`CallIdLayout`] is needed iff any hook is wired (to populate
+    // the indirect-params buffer); also drives the buffer's size +
+    // alignment in [`compute_func_dispatches`].
     let callid_layout = any_hook
         .then(|| call_id_layout(resolve, &sizes))
         .transpose()?;
     let plan = compute_func_dispatches(
         resolve,
         &sizes,
-        lift_iface,
-        lower_iface,
-        lower_interface_name,
-        &lift_funcs,
+        target_iface,
+        target_interface_name,
+        &funcs,
         SlotReservations {
             needs_async_runtime,
             has_gate,
@@ -409,7 +378,7 @@ fn build_dispatch_module(
         resolve,
         &sizes,
         &plan.per_func,
-        &lift_funcs,
+        &funcs,
         &func_idx,
         &globals,
         call_id_wiring,
@@ -462,86 +431,73 @@ const LAYOUT_SIZE_BUDGET: u32 = i32::MAX as u32;
 /// Phase 1 — per-func dispatch shapes, name bytes, and memory-slot
 /// reservations (retptr scratch, event record, call-id buffer).
 /// Iface name lives once at the head of memory; each fn name follows.
-#[allow(clippy::too_many_arguments)]
 fn compute_func_dispatches(
     resolve: &Resolve,
     sizes: &SizeAlign,
-    lift_iface: InterfaceId,
-    lower_iface: InterfaceId,
-    lower_interface_name: &str,
-    lift_funcs: &[&WitFunction],
+    target_iface: InterfaceId,
+    target_interface_name: &str,
+    funcs: &[&WitFunction],
     slots: SlotReservations,
 ) -> Result<DispatchPlan> {
-    let iface_name_bytes = lower_interface_name.len() as u32;
-    let total_fn_name_bytes: u32 = lift_funcs.iter().map(|f| f.name.len() as u32).sum();
+    let iface_name_bytes = target_interface_name.len() as u32;
+    let total_fn_name_bytes: u32 = funcs.iter().map(|f| f.name.len() as u32).sum();
     let total_name_bytes = iface_name_bytes + total_fn_name_bytes;
     let mut layout = MemoryLayoutBuilder::new(total_name_bytes);
     let mut name_blob: Vec<u8> = Vec::with_capacity(total_name_bytes as usize);
-    let mut per_func: Vec<FuncDispatch> = Vec::with_capacity(lift_funcs.len());
+    let mut per_func: Vec<FuncDispatch> = Vec::with_capacity(funcs.len());
 
-    // The iface name placed in the call-id blob is the user-facing
-    // (lower-side / target) name — that's what middleware authors see
-    // in their hook bodies, regardless of whether the adapter is
-    // mirror-lifted underneath.
+    // Iface name allocated once and reused across all FuncDispatches.
     let iface_name_offset = layout.alloc_name(iface_name_bytes) as i32;
-    name_blob.extend_from_slice(lower_interface_name.as_bytes());
+    name_blob.extend_from_slice(target_interface_name.as_bytes());
 
-    let lift_world_key = WorldKey::Interface(lift_iface);
-    let lower_world_key = WorldKey::Interface(lower_iface);
-    let lower = &resolve.interfaces[lower_iface];
+    let target_world_key = WorldKey::Interface(target_iface);
 
-    for lift_func in lift_funcs.iter() {
-        // Lower-side func has the same name + param/result types by
-        // construction — the mirror only differs in async-ness.
-        let lower_func = lower
-            .functions
-            .get(&lift_func.name)
-            .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
-
-        // Variant + mangling per side; sides diverge on bridged path.
-        let export_is_async = lift_func.kind.is_async();
-        let import_is_async = lower_func.kind.is_async();
-        let export_variant = if export_is_async {
-            AbiVariant::GuestExportAsyncStackful
+    for func in funcs.iter() {
+        let is_async = func.kind.is_async();
+        let (import_variant, export_variant) = if is_async {
+            (
+                AbiVariant::GuestImportAsync,
+                AbiVariant::GuestExportAsyncStackful,
+            )
         } else {
-            AbiVariant::GuestExport
+            (AbiVariant::GuestImport, AbiVariant::GuestExport)
         };
-        let import_variant = if import_is_async {
-            AbiVariant::GuestImportAsync
-        } else {
-            AbiVariant::GuestImport
-        };
-
-        // Per-side mangling — ABI namespaces diverge on bridged path.
+        // Same mangling on both sides → matched `[async-lower]<fn>` /
+        // `[async-lift-stackful]<iface>#<fn>` pair (or no prefix for sync).
+        let mangling = dispatch_mangling(is_async);
         let (import_module, import_field) = resolve.wasm_import_name(
-            dispatch_mangling(import_is_async),
+            mangling,
             WasmImport::Func {
-                interface: Some(&lower_world_key),
-                func: lower_func,
+                interface: Some(&target_world_key),
+                func,
             },
         );
         let export_name = resolve.wasm_export_name(
-            dispatch_mangling(export_is_async),
+            mangling,
             WasmExport::Func {
-                interface: Some(&lift_world_key),
-                func: lift_func,
+                interface: Some(&target_world_key),
+                func,
                 kind: WasmExportKind::Normal,
             },
         );
-        let export_sig = resolve.wasm_signature(export_variant, lift_func);
-        let import_sig = resolve.wasm_signature(import_variant, lower_func);
-        let fn_name_offset = layout.alloc_name(lift_func.name.len() as u32) as i32;
-        name_blob.extend_from_slice(lift_func.name.as_bytes());
-
-        // Async-stackful lifts always retptr through memory for
-        // `task.return`; sync lifts only when the export sig says so.
-        let retptr_needed = if export_is_async {
-            lift_func.result.is_some()
+        let export_sig = resolve.wasm_signature(export_variant, func);
+        let import_sig = resolve.wasm_signature(import_variant, func);
+        let fn_name_offset = layout.alloc_name(func.name.len() as u32) as i32;
+        name_blob.extend_from_slice(func.name.as_bytes());
+        // Sync: retptr iff the export sig says so. Async: canon-lower-async
+        // always retptr's a non-void result.
+        let retptr_needed = if is_async {
+            import_sig.retptr
         } else {
             export_sig.retptr
         };
         let retptr_offset = retptr_needed.then(|| {
-            let result_ty = lift_func
+            // Exact canonical-ABI size + alignment of the result type
+            // — anything smaller than the type's natural alignment
+            // (e.g. 4-byte buffer for an i64-bearing variant) traps
+            // with "unaligned pointer" inside `lift_from_memory` /
+            // wit-bindgen's async runtime.
+            let result_ty = func
                 .result
                 .as_ref()
                 .expect("retptr_needed → func.result is_some()");
@@ -549,34 +505,39 @@ fn compute_func_dispatches(
             let align = sizes.align(result_ty).align_wasm32() as u32;
             layout.alloc_aligned(size, align) as i32
         });
+        // Indirect-params record: needed only when the import sig is
+        // by-pointer but the export sig is still flat — i.e. the
+        // async-stackful 5..16 corner where the wrapper has flat
+        // locals to lower. Sync (and async >16) flip both sides at
+        // the same cap, so the wrapper's local 0 already holds the
+        // host's params pointer and is passed through directly.
         let asymmetric_indirect = import_sig.indirect_params && !export_sig.indirect_params;
         let params_record_offset = asymmetric_indirect.then(|| {
-            let param_types: Vec<Type> = lift_func.params.iter().map(|p| p.ty).collect();
+            let param_types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
             let info = sizes.record(&param_types);
             let size = info.size.size_wasm32() as u32;
             let align = info.align.align_wasm32() as u32;
             layout.alloc_aligned(size, align) as i32
         });
-        let task_return = export_is_async.then(|| {
+        let task_return = is_async.then(|| {
             let (module, name, sig) =
-                lift_func.task_return_import(resolve, Some(&lift_world_key), Mangling::Legacy);
+                func.task_return_import(resolve, Some(&target_world_key), Mangling::Legacy);
             TaskReturnImport { module, name, sig }
         });
-        let borrow_drops = collect_borrow_drops(resolve, lift_func);
+        let borrow_drops = collect_borrow_drops(resolve, func);
         per_func.push(FuncDispatch {
             import_module,
             import_field,
             export_name,
-            export_is_async,
-            import_is_async,
+            is_async,
             export_sig,
             import_sig,
-            result_ty: lift_func.result,
+            result_ty: func.result,
             task_return,
             iface_name_offset,
             iface_name_len: iface_name_bytes as i32,
             fn_name_offset,
-            fn_name_len: lift_func.name.len() as i32,
+            fn_name_len: func.name.len() as i32,
             retptr_offset,
             params_record_offset,
             borrow_drops,
@@ -723,7 +684,7 @@ fn emit_type_section(
     // target func is async — both fire the wait loop in the wrapper
     // body. Gating only on hooks would leave a hook-less async-target
     // module unable to await its handler subtask.
-    let needs_async_runtime = hook_imports.any() || per_func.iter().any(|f| f.export_is_async);
+    let needs_async_runtime = hook_imports.any() || per_func.iter().any(|f| f.is_async);
     let async_runtime =
         needs_async_runtime.then(|| canon_async::emit_types(&mut types, || idx.alloc_ty()));
 
@@ -866,7 +827,7 @@ fn emit_function_section(
     // `cabi_post_*` only for sync retptr — async-stackful has no
     // post-return contract.
     for (i, fd) in per_func.iter().enumerate() {
-        if fd.export_sig.retptr && !fd.export_is_async {
+        if fd.export_sig.retptr && !fd.is_async {
             fsec.function(type_idx.cabi_post_ty);
             func_idx.cabi_post[i] = Some(idx.alloc_func());
         }
@@ -905,7 +866,7 @@ fn emit_code_section(
         });
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
-        if fd.export_is_async {
+        if fd.is_async {
             emit_async_wrapper_body(
                 &mut code,
                 resolve,
@@ -942,7 +903,7 @@ fn emit_code_section(
     }
     code.function(&empty_function());
     for fd in per_func {
-        if fd.export_sig.retptr && !fd.export_is_async {
+        if fd.export_sig.retptr && !fd.is_async {
             code.function(&empty_function());
         }
     }
@@ -1090,43 +1051,9 @@ fn emit_gate_phase(
     f.instructions().end();
 }
 
-/// Store a flat wasm value (top-of-stack) at the address underneath
-/// it, with canonical natural alignment for the type.
-fn emit_store_flat_value(f: &mut Function, ty: WasmType) {
-    match ty {
-        WasmType::I32 | WasmType::Pointer | WasmType::Length => {
-            f.instructions().i32_store(MemArg {
-                offset: 0,
-                align: 2,
-                memory_index: 0,
-            });
-        }
-        WasmType::I64 | WasmType::PointerOrI64 => {
-            f.instructions().i64_store(MemArg {
-                offset: 0,
-                align: 3,
-                memory_index: 0,
-            });
-        }
-        WasmType::F32 => {
-            f.instructions().f32_store(MemArg {
-                offset: 0,
-                align: 2,
-                memory_index: 0,
-            });
-        }
-        WasmType::F64 => {
-            f.instructions().f64_store(MemArg {
-                offset: 0,
-                align: 3,
-                memory_index: 0,
-            });
-        }
-    }
-}
-
-/// Async-stackful wrapper body. Result delivered via `task.return`;
-/// arg loads come from [`lift_from_memory`] via [`WasmEncoderBindgen`].
+/// Emit one async-stackful wrapper body. Result is delivered via
+/// `task.return` (not the wrapper's return); arg loads come from
+/// [`lift_from_memory`] driven by [`WasmEncoderBindgen`].
 #[allow(clippy::too_many_arguments)]
 fn emit_async_wrapper_body(
     code: &mut CodeSection,
@@ -1154,15 +1081,6 @@ fn emit_async_wrapper_body(
     let st = locals.alloc_local(ValType::I32);
     let ws = locals.alloc_local(ValType::I32);
     let wait_locals = Some((st, ws));
-    // Bridged direct-return: handler leaves a flat result on the stack
-    // that we spill to memory at `retptr_offset` for the task.return
-    // flat-load path. Sync retptr handlers already wrote there; sync
-    // void leaves nothing — neither needs a spill local.
-    let bridged_direct_return_spill =
-        (!fd.import_is_async && !fd.import_sig.retptr && fd.result_ty.is_some()).then(|| {
-            let ty = wasm_type_to_val(fd.import_sig.results[0]);
-            locals.alloc_local(ty)
-        });
     // task.return is `wasm_signature(GuestImport, fake_func_with_result_as_param)`:
     // small results flatten into params; large results overflow into a
     // single retptr param (`indirect_params=true`). The `retptr` flag is
@@ -1264,23 +1182,8 @@ fn emit_async_wrapper_body(
             .i32_const(fd.retptr_offset.expect("retptr_offset for async retptr"));
     }
     f.instructions().call(imp_handler);
-    if fd.import_is_async {
-        // canon-lower-async leaves packed (handle << 4) | status; await.
-        f.instructions().local_set(st);
-        canon_async::emit_wait_loop(&mut f, st, ws, async_runtime);
-    } else if let Some(spill_local) = bridged_direct_return_spill {
-        // Spill stack result to `retptr_offset` so task.return reads it.
-        let result_wasm_ty = fd.import_sig.results[0];
-        f.instructions().local_set(spill_local);
-        f.instructions().i32_const(
-            fd.retptr_offset
-                .expect("retptr_offset reserved for non-void async lift"),
-        );
-        f.instructions().local_get(spill_local);
-        emit_store_flat_value(&mut f, result_wasm_ty);
-    }
-    // Sync retptr / sync void handlers need no extra step here; the
-    // task.return logic below reads from `retptr_offset` directly.
+    f.instructions().local_set(st);
+    canon_async::emit_wait_loop(&mut f, st, ws, async_runtime);
 
     if let Some(idx) = imp_after {
         emit_hook_call(
@@ -1394,7 +1297,7 @@ mod tests {
             "my:shape",
             "api@1.0.0",
         );
-        let err = require_supported_case(&resolve, iface_id, iface_id, false)
+        let err = require_supported_case(&resolve, iface_id, false)
             .expect_err("inline resource should bail");
         let msg = err.to_string();
         assert!(
@@ -1425,7 +1328,7 @@ mod tests {
             "my:shape",
             "api@1.0.0",
         );
-        require_supported_case(&resolve, iface_id, iface_id, false)
+        require_supported_case(&resolve, iface_id, false)
             .expect("factored-types should be accepted");
     }
 
@@ -1442,7 +1345,7 @@ mod tests {
             "my:shape",
             "api@1.0.0",
         );
-        require_supported_case(&resolve, iface_id, iface_id, false)
+        require_supported_case(&resolve, iface_id, false)
             .expect("value-type interfaces should be accepted");
     }
 
@@ -1462,7 +1365,7 @@ mod tests {
             "my:shape",
             "api@1.0.0",
         );
-        require_supported_case(&resolve, iface_id, iface_id, false)
+        require_supported_case(&resolve, iface_id, false)
             .expect("primitive alias in indirect-params position should be accepted");
     }
 
@@ -1490,7 +1393,7 @@ mod tests {
             "my:shape",
             "api@1.0.0",
         );
-        require_supported_case(&resolve, iface_id, iface_id, false)
+        require_supported_case(&resolve, iface_id, false)
             .expect("record / tuple / enum / flags in indirect-params should be accepted");
     }
 
@@ -1515,7 +1418,7 @@ mod tests {
             "my:shape",
             "api@1.0.0",
         );
-        require_supported_case(&resolve, iface_id, iface_id, false)
+        require_supported_case(&resolve, iface_id, false)
             .expect("17×u32 sync func should be accepted (params overflow MAX_FLAT_PARAMS)");
     }
 
@@ -1543,7 +1446,7 @@ mod tests {
             "my:shape",
             "api@1.0.0",
         );
-        require_supported_case(&resolve, iface_id, iface_id, false)
+        require_supported_case(&resolve, iface_id, false)
             .expect("full canonical-ABI value-type space accepted");
     }
 }

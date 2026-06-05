@@ -760,25 +760,18 @@ pub(crate) fn find_imported_hook(
     })
 }
 
-/// Synthesize the WIT for a tier's adapter world: import the
-/// `lower_interface` (what the adapter calls downstream), export the
-/// `lift_interface` (what the adapter exposes to callers), plus one
-/// import per active hook interface (already-versioned, e.g.
-/// `"splicer:tier1/before@0.2.0"`). When `lift_interface ==
-/// lower_interface` (the common case), the adapter is a transparent
-/// wrapper. When they differ — the sync→async bridge path — the
-/// adapter lifts an async-WIT mirror and lowers onto the real
-/// sync-WIT target.
+/// Synthesize the WIT for a tier's adapter world: import + export
+/// the target interface, plus one import per active hook interface
+/// (already-versioned, e.g. `"splicer:tier1/before@0.2.0"`).
 pub(crate) fn synthesize_adapter_world_wit(
     package_name: &str,
     world_name: &str,
-    lift_interface: &str,
-    lower_interface: &str,
+    target_interface: &str,
     hook_iface_imports: &[String],
 ) -> String {
     let mut wit = format!("package {package_name};\n\nworld {world_name} {{\n");
-    wit.push_str(&format!("    import {lower_interface};\n"));
-    wit.push_str(&format!("    export {lift_interface};\n"));
+    wit.push_str(&format!("    import {target_interface};\n"));
+    wit.push_str(&format!("    export {target_interface};\n"));
     for iface in hook_iface_imports {
         wit.push_str(&format!("    import {iface};\n"));
     }

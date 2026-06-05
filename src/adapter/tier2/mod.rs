@@ -28,7 +28,6 @@ use super::abi::emit::{
     require_gate_compatible_func, require_indirect_params_supported_shape,
     require_no_inline_resources, synthesize_adapter_world_wit, BlobSlice,
 };
-use super::async_mirror::{synthesize_async_mirror, MIRROR_NAME_MISMATCH_PREFIX};
 use super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
 use blob::NameInterner;
 use layout::lay_out_static_memory;
@@ -55,7 +54,6 @@ pub(super) fn build_tier2_adapter(
     split_bytes: &[u8],
     common_wit: &str,
     tier2_wit: &str,
-    mirror_export_name: Option<&str>,
 ) -> Result<Vec<u8>> {
     if !has_before && !has_after && !has_gate {
         bail!(
@@ -68,29 +66,7 @@ pub(super) fn build_tier2_adapter(
 
     let mut resolve = decode_input_resolve(split_bytes)?;
     let target_iface = find_target_interface(&resolve, target_interface)?;
-
-    // Bridged path: synthesize the async mirror and lift against it
-    // (matches tier-1). Lower side stays on the real sync target.
-    let (lift_iface, lift_interface_name) = match mirror_export_name {
-        Some(expected) => {
-            let (mirror_id, mirror_qname) = synthesize_async_mirror(&mut resolve, target_iface)
-                .with_context(|| format!("synthesize async mirror for `{target_interface}`"))?;
-            if mirror_qname != expected {
-                bail!(
-                    "{MIRROR_NAME_MISMATCH_PREFIX} for `{target_interface}`: \
-                     wac wiring expected `{expected}` but tier-2 adapter \
-                     synthesized `{mirror_qname}` — both sides should derive \
-                     the same hash",
-                );
-            }
-            (mirror_id, mirror_qname)
-        }
-        None => (target_iface, target_interface.to_string()),
-    };
-    let lower_iface = target_iface;
-    let lower_interface_name = target_interface;
-
-    require_supported_case(&resolve, lift_iface, lower_iface, has_gate)?;
+    require_supported_case(&resolve, target_iface, has_gate)?;
 
     resolve
         .push_str("splicer-common.wit", common_wit)
@@ -104,8 +80,7 @@ pub(super) fn build_tier2_adapter(
             &synthesize_adapter_world_wit(
                 TIER2_ADAPTER_WORLD_PACKAGE,
                 TIER2_ADAPTER_WORLD_NAME,
-                &lift_interface_name,
-                lower_interface_name,
+                target_interface,
                 &tier2_hook_imports(has_before, has_after, has_gate),
             ),
         )
@@ -119,30 +94,21 @@ pub(super) fn build_tier2_adapter(
     // immutable borrows of `resolve`.
     let map_aliases = desugar_map_aliases(&mut resolve);
 
-    // Iterate the lift side — those become wrapper exports. In the
-    // bridged path the lift's funcs are async by construction.
-    let lift_funcs: Vec<&WitFunction> = resolve.interfaces[lift_iface].functions.values().collect();
+    let funcs: Vec<&WitFunction> = resolve.interfaces[target_iface]
+        .functions
+        .values()
+        .collect();
     let schema = compute_schema(&resolve, world_id, has_before, has_after, has_gate)?;
 
     let mut names = NameInterner::new();
-    // Call-id reports the user-facing (lower / target) iface name so
-    // middleware authors see the interface they wrote in YAML,
-    // regardless of whether the adapter is mirror-lifted underneath.
-    let iface_name = names.intern(lower_interface_name);
-    let classified = build_per_func_classified(
-        &resolve,
-        lift_iface,
-        lower_iface,
-        &lift_funcs,
-        &mut names,
-        &map_aliases,
-    )?;
+    let iface_name = names.intern(target_interface);
+    let classified =
+        build_per_func_classified(&resolve, target_iface, &funcs, &mut names, &map_aliases)?;
 
-    let (per_func, plan) =
-        lay_out_static_memory(classified, &lift_funcs, &schema, names, iface_name)?;
+    let (per_func, plan) = lay_out_static_memory(classified, &funcs, &schema, names, iface_name)?;
 
     let mut core_module =
-        build_dispatch_module(&resolve, &schema, &per_func, &lift_funcs, plan, iface_name)?;
+        build_dispatch_module(&resolve, &schema, &per_func, &funcs, plan, iface_name)?;
     embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
         .context("embed_component_metadata")?;
 
@@ -157,38 +123,31 @@ pub(super) fn build_tier2_adapter(
 /// Bail on cases that fail before the lift codegen even runs.
 fn require_supported_case(
     resolve: &Resolve,
-    lift_iface: InterfaceId,
-    lower_iface: InterfaceId,
+    target_iface: InterfaceId,
     has_gate: bool,
 ) -> Result<()> {
-    let lift = &resolve.interfaces[lift_iface];
-    if lift.functions.is_empty() {
+    let iface = &resolve.interfaces[target_iface];
+    if iface.functions.is_empty() {
         bail!("interface has no functions");
     }
-    require_no_inline_resources(resolve, lift_iface)?;
-    if lower_iface != lift_iface {
-        require_no_inline_resources(resolve, lower_iface)?;
-    }
-    let lower = &resolve.interfaces[lower_iface];
-    for (name, lift_func) in &lift.functions {
+    require_no_inline_resources(resolve, target_iface)?;
+    // Indirect-params path covers the supported value-type space
+    // (mirrors tier-1). Fires for async params >4 flat AND sync
+    // params >16 flat — both flip the wrapper / handler to
+    // pass-by-record on the import side.
+    for (name, func) in &iface.functions {
         if has_gate {
-            require_gate_compatible_func(resolve, name, lift_func, "2")?;
+            require_gate_compatible_func(resolve, name, func, "2")?;
         }
-        // Indirect-params cap is variant-dependent; check the lower
-        // (import / canon-lower) side that drives the bindgen pass.
-        let lower_func = lower
-            .functions
-            .get(name)
-            .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
-        let import_is_async = lower_func.kind.is_async();
-        let import_variant = if import_is_async {
+        let is_async = func.kind.is_async();
+        let variant = if is_async {
             AbiVariant::GuestImportAsync
         } else {
             AbiVariant::GuestImport
         };
-        let import_sig = resolve.wasm_signature(import_variant, lower_func);
+        let import_sig = resolve.wasm_signature(variant, func);
         if import_sig.indirect_params {
-            require_indirect_params_supported_shape(resolve, name, lower_func, import_is_async)?;
+            require_indirect_params_supported_shape(resolve, name, func, is_async)?;
         }
     }
     Ok(())
@@ -322,91 +281,65 @@ pub(in crate::adapter::tier2) struct TaskReturnImport {
     pub sig: WasmSignature,
 }
 
-/// Per-side sync/async. Flags can disagree on the bridged path
-/// (async lift, sync lower); they always agree otherwise.
-pub(in crate::adapter::tier2) struct FuncShape {
-    export_is_async: bool,
-    import_is_async: bool,
-    /// `Some` iff `export_is_async` (invariant enforced by
-    /// constructors; field private to prevent struct-literal misuse).
-    task_return: Option<TaskReturnImport>,
+/// Sync/async shape of one target function.
+pub(in crate::adapter::tier2) enum FuncShape {
+    Sync,
+    Async(TaskReturnImport),
 }
 
 impl FuncShape {
-    fn classify(
-        resolve: &Resolve,
-        lift_world_key: &WorldKey,
-        lift_func: &WitFunction,
-        lower_func: &WitFunction,
-    ) -> Self {
-        let export_is_async = lift_func.kind.is_async();
-        let import_is_async = lower_func.kind.is_async();
-        let task_return = export_is_async.then(|| {
+    fn classify(resolve: &Resolve, target_world_key: &WorldKey, func: &WitFunction) -> Self {
+        if func.kind.is_async() {
             let (module, name, sig) =
-                lift_func.task_return_import(resolve, Some(lift_world_key), Mangling::Legacy);
-            TaskReturnImport { module, name, sig }
-        });
-        Self {
-            export_is_async,
-            import_is_async,
-            task_return,
+                func.task_return_import(resolve, Some(target_world_key), Mangling::Legacy);
+            FuncShape::Async(TaskReturnImport { module, name, sig })
+        } else {
+            FuncShape::Sync
         }
     }
 
-    /// All-sync stub for unit tests that don't want to build a full
-    /// `Resolve` for `classify`.
-    #[cfg(test)]
-    pub(in crate::adapter::tier2) fn sync_stub() -> Self {
-        Self {
-            export_is_async: false,
-            import_is_async: false,
-            task_return: None,
-        }
-    }
-
-    pub fn is_export_async(&self) -> bool {
-        self.export_is_async
-    }
-
-    pub fn is_import_async(&self) -> bool {
-        self.import_is_async
+    fn is_async(&self) -> bool {
+        matches!(self, FuncShape::Async(_))
     }
 
     pub fn task_return(&self) -> Option<&TaskReturnImport> {
-        debug_assert_eq!(
-            self.export_is_async,
-            self.task_return.is_some(),
-            "FuncShape invariant: task_return.is_some() ⇔ export_is_async",
-        );
-        self.task_return.as_ref()
+        match self {
+            FuncShape::Async(tr) => Some(tr),
+            FuncShape::Sync => None,
+        }
     }
 
-    /// `(import_variant, export_variant)` — per-side. In the bridged
-    /// path the two sides disagree.
+    /// `(import_variant, export_variant)` to pass to
+    /// `Resolve::wasm_signature` for this shape.
     fn abi_variants(&self) -> (AbiVariant, AbiVariant) {
-        let import = if self.import_is_async {
-            AbiVariant::GuestImportAsync
-        } else {
-            AbiVariant::GuestImport
-        };
-        let export = if self.export_is_async {
-            AbiVariant::GuestExportAsyncStackful
-        } else {
-            AbiVariant::GuestExport
-        };
-        (import, export)
+        match self {
+            FuncShape::Async(_) => (
+                AbiVariant::GuestImportAsync,
+                AbiVariant::GuestExportAsyncStackful,
+            ),
+            FuncShape::Sync => (AbiVariant::GuestImport, AbiVariant::GuestExport),
+        }
     }
 
-    /// `cabi_post_*` companion: only sync-lift retptr exports.
-    /// Async lifts deliver via `task.return`.
+    /// Whether the wrapper export needs a `cabi_post_*` companion.
+    /// Async exports never do (results land via `task.return`); sync
+    /// exports do iff the export sig retptr's the result.
     fn needs_cabi_post(&self, export_sig: &WasmSignature) -> bool {
-        !self.export_is_async && export_sig.retptr
+        match self {
+            FuncShape::Async(_) => false,
+            FuncShape::Sync => export_sig.retptr,
+        }
     }
 
-    /// Result in `retptr_offset` memory (true) vs. a direct-return
-    /// local (false) — driven by the import side.
-    fn result_at_retptr(&self, import_sig: &WasmSignature) -> bool {
-        import_sig.retptr
+    /// Whether the function's result lives at retptr scratch (vs.
+    /// flat return-value slots). Async funcs use the import-sig
+    /// retptr (canon-lower-async always retptr's a non-void result);
+    /// sync funcs use the export-sig retptr.
+    fn result_at_retptr(&self, export_sig: &WasmSignature, import_sig: &WasmSignature) -> bool {
+        match self {
+            FuncShape::Async(_) => import_sig.retptr,
+            FuncShape::Sync => export_sig.retptr,
+        }
     }
 }
 
@@ -484,68 +417,55 @@ pub(in crate::adapter::tier2) struct FuncDispatch {
 
 /// Build per-target-function classify records. Interns fn names,
 /// param names, and any record/field names referenced by lift plans.
-/// `lift_funcs` is the iteration set — these become wrapper exports.
-/// `lower_iface` provides the matching downstream handler funcs
-/// looked up by name. In the `NotNeeded` path both ifaces are the
-/// real target; in the bridged path the lift is the async mirror.
 fn build_per_func_classified(
     resolve: &Resolve,
-    lift_iface: InterfaceId,
-    lower_iface: InterfaceId,
-    lift_funcs: &[&WitFunction],
+    target_iface: InterfaceId,
+    funcs: &[&WitFunction],
     names: &mut NameInterner,
     map_aliases: &MapAliases,
 ) -> Result<Vec<FuncClassified>> {
-    let lift_world_key = WorldKey::Interface(lift_iface);
-    let lower_world_key = WorldKey::Interface(lower_iface);
-    let lower = &resolve.interfaces[lower_iface];
-    let mut per_func: Vec<FuncClassified> = Vec::with_capacity(lift_funcs.len());
+    let target_world_key = WorldKey::Interface(target_iface);
+    let mut per_func: Vec<FuncClassified> = Vec::with_capacity(funcs.len());
 
-    for lift_func in lift_funcs {
-        let fn_name_slice = names.intern(&lift_func.name);
+    for func in funcs {
+        let fn_name_slice = names.intern(&func.name);
 
-        let lower_func = lower
-            .functions
-            .get(&lift_func.name)
-            .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
-
-        // Lift and lower share params by construction; classify on lift.
-        let params_lift = classify_func_params(resolve, lift_func, names, map_aliases)?;
-        let shape = FuncShape::classify(resolve, &lift_world_key, lift_func, lower_func);
+        let params_lift = classify_func_params(resolve, func, names, map_aliases)?;
+        let shape = FuncShape::classify(resolve, &target_world_key, func);
         let (import_variant, export_variant) = shape.abi_variants();
+        let mangling = dispatch_mangling(shape.is_async());
 
-        // Per-side mangling — ABI namespaces diverge on bridged path.
         let (import_module, import_field) = resolve.wasm_import_name(
-            dispatch_mangling(shape.is_import_async()),
+            mangling,
             WasmImport::Func {
-                interface: Some(&lower_world_key),
-                func: lower_func,
+                interface: Some(&target_world_key),
+                func,
             },
         );
         let export_name = resolve.wasm_export_name(
-            dispatch_mangling(shape.is_export_async()),
+            mangling,
             WasmExport::Func {
-                interface: Some(&lift_world_key),
-                func: lift_func,
+                interface: Some(&target_world_key),
+                func,
                 kind: WasmExportKind::Normal,
             },
         );
-        let export_sig = resolve.wasm_signature(export_variant, lift_func);
-        let import_sig = resolve.wasm_signature(import_variant, lower_func);
+        let export_sig = resolve.wasm_signature(export_variant, func);
+        let import_sig = resolve.wasm_signature(import_variant, func);
         let needs_cabi_post = shape.needs_cabi_post(&export_sig);
         let result_lift = classify_result_lift(
             resolve,
-            lift_func,
-            shape.result_at_retptr(&import_sig),
+            func,
+            shape.result_at_retptr(&export_sig, &import_sig),
             names,
             map_aliases,
         )?;
 
-        let borrow_drops = collect_borrow_drops(resolve, lift_func);
+        let borrow_drops = collect_borrow_drops(resolve, func);
 
         per_func.push(FuncClassified {
             shape,
-            result_ty: lift_func.result,
+            result_ty: func.result,
             import_module,
             import_field,
             export_name,

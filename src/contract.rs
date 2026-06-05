@@ -58,6 +58,15 @@ pub fn validate_contract(
                 contract_fingerprint,
                 fingerprint,
             ));
+        } else if exports
+            .keys()
+            .any(|k| k.starts_with("splicer:async-mirror-"))
+        {
+            // Bridged tier-3/4 wrapper exports a synthesized async-WIT
+            // mirror in place of the target. The bridge component
+            // mediates sync↔async at runtime; fingerprint divergence
+            // (sync vs async kind) is structurally expected here.
+            results.push(ContractResult::Ok);
         } else {
             results.push(classify_tier_export(name, exports, path, interface_name));
         }

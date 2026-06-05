@@ -222,8 +222,24 @@ fn materialize_from_prepared(
     let adapter_path = ensure_preview1_adapter(&cache_root)?;
     let strategy_type = prep.strategy_crate_name.to_upper_camel_case();
 
+    // Bridged variants need a distinct on-disk wasm so two rules
+    // using the same builtin on different (sync vs async) targets
+    // don't overwrite each other's output. The mirror hash already
+    // uniquely identifies the target's sync-WIT interface.
+    let bridged_out_name;
+    let out_name: &str = if let Some(mirror) = mirror_export_name {
+        let mirror_tag = mirror
+            .strip_prefix("splicer:async-mirror-")
+            .and_then(|s| s.split('/').next())
+            .unwrap_or("bridged");
+        bridged_out_name = format!("{}-bridged-{}", prep.out_name, mirror_tag);
+        &bridged_out_name
+    } else {
+        &prep.out_name
+    };
+
     let plan = BuildPlan {
-        out_name: &prep.out_name,
+        out_name,
         strategy_dir: &prep.strategy_dir,
         sdk_version: &prep.sdk_version,
         strategy_crate_name: &prep.strategy_crate_name,
@@ -231,7 +247,13 @@ fn materialize_from_prepared(
         adapter_path: &adapter_path,
         cache_root: &cache_root,
     };
-    let path = run_codegen_build(splits_dir, &plan, behavior, &target)?;
+    let path = run_codegen_build(
+        splits_dir,
+        &plan,
+        behavior,
+        &target,
+        mirror_export_name.is_some(),
+    )?;
     Ok((path, prep.manifest.builtin.tier))
 }
 
@@ -372,6 +394,7 @@ fn run_codegen_build(
     plan: &BuildPlan<'_>,
     behavior: Behavior,
     target: &TargetWit,
+    bridged_sync_target: bool,
 ) -> Result<PathBuf> {
     let strategy_path_str = plan.strategy_dir.to_str().with_context(|| {
         format!(
@@ -389,6 +412,7 @@ fn run_codegen_build(
         strategy_crate_path: strategy_path_str,
         strategy_type: plan.strategy_type,
         splicer_tool_sdk_version: plan.sdk_version,
+        bridged_sync_target,
     };
     let built = build_wrapper(
         &input,

@@ -60,7 +60,15 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     let guests: Vec<EmittedGuest> = bindings
         .guest_traits
         .iter()
-        .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior, &ir))
+        .map(|g| {
+            emit_guest(
+                g,
+                input.interface_qualified_name,
+                input.behavior,
+                &ir,
+                input.bridged_sync_target,
+            )
+        })
         .collect();
 
     let lib_rs = assemble_lib_rs(&WrapperCrateInputs {
@@ -110,6 +118,10 @@ pub struct GenerateWrapperInput<'a> {
     /// match the version the strategy itself declares so cargo
     /// dedupes the two into a single source.
     pub splicer_tool_sdk_version: &'a str,
+    /// `true` when the wrapper lifts an async-WIT mirror against a
+    /// sync-WIT downstream — the Guest impl's body must call the
+    /// import without `.await` since the wrapped target is sync.
+    pub bridged_sync_target: bool,
 }
 
 /// Output of [`generate_wrapper_crate`]: the two source strings that

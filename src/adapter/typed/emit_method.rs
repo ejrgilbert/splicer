@@ -60,6 +60,7 @@ pub fn emit_guest(
     interface_qualified_name: &str,
     behavior: Behavior,
     ir: &WrapperIR,
+    bridged_sync_target: bool,
 ) -> EmittedGuest {
     // Last segment is the interface name; an empty path would silently
     // derive the wrong args ident and miss the lookup downstream.
@@ -83,7 +84,7 @@ pub fn emit_guest(
             args_record,
             interface_qualified_name,
             behavior,
-            &g.module_path,
+            bridged_sync_target,
         ));
     }
 
@@ -141,7 +142,7 @@ fn emit_method_body(
     args_record: &NamedType,
     interface_qualified_name: &str,
     behavior: Behavior,
-    guest_module_path: &[String],
+    bridged_sync_target: bool,
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
@@ -170,9 +171,14 @@ fn emit_method_body(
 
     // Transform strategies forward to the wrapped target via the
     // closure; virtualize strategies replace the target and never
-    // call into it. `.await` only if the Guest method is async.
-    let target_call = build_target_call(method_ident, fields, guest_module_path);
-    let target_call = if method.sig.asyncness.is_some() {
+    // call into it. The downstream import path is derived from the
+    // user-facing target qname (which may differ from the wrapper's
+    // lift path on the bridged sync→async path). `.await` only if
+    // the Guest method is async.
+    let target_call = build_target_call(method_ident, fields, interface_qualified_name);
+    // On the bridged path the Guest is async but the downstream
+    // import is sync — skip `.await`.
+    let target_call = if method.sig.asyncness.is_some() && !bridged_sync_target {
         quote! { #target_call.await }
     } else {
         target_call
@@ -244,27 +250,43 @@ fn return_type(sig: &syn::Signature) -> TokenStream {
     }
 }
 
-/// Build the closure body that calls the wrapped target with args
-/// unpacked, against the import-side path
-/// (`bindings::<pkg>::<iface>::<method>`, no `exports::` prefix).
+/// Build the closure body that calls the wrapped target's import
+/// path. Derives the path from the user-facing target qname (e.g.
+/// `my:service/adder` → `bindings::my::service::adder`) so the
+/// bridged sync→async path — where the wrapper exports an async
+/// mirror but imports the real sync target downstream — points at
+/// the right side.
 fn build_target_call(
     method_ident: &syn::Ident,
     fields: &[RecordField],
-    guest_module_path: &[String],
+    interface_qualified_name: &str,
 ) -> TokenStream {
-    // The Guest trait lives at `exports::<pkg>::<iface>`; the import
-    // side drops that prefix.
-    assert_eq!(
-        guest_module_path.first().map(String::as_str),
-        Some("exports"),
-        "Guest trait module path must start with `exports`; got {guest_module_path:?}",
-    );
-    let import_path = bindings_path_tokens(&guest_module_path[1..], None);
+    let segments = iface_qname_to_bindings_segments(interface_qualified_name);
+    let import_path = bindings_path_tokens(&segments, None);
     let arg_exprs = fields.iter().map(|f| {
         let name = &f.rust_ident;
         quote! { args.#name }
     });
     quote! { #import_path::#method_ident(#(#arg_exprs),*) }
+}
+
+/// Convert a fully-qualified WIT interface name to the segment path
+/// wit-bindgen's Rust output uses, e.g. `my:service/adder@1.0.0` →
+/// `["my", "service", "adder"]`. Versions are stripped; kebab-case
+/// idents become snake_case.
+fn iface_qname_to_bindings_segments(qname: &str) -> Vec<String> {
+    use heck::ToSnakeCase;
+    let unversioned = qname.split('@').next().unwrap_or(qname);
+    let (pkg, iface) = unversioned
+        .split_once('/')
+        .expect("WIT iface qname has `pkg/iface` form");
+    let (ns, name) = pkg
+        .split_once(':')
+        .expect("WIT pkg qname has `ns:name` form");
+    [ns, name, iface]
+        .into_iter()
+        .map(|s| s.to_snake_case())
+        .collect()
 }
 
 fn build_module_path(segments: &[String]) -> TokenStream {
@@ -297,7 +319,7 @@ mod tests {
         let bindings = build_bindings_index(&src).unwrap();
         let ir = build_ir(&resolve, world_id, &bindings).unwrap();
         let g = &bindings.guest_traits[0];
-        emit_guest(g, INTERFACE_QN, behavior, &ir)
+        emit_guest(g, INTERFACE_QN, behavior, &ir, false)
     }
 
     fn args_structs_str(emitted: &EmittedGuest) -> String {

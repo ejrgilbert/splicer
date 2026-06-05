@@ -418,7 +418,7 @@ fn func_with_params(
         .map(|n| make_param(&type_named(resolve, n), resolve, names))
         .collect();
     FuncClassified {
-        shape: FuncShape::sync_stub(),
+        shape: FuncShape::Sync,
         result_ty: None,
         import_module: String::new(),
         import_field: String::new(),

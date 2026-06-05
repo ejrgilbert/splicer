@@ -627,7 +627,7 @@ pub(super) fn lay_out_static_memory(
                         // from the wrong place.
                         debug_assert_eq!(
                             retptr_offset.is_some(),
-                            fc.shape.result_at_retptr(&fc.import_sig),
+                            fc.shape.result_at_retptr(&fc.export_sig, &fc.import_sig),
                             "retptr scratch reservation must match \
                              classify-time result_at_retptr",
                         );
