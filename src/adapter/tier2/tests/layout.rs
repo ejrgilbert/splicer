@@ -64,6 +64,7 @@ fn env_with(has_before: bool, has_after: bool) -> LayoutEnv {
         "test:layout-fixture-adapter",
         "adapter",
         TARGET_IFACE,
+        TARGET_IFACE,
         &hook_ifaces,
     );
     let world_pkg = resolve.push_str("world.wit", &world_wit).unwrap();
@@ -207,6 +208,7 @@ fn try_lay_out(target_wit: &str, target_iface_qname: &str) -> Result<()> {
     let world_wit = synthesize_adapter_world_wit(
         "test:budget-fixture-adapter",
         "adapter",
+        &target_versioned,
         &target_versioned,
         &hook_ifaces,
     );

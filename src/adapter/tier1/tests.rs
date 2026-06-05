@@ -1398,3 +1398,177 @@ fn test_adapter_provider_split_primitive() {
     )]);
     gen_and_validate("test:pkg/adder@1.0.0", &iface, &arena, SplitKind::Provider);
 }
+
+// ── Tier 1: bridged path (sync target, async-mirror lift) ────────────
+
+/// When the splice driver determines the bridged path is needed, it
+/// passes a `mirror_export_name` derived from the target's qualified
+/// name. The tier-1 adapter must synthesize the matching mirror
+/// internally, lift it as the wrapper's export side, and keep its
+/// downstream handler import on the real sync target. End-to-end:
+/// build_adapter accepts the param and produces a wasm-component that
+/// ComponentEncoder validates.
+#[test]
+fn test_adapter_bridged_sync_primitives() {
+    use crate::adapter::async_mirror::short_hash_hex;
+    let mut arena = TypeArena::default();
+    let s32 = arena.intern_val(ValueType::S32);
+    let target = "test:pkg/adder@1.0.0";
+    let iface = make_iface(vec![(
+        "add",
+        sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
+    )]);
+    let mirror_name = format!(
+        "splicer:async-mirror-{}/adder@0.0.1",
+        short_hash_hex(target)
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let split = synth_split(target, &iface, &arena, SplitKind::Consumer);
+    let split_path = split.path().to_str().expect("tempfile path utf-8");
+    let hooks: Vec<String> = DEFAULT_HOOKS.iter().map(|s| s.to_string()).collect();
+    let path = crate::adapter::generate_tier1_adapter(
+        "test-mdl",
+        target,
+        &hooks,
+        tmp.path().to_str().unwrap(),
+        split_path,
+        Some(&mirror_name),
+    )
+    .expect("bridged adapter generation should succeed");
+    let bytes = std::fs::read(&path).expect("read adapter");
+    validate_component(&bytes);
+
+    // The decoded adapter world should export the mirror (async-WIT)
+    // and still import the original sync target.
+    let decoded = wit_component::decode(&bytes).expect("decode bridged adapter");
+    let wit_component::DecodedWasm::Component(resolve, world_id) = decoded else {
+        panic!("expected component");
+    };
+    let world = &resolve.worlds[world_id];
+    let imports: Vec<String> = world
+        .imports
+        .keys()
+        .filter_map(|k| match k {
+            wit_parser::WorldKey::Interface(id) => resolve.id_of(*id),
+            _ => None,
+        })
+        .collect();
+    let exports: Vec<String> = world
+        .exports
+        .keys()
+        .filter_map(|k| match k {
+            wit_parser::WorldKey::Interface(id) => resolve.id_of(*id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        exports.iter().any(|e| e == &mirror_name),
+        "expected mirror export `{mirror_name}`, got: {exports:?}"
+    );
+    assert!(
+        imports.iter().any(|i| i == target),
+        "expected target import `{target}`, got: {imports:?}"
+    );
+}
+
+/// Mirror name passed by the driver MUST match what the tier-1
+/// adapter synthesizes — they're derived from the same hash, so any
+/// drift between the driver and adapter sides is a splicer bug, not
+/// user-fixable. Pinning the bail surfaces drift loudly.
+#[test]
+fn test_adapter_bridged_mirror_name_mismatch_bails() {
+    let mut arena = TypeArena::default();
+    let s32 = arena.intern_val(ValueType::S32);
+    let target = "test:pkg/adder@1.0.0";
+    let iface = make_iface(vec![(
+        "add",
+        sig(false, &["a", "b"], vec![s32, s32], vec![s32]),
+    )]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let split = synth_split(target, &iface, &arena, SplitKind::Consumer);
+    let split_path = split.path().to_str().expect("tempfile path utf-8");
+    let hooks: Vec<String> = DEFAULT_HOOKS.iter().map(|s| s.to_string()).collect();
+    let err = crate::adapter::generate_tier1_adapter(
+        "test-mdl",
+        target,
+        &hooks,
+        tmp.path().to_str().unwrap(),
+        split_path,
+        Some("splicer:async-mirror-deadbeef/adder@0.0.1"),
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("async mirror name mismatch"),
+        "expected mirror-name mismatch bail, got: {msg}"
+    );
+}
+
+/// Bridged path with a sync void target — exercises the canon-lower
+/// path that returns nothing on the stack. The previous wrapper-body
+/// (pre-fix) did `local_set(st)` on an empty stack and would fail
+/// validation; this test fails to validate if that regresses.
+#[test]
+fn test_adapter_bridged_sync_void() {
+    use crate::adapter::async_mirror::short_hash_hex;
+    let arena = TypeArena::default();
+    let target = "test:pkg/voider@1.0.0";
+    let iface = make_iface(vec![("ping", sig(false, &[], vec![], vec![]))]);
+    let mirror_name = format!(
+        "splicer:async-mirror-{}/voider@0.0.1",
+        short_hash_hex(target)
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let split = synth_split(target, &iface, &arena, SplitKind::Consumer);
+    let split_path = split.path().to_str().expect("tempfile path utf-8");
+    let hooks: Vec<String> = DEFAULT_HOOKS.iter().map(|s| s.to_string()).collect();
+    let path = crate::adapter::generate_tier1_adapter(
+        "test-mdl",
+        target,
+        &hooks,
+        tmp.path().to_str().unwrap(),
+        split_path,
+        Some(&mirror_name),
+    )
+    .expect("bridged void adapter generation should succeed");
+    validate_component(&std::fs::read(&path).expect("read adapter"));
+}
+
+/// Bridged path with a sync string-returning target — the handler is
+/// canon-lower sync with caller-allocates retptr, writing the result
+/// to the buffer the wrapper passes. Exercises both the retptr
+/// import-call shape and the retptr `task.return` shape, neither of
+/// which the s32→s32 test touches.
+#[test]
+fn test_adapter_bridged_sync_string_return() {
+    use crate::adapter::async_mirror::short_hash_hex;
+    let mut arena = TypeArena::default();
+    let string_id = arena.intern_val(ValueType::String);
+    let target = "test:pkg/greeter@1.0.0";
+    let iface = make_iface(vec![(
+        "greet",
+        sig(false, &["name"], vec![string_id], vec![string_id]),
+    )]);
+    let mirror_name = format!(
+        "splicer:async-mirror-{}/greeter@0.0.1",
+        short_hash_hex(target)
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let split = synth_split(target, &iface, &arena, SplitKind::Consumer);
+    let split_path = split.path().to_str().expect("tempfile path utf-8");
+    let hooks: Vec<String> = DEFAULT_HOOKS.iter().map(|s| s.to_string()).collect();
+    let path = crate::adapter::generate_tier1_adapter(
+        "test-mdl",
+        target,
+        &hooks,
+        tmp.path().to_str().unwrap(),
+        split_path,
+        Some(&mirror_name),
+    )
+    .expect("bridged string-return adapter generation should succeed");
+    validate_component(&std::fs::read(&path).expect("read adapter"));
+}

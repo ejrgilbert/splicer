@@ -108,12 +108,20 @@ pub(crate) fn synthesize_async_mirror(
     Ok((mirror_iface_id, mirror_qualified))
 }
 
+/// 16-hex-char prefix of `sha2::Sha256(s)`. Stable across Rust
+/// versions and processes — bridge codegen and adapter codegen
+/// independently derive the same mirror package name, so the hash
+/// has to agree across an arbitrary toolchain split. 64 bits keeps
+/// collision probability negligible.
 pub(crate) fn short_hash_hex(s: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(s.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        write!(out, "{byte:02x}").expect("write to String never fails");
+    }
+    out
 }
 
 #[cfg(test)]

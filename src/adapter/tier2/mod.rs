@@ -56,9 +56,18 @@ pub(super) fn build_tier2_adapter(
     tier2_wit: &str,
     mirror_export_name: Option<&str>,
 ) -> Result<Vec<u8>> {
-    // Wired by Step 4; threaded here so the call sites + public API
-    // settle ahead of the codegen change.
-    let _ = mirror_export_name;
+    // tier-2 mirror-lift is not yet wired (the per-side async-ness
+    // split that tier-1 carries needs to thread through tier-2's
+    // `FuncShape` enum). Bail loudly rather than silently producing a
+    // non-bridged adapter that the wac wiring then can't match.
+    if mirror_export_name.is_some() {
+        bail!(
+            "tier-2 adapter does not yet support the sync→async bridge \
+             path — pass `mirror_export_name = None` and target an \
+             async-WIT interface (or use a tier-1 middleware on this \
+             sync-WIT target)."
+        );
+    }
     if !has_before && !has_after && !has_gate {
         bail!(
             "tier-2 adapter generation requires the middleware to export at least \
@@ -84,6 +93,7 @@ pub(super) fn build_tier2_adapter(
             &synthesize_adapter_world_wit(
                 TIER2_ADAPTER_WORLD_PACKAGE,
                 TIER2_ADAPTER_WORLD_NAME,
+                target_interface,
                 target_interface,
                 &tier2_hook_imports(has_before, has_after, has_gate),
             ),
