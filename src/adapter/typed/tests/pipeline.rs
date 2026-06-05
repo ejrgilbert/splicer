@@ -159,6 +159,53 @@ fn chaos_err_composes_against_resource_bearing_interface() {
 }
 
 #[test]
+fn replayer_composes_against_resource_bearing_interface() {
+    // The Replayer's `R: WitTypedWithResources` bound is satisfied
+    // by `Result<WrapperBucket, String>`: WrapperBucket gets its
+    // WTWR impl from the codegen-emitted SDK macro.
+    let wit = r#"
+        package test:store@0.1.0;
+        interface store {
+            resource bucket {
+                constructor(name: string);
+                size: async func() -> result<u64, string>;
+            }
+            open: async func(name: string) -> result<bucket, string>;
+        }
+        world w { export store; }
+    "#;
+    let crate_out = generate_wrapper_crate(&GenerateWrapperInput {
+        target_wit: wit,
+        world_name: Some("w"),
+        interface_qualified_name: "test:store/store@0.1.0",
+        behavior: Behavior::Virtualize,
+        strategy_crate_name: "replayer",
+        strategy_crate_path: "/abs/path/to/replayer",
+        strategy_type: "Replayer",
+        splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
+    })
+    .unwrap();
+    let lib = &crate_out.lib_rs;
+
+    assert!(
+        lib.contains("VirtualizeStrategy"),
+        "replayer wrapper should dispatch through VirtualizeStrategy:\n{lib}"
+    );
+    assert!(
+        !lib.contains("TransformStrategy"),
+        "replayer wrapper must not dispatch through TransformStrategy:\n{lib}"
+    );
+    assert!(
+        lib.contains("define_strategy_singleton!(replayer::Replayer)"),
+        "expected strategy singleton bound to replayer::Replayer:\n{lib}"
+    );
+    assert!(
+        lib.contains("impl_wit_typed_with_resources_for_wrapper!"),
+        "expected wrapper-newtype WTWR macro invocation:\n{lib}"
+    );
+}
+
+#[test]
 fn wrapper_crate_name_distinguishes_inputs_that_sanitize_identically() {
     // Both inputs sanitize to "wasi_http_handler_0_3_0" — the hash
     // suffix is what keeps the two crate names distinct.
