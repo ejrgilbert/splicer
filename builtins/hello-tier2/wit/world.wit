@@ -1,4 +1,4 @@
-package splicer:hello-tier2@0.1.0;
+package splicer:hello-tier2@0.2.0;
 
 world hello-tier2-mdl {
     export splicer:tier2/before@0.2.0;
