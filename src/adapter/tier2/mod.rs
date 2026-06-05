@@ -45,6 +45,7 @@ const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
 const TIER2_ADAPTER_WORLD_NAME: &str = "adapter";
 
 /// Generate a tier-2 adapter component.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_tier2_adapter(
     target_interface: &str,
     has_before: bool,
@@ -53,7 +54,11 @@ pub(super) fn build_tier2_adapter(
     split_bytes: &[u8],
     common_wit: &str,
     tier2_wit: &str,
+    mirror_export_name: Option<&str>,
 ) -> Result<Vec<u8>> {
+    // Wired by Step 4; threaded here so the call sites + public API
+    // settle ahead of the codegen change.
+    let _ = mirror_export_name;
     if !has_before && !has_after && !has_gate {
         bail!(
             "tier-2 adapter generation requires the middleware to export at least \

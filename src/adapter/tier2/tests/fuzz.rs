@@ -217,6 +217,7 @@ fn gen_tier2_adapter(
         hooks,
         tmp.path().to_str().unwrap(),
         split_path,
+        None,
     )?;
     std::fs::read(&path).map_err(Into::into)
 }

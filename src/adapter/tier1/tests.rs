@@ -592,6 +592,7 @@ fn gen_adapter(
         &hook_strings,
         tmp.path().to_str().unwrap(),
         split_path,
+        None,
     )
     .expect("adapter generation should succeed");
     std::fs::read(&path).expect("should read generated adapter file")

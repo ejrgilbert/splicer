@@ -58,6 +58,13 @@ const COMMON_WORLD_WIT: &str = include_str!("../../wit/common/world.wit");
 ///   `should-call` (early-return when false; void funcs only) →
 ///   the handler → `on-return`.
 ///
+/// `mirror_export_name`, when `Some`, names an async-WIT mirror of
+/// `target_interface` that the adapter lifts AGAINST (so the
+/// adapter's task is async and its hook bodies can suspend). The
+/// downstream import side still uses `target_interface`. `None`
+/// means lift the target directly — today's behavior. Used by the
+/// sync→async bridge path.
+///
 /// Returns the path to the generated `.wasm`.
 pub fn generate_tier1_adapter(
     middleware_name: &str,
@@ -65,6 +72,7 @@ pub fn generate_tier1_adapter(
     middleware_interfaces: &[String],
     splits_output_path: &str,
     split_path: &str,
+    mirror_export_name: Option<&str>,
 ) -> anyhow::Result<String> {
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
@@ -85,6 +93,7 @@ pub fn generate_tier1_adapter(
                 split_bytes,
                 COMMON_WORLD_WIT,
                 TIER1_WORLD_WIT,
+                mirror_export_name,
             )
         },
     )
@@ -93,16 +102,13 @@ pub fn generate_tier1_adapter(
 /// Generate a tier-2 adapter component. Mirrors
 /// [`generate_tier1_adapter`] in shape — different hook interface
 /// package, different lift codegen.
-///
-/// Phase 2-3 scope: middleware must export `splicer:tier2/before`;
-/// targets are restricted to primitive-typed parameters and result.
-/// Bails cleanly on out-of-scope cases until subsequent slices land.
 pub fn generate_tier2_adapter(
     middleware_name: &str,
     target_interface: &str,
     middleware_interfaces: &[String],
     splits_output_path: &str,
     split_path: &str,
+    mirror_export_name: Option<&str>,
 ) -> anyhow::Result<String> {
     let has_before = middleware_interfaces.iter().any(|i| i.contains("/before"));
     let has_after = middleware_interfaces.iter().any(|i| i.contains("/after"));
@@ -123,6 +129,7 @@ pub fn generate_tier2_adapter(
                 split_bytes,
                 COMMON_WORLD_WIT,
                 TIER2_WORLD_WIT,
+                mirror_export_name,
             )
         },
     )

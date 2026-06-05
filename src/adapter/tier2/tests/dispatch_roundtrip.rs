@@ -48,6 +48,7 @@ fn dispatch_module_roundtrips_through_component_encoder() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed");
 
@@ -91,6 +92,7 @@ fn dispatch_module_with_tuple_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for tuple param");
 
@@ -134,6 +136,7 @@ fn dispatch_module_with_option_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for option param");
 
@@ -176,6 +179,7 @@ fn dispatch_module_with_single_slot_tuple_result_lifts_from_flat() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("single-slot tuple result must build via no-retptr Compound, not panic");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -232,6 +236,7 @@ fn dispatch_module_with_tuple_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for tuple result");
 
@@ -289,6 +294,7 @@ fn dispatch_module_with_option_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for option result");
 
@@ -337,6 +343,7 @@ fn dispatch_module_with_flags_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for flags param");
 
@@ -381,6 +388,7 @@ fn dispatch_module_with_flags_param_and_flags_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect(
         "tier-2 adapter generation should succeed for flags param + flags result on the same fn",
@@ -423,6 +431,7 @@ fn dispatch_module_with_char_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for char param");
 
@@ -473,6 +482,7 @@ fn dispatch_module_with_char_list_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for list<char> param");
 
@@ -521,6 +531,7 @@ fn dispatch_module_with_variant_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for variant param");
 
@@ -562,6 +573,7 @@ fn dispatch_module_with_inline_resource_bails() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect_err("inline-resource interface must bail");
     let msg = err.to_string();
@@ -648,6 +660,7 @@ fn dispatch_module_with_resource_handle_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for factored-types resource handle param");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -713,6 +726,7 @@ fn dispatch_module_with_resource_handle_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for factored-types resource handle result");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -779,6 +793,7 @@ fn dispatch_module_with_handle_param_and_handle_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect(
         "tier-2 adapter generation should succeed for handle param + handle result on the same fn",
@@ -822,6 +837,7 @@ fn dispatch_module_with_char_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for char result");
 
@@ -865,6 +881,7 @@ fn dispatch_module_with_error_context_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for error-context param");
 
@@ -906,6 +923,7 @@ fn dispatch_module_with_error_context_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for error-context result");
 
@@ -966,6 +984,7 @@ fn dispatch_module_with_variant_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for variant result");
 
@@ -1025,6 +1044,7 @@ fn dispatch_module_with_list_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for list<u32> result");
 
@@ -1073,6 +1093,7 @@ fn dispatch_module_with_option_list_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for list<option<u32>> param");
 
@@ -1120,6 +1141,7 @@ fn dispatch_module_with_result_list_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for list<result<u32, string>> param");
 
@@ -1168,6 +1190,7 @@ fn dispatch_module_with_tuple_list_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for list<tuple<u32, string>> param");
 
@@ -1229,6 +1252,7 @@ fn dispatch_module_with_char_list_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for list<char> result");
 
@@ -1274,6 +1298,7 @@ fn dispatch_module_with_single_slot_variant_result_lifts_from_flat() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("single-slot variant must build via no-retptr Compound, not panic");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -1320,6 +1345,7 @@ fn dispatch_module_with_flags_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for flags result");
 
@@ -1365,6 +1391,7 @@ fn dispatch_module_with_result_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for result param");
 
@@ -1409,6 +1436,7 @@ fn dispatch_module_with_widening_result_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation must succeed for widening result param");
 
@@ -1456,6 +1484,7 @@ fn dispatch_module_with_widening_variant_param_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation must succeed for mixed-width variant param");
 
@@ -1514,6 +1543,7 @@ fn dispatch_module_with_result_result_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for result result");
 
@@ -1557,6 +1587,7 @@ fn dispatch_module_with_single_slot_result_result_lifts_from_flat() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("single-slot result must build via no-retptr Compound, not panic");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -1601,6 +1632,7 @@ fn async_5_u32_params_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for 5×u32 async params");
 
@@ -1638,6 +1670,7 @@ fn async_mixed_primitives_indirect_params_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for mixed-primitive async params");
 
@@ -1685,6 +1718,7 @@ fn async_aggregates_indirect_params_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for aggregate async params");
 
@@ -1732,6 +1766,7 @@ fn async_dispatch_shapes_indirect_params_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter generation should succeed for dispatch shapes");
 
@@ -1780,6 +1815,7 @@ fn sync_17_u32_params_with_hooks_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter must succeed for 17×u32 sync params with hooks");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -1816,6 +1852,7 @@ fn sync_mixed_primitives_indirect_params_with_hooks_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter must succeed for mixed-primitive sync indirect params");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -1860,6 +1897,7 @@ fn sync_wide_aggregates_indirect_params_with_hooks_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter must succeed for wide aggregate sync indirect params");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -1893,6 +1931,7 @@ fn sync_string_list_indirect_params_with_hooks_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter must succeed for 9-string sync indirect params");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -1933,6 +1972,7 @@ fn async_17_u32_params_symmetric_indirect_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter must succeed for 17×u32 async symmetric-indirect");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -1970,6 +2010,7 @@ fn sync_17_u32_params_after_only_validates() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 adapter must succeed for 17×u32 sync params with after-hook only");
     wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
@@ -2004,6 +2045,7 @@ fn dispatch_module_with_gate_only_void_async_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 gate-only adapter generation should succeed");
 
@@ -2037,6 +2079,7 @@ fn dispatch_module_with_gate_and_full_hooks_roundtrips() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect("tier-2 gate+before+after adapter generation should succeed");
 
@@ -2069,6 +2112,7 @@ fn dispatch_module_with_gate_and_nonvoid_bails() {
         &split_bytes,
         common_wit,
         tier2_wit,
+        None,
     )
     .expect_err("gate on a non-void fn must bail");
     let msg = err.to_string();

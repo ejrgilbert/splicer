@@ -716,6 +716,7 @@ fn fuzz_structural_shapes() {
             &hooks,
             tmp.path().to_str().unwrap(),
             split_path,
+            None,
         );
 
         match gen {

@@ -48,6 +48,7 @@ use super::super::resolve::{decode_input_resolve, dispatch_mangling, find_target
 /// `common_world_wit` is the contents of `wit/common/world.wit`
 /// (loaded first as a dependency); `tier1_world_wit` is the contents
 /// of `wit/tier1/world.wit` (which references `splicer:common`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_adapter(
     target_interface: &str,
     has_before: bool,
@@ -56,7 +57,11 @@ pub(crate) fn build_adapter(
     split_bytes: &[u8],
     common_world_wit: &str,
     tier1_world_wit: &str,
+    mirror_export_name: Option<&str>,
 ) -> Result<Vec<u8>> {
+    // Wired by Step 4; threaded here so the call sites + public API
+    // settle ahead of the codegen change.
+    let _ = mirror_export_name;
     let mut resolve = decode_input_resolve(split_bytes)?;
     let target_iface = find_target_interface(&resolve, target_interface)?;
 
