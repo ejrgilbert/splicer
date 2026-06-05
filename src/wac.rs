@@ -1449,22 +1449,23 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
-                if let Some(mw_path) = injection.path.as_deref() {
-                    bail_if_bridge_required(
-                        &injection.name,
+                let mirror_export_name = match injection.path.as_deref() {
+                    Some(mw_path) => ensure_bridge_if_needed(
                         mw_path,
                         interface_name,
                         consumer_split_path,
+                        ctx.splits_path,
                         accs,
-                    )?;
-                }
+                    )?,
+                    None => None,
+                };
                 let adapter_path = generate_tier1_adapter(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
                     ctx.splits_path,
                     consumer_split_path,
-                    None,
+                    mirror_export_name.as_deref(),
                 )?;
                 accs.generated_adapters.push(GeneratedAdapter {
                     adapter_path: adapter_path.clone(),
@@ -1489,22 +1490,23 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
-                if let Some(mw_path) = injection.path.as_deref() {
-                    bail_if_bridge_required(
-                        &injection.name,
+                let mirror_export_name = match injection.path.as_deref() {
+                    Some(mw_path) => ensure_bridge_if_needed(
                         mw_path,
                         interface_name,
                         consumer_split_path,
+                        ctx.splits_path,
                         accs,
-                    )?;
-                }
+                    )?,
+                    None => None,
+                };
                 let adapter_path = generate_tier2_adapter(
                     &injection.name,
                     interface_name,
                     &matched_interfaces,
                     ctx.splits_path,
                     consumer_split_path,
-                    None,
+                    mirror_export_name.as_deref(),
                 )?;
                 accs.generated_adapters.push(GeneratedAdapter {
                     adapter_path: adapter_path.clone(),
@@ -1627,11 +1629,7 @@ fn factored_types_to_wire(
 /// mediate between a sync-WIT target and a suspending hook body.
 enum SyncWitTreatment {
     NotNeeded,
-    /// Carries the offending `async func` peer-component import for
-    /// diagnostics.
-    BridgeRequired {
-        offender: String,
-    },
+    BridgeRequired,
 }
 
 /// Conservative — only catches imports that are `async func` at the
@@ -1654,32 +1652,37 @@ fn classify_bridge_need(
     let offender = accs
         .middleware_first_async_peer_cache
         .entry(middleware_path.to_string())
-        .or_insert_with(|| first_async_peer_import(middleware_path))
-        .clone();
+        .or_insert_with(|| first_async_peer_import(middleware_path));
     match offender {
-        Some(offender) => SyncWitTreatment::BridgeRequired { offender },
+        Some(_) => SyncWitTreatment::BridgeRequired,
         None => SyncWitTreatment::NotNeeded,
     }
 }
 
-fn bail_if_bridge_required(
-    middleware_name: &str,
+/// If a tier-1/2 site needs the sync→async bridge, generate (cache)
+/// the bridge component and return the mirror's qualified name for
+/// the adapter to lift against. `None` means the site is the inline
+/// path — adapter codegen runs unchanged.
+fn ensure_bridge_if_needed(
     middleware_path: &str,
     target_interface: &str,
     target_split_path: &str,
+    splits_output_path: &str,
     accs: &mut SpliceAccumulators,
-) -> anyhow::Result<()> {
-    let SyncWitTreatment::BridgeRequired { offender } =
-        classify_bridge_need(middleware_path, target_interface, target_split_path, accs)
-    else {
-        return Ok(());
-    };
-    anyhow::bail!(
-        "cannot splice '{middleware_name}' onto sync-WIT target '{target_interface}': \
-         middleware imports async-peer '{offender}', which would suspend a sync-WIT \
-         task at runtime. Target an `async func` interface, or drop the `.await` \
-         from the middleware.",
-    );
+) -> anyhow::Result<Option<String>> {
+    if matches!(
+        classify_bridge_need(middleware_path, target_interface, target_split_path, accs),
+        SyncWitTreatment::NotNeeded,
+    ) {
+        return Ok(None);
+    }
+    let (_path, mirror_qname) = ensure_bridge(
+        target_interface,
+        target_split_path,
+        splits_output_path,
+        accs,
+    )?;
+    Ok(Some(mirror_qname))
 }
 
 /// Cached bridge generation. Returns the bridge's `.wasm` path and
