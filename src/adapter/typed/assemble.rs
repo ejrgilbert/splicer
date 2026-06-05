@@ -189,6 +189,22 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
     root.insert("lib".into(), Value::Table(lib));
     root.insert("dependencies".into(), Value::Table(dependencies));
 
+    // Local-dev override: if `SPLICER_TOOL_SDK_PATH` points at a
+    // local splicer-tool-sdk checkout, redirect the wrapper crate
+    // (and every transitive dep via cargo's patch mechanism) to it.
+    // Lets developers test unpublished SDK changes without bumping +
+    // publishing. Unset → wrapper resolves `splicer-tool-sdk` from
+    // crates.io as normal.
+    if let Ok(local_sdk) = std::env::var("SPLICER_TOOL_SDK_PATH") {
+        let mut sdk_patch = Map::new();
+        sdk_patch.insert("path".into(), Value::String(local_sdk));
+        let mut crates_io = Map::new();
+        crates_io.insert("splicer-tool-sdk".into(), Value::Table(sdk_patch));
+        let mut patch = Map::new();
+        patch.insert("crates-io".into(), Value::Table(crates_io));
+        root.insert("patch".into(), Value::Table(patch));
+    }
+
     toml::to_string(&Value::Table(root))
         .expect("toml serialization of strings + booleans + tables is infallible")
 }
