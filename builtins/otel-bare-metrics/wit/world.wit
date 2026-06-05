@@ -1,4 +1,4 @@
-package splicer:otel-bare-metrics@0.2.0;
+package splicer:otel-bare-metrics@0.3.0;
 
 /// Emits two `wasi:otel` metrics per wrapped call, delta-temporality:
 ///
