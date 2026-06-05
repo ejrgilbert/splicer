@@ -856,6 +856,90 @@ fn matrix_multi_resource_with_cross_resource_borrow() {
 }
 
 #[test]
+fn matrix_value_typed_user_types_get_dual_impls() {
+    // Value-typed user records / enums / variants / flags get both
+    // WitTyped and WitTypedWithResources. The latter goes through
+    // the SDK's via-wave macro, which delegates to cells_to_typed.
+    let out = generate_for_wit(
+        r#"
+            package matrix:dual@0.1.0;
+            interface ops {
+                record point { x: u32, y: u32 }
+                enum color { red, green, blue }
+                variant outcome { miss, hit(u32) }
+                flags perms { read, write, exec-x }
+                pack: async func(p: point, c: color, o: outcome, perms: perms) -> u32;
+            }
+            world w { export ops; }
+        "#,
+        "w",
+        "matrix:dual/ops@0.1.0",
+        "bindings::matrix::dual::ops::pack",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Every value-typed user type gets the WTWR macro invocation
+    // alongside its WitTyped impl.
+    for ty_path in [
+        "bindings::exports::matrix::dual::ops::Point",
+        "bindings::exports::matrix::dual::ops::Color",
+        "bindings::exports::matrix::dual::ops::Outcome",
+        "bindings::exports::matrix::dual::ops::Perms",
+    ] {
+        assert!(
+            oneline.contains(&format!("WitTyped for {ty_path}")),
+            "expected WitTyped impl for {ty_path}:\n{}",
+            out.lib_rs,
+        );
+        // The macro invocation gets line-wrapped by prettyplease when
+        // the type path is long; check the two pieces separately.
+        assert!(
+            oneline.contains("impl_wit_typed_with_resources_via_wave!")
+                && oneline.contains(ty_path),
+            "expected WTWR via-wave macro to reference {ty_path}:\n{}",
+            out.lib_rs,
+        );
+    }
+}
+
+#[test]
+fn matrix_handle_bearing_args_skip_both_witty_and_wtwr() {
+    // Args structs with a borrow field already skip the WitTyped
+    // impl (`contains_handle` short-circuits). The WTWR via-wave
+    // macro must skip too — it routes through cells_to_typed which
+    // requires WitTyped.
+    let out = generate_for_wit(
+        r#"
+            package matrix:dual-skip@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    copy-from: async func(src: borrow<bucket>);
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:dual-skip/store@0.1.0",
+        "self.0.copy_from(args.src)",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        !oneline.contains("WitTyped for BucketCopyFromArgs"),
+        "handle-bearing args must not get a WitTyped impl:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("impl_wit_typed_with_resources_via_wave!(BucketCopyFromArgs"),
+        "handle-bearing args must not get a WTWR via-wave impl:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
 fn matrix_resource_method_returns_resource() {
     // Resource methods returning a resource: the wrap fires from
     // the per-resource trait kind, not just Interface.

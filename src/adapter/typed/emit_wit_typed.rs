@@ -36,25 +36,31 @@ use quote::quote;
 
 use super::ir::{EnumCase, FlagMember, NamedKind, NamedType, RecordField, VariantCase};
 
-/// Emit one `WitTyped` impl block per [`NamedType`]. Args records
-/// carrying a handle-typed field emit no impl: handles aren't `WitTyped`,
-/// so the impl couldn't compile.
+/// Emit `WitTyped` + `WitTypedWithResources` impls per [`NamedType`].
+/// Value-typed types get both via the SDK's dual-impl macro pattern;
+/// handle-containing records get neither (need the recursive cell
+/// walker, separate slice).
 pub fn emit_wit_typed_impls(types: &[NamedType]) -> Vec<TokenStream> {
     types.iter().filter_map(emit_one).collect()
 }
 
 fn emit_one(t: &NamedType) -> Option<TokenStream> {
-    match &t.kind {
+    let witty = match &t.kind {
         NamedKind::Record { fields } => {
             if fields.iter().any(|f| f.ty.contains_handle()) {
                 return None;
             }
-            Some(emit_record(t, fields))
+            emit_record(t, fields)
         }
-        NamedKind::Variant { cases } => Some(emit_variant(t, cases)),
-        NamedKind::Enum { cases } => Some(emit_enum(t, cases)),
-        NamedKind::Flags { members } => Some(emit_flags(t, members)),
-    }
+        NamedKind::Variant { cases } => emit_variant(t, cases),
+        NamedKind::Enum { cases } => emit_enum(t, cases),
+        NamedKind::Flags { members } => emit_flags(t, members),
+    };
+    let type_path = t.rust_path_tokens();
+    Some(quote! {
+        #witty
+        ::splicer_tool_sdk::impl_wit_typed_with_resources_via_wave!(#type_path);
+    })
 }
 
 fn emit_record(t: &NamedType, fields: &[RecordField]) -> TokenStream {

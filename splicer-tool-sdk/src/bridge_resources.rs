@@ -113,6 +113,27 @@ macro_rules! mint_mock_resource {
     }};
 }
 
+/// Implement [`WitTypedWithResources`] for a value-typed user type
+/// (one that already impls [`WitTyped`](crate::WitTyped)) by routing
+/// through the wave bridge. Codegen emits one invocation per user-
+/// declared record / enum / variant / flags type so the same type
+/// satisfies both bridges; this is the macro form of the
+/// "dual impl" pattern (avoids a blanket `impl<T: WitTyped> WTWR
+/// for T` that would conflict with the explicit wrapper impl).
+#[macro_export]
+macro_rules! impl_wit_typed_with_resources_via_wave {
+    ($ty:ty) => {
+        impl $crate::WitTypedWithResources for $ty {
+            fn from_cells(
+                tree: &$crate::FieldTree,
+                root: u32,
+            ) -> ::core::result::Result<Self, $crate::BridgeError> {
+                $crate::cells_to_typed::<$ty>(tree, root)
+            }
+        }
+    };
+}
+
 /// Implement [`WitTypedWithResources`] for a `Wrapper(MockedResource)`
 /// newtype by delegating to [`MockedResource::from_handle_cell`].
 /// Tier-4 codegen emits one invocation per WIT resource.
@@ -663,6 +684,45 @@ mod tests {
     // place and have successive constructor calls share the static.
     fn mint_bucket() -> MacroBucket {
         crate::mint_mock_resource!(MacroBucket, "bucket")
+    }
+
+    /// Stand-in for a codegen-emitted value-typed user type. WitTyped
+    /// delegates to the inner primitive; WTWR comes from the macro.
+    #[derive(Debug, PartialEq)]
+    struct WrappedU32(u32);
+    impl crate::WitTyped for WrappedU32 {
+        fn wave_type() -> wasm_wave::value::Type {
+            <u32 as crate::WitTyped>::wave_type()
+        }
+        fn to_value(&self) -> wasm_wave::value::Value {
+            <u32 as crate::WitTyped>::to_value(&self.0)
+        }
+        fn from_value(v: &wasm_wave::value::Value) -> Result<Self, BridgeError> {
+            <u32 as crate::WitTyped>::from_value(v).map(WrappedU32)
+        }
+    }
+    crate::impl_wit_typed_with_resources_via_wave!(WrappedU32);
+
+    #[test]
+    fn via_wave_macro_round_trips_value_typed() {
+        let t = empty_tree(vec![Cell::Integer(42)], 0);
+        let v: WrappedU32 = WitTypedWithResources::from_cells(&t, 0).unwrap();
+        assert_eq!(v, WrappedU32(42));
+    }
+
+    #[test]
+    fn via_wave_macro_composes_inside_compound_wtwr_impl() {
+        // `Vec<WrappedU32>::from_cells` resolves through the SDK's
+        // generic `Vec<T: WTWR>` impl, which recurses via
+        // `WrappedU32::from_cells` (the macro-installed one). Pins
+        // that the dual-impl pattern composes with the existing
+        // container impls.
+        let t = empty_tree(
+            vec![Cell::Integer(10), Cell::Integer(20), Cell::ListOf(vec![0, 1])],
+            2,
+        );
+        let v: Vec<WrappedU32> = WitTypedWithResources::from_cells(&t, 2).unwrap();
+        assert_eq!(v, vec![WrappedU32(10), WrappedU32(20)]);
     }
 
     #[test]
