@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "recorder"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "splicer-builtin-protocol",
  "splicer-tool-sdk",
