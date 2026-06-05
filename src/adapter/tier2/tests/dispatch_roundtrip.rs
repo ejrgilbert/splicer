@@ -2125,3 +2125,278 @@ fn dispatch_module_with_gate_and_nonvoid_bails() {
         "bail should explain the void-only constraint; got: {msg}",
     );
 }
+
+// ── Tier-2 bridged path (sync target, async-mirror lift) ─────────────
+
+/// Bridged-path roundtrip: a sync u32→u32 target lifted via the
+/// async mirror. Validates that the tier-2 adapter accepts
+/// `mirror_export_name = Some(...)` and that the produced component
+/// passes both `ComponentEncoder::validate(true)` and the wasmparser
+/// roundtrip.
+#[test]
+fn bridged_sync_primitives_roundtrips() {
+    use crate::adapter::async_mirror::short_hash_hex;
+    let wat = r#"(component
+        (component $inner
+            (core module $m
+                (func (export "add") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    i32.add
+                )
+            )
+            (core instance $i (instantiate $m))
+            (alias core export $i "add" (core func $add))
+            (type $add-ty (func (param "x" u32) (param "y" u32) (result u32)))
+            (func $add-lifted (type $add-ty) (canon lift (core func $add)))
+            (instance $api-inst (export "add" (func $add-lifted)))
+            (export "my:math/api@1.0.0" (instance $api-inst))
+        )
+        (instance $api (instantiate $inner))
+        (export "my:math/api@1.0.0" (instance $api "my:math/api@1.0.0"))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let target = "my:math/api@1.0.0";
+    let mirror_name = format!("splicer:async-mirror-{}/api@0.0.1", short_hash_hex(target));
+
+    let bytes = build_tier2_adapter(
+        target,
+        true,
+        true,
+        false,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+        Some(&mirror_name),
+    )
+    .expect("tier-2 bridged adapter generation should succeed");
+
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("bridged tier-2 adapter must be a valid component");
+
+    // Verify the decoded world exports the mirror + imports the target.
+    let decoded = wit_component::decode(&bytes).expect("decode bridged adapter");
+    let wit_component::DecodedWasm::Component(resolve, world_id) = decoded else {
+        panic!("expected component");
+    };
+    let world = &resolve.worlds[world_id];
+    let imports: Vec<String> = world
+        .imports
+        .keys()
+        .filter_map(|k| match k {
+            wit_parser::WorldKey::Interface(id) => resolve.id_of(*id),
+            _ => None,
+        })
+        .collect();
+    let exports: Vec<String> = world
+        .exports
+        .keys()
+        .filter_map(|k| match k {
+            wit_parser::WorldKey::Interface(id) => resolve.id_of(*id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        exports.iter().any(|e| e == &mirror_name),
+        "expected mirror export `{mirror_name}`, got: {exports:?}"
+    );
+    assert!(
+        imports.iter().any(|i| i == target),
+        "expected target import `{target}`, got: {imports:?}"
+    );
+}
+
+/// Mismatched mirror name should bail loudly — same shape as tier-1.
+#[test]
+fn bridged_mirror_name_mismatch_bails() {
+    let wat = r#"(component
+        (component $inner
+            (core module $m
+                (func (export "add") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    i32.add
+                )
+            )
+            (core instance $i (instantiate $m))
+            (alias core export $i "add" (core func $add))
+            (type $add-ty (func (param "x" u32) (param "y" u32) (result u32)))
+            (func $add-lifted (type $add-ty) (canon lift (core func $add)))
+            (instance $api-inst (export "add" (func $add-lifted)))
+            (export "my:math/api@1.0.0" (instance $api-inst))
+        )
+        (instance $api (instantiate $inner))
+        (export "my:math/api@1.0.0" (instance $api "my:math/api@1.0.0"))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let err = build_tier2_adapter(
+        "my:math/api@1.0.0",
+        true,
+        true,
+        false,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+        Some("splicer:async-mirror-deadbeef/api@0.0.1"),
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(crate::adapter::async_mirror::MIRROR_NAME_MISMATCH_PREFIX),
+        "expected mirror-name mismatch bail, got: {msg}"
+    );
+}
+
+/// Bridged void: sync target with no return — exercises the
+/// post-handler-call sync-import branch where the handler leaves
+/// nothing on the stack and `lcl.result` is None, and the
+/// `task.return` void early-return in `emit_task_return`.
+#[test]
+fn bridged_sync_void_roundtrips() {
+    use crate::adapter::async_mirror::short_hash_hex;
+    let wat = r#"(component
+        (component $inner
+            (core module $m
+                (func (export "ping") (param i32))
+            )
+            (core instance $i (instantiate $m))
+            (alias core export $i "ping" (core func $ping))
+            (type $ping-ty (func (param "x" u32)))
+            (func $ping-lifted (type $ping-ty) (canon lift (core func $ping)))
+            (instance $api-inst (export "ping" (func $ping-lifted)))
+            (export "my:void/api@1.0.0" (instance $api-inst))
+        )
+        (instance $api (instantiate $inner))
+        (export "my:void/api@1.0.0" (instance $api "my:void/api@1.0.0"))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let target = "my:void/api@1.0.0";
+    let mirror = format!("splicer:async-mirror-{}/api@0.0.1", short_hash_hex(target));
+    let bytes = build_tier2_adapter(
+        target,
+        true,
+        true,
+        false,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+        Some(&mirror),
+    )
+    .expect("tier-2 bridged void adapter generation should succeed");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("bridged void tier-2 adapter must validate");
+}
+
+/// Bridged compound result (sync retptr handler): exercises the
+/// `task.return` flat-load-from-retptr path with the sync canon-lower
+/// import side, confirming the sync handler's mem layout aligns with
+/// what async `task.return` lift expects.
+#[test]
+fn bridged_sync_compound_result_roundtrips() {
+    use crate::adapter::async_mirror::short_hash_hex;
+    let wat = r#"(component
+        (component $inner
+            (core module $m
+                (memory (export "memory") 1)
+                (func (export "two-vals") (param i32) (result i32)
+                    i32.const 0x1000
+                    local.get 0
+                    i32.store
+                    i32.const 0x1000
+                    i32.const -1
+                    i32.store offset=4
+                    i32.const 0x1000
+                )
+                (func (export "cabi_post_two-vals") (param i32))
+            )
+            (core instance $i (instantiate $m))
+            (alias core export $i "two-vals" (core func $two))
+            (alias core export $i "cabi_post_two-vals" (core func $two_post))
+            (alias core export $i "memory" (core memory $mem))
+            (type $two-ty (func (param "x" u32) (result (tuple u32 s32))))
+            (func $two-lifted (type $two-ty)
+                (canon lift (core func $two) (memory $mem)
+                    (post-return (func $two_post))))
+            (instance $api-inst (export "two-vals" (func $two-lifted)))
+            (export "my:tup-ret/api@1.0.0" (instance $api-inst))
+        )
+        (instance $api (instantiate $inner))
+        (export "my:tup-ret/api@1.0.0" (instance $api "my:tup-ret/api@1.0.0"))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let target = "my:tup-ret/api@1.0.0";
+    let mirror = format!("splicer:async-mirror-{}/api@0.0.1", short_hash_hex(target));
+    let bytes = build_tier2_adapter(
+        target,
+        true,
+        true,
+        false,
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+        Some(&mirror),
+    )
+    .expect("tier-2 bridged compound-result adapter generation should succeed");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("bridged compound-result tier-2 adapter must validate");
+}
+
+/// Bridged with gate hook on a void target — exercises
+/// `emit_gate_skip_branch`'s `is_export_async()` path where the gate
+/// fires task.return on a bridged adapter (export async, import sync).
+/// Non-void + gate is rejected upstream, so the test uses void.
+#[test]
+fn bridged_sync_void_with_gate_roundtrips() {
+    use crate::adapter::async_mirror::short_hash_hex;
+    let wat = r#"(component
+        (component $inner
+            (core module $m
+                (func (export "ping") (param i32))
+            )
+            (core instance $i (instantiate $m))
+            (alias core export $i "ping" (core func $ping))
+            (type $ping-ty (func (param "x" u32)))
+            (func $ping-lifted (type $ping-ty) (canon lift (core func $ping)))
+            (instance $api-inst (export "ping" (func $ping-lifted)))
+            (export "my:gate/api@1.0.0" (instance $api-inst))
+        )
+        (instance $api (instantiate $inner))
+        (export "my:gate/api@1.0.0" (instance $api "my:gate/api@1.0.0"))
+    )"#;
+    let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let tier2_wit = include_str!("../../../../wit/tier2/world.wit");
+
+    let target = "my:gate/api@1.0.0";
+    let mirror = format!("splicer:async-mirror-{}/api@0.0.1", short_hash_hex(target));
+    let bytes = build_tier2_adapter(
+        target,
+        true,
+        true,
+        true, // has_gate
+        &split_bytes,
+        common_wit,
+        tier2_wit,
+        Some(&mirror),
+    )
+    .expect("tier-2 bridged adapter generation with gate should succeed");
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+        .validate_all(&bytes)
+        .expect("bridged + gate tier-2 adapter must validate");
+}

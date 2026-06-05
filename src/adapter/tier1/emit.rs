@@ -39,7 +39,7 @@ use super::super::abi::emit::{
     BlobSlice, BumpReset, CallIdLayout, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
-use super::super::async_mirror::synthesize_async_mirror;
+use super::super::async_mirror::{synthesize_async_mirror, MIRROR_NAME_MISMATCH_PREFIX};
 use super::super::indices::{DispatchIndices, LocalsBuilder};
 use super::super::mem_layout::MemoryLayoutBuilder;
 use super::super::resolve::{decode_input_resolve, dispatch_mangling, find_target_interface};
@@ -72,7 +72,7 @@ pub(crate) fn build_adapter(
                 .with_context(|| format!("synthesize async mirror for `{target_interface}`"))?;
             if mirror_qname != expected {
                 bail!(
-                    "async mirror name mismatch for `{target_interface}`: \
+                    "{MIRROR_NAME_MISMATCH_PREFIX} for `{target_interface}`: \
                      wac wiring expected `{expected}` but tier-1 adapter \
                      synthesized `{mirror_qname}` — both sides should derive \
                      the same hash",
@@ -160,12 +160,10 @@ fn require_supported_case(
         // param/result types by construction (mirror differs only in
         // async-ness), but the cap differs by variant so we check the
         // lower func.
-        let lower_func = lower.functions.get(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "lift function `{name}` has no matching lower function — \
-                 async mirror synth invariant broken"
-            )
-        })?;
+        let lower_func = lower
+            .functions
+            .get(name)
+            .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
         let import_is_async = lower_func.kind.is_async();
         let import_variant = if import_is_async {
             AbiVariant::GuestImportAsync
@@ -505,13 +503,10 @@ fn compute_func_dispatches(
     for lift_func in lift_funcs.iter() {
         // Lower-side func has the same name + param/result types by
         // construction — the mirror only differs in async-ness.
-        let lower_func = lower.functions.get(&lift_func.name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "lift function `{}` has no matching lower function — \
-                 async mirror synth invariant broken",
-                lift_func.name,
-            )
-        })?;
+        let lower_func = lower
+            .functions
+            .get(&lift_func.name)
+            .expect("async mirror synth guarantees fn-by-fn parity with lower iface");
 
         // Per-side async-ness drives variant + mangling independently.
         // In the bridged path the lift (mirror) is async and the lower
@@ -529,6 +524,10 @@ fn compute_func_dispatches(
             AbiVariant::GuestImport
         };
 
+        // Mangling is computed per side — in the bridged path the
+        // import (sync canon-lower) and export (async-stackful
+        // canon-lift) live in different ABI namespaces and get
+        // different `[…]` prefixes.
         let (import_module, import_field) = resolve.wasm_import_name(
             dispatch_mangling(import_is_async),
             WasmImport::Func {

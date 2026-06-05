@@ -3,6 +3,13 @@
 
 pub(crate) mod bridge;
 
+/// Prefix of the bail emitted when an adapter's `synthesize_async_mirror`
+/// produces a different qualified name than the caller-supplied
+/// `mirror_export_name`. Both must derive the same hash; a mismatch
+/// is a splicer bug, not a user error. Tests assert against this
+/// prefix instead of the full free-form sentence.
+pub(crate) const MIRROR_NAME_MISMATCH_PREFIX: &str = "async mirror name mismatch";
+
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::WitPrinter;
 use wit_parser::{FunctionKind, InterfaceId, Resolve, Type};

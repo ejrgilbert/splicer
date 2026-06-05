@@ -1501,7 +1501,7 @@ fn test_adapter_bridged_mirror_name_mismatch_bails() {
     .unwrap_err();
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("async mirror name mismatch"),
+        msg.contains(crate::adapter::async_mirror::MIRROR_NAME_MISMATCH_PREFIX),
         "expected mirror-name mismatch bail, got: {msg}"
     );
 }
