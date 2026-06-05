@@ -1,0 +1,3 @@
+[builtin]
+description = "Returns each wrapped call's result from a recorded trace. Requires `R: WitTypedWithResources`. Trace path: `$SPLICER_REPLAY_TRACE` (v0)."
+tier = 4

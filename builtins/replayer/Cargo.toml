@@ -1,0 +1,12 @@
+[package]
+name = "replayer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+
+[dependencies]
+splicer-tool-sdk = { version = "0.1.0", path = "../../splicer-tool-sdk" }
