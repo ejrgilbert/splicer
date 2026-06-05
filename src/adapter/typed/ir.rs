@@ -71,24 +71,48 @@ pub fn build_ir(
     let mut types: Vec<NamedType> = Vec::new();
     let mut resources: Vec<ResourceInfo> = Vec::new();
     let mut seen: HashSet<(BindingsPath, String)> = HashSet::new();
-    let mut seen_resources: HashSet<(BindingsPath, String)> = HashSet::new();
+    // Resources are deduped by `TypeId`, not by `(iface_path,
+    // ident)` — a resource that gets `use`d into a second iface
+    // shares its declaring iface's `TypeId` and would otherwise
+    // emit a duplicate wrapper newtype here.
+    let mut seen_resource_ids: HashSet<TypeId> = HashSet::new();
     for entry in &ifaces {
         let iface = &resolve.interfaces[entry.id];
         for (wit_name, type_id) in &iface.types {
             let td = &resolve.types[*type_id];
             if matches!(td.kind, TypeDefKind::Resource) {
-                // Resources don't get a `WitTyped` impl, but the
-                // codegen still needs to emit a per-resource newtype
-                // and GuestBucket-trait impl. Track them separately.
-                let rust_ident_str = wit_name.to_upper_camel_case();
-                let key = (entry.path.clone(), rust_ident_str.clone());
-                if seen_resources.insert(key) {
-                    resources.push(ResourceInfo {
-                        iface_path: entry.path.clone(),
-                        wit_name: wit_name.clone(),
-                        rust_ident: syn::Ident::new(&rust_ident_str, Span::call_site()),
-                    });
+                // Resources only need to be emitted from the export
+                // side — import-side ifaces in the wrapper world are
+                // sibling entries (distinct `InterfaceId` and
+                // `TypeId` from the export side per wit-parser's
+                // import/export materialization), and processing both
+                // would emit two `Wrapper<R>` newtypes with the same
+                // ident.
+                if !entry.is_export {
+                    continue;
                 }
+                if !seen_resource_ids.insert(*type_id) {
+                    continue;
+                }
+                // Anchor on the *declaring* iface's path (via
+                // `TypeOwner`), not on the iface we found it
+                // through — a resource `use`d across a second iface
+                // surfaces under both, but wit-bindgen homes the
+                // Rust type under the declaring iface's module.
+                let declaring_path = match td.owner {
+                    TypeOwner::Interface(declaring_id) => ifaces
+                        .iter()
+                        .find(|e| e.id == declaring_id)
+                        .map(|e| e.path.clone())
+                        .unwrap_or_else(|| entry.path.clone()),
+                    _ => entry.path.clone(),
+                };
+                let rust_ident_str = wit_name.to_upper_camel_case();
+                resources.push(ResourceInfo {
+                    iface_path: declaring_path,
+                    wit_name: wit_name.clone(),
+                    rust_ident: syn::Ident::new(&rust_ident_str, Span::call_site()),
+                });
                 continue;
             }
             let nt = build_named_type(resolve, &ifaces, *type_id, wit_name, &entry.path, bindings)?;

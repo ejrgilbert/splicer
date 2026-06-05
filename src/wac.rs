@@ -1258,7 +1258,10 @@ fn classify_tier3_4_source(inj: &Injection) -> Option<crate::strategies::Tier3_4
     use crate::strategies::Tier3_4Source;
     if let Some(b) = inj.builtin.as_deref() {
         if crate::strategies::is_embedded_builtin(b) {
-            return Some(Tier3_4Source::Builtin(b));
+            return Some(Tier3_4Source::Builtin {
+                name: b,
+                wac_name: &inj.name,
+            });
         }
         return None;
     }
@@ -1279,7 +1282,7 @@ fn classify_tier3_4_source(inj: &Injection) -> Option<crate::strategies::Tier3_4
 fn source_label<'a>(source: &crate::strategies::Tier3_4Source<'a>) -> &'a str {
     use crate::strategies::Tier3_4Source;
     match source {
-        Tier3_4Source::Builtin(name) => name,
+        Tier3_4Source::Builtin { name, .. } => name,
         Tier3_4Source::User { wac_name, .. } => wac_name,
     }
 }

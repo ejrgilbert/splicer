@@ -240,9 +240,24 @@ fn emit_method_body(
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
-    let sig_inputs = &method.sig.inputs;
-    let sig_output = &method.sig.output;
-    let nominal_return_ty = return_type(&method.sig);
+    // wit-bindgen-emitted trait sigs reference iface-local idents
+    // (`Bucket`, `BucketBorrow`, …) that resolve inside the iface
+    // module but NOT at the wrapper crate's top level where our
+    // impl block lives. Rewrite bare resource idents to their
+    // absolute `bindings::<iface_path>::<R>` form first.
+    let mut sig_inputs = method.sig.inputs.clone();
+    let mut sig_output = method.sig.output.clone();
+    {
+        let mut visitor = AbsolutizeResources { resources: &ir.resources };
+        for arg in sig_inputs.iter_mut() {
+            syn::visit_mut::VisitMut::visit_fn_arg_mut(&mut visitor, arg);
+        }
+        syn::visit_mut::VisitMut::visit_return_type_mut(&mut visitor, &mut sig_output);
+    }
+    let nominal_return_ty = match &sig_output {
+        syn::ReturnType::Default => quote!(()),
+        syn::ReturnType::Type(_, ty) => quote!(#ty),
+    };
     let fields = args_fields(args_record);
     let is_async = method.sig.asyncness.is_some();
 
@@ -346,7 +361,7 @@ fn emit_method_body(
             (rw.wrap_to)(&target_call),
             Some((rw.wrap_from)(quote!(intermediate))),
         ),
-        None => (nominal_return_ty.clone(), target_call, None),
+        None => (nominal_return_ty.clone(), target_call.clone(), None),
     };
 
     let dispatch = match behavior {
@@ -374,37 +389,43 @@ fn emit_method_body(
         }
     };
 
-    let body = match final_wrap {
-        Some(wrap) => quote! {
-            let call = ::splicer_tool_sdk::CallId {
-                interface_name: #interface_qualified_name.into(),
-                function_name: #method_name.into(),
-                id: 0,
-            };
+    // Sync wrapper methods can't `.await` the async strategy. For
+    // those, skip strategy dispatch and direct-delegate the call.
+    // This is the documented L2 limitation around tier-3 + sync
+    // WIT — primarily exercised by resource constructors (always
+    // sync per the WIT spec). When end-user-visible interposition
+    // on sync methods is needed, this is the surface that grows.
+    let body = if !is_async {
+        quote! {
             let args = #args_construct;
-            let s = strategy();
-            let intermediate = #dispatch.await;
-            #wrap
-        },
-        None => quote! {
-            let call = ::splicer_tool_sdk::CallId {
-                interface_name: #interface_qualified_name.into(),
-                function_name: #method_name.into(),
-                id: 0,
-            };
-            let args = #args_construct;
-            let s = strategy();
-            #dispatch.await
-        },
+            #target_call
+        }
+    } else {
+        match final_wrap {
+            Some(wrap) => quote! {
+                let call = ::splicer_tool_sdk::CallId {
+                    interface_name: #interface_qualified_name.into(),
+                    function_name: #method_name.into(),
+                    id: 0,
+                };
+                let args = #args_construct;
+                let s = strategy();
+                let intermediate = #dispatch.await;
+                #wrap
+            },
+            None => quote! {
+                let call = ::splicer_tool_sdk::CallId {
+                    interface_name: #interface_qualified_name.into(),
+                    function_name: #method_name.into(),
+                    id: 0,
+                };
+                let args = #args_construct;
+                let s = strategy();
+                #dispatch.await
+            },
+        }
     };
 
-    // Match the wit-bindgen-emitted signature's async-ness; sync WIT
-    // methods get sync wrapper bodies. Sync bodies still expand the
-    // async `dispatch.await` — but the surrounding `strategy()` call
-    // is sync, so the only `.await` is on a future returned by
-    // TransformStrategy::handle (also async). Sync wrappers therefore
-    // can only host async strategies — which works because the host
-    // executor is the wasm runtime, not the wrapper's frame.
     if is_async {
         quote! {
             async fn #method_ident(#sig_inputs) #sig_output {
@@ -417,6 +438,57 @@ fn emit_method_body(
                 #body
             }
         }
+    }
+}
+
+/// Rewrite bare iface-local resource idents (e.g. `Bucket`) inside a
+/// syn type into their absolute `bindings::<iface_path>::<R>` form,
+/// recursively. wit-bindgen's trait sigs use the bare form because
+/// they're emitted *inside* the iface module; our impl block lives
+/// at the wrapper crate's top level and needs the absolute path.
+struct AbsolutizeResources<'a> {
+    resources: &'a [ResourceInfo],
+}
+
+impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
+    fn visit_type_path_mut(&mut self, tp: &mut syn::TypePath) {
+        if tp.qself.is_none() && tp.path.segments.len() == 1 {
+            let seg_ident = &tp.path.segments[0].ident;
+            if let Some(r) = self.resources.iter().find(|r| &r.rust_ident == seg_ident) {
+                let abs = absolute_resource_path(r);
+                // Preserve the original segment's path args (handles
+                // generics like `BucketBorrow<'a>` would carry).
+                let trailing_args = tp.path.segments[0].arguments.clone();
+                tp.path = abs;
+                if let Some(last) = tp.path.segments.last_mut() {
+                    last.arguments = trailing_args;
+                }
+            }
+        }
+        syn::visit_mut::visit_type_path_mut(self, tp);
+    }
+}
+
+fn absolute_resource_path(r: &ResourceInfo) -> syn::Path {
+    use syn::punctuated::Punctuated;
+    let mut segments: Punctuated<syn::PathSegment, syn::Token![::]> = Punctuated::new();
+    segments.push(syn::PathSegment {
+        ident: syn::Ident::new("bindings", Span::call_site()),
+        arguments: syn::PathArguments::None,
+    });
+    for s in &r.iface_path {
+        segments.push(syn::PathSegment {
+            ident: syn::Ident::new(s, Span::call_site()),
+            arguments: syn::PathArguments::None,
+        });
+    }
+    segments.push(syn::PathSegment {
+        ident: r.rust_ident.clone(),
+        arguments: syn::PathArguments::None,
+    });
+    syn::Path {
+        leading_colon: None,
+        segments,
     }
 }
 
@@ -605,10 +677,14 @@ mod tests {
 
     const INTERFACE_QN: &str = "test:pkg/ops@0.1.0";
 
+    // `async func` deliberately: tier-3 strategy dispatch needs to
+    // `.await`, which sync wrapper methods can't host (the L2
+    // sync-method limitation). Tests that assert on the strategy
+    // path must therefore exercise an async surface.
     const TINY_WIT: &str = r#"
         package test:pkg@0.1.0;
         interface ops {
-            add: func(a: u32, b: u32) -> u32;
+            add: async func(a: u32, b: u32) -> u32;
         }
         world w { export ops; }
     "#;
