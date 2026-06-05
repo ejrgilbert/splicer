@@ -1,4 +1,4 @@
-package splicer:recorder@0.1.0;
+package splicer:recorder@0.2.0;
 
 /// Emit a binary stream of every wrapped call's lifted args + result.
 /// Wire format documented in `recorder-format.md` (sibling file).
