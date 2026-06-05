@@ -1,4 +1,4 @@
-package splicer:otel-bare-spans@0.2.0;
+package splicer:otel-bare-spans@0.3.0;
 
 /// Emits one `wasi:otel` span per wrapped call: timing,
 /// `code.namespace` / `code.function` attrs, and the host's outer
