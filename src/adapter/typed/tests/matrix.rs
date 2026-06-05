@@ -424,21 +424,25 @@ fn matrix_resource_pass_through() {
         "expected outer wrap to re-wrap intermediate into export-side Bucket:\n{}",
         out.lib_rs,
     );
-    // result<bucket, _> compound: closure maps Ok arm to
-    // WrapperBucket; outer maps it back to export-side Bucket::new.
+    // result<bucket, _>: match Ok→WrapperBucket(x) forward,
+    // match Ok→Bucket::new(x) reverse, Err passes through.
     assert!(
-        oneline.contains(".map(WrapperBucket)"),
-        "expected closure to `.map(WrapperBucket)` for the Ok arm:\n{}",
+        oneline.contains("WrapperBucket(x)"),
+        "expected Ok-arm forward to wrap inner value into WrapperBucket(x):\n{}",
         out.lib_rs,
     );
     assert!(
-        oneline.contains(".map(bindings::exports::matrix::res_bucket::store::Bucket::new)"),
-        "expected outer wrap to `.map(Bucket::new)` for the Ok arm:\n{}",
+        oneline.contains("bindings::exports::matrix::res_bucket::store::Bucket::new(x)"),
+        "expected Ok-arm reverse to call Bucket::new(x):\n{}",
         out.lib_rs,
     );
-    // Per-resource methods dispatch through TransformStrategy; the
-    // closure body uses the captured `self` (the wrapper newtype),
-    // not an args-struct field for the receiver.
+    assert!(
+        oneline.contains("Result::Err(x) => ::core::result::Result::Err(x)"),
+        "expected Err-arm to pass through unchanged:\n{}",
+        out.lib_rs,
+    );
+    // Per-resource methods use the captured `&self`, not an args
+    // field.
     assert!(
         oneline.contains("self.0.get(args.key)"),
         "expected GuestBucket::get closure body to call self.0.get(args.key):\n{}",
@@ -536,11 +540,22 @@ fn matrix_resource_virtualize() {
         "expected outer wrap to re-wrap intermediate into export-side Bucket:\n{}",
         out.lib_rs,
     );
-    // `result<bucket, _>`, `option<bucket>`, `list<bucket>` compounds:
-    // outer maps back to export-side Bucket::new on resource leaves.
+    // Four return shapes through the recursive wrap: bare, result,
+    // option, list.
+    let bucket_new = "bindings::exports::matrix::res_virt::store::Bucket::new(x)";
     assert!(
-        oneline.contains(".map(bindings::exports::matrix::res_virt::store::Bucket::new)"),
-        "expected outer wrap to `.map(Bucket::new)` for compound returns:\n{}",
+        oneline.contains(bucket_new),
+        "expected reverse transform to call Bucket::new(x) at resource leaves:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains(&format!(".map(|x| {bucket_new})")),
+        "expected option<bucket> + list<bucket> reverse to use .map(|x| Bucket::new(x)):\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains(".into_iter()") && oneline.contains(".collect::<::std::vec::Vec<_>>()"),
+        "expected list<bucket> reverse to use .into_iter().map().collect::<Vec<_>>():\n{}",
         out.lib_rs,
     );
 }
@@ -659,6 +674,355 @@ fn matrix_tier4_static_method_fails_fast_with_compile_error() {
         oneline.contains("compile_error")
             && oneline.contains("tier-4 static methods on resources are not yet supported"),
         "expected a compile_error! at the tier-4 static method site:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_own_resource_arg_emits_structural_codegen() {
+    // Structural pin only. Whether the closure-body call typechecks
+    // depends on wit-bindgen's re-exported-resource handling and
+    // needs a cargo-check integration test to verify.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-own-arg@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                }
+                push: async func(b: bucket);
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-own-arg/store@0.1.0",
+        "bindings::matrix::res_own_arg::store::push",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Args struct field type renders as the export-side Bucket path.
+    assert!(
+        oneline.contains("pub struct StorePushArgs"),
+        "expected args struct for push:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("pub b: bindings::exports::matrix::res_own_arg::store::Bucket"),
+        "expected own<bucket> arg field to render as export-side Bucket path:\n{}",
+        out.lib_rs,
+    );
+
+    // Closure body forwards `args.b` to the import-side push call.
+    assert!(
+        oneline.contains("bindings::matrix::res_own_arg::store::push(args.b).await"),
+        "expected closure body to call import-side push(args.b):\n{}",
+        out.lib_rs,
+    );
+
+    // No WitTyped impl on the args struct (it carries a handle).
+    assert!(
+        !oneline.contains("WitTyped for StorePushArgs"),
+        "args struct with own<R> arg must not get a WitTyped impl:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_zero_arg_constructor_tier4() {
+    // Zero-arg sentinel macro + tier-4 mint macro composing in the
+    // same body.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-zero-ctor@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor();
+                    poke: async func();
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-zero-ctor/store@0.1.0",
+        "bindings::matrix::res_zero_ctor::store::Bucket::new",
+        Behavior::Virtualize,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("pub struct BucketNewArgs {}"),
+        "expected zero-arg args struct decl:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("impl_wit_typed_for_zero_arg_args!(BucketNewArgs)"),
+        "expected zero-arg sentinel macro invocation:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("let args = BucketNewArgs {}"),
+        "expected empty args literal in constructor body:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("mint_mock_resource!(WrapperBucket, \"bucket\")"),
+        "expected tier-4 mint_mock_resource invocation in constructor:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_multi_resource_with_cross_resource_borrow() {
+    // Two resources + a method on one taking a borrow of the other:
+    // pins per-resource codegen isolation and cross-resource ident
+    // rewrites in AbsolutizeResources.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-multi@0.1.0;
+            interface store {
+                resource conn {
+                    constructor(url: string);
+                    ping: async func();
+                }
+                resource bucket {
+                    constructor(name: string);
+                    attach-conn: async func(c: borrow<conn>);
+                }
+                open-bucket: async func(name: string) -> bucket;
+                open-conn: async func(url: string) -> conn;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-multi/store@0.1.0",
+        "bindings::matrix::res_multi::store::open_bucket",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("pub struct WrapperBucket")
+            && oneline.contains("pub struct WrapperConn"),
+        "expected per-resource wrapper newtypes for both resources:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("GuestBucket for WrapperBucket")
+            && oneline.contains("GuestConn for WrapperConn"),
+        "expected per-resource GuestX impls for both resources:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("type Bucket = WrapperBucket")
+            && oneline.contains("type Conn = WrapperConn"),
+        "expected interface Guest impl to declare both assoc types:\n{}",
+        out.lib_rs,
+    );
+
+    // Cross-resource borrow: `bucket.attach-conn` carries
+    // `ConnBorrow<'a>` (not `BucketBorrow<'a>`).
+    assert!(
+        oneline.contains("pub struct BucketAttachConnArgs<'a>"),
+        "expected BucketAttachConnArgs to be parameterized by 'a:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("bindings::exports::matrix::res_multi::store::ConnBorrow<'a>"),
+        "expected the borrow field to render the cross-resource Conn path:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("TransformStrategy< BucketAttachConnArgs<'_>")
+            || oneline.contains("TransformStrategy<BucketAttachConnArgs<'_>"),
+        "expected dispatch to instantiate the lifetime-parameterized args:\n{}",
+        out.lib_rs,
+    );
+
+    for ident in [
+        "BucketNewArgs",
+        "BucketAttachConnArgs",
+        "ConnNewArgs",
+        "ConnPingArgs",
+        "StoreOpenBucketArgs",
+        "StoreOpenConnArgs",
+    ] {
+        assert!(
+            oneline.contains(ident),
+            "expected args ident `{ident}`:\n{}",
+            out.lib_rs,
+        );
+    }
+}
+
+#[test]
+fn matrix_resource_method_returns_resource() {
+    // Resource methods returning a resource: the wrap fires from
+    // the per-resource trait kind, not just Interface.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-clone@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    clone: async func() -> bucket;
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-clone/store@0.1.0",
+        "self.0.clone()",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Strategy R is the wrapper newtype, not Resource<WrapperBucket>.
+    assert!(
+        oneline.contains("TransformStrategy< BucketCloneArgs, WrapperBucket")
+            || oneline.contains("TransformStrategy<BucketCloneArgs, WrapperBucket"),
+        "expected method dispatch to use WrapperBucket as R:\n{}",
+        out.lib_rs,
+    );
+    // Closure body wraps the import-side `self.0.clone().await` into
+    // the wrapper newtype.
+    assert!(
+        oneline.contains("WrapperBucket(self.0.clone().await)"),
+        "expected closure body to wrap self.0.clone().await into WrapperBucket:\n{}",
+        out.lib_rs,
+    );
+    // Final wrap calls Bucket::new on the strategy-returned intermediate.
+    assert!(
+        oneline.contains("bindings::exports::matrix::res_clone::store::Bucket::new(intermediate)"),
+        "expected final wrap to call Bucket::new(intermediate):\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_resource_static_factory_returns_resource() {
+    // `[static] bucket.anonymous -> bucket`: wrap fires from the
+    // static-method body too, not just methods.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-stat@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    anonymous: static async func() -> bucket;
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-stat/store@0.1.0",
+        "bindings::matrix::res_stat::store::Bucket::anonymous",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("TransformStrategy< BucketAnonymousArgs, WrapperBucket")
+            || oneline.contains("TransformStrategy<BucketAnonymousArgs, WrapperBucket"),
+        "expected static dispatch to use WrapperBucket as R:\n{}",
+        out.lib_rs,
+    );
+    // prettyplease can wrap the WrapperBucket(...) call across lines
+    // when the inner call is long; assert on the two pieces.
+    assert!(
+        oneline.contains("WrapperBucket(")
+            && oneline.contains("bindings::matrix::res_stat::store::Bucket::anonymous().await"),
+        "expected static closure body to wrap import-side factory call:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("bindings::exports::matrix::res_stat::store::Bucket::new(intermediate)"),
+        "expected final wrap to call Bucket::new(intermediate):\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_resource_in_tuple_return() {
+    // Mixed value + resource elements; wrap destructures and
+    // rebuilds.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-tuple@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    poke: async func();
+                }
+                open-tagged: async func(name: string) -> tuple<u32, bucket>;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-tuple/store@0.1.0",
+        "bindings::matrix::res_tuple::store::open_tagged",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("(u32, WrapperBucket)") || oneline.contains("(u32 , WrapperBucket)"),
+        "expected intermediate type `(u32, WrapperBucket)`:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("let __t = ") && oneline.contains("WrapperBucket(__t.1)"),
+        "expected forward transform to bind tuple and wrap element 1:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("bindings::exports::matrix::res_tuple::store::Bucket::new(__t.1)"),
+        "expected reverse transform to call Bucket::new(__t.1):\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_resource_in_nested_compound_return() {
+    // `result<option<bucket>, string>` composes `match` (Result)
+    // with `.map(|x| …)` (Option) at the same call site.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-nested@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    poke: async func();
+                }
+                open-maybe-opt: async func(name: string) -> result<option<bucket>, string>;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-nested/store@0.1.0",
+        "bindings::matrix::res_nested::store::open_maybe_opt",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("Option<WrapperBucket>"),
+        "expected `Option<WrapperBucket>` in nested intermediate type:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains(".map(|x| WrapperBucket(x))"),
+        "expected forward to map inner Option with WrapperBucket(x):\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains(".map(|x| bindings::exports::matrix::res_nested::store::Bucket::new"),
+        "expected reverse to map inner Option with Bucket::new at the leaf:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("Result::Err(x) => ::core::result::Result::Err(x)"),
+        "expected Err arm to pass through unchanged:\n{}",
         out.lib_rs,
     );
 }

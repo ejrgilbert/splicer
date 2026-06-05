@@ -463,6 +463,24 @@ impl WitTypeRef {
             WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_borrow()),
         }
     }
+
+    /// True if this type tree contains an `own<R>` handle at any depth.
+    /// The codegen rewrites every such position from `Bucket` to
+    /// `WrapperBucket` (intermediate type for the strategy) and back
+    /// via `Bucket::new(...)` at the export boundary; this predicate
+    /// gates the whole wrap.
+    pub fn contains_resource_own(&self) -> bool {
+        match self {
+            WitTypeRef::Handle(HandleRef::ResourceOwn(_)) => true,
+            WitTypeRef::Handle(_) | WitTypeRef::Primitive(_) | WitTypeRef::Named(_) => false,
+            WitTypeRef::List(inner) | WitTypeRef::Option(inner) => inner.contains_resource_own(),
+            WitTypeRef::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| t.contains_resource_own())
+                    || err.as_ref().is_some_and(|t| t.contains_resource_own())
+            }
+            WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_resource_own()),
+        }
+    }
 }
 
 #[derive(Copy, Clone)]

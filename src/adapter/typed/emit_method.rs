@@ -40,7 +40,7 @@ use quote::quote;
 
 use super::bindings_index::{bindings_path_tokens, GuestMethod, GuestTrait, GuestTraitKind};
 use super::ir::{
-    args_struct_ident, ExportFnKind, HandleRef, NamedKind, NamedRef, NamedType, RecordField,
+    args_struct_ident, ExportFnKind, HandleRef, NamedKind, NamedType, RecordField,
     ResourceInfo, TypeLocation, WitTypeRef, WrapperIR,
 };
 use super::Behavior;
@@ -421,25 +421,17 @@ fn emit_method_body(
         target_call
     };
 
-    // Resource-returning interface-level fns route through an
-    // intermediate type (the wrapper newtype) inside the strategy,
-    // then re-wrap to the export-side resource at the boundary.
-    let resource_wrap = match trait_kind {
-        GuestTraitKind::Interface => {
-            let ret = ir
-                .fn_sigs
-                .get(&args_ident.to_string())
-                .and_then(|s| s.return_ty.as_ref());
-            ret.and_then(detect_resource_wrap)
-        }
-        GuestTraitKind::Resource(_) => None,
-    };
-    let (strategy_r_ty, closure_body, final_wrap) = match &resource_wrap {
-        Some(rw) => (
-            rw.intermediate_ty.clone(),
-            (rw.wrap_to)(&target_call),
-            Some((rw.wrap_from)(quote!(intermediate))),
-        ),
+    // Resource-returning fns (interface factories, resource methods,
+    // static factories) route through `WrapperR` inside the strategy
+    // and re-wrap at the boundary. Sync paths bypass dispatch and
+    // don't use `final_wrap`.
+    let resource_wrap = ir
+        .fn_sigs
+        .get(&args_ident.to_string())
+        .and_then(|s| s.return_ty.as_ref())
+        .and_then(|r| build_resource_wrap(r, target_call.clone(), quote!(intermediate)));
+    let (strategy_r_ty, closure_body, final_wrap) = match resource_wrap {
+        Some(rw) => (rw.intermediate_ty, rw.forward_expr, Some(rw.reverse_expr)),
         None => (nominal_return_ty.clone(), target_call.clone(), None),
     };
 
@@ -647,85 +639,163 @@ fn build_import_resource_path(
     bindings_path_tokens(&import_segs, Some(resource_pascal))
 }
 
-/// Recognizes resource-bearing return shapes that the interface-level
-/// Guest emitter must rewrap. Covers:
-///
-/// - bare `own<R>` returns (wrap → `WrapperR`)
-/// - `result<own<R>, E>` (wrap → `Result<WrapperR, E>`)
-///
-/// Other compound shapes (`option<R>`, `tuple<…, R, …>`, `list<R>`)
-/// would need per-shape closures; deferred until a test fixture
-/// exercises them.
-fn detect_resource_wrap(ret: &WitTypeRef) -> Option<ResourceWrap> {
-    match ret {
-        WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => Some(make_own_wrap(nr)),
-        WitTypeRef::Result {
-            ok: Some(inner),
-            err,
-        } => match inner.as_ref() {
-            WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => {
-                Some(make_result_own_wrap(nr, err.as_deref()))
-            }
-            _ => None,
-        },
-        _ => None,
+/// Compute the wrap transforms for a return type tree mentioning
+/// `own<R>` at any depth. `None` when there's nothing to rewrite.
+fn build_resource_wrap(
+    ret: &WitTypeRef,
+    source_for_forward: TokenStream,
+    source_for_reverse: TokenStream,
+) -> Option<CompoundWrap> {
+    if !ret.contains_resource_own() {
+        return None;
     }
+    Some(build_wrap_at(ret, source_for_forward, source_for_reverse))
 }
 
-fn make_own_wrap(nr: &NamedRef) -> ResourceWrap {
-    let export_path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
-    let wrap_ident = wrapper_ident_for(&nr.rust_ident);
-    let intermediate_ty = quote!(#wrap_ident);
-    let wrap_ident_for_to = wrap_ident.clone();
-    let export_path_for_from = export_path.clone();
-    ResourceWrap {
-        intermediate_ty,
-        wrap_to: Box::new(move |inner: &TokenStream| {
-            let wrap = &wrap_ident_for_to;
-            quote!(#wrap(#inner))
-        }),
-        wrap_from: Box::new(move |intermediate: TokenStream| {
-            let p = &export_path_for_from;
-            quote!(#p::new(#intermediate))
-        }),
-    }
-}
-
-fn make_result_own_wrap(nr: &NamedRef, err: Option<&WitTypeRef>) -> ResourceWrap {
-    let export_path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
-    let wrap_ident = wrapper_ident_for(&nr.rust_ident);
-    let err_ty = match err {
-        Some(t) => t.to_tokens(),
-        None => quote!(()),
-    };
-    let intermediate_ty = quote!(::core::result::Result<#wrap_ident, #err_ty>);
-    let wrap_ident_for_to = wrap_ident.clone();
-    let export_path_for_from = export_path.clone();
-    ResourceWrap {
-        intermediate_ty,
-        wrap_to: Box::new(move |inner: &TokenStream| {
-            let wrap = &wrap_ident_for_to;
-            // `.map(WrapperBucket)` reuses the newtype's tuple-struct
-            // call-form as a function pointer over the Ok arm.
-            quote!((#inner).map(#wrap))
-        }),
-        wrap_from: Box::new(move |intermediate: TokenStream| {
-            let p = &export_path_for_from;
-            quote!((#intermediate).map(#p::new))
-        }),
-    }
-}
-
-struct ResourceWrap {
+struct CompoundWrap {
+    /// Strategy R, with resource leaves rewritten to `WrapperR`.
     intermediate_ty: TokenStream,
-    /// Converts the import-side call's result into the strategy R
-    /// intermediate (e.g. `WrapperBucket(<call>)` or
-    /// `<call>.map(WrapperBucket)`).
-    wrap_to: Box<dyn Fn(&TokenStream) -> TokenStream>,
-    /// Converts the strategy-returned intermediate back into the
-    /// nominal Guest return type (e.g.
-    /// `bindings::exports::iface::Bucket::new(intermediate)`).
-    wrap_from: Box<dyn Fn(TokenStream) -> TokenStream>,
+    /// Closure-body expression (tier-3 only; computed for tier-4 but unused).
+    forward_expr: TokenStream,
+    /// Final-wrap expression: `Bucket::new(...)` at each resource leaf.
+    reverse_expr: TokenStream,
+}
+
+fn build_wrap_at(
+    ret: &WitTypeRef,
+    src_fwd: TokenStream,
+    src_rev: TokenStream,
+) -> CompoundWrap {
+    // Non-resource subtrees pass through; lets compounds recurse
+    // over only the resource-bearing arms.
+    if !ret.contains_resource_own() {
+        return CompoundWrap {
+            intermediate_ty: ret.to_tokens(),
+            forward_expr: src_fwd,
+            reverse_expr: src_rev,
+        };
+    }
+    match ret {
+        WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => {
+            let wrap_ident = wrapper_ident_for(&nr.rust_ident);
+            let export_path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
+            CompoundWrap {
+                intermediate_ty: quote!(#wrap_ident),
+                forward_expr: quote!(#wrap_ident(#src_fwd)),
+                reverse_expr: quote!(#export_path::new(#src_rev)),
+            }
+        }
+        WitTypeRef::Option(inner) => {
+            let inner_wrap = build_wrap_at(inner, quote!(x), quote!(x));
+            let inner_ty = inner_wrap.intermediate_ty;
+            let inner_fwd = inner_wrap.forward_expr;
+            let inner_rev = inner_wrap.reverse_expr;
+            CompoundWrap {
+                intermediate_ty: quote!(::core::option::Option<#inner_ty>),
+                forward_expr: quote!((#src_fwd).map(|x| #inner_fwd)),
+                reverse_expr: quote!((#src_rev).map(|x| #inner_rev)),
+            }
+        }
+        WitTypeRef::Result { ok, err } => {
+            // Each Result arm either recurses (typed payload) or
+            // returns `()` (unit payload, `result<_>` / `result<_, _>`).
+            let arm = |t: Option<&WitTypeRef>| match t {
+                Some(inner) => {
+                    let w = build_wrap_at(inner, quote!(x), quote!(x));
+                    (w.intermediate_ty, w.forward_expr, w.reverse_expr)
+                }
+                None => (quote!(()), quote!(()), quote!(())),
+            };
+            let (ok_ty, ok_fwd, ok_rev) = arm(ok.as_deref());
+            let (err_ty, err_fwd, err_rev) = arm(err.as_deref());
+            let intermediate_ty = quote!(::core::result::Result<#ok_ty, #err_ty>);
+            let arm_pat = |is_ok: bool, has_payload: bool| {
+                let payload = if has_payload { quote!(x) } else { quote!(()) };
+                if is_ok {
+                    quote!(::core::result::Result::Ok(#payload))
+                } else {
+                    quote!(::core::result::Result::Err(#payload))
+                }
+            };
+            let ok_pat = arm_pat(true, ok.is_some());
+            let err_pat = arm_pat(false, err.is_some());
+            let forward_expr = quote! {
+                match #src_fwd {
+                    #ok_pat => ::core::result::Result::Ok(#ok_fwd),
+                    #err_pat => ::core::result::Result::Err(#err_fwd),
+                }
+            };
+            let reverse_expr = quote! {
+                match #src_rev {
+                    #ok_pat => ::core::result::Result::Ok(#ok_rev),
+                    #err_pat => ::core::result::Result::Err(#err_rev),
+                }
+            };
+            CompoundWrap {
+                intermediate_ty,
+                forward_expr,
+                reverse_expr,
+            }
+        }
+        WitTypeRef::List(inner) => {
+            let inner_wrap = build_wrap_at(inner, quote!(x), quote!(x));
+            let inner_ty = inner_wrap.intermediate_ty;
+            let inner_fwd = inner_wrap.forward_expr;
+            let inner_rev = inner_wrap.reverse_expr;
+            CompoundWrap {
+                intermediate_ty: quote!(::std::vec::Vec<#inner_ty>),
+                forward_expr: quote!(
+                    (#src_fwd).into_iter().map(|x| #inner_fwd).collect::<::std::vec::Vec<_>>()
+                ),
+                reverse_expr: quote!(
+                    (#src_rev).into_iter().map(|x| #inner_rev).collect::<::std::vec::Vec<_>>()
+                ),
+            }
+        }
+        WitTypeRef::Tuple(elems) => {
+            // Bind the tuple so each `__t.i` can move independently.
+            let elem_wraps: Vec<CompoundWrap> = elems
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let idx = syn::Index::from(i);
+                    build_wrap_at(e, quote!(__t.#idx), quote!(__t.#idx))
+                })
+                .collect();
+            let elem_tys: Vec<&TokenStream> =
+                elem_wraps.iter().map(|w| &w.intermediate_ty).collect();
+            let intermediate_ty = if elem_tys.len() == 1 {
+                let t = &elem_tys[0];
+                quote!((#t,))
+            } else {
+                quote!((#(#elem_tys),*))
+            };
+            let fwd_elems: Vec<&TokenStream> =
+                elem_wraps.iter().map(|w| &w.forward_expr).collect();
+            let rev_elems: Vec<&TokenStream> =
+                elem_wraps.iter().map(|w| &w.reverse_expr).collect();
+            let fwd_tuple = if fwd_elems.len() == 1 {
+                let e = &fwd_elems[0];
+                quote!((#e,))
+            } else {
+                quote!((#(#fwd_elems),*))
+            };
+            let rev_tuple = if rev_elems.len() == 1 {
+                let e = &rev_elems[0];
+                quote!((#e,))
+            } else {
+                quote!((#(#rev_elems),*))
+            };
+            let forward_expr = quote!({ let __t = #src_fwd; #fwd_tuple });
+            let reverse_expr = quote!({ let __t = #src_rev; #rev_tuple });
+            CompoundWrap {
+                intermediate_ty,
+                forward_expr,
+                reverse_expr,
+            }
+        }
+        _ => unreachable!("build_wrap_at: unsupported resource-bearing shape"),
+    }
 }
 
 fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {
