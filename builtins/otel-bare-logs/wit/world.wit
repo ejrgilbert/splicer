@@ -1,4 +1,4 @@
-package splicer:otel-bare-logs@0.2.0;
+package splicer:otel-bare-logs@0.3.0;
 
 /// Emits one structured `wasi:otel` log record per wrapped call:
 /// configurable severity (default `INFO`), event-name `call.invoked`,
