@@ -101,7 +101,11 @@ Conservative — refuses some valid cases where the async-lowered
 peer call happens to always run inline — but never wrong, and
 always loud. Cost: ~a day.
 
-### Option 2 — auto async-bridge component (restores generality)
+### Option 2 — auto async-bridge component (partial fix; codegen only)
+
+> ⚠️ The design described here ships for tier-3/4 but **does not
+> restore generality** the way the original write-up claimed. See
+> "What Option 2 actually buys us" below.
 
 When splicer sees a sync-WIT target, auto-generate two extra
 components and re-wire the composition:
@@ -110,7 +114,8 @@ components and re-wire the composition:
 service-comp.handle (async-WIT, suspendable)
   └─ imports my:service/adder            [sync WIT, unchanged]
      └─ exported by: SYNC→ASYNC BRIDGE   [splicer-generated]
-           body: sync canon-lower onto my:service/adder-suspendable
+           body: async canon-lower onto my:service/adder-suspendable
+                 + subtask wait
            └─ imports my:service/adder-suspendable  [async-WIT mirror, splicer-synthesized]
               └─ exported by: middleware adapter    [splicer-generated, ASYNC-WIT lift]
                     body: hooks + downstream
@@ -118,17 +123,56 @@ service-comp.handle (async-WIT, suspendable)
                        └─ exported by: real adder
 ```
 
-The sync→async bridge is the only sync-lifted component. Its body
-does `canon lower` (sync, no async modifier) onto the async-WIT
-async mirror — the canon ABI defines this as the caller blocking
-while wasmtime's stackful-async runtime drives the callee on a
-fiber. The bridge never tries to canon-async-wait, so no sync-task
-suspension is ever attempted. The middleware adapter is async-WIT
-lifted, so its hook bodies can suspend freely.
+The bridge is the only sync-lifted component. Its body does async
+canon-lower onto the async-WIT mirror and then `[waitable-set-wait]`
+on the resulting packed status. As long as the lift actually returns
+status=Returned (subtask completed inline), the wait branch is
+skipped and the call passes through fine.
 
-Cost: a week. Adds one extra component per spliced sync-WIT site,
-plus the codegen template for the bridge. Splicer's "any
-middleware on any interface" claim becomes true again.
+#### What Option 2 actually buys us
+
+The original write-up claimed the bridge lets hook / wrapper bodies
+"suspend freely" because the adapter is async-lifted. That's not how
+the canon ABI works: wasmtime classifies a task by the WIT contract
+with its **caller**, not by the callee's lift modifier. The bridge's
+caller is the sync-WIT consumer, so the **bridge's task is sync**,
+even though its body issues async canon-lower. If the subtask the
+bridge is waiting on hasn't completed by the time the wait fires,
+`[waitable-set-wait]` from a sync task is exactly the operation
+wasmtime refuses (see "The constraint" above). The trap moves from
+the adapter to the bridge; it doesn't disappear.
+
+So Option 2 in practice is **codegen unification, not runtime
+unblock**:
+
+- ✅ Tier-3/4 wrappers always lift against the async mirror →
+  `wit-bindgen` Rust always emits an `async fn` Guest trait, regardless
+  of whether the target is sync or async at WIT. One codegen path.
+- ✅ Wrapper / hook bodies that complete inline keep working
+  (their futures resolve immediately, the wait branch never fires,
+  the bridge passes through). This is the common case for the
+  `hello-tier{3,4}` builtins, recorder, otel-bare-metrics, etc.
+- ❌ Wrapper / hook bodies that genuinely suspend on a non-host
+  async operation still trap — just at the bridge's wait instead
+  of the adapter's. The fundamental sync-task-can't-yield invariant
+  is unchanged.
+
+For tier-1/2 the bridge buys us nothing — adapter emission is
+wasm-encoder-generated, so we control the lift shape directly with
+no wit-bindgen Rust in the picture. Inserting a bridge would just
+add a component to the chain without changing what works at runtime.
+Tier-1/2 stays on the inline path (no bridge) and the sync-target
+limits there match what shipped pre-bridge.
+
+#### Cost / scope of what landed
+
+A week of work + a per-target bridge wasm at splice time. Splicer's
+"any middleware on any interface" claim is still **not** true at
+runtime; what changed is that the tier-3/4 codegen path is the same
+shape across sync and async targets, which makes the wrapper Cargo
+build deterministic regardless of which target it's pointed at.
+
+The true runtime unblock requires Option 3.
 
 #### Resource-bearing sync targets
 
@@ -201,22 +245,48 @@ WIT-clone helper plus per-resource wasm passthroughs in the bridge.
 
 [proxy]: https://github.com/chenyan2002/proxy-component
 
-### Option 3 — make wasmtime allow sync to suspend
+### Option 3 — make wasmtime drive non-host async subtasks from sync tasks
 
-Off the table. Sync-suspends would violate the sync contract.
+Sync tasks "can't suspend" in the strictest reading — but
+`[waitable-set-wait]` from a sync task could in principle be
+implemented by letting wasmtime drive the awaited subtask to
+completion on VM-managed fibers without yielding control back to
+the host scheduler. The sync caller's wasm execution stalls (which
+it does today anyway, for wasi async calls); the subtask makes
+progress; the wait resolves; sync caller resumes. No host-side
+yield, no violation of the sync contract from the caller's view.
+
+This is a wasmtime runtime change, not something splicer can paper
+over. If we want a true e2e test of suspending hook / wrapper bodies
+on sync-WIT targets, that's the path: file an upstream issue with
+a minimal repro (one sync-WIT target + one middleware whose hook
+genuinely awaits a non-wasi peer-component async function) and see
+what falls out. The bridge as shipped is the right shape to consume
+that fix when it lands — just inert until then.
 
 ## What we shipped today
 
-Option 1 (preflight error) — see splicer source at the splice
-entry point. Targets the narrow detectable case (any canon-lower-async
-import in the middleware against a sync-WIT splice target). Errors
-out at splice time with a message pointing at this doc.
+- **Option 1** (preflight error) — see splicer source at the splice
+  entry point. Targets the narrow detectable case (any canon-lower-async
+  import in the middleware against a sync-WIT splice target).
+- **Option 2** for tier-3/4 only — bridges sync-WIT targets so the
+  wrapper crate's `wit-bindgen` Rust always sees an async-WIT mirror
+  and emits an `async fn` Guest trait. Codegen unification, not a
+  runtime unblock. Wrapper bodies whose `.await`s complete inline
+  pass through; bodies that genuinely suspend still trap (now at the
+  bridge instead of the adapter). The `hello-tier3` and `hello-tier4`
+  builtin demos exercise this end-to-end.
+- **Option 2 NOT for tier-1/2** — adapter emission is wasm-encoder-
+  generated so codegen unification isn't a problem the bridge solves
+  there. Tier-1/2 stays on the inline path; the sync-target limits
+  are the same as pre-bridge: works for hook bodies that complete
+  inline, traps for bodies that genuinely suspend on a non-host
+  async peer.
 
 Built-in substrate stays as the sync workaround described in
 "Where splicer hits this", because shipped builtins need to keep
 working with the current substrate shape regardless of which
 target interface they're spliced on.
 
-Option 2 is the proper fix; budget when there's demand from a
-user wanting to splice their own substrate-consuming middleware on
-a sync-WIT interface.
+Option 3 is the only path that genuinely closes the gap. Budget
+that work alongside upstream wasmtime when there's user demand.
