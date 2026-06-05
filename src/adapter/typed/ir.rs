@@ -370,11 +370,19 @@ impl HandleRef {
     fn to_tokens(&self) -> TokenStream {
         match self {
             HandleRef::ErrorContext => quote!(::wit_bindgen::rt::async_support::ErrorContext),
-            // Resources render to the wit-bindgen-emitted `Bucket`
-            // struct path — same path for own and borrow at the IR
-            // level
-            HandleRef::ResourceOwn(nr) | HandleRef::ResourceBorrow(nr) => {
-                bindings_path_tokens(&nr.path, Some(&nr.rust_ident))
+            // `own<R>` lowers to the bare resource type
+            // (`bindings::iface::Bucket`).
+            HandleRef::ResourceOwn(nr) => bindings_path_tokens(&nr.path, Some(&nr.rust_ident)),
+            // `borrow<R>` lowers to wit-bindgen's `BucketBorrow<'a>`
+            // companion struct, with the lifetime hardcoded to `'a`.
+            HandleRef::ResourceBorrow(nr) => {
+                let borrow_ident = syn::Ident::new(
+                    &format!("{}Borrow", nr.rust_ident),
+                    Span::call_site(),
+                );
+                let path = bindings_path_tokens(&nr.path, Some(&borrow_ident));
+                let lt = syn::Lifetime::new("'a", Span::call_site());
+                quote!(#path<#lt>)
             }
             HandleRef::Future(_) | HandleRef::Stream(_) => {
                 unreachable!("future/stream handle kind not yet supported")
@@ -439,6 +447,20 @@ impl WitTypeRef {
                     || err.as_ref().is_some_and(|t| t.contains_handle())
             }
             WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_handle()),
+        }
+    }
+
+    /// True if this type tree contains a `borrow<R>` handle at any depth.
+    pub fn contains_borrow(&self) -> bool {
+        match self {
+            WitTypeRef::Handle(HandleRef::ResourceBorrow(_)) => true,
+            WitTypeRef::Handle(_) | WitTypeRef::Primitive(_) | WitTypeRef::Named(_) => false,
+            WitTypeRef::List(inner) | WitTypeRef::Option(inner) => inner.contains_borrow(),
+            WitTypeRef::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| t.contains_borrow())
+                    || err.as_ref().is_some_and(|t| t.contains_borrow())
+            }
+            WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_borrow()),
         }
     }
 }

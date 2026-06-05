@@ -447,6 +447,306 @@ fn matrix_resource_pass_through() {
 }
 
 #[test]
+fn matrix_resource_virtualize() {
+    // Tier-4 (Virtualize) over a resource-bearing interface: the
+    // wrapper newtype's inner field is `MockedResource` (no import
+    // side exists), per-resource async methods dispatch via
+    // `VirtualizeStrategy`, the sync constructor synthesizes a
+    // stand-in `MockedResource` (no strategy dispatch, since
+    // constructors are sync per the WIT spec), and the codegen emits
+    // a `WitTypedWithResources` impl that decodes a recorded
+    // `Cell::ResourceHandle` into the wrapper newtype.
+    //
+    // Exercises the four return shapes a tier-4 strategy may
+    // synthesize: bare `bucket`, `option<bucket>`, `result<bucket, _>`,
+    // `list<bucket>`.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-virt@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    get: async func(key: string) -> option<list<u8>>;
+                }
+                open: async func(name: string) -> bucket;
+                open-maybe: async func(name: string) -> result<bucket, string>;
+                open-opt: async func(name: string) -> option<bucket>;
+                open-many: async func(prefix: string) -> list<bucket>;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-virt/store@0.1.0",
+        // Behavior::Virtualize does NOT import the target, so the
+        // generate_for_wit helper asserts the import path is absent.
+        "bindings::matrix::res_virt::store::open",
+        Behavior::Virtualize,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The wrapper newtype is `WrapperBucket(pub MockedResource)` — no
+    // bindings::iface::Bucket inner anywhere.
+    assert!(
+        oneline.contains("pub struct WrapperBucket")
+            && oneline.contains("::splicer_tool_sdk::MockedResource"),
+        "expected WrapperBucket(pub MockedResource):\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("WrapperBucket(pub bindings"),
+        "tier-4 wrapper newtype must not reference import-side bindings:\n{}",
+        out.lib_rs,
+    );
+
+    // The impl is wired through the SDK's
+    // `impl_wit_typed_with_resources_for_wrapper!` macro: the body
+    // lives in the SDK, the codegen just emits the one-line
+    // invocation per WIT resource.
+    assert!(
+        oneline.contains("impl_wit_typed_with_resources_for_wrapper!(WrapperBucket, \"bucket\")"),
+        "expected the SDK macro invocation per-WIT-resource:\n{}",
+        out.lib_rs,
+    );
+
+    // VirtualizeStrategy dispatch — no TransformStrategy anywhere.
+    assert!(
+        oneline.contains("VirtualizeStrategy"),
+        "expected VirtualizeStrategy dispatch:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("TransformStrategy"),
+        "tier-4 emission must not reference TransformStrategy:\n{}",
+        out.lib_rs,
+    );
+
+    // The sync constructor goes through the SDK macro that owns the
+    // counter + Cow shape. Codegen just emits the invocation.
+    assert!(
+        oneline.contains("mint_mock_resource!(WrapperBucket, \"bucket\")"),
+        "expected sync constructor to delegate to mint_mock_resource! macro:\n{}",
+        out.lib_rs,
+    );
+
+    // Resource-returning interface fns get the same intermediate-
+    // wrapping treatment regardless of tier: strategy returns the
+    // wrapper newtype, codegen does `Bucket::new(intermediate)`.
+    assert!(
+        oneline.contains("bindings::exports::matrix::res_virt::store::Bucket::new(intermediate)"),
+        "expected outer wrap to re-wrap intermediate into export-side Bucket:\n{}",
+        out.lib_rs,
+    );
+    // `result<bucket, _>`, `option<bucket>`, `list<bucket>` compounds:
+    // outer maps back to export-side Bucket::new on resource leaves.
+    assert!(
+        oneline.contains(".map(bindings::exports::matrix::res_virt::store::Bucket::new)"),
+        "expected outer wrap to `.map(Bucket::new)` for compound returns:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_borrow_args_thread_lifetime() {
+    // `borrow<R>` lowers to wit-bindgen's `BucketBorrow<'_>` companion
+    // struct. The wrapper crate top-level args struct must (1) render
+    // the field type as the absolute `bindings::iface::BucketBorrow<'a>`,
+    // (2) parameterize itself by `<'a>` so the field's lifetime has a
+    // binding, and (3) instantiate as `Args<'_>` at the strategy
+    // dispatch site so the closure / virtualize call infers the live
+    // lifetime. Exercises both interface-level (`compare-buckets`)
+    // and per-resource (`copy-from`) borrow positions.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-borrow@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    copy-from: async func(src: borrow<bucket>);
+                }
+                compare-buckets: async func(a: borrow<bucket>, b: borrow<bucket>) -> bool;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-borrow/store@0.1.0",
+        "bindings::matrix::res_borrow::store::compare_buckets",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Both args structs declare `<'a>` since they each carry a
+    // BucketBorrow field. The freestanding `compare-buckets`
+    // synthesizes `StoreCompareBucketsArgs<'a>`; the per-resource
+    // `copy-from` synthesizes `BucketCopyFromArgs<'a>`.
+    for sig in [
+        "pub struct StoreCompareBucketsArgs<'a>",
+        "pub struct BucketCopyFromArgs<'a>",
+    ] {
+        assert!(
+            oneline.contains(sig),
+            "expected lifetime-parameterized args decl `{sig}`:\n{}",
+            out.lib_rs,
+        );
+    }
+
+    // Field type renders to the absolute BucketBorrow path with the
+    // hardcoded `'a` from the IR. Exported resources nest under
+    // `exports::`, mirroring wit-bindgen's module shape.
+    assert!(
+        oneline.contains("bindings::exports::matrix::res_borrow::store::BucketBorrow<'a>"),
+        "expected absolute BucketBorrow<'a> in field types:\n{}",
+        out.lib_rs,
+    );
+
+    // Strategy dispatch instantiates the args type as
+    // `Args<'_>`: the placeholder lets Rust infer the binding from
+    // the trait method's borrow inputs at the call site.
+    assert!(
+        oneline.contains("TransformStrategy< StoreCompareBucketsArgs<'_>"),
+        "expected dispatch to instantiate StoreCompareBucketsArgs<'_>:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("TransformStrategy< BucketCopyFromArgs<'_>"),
+        "expected dispatch to instantiate BucketCopyFromArgs<'_>:\n{}",
+        out.lib_rs,
+    );
+
+    // Args-struct WitTyped impls are suppressed because the fields
+    // contain a Handle. The existing `contains_handle` rule covers
+    // this; verify the impl didn't sneak in.
+    assert!(
+        !oneline.contains("WitTyped for StoreCompareBucketsArgs"),
+        "args struct with borrow field must NOT get a WitTyped impl:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("WitTyped for BucketCopyFromArgs"),
+        "args struct with borrow field must NOT get a WitTyped impl:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_tier4_static_method_fails_fast_with_compile_error() {
+    // tier-4 has no import side, so a static method body has nowhere
+    // to dispatch (and no fixture / design exercises strategy
+    // dispatch from a static yet). The codegen must emit a
+    // `compile_error!` into the wrapper crate so the build error
+    // points at the unsupported shape, rather than producing a call
+    // to a nonexistent import that surfaces as a misleading
+    // unresolved-name error.
+    let out = generate_for_wit(
+        r#"
+            package matrix:s4@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor();
+                    info: static func() -> string;
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:s4/store@0.1.0",
+        // No target import path to check; just ensure the helper's
+        // post-condition (no import for Virtualize) holds.
+        "bindings::matrix::s4::store::info",
+        Behavior::Virtualize,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        oneline.contains("compile_error")
+            && oneline.contains("tier-4 static methods on resources are not yet supported"),
+        "expected a compile_error! at the tier-4 static method site:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_resource_named_borrow_is_not_misrewritten() {
+    // Regression: an `XxxBorrow`-named resource in own position must
+    // resolve to `bindings::iface::XxxBorrow` (its own type), not
+    // `bindings::iface::Xxx` via the suffix-strip path. Exact-match
+    // takes precedence; suffix-strip is the fallback.
+    let out = generate_for_wit(
+        r#"
+            package matrix:nb@0.1.0;
+            interface store {
+                resource foo-borrow {
+                    constructor();
+                    poke: async func();
+                }
+                lend: async func() -> foo-borrow;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:nb/store@0.1.0",
+        "bindings::matrix::nb::store::lend",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The wrapper newtype references the resource's actual ident, not
+    // a stripped-suffix variant.
+    assert!(
+        oneline.contains("bindings::matrix::nb::store::FooBorrow"),
+        "expected the literal `FooBorrow` resource path in tier-3 newtype:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("bindings::matrix::nb::store::Foo)")
+            && !oneline.contains("bindings::matrix::nb::store::Foo>"),
+        "must NOT rewrite `FooBorrow` (own resource) as `Foo` via suffix-strip:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_resource_virtualize_with_borrow() {
+    // Combined: tier-4 virtualize + borrow arg. Exercises the
+    // interaction between `Args<'a>` and `VirtualizeStrategy` (which
+    // may .await between accepting args and producing R). The wrapper
+    // crate must still type-check.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-virt-borrow@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    copy-from: async func(src: borrow<bucket>);
+                }
+                compare-buckets: async func(a: borrow<bucket>, b: borrow<bucket>) -> bool;
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-virt-borrow/store@0.1.0",
+        "bindings::matrix::res_virt_borrow::store::compare_buckets",
+        Behavior::Virtualize,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // tier-4: inner is MockedResource, dispatch is VirtualizeStrategy,
+    // borrow args carry through the same lifetime threading.
+    assert!(
+        oneline.contains("VirtualizeStrategy< StoreCompareBucketsArgs<'_>"),
+        "expected VirtualizeStrategy dispatch with lifetime-parameterized args:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("VirtualizeStrategy< BucketCopyFromArgs<'_>"),
+        "expected per-resource VirtualizeStrategy dispatch with lifetime args:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("pub struct WrapperBucket(pub ::splicer_tool_sdk::MockedResource)"),
+        "expected tier-4 WrapperBucket with MockedResource inner:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
 fn matrix_multiple_exported_interfaces() {
     // Two exported interfaces in one world. Exercises the per-Guest
     // loop in `emit_guest` and the multi-impl assembly in

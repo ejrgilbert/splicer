@@ -62,7 +62,7 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         .iter()
         .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior, &ir))
         .collect();
-    let resource_newtypes = emit_resource_newtypes(&ir);
+    let resource_newtypes = emit_resource_newtypes(&ir, input.behavior);
 
     let lib_rs = assemble_lib_rs(&WrapperCrateInputs {
         bindings_src: &bindings_src,

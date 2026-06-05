@@ -1,0 +1,15 @@
+[package]
+name = "chaos-err"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+
+[dependencies]
+splicer-tool-sdk = { version = "0.1.0", path = "../../splicer-tool-sdk" }
+# Entropy source — calls into wasi:random/random on wasi targets,
+# the OS RNG on native (used by the lib's own test build).
+getrandom = "0.2"

@@ -12,6 +12,7 @@
 //! See the crate-root `README.md` for the full `with:` boilerplate.
 
 pub mod bridge;
+pub mod bridge_resources;
 pub mod render;
 pub mod strategy;
 pub mod trace;
@@ -27,6 +28,11 @@ pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };
 pub use bridge::{args_to_typed, cells_to_typed, cells_to_value, BridgeError, WitTyped};
+pub use bridge_resources::{
+    cells_to_typed_with_resources, HasArbitraryErr, HasDefaultErr, MockedResource,
+    WitTypedWithResources,
+};
+pub use arbitrary;
 
 /// Derive `WitTyped` for a user-authored struct (WIT record) or enum
 /// (WIT enum/variant). Behind the off-by-default `derive` feature.

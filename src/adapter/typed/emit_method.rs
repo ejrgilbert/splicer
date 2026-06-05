@@ -97,12 +97,14 @@ pub fn emit_guest(
     for method in &g.methods {
         let args_ident = args_struct_ident(&args_prefix, &method.ident.to_string());
         let args_record = find_args_record(ir, &args_ident);
+        let has_borrow = args_has_borrow(args_record);
 
-        args_structs.push(emit_args_struct(&args_ident, args_record));
+        args_structs.push(emit_args_struct(&args_ident, args_record, has_borrow));
         method_bodies.push(emit_method_body(
             method,
             &args_ident,
             args_record,
+            has_borrow,
             interface_qualified_name,
             behavior,
             &g.module_path,
@@ -153,19 +155,47 @@ pub fn emit_guest(
     }
 }
 
-/// Emit one `pub struct Wrapper<Resource>(pub bindings::<import>::<Resource>);`
-/// newtype per resource declared in any exported interface. The inner
-/// field holds the import-side resource handle that the wrapper
-/// forwards method calls to.
-pub fn emit_resource_newtypes(ir: &WrapperIR) -> Vec<TokenStream> {
-    ir.resources.iter().map(emit_one_resource_newtype).collect()
+/// Emit the per-resource pieces of the wrapper crate: the wrapper
+/// newtype, and for tier-4 the [`WitTypedWithResources`] impl that
+/// decodes a `Cell::ResourceHandle` into the newtype.
+///
+/// Same struct name regardless of tier (`WrapperBucket`); the inner
+/// field shape and any companion impls differ:
+///
+/// - tier-3 (Transform): inner is the wit-bindgen-generated import-side
+///   handle (`bindings::<import>::<R>`); method bodies forward to it.
+/// - tier-4 (Virtualize): inner is [`MockedResource`](::splicer_tool_sdk::MockedResource);
+///   method bodies dispatch to the strategy. The `WitTypedWithResources`
+///   impl is what replay-style strategies invoke internally to decode
+///   recorded tier-2 trace data.
+pub fn emit_resource_newtypes(ir: &WrapperIR, behavior: Behavior) -> Vec<TokenStream> {
+    ir.resources
+        .iter()
+        .map(|r| emit_one_resource_newtype(r, behavior))
+        .collect()
 }
 
-fn emit_one_resource_newtype(r: &ResourceInfo) -> TokenStream {
+/// All per-resource items concatenated into one `TokenStream` (the
+/// struct decl, and for tier-4 the `WitTypedWithResources` impl). The
+/// caller treats this as one unit per resource.
+fn emit_one_resource_newtype(r: &ResourceInfo, behavior: Behavior) -> TokenStream {
     let wrap = wrapper_ident_for(&r.rust_ident);
-    let import_path = import_resource_path_tokens(r);
-    quote! {
-        pub struct #wrap(pub #import_path);
+    match behavior {
+        Behavior::Transform => {
+            let import_path = import_resource_path_tokens(r);
+            quote! {
+                pub struct #wrap(pub #import_path);
+            }
+        }
+        Behavior::Virtualize => {
+            let wit_name = &r.wit_name;
+            quote! {
+                pub struct #wrap(pub ::splicer_tool_sdk::MockedResource);
+                ::splicer_tool_sdk::impl_wit_typed_with_resources_for_wrapper!(
+                    #wrap, #wit_name
+                );
+            }
+        }
     }
 }
 
@@ -211,20 +241,33 @@ fn args_fields(t: &NamedType) -> &[RecordField] {
     }
 }
 
-fn emit_args_struct(args_ident: &syn::Ident, args_record: &NamedType) -> TokenStream {
+fn emit_args_struct(
+    args_ident: &syn::Ident,
+    args_record: &NamedType,
+    has_borrow: bool,
+) -> TokenStream {
     debug_assert!(matches!(args_record.location, TypeLocation::TopLevel));
     let field_tokens = args_fields(args_record).iter().map(|f| {
         let name = &f.rust_ident;
         let ty = f.ty.to_tokens();
         quote! { pub #name: #ty }
     });
+    // wit-bindgen renders `borrow<R>` as `BucketBorrow<'a>`; when any
+    // field carries one, the struct hosts the `'a` binding. Fields
+    // without borrows widen to the same `'a` harmlessly via Rust
+    // lifetime variance.
+    let generics = if has_borrow { quote!(<'a>) } else { quote!() };
     // Named-empty `{}` (not `;`) so the zero-arg `WitTyped` impl can
     // construct via `Self {}`.
     quote! {
-        pub struct #args_ident {
+        pub struct #args_ident #generics {
             #(#field_tokens),*
         }
     }
+}
+
+fn args_has_borrow(args_record: &NamedType) -> bool {
+    args_fields(args_record).iter().any(|f| f.ty.contains_borrow())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,6 +275,7 @@ fn emit_method_body(
     method: &GuestMethod,
     args_ident: &syn::Ident,
     args_record: &NamedType,
+    has_borrow: bool,
     interface_qualified_name: &str,
     behavior: Behavior,
     guest_module_path: &[String],
@@ -299,30 +343,65 @@ fn emit_method_body(
             build_self_call(method_ident, fields)
         }
         (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Constructor) => {
-            // Constructors return `Self` in the trait; their import-side
-            // call returns the import Bucket which we wrap into the
-            // wrapper newtype to satisfy the `-> Self` signature.
-            let import_resource = build_import_resource_path(resource_pascal, guest_module_path);
-            let call = build_static_call(&import_resource, method_ident, fields);
             let wrap = wrapper_ident_for(resource_pascal);
-            // Constructor is always sync per the WIT spec, but
-            // guard the await branch defensively in case the spec
-            // grows async constructors later.
-            if is_async {
-                quote!(#wrap(#call.await))
-            } else {
-                quote!(#wrap(#call))
+            match behavior {
+                Behavior::Transform => {
+                    // tier-3: forward to the import-side constructor
+                    // and wrap the resulting handle into our newtype.
+                    let import_resource =
+                        build_import_resource_path(resource_pascal, guest_module_path);
+                    let call = build_static_call(&import_resource, method_ident, fields);
+                    // Constructor is always sync per the WIT spec, but
+                    // guard the await branch defensively in case the
+                    // spec grows async constructors later.
+                    if is_async {
+                        quote!(#wrap(#call.await))
+                    } else {
+                        quote!(#wrap(#call))
+                    }
+                }
+                Behavior::Virtualize => {
+                    // tier-4 has no import side; the sync constructor
+                    // can't await an async strategy. The SDK macro
+                    // owns the monotonic-counter + Cow shape.
+                    let resource_wit_name = ir
+                        .resources
+                        .iter()
+                        .find(|r| &r.rust_ident == resource_pascal)
+                        .map(|r| r.wit_name.as_str())
+                        .unwrap_or_else(|| {
+                            unreachable!(
+                                "IR has no resource entry for `{resource_pascal}`; the \
+                                 Resolve walk and per-resource Guest extraction disagree"
+                            )
+                        });
+                    quote!(::splicer_tool_sdk::mint_mock_resource!(#wrap, #resource_wit_name))
+                }
             }
         }
         (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Static) => {
-            // Static methods dispatch through the import-side type
-            // surface and return whatever the WIT declared — no
-            // automatic wrap. Static methods that themselves return
-            // the resource would need the same resource-wrap helper
-            // the interface-level emit uses; deferred until a fixture
-            // exercises it.
-            let import_resource = build_import_resource_path(resource_pascal, guest_module_path);
-            build_static_call(&import_resource, method_ident, fields)
+            match behavior {
+                Behavior::Transform => {
+                    // tier-3: dispatch through the import-side type
+                    // surface and return whatever the WIT declared.
+                    let import_resource =
+                        build_import_resource_path(resource_pascal, guest_module_path);
+                    build_static_call(&import_resource, method_ident, fields)
+                }
+                Behavior::Virtualize => {
+                    // tier-4 has no import side. A static method's
+                    // body would need to dispatch through the strategy
+                    // (and an async one would need the wrapper method
+                    // to be async too, which static-method async-ness
+                    // determines).
+                    let msg = format!(
+                        "tier-4 static methods on resources are not yet supported \
+                         (encountered `{}::{}`)",
+                        resource_pascal, method_ident,
+                    );
+                    quote!(::core::compile_error!(#msg))
+                }
+            }
         }
         (GuestTraitKind::Resource(_), ExportFnKind::Freestanding) => {
             unreachable!("freestanding fn appeared in a per-resource Guest trait")
@@ -364,23 +443,32 @@ fn emit_method_body(
         None => (nominal_return_ty.clone(), target_call.clone(), None),
     };
 
+    // Args structs with a `borrow<R>` field carry a `<'a>`
+    // parameter; instantiate at use sites with the `<'_>` placeholder
+    // so the closure / dispatch infers the live lifetime.
+    let args_ty: TokenStream = if has_borrow {
+        quote!(#args_ident<'_>)
+    } else {
+        quote!(#args_ident)
+    };
+
     let dispatch = match behavior {
         Behavior::Transform => {
             // Annotate the closure parameter — qualified
             // `<_ as Trait<…>>::handle` dispatch doesn't propagate
             // into closure inference (E0282).
             quote! {
-                <_ as ::splicer_tool_sdk::TransformStrategy<#args_ident, #strategy_r_ty>>::handle(
+                <_ as ::splicer_tool_sdk::TransformStrategy<#args_ty, #strategy_r_ty>>::handle(
                     s,
                     call,
                     args,
-                    |args: #args_ident| async move { #closure_body },
+                    |args: #args_ty| async move { #closure_body },
                 )
             }
         }
         Behavior::Virtualize => {
             quote! {
-                <_ as ::splicer_tool_sdk::VirtualizeStrategy<#args_ident, #strategy_r_ty>>::handle(
+                <_ as ::splicer_tool_sdk::VirtualizeStrategy<#args_ty, #strategy_r_ty>>::handle(
                     s,
                     call,
                     args,
@@ -453,11 +541,33 @@ struct AbsolutizeResources<'a> {
 impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
     fn visit_type_path_mut(&mut self, tp: &mut syn::TypePath) {
         if tp.qself.is_none() && tp.path.segments.len() == 1 {
-            let seg_ident = &tp.path.segments[0].ident;
-            if let Some(r) = self.resources.iter().find(|r| &r.rust_ident == seg_ident) {
-                let abs = absolute_resource_path(r);
-                // Preserve the original segment's path args (handles
-                // generics like `BucketBorrow<'a>` would carry).
+            let seg_ident = tp.path.segments[0].ident.clone();
+            // wit-bindgen emits two distinct types for a WIT resource:
+            // the bare ident (`Bucket`) for `own<R>` positions and a
+            // `<R>Borrow` companion (`BucketBorrow<'_>`) for `borrow<R>`.
+            // Both are iface-module-local in wit-bindgen output, so the
+            // wrapper crate top-level reference needs the absolute
+            // `bindings::<iface>::…` prefix in either case.
+            //
+            // Try exact match first: a resource literally named
+            // `FooBorrow` in own position must NOT be rewritten as
+            // `Foo` via the suffix-strip path.
+            let matched = self
+                .resources
+                .iter()
+                .find(|r| r.rust_ident == seg_ident)
+                .or_else(|| {
+                    seg_ident
+                        .to_string()
+                        .strip_suffix("Borrow")
+                        .and_then(|stripped| {
+                            self.resources.iter().find(|r| r.rust_ident == stripped)
+                        })
+                });
+            if let Some(r) = matched {
+                let abs = absolute_resource_path(r, &seg_ident);
+                // Preserve the original segment's path args (e.g. the
+                // `<'_>` carried by `BucketBorrow<'_>`).
                 let trailing_args = tp.path.segments[0].arguments.clone();
                 tp.path = abs;
                 if let Some(last) = tp.path.segments.last_mut() {
@@ -469,7 +579,11 @@ impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
     }
 }
 
-fn absolute_resource_path(r: &ResourceInfo) -> syn::Path {
+/// Build an absolute `bindings::<iface>::<seg_ident>` path. `seg_ident`
+/// is what wit-bindgen used for the terminal segment (`Bucket` for
+/// own, `BucketBorrow` for borrow); the IfacePath comes from the
+/// resource's declaring interface.
+fn absolute_resource_path(r: &ResourceInfo, seg_ident: &syn::Ident) -> syn::Path {
     use syn::punctuated::Punctuated;
     let mut segments: Punctuated<syn::PathSegment, syn::Token![::]> = Punctuated::new();
     segments.push(syn::PathSegment {
@@ -483,7 +597,7 @@ fn absolute_resource_path(r: &ResourceInfo) -> syn::Path {
         });
     }
     segments.push(syn::PathSegment {
-        ident: r.rust_ident.clone(),
+        ident: seg_ident.clone(),
         arguments: syn::PathArguments::None,
     });
     syn::Path {

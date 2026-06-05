@@ -46,7 +46,10 @@ fn transform_pipeline_produces_a_complete_wrapper_crate() {
         lib.contains("TransformStrategy"),
         "transform pipeline should use TransformStrategy:\n{lib}"
     );
-    assert!(lib.contains("OnceLock"), "missing OnceLock storage:\n{lib}");
+    assert!(
+        lib.contains("define_strategy_singleton!"),
+        "missing strategy singleton invocation:\n{lib}"
+    );
     assert!(
         lib.contains("bindings::export!"),
         "missing component-export hookup:\n{lib}"
@@ -69,6 +72,89 @@ fn virtualize_pipeline_swaps_strategy_trait() {
         !crate_out.lib_rs.contains("TransformStrategy"),
         "virtualize pipeline should not import TransformStrategy:\n{}",
         crate_out.lib_rs
+    );
+}
+
+#[test]
+fn chaos_err_composes_against_resource_bearing_interface() {
+    // Smoke check for L3c: a `Result<resource, E: Default>`-returning
+    // interface, tier-4 virtualize, the chaos-err strategy. The
+    // wrapper crate must:
+    //   - dispatch through VirtualizeStrategy on the `Result<...>`
+    //     return type (whose Ok arm contains a `WrapperBucket`);
+    //   - not pull in any of the cells-decoding APIs
+    //     (cells_to_typed, cells_to_typed_with_resources, etc.);
+    //   - parameterize args by `<'a>` for the borrow argument.
+    //
+    // The strategy's `R: HasArbitraryErr` bound is satisfied by
+    // `Result<WrapperBucket, String>` via
+    // `impl<T, E: Arbitrary> HasArbitraryErr for Result<T, E>` in
+    // the SDK. The Ok arm's type (`WrapperBucket`) doesn't need
+    // `Arbitrary` because the Ok arm is never instantiated.
+    let wit = r#"
+        package test:store@0.1.0;
+        interface store {
+            resource bucket {
+                constructor(name: string);
+                size: async func() -> result<u64, string>;
+            }
+            open: async func(name: string) -> result<bucket, string>;
+            compare: async func(a: borrow<bucket>, b: borrow<bucket>) -> result<bool, string>;
+        }
+        world w { export store; }
+    "#;
+    let crate_out = generate_wrapper_crate(&GenerateWrapperInput {
+        target_wit: wit,
+        world_name: Some("w"),
+        interface_qualified_name: "test:store/store@0.1.0",
+        behavior: Behavior::Virtualize,
+        strategy_crate_name: "chaos-err",
+        strategy_crate_path: "/abs/path/to/chaos-err",
+        strategy_type: "ChaosErr",
+        splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
+    })
+    .unwrap();
+    let lib = &crate_out.lib_rs;
+
+    // tier-4 dispatch only.
+    assert!(
+        lib.contains("VirtualizeStrategy"),
+        "chaos-err wrapper should dispatch through VirtualizeStrategy:\n{lib}"
+    );
+    assert!(
+        !lib.contains("TransformStrategy"),
+        "chaos-err wrapper must not dispatch through TransformStrategy:\n{lib}"
+    );
+
+    // No cells-decoding helpers in the build path. ChaosErr returns
+    // `Err(E::default())`; it never touches the recorded-trace path.
+    // The codegen DOES emit a `WitTypedWithResources` impl on
+    // `WrapperBucket` as a forward-looking convenience for replay-
+    // style strategies; that's fine. What we care about here is the
+    // call surface (no helper invocations).
+    assert!(
+        !lib.contains("::cells_to_typed("),
+        "chaos-err must not invoke cells_to_typed:\n{lib}"
+    );
+    assert!(
+        !lib.contains("::cells_to_typed_with_resources("),
+        "chaos-err must not invoke cells_to_typed_with_resources:\n{lib}"
+    );
+
+    // Borrow-argument lifetime threads through `compare`.
+    assert!(
+        lib.contains("StoreCompareArgs<'a>"),
+        "expected lifetime-parameterized StoreCompareArgs:\n{lib}"
+    );
+    assert!(
+        lib.contains("StoreCompareArgs<'_>"),
+        "expected StoreCompareArgs<'_> at dispatch site:\n{lib}"
+    );
+
+    // Wrapper newtype is tier-4 shaped (inner is MockedResource).
+    assert!(
+        lib.contains("pub struct WrapperBucket(pub ::splicer_tool_sdk::MockedResource)"),
+        "expected tier-4 WrapperBucket(MockedResource):\n{lib}"
     );
 }
 

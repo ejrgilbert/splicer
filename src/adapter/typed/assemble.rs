@@ -116,21 +116,10 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         #(#resource_newtypes)*
         #(#witty_impls)*
 
-        // One shared strategy instance for the whole wrapper. Stored
-        // as `OnceLock<S>` so the strategy reference has `'static`
-        // lifetime — avoids the borrow-across-`.await` lifetime
-        // conflict that `thread_local! { RefCell<S> }` would trip.
-        // The strategy type must impl `Default` (for lazy init) and
-        // `Sync` (for static storage); strategies needing interior
-        // mutability can wrap their state in atomic / lock primitives.
-        static STRATEGY: ::std::sync::OnceLock<#strategy_crate_ident::#strategy_type_ident> =
-            ::std::sync::OnceLock::new();
-
-        fn strategy() -> &'static #strategy_crate_ident::#strategy_type_ident {
-            STRATEGY.get_or_init(
-                <#strategy_crate_ident::#strategy_type_ident as ::core::default::Default>::default
-            )
-        }
+        // Strategy storage + `strategy()` accessor.
+        ::splicer_tool_sdk::define_strategy_singleton!(
+            #strategy_crate_ident::#strategy_type_ident
+        );
 
         // The user-facing Guest impl target. Each `impl Guest for Wrapper`
         // block (one per exported interface) dispatches into STRATEGY.
@@ -262,16 +251,12 @@ mod tests {
             out.contains("use ::splicer_tool_sdk::TransformStrategy"),
             "forward dispatch expects TransformStrategy use:\n{out}"
         );
-        // The strategy is stored in a OnceLock<S> so the `&S`
-        // handed to handle() has `'static` lifetime (avoids
-        // borrow-across-await with thread_local!{RefCell<S>}).
+        // Strategy storage goes through the SDK macro; codegen
+        // emits the invocation with the snake-cased strategy path.
         assert!(
-            out.contains("OnceLock"),
-            "expected OnceLock storage:\n{out}"
-        );
-        assert!(
-            out.contains("my_strategy :: MyStrategy") || out.contains("my_strategy::MyStrategy"),
-            "expected snake-cased strategy path:\n{out}"
+            out.contains("define_strategy_singleton!(my_strategy::MyStrategy)")
+                || out.contains("define_strategy_singleton ! (my_strategy :: MyStrategy)"),
+            "expected define_strategy_singleton! invocation:\n{out}"
         );
         // The wrapper struct + Guest impl.
         assert!(out.contains("struct Wrapper"), "missing Wrapper:\n{out}");

@@ -1,0 +1,3 @@
+[builtin]
+description = "Returns a freshly-sampled Err for every wrapped call. Requires `R: HasArbitraryErr` (e.g. `Result<_, E: Arbitrary>`); the Ok arm's type is unconstrained."
+tier = 4
