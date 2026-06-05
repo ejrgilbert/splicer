@@ -132,7 +132,7 @@ pub fn emit_guest(
         GuestTraitKind::Interface => ir
             .resources
             .iter()
-            .filter(|r| r.iface_path == g.module_path)
+            .filter(|r| r.is_owned && r.iface_path == g.module_path)
             .map(|r| {
                 let res = &r.rust_ident;
                 let wrap = wrapper_ident_for(&r.rust_ident);
@@ -171,6 +171,7 @@ pub fn emit_guest(
 pub fn emit_resource_newtypes(ir: &WrapperIR, behavior: Behavior) -> Vec<TokenStream> {
     ir.resources
         .iter()
+        .filter(|r| r.is_owned)
         .map(|r| emit_one_resource_newtype(r, behavior))
         .collect()
 }
@@ -429,7 +430,9 @@ fn emit_method_body(
         .fn_sigs
         .get(&args_ident.to_string())
         .and_then(|s| s.return_ty.as_ref())
-        .and_then(|r| build_resource_wrap(r, target_call.clone(), quote!(intermediate)));
+        .and_then(|r| {
+            build_resource_wrap(r, target_call.clone(), quote!(intermediate), &ir.resources)
+        });
     let (strategy_r_ty, closure_body, final_wrap) = match resource_wrap {
         Some(rw) => (rw.intermediate_ty, rw.forward_expr, Some(rw.reverse_expr)),
         None => (nominal_return_ty.clone(), target_call.clone(), None),
@@ -640,16 +643,20 @@ fn build_import_resource_path(
 }
 
 /// Compute the wrap transforms for a return type tree mentioning
-/// `own<R>` at any depth. `None` when there's nothing to rewrite.
+/// `own<R>` at any depth. `None` when there's nothing to rewrite OR
+/// when every `own<R>` in the tree is a resource the wrapper merely
+/// uses (factored types, declared in an imported types iface) — those
+/// pass through untouched via wit-bindgen's type identity flow.
 fn build_resource_wrap(
     ret: &WitTypeRef,
     source_for_forward: TokenStream,
     source_for_reverse: TokenStream,
+    resources: &[ResourceInfo],
 ) -> Option<CompoundWrap> {
-    if !ret.contains_resource_own() {
+    if !ret.contains_owned_resource(resources) {
         return None;
     }
-    Some(build_wrap_at(ret, source_for_forward, source_for_reverse))
+    Some(build_wrap_at(ret, source_for_forward, source_for_reverse, resources))
 }
 
 struct CompoundWrap {
@@ -665,10 +672,11 @@ fn build_wrap_at(
     ret: &WitTypeRef,
     src_fwd: TokenStream,
     src_rev: TokenStream,
+    resources: &[ResourceInfo],
 ) -> CompoundWrap {
-    // Non-resource subtrees pass through; lets compounds recurse
-    // over only the resource-bearing arms.
-    if !ret.contains_resource_own() {
+    // Non-(owned-)resource subtrees pass through; lets compounds
+    // recurse over only the leaves that actually need rewriting.
+    if !ret.contains_owned_resource(resources) {
         return CompoundWrap {
             intermediate_ty: ret.to_tokens(),
             forward_expr: src_fwd,
@@ -677,6 +685,10 @@ fn build_wrap_at(
     }
     match ret {
         WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => {
+            // The outer `contains_owned_resource` short-circuit
+            // guarantees this leaf is owned; the type identity flow
+            // for used (non-owned) resources is handled by the
+            // pass-through arm above.
             let wrap_ident = wrapper_ident_for(&nr.rust_ident);
             let export_path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
             CompoundWrap {
@@ -686,7 +698,7 @@ fn build_wrap_at(
             }
         }
         WitTypeRef::Option(inner) => {
-            let inner_wrap = build_wrap_at(inner, quote!(x), quote!(x));
+            let inner_wrap = build_wrap_at(inner, quote!(x), quote!(x), resources);
             let inner_ty = inner_wrap.intermediate_ty;
             let inner_fwd = inner_wrap.forward_expr;
             let inner_rev = inner_wrap.reverse_expr;
@@ -701,7 +713,7 @@ fn build_wrap_at(
             // returns `()` (unit payload, `result<_>` / `result<_, _>`).
             let arm = |t: Option<&WitTypeRef>| match t {
                 Some(inner) => {
-                    let w = build_wrap_at(inner, quote!(x), quote!(x));
+                    let w = build_wrap_at(inner, quote!(x), quote!(x), resources);
                     (w.intermediate_ty, w.forward_expr, w.reverse_expr)
                 }
                 None => (quote!(()), quote!(()), quote!(())),
@@ -738,7 +750,7 @@ fn build_wrap_at(
             }
         }
         WitTypeRef::List(inner) => {
-            let inner_wrap = build_wrap_at(inner, quote!(x), quote!(x));
+            let inner_wrap = build_wrap_at(inner, quote!(x), quote!(x), resources);
             let inner_ty = inner_wrap.intermediate_ty;
             let inner_fwd = inner_wrap.forward_expr;
             let inner_rev = inner_wrap.reverse_expr;
@@ -759,7 +771,7 @@ fn build_wrap_at(
                 .enumerate()
                 .map(|(i, e)| {
                     let idx = syn::Index::from(i);
-                    build_wrap_at(e, quote!(__t.#idx), quote!(__t.#idx))
+                    build_wrap_at(e, quote!(__t.#idx), quote!(__t.#idx), resources)
                 })
                 .collect();
             let elem_tys: Vec<&TokenStream> =

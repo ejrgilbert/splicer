@@ -79,39 +79,40 @@ pub fn build_ir(
     for entry in &ifaces {
         let iface = &resolve.interfaces[entry.id];
         for (wit_name, type_id) in &iface.types {
-            let td = &resolve.types[*type_id];
+            // Follow `Type(_)` aliases to find the original
+            // declaration. WIT's `use types.{bucket}` materializes
+            // as a local alias whose `kind = Type(original_id)` and
+            // whose `owner` is the using iface; the resource itself
+            // is at the original id with `kind = Resource`.
+            let (resolved_id, td) = resolve_through_aliases(resolve, *type_id);
             if matches!(td.kind, TypeDefKind::Resource) {
-                // Resources only need to be emitted from the export
-                // side — import-side ifaces in the wrapper world are
-                // sibling entries (distinct `InterfaceId` and
-                // `TypeId` from the export side per wit-parser's
-                // import/export materialization), and processing both
-                // would emit two `Wrapper<R>` newtypes with the same
-                // ident.
-                if !entry.is_export {
-                    continue;
-                }
-                if !seen_resource_ids.insert(*type_id) {
+                if !seen_resource_ids.insert(resolved_id) {
                     continue;
                 }
                 // Anchor on the *declaring* iface's path (via
-                // `TypeOwner`), not on the iface we found it
-                // through — a resource `use`d across a second iface
-                // surfaces under both, but wit-bindgen homes the
-                // Rust type under the declaring iface's module.
-                let declaring_path = match td.owner {
-                    TypeOwner::Interface(declaring_id) => ifaces
-                        .iter()
-                        .find(|e| e.id == declaring_id)
-                        .map(|e| e.path.clone())
-                        .unwrap_or_else(|| entry.path.clone()),
-                    _ => entry.path.clone(),
+                // `TypeOwner`). For wasi-style factored types the
+                // declaring iface may be on the wrapper world's
+                // import side (e.g. tier-3 wraps `async-bucket` while
+                // `bucket` lives in imported `async-bucket-types`);
+                // the import-side `IfaceEntry` provides the right
+                // module path either way.
+                let (declaring_path, is_owned) = match td.owner {
+                    TypeOwner::Interface(declaring_id) => {
+                        let declaring_entry = ifaces.iter().find(|e| e.id == declaring_id);
+                        let path = declaring_entry
+                            .map(|e| e.path.clone())
+                            .unwrap_or_else(|| entry.path.clone());
+                        let owned = declaring_entry.map(|e| e.is_export).unwrap_or(false);
+                        (path, owned)
+                    }
+                    _ => (entry.path.clone(), entry.is_export),
                 };
                 let rust_ident_str = wit_name.to_upper_camel_case();
                 resources.push(ResourceInfo {
                     iface_path: declaring_path,
                     wit_name: wit_name.clone(),
                     rust_ident: syn::Ident::new(&rust_ident_str, Span::call_site()),
+                    is_owned,
                 });
                 continue;
             }
@@ -183,6 +184,24 @@ pub fn build_ir(
         args_records,
         fn_sigs,
     })
+}
+
+/// Walk `Type(_)` aliases to find a type's original declaration.
+/// WIT's `use types.{R}` produces a local alias whose `kind =
+/// Type(original_id)` and whose `owner` is the using interface; the
+/// real `Resource` (or `Record`, etc.) lives at the original id.
+fn resolve_through_aliases(
+    resolve: &Resolve,
+    mut type_id: TypeId,
+) -> (TypeId, &wit_parser::TypeDef) {
+    loop {
+        let td = &resolve.types[type_id];
+        if let TypeDefKind::Type(wit_parser::Type::Id(next)) = td.kind {
+            type_id = next;
+            continue;
+        }
+        return (type_id, td);
+    }
 }
 
 fn resource_pascal(resolve: &Resolve, type_id: TypeId) -> Result<String> {
@@ -265,15 +284,25 @@ impl From<&FunctionKind> for ExportFnKind {
     }
 }
 
-/// A WIT resource declared in an exported interface.
+/// A WIT resource reachable from the wrapper world.
 pub struct ResourceInfo {
-    /// `bindings::exports::...::store` (the interface module path).
+    /// `bindings::exports::...::store` for resources the wrapper
+    /// owns (the iface that DECLARES them is on the export side);
+    /// `bindings::...::store` (no `exports::`) for resources the
+    /// wrapper merely USES (declared in an iface only on the
+    /// import side, as for tier-3 wraps over factored types where
+    /// the inner producer owns the resource).
     pub iface_path: BindingsPath,
     /// Kebab-case WIT name, e.g. `"bucket"`.
     #[allow(dead_code)]
     pub wit_name: String,
     /// PascalCase Rust ident wit-bindgen emits for the resource type.
     pub rust_ident: syn::Ident,
+    /// True iff the wrapper EXPORTS the iface that declares this
+    /// resource (the wrapper is the canonical type owner and emits
+    /// a `WrapperR` newtype + `GuestR` impl). False for resources
+    /// the wrapper only consumes from an imported iface.
+    pub is_owned: bool,
 }
 
 /// A named entity that gets a `WitTyped` impl: either a WIT-declared
@@ -479,6 +508,32 @@ impl WitTypeRef {
                     || err.as_ref().is_some_and(|t| t.contains_resource_own())
             }
             WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_resource_own()),
+        }
+    }
+
+    /// True if this type tree contains an `own<R>` handle for a
+    /// resource the wrapper OWNS. Resources the wrapper only uses
+    /// (factored types via an imported `-types` iface) flow through
+    /// untouched, so the wrap doesn't fire for them.
+    pub fn contains_owned_resource(&self, resources: &[ResourceInfo]) -> bool {
+        let owned = |nr: &NamedRef| {
+            resources
+                .iter()
+                .any(|r| r.is_owned && r.rust_ident == nr.rust_ident && r.iface_path == nr.path)
+        };
+        match self {
+            WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => owned(nr),
+            WitTypeRef::Handle(_) | WitTypeRef::Primitive(_) | WitTypeRef::Named(_) => false,
+            WitTypeRef::List(inner) | WitTypeRef::Option(inner) => {
+                inner.contains_owned_resource(resources)
+            }
+            WitTypeRef::Result { ok, err } => {
+                ok.as_ref().is_some_and(|t| t.contains_owned_resource(resources))
+                    || err.as_ref().is_some_and(|t| t.contains_owned_resource(resources))
+            }
+            WitTypeRef::Tuple(elems) => {
+                elems.iter().any(|t| t.contains_owned_resource(resources))
+            }
         }
     }
 }

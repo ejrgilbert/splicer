@@ -3,8 +3,11 @@
 //! types. The output is a single WIT text + world name + qualified
 //! interface name, suitable for [`super::GenerateWrapperInput`].
 
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, Context, Result};
 use wit_component::{Output, WitPrinter};
+use wit_parser::{InterfaceId, Resolve, TypeOwner};
 
 use super::Behavior;
 use crate::adapter::resolve::{decode_input_resolve, find_target_interface};
@@ -37,13 +40,51 @@ pub fn target_wit_for_codegen(
         .id_of(target_iface_id)
         .ok_or_else(|| anyhow!("target interface `{target_interface}` has no qualified name"))?;
 
+    // Sibling `-types` interfaces the target `use`s. For the
+    // wasi-style factored-types pattern (resources declared in a
+    // sibling, referenced via `use types.{R}`), the wrapper world
+    // has to also claim these so wit-bindgen materializes the
+    // resource type in the wrapper crate's bindings and so wac can
+    // wire handle traffic between consumer and inner producer.
+    let sibling_ifaces = sibling_types_ifaces_of(&resolve, target_iface_id);
+    let sibling_qualified: Vec<String> = sibling_ifaces
+        .iter()
+        .map(|id| {
+            resolve.id_of(*id).ok_or_else(|| {
+                anyhow!("sibling interface used by `{target_interface}` has no qualified name")
+            })
+        })
+        .collect::<Result<_>>()?;
+
     let mut out = String::new();
     out.push_str(&format!("package {WRAPPER_PACKAGE};\n\n"));
     out.push_str(&format!("world {WRAPPER_WORLD} {{\n"));
-    out.push_str(&format!("    export {qualified};\n"));
-    // Tier-4 synthesizes the result in-strategy, so no downstream import.
-    if matches!(behavior, Behavior::Transform) {
-        out.push_str(&format!("    import {qualified};\n"));
+    match behavior {
+        Behavior::Transform => {
+            // Tier-3 wraps with an inner producer; resource type
+            // identity flows from the inner via import of the
+            // sibling types iface. The wrapper does NOT export the
+            // types iface — wac wires the consumer's
+            // `<iface>-types` import to the inner producer's
+            // export directly, leaving the wrapper out of the
+            // resource type's ownership chain. Resource-method
+            // interception requires a different substrate pattern
+            // (see docs/TODO/resource-method-interception.md).
+            for q in &sibling_qualified {
+                out.push_str(&format!("    import {q};\n"));
+            }
+            out.push_str(&format!("    export {qualified};\n"));
+            out.push_str(&format!("    import {qualified};\n"));
+        }
+        Behavior::Virtualize => {
+            // Tier-4 has no inner producer; the wrapper IS the type
+            // owner. Export the sibling types iface and synthesize
+            // resources via the strategy.
+            for q in &sibling_qualified {
+                out.push_str(&format!("    export {q};\n"));
+            }
+            out.push_str(&format!("    export {qualified};\n"));
+        }
     }
     out.push_str("}\n\n");
 
@@ -64,6 +105,41 @@ pub fn target_wit_for_codegen(
         world_name: WRAPPER_WORLD.to_string(),
         qualified_name: qualified,
     })
+}
+
+/// Walk `target`'s types and return every sibling interface that
+/// declares a type referenced via `use types.{R}` (or any other type
+/// whose original owner is a different interface). The wasi-style
+/// factored-types pattern lands resources in a sibling `-types`
+/// interface; the wrapper world has to claim that interface too so
+/// the resource type identity is part of the wac composition.
+fn sibling_types_ifaces_of(
+    resolve: &Resolve,
+    target: InterfaceId,
+) -> BTreeSet<InterfaceId> {
+    let mut out = BTreeSet::new();
+    let iface = &resolve.interfaces[target];
+    for (_name, type_id) in &iface.types {
+        // Follow `Type(_)` aliases (wit-parser models `use` as a
+        // local alias whose `kind = Type(original_id)`) until we
+        // reach the original declaration. The original's owner is
+        // the interface that actually declared the type.
+        let mut cur = *type_id;
+        loop {
+            let td = &resolve.types[cur];
+            if let wit_parser::TypeDefKind::Type(wit_parser::Type::Id(next)) = td.kind {
+                cur = next;
+                continue;
+            }
+            if let TypeOwner::Interface(declaring) = td.owner {
+                if declaring != target {
+                    out.insert(declaring);
+                }
+            }
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
