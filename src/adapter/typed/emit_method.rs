@@ -293,7 +293,10 @@ fn emit_method_body(
     let mut sig_inputs = method.sig.inputs.clone();
     let mut sig_output = method.sig.output.clone();
     {
-        let mut visitor = AbsolutizeResources { resources: &ir.resources };
+        let mut visitor = AbsolutizeResources {
+            resources: &ir.resources,
+            types: &ir.types,
+        };
         for arg in sig_inputs.iter_mut() {
             syn::visit_mut::VisitMut::visit_fn_arg_mut(&mut visitor, arg);
         }
@@ -524,13 +527,19 @@ fn emit_method_body(
     }
 }
 
-/// Rewrite bare iface-local resource idents (e.g. `Bucket`) inside a
-/// syn type into their absolute `bindings::<iface_path>::<R>` form,
-/// recursively. wit-bindgen's trait sigs use the bare form because
-/// they're emitted *inside* the iface module; our impl block lives
-/// at the wrapper crate's top level and needs the absolute path.
+/// Rewrite bare iface-local type idents (e.g. `Bucket`, `ErrorCode`)
+/// inside a syn type into their absolute `bindings::<iface_path>::<R>`
+/// form, recursively. wit-bindgen's trait sigs use the bare form
+/// because they're emitted *inside* the iface module; our impl block
+/// lives at the wrapper crate's top level and needs the absolute path.
+///
+/// Covers both resource types (`Bucket`, `BucketBorrow<'_>`) and
+/// non-resource named types (`ErrorCode`, user records / enums /
+/// variants / flags) that the target iface `use`s from a sibling
+/// types iface.
 struct AbsolutizeResources<'a> {
     resources: &'a [ResourceInfo],
+    types: &'a [NamedType],
 }
 
 impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
@@ -547,7 +556,7 @@ impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
             // Try exact match first: a resource literally named
             // `FooBorrow` in own position must NOT be rewritten as
             // `Foo` via the suffix-strip path.
-            let matched = self
+            let resource_match = self
                 .resources
                 .iter()
                 .find(|r| r.rust_ident == seg_ident)
@@ -559,14 +568,28 @@ impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
                             self.resources.iter().find(|r| r.rust_ident == stripped)
                         })
                 });
-            if let Some(r) = matched {
-                let abs = absolute_resource_path(r, &seg_ident);
-                // Preserve the original segment's path args (e.g. the
-                // `<'_>` carried by `BucketBorrow<'_>`).
+            if let Some(r) = resource_match {
+                let abs = absolute_resource_path(&r.iface_path, &seg_ident);
                 let trailing_args = tp.path.segments[0].arguments.clone();
                 tp.path = abs;
                 if let Some(last) = tp.path.segments.last_mut() {
                     last.arguments = trailing_args;
+                }
+            } else if let Some(nt) = self.types.iter().find(|t| t.rust_ident == seg_ident) {
+                // Non-resource named types (records, variants, enums,
+                // flags) reached via `use types.{ErrorCode};` are
+                // emitted inside the declaring iface's module. Rewrite
+                // to the absolute path only when the type lives in a
+                // bindings module — top-level synthesized args
+                // records keep their bare ident at the wrapper crate's
+                // top level.
+                if let TypeLocation::InBindings { path } = &nt.location {
+                    let abs = absolute_resource_path(path, &seg_ident);
+                    let trailing_args = tp.path.segments[0].arguments.clone();
+                    tp.path = abs;
+                    if let Some(last) = tp.path.segments.last_mut() {
+                        last.arguments = trailing_args;
+                    }
                 }
             }
         }
@@ -576,16 +599,16 @@ impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
 
 /// Build an absolute `bindings::<iface>::<seg_ident>` path. `seg_ident`
 /// is what wit-bindgen used for the terminal segment (`Bucket` for
-/// own, `BucketBorrow` for borrow); the IfacePath comes from the
-/// resource's declaring interface.
-fn absolute_resource_path(r: &ResourceInfo, seg_ident: &syn::Ident) -> syn::Path {
+/// own, `BucketBorrow` for borrow, `ErrorCode` for a used variant);
+/// `iface_path` comes from the declaring interface's IR entry.
+fn absolute_resource_path(iface_path: &[String], seg_ident: &syn::Ident) -> syn::Path {
     use syn::punctuated::Punctuated;
     let mut segments: Punctuated<syn::PathSegment, syn::Token![::]> = Punctuated::new();
     segments.push(syn::PathSegment {
         ident: syn::Ident::new("bindings", Span::call_site()),
         arguments: syn::PathArguments::None,
     });
-    for s in &r.iface_path {
+    for s in iface_path {
         segments.push(syn::PathSegment {
             ident: syn::Ident::new(s, Span::call_site()),
             arguments: syn::PathArguments::None,

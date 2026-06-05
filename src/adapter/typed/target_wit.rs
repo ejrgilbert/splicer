@@ -59,17 +59,24 @@ pub fn target_wit_for_codegen(
     let mut out = String::new();
     out.push_str(&format!("package {WRAPPER_PACKAGE};\n\n"));
     out.push_str(&format!("world {WRAPPER_WORLD} {{\n"));
+    // TODO: tier-3 wrap of resource-bearing interfaces (whether
+    // inline or factored) is blocked by a component-model spec gap.
+    // The wrapper needs to say "my export of `async-bucket` uses the
+    // bucket I'm importing from `async-bucket-types`" — i.e.,
+    // re-export an imported type's identity through the export side.
+    // WIT has no syntax for this today; wit-component creates a new
+    // contextual resource identity on the export side, and wac
+    // rejects the composition with "resource types are not the
+    // same". See bytecodealliance/wasm-tools#2506 (closed: not a
+    // tool bug, needs first-class WIT syntax). Tier-4 wrap is
+    // unaffected because the wrapper is the type owner.
+    // See docs/TODO/resource-method-interception.md.
     match behavior {
         Behavior::Transform => {
-            // Tier-3 wraps with an inner producer; resource type
-            // identity flows from the inner via import of the
-            // sibling types iface. The wrapper does NOT export the
-            // types iface — wac wires the consumer's
-            // `<iface>-types` import to the inner producer's
-            // export directly, leaving the wrapper out of the
-            // resource type's ownership chain. Resource-method
-            // interception requires a different substrate pattern
-            // (see docs/TODO/resource-method-interception.md).
+            // Tier-3 wraps with an inner producer; sibling types
+            // iface is pulled in transitively by the target's `use`
+            // statement. wit-component emits the right import in
+            // the encoded wrapper regardless.
             for q in &sibling_qualified {
                 out.push_str(&format!("    import {q};\n"));
             }
