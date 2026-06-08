@@ -181,7 +181,7 @@ impl Entity {
 /// [`EmitPlan`] transformations; rendered by [`EmitPlan::render`].
 #[derive(Debug, Default)]
 struct EmitPlan {
-    // ── Output (consumed by `render`) ──
+    // Output (consumed by `render`)
     /// All entities to emit, keyed by their var name.
     entities: BTreeMap<String, Entity>,
     /// `(export_iface, source_var)` to emit `export src_var["iface"];` for.
@@ -196,7 +196,7 @@ struct EmitPlan {
     /// emitted command line deterministic.
     used_middlewares: BTreeMap<String, String>,
 
-    // ── Planning state (carried between pipeline steps) ──
+    // Planning state
     /// First non-`None` alias seen per node id. Drives the var assigned
     /// to that node. Subsequent differing aliases for the same id are
     /// silently ignored on the assumption that `add_to_inject_plan`
@@ -222,9 +222,7 @@ struct EmitPlan {
     /// [`Self::simple_mdl_counts`] — distinct downstream wirings get
     /// distinct instances.
     adapter_counts: HashMap<String, usize>,
-    /// Use-count per bridge pkg. Multiple chains can share one bridge
-    /// `.wasm` but each chain needs its own wac instance with its own
-    /// downstream wiring; same disambiguation scheme as adapters.
+    /// Use-count per bridge pkg.
     bridge_counts: HashMap<String, usize>,
     /// Real-middleware vars already added (dedup tier-1 across rules).
     emitted_real_vars: HashSet<String>,
@@ -646,15 +644,11 @@ impl EmitPlan {
         }
     }
 
-    /// Register a sync→async bridge entity in the plan. The bridge
-    /// exports `target_interface` to its callers and imports
-    /// `mirror_iface_qualified` from `downstream_var`.
-    /// Returns the bridge's wac var, ready to be plugged into
-    /// `self.routing` / `self.export_routing`.
+    /// Register a sync-to-async bridge entity in the plan.
     ///
     /// Multiple calls with the same `target_interface` share one
-    /// `wac_deps` pkg entry but get distinct vars (`-1`, `-2`, …) so
-    /// each chain's bridge instance carries its own downstream wiring.
+    /// `wac_deps` pkg entry but get distinct vars so each chain's
+    /// bridge instance carries its own downstream wiring.
     fn add_bridge_entity(
         &mut self,
         target_interface: &str,
@@ -669,9 +663,7 @@ impl EmitPlan {
             downstream_var.to_string(),
         )];
         // The bridge has exactly one declared import (the mirror) and
-        // one export (the target). No host/peer catchall is meaningful
-        // — emit a strict entity so future tightening of wac's `...`
-        // semantics can't quietly break the bridge.
+        // one export (the target)
         self.entities.insert(
             bridge_var.clone(),
             Entity {
@@ -873,17 +865,11 @@ struct SpliceCtx<'a> {
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: Vec<GeneratedAdapter>,
-    /// Decode-cache: `(target_split_path, target_interface)` → has
-    /// at least one sync (non-async) function declared on that
-    /// interface.
     target_has_sync_cache: HashMap<(String, String), bool>,
-    /// `(target_split_path, target_interface)` →
+    /// `(target_split_path, target_interface)` ->
     /// `(bridge_wasm_path, async_mirror_qualified_name)`. One bridge
     /// per distinct provider+interface across the run; shared by every
-    /// site that needs it. The split path is part of the key as
-    /// defensive insurance: two providers exporting the same iface
-    /// name with divergent transitive type definitions get distinct
-    /// bridges instead of silently sharing one.
+    /// site that needs it.
     bridges: HashMap<(String, String), (String, String)>,
 }
 
@@ -1600,9 +1586,7 @@ fn factored_types_to_wire(
 }
 
 /// Cached bridge generation. Returns the bridge's `.wasm` path and
-/// the async-mirror interface's fully-qualified name; both are also
-/// stored on `accs.bridges` so later sites + EmitPlan routing share
-/// the same generated component.
+/// the async-mirror interface's fully-qualified name.
 fn ensure_bridge(
     target_interface: &str,
     target_split_path: &str,

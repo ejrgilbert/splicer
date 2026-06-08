@@ -14,26 +14,18 @@ use crate::adapter::resolve::{decode_input_resolve, find_target_interface};
 pub struct TargetWit {
     pub wit_text: String,
     pub world_name: String,
-    /// User-facing target name. Stays as the original even when the
-    /// wrapper world exports the async mirror — runtime
-    /// `CallId.interface_name` shows what middleware authors wrote.
+    /// User-facing target name.
     pub qualified_name: String,
 }
 
-/// Synthetic world's own package keeps its name from colliding with
-/// composition packages.
 const WRAPPER_PACKAGE: &str = "splicer:wrapper@0.0.0";
 const WRAPPER_WORLD: &str = "target";
 
-/// Renders every package in the resolve (wit-bindgen tolerates
-/// unused packages; precise closure walk would need wit-parser
-/// internals).
+/// Renders every package in the resolve.
 ///
-/// `mirror_export_name = Some(qname)` triggers the sync→async bridge
-/// path: synthesize an async mirror, export it instead of the target,
-/// cross-check against the caller-supplied name (mismatch bails with
-/// [`MIRROR_NAME_MISMATCH_PREFIX`]). Caller is responsible for only
-/// passing `Some` when the target is sync-WIT.
+/// Pass `mirror_export_name = Some(qname)` to trigger the sync-to-async bridge
+/// path. This synthesizes an async mirror, exports it instead of the target,
+/// cross-checks against the caller-supplied name. Bail on mismatch.
 pub fn target_wit_for_codegen(
     component_bytes: &[u8],
     target_interface: &str,
@@ -69,8 +61,7 @@ pub fn target_wit_for_codegen(
     out.push_str(&format!("package {WRAPPER_PACKAGE};\n\n"));
     out.push_str(&format!("world {WRAPPER_WORLD} {{\n"));
     out.push_str(&format!("    export {export_iface};\n"));
-    // Tier-3 imports the real sync target even when lifting the
-    // mirror — async lift can canon-lower onto a sync downstream.
+    // Tier-3 imports the real sync target even when lifting the mirror.
     // Tier-4 has no downstream import (result synthesized in-strategy).
     if matches!(behavior, Behavior::Transform) {
         out.push_str(&format!("    import {qualified};\n"));

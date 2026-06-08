@@ -222,10 +222,8 @@ fn materialize_from_prepared(
     let adapter_path = ensure_preview1_adapter(&cache_root)?;
     let strategy_type = prep.strategy_crate_name.to_upper_camel_case();
 
-    // Bridged variants need a distinct on-disk wasm so two rules
-    // using the same builtin on different (sync vs async) targets
-    // don't overwrite each other's output. The mirror hash already
-    // uniquely identifies the target's sync-WIT interface.
+    // Bridged variants need a distinct on-disk wasm so two rules using the same
+    // builtin on different targets don't overwrite each other's output.
     let bridged_out_name;
     let out_name: &str = if let Some(mirror) = mirror_export_name {
         let mirror_tag = mirror

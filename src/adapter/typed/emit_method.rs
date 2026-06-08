@@ -171,16 +171,12 @@ fn emit_method_body(
 
     // Transform strategies forward to the wrapped target via the
     // closure; virtualize strategies replace the target and never
-    // call into it. The downstream import path is derived from the
-    // user-facing target qname (which may differ from the wrapper's
-    // lift path on the bridged sync→async path). `.await` only if
-    // the Guest method is async.
+    // call into it.
     let target_call = build_target_call(method_ident, fields, interface_qualified_name);
-    // On the bridged path the Guest is async but the downstream
-    // import is sync — skip `.await`.
     let target_call = if method.sig.asyncness.is_some() && !bridged_sync_target {
         quote! { #target_call.await }
     } else {
+        // Guest is async but the downstream import is sync, skip `.await`
         target_call
     };
 
@@ -250,18 +246,13 @@ fn return_type(sig: &syn::Signature) -> TokenStream {
     }
 }
 
-/// Build the closure body that calls the wrapped target's import
-/// path. Derives the path from the user-facing target qname (e.g.
-/// `my:service/adder` → `bindings::my::service::adder`) so the
-/// bridged sync→async path — where the wrapper exports an async
-/// mirror but imports the real sync target downstream — points at
-/// the right side.
+/// Build the closure body that calls the wrapped target's import path.
 fn build_target_call(
     method_ident: &syn::Ident,
     fields: &[RecordField],
     interface_qualified_name: &str,
 ) -> TokenStream {
-    let segments = iface_qname_to_bindings_segments(interface_qualified_name);
+    let segments = iface_name_to_bindings_segments(interface_qualified_name);
     let import_path = bindings_path_tokens(&segments, None);
     let arg_exprs = fields.iter().map(|f| {
         let name = &f.rust_ident;
@@ -271,18 +262,17 @@ fn build_target_call(
 }
 
 /// Convert a fully-qualified WIT interface name to the segment path
-/// wit-bindgen's Rust output uses, e.g. `my:service/adder@1.0.0` →
-/// `["my", "service", "adder"]`. Versions are stripped; kebab-case
-/// idents become snake_case.
-fn iface_qname_to_bindings_segments(qname: &str) -> Vec<String> {
+/// wit-bindgen's Rust output uses:
+/// `my:service/adder@1.0.0` --> `["my", "service", "adder"]`.
+fn iface_name_to_bindings_segments(name: &str) -> Vec<String> {
     use heck::ToSnakeCase;
-    let unversioned = qname.split('@').next().unwrap_or(qname);
+    let unversioned = name.split('@').next().unwrap_or(name);
     let (pkg, iface) = unversioned
         .split_once('/')
-        .expect("WIT iface qname has `pkg/iface` form");
+        .expect("WIT iface name has `pkg/iface` form");
     let (ns, name) = pkg
         .split_once(':')
-        .expect("WIT pkg qname has `ns:name` form");
+        .expect("WIT pkg name has `ns:name` form");
     [ns, name, iface]
         .into_iter()
         .map(|s| s.to_snake_case())

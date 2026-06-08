@@ -119,8 +119,7 @@ pub struct GenerateWrapperInput<'a> {
     /// dedupes the two into a single source.
     pub splicer_tool_sdk_version: &'a str,
     /// `true` when the wrapper lifts an async-WIT mirror against a
-    /// sync-WIT downstream — the Guest impl's body must call the
-    /// import without `.await` since the wrapped target is sync.
+    /// sync-WIT downstream
     pub bridged_sync_target: bool,
 }
 

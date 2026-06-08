@@ -192,7 +192,7 @@ mod tests {
             strategy_crate_path: "/p",
             strategy_type: "S",
             splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
-        bridged_sync_target: false,
+            bridged_sync_target: false,
         }
     }
 

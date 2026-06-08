@@ -1,33 +1,22 @@
-//! Async-WIT mirror synthesis and the sync→async bridge component
+//! Async-WIT mirror synthesis and the sync-to-async bridge component
 //! that uses it.
 
 pub(crate) mod bridge;
 
-/// Shared prefix for the bail when caller-supplied vs synthesized
-/// mirror names disagree. Both sides derive the same hash, so a
-/// mismatch is a splicer bug. Pulled into a constant so tests can
-/// assert without pinning the full sentence.
 pub(crate) const MIRROR_NAME_MISMATCH_PREFIX: &str = "async mirror name mismatch";
 
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::WitPrinter;
 use wit_parser::{FunctionKind, InterfaceId, Resolve, Type};
 
-/// Push a new package into `resolve` containing one interface that
-/// async-mirrors `iface_id`: same named types (re-shared via `use`),
-/// every `func` rewritten as `async func`. Returns the async mirror
-/// interface's id plus its fully-qualified name (e.g.
-/// `"splicer:async-mirror-<hash>/<iface>@0.0.1"`).
+/// Push a new package into `resolve` containing one interface to mirror
+/// `iface_id` as async. Returns the async mirror interface's id plus its
+/// fully-qualified name (e.g. `"splicer:async-mirror-<hash>/<iface>@0.0.1"`).
 ///
 /// Bails on:
-/// - interfaces with no qualified name (splicer never
-///   targets these),
+/// - interfaces with no qualified name,
 /// - interfaces with resource-bound functions (methods, statics,
-///   constructors): WIT syntax requires those inside `resource { … }`
-///   blocks, which the async mirror would have to redeclare with
-///   re-shared resource identity — out of scope until the fuzzer
-///   surfaces a real target shape that hits this.
-#[allow(dead_code)]
+///   constructors)
 pub(crate) fn synthesize_async_mirror(
     resolve: &mut Resolve,
     iface_id: InterfaceId,
@@ -49,16 +38,13 @@ pub(crate) fn synthesize_async_mirror(
                 "interface `{qualified}` declares resource-bound function `{fn_name}` \
                  ({:?}); async-WIT mirror synthesis only supports freestanding functions. \
                  Targeting resource-bearing sync interfaces requires extending the async \
-                 mirror synth to redeclare resources via `use` and re-emit methods inside \
-                 the resource block.",
+                 mirror synth to redeclare resources and re-emit methods inside the resource block.",
                 func.kind,
             );
         }
     }
 
-    // Render param/result types via the printer so the WIT we push is
-    // syntactically faithful to the original — primitives, aggregates,
-    // and `Id` references to named types all round-trip.
+    // Render param/result types
     let render_ty = |ty: &Type| -> Result<String> {
         let mut printer = WitPrinter::default();
         printer
@@ -114,9 +100,7 @@ pub(crate) fn synthesize_async_mirror(
     Ok((mirror_iface_id, mirror_qualified))
 }
 
-/// 16-hex-char (64-bit) sha256 prefix. Stable across Rust versions
-/// and processes — bridge and adapter sides derive the same mirror
-/// name independently, so the hash must agree across toolchains.
+/// 16-hex-char (64-bit) sha256 prefix
 pub(crate) fn short_hash_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(s.as_bytes());
