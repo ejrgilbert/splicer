@@ -405,10 +405,8 @@ impl HandleRef {
             // `borrow<R>` lowers to wit-bindgen's `BucketBorrow<'a>`
             // companion struct, with the lifetime hardcoded to `'a`.
             HandleRef::ResourceBorrow(nr) => {
-                let borrow_ident = syn::Ident::new(
-                    &format!("{}Borrow", nr.rust_ident),
-                    Span::call_site(),
-                );
+                let borrow_ident =
+                    syn::Ident::new(&format!("{}Borrow", nr.rust_ident), Span::call_site());
                 let path = bindings_path_tokens(&nr.path, Some(&borrow_ident));
                 let lt = syn::Lifetime::new("'a", Span::call_site());
                 quote!(#path<#lt>)
@@ -528,12 +526,13 @@ impl WitTypeRef {
                 inner.contains_owned_resource(resources)
             }
             WitTypeRef::Result { ok, err } => {
-                ok.as_ref().is_some_and(|t| t.contains_owned_resource(resources))
-                    || err.as_ref().is_some_and(|t| t.contains_owned_resource(resources))
+                ok.as_ref()
+                    .is_some_and(|t| t.contains_owned_resource(resources))
+                    || err
+                        .as_ref()
+                        .is_some_and(|t| t.contains_owned_resource(resources))
             }
-            WitTypeRef::Tuple(elems) => {
-                elems.iter().any(|t| t.contains_owned_resource(resources))
-            }
+            WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_owned_resource(resources)),
         }
     }
 }

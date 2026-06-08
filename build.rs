@@ -413,38 +413,49 @@ fn copy_dir_recursive(src: &Path, dest: &Path) {
     }
 }
 
-/// Rewrite the strategy's `splicer-tool-sdk` dep to a plain version
-/// string, stripping the dev-only `path` hint that only resolves at
-/// the repo location (not after OUT_DIR staging).
+/// Strip `path` from any `{ path, version }` dep so cargo falls back to
+/// the registry version after OUT_DIR staging. Panics if `splicer-tool-sdk`
+/// is missing from `[dependencies]` — required by the wrapper codegen.
 fn normalize_strategy_cargo_toml(src: &str, src_path: &Path) -> String {
     let mut parsed: toml::Value = toml::from_str(src).unwrap_or_else(|e| {
         panic!("Failed to parse {} as TOML: {e}", src_path.display());
     });
-    let version = parsed
+
+    for table_name in ["dependencies", "build-dependencies", "dev-dependencies"] {
+        let Some(table) = parsed.get_mut(table_name).and_then(|d| d.as_table_mut()) else {
+            continue;
+        };
+        for (_key, val) in table.iter_mut() {
+            let Some(t) = val.as_table_mut() else {
+                continue;
+            };
+            if t.contains_key("path") && t.contains_key("version") {
+                t.remove("path");
+            }
+            if t.len() == 1 {
+                if let Some(v) = t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                {
+                    *val = toml::Value::String(v);
+                }
+            }
+        }
+    }
+
+    let has_sdk = parsed
         .get("dependencies")
         .and_then(|d| d.get("splicer-tool-sdk"))
-        .and_then(|d| match d {
-            toml::Value::String(s) => Some(s.clone()),
-            toml::Value::Table(t) => t
-                .get("version")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "Strategy {} must declare splicer-tool-sdk = \"<version>\" \
-                 (or `{{ version = \"<version>\", path = \"...\" }}`) in [dependencies]",
-                src_path.display(),
-            );
-        });
-
-    if let Some(deps) = parsed
-        .get_mut("dependencies")
-        .and_then(|d| d.as_table_mut())
-    {
-        deps.insert("splicer-tool-sdk".to_string(), toml::Value::String(version));
+        .is_some();
+    if !has_sdk {
+        panic!(
+            "Strategy {} must declare splicer-tool-sdk = \"<version>\" \
+             (or `{{ version = \"<version>\", path = \"...\" }}`) in [dependencies]",
+            src_path.display(),
+        );
     }
+
     toml::to_string(&parsed).unwrap_or_else(|e| {
         panic!(
             "Failed to re-serialize normalized Cargo.toml for {}: {e}",

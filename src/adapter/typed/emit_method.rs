@@ -40,8 +40,8 @@ use quote::quote;
 
 use super::bindings_index::{bindings_path_tokens, GuestMethod, GuestTrait, GuestTraitKind};
 use super::ir::{
-    args_struct_ident, ExportFnKind, HandleRef, NamedKind, NamedType, RecordField,
-    ResourceInfo, TypeLocation, WitTypeRef, WrapperIR,
+    args_struct_ident, ExportFnKind, HandleRef, NamedKind, NamedType, RecordField, ResourceInfo,
+    TypeLocation, WitTypeRef, WrapperIR,
 };
 use super::Behavior;
 
@@ -268,7 +268,9 @@ fn emit_args_struct(
 }
 
 fn args_has_borrow(args_record: &NamedType) -> bool {
-    args_fields(args_record).iter().any(|f| f.ty.contains_borrow())
+    args_fields(args_record)
+        .iter()
+        .any(|f| f.ty.contains_borrow())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,7 +681,12 @@ fn build_resource_wrap(
     if !ret.contains_owned_resource(resources) {
         return None;
     }
-    Some(build_wrap_at(ret, source_for_forward, source_for_reverse, resources))
+    Some(build_wrap_at(
+        ret,
+        source_for_forward,
+        source_for_reverse,
+        resources,
+    ))
 }
 
 struct CompoundWrap {
@@ -805,10 +812,8 @@ fn build_wrap_at(
             } else {
                 quote!((#(#elem_tys),*))
             };
-            let fwd_elems: Vec<&TokenStream> =
-                elem_wraps.iter().map(|w| &w.forward_expr).collect();
-            let rev_elems: Vec<&TokenStream> =
-                elem_wraps.iter().map(|w| &w.reverse_expr).collect();
+            let fwd_elems: Vec<&TokenStream> = elem_wraps.iter().map(|w| &w.forward_expr).collect();
+            let rev_elems: Vec<&TokenStream> = elem_wraps.iter().map(|w| &w.reverse_expr).collect();
             let fwd_tuple = if fwd_elems.len() == 1 {
                 let e = &fwd_elems[0];
                 quote!((#e,))
