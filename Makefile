@@ -10,12 +10,28 @@ BUILTIN_NAMES := $(shell for d in $(BUILTINS_DIR)/*/wit; do \
 done)
 BUILTIN_WASMS := $(addprefix $(ASSETS_DIR)/,$(addsuffix .wasm,$(BUILTIN_NAMES)))
 
+# Tier-3/4 strategies ship as rlibs but still need wit/deps/ populated
+# so splicer's splice-time wrapper build can run wit-bindgen against
+# their consumer-side WIT. Fetched here, not in the cdylib pattern rule.
+STRATEGY_NAMES := $(shell for d in $(BUILTINS_DIR)/*/wit; do \
+  crate=$$(dirname $$d); \
+  awk '/^tier *= *[34] *$$/ {f=1} END{exit !f}' $$crate/manifest.toml 2>/dev/null \
+    && basename $$crate; \
+done)
+STRATEGY_WIT_DEPS := $(addprefix $(BUILTINS_DIR)/,$(addsuffix /wit/deps,$(STRATEGY_NAMES)))
+
 # wkg.toml [overrides] resolves splicer:tier1 / splicer:common from
 # these dirs, so any change in here invalidates every builtin.
 CANONICAL_WIT := $(wildcard wit/tier1/*.wit wit/common/*.wit)
 
 .PHONY: build-builtins check-env clean-builtins
-build-builtins: check-env $(BUILTIN_WASMS)
+build-builtins: check-env $(BUILTIN_WASMS) $(STRATEGY_WIT_DEPS)
+
+$(BUILTINS_DIR)/%/wit/deps: \
+    $(BUILTINS_DIR)/%/wit/world.wit \
+    $(BUILTINS_DIR)/%/wkg.toml
+	@echo "── Fetching wit/deps for strategy: $* ──"
+	cd $(BUILTINS_DIR)/$* && wkg wit fetch
 
 # Verify the toolchain is installed before invoking it. Quiet on
 # success; on failure, lists every missing tool with an install hint
