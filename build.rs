@@ -422,19 +422,22 @@ fn normalize_strategy_cargo_toml(src: &str, src_path: &Path) -> String {
     });
 
     for table_name in ["dependencies", "build-dependencies", "dev-dependencies"] {
-        let Some(table) = parsed
-            .get_mut(table_name)
-            .and_then(|d| d.as_table_mut())
-        else {
+        let Some(table) = parsed.get_mut(table_name).and_then(|d| d.as_table_mut()) else {
             continue;
         };
         for (_key, val) in table.iter_mut() {
-            let Some(t) = val.as_table_mut() else { continue };
+            let Some(t) = val.as_table_mut() else {
+                continue;
+            };
             if t.contains_key("path") && t.contains_key("version") {
                 t.remove("path");
             }
             if t.len() == 1 {
-                if let Some(v) = t.get("version").and_then(|v| v.as_str()).map(str::to_string) {
+                if let Some(v) = t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                {
                     *val = toml::Value::String(v);
                 }
             }

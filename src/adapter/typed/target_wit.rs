@@ -120,10 +120,7 @@ pub fn target_wit_for_codegen(
 /// factored-types pattern lands resources in a sibling `-types`
 /// interface; the wrapper world has to claim that interface too so
 /// the resource type identity is part of the wac composition.
-fn sibling_types_ifaces_of(
-    resolve: &Resolve,
-    target: InterfaceId,
-) -> BTreeSet<InterfaceId> {
+fn sibling_types_ifaces_of(resolve: &Resolve, target: InterfaceId) -> BTreeSet<InterfaceId> {
     let mut out = BTreeSet::new();
     let iface = &resolve.interfaces[target];
     for (_name, type_id) in &iface.types {

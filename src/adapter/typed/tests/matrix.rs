@@ -802,8 +802,7 @@ fn matrix_multi_resource_with_cross_resource_borrow() {
     let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
-        oneline.contains("pub struct WrapperBucket")
-            && oneline.contains("pub struct WrapperConn"),
+        oneline.contains("pub struct WrapperBucket") && oneline.contains("pub struct WrapperConn"),
         "expected per-resource wrapper newtypes for both resources:\n{}",
         out.lib_rs,
     );

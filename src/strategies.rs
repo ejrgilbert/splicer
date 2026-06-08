@@ -94,10 +94,7 @@ pub enum Tier3_4Source<'a> {
     /// can be injected on multiple targets within one splice
     /// without the materialized wrappers colliding on a single
     /// `builtins/<name>.wasm` path.
-    Builtin {
-        name: &'a str,
-        wac_name: &'a str,
-    },
+    Builtin { name: &'a str, wac_name: &'a str },
     /// User-supplied strategy crate on disk. `wac_name` is the YAML
     /// `name:` field (the WAC variable identifier and the output
     /// filename stem); `strategy_dir` is the crate root containing
