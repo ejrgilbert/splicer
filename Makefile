@@ -3,11 +3,11 @@ BUILTINS_DIR  := builtins
 ASSETS_DIR    := assets/builtins
 ADAPTER       := $(BUILTINS_DIR)/wasi_snapshot_preview1.reactor.wasm
 
-# Every dir under builtins/ that has both a Cargo.toml and a wit/
-# directory is a builtin crate; the output goes to
-# assets/builtins/<name>.wasm. Host-side helper crates (e.g.
-# builtin-protocol) live alongside but lack wit/, so they're excluded.
-BUILTIN_NAMES := $(patsubst $(BUILTINS_DIR)/%/wit,%,$(wildcard $(BUILTINS_DIR)/*/wit))
+BUILTIN_NAMES := $(shell for d in $(BUILTINS_DIR)/*/wit; do \
+  crate=$$(dirname $$d); \
+  awk '/^tier *= *[12] *$$/ {f=1} END{exit !f}' $$crate/manifest.toml 2>/dev/null \
+    && basename $$crate; \
+done)
 BUILTIN_WASMS := $(addprefix $(ASSETS_DIR)/,$(addsuffix .wasm,$(BUILTIN_NAMES)))
 
 # wkg.toml [overrides] resolves splicer:tier1 / splicer:common from

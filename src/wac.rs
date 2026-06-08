@@ -616,11 +616,23 @@ impl EmitPlan {
             // Tier-4 (virtualize) middlewares don't import the target
             // (they replace the downstream instead of forwarding); the
             // wac wire must be skipped for those.
-            let imports = if mdl.tier.is_some_and(|t| !t.imports_target()) {
+            let mut imports = if mdl.tier.is_some_and(|t| !t.imports_target()) {
                 Vec::new()
             } else {
                 vec![(interface.name.clone(), downstream_var.to_string())]
             };
+            // Wire the config provider on the wrapper.
+            if let Some(cfg_path) = mdl.config_provider_path.as_ref() {
+                let cfg_pkg = format!("{real_pkg}-config");
+                self.entities
+                    .insert(cfg_pkg.clone(), Entity::leaf(&cfg_pkg, &cfg_pkg));
+                self.used_middlewares
+                    .insert(cfg_pkg.clone(), cfg_path.clone());
+                imports.push((
+                    crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED.to_string(),
+                    cfg_pkg,
+                ));
+            }
             self.entities
                 .insert(mw_var.clone(), Entity::wired(&mw_var, &real_pkg, imports));
             self.used_middlewares.insert(real_pkg, mdl_path);
@@ -1074,31 +1086,6 @@ fn apply_site(
     let caller_var = caller_id.map(|id| get_name(&ctx.composition.nodes[&id]).to_string());
 
     let edge_id = canonical_edge_id(interface, caller_var.as_deref(), &provider_var);
-    let edge_inject = build_per_edge_providers(rule.inject(), &edge_id, ctx.splits_path)?;
-
-    // Alias the matched provider; `between` also aliases the caller (outer).
-    // OnSubgraph is expected to be resolved before generate_wac runs,
-    // so it should never reach this site.
-    let new_aliases: Vec<(u32, Option<String>)> = match rule {
-        SpliceRule::Before { provider_alias, .. } => vec![(provider_id, provider_alias.clone())],
-        SpliceRule::Between {
-            inner_alias,
-            outer_alias,
-            ..
-        } => {
-            let mut v = vec![(provider_id, inner_alias.clone())];
-            if let Some(cid) = caller_id {
-                v.push((cid, outer_alias.clone()));
-            }
-            v
-        }
-        SpliceRule::OnNode { .. } | SpliceRule::OnSubgraph { .. } => {
-            anyhow::bail!(
-                "splicer bug: unresolved variant reached apply_site; \
-                 caller must run resolve_rules() first"
-            )
-        }
-    };
 
     // Prefer the consumer's split (provider_idx + 1) so the adapter
     // copies its import surface. At the outermost boundary there's no
@@ -1119,6 +1106,34 @@ fn apply_site(
                 ctx.shim_comps,
             )
         });
+
+    // Materialize tier-3/4 first so `build_per_edge_providers` sees
+    // the wrapper's config import on the resulting `config_as_wave`.
+    let materialized_inject =
+        materialize_tier3_4_inline(interface, rule.inject(), consumer_path.as_deref(), ctx)?;
+    let edge_inject = build_per_edge_providers(&materialized_inject, &edge_id, ctx.splits_path)?;
+
+    // Alias the matched provider; `between` also aliases the caller (outer).
+    let new_aliases: Vec<(u32, Option<String>)> = match rule {
+        SpliceRule::Before { provider_alias, .. } => vec![(provider_id, provider_alias.clone())],
+        SpliceRule::Between {
+            inner_alias,
+            outer_alias,
+            ..
+        } => {
+            let mut v = vec![(provider_id, inner_alias.clone())];
+            if let Some(cid) = caller_id {
+                v.push((cid, outer_alias.clone()));
+            }
+            v
+        }
+        SpliceRule::OnNode { .. } | SpliceRule::OnSubgraph { .. } => {
+            anyhow::bail!(
+                "splicer bug: unresolved variant reached apply_site; \
+                 caller must run resolve_rules() first"
+            )
+        }
+    };
 
     add_to_inject_plan(
         interface,
@@ -1287,9 +1302,8 @@ fn source_label<'a>(source: &crate::strategies::Tier3_4Source<'a>) -> &'a str {
     }
 }
 
-/// Stamp the materialized wrapper path + resolved tier onto a clone
-/// of `inj` so downstream stages treat it like any other path-backed
-/// middleware.
+/// Stamp the materialized wrapper path + tier onto a clone of `inj`
+/// and validate config against the wrapper's config import.
 fn stamp_materialized(
     inj: &Injection,
     wrapper_path: std::path::PathBuf,
@@ -1299,11 +1313,13 @@ fn stamp_materialized(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display()))?
         .to_string();
-    Ok(Injection {
+    let mut stamped = Injection {
         path: Some(path_str),
         tier: Some(tier),
         ..inj.clone()
-    })
+    };
+    crate::config_provider::validate_config_as_wave(&mut stamped)?;
+    Ok(stamped)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1319,15 +1335,10 @@ fn add_to_inject_plan(
     ctx: &SpliceCtx,
     accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<Vec<ContractResult>> {
-    // Tier-3/4 wrappers ARE the adapter — codegen them here so
-    // validate_contract sees their exports.
-    let to_inject_materialized =
-        materialize_tier3_4_inline(interface_name, to_inject, consumer_split.as_deref(), ctx)?;
-
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
     let contract_results = validate_contract(
-        &to_inject_materialized,
+        to_inject,
         interface_name,
         contract_fingerprint,
         &mut accs.checked_middlewares,
@@ -1335,9 +1346,9 @@ fn add_to_inject_plan(
 
     // For tier-1 compatible middleware, generate a adapter component and substitute
     // the injection path so the rest of the WAC generation uses the adapter.
-    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject_materialized.len());
+    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
     let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
-    for (injection, result) in to_inject_materialized.iter().zip(contract_results) {
+    for (injection, result) in to_inject.iter().zip(contract_results) {
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
                 // `consumer_split` is the split the adapter inherits
