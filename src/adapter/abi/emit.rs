@@ -760,9 +760,9 @@ pub(crate) fn find_imported_hook(
     })
 }
 
-/// Synthesize the WIT for a tier's adapter world: import + export the
-/// target interface by name, plus one import per active hook
-/// interface (already-versioned, e.g. `"splicer:tier1/before@0.2.0"`).
+/// Synthesize the WIT for a tier's adapter world: import + export
+/// the target interface, plus one import per active hook interface
+/// (already-versioned, e.g. `"splicer:tier1/before@0.2.0"`).
 pub(crate) fn synthesize_adapter_world_wit(
     package_name: &str,
     world_name: &str,

@@ -73,6 +73,7 @@ pub fn emit_guest(
     interface_qualified_name: &str,
     behavior: Behavior,
     ir: &WrapperIR,
+    bridged_sync_target: bool,
 ) -> EmittedGuest {
     // Last segment is the interface name; an empty path would silently
     // derive the wrong args ident and miss the lookup downstream.
@@ -110,6 +111,7 @@ pub fn emit_guest(
             &g.module_path,
             &g.kind,
             ir,
+            bridged_sync_target,
         ));
     }
 
@@ -284,6 +286,7 @@ fn emit_method_body(
     guest_module_path: &[String],
     trait_kind: &GuestTraitKind,
     ir: &WrapperIR,
+    bridged_sync_target: bool,
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
@@ -359,7 +362,10 @@ fn emit_method_body(
                     let call = build_static_call(&import_resource, method_ident, fields);
                     // Constructor is always sync per the WIT spec, but
                     // guard the await branch defensively in case the
-                    // spec grows async constructors later.
+                    // spec grows async constructors later. The
+                    // sync-target bridge can't carry resource-bound
+                    // fns (async-mirror synth bails), so this branch
+                    // is only reachable in pure-async setups.
                     if is_async {
                         quote!(#wrap(#call.await))
                     } else {
@@ -414,16 +420,19 @@ fn emit_method_body(
         }
     };
     // Constructor's wrap-with-await is already inlined above; other
-    // calls get the standard sync/async suffix here.
+    // calls get the standard sync/async suffix here. `bridged_sync_target`
+    // is the sync-WIT-via-async-mirror path: the wrapper's method is
+    // async but the import side is sync, so skip `.await`.
     let constructor_already_handled = matches!(
         (trait_kind, fn_kind),
         (GuestTraitKind::Resource(_), ExportFnKind::Constructor)
     );
     let target_call = if constructor_already_handled {
         target_call
-    } else if is_async {
+    } else if is_async && !bridged_sync_target {
         quote! { #target_call.await }
     } else {
+        // Guest is async but the downstream import is sync, skip `.await`
         target_call
     };
 
@@ -927,7 +936,7 @@ mod tests {
         let bindings = build_bindings_index(&src).unwrap();
         let ir = build_ir(&resolve, world_id, &bindings).unwrap();
         let g = &bindings.guest_traits[0];
-        emit_guest(g, INTERFACE_QN, behavior, &ir)
+        emit_guest(g, INTERFACE_QN, behavior, &ir, false)
     }
 
     fn args_structs_str(emitted: &EmittedGuest) -> String {

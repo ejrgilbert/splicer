@@ -1,3 +1,4 @@
+use crate::adapter::async_mirror::bridge::generate_sync_async_bridge;
 use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
@@ -180,7 +181,7 @@ impl Entity {
 /// [`EmitPlan`] transformations; rendered by [`EmitPlan::render`].
 #[derive(Debug, Default)]
 struct EmitPlan {
-    // ── Output (consumed by `render`) ──
+    // Output (consumed by `render`)
     /// All entities to emit, keyed by their var name.
     entities: BTreeMap<String, Entity>,
     /// `(export_iface, source_var)` to emit `export src_var["iface"];` for.
@@ -195,7 +196,7 @@ struct EmitPlan {
     /// emitted command line deterministic.
     used_middlewares: BTreeMap<String, String>,
 
-    // ── Planning state (carried between pipeline steps) ──
+    // Planning state
     /// First non-`None` alias seen per node id. Drives the var assigned
     /// to that node. Subsequent differing aliases for the same id are
     /// silently ignored on the assumption that `add_to_inject_plan`
@@ -221,6 +222,8 @@ struct EmitPlan {
     /// [`Self::simple_mdl_counts`] — distinct downstream wirings get
     /// distinct instances.
     adapter_counts: HashMap<String, usize>,
+    /// Use-count per bridge pkg.
+    bridge_counts: HashMap<String, usize>,
     /// Real-middleware vars already added (dedup tier-1 across rules).
     emitted_real_vars: HashSet<String>,
 }
@@ -291,6 +294,7 @@ impl EmitPlan {
         chains: &[Chain],
         composition: &CompositionGraph,
         shim_comps: &HashMap<usize, usize>,
+        bridges: &HashMap<(String, String), (String, String)>,
     ) -> anyhow::Result<Self> {
         for Chain {
             interface,
@@ -299,6 +303,10 @@ impl EmitPlan {
             ..
         } in chains
         {
+            let bridge_entry = bridges
+                .iter()
+                .find(|((_, target), _)| target == &interface.name)
+                .map(|(_, v)| v.clone());
             let mut prev_var: Option<String> = None;
             for i in 0..chain.len() {
                 let id = chain[i];
@@ -308,10 +316,6 @@ impl EmitPlan {
                          with_node_vars must run before with_chain_routing"
                     )
                 })?;
-                // Routing keys store the shim-resolved id so the
-                // `with_exports` lookup matches; otherwise an export
-                // sourced from a shim wouldn't find the wiring stored
-                // under the raw chain id.
                 let routing_id = resolve_shim_node(id, composition, shim_comps);
 
                 if i > 0 {
@@ -321,31 +325,43 @@ impl EmitPlan {
                              chain construction produced an inconsistent ordering"
                         )
                     })?;
-                    let current = self.fold_inject_middlewares(
+                    let middleware_var = self.fold_inject_middlewares(
                         upstream,
                         inject_plan.get(&i),
                         interface,
                         composition,
                         shim_comps,
                     )?;
+                    let current = match bridge_entry.as_ref() {
+                        Some((path, mirror)) => {
+                            self.add_bridge_entity(&interface.name, mirror, path, &middleware_var)
+                        }
+                        None => middleware_var,
+                    };
                     self.routing
                         .insert((routing_id, interface.name.clone()), current.clone());
                 }
-                // The current node consumes from the wrapped source above
-                // and re-provides the iface through itself; the next
-                // iteration's source is the node, not the wrapped input.
                 prev_var = Some(node_var.clone());
 
                 if i == chain.len() - 1 {
                     if let Some(top) = inject_plan.get(&(i + 1)) {
                         if !top.is_empty() {
-                            let current = self.fold_inject_middlewares(
+                            let middleware_var = self.fold_inject_middlewares(
                                 node_var.clone(),
                                 Some(top),
                                 interface,
                                 composition,
                                 shim_comps,
                             )?;
+                            let current = match bridge_entry.as_ref() {
+                                Some((path, mirror)) => self.add_bridge_entity(
+                                    &interface.name,
+                                    mirror,
+                                    path,
+                                    &middleware_var,
+                                ),
+                                None => middleware_var,
+                            };
                             self.export_routing
                                 .insert((routing_id, interface.name.clone()), current);
                         }
@@ -703,6 +719,40 @@ impl EmitPlan {
         }
     }
 
+    /// Register a sync-to-async bridge entity in the plan.
+    ///
+    /// Multiple calls with the same `target_interface` share one
+    /// `wac_deps` pkg entry but get distinct vars so each chain's
+    /// bridge instance carries its own downstream wiring.
+    fn add_bridge_entity(
+        &mut self,
+        target_interface: &str,
+        mirror_iface_qualified: &str,
+        bridge_wasm_path: &str,
+        downstream_var: &str,
+    ) -> String {
+        let bridge_pkg = format!("splicer-bridge-{}", sanitize_wac_id(target_interface));
+        let bridge_var = disambiguated_var(&mut self.bridge_counts, &bridge_pkg);
+        let imports = vec![(
+            mirror_iface_qualified.to_string(),
+            downstream_var.to_string(),
+        )];
+        // The bridge has exactly one declared import (the mirror) and
+        // one export (the target)
+        self.entities.insert(
+            bridge_var.clone(),
+            Entity {
+                var: bridge_var.clone(),
+                pkg: bridge_pkg.clone(),
+                imports,
+                catchall: false,
+            },
+        );
+        self.used_middlewares
+            .insert(bridge_pkg, bridge_wasm_path.to_string());
+        bridge_var
+    }
+
     /// Render the plan to WAC text. Entities are emitted in topological
     /// order so every reference resolves to a name introduced earlier
     /// in the file (wac compose rejects forward references). Cycles
@@ -890,14 +940,12 @@ struct SpliceCtx<'a> {
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: Vec<GeneratedAdapter>,
-    /// Decode-cache: `(target_split_path, target_interface)` → has
-    /// at least one sync (non-async) function declared on that
-    /// interface.
     target_has_sync_cache: HashMap<(String, String), bool>,
-    /// Decode-cache: `middleware_path` → qualified name of the first
-    /// non-`wasi:*` peer import declared `async func`, or `None` if
-    /// no offender.
-    middleware_first_async_peer_cache: HashMap<String, Option<String>>,
+    /// `(target_split_path, target_interface)` ->
+    /// `(bridge_wasm_path, async_mirror_qualified_name)`. One bridge
+    /// per distinct provider+interface across the run; shared by every
+    /// site that needs it.
+    bridges: HashMap<(String, String), (String, String)>,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
@@ -989,7 +1037,7 @@ pub fn generate_wac(
     let plan = EmitPlan::new()
         .with_aliases(&chains)
         .with_node_vars(composition, &chains, &shim_comps)
-        .with_chain_routing(&chains, composition, &shim_comps)?
+        .with_chain_routing(&chains, composition, &shim_comps, &accs.bridges)?
         .with_node_entities(composition, &shim_comps)?
         .with_exports(composition, &chains, &handled_interfaces, &shim_comps);
     let wac = plan.render(pkg_name)?;
@@ -1172,8 +1220,15 @@ fn apply_site(
 
     // Materialize tier-3/4 first so `build_per_edge_providers` sees
     // the wrapper's config import on the resulting `config_as_wave`.
-    let materialized_inject =
-        materialize_tier3_4_inline(interface, rule.inject(), consumer_path.as_deref(), ctx)?;
+    // `accs` carries the sync-WIT detection cache and the bridge
+    // registry so a sync target only triggers mirror synth once.
+    let materialized_inject = materialize_tier3_4_inline(
+        interface,
+        rule.inject(),
+        consumer_path.as_deref(),
+        ctx,
+        accs,
+    )?;
     let edge_inject = build_per_edge_providers(&materialized_inject, &edge_id, ctx.splits_path)?;
 
     // Alias the matched provider; `between` also aliases the caller (outer).
@@ -1285,12 +1340,10 @@ fn materialize_tier3_4_inline(
     to_inject: &[Injection],
     consumer_split: Option<&str>,
     ctx: &SpliceCtx,
+    accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<Vec<Injection>> {
     use crate::strategies::Tier3_4Source;
 
-    // Classify once — the user-form branch stats the filesystem,
-    // and we'd otherwise hit it twice per injection (the short-
-    // circuit check + the dispatch loop).
     let sources: Vec<Option<Tier3_4Source<'_>>> =
         to_inject.iter().map(classify_tier3_4_source).collect();
     if sources.iter().all(Option::is_none) {
@@ -1303,6 +1356,33 @@ fn materialize_tier3_4_inline(
         })?;
         std::fs::read(split_path)
             .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))
+    };
+
+    // Tier-3/4 wrappers are async-only by construction, so any
+    // sync-WIT target forces the bridged path. Detect once + cache
+    // the bridge before each materialization so the wrapper crate
+    // gets the mirror name to lift against.
+    let mirror_for_target = if !sources.iter().any(Option::is_some) {
+        None
+    } else {
+        let consumer_split_path = consumer_split.ok_or_else(|| {
+            anyhow::anyhow!("no split for tier-3/4 sync-WIT detection on '{interface_name}'")
+        })?;
+        let target_key = (consumer_split_path.to_string(), interface_name.to_string());
+        let has_sync = *accs
+            .target_has_sync_cache
+            .entry(target_key)
+            .or_insert_with(|| target_interface_has_sync_func(interface_name, consumer_split_path));
+        if has_sync {
+            let (_path, mirror_qname) =
+                ensure_bridge(interface_name, consumer_split_path, ctx.splits_path, accs)
+                    .with_context(|| {
+                        format!("ensure bridge for tier-3/4 site on `{interface_name}`")
+                    })?;
+            Some(mirror_qname)
+        } else {
+            None
+        }
     };
 
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
@@ -1318,6 +1398,7 @@ fn materialize_tier3_4_inline(
             source,
             &split_bytes,
             interface_name,
+            mirror_for_target.as_deref(),
         )
         .with_context(|| {
             format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'")
@@ -1429,15 +1510,6 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
-                if let Some(mw_path) = injection.path.as_deref() {
-                    preflight_sync_target_async_middleware(
-                        &injection.name,
-                        mw_path,
-                        interface_name,
-                        consumer_split_path,
-                        accs,
-                    )?;
-                }
                 let adapter_path = generate_tier1_adapter(
                     &injection.name,
                     interface_name,
@@ -1468,15 +1540,6 @@ fn add_to_inject_plan(
                         injection.name
                     )
                 })?;
-                if let Some(mw_path) = injection.path.as_deref() {
-                    preflight_sync_target_async_middleware(
-                        &injection.name,
-                        mw_path,
-                        interface_name,
-                        consumer_split_path,
-                        accs,
-                    )?;
-                }
                 let adapter_path = generate_tier2_adapter(
                     &injection.name,
                     interface_name,
@@ -1601,51 +1664,22 @@ fn factored_types_to_wire(
     Ok(out)
 }
 
-/// Preflight: refuse to splice a middleware that imports any
-/// `async func` peer-component interface (non-`wasi:*`) onto a target
-/// interface that has any `func` (sync at WIT) function. The runtime
-/// wedge that combination produces is documented in
-/// `docs/TODO/sync-wit-suspend-limit.md`: a sync-WIT-rooted wasm task
-/// cannot suspend, so any canon-async wait inside the middleware's
-/// hook body — driving an async peer-component import — traps with
-/// `cannot block a synchronous task before returning`.
-///
-/// This is a conservative check: it only catches imports that are
-/// `async func` at the middleware's WIT level. A middleware that
-/// declares a sync-WIT import but still ends up canon-lower-async'ing
-/// it (e.g. via `wit_bindgen::generate!({ async: true })` without
-/// per-import filtering) would slip through, but those cases tend to
-/// be authored by builtin maintainers who follow the documented
-/// pattern. Wasm-bytecode-level scan would be more complete; deferred.
-fn preflight_sync_target_async_middleware(
-    middleware_name: &str,
-    middleware_path: &str,
+/// Cached bridge generation. Returns the bridge's `.wasm` path and
+/// the async-mirror interface's fully-qualified name.
+fn ensure_bridge(
     target_interface: &str,
     target_split_path: &str,
+    splits_output_path: &str,
     accs: &mut SpliceAccumulators,
-) -> anyhow::Result<()> {
-    let target_key = (target_split_path.to_string(), target_interface.to_string());
-    let has_sync = *accs
-        .target_has_sync_cache
-        .entry(target_key)
-        .or_insert_with(|| target_interface_has_sync_func(target_interface, target_split_path));
-    if !has_sync {
-        return Ok(());
+) -> anyhow::Result<(String, String)> {
+    let key = (target_split_path.to_string(), target_interface.to_string());
+    if let Some(entry) = accs.bridges.get(&key) {
+        return Ok(entry.clone());
     }
-    let offender = accs
-        .middleware_first_async_peer_cache
-        .entry(middleware_path.to_string())
-        .or_insert_with(|| first_async_peer_import(middleware_path))
-        .clone();
-    let Some(offender) = offender else {
-        return Ok(());
-    };
-    anyhow::bail!(
-        "cannot splice '{middleware_name}' onto sync-WIT target '{target_interface}': \
-         middleware imports async-peer '{offender}', which would suspend a sync-WIT \
-         task at runtime. Target an `async func` interface, or drop the `.await` \
-         from the middleware.",
-    );
+    let entry =
+        generate_sync_async_bridge(target_interface, splits_output_path, target_split_path)?;
+    accs.bridges.insert(key, entry.clone());
+    Ok(entry)
 }
 
 /// True iff `target_interface` (resolved via the component at
@@ -1689,44 +1723,6 @@ fn target_interface_has_sync_func(target_interface: &str, target_split_path: &st
         }
     }
     false
-}
-
-/// Return the qualified name of the first import in the middleware's
-/// world that is `async func` and belongs to a non-`wasi:*` package
-/// (so it's a peer component, not a host import). `None` if no such
-/// import exists.
-fn first_async_peer_import(middleware_path: &str) -> Option<String> {
-    let bytes = std::fs::read(middleware_path).ok()?;
-    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wit_component::decode(&bytes)
-    }))
-    .ok()?
-    .ok()?;
-    let wit_component::DecodedWasm::Component(resolve, world_id) = decoded else {
-        return None;
-    };
-    let world = &resolve.worlds[world_id];
-    for (_key, item) in &world.imports {
-        let wit_parser::WorldItem::Interface { id, .. } = item else {
-            continue;
-        };
-        let Some(qname) = resolve.id_of(*id) else {
-            continue;
-        };
-        // wasi:* is host-provided; the wasmtime runtime drives those
-        // suspends correctly even from a sync-rooted task because the
-        // host owns the scheduler. Peer components don't.
-        if qname.starts_with("wasi:") {
-            continue;
-        }
-        let iface = &resolve.interfaces[*id];
-        for (fn_name, func) in &iface.functions {
-            if func.kind.is_async() {
-                return Some(format!("{qname}#{fn_name}"));
-            }
-        }
-    }
-    None
 }
 
 #[derive(Clone, Copy)]
@@ -1851,6 +1847,72 @@ fn sanitize_wac_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── EmitPlan::add_bridge_entity ─────────────────────────────────
+
+    #[test]
+    fn add_bridge_entity_registers_wired_entity_and_dep() {
+        let mut plan = EmitPlan::new();
+        let bridge_var = plan.add_bridge_entity(
+            "my:srv/adder@1.0.0",
+            "splicer:async-mirror-abc/adder@0.0.1",
+            "/tmp/splicer_bridge_my_srv_adder.wasm",
+            "mw_a",
+        );
+        // `sanitize_wac_id` strips `my-`, replaces non-alphanumerics
+        // with `-`, and prepends `v` on numeric-leading segments.
+        let pkg = "splicer-bridge-srv-adder-v1-v0-v0";
+        assert_eq!(bridge_var, pkg);
+        let entity = plan.entities.get(&bridge_var).expect("bridge registered");
+        assert_eq!(entity.pkg, pkg);
+        assert!(!entity.catchall, "bridge entity should not be catchall");
+        assert_eq!(
+            entity.imports,
+            vec![(
+                "splicer:async-mirror-abc/adder@0.0.1".to_string(),
+                "mw_a".to_string()
+            )]
+        );
+        assert_eq!(
+            plan.used_middlewares.get(pkg),
+            Some(&"/tmp/splicer_bridge_my_srv_adder.wasm".to_string())
+        );
+    }
+
+    /// Two chains targeting the same interface must get distinct
+    /// bridge instances so each carries its own downstream wiring —
+    /// otherwise the second call silently overwrites the first.
+    #[test]
+    fn add_bridge_entity_disambiguates_on_repeated_calls() {
+        let mut plan = EmitPlan::new();
+        let first = plan.add_bridge_entity(
+            "my:srv/adder@1.0.0",
+            "splicer:async-mirror-abc/adder@0.0.1",
+            "/tmp/splicer_bridge_my_srv_adder.wasm",
+            "mw_a",
+        );
+        let second = plan.add_bridge_entity(
+            "my:srv/adder@1.0.0",
+            "splicer:async-mirror-abc/adder@0.0.1",
+            "/tmp/splicer_bridge_my_srv_adder.wasm",
+            "mw_b",
+        );
+        assert_ne!(first, second, "second call must produce a distinct var");
+        assert!(
+            plan.entities.contains_key(&first) && plan.entities.contains_key(&second),
+            "both entities should survive in the plan"
+        );
+        assert_eq!(
+            plan.entities[&first].imports[0].1, "mw_a",
+            "first instance keeps its downstream"
+        );
+        assert_eq!(
+            plan.entities[&second].imports[0].1, "mw_b",
+            "second instance carries its own downstream"
+        );
+        // Same .wasm pkg path — distinct wac instances of one component.
+        assert_eq!(plan.entities[&first].pkg, plan.entities[&second].pkg);
+    }
 
     // ── edge_id ──────────────────────────────────────────────────────
 

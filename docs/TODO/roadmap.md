@@ -125,7 +125,7 @@ return-synthesis is the harder step):
 Defer until post-paper, no blocking impact:
 - `tier2-generic-resource-handles.md` (long-term design)
 - `tier2-list-compound-elements.md` (only items with concrete demand)
-- `sync-wit-suspend-limit.md` (bug fix on demand)
+- `sync-suspend-limitation.md` (bug fix on demand)
 - `per-function-interposition-filter.md` (UX, gated on real demand)
 - `canonical-abi-gaps.md` (real `bail!`s; fix when a user hits them)
 

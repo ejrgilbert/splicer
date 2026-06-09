@@ -45,6 +45,7 @@ const TIER2_ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter-tier2";
 const TIER2_ADAPTER_WORLD_NAME: &str = "adapter";
 
 /// Generate a tier-2 adapter component.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_tier2_adapter(
     target_interface: &str,
     has_before: bool,

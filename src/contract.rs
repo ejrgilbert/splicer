@@ -58,6 +58,12 @@ pub fn validate_contract(
                 contract_fingerprint,
                 fingerprint,
             ));
+        } else if exports
+            .keys()
+            .any(|k| k.starts_with("splicer:async-mirror-"))
+        {
+            // Mediates sync target interface with async interposition through a generated bridge.
+            results.push(ContractResult::Ok);
         } else {
             results.push(classify_tier_export(name, exports, path, interface_name));
         }

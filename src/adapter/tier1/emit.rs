@@ -48,6 +48,7 @@ use super::super::resolve::{decode_input_resolve, dispatch_mangling, find_target
 /// `common_world_wit` is the contents of `wit/common/world.wit`
 /// (loaded first as a dependency); `tier1_world_wit` is the contents
 /// of `wit/tier1/world.wit` (which references `splicer:common`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_adapter(
     target_interface: &str,
     has_before: bool,

@@ -25,6 +25,7 @@ fn input<'a>(behavior: Behavior) -> GenerateWrapperInput<'a> {
         strategy_crate_path: "/abs/path/to/my-strategy",
         strategy_type: "MyStrategy",
         splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
+        bridged_sync_target: false,
     }
 }
 
@@ -112,6 +113,7 @@ fn chaos_err_composes_against_resource_bearing_interface() {
         strategy_crate_path: "/abs/path/to/chaos-err",
         strategy_type: "ChaosErr",
         splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
+        bridged_sync_target: false,
     })
     .unwrap();
     let lib = &crate_out.lib_rs;
@@ -183,6 +185,7 @@ fn replayer_composes_against_resource_bearing_interface() {
         strategy_crate_path: "/abs/path/to/replayer",
         strategy_type: "Replayer",
         splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
+        bridged_sync_target: false,
     })
     .unwrap();
     let lib = &crate_out.lib_rs;

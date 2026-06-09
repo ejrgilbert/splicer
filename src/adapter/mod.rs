@@ -17,6 +17,7 @@
 use anyhow::Context;
 
 mod abi;
+pub(crate) mod async_mirror;
 #[cfg(test)]
 mod fuzz_common;
 mod indices;
@@ -92,10 +93,6 @@ pub fn generate_tier1_adapter(
 /// Generate a tier-2 adapter component. Mirrors
 /// [`generate_tier1_adapter`] in shape — different hook interface
 /// package, different lift codegen.
-///
-/// Phase 2-3 scope: middleware must export `splicer:tier2/before`;
-/// targets are restricted to primitive-typed parameters and result.
-/// Bails cleanly on out-of-scope cases until subsequent slices land.
 pub fn generate_tier2_adapter(
     middleware_name: &str,
     target_interface: &str,
