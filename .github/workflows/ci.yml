@@ -99,6 +99,11 @@ jobs:
        with:
          targets: wasm32-wasip1
      - uses: Swatinem/rust-cache@v2
+     - uses: taiki-e/install-action@v2
+       with:
+         tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }},wkg@${{ env.WKG_VERSION }}
+     - name: Build builtins
+       run: make build-builtins
      - name: Lib-level codegen tests
        run: cargo test --lib --locked -- --ignored --nocapture materialize_tier3_produces_a_component
      - name: End-to-end smoke
