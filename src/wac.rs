@@ -548,9 +548,26 @@ impl EmitPlan {
         // IndexSet's iter doesn't impl DoubleEndedIterator, so the
         // .collect() is required for `.rev()`.
         let ordered: Vec<&Injection> = middlewares.iter().collect();
-        let mut current = initial;
+        // Each wrap that imports the target also imports its
+        // sibling-types iface; that import must point at a var that
+        // exports the iface. Only tier-4 wraps do (they own a fresh
+        // resource identity); tier-1/2/3 wraps just forward the
+        // target and don't re-export sibling types. So we track the
+        // nearest tier-4 below (or the chain root, if none).
+        let mut current = initial.clone();
+        let mut sibling_types_source = initial;
         for mdl in ordered.iter().rev() {
-            current = self.add_middleware(mdl, interface, &current, composition, shim_comps)?;
+            current = self.add_middleware(
+                mdl,
+                interface,
+                &current,
+                &sibling_types_source,
+                composition,
+                shim_comps,
+            )?;
+            if mdl.tier.is_some_and(|t| !t.imports_target()) {
+                sibling_types_source = current.clone();
+            }
         }
         Ok(current)
     }
@@ -569,6 +586,7 @@ impl EmitPlan {
         mdl: &Injection,
         interface: &Contract,
         downstream_var: &str,
+        sibling_types_source: &str,
         composition: &CompositionGraph,
         shim_comps: &HashMap<usize, usize>,
     ) -> anyhow::Result<String> {
@@ -660,7 +678,7 @@ impl EmitPlan {
                 composition,
                 shim_comps,
             )? {
-                imports.push((extra, downstream_var.to_string()));
+                imports.push((extra, sibling_types_source.to_string()));
             }
             self.entities.insert(
                 adapter_var.clone(),
@@ -697,7 +715,7 @@ impl EmitPlan {
                     composition,
                     shim_comps,
                 )? {
-                    imports.push((extra, downstream_var.to_string()));
+                    imports.push((extra, sibling_types_source.to_string()));
                 }
             }
             // Wire the config provider on the wrapper.
@@ -2069,7 +2087,14 @@ mod tests {
         let graph = synth_graph(1, &[]);
         let mut plan = EmitPlan::new();
         let _adapter_var = plan
-            .add_middleware(&mdl, &contract, "downstream", &graph, &HashMap::new())
+            .add_middleware(
+                &mdl,
+                &contract,
+                "downstream",
+                "downstream",
+                &graph,
+                &HashMap::new(),
+            )
             .expect("plan");
 
         let cfg = plan
@@ -2132,7 +2157,14 @@ mod tests {
         let graph = synth_graph(1, &[]);
         let mut plan = EmitPlan::new();
         let _adapter_var = plan
-            .add_middleware(&mdl, &contract, "downstream", &graph, &HashMap::new())
+            .add_middleware(
+                &mdl,
+                &contract,
+                "downstream",
+                "downstream",
+                &graph,
+                &HashMap::new(),
+            )
             .expect("plan");
 
         let real = plan
