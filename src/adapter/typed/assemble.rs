@@ -189,13 +189,7 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
     root.insert("lib".into(), Value::Table(lib));
     root.insert("dependencies".into(), Value::Table(dependencies));
 
-    // Local-dev override: if `SPLICER_TOOL_SDK_PATH` points at a
-    // local splicer-tool-sdk checkout, redirect the wrapper crate
-    // (and every transitive dep via cargo's patch mechanism) to it.
-    // Lets developers test unpublished SDK changes without bumping +
-    // publishing. Unset → wrapper resolves `splicer-tool-sdk` from
-    // crates.io as normal.
-    if let Ok(local_sdk) = std::env::var("SPLICER_TOOL_SDK_PATH") {
+    if let Some(local_sdk) = local_sdk_path() {
         let mut sdk_patch = Map::new();
         sdk_patch.insert("path".into(), Value::String(local_sdk));
         let mut crates_io = Map::new();
@@ -207,6 +201,26 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
 
     toml::to_string(&Value::Table(root))
         .expect("toml serialization of strings + booleans + tables is infallible")
+}
+
+/// Path the wrapper should patch `splicer-tool-sdk` to, or `None` for
+/// crates.io resolution. Three-state precedence:
+///
+/// - `SPLICER_TOOL_SDK_PATH=""` → opt out (registry, even from workspace builds).
+/// - `SPLICER_TOOL_SDK_PATH=/some/path` → explicit override.
+/// - Unset + splicer compiled from a workspace with a sibling
+///   `splicer-tool-sdk/` → that sibling. Otherwise (crates.io
+///   installs) → registry.
+fn local_sdk_path() -> Option<String> {
+    const WORKSPACE_SDK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/splicer-tool-sdk");
+    match std::env::var("SPLICER_TOOL_SDK_PATH").as_deref() {
+        Ok("") => None,
+        Ok(path) => Some(path.to_string()),
+        Err(_) => std::path::Path::new(WORKSPACE_SDK)
+            .join("Cargo.toml")
+            .exists()
+            .then(|| WORKSPACE_SDK.to_string()),
+    }
 }
 
 #[cfg(test)]
