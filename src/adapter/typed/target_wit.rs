@@ -295,14 +295,11 @@ mod tests {
     /// `short_hash_hex` so the adapter-side cross-check passes.
     fn expected_mirror_name(target: &str) -> String {
         use crate::adapter::async_mirror::short_hash_hex;
-        // Pull the iface segment out of `ns:pkg/iface@ver` for the
-        // mirror's qualified name: `splicer:async-mirror-<hash>/<iface>@<ver>`.
-        let iface_at_ver = target
-            .rsplit_once('/')
-            .map(|(_, tail)| tail)
-            .unwrap_or(target);
+        use crate::parse::wit_name::WitName;
+        let iface = WitName::parse(target)
+            .expect("target qname must parse as ns:pkg/iface[@ver]")
+            .iface;
         // Mirror package is always `@0.0.1` regardless of the target's version.
-        let iface = iface_at_ver.split('@').next().unwrap_or(iface_at_ver);
         format!(
             "splicer:async-mirror-{}/{iface}@0.0.1",
             short_hash_hex(target)

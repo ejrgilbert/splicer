@@ -1709,11 +1709,8 @@ fn target_interface_has_sync_func(target_interface: &str, target_split_path: &st
         let Some(qname) = resolve.id_of(*id) else {
             continue;
         };
-        if qname.split('@').next().unwrap_or(&qname)
-            != target_interface
-                .split('@')
-                .next()
-                .unwrap_or(target_interface)
+        if crate::parse::wit_name::unversioned(&qname)
+            != crate::parse::wit_name::unversioned(target_interface)
         {
             continue;
         }

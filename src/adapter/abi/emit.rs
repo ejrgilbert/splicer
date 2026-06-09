@@ -787,8 +787,7 @@ pub(crate) fn find_common_typeid(resolve: &Resolve, type_name: &str) -> Result<T
         let Some(qname) = resolve.id_of(id) else {
             continue;
         };
-        let unversioned = qname.split('@').next().unwrap_or(&qname);
-        if unversioned == "splicer:common/types" {
+        if crate::parse::wit_name::unversioned(&qname) == "splicer:common/types" {
             return resolve.interfaces[id]
                 .types
                 .get(type_name)
