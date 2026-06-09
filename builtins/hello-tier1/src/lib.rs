@@ -1,8 +1,4 @@
 mod bindings {
-    // Per-export async filter (NOT `async: true`). Every import is
-    // sync-WIT and MUST lower as plain `canon lower` (no async); see
-    // `docs/TODO/sync-wit-suspend-limit.md` and hello-tier1 for the
-    // rationale (sync-WIT-rooted task cannot block on canon-async wait).
     wit_bindgen::generate!({
         world: "hello-tier1-mdl",
         async: [
