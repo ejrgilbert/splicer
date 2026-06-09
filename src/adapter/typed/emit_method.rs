@@ -546,6 +546,18 @@ struct AbsolutizeResources<'a> {
 
 impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
     fn visit_type_path_mut(&mut self, tp: &mut syn::TypePath) {
+        if tp.qself.is_none() && tp.path.segments.len() > 1 && tp.path.segments[0].ident == "_rt" {
+            // wit-bindgen emits `_rt::X` paths (`_rt::String`, `_rt::Vec`,
+            // `_rt::Box`) that resolve inside `mod bindings` but not at
+            // the wrapper crate root where the lifted signature lands.
+            // The `_rt` module is private; strip the prefix and rely on
+            // std prelude (`String`, `Vec`, `Box` all re-export there).
+            let mut segs = std::mem::take(&mut tp.path.segments)
+                .into_iter()
+                .skip(1)
+                .collect::<syn::punctuated::Punctuated<_, _>>();
+            std::mem::swap(&mut tp.path.segments, &mut segs);
+        }
         if tp.qself.is_none() && tp.path.segments.len() == 1 {
             let seg_ident = tp.path.segments[0].ident.clone();
             // wit-bindgen emits two distinct types for a WIT resource:
@@ -856,13 +868,6 @@ fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {
             syn::FnArg::Receiver(_) => None,
         })
         .collect()
-}
-
-fn return_type(sig: &syn::Signature) -> TokenStream {
-    match &sig.output {
-        syn::ReturnType::Default => quote!(()),
-        syn::ReturnType::Type(_, ty) => quote!(#ty),
-    }
 }
 
 /// Build the closure body that calls the wrapped target with args

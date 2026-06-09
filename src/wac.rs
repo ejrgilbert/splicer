@@ -329,7 +329,7 @@ impl EmitPlan {
                         shim_comps,
                     )?;
                     self.routing
-                        .insert((routing_id, interface.name.clone()), current);
+                        .insert((routing_id, interface.name.clone()), current.clone());
                 }
                 // The current node consumes from the wrapped source above
                 // and re-provides the iface through itself; the next
@@ -350,6 +350,51 @@ impl EmitPlan {
                                 .insert((routing_id, interface.name.clone()), current);
                         }
                     }
+                }
+            }
+        }
+
+        // Second pass: tier-4 wraps EXPORT the sibling-types iface
+        // (the wrapper owns the resource identity). Route the
+        // consumer's import of those sibling types ifaces through
+        // the wrapper so it sees one consistent resource type.
+        // Mirror of the wrapper-side sibling-types wiring the
+        // simple-middleware branch of `add_middleware` does for
+        // tier-2/3. Done after the main pass so no-injection chains'
+        // no-op routing inserts don't clobber these overrides.
+        for Chain {
+            interface,
+            chain,
+            inject_plan,
+            ..
+        } in chains
+        {
+            for (i, id) in chain.iter().enumerate().skip(1) {
+                let routing_id = resolve_shim_node(*id, composition, shim_comps);
+                let Some(outermost) = inject_plan.get(&i).and_then(|m| m.iter().next()) else {
+                    continue;
+                };
+                if outermost.tier.is_none_or(|t| t.imports_target()) {
+                    continue;
+                }
+                let Some(path) = outermost.path.as_ref() else {
+                    continue;
+                };
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                let Some(current) = self
+                    .routing
+                    .get(&(routing_id, interface.name.clone()))
+                    .cloned()
+                else {
+                    continue;
+                };
+                for sib in resource_bearing_exports(&bytes) {
+                    if sib == interface.name {
+                        continue;
+                    }
+                    self.routing.insert((routing_id, sib), current.clone());
                 }
             }
         }
@@ -616,11 +661,29 @@ impl EmitPlan {
             // Tier-4 (virtualize) middlewares don't import the target
             // (they replace the downstream instead of forwarding); the
             // wac wire must be skipped for those.
-            let mut imports = if mdl.tier.is_some_and(|t| !t.imports_target()) {
-                Vec::new()
-            } else {
+            let imports_target = mdl.tier.is_none_or(|t| t.imports_target());
+            let mut imports = if imports_target {
                 vec![(interface.name.clone(), downstream_var.to_string())]
+            } else {
+                Vec::new()
             };
+            // Tier-2/3 wrappers also import the target's sibling
+            // types iface; without explicit wiring, wac's `...`
+            // defaults give it a contextually-distinct resource id
+            // and the wrapper's async-shim rejects the composition.
+            if imports_target {
+                let mdl_bytes = std::fs::read(&mdl_path).map_err(|e| {
+                    anyhow::anyhow!("failed to read middleware wasm at `{mdl_path}`: {e}",)
+                })?;
+                for extra in factored_types_to_wire(
+                    &resource_bearing_imports(&mdl_bytes),
+                    &interface.name,
+                    composition,
+                    shim_comps,
+                )? {
+                    imports.push((extra, downstream_var.to_string()));
+                }
+            }
             // Wire the config provider on the wrapper.
             if let Some(cfg_path) = mdl.config_provider_path.as_ref() {
                 let cfg_pkg = format!("{real_pkg}-config");
@@ -1666,10 +1729,16 @@ fn first_async_peer_import(middleware_path: &str) -> Option<String> {
     None
 }
 
-/// Qualified names of the component's interface imports whose
-/// instance type contains at least one resource. Best-effort: empty
-/// on decode errors.
-fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
+#[derive(Clone, Copy)]
+enum WorldSide {
+    Imports,
+    Exports,
+}
+
+/// Qualified names of the component's interface imports or exports
+/// whose instance type contains at least one resource. Best-effort:
+/// empty on decode errors.
+fn resource_bearing_ifaces(bytes: &[u8], side: WorldSide) -> Vec<String> {
     let Ok(decoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wit_component::decode(bytes)
     })) else {
@@ -1679,8 +1748,12 @@ fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
         return Vec::new();
     };
     let world = &resolve.worlds[world_id];
+    let items = match side {
+        WorldSide::Imports => &world.imports,
+        WorldSide::Exports => &world.exports,
+    };
     let mut result = Vec::new();
-    for (_key, item) in &world.imports {
+    for (_key, item) in items {
         let wit_parser::WorldItem::Interface { id, .. } = item else {
             continue;
         };
@@ -1697,6 +1770,14 @@ fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
         }
     }
     result
+}
+
+fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
+    resource_bearing_ifaces(bytes, WorldSide::Imports)
+}
+
+fn resource_bearing_exports(bytes: &[u8]) -> Vec<String> {
+    resource_bearing_ifaces(bytes, WorldSide::Exports)
 }
 
 /// Returns true if the split-file number `split_num` corresponds to a shim.

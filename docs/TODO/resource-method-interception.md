@@ -204,38 +204,36 @@ though the underlying issue maps to an unfilled WIT spec corner.
 
 ### Subsequent finding (updated June 2026)
 
-Tier-3 wrap of `wasi:http/handler` DOES compose, despite handler
-`use`ing `request` / `response` / `error-code` from a sibling types
-interface. The wasi case works because `wasi:http/types` is a shared
-external import (host-provided); the producer-owned case (e.g.
-`shapes_handles` exporting `my:service/async-bucket-types`) is what
-fails. The gap is narrower than "any resource-bearing interface" and
-may admit a splicer-side workaround.
-
-See [tier3-bridge-producer-owned-types.md](tier3-bridge-producer-owned-types.md)
-for the diagnosis and candidate approaches (component-types
-post-process, hand-encoded wrapper shell a la proxy-component, or
-upstream wit_component fix).
+The "tier-3 wrap of producer-owned types iface won't compose"
+sub-claim is no longer accurate. The wasm-tools#2506 quote above
+describes a real WIT-spec gap, but splicer was hitting it because its
+WAC emission only explicitly bound the chained target iface and left
+the sibling `-types` iface to `...` defaults. wac's default routing
+gave the types iface a contextually-distinct resource id from the one
+threaded through the target binding, and the wrapper's async-shim saw
+inconsistent witnesses for the same bucket. Explicitly binding the
+sibling types iface to the same source fixes it (see `src/wac.rs`,
+the simple-middleware branch of `add_middleware` mirrors the tier-1
+adapter's `factored_types_to_wire` call).
 
 ### What that means concretely
 
 - **Tier-3 wrap of producer-owned resource-bearing interfaces:
-  blocked today.** Splicer-side workarounds plausible; see linked
-  doc. Matrix tests still pass because they verify codegen-string
-  shape, not runtime composition.
+  composes today** (verified via `--builtin-hello-tier3` on
+  `my:service/async-bucket`). But the broader dispatch problem
+  remains: methods invoked on a resource (e.g. `bucket.get`) still
+  go to the producer that declared `GuestBucket`, bypassing the
+  wrapper. So tier-3 can intercept iface-level functions that
+  take/return resources, not methods on the resources themselves.
 - **Tier-3 wrap of host-provided resource-bearing interfaces (wasi):
   works today.**
 - **Tier-4 wrap is unaffected.** The wrapper IS the resource type
   owner (exports the types iface, synthesizes via the strategy); no
-  import↔export type identity bridging needed; no expressibility gap.
-- **Action needed in component-model spec.** A first-class WIT
-  syntax for "exported interface uses an imported type" — likely a
-  feature proposal upstream. Splicer is the consumer waiting on it.
-- **For the meantime,** splicer can document the limitation and ship
-  tier-4 (which works for resource-bearing interfaces today). Tier-3
-  for value-typed interfaces continues to work; tier-3 for
-  resource-bearing interfaces produces wrappers that compile but
-  fail to compose.
+  import↔export type identity bridging needed.
+- **Resource-method dispatch through the wrapper is still blocked**
+  unless splicer takes the proxy-component route (wrapper exports
+  the types iface, owns `GuestR` for every resource it virtualizes).
+  That's a separate substrate change from the wac wiring fix above.
 
 ## References
 
