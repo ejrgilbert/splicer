@@ -231,7 +231,7 @@ mod tests {
     fn assemble_for_wit(wit: &str, behavior: Behavior) -> String {
         let (resolve, world_id, bindings_src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = build_bindings_index(&bindings_src).unwrap();
-        let ir = build_ir(&resolve, world_id, &bindings).unwrap();
+        let ir = build_ir(&resolve, world_id, &bindings, INTERFACE_QN).unwrap();
         let user_impls = emit_wit_typed_impls(&ir.types);
         let args_impls = emit_wit_typed_impls(&ir.args_records);
         let witty_impls: Vec<_> = user_impls.into_iter().chain(args_impls).collect();

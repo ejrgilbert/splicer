@@ -20,6 +20,14 @@ use syn::{Item, ItemMacro, ItemMod, ItemTrait, TraitItem, TraitItemFn};
 /// `Color`, etc.
 pub type BindingsPath = Vec<String>;
 
+pub fn strip_exports_prefix(segs: &[String]) -> Vec<String> {
+    if segs.first().map(String::as_str) == Some("exports") {
+        segs[1..].to_vec()
+    } else {
+        segs.to_vec()
+    }
+}
+
 /// Render `bindings::<seg1>::<seg2>::…[::<ident>]` from a path slice
 /// and an optional terminal ident. E.g.:
 /// - `(["exports","pkg","ops"], Some(Point))` → `bindings::exports::pkg::ops::Point`

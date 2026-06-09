@@ -51,7 +51,12 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     let (resolve, world_id, bindings_src) =
         run_wit_bindgen_rust(input.target_wit, input.world_name)?;
     let bindings = build_bindings_index(&bindings_src)?;
-    let ir = build_ir(&resolve, world_id, &bindings)?;
+    let ir = build_ir(
+        &resolve,
+        world_id,
+        &bindings,
+        input.interface_qualified_name,
+    )?;
     // User-declared types + per-method synthesized args records both
     // ride the same emitter via NamedKind dispatch.
     let user_impls = emit_wit_typed_impls(&ir.types);

@@ -18,7 +18,9 @@ use wit_parser::{
     TypeOwner, WorldId, WorldItem,
 };
 
-use super::bindings_index::{bindings_path_tokens, BindingsItem, BindingsPath, WrapperBindings};
+use super::bindings_index::{
+    bindings_path_tokens, strip_exports_prefix, BindingsItem, BindingsPath, WrapperBindings,
+};
 
 /// Per-interface metadata collected from the world: WIT InterfaceId,
 /// the Rust module path wit-bindgen emits the iface under, and which
@@ -38,6 +40,7 @@ pub fn build_ir(
     resolve: &Resolve,
     world_id: WorldId,
     bindings: &WrapperBindings,
+    interface_qualified_name: &str,
 ) -> Result<WrapperIR> {
     let world = &resolve.worlds[world_id];
 
@@ -178,11 +181,29 @@ pub fn build_ir(
         }
     }
 
+    // Pin the wrapped target's import-side bindings path
+    let target_import_path = ifaces
+        .iter()
+        .find(|e| {
+            resolve
+                .id_of(e.id)
+                .as_deref()
+                .is_some_and(|q| q == interface_qualified_name)
+        })
+        .map(|e| {
+            if e.is_export {
+                strip_exports_prefix(&e.path)
+            } else {
+                e.path.clone()
+            }
+        });
+
     Ok(WrapperIR {
         types,
         resources,
         args_records,
         fn_sigs,
+        target_import_path,
     })
 }
 
@@ -255,6 +276,9 @@ pub struct WrapperIR {
     /// so emit_method can branch on the *authoritative* kind instead
     /// of re-deriving from Rust method names.
     pub fn_sigs: std::collections::HashMap<String, ExportFnSig>,
+    /// Bindings path of the wrapped target on the wrapper's *import*
+    /// side. `None` in tier-4 virtualize (no downstream import).
+    pub target_import_path: Option<BindingsPath>,
 }
 
 pub struct ExportFnSig {
@@ -966,7 +990,7 @@ mod tests {
     fn build(wit: &str, world: &str) -> WrapperIR {
         let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some(world)).unwrap();
         let bindings = build_bindings_index(&src).unwrap();
-        build_ir(&resolve, world_id, &bindings).unwrap()
+        build_ir(&resolve, world_id, &bindings, "").unwrap()
     }
 
     #[test]

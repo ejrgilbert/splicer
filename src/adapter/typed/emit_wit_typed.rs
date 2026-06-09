@@ -374,7 +374,8 @@ mod tests {
     fn build_ir_for(wit: &str) -> WrapperIR {
         let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = build_bindings_index(&src).unwrap();
-        build_ir(&resolve, world_id, &bindings).unwrap()
+        // WitTyped emission ignores target_import_path.
+        build_ir(&resolve, world_id, &bindings, "").unwrap()
     }
 
     fn impls_str(types: &[NamedType]) -> String {

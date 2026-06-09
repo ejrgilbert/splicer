@@ -38,7 +38,9 @@ use heck::ToUpperCamelCase;
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 
-use super::bindings_index::{bindings_path_tokens, GuestMethod, GuestTrait, GuestTraitKind};
+use super::bindings_index::{
+    bindings_path_tokens, strip_exports_prefix, GuestMethod, GuestTrait, GuestTraitKind,
+};
 use super::ir::{
     args_struct_ident, ExportFnKind, HandleRef, NamedKind, NamedType, RecordField, ResourceInfo,
     TypeLocation, WitTypeRef, WrapperIR,
@@ -217,14 +219,6 @@ fn import_resource_path_tokens(r: &ResourceInfo) -> TokenStream {
     bindings_path_tokens(&import_segs, Some(&r.rust_ident))
 }
 
-fn strip_exports_prefix(segs: &[String]) -> Vec<String> {
-    if segs.first().map(String::as_str) == Some("exports") {
-        segs[1..].to_vec()
-    } else {
-        segs.to_vec()
-    }
-}
-
 fn find_args_record<'a>(ir: &'a WrapperIR, args_ident: &syn::Ident) -> &'a NamedType {
     ir.args_records
         .iter()
@@ -345,9 +339,14 @@ fn emit_method_body(
     // forward via the captured `&self` (instance method) or the
     // resource's import-side type (constructor / static).
     let target_call = match (trait_kind, fn_kind) {
-        (GuestTraitKind::Interface, _) => {
-            build_target_call(method_ident, fields, guest_module_path)
-        }
+        (GuestTraitKind::Interface, _) => match behavior {
+            Behavior::Transform => build_target_call(method_ident, fields, ir),
+            // Virtualize doesn't forward — the strategy synthesizes
+            // the result. The closure body is dropped in the
+            // Virtualize dispatch arm; only the return type derived
+            // alongside it is consumed.
+            Behavior::Virtualize => quote!(unreachable!()),
+        },
         (GuestTraitKind::Resource(_), ExportFnKind::Method) => {
             build_self_call(method_ident, fields)
         }
@@ -880,21 +879,17 @@ fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {
 }
 
 /// Build the closure body that calls the wrapped target with args
-/// unpacked, against the import-side path
-/// (`bindings::<pkg>::<iface>::<method>`, no `exports::` prefix).
+/// unpacked, against the import-side path pinned on the IR.
 fn build_target_call(
     method_ident: &syn::Ident,
     fields: &[RecordField],
-    guest_module_path: &[String],
+    ir: &WrapperIR,
 ) -> TokenStream {
-    // The Guest trait lives at `exports::<pkg>::<iface>`; the import
-    // side drops that prefix.
-    assert_eq!(
-        guest_module_path.first().map(String::as_str),
-        Some("exports"),
-        "Guest trait module path must start with `exports`; got {guest_module_path:?}",
-    );
-    let import_path = bindings_path_tokens(&guest_module_path[1..], None);
+    let import_path = ir
+        .target_import_path
+        .as_ref()
+        .expect("IR has no target_import_path; tier-3 Transform must import the wrapped target");
+    let import_path = bindings_path_tokens(import_path, None);
     let arg_exprs = fields.iter().map(|f| {
         let name = &f.rust_ident;
         quote! { args.#name }
@@ -934,7 +929,7 @@ mod tests {
     fn emit_for_wit(wit: &str, behavior: Behavior) -> EmittedGuest {
         let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = build_bindings_index(&src).unwrap();
-        let ir = build_ir(&resolve, world_id, &bindings).unwrap();
+        let ir = build_ir(&resolve, world_id, &bindings, INTERFACE_QN).unwrap();
         let g = &bindings.guest_traits[0];
         emit_guest(g, INTERFACE_QN, behavior, &ir, false)
     }
