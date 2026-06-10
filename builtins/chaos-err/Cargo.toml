@@ -1,0 +1,17 @@
+[package]
+name = "chaos-err"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+
+[dependencies]
+splicer-tool-sdk = { version = "0.1.0", path = "../../splicer-tool-sdk" }
+getrandom = "0.4"
+wit-bindgen = { version = "0.51.0", features = ["default", "async-spawn", "inter-task-wakeup", "async"] }
+
+[build-dependencies]
+builtin-protocol = { package = "splicer-builtin-protocol", path = "../builtin-protocol", version = "0.2.0" }

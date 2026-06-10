@@ -36,50 +36,43 @@ use quote::quote;
 
 use super::ir::{EnumCase, FlagMember, NamedKind, NamedType, RecordField, VariantCase};
 
-/// Emit one `WitTyped` impl block per [`NamedType`].
+/// Emit `WitTyped` + `WitTypedWithResources` impls per [`NamedType`].
+/// Value-typed types get both via the SDK's dual-impl macro pattern;
+/// handle-containing records get neither (need the recursive cell
+/// walker, separate slice).
 pub fn emit_wit_typed_impls(types: &[NamedType]) -> Vec<TokenStream> {
-    types.iter().map(emit_one).collect()
+    types.iter().filter_map(emit_one).collect()
 }
 
-fn emit_one(t: &NamedType) -> TokenStream {
-    match &t.kind {
-        NamedKind::Record { fields } => emit_record(t, fields),
+fn emit_one(t: &NamedType) -> Option<TokenStream> {
+    let witty = match &t.kind {
+        NamedKind::Record { fields } => {
+            if fields.iter().any(|f| f.ty.contains_handle()) {
+                return None;
+            }
+            emit_record(t, fields)
+        }
         NamedKind::Variant { cases } => emit_variant(t, cases),
         NamedKind::Enum { cases } => emit_enum(t, cases),
         NamedKind::Flags { members } => emit_flags(t, members),
-    }
+    };
+    let type_path = t.rust_path_tokens();
+    Some(quote! {
+        #witty
+        ::splicer_tool_sdk::impl_wit_typed_with_resources_via_wave!(#type_path);
+    })
 }
 
 fn emit_record(t: &NamedType, fields: &[RecordField]) -> TokenStream {
     let type_path = t.rust_path_tokens();
 
-    // wasm-wave rejects both zero-field records and zero-element
-    // tuples, so encode the unit shape as a single-field sentinel
-    // record. Only reached for synthesized args structs — WIT
-    // doesn't allow zero-field records.
+    // Zero-field args structs go through the SDK macro that owns
+    // the single-field sentinel encoding (wasm-wave rejects empty
+    // records / tuples). Only reached for synthesized args structs:
+    // WIT itself doesn't allow zero-field records.
     if fields.is_empty() {
         return quote! {
-            impl ::splicer_tool_sdk::WitTyped for #type_path {
-                fn wave_type() -> ::splicer_tool_sdk::wasm_wave::value::Type {
-                    ::splicer_tool_sdk::wasm_wave::value::Type::record([
-                        ("unit", ::splicer_tool_sdk::wasm_wave::value::Type::BOOL),
-                    ]).expect("single-field record is permitted")
-                }
-                fn to_value(&self) -> ::splicer_tool_sdk::wasm_wave::value::Value {
-                    ::splicer_tool_sdk::wasm_wave::value::Value::make_record(
-                        &Self::wave_type(),
-                        [(
-                            "unit",
-                            ::splicer_tool_sdk::wasm_wave::value::Value::make_bool(true),
-                        )],
-                    ).expect("sentinel field matches the declared record type")
-                }
-                fn from_value(
-                    _value: &::splicer_tool_sdk::wasm_wave::value::Value,
-                ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
-                    ::core::result::Result::Ok(Self {})
-                }
-            }
+            ::splicer_tool_sdk::impl_wit_typed_for_zero_arg_args!(#type_path);
         };
     }
 
@@ -381,7 +374,8 @@ mod tests {
     fn build_ir_for(wit: &str) -> WrapperIR {
         let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = build_bindings_index(&src).unwrap();
-        build_ir(&resolve, world_id, &bindings).unwrap()
+        // WitTyped emission ignores target_import_path.
+        build_ir(&resolve, world_id, &bindings, "").unwrap()
     }
 
     fn impls_str(types: &[NamedType]) -> String {
@@ -526,10 +520,12 @@ mod tests {
     }
 
     #[test]
-    fn zero_arg_args_record_uses_sentinel_record_not_empty_tuple() {
+    fn zero_arg_args_record_delegates_to_sdk_sentinel_macro() {
         // wasm-wave returns None for empty records and empty tuples,
-        // so the zero-arg branch must use a sentinel-field record;
-        // emitting `Type::tuple([])` would panic at runtime.
+        // so the sentinel encoding lives in the SDK behind
+        // `impl_wit_typed_for_zero_arg_args!`. Codegen must emit the
+        // macro invocation rather than a `Type::tuple([])` impl
+        // (which would panic at runtime).
         let ir = build_ir_for(
             r#"
                 package test:pkg@0.1.0;
@@ -541,8 +537,9 @@ mod tests {
         );
         let combined = impls_str(&ir.args_records);
         assert!(
-            combined.contains("Type :: record"),
-            "zero-arg args impl must use Type::record (sentinel): {combined}"
+            combined.contains("impl_wit_typed_for_zero_arg_args ! (OpsNoopArgs)")
+                || combined.contains("impl_wit_typed_for_zero_arg_args !(OpsNoopArgs)"),
+            "zero-arg args impl must delegate to the SDK sentinel macro: {combined}"
         );
         assert!(
             !combined.contains("Type :: tuple ([])"),

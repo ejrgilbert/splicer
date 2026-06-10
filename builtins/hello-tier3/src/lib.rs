@@ -3,6 +3,15 @@
 //! end-to-end with the smallest meaningful strategy body — no bounds
 //! on `R` so it can interpose any tier-3-eligible target.
 
+mod bindings {
+    wit_bindgen::generate!({
+        world: "consumer",
+        generate_all,
+    });
+}
+
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 use splicer_tool_sdk::{CallId, TransformStrategy};
 
 #[derive(Default)]
@@ -15,13 +24,14 @@ impl<Args, R> TransformStrategy<Args, R> for HelloTier3 {
         args: Args,
         downstream: impl AsyncFn(Args) -> R,
     ) -> R {
+        let greeting = config::greeting();
         println!(
-            "[hello-tier3] before {}#{}",
+            "[{greeting}] before {}#{}",
             call.interface_name, call.function_name
         );
         let r = downstream(args).await;
         println!(
-            "[hello-tier3] after  {}#{}",
+            "[{greeting}] after  {}#{}",
             call.interface_name, call.function_name
         );
         r

@@ -19,7 +19,7 @@ use wit_parser::{
 };
 
 use super::super::indices::LocalsBuilder;
-use super::super::resolve::{hook_callback_mangling, sync_mangling};
+use super::super::resolve::{hook_callback_mangling, resolve_type_alias, sync_mangling};
 
 // ─── Standard wasm-component-model exports ────────────────────────
 //
@@ -787,8 +787,7 @@ pub(crate) fn find_common_typeid(resolve: &Resolve, type_name: &str) -> Result<T
         let Some(qname) = resolve.id_of(id) else {
             continue;
         };
-        let unversioned = qname.split('@').next().unwrap_or(&qname);
-        if unversioned == "splicer:common/types" {
+        if crate::parse::wit_name::unversioned(&qname) == "splicer:common/types" {
             return resolve.interfaces[id]
                 .types
                 .get(type_name)
@@ -1183,16 +1182,6 @@ pub(crate) fn require_gate_compatible_func(
         );
     }
     Ok(())
-}
-
-/// Follow `TypeDefKind::Type` aliases to the underlying definition
-/// (e.g. an `api`-side `use types.{cat}` alias → the `types`-side
-/// `resource cat` definition).
-pub(crate) fn resolve_type_alias(resolve: &Resolve, mut tid: TypeId) -> TypeId {
-    while let TypeDefKind::Type(Type::Id(next)) = &resolve.types[tid].kind {
-        tid = *next;
-    }
-    tid
 }
 
 /// Emit one `[resource-drop]<R>` import per unique borrow resource

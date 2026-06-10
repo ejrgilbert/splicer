@@ -581,6 +581,7 @@ rules:
                 config_provider_path: None,
                 adapter_info: None,
                 tier: None,
+                resource_bearing_exports: Vec::new(),
             }],
         )];
         let tmp = tempfile::tempdir().unwrap();

@@ -3,19 +3,34 @@ BUILTINS_DIR  := builtins
 ASSETS_DIR    := assets/builtins
 ADAPTER       := $(BUILTINS_DIR)/wasi_snapshot_preview1.reactor.wasm
 
-# Every dir under builtins/ that has both a Cargo.toml and a wit/
-# directory is a builtin crate; the output goes to
-# assets/builtins/<name>.wasm. Host-side helper crates (e.g.
-# builtin-protocol) live alongside but lack wit/, so they're excluded.
-BUILTIN_NAMES := $(patsubst $(BUILTINS_DIR)/%/wit,%,$(wildcard $(BUILTINS_DIR)/*/wit))
+BUILTIN_NAMES := $(shell for d in $(BUILTINS_DIR)/*/wit; do \
+  crate=$$(dirname $$d); \
+  awk '/^tier *= *[12] *$$/ {f=1} END{exit !f}' $$crate/manifest.toml 2>/dev/null \
+    && basename $$crate; \
+done)
+# Internal substrate helper: no manifest.toml, but needs to be built.
+BUILTIN_NAMES += config-provider
 BUILTIN_WASMS := $(addprefix $(ASSETS_DIR)/,$(addsuffix .wasm,$(BUILTIN_NAMES)))
+
+# Every builtin with a wkg.toml needs wit/deps populated before
+# cargo can compile it. Covers tier-3/4 strategies (rlibs whose
+# wrapper builds run wit-bindgen at splice time) and helper builtins
+# like config-provider (which have a wkg.toml but no manifest.toml).
+WIT_DEP_NAMES := $(patsubst $(BUILTINS_DIR)/%/wkg.toml,%,$(wildcard $(BUILTINS_DIR)/*/wkg.toml))
+WIT_DEPS := $(addprefix $(BUILTINS_DIR)/,$(addsuffix /wit/deps,$(WIT_DEP_NAMES)))
 
 # wkg.toml [overrides] resolves splicer:tier1 / splicer:common from
 # these dirs, so any change in here invalidates every builtin.
 CANONICAL_WIT := $(wildcard wit/tier1/*.wit wit/common/*.wit)
 
 .PHONY: build-builtins check-env clean-builtins
-build-builtins: check-env $(BUILTIN_WASMS)
+build-builtins: check-env $(BUILTIN_WASMS) $(WIT_DEPS)
+
+$(BUILTINS_DIR)/%/wit/deps: \
+    $(BUILTINS_DIR)/%/wit/world.wit \
+    $(BUILTINS_DIR)/%/wkg.toml
+	@echo "── Fetching wit/deps: $* ──"
+	cd $(BUILTINS_DIR)/$* && wkg wit fetch
 
 # Verify the toolchain is installed before invoking it. Quiet on
 # success; on failure, lists every missing tool with an install hint

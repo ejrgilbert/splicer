@@ -266,6 +266,41 @@ impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 =
 impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6, T8 => 7, T9 => 8, T10 => 9, T11 => 10);
 impl_wit_typed_tuple!(T1 => 0, T2 => 1, T3 => 2, T4 => 3, T5 => 4, T6 => 5, T7 => 6, T8 => 7, T9 => 8, T10 => 9, T11 => 10, T12 => 11);
 
+/// Implement [`WitTyped`] for a zero-field args struct via the
+/// single-field sentinel-record encoding that works around
+/// `wasm-wave`'s rejection of zero-field records (and zero-element
+/// tuples). Codegen emits one invocation per synthesized zero-arg
+/// args record.
+#[macro_export]
+macro_rules! impl_wit_typed_for_zero_arg_args {
+    ($args:ty) => {
+        impl $crate::WitTyped for $args {
+            fn wave_type() -> $crate::wasm_wave::value::Type {
+                $crate::wasm_wave::value::Type::record([(
+                    "unit",
+                    $crate::wasm_wave::value::Type::BOOL,
+                )])
+                .expect("single-field record is permitted")
+            }
+            fn to_value(&self) -> $crate::wasm_wave::value::Value {
+                $crate::wasm_wave::value::Value::make_record(
+                    &<Self as $crate::WitTyped>::wave_type(),
+                    [(
+                        "unit",
+                        $crate::wasm_wave::value::Value::make_bool(true),
+                    )],
+                )
+                .expect("sentinel field matches the declared record type")
+            }
+            fn from_value(
+                _value: &$crate::wasm_wave::value::Value,
+            ) -> ::core::result::Result<Self, $crate::BridgeError> {
+                ::core::result::Result::Ok(Self {})
+            }
+        }
+    };
+}
+
 /// Decode the cell at `root` directly into a typed Rust value.
 /// Convenience over [`cells_to_value`] + [`WitTyped::from_value`].
 pub fn cells_to_typed<T: WitTyped>(tree: &FieldTree, root: u32) -> Result<T, BridgeError> {
@@ -1124,6 +1159,29 @@ mod tests {
         let mut fields = v.unwrap_record();
         let (name, _val) = fields.next().expect("one field present");
         assert_eq!(name.as_ref(), "unit");
+    }
+
+    /// Stand-in for a codegen-emitted zero-arg args struct. Exercises
+    /// the macro end-to-end so the SDK pins the impl shape
+    /// independent of the splicer-side codegen.
+    #[derive(Debug, PartialEq)]
+    struct NoopArgs {}
+    crate::impl_wit_typed_for_zero_arg_args!(NoopArgs);
+
+    #[test]
+    fn zero_arg_args_macro_round_trips_via_wave() {
+        let a = NoopArgs {};
+        let v = a.to_value();
+        let back = NoopArgs::from_value(&v).unwrap();
+        assert_eq!(back, NoopArgs {});
+    }
+
+    #[test]
+    fn zero_arg_args_macro_wave_type_matches_sentinel_shape() {
+        let ty = <NoopArgs as WitTyped>::wave_type();
+        let fields: Vec<_> = ty.record_fields().collect();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0.as_ref(), "unit");
     }
 
     #[test]

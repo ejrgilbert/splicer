@@ -339,7 +339,7 @@ impl EmitPlan {
                         None => middleware_var,
                     };
                     self.routing
-                        .insert((routing_id, interface.name.clone()), current);
+                        .insert((routing_id, interface.name.clone()), current.clone());
                 }
                 prev_var = Some(node_var.clone());
 
@@ -369,6 +369,45 @@ impl EmitPlan {
                 }
             }
         }
+
+        // Second pass: a tier-4 wrapper EXPORTS the sibling resource-bearing
+        // interfaces and owns their resource identity. Route the consumer's
+        // imports of those siblings through the wrapper so it sees one
+        // consistent resource type. Done after the main pass so the siblings'
+        // own no-injection chains don't clobber these overrides by re-routing
+        // them back to the original provider. `resource_bearing_exports` is
+        // empty for non-wrapping tiers, making this a no-op there.
+        for Chain {
+            interface,
+            chain,
+            inject_plan,
+            ..
+        } in chains
+        {
+            for (i, id) in chain.iter().enumerate().skip(1) {
+                let Some(outermost) = inject_plan.get(&i).and_then(|m| m.iter().next()) else {
+                    continue;
+                };
+                if outermost.resource_bearing_exports.is_empty() {
+                    continue;
+                }
+                let routing_id = resolve_shim_node(*id, composition, shim_comps);
+                let Some(current) = self
+                    .routing
+                    .get(&(routing_id, interface.name.clone()))
+                    .cloned()
+                else {
+                    continue;
+                };
+                for sib in &outermost.resource_bearing_exports {
+                    if *sib != interface.name {
+                        self.routing
+                            .insert((routing_id, sib.clone()), current.clone());
+                    }
+                }
+            }
+        }
+
         Ok(self)
     }
 
@@ -503,9 +542,26 @@ impl EmitPlan {
         // IndexSet's iter doesn't impl DoubleEndedIterator, so the
         // .collect() is required for `.rev()`.
         let ordered: Vec<&Injection> = middlewares.iter().collect();
-        let mut current = initial;
+        // Each wrap that imports the target also imports its
+        // sibling-types iface; that import must point at a var that
+        // exports the iface. Only tier-4 wraps do (they own a fresh
+        // resource identity); tier-1/2/3 wraps just forward the
+        // target and don't re-export sibling types. So we track the
+        // nearest tier-4 below (or the chain root, if none).
+        let mut current = initial.clone();
+        let mut sibling_types_source = initial;
         for mdl in ordered.iter().rev() {
-            current = self.add_middleware(mdl, interface, &current, composition, shim_comps)?;
+            current = self.add_middleware(
+                mdl,
+                interface,
+                &current,
+                &sibling_types_source,
+                composition,
+                shim_comps,
+            )?;
+            if mdl.tier.is_some_and(|t| !t.imports_target()) {
+                sibling_types_source = current.clone();
+            }
         }
         Ok(current)
     }
@@ -524,6 +580,7 @@ impl EmitPlan {
         mdl: &Injection,
         interface: &Contract,
         downstream_var: &str,
+        sibling_types_source: &str,
         composition: &CompositionGraph,
         shim_comps: &HashMap<usize, usize>,
     ) -> anyhow::Result<String> {
@@ -615,7 +672,7 @@ impl EmitPlan {
                 composition,
                 shim_comps,
             )? {
-                imports.push((extra, downstream_var.to_string()));
+                imports.push((extra, sibling_types_source.to_string()));
             }
             self.entities.insert(
                 adapter_var.clone(),
@@ -632,11 +689,38 @@ impl EmitPlan {
             // Tier-4 (virtualize) middlewares don't import the target
             // (they replace the downstream instead of forwarding); the
             // wac wire must be skipped for those.
-            let imports = if mdl.tier.is_some_and(|t| !t.imports_target()) {
-                Vec::new()
-            } else {
+            let imports_target = mdl.tier.is_none_or(|t| t.imports_target());
+            let mut imports = if imports_target {
                 vec![(interface.name.clone(), downstream_var.to_string())]
+            } else {
+                Vec::new()
             };
+
+            if imports_target {
+                let mdl_bytes = std::fs::read(&mdl_path).map_err(|e| {
+                    anyhow::anyhow!("failed to read middleware wasm at `{mdl_path}`: {e}",)
+                })?;
+                for extra in factored_types_to_wire(
+                    &resource_bearing_imports(&mdl_bytes),
+                    &interface.name,
+                    composition,
+                    shim_comps,
+                )? {
+                    imports.push((extra, sibling_types_source.to_string()));
+                }
+            }
+            // Wire the config provider on the wrapper.
+            if let Some(cfg_path) = mdl.config_provider_path.as_ref() {
+                let cfg_pkg = format!("{real_pkg}-config");
+                self.entities
+                    .insert(cfg_pkg.clone(), Entity::leaf(&cfg_pkg, &cfg_pkg));
+                self.used_middlewares
+                    .insert(cfg_pkg.clone(), cfg_path.clone());
+                imports.push((
+                    crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED.to_string(),
+                    cfg_pkg,
+                ));
+            }
             self.entities
                 .insert(mw_var.clone(), Entity::wired(&mw_var, &real_pkg, imports));
             self.used_middlewares.insert(real_pkg, mdl_path);
@@ -1122,11 +1206,38 @@ fn apply_site(
     let caller_var = caller_id.map(|id| get_name(&ctx.composition.nodes[&id]).to_string());
 
     let edge_id = canonical_edge_id(interface, caller_var.as_deref(), &provider_var);
-    let edge_inject = build_per_edge_providers(rule.inject(), &edge_id, ctx.splits_path)?;
+
+    // Prefer the consumer's split (provider_idx + 1) so the adapter
+    // copies its import surface. At the outermost boundary there's no
+    // consumer, so fall back to the provider's own split.
+    let consumer_path = chain
+        .consumer_split_path(
+            site.provider_idx + 1,
+            ctx.composition,
+            ctx.splits_path,
+            ctx.shim_comps,
+        )
+        .or_else(|| {
+            chain.consumer_split_path(
+                site.provider_idx,
+                ctx.composition,
+                ctx.splits_path,
+                ctx.shim_comps,
+            )
+        });
+
+    // Materialize tier-3/4 first so `build_per_edge_providers` sees
+    // the wrapper's config import on the resulting `config_as_wave`.
+    let materialized_inject = materialize_tier3_4_inline(
+        interface,
+        rule.inject(),
+        consumer_path.as_deref(),
+        ctx,
+        accs,
+    )?;
+    let edge_inject = build_per_edge_providers(&materialized_inject, &edge_id, ctx.splits_path)?;
 
     // Alias the matched provider; `between` also aliases the caller (outer).
-    // OnSubgraph is expected to be resolved before generate_wac runs,
-    // so it should never reach this site.
     let new_aliases: Vec<(u32, Option<String>)> = match rule {
         SpliceRule::Before { provider_alias, .. } => vec![(provider_id, provider_alias.clone())],
         SpliceRule::Between {
@@ -1147,26 +1258,6 @@ fn apply_site(
             )
         }
     };
-
-    // Prefer the consumer's split (provider_idx + 1) so the adapter
-    // copies its import surface. At the outermost boundary there's no
-    // consumer, so fall back to the provider's own split — the adapter
-    // mirrors the provider's full import topology.
-    let consumer_path = chain
-        .consumer_split_path(
-            site.provider_idx + 1,
-            ctx.composition,
-            ctx.splits_path,
-            ctx.shim_comps,
-        )
-        .or_else(|| {
-            chain.consumer_split_path(
-                site.provider_idx,
-                ctx.composition,
-                ctx.splits_path,
-                ctx.shim_comps,
-            )
-        });
 
     add_to_inject_plan(
         interface,
@@ -1332,7 +1423,10 @@ fn classify_tier3_4_source(inj: &Injection) -> Option<crate::strategies::Tier3_4
     use crate::strategies::Tier3_4Source;
     if let Some(b) = inj.builtin.as_deref() {
         if crate::strategies::is_embedded_builtin(b) {
-            return Some(Tier3_4Source::Builtin(b));
+            return Some(Tier3_4Source::Builtin {
+                name: b,
+                wac_name: &inj.name,
+            });
         }
         return None;
     }
@@ -1353,14 +1447,13 @@ fn classify_tier3_4_source(inj: &Injection) -> Option<crate::strategies::Tier3_4
 fn source_label<'a>(source: &crate::strategies::Tier3_4Source<'a>) -> &'a str {
     use crate::strategies::Tier3_4Source;
     match source {
-        Tier3_4Source::Builtin(name) => name,
+        Tier3_4Source::Builtin { name, .. } => name,
         Tier3_4Source::User { wac_name, .. } => wac_name,
     }
 }
 
-/// Stamp the materialized wrapper path + resolved tier onto a clone
-/// of `inj` so downstream stages treat it like any other path-backed
-/// middleware.
+/// Stamp the materialized wrapper path + tier onto a clone of `inj`
+/// and validate config against the wrapper's config import.
 fn stamp_materialized(
     inj: &Injection,
     wrapper_path: std::path::PathBuf,
@@ -1370,11 +1463,26 @@ fn stamp_materialized(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display()))?
         .to_string();
-    Ok(Injection {
+    // Tier-4 wrappers export the sibling resource-bearing interfaces and own
+    // the resource identity; discover those exports once here so chain routing
+    // can wire the consumer's sibling imports through the wrapper without
+    // re-reading it. Tiers that import the target don't wrap, so stay empty.
+    let sibling_exports = if tier.imports_target() {
+        Vec::new()
+    } else {
+        let bytes = std::fs::read(&wrapper_path).with_context(|| {
+            format!("read tier-4 wrapper for sibling-export discovery: {path_str}")
+        })?;
+        resource_bearing_exports(&bytes)
+    };
+    let mut stamped = Injection {
         path: Some(path_str),
         tier: Some(tier),
+        resource_bearing_exports: sibling_exports,
         ..inj.clone()
-    })
+    };
+    crate::config_provider::validate_config_as_wave(&mut stamped)?;
+    Ok(stamped)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1390,20 +1498,10 @@ fn add_to_inject_plan(
     ctx: &SpliceCtx,
     accs: &mut SpliceAccumulators,
 ) -> anyhow::Result<Vec<ContractResult>> {
-    // Tier-3/4 wrappers ARE the adapter — codegen them here so
-    // validate_contract sees their exports.
-    let to_inject_materialized = materialize_tier3_4_inline(
-        interface_name,
-        to_inject,
-        consumer_split.as_deref(),
-        ctx,
-        accs,
-    )?;
-
     // Check that the import/export contract is upheld by this plan and return results
     // to the caller — logging and error-handling is the caller's responsibility.
     let contract_results = validate_contract(
-        &to_inject_materialized,
+        to_inject,
         interface_name,
         contract_fingerprint,
         &mut accs.checked_middlewares,
@@ -1411,9 +1509,9 @@ fn add_to_inject_plan(
 
     // For tier-1 compatible middleware, generate a adapter component and substitute
     // the injection path so the rest of the WAC generation uses the adapter.
-    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject_materialized.len());
+    let mut resolved: Vec<Injection> = Vec::with_capacity(to_inject.len());
     let mut final_results: Vec<ContractResult> = Vec::with_capacity(contract_results.len());
-    for (injection, result) in to_inject_materialized.iter().zip(contract_results) {
+    for (injection, result) in to_inject.iter().zip(contract_results) {
         match result {
             ContractResult::Tier1Compatible(matched_interfaces) => {
                 // `consumer_split` is the split the adapter inherits
@@ -1630,11 +1728,8 @@ fn target_interface_has_sync_func(target_interface: &str, target_split_path: &st
         let Some(qname) = resolve.id_of(*id) else {
             continue;
         };
-        if qname.split('@').next().unwrap_or(&qname)
-            != target_interface
-                .split('@')
-                .next()
-                .unwrap_or(target_interface)
+        if crate::parse::wit_name::unversioned(&qname)
+            != crate::parse::wit_name::unversioned(target_interface)
         {
             continue;
         }
@@ -1646,10 +1741,16 @@ fn target_interface_has_sync_func(target_interface: &str, target_split_path: &st
     false
 }
 
-/// Qualified names of the component's interface imports whose
-/// instance type contains at least one resource. Best-effort: empty
-/// on decode errors.
-fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
+#[derive(Clone, Copy)]
+enum WorldSide {
+    Imports,
+    Exports,
+}
+
+/// Qualified names of the component's interface imports or exports
+/// whose instance type contains at least one resource. Best-effort:
+/// empty on decode errors.
+fn resource_bearing_ifaces(bytes: &[u8], side: WorldSide) -> Vec<String> {
     let Ok(decoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wit_component::decode(bytes)
     })) else {
@@ -1659,8 +1760,12 @@ fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
         return Vec::new();
     };
     let world = &resolve.worlds[world_id];
+    let items = match side {
+        WorldSide::Imports => &world.imports,
+        WorldSide::Exports => &world.exports,
+    };
     let mut result = Vec::new();
-    for (_key, item) in &world.imports {
+    for item in items.values() {
         let wit_parser::WorldItem::Interface { id, .. } = item else {
             continue;
         };
@@ -1677,6 +1782,14 @@ fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
         }
     }
     result
+}
+
+fn resource_bearing_imports(bytes: &[u8]) -> Vec<String> {
+    resource_bearing_ifaces(bytes, WorldSide::Imports)
+}
+
+fn resource_bearing_exports(bytes: &[u8]) -> Vec<String> {
+    resource_bearing_ifaces(bytes, WorldSide::Exports)
 }
 
 /// Returns true if the split-file number `split_num` corresponds to a shim.
@@ -1966,6 +2079,7 @@ mod tests {
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
             tier: None,
+            resource_bearing_exports: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -1975,7 +2089,14 @@ mod tests {
         let graph = synth_graph(1, &[]);
         let mut plan = EmitPlan::new();
         let _adapter_var = plan
-            .add_middleware(&mdl, &contract, "downstream", &graph, &HashMap::new())
+            .add_middleware(
+                &mdl,
+                &contract,
+                "downstream",
+                "downstream",
+                &graph,
+                &HashMap::new(),
+            )
             .expect("plan");
 
         let cfg = plan
@@ -2029,6 +2150,7 @@ mod tests {
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
             tier: None,
+            resource_bearing_exports: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2038,7 +2160,14 @@ mod tests {
         let graph = synth_graph(1, &[]);
         let mut plan = EmitPlan::new();
         let _adapter_var = plan
-            .add_middleware(&mdl, &contract, "downstream", &graph, &HashMap::new())
+            .add_middleware(
+                &mdl,
+                &contract,
+                "downstream",
+                "downstream",
+                &graph,
+                &HashMap::new(),
+            )
             .expect("plan");
 
         let real = plan
@@ -2133,6 +2262,7 @@ mod tests {
                 config_provider_path: None,
                 adapter_info: None,
                 tier: None,
+                resource_bearing_exports: Vec::new(),
             }],
         )];
 

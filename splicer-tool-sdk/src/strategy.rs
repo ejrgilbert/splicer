@@ -14,6 +14,26 @@
 
 use crate::types::CallId;
 
+/// Define the wrapper crate's single strategy instance plus a
+/// `strategy() -> &'static S` accessor.
+///
+/// Storage is [`std::sync::OnceLock`] so the returned reference has
+/// `'static` lifetime, which avoids the borrow-across-`.await`
+/// conflict that `thread_local! { RefCell<S> }` would trip. The
+/// strategy type must impl [`Default`] (for lazy init) and `Sync`
+/// (for static storage); strategies needing interior mutability can
+/// wrap their state in atomic / lock primitives.
+#[macro_export]
+macro_rules! define_strategy_singleton {
+    ($strategy_ty:path) => {
+        static STRATEGY: ::std::sync::OnceLock<$strategy_ty> = ::std::sync::OnceLock::new();
+
+        fn strategy() -> &'static $strategy_ty {
+            STRATEGY.get_or_init(<$strategy_ty as ::core::default::Default>::default)
+        }
+    };
+}
+
 /// **Tier-3 (forward) strategy.** Implement this when your
 /// middleware forwards each call to the wrapped target, optionally
 /// transforming arguments before or the result after.
@@ -175,5 +195,23 @@ mod tests {
         )
         .await;
         assert_eq!(r, 0);
+    }
+
+    // Stand-in mirroring the wrapper crate's STRATEGY pattern.
+    #[derive(Default)]
+    pub struct StubSingletonStrategy {
+        pub init_marker: u64,
+    }
+    crate::define_strategy_singleton!(StubSingletonStrategy);
+
+    #[test]
+    fn singleton_macro_yields_stable_static_reference() {
+        let a: *const StubSingletonStrategy = strategy();
+        let b: *const StubSingletonStrategy = strategy();
+        // OnceLock returns the same instance on every call; the
+        // accessor's `&'static S` lifetime is what lets the wrapper
+        // hold the borrow across `.await`.
+        assert_eq!(a, b);
+        assert_eq!(strategy().init_marker, 0);
     }
 }

@@ -2,6 +2,15 @@
 //! of each wrapped call's return type — never invokes the target.
 //! Smoke-tests the tier-4 codegen pipeline end-to-end.
 
+mod bindings {
+    wit_bindgen::generate!({
+        world: "consumer",
+        generate_all,
+    });
+}
+
+include!(concat!(env!("OUT_DIR"), "/builtin_config_codegen.rs"));
+
 use splicer_tool_sdk::{CallId, VirtualizeStrategy};
 
 #[derive(Default)]
@@ -11,8 +20,9 @@ pub struct HelloTier4;
 // Use splicer type predication to constrain to `concrete` results.
 impl<Args, R: Default> VirtualizeStrategy<Args, R> for HelloTier4 {
     async fn handle(&self, call: CallId, _args: Args) -> R {
+        let greeting = config::greeting();
         println!(
-            "[hello-tier4] virtualizing {}#{}",
+            "[{greeting}] virtualizing {}#{}",
             call.interface_name, call.function_name
         );
         R::default()

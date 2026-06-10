@@ -146,11 +146,19 @@ narrowing.
 
 ## Limitations
 
-- **Async targets only.** wit-bindgen emits sync `fn` Guest methods
-  for `func` WIT signatures but the strategy traits are `async fn`,
-  producing an E0053 type mismatch in the generated wrapper crate.
-  Today tier-3 only wraps interfaces whose functions are declared
-  `async func`. Sync-target support is on the roadmap.
+- **Sync targets** are wrapped via an auto-generated sync->async
+  bridge; see [`sync-suspend-limitation.md`](../TODO/sync-suspend-limitation.md).
+- **Resources** work when factored into a sibling `-types` interface
+  (inline declarations are rejected). Tier-3 intercepts iface-level
+  functions that take or return a resource, but method calls on a
+  returned resource bypass the wrapper -- dispatch routes to the
+  producer's `GuestR`. Use tier-4 if you need method interception.
+  See [`resource-method-interception.md`](../TODO/resource-method-interception.md).
+- **`future`, `stream`, `error-context`** aren't supported. The
+  `concrete` predicate in
+  [`splice-config.md`](../splice-config.md#function-shape-matching-all-funcs)
+  filters them out at match time. Tracked in
+  [`tier3-tier4-builtins.md`](../TODO/tier3-tier4-builtins.md).
 
 ## Good for
 

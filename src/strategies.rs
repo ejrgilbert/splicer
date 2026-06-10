@@ -86,16 +86,9 @@ fn lookup(name: &str) -> Result<&'static Dir<'static>> {
 /// Each variant maps to one `prepare_*` step; the rest of the
 /// pipeline is source-agnostic.
 pub enum Tier3_4Source<'a> {
-    /// Embedded builtin, referenced by name. The strategy crate's
-    /// source + the SDK are extracted from the splicer binary to a
-    /// cache dir before cargo runs.
-    Builtin(&'a str),
-    /// User-supplied strategy crate on disk. `wac_name` is the YAML
-    /// `name:` field (the WAC variable identifier and the output
-    /// filename stem); `strategy_dir` is the crate root containing
-    /// `Cargo.toml` + `manifest.toml` + `src/`. The Cargo package
-    /// name and Rust struct ident are read from the on-disk
-    /// `Cargo.toml`, so YAML and crate names don't have to match.
+    /// Embedded builtin, referenced by name.
+    Builtin { name: &'a str, wac_name: &'a str },
+    /// User-supplied strategy crate on disk.
     User {
         wac_name: &'a str,
         strategy_dir: &'a Path,
@@ -126,7 +119,7 @@ pub fn materialize_tier3_4(
     mirror_export_name: Option<&str>,
 ) -> Result<(PathBuf, Tier)> {
     let prep = match source {
-        Tier3_4Source::Builtin(name) => prepare_builtin_strategy(name)?,
+        Tier3_4Source::Builtin { name, wac_name } => prepare_builtin_strategy(name, wac_name)?,
         Tier3_4Source::User {
             wac_name,
             strategy_dir,
@@ -169,10 +162,8 @@ struct PreparedStrategy {
 
 /// Extract the embedded builtin's source to the per-process cache and
 /// read its `splicer-tool-sdk` version, returning the inputs the
-/// shared codegen pipeline needs. The builtin name doubles as the
-/// Cargo package name and the output filename stem (the embed
-/// convention).
-fn prepare_builtin_strategy(name: &str) -> Result<PreparedStrategy> {
+/// shared codegen pipeline needs.
+fn prepare_builtin_strategy(name: &str, wac_name: &str) -> Result<PreparedStrategy> {
     let manifest = read_manifest(name)?;
     let cache_root = typed_cache_root()?;
     let strategy_dir = cache_root.join("strategies").join(name);
@@ -180,7 +171,7 @@ fn prepare_builtin_strategy(name: &str) -> Result<PreparedStrategy> {
     let sdk_version = read_sdk_version_from(&strategy_dir)?;
     Ok(PreparedStrategy {
         manifest,
-        out_name: name.to_string(),
+        out_name: wac_name.to_string(),
         strategy_dir,
         sdk_version,
         strategy_crate_name: name.to_string(),
@@ -653,7 +644,10 @@ mod tests {
         let splits = tempfile::tempdir().unwrap();
         let (out, tier) = materialize_tier3_4(
             splits.path(),
-            Tier3_4Source::Builtin("hello-tier3"),
+            Tier3_4Source::Builtin {
+                name: "hello-tier3",
+                wac_name: "hello-tier3",
+            },
             &composition,
             "test:demo/ops@0.1.0",
             None,

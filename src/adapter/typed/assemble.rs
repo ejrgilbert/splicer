@@ -50,6 +50,8 @@ pub struct WrapperCrateInputs<'a> {
     pub witty_impls: &'a [TokenStream],
     /// Per-Guest emissions from [`super::emit_method::emit_guest`].
     pub guests: &'a [EmittedGuest],
+    /// Per-resource wrapper newtypes
+    pub resource_newtypes: &'a [TokenStream],
     pub behavior: Behavior,
     /// The strategy crate's Cargo package name (kebab- or snake-case).
     pub strategy_crate_name: &'a str,
@@ -81,6 +83,7 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
     };
 
     let witty_impls = inputs.witty_impls;
+    let resource_newtypes = inputs.resource_newtypes;
     let args_structs: Vec<&TokenStream> = inputs
         .guests
         .iter()
@@ -105,25 +108,18 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         #strategy_trait_use
 
         // Args record decls (top-level structs), then `WitTyped`
-        // impls for user types and args records alike.
+        // impls for user types and args records alike. Resource
+        // wrapper newtypes (Wrapper<R>) live alongside and back the
+        // export-side resource table via the impl<GuestR for WrapperR>
+        // blocks emitted below.
         #(#args_structs)*
+        #(#resource_newtypes)*
         #(#witty_impls)*
 
-        // One shared strategy instance for the whole wrapper. Stored
-        // as `OnceLock<S>` so the strategy reference has `'static`
-        // lifetime — avoids the borrow-across-`.await` lifetime
-        // conflict that `thread_local! { RefCell<S> }` would trip.
-        // The strategy type must impl `Default` (for lazy init) and
-        // `Sync` (for static storage); strategies needing interior
-        // mutability can wrap their state in atomic / lock primitives.
-        static STRATEGY: ::std::sync::OnceLock<#strategy_crate_ident::#strategy_type_ident> =
-            ::std::sync::OnceLock::new();
-
-        fn strategy() -> &'static #strategy_crate_ident::#strategy_type_ident {
-            STRATEGY.get_or_init(
-                <#strategy_crate_ident::#strategy_type_ident as ::core::default::Default>::default
-            )
-        }
+        // Strategy storage + `strategy()` accessor.
+        ::splicer_tool_sdk::define_strategy_singleton!(
+            #strategy_crate_ident::#strategy_type_ident
+        );
 
         // The user-facing Guest impl target. Each `impl Guest for Wrapper`
         // block (one per exported interface) dispatches into STRATEGY.
@@ -193,8 +189,38 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
     root.insert("lib".into(), Value::Table(lib));
     root.insert("dependencies".into(), Value::Table(dependencies));
 
+    if let Some(local_sdk) = local_sdk_path() {
+        let mut sdk_patch = Map::new();
+        sdk_patch.insert("path".into(), Value::String(local_sdk));
+        let mut crates_io = Map::new();
+        crates_io.insert("splicer-tool-sdk".into(), Value::Table(sdk_patch));
+        let mut patch = Map::new();
+        patch.insert("crates-io".into(), Value::Table(crates_io));
+        root.insert("patch".into(), Value::Table(patch));
+    }
+
     toml::to_string(&Value::Table(root))
         .expect("toml serialization of strings + booleans + tables is infallible")
+}
+
+/// Path the wrapper should patch `splicer-tool-sdk` to, or `None` for
+/// crates.io resolution. Three-state precedence:
+///
+/// - `SPLICER_TOOL_SDK_PATH=""` → opt out (registry, even from workspace builds).
+/// - `SPLICER_TOOL_SDK_PATH=/some/path` → explicit override.
+/// - Unset + splicer compiled from a workspace with a sibling
+///   `splicer-tool-sdk/` → that sibling. Otherwise (crates.io
+///   installs) → registry.
+fn local_sdk_path() -> Option<String> {
+    const WORKSPACE_SDK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/splicer-tool-sdk");
+    match std::env::var("SPLICER_TOOL_SDK_PATH").as_deref() {
+        Ok("") => None,
+        Ok(path) => Some(path.to_string()),
+        Err(_) => std::path::Path::new(WORKSPACE_SDK)
+            .join("Cargo.toml")
+            .exists()
+            .then(|| WORKSPACE_SDK.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -219,7 +245,7 @@ mod tests {
     fn assemble_for_wit(wit: &str, behavior: Behavior) -> String {
         let (resolve, world_id, bindings_src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = build_bindings_index(&bindings_src).unwrap();
-        let ir = build_ir(&resolve, world_id, &bindings).unwrap();
+        let ir = build_ir(&resolve, world_id, &bindings, INTERFACE_QN).unwrap();
         let user_impls = emit_wit_typed_impls(&ir.types);
         let args_impls = emit_wit_typed_impls(&ir.args_records);
         let witty_impls: Vec<_> = user_impls.into_iter().chain(args_impls).collect();
@@ -233,6 +259,7 @@ mod tests {
             bindings_src: &bindings_src,
             witty_impls: &witty_impls,
             guests: &guests,
+            resource_newtypes: &[],
             behavior,
             strategy_crate_name: "my-strategy",
             strategy_type: "MyStrategy",
@@ -254,16 +281,12 @@ mod tests {
             out.contains("use ::splicer_tool_sdk::TransformStrategy"),
             "forward dispatch expects TransformStrategy use:\n{out}"
         );
-        // The strategy is stored in a OnceLock<S> so the `&S`
-        // handed to handle() has `'static` lifetime (avoids
-        // borrow-across-await with thread_local!{RefCell<S>}).
+        // Strategy storage goes through the SDK macro; codegen
+        // emits the invocation with the snake-cased strategy path.
         assert!(
-            out.contains("OnceLock"),
-            "expected OnceLock storage:\n{out}"
-        );
-        assert!(
-            out.contains("my_strategy :: MyStrategy") || out.contains("my_strategy::MyStrategy"),
-            "expected snake-cased strategy path:\n{out}"
+            out.contains("define_strategy_singleton!(my_strategy::MyStrategy)")
+                || out.contains("define_strategy_singleton ! (my_strategy :: MyStrategy)"),
+            "expected define_strategy_singleton! invocation:\n{out}"
         );
         // The wrapper struct + Guest impl.
         assert!(out.contains("struct Wrapper"), "missing Wrapper:\n{out}");

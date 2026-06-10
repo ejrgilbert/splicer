@@ -16,6 +16,8 @@ jobs:
   publish:
     name: Publish splicer-tool-sdk to crates.io
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
@@ -75,3 +77,35 @@ jobs:
             echo "cargo add splicer-tool-sdk@$VERSION"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Verify a tier-3 wrapper builds against the just-published SDK.
+  smoke_against_published_sdk:
+    name: Tier-3 wrapper builds against published SDK
+    needs: publish
+    runs-on: ubuntu-latest
+    # Empty value overrides the workspace's .cargo/config.toml default
+    # so the wrapper resolves splicer-tool-sdk from crates.io.
+    env:
+      SPLICER_TOOL_SDK_PATH: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      # crates.io index can lag a few seconds behind publish.
+      - name: Wait for crates.io to see new version
+        env:
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if cargo search splicer-tool-sdk --limit 1 2>/dev/null | grep -q "\"$VERSION\""; then
+              echo "crates.io index has $VERSION"; exit 0
+            fi
+            echo "Attempt $i: $VERSION not visible yet; sleeping 10s"; sleep 10
+          done
+          echo "::error::splicer-tool-sdk $VERSION never appeared on crates.io after 60s"
+          exit 1
+      # No SPLICER_TOOL_SDK_PATH: wrapper must resolve SDK from crates.io.
+      - name: Materialize a wrapper against published SDK
+        run: cargo test --lib --locked -- --ignored --nocapture materialize_tier3_produces_a_component

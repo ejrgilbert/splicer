@@ -272,3 +272,155 @@ fn idents_mirror_via_heck_with_trailing_underscore_for_keyword_fields() {
          got module paths {module_paths:?}\nfull bindings:\n{src}"
     );
 }
+
+const RESOURCE_TRAIT_WIT: &str = r#"
+    package test:rt@0.1.0;
+    interface store {
+        resource bucket {
+            constructor(name: string);
+            get: func(key: string) -> option<list<u8>>;
+        }
+        resource conn-pool {
+            constructor();
+            checkout: func() -> bucket;
+        }
+        open: func(name: string) -> bucket;
+    }
+    world rt { export store; }
+"#;
+
+#[test]
+fn per_resource_guest_trait_is_named_guest_then_pascal_resource() {
+    // Pins the convention the `bindings_index` recognizer hangs on:
+    // interface trait is exactly `Guest`; per-resource traits are
+    // `Guest<ResourcePascal>` (no separator, PascalCase suffix). If
+    // wit-bindgen ever renames this, fail here with the actual
+    // emitted source instead of silently dropping resource codegen.
+    let (_resolve, _world, src) = run_wit_bindgen_rust(RESOURCE_TRAIT_WIT, Some("rt")).unwrap();
+    let file = syn::parse_file(&src).expect("bindings parse as Rust");
+    let mut traits: Vec<(Vec<String>, String)> = Vec::new();
+    walk_with_path(&file.items, &mut Vec::new(), &mut |path, item| {
+        if let Item::Trait(t) = item {
+            traits.push((path.to_vec(), t.ident.to_string()));
+        }
+    });
+    let store_traits: Vec<&String> = traits
+        .iter()
+        .filter(|(p, _)| p == &["exports", "test", "rt", "store"])
+        .map(|(_, n)| n)
+        .collect();
+    assert!(
+        store_traits.iter().any(|n| n.as_str() == "Guest"),
+        "expected `Guest` trait; got {store_traits:?}\n{src}"
+    );
+    for resource_pascal in ["Bucket", "ConnPool"] {
+        let expected = format!("Guest{resource_pascal}");
+        assert!(
+            store_traits.iter().any(|n| n.as_str() == expected),
+            "expected `{expected}` trait; got {store_traits:?}\n{src}"
+        );
+    }
+    // No separator, no raw-ident `r#` prefix.
+    for n in &store_traits {
+        assert!(!n.contains('_'), "expected PascalCase, got {n:?}");
+        assert!(!n.starts_with("r#"), "unexpected raw ident: {n:?}");
+    }
+}
+
+const IMPORT_EXPORT_RESOURCE_WIT: &str = r#"
+    package test:ie@0.1.0;
+    interface store {
+        resource bucket {
+            constructor(name: string);
+        }
+        open: func(name: string) -> bucket;
+    }
+    world ie { import store; export store; }
+"#;
+
+#[test]
+fn import_and_export_split_on_exports_prefix() {
+    // Pins the path convention `emit_method` strips when converting
+    // export-side bindings paths to import-side. wit-bindgen places
+    // imported modules at `bindings::<pkg>::<iface>` and exported
+    // modules at `bindings::exports::<pkg>::<iface>`. If that ever
+    // changes, our `strip_exports_prefix` call sites would silently
+    // miss-route resource handles; fail here instead.
+    let (_resolve, _world, src) =
+        run_wit_bindgen_rust(IMPORT_EXPORT_RESOURCE_WIT, Some("ie")).unwrap();
+    let file = syn::parse_file(&src).expect("bindings parse as Rust");
+
+    let mut module_paths: Vec<Vec<String>> = Vec::new();
+    walk_with_path(&file.items, &mut Vec::new(), &mut |path, item| {
+        if let Item::Struct(s) = item {
+            if s.ident == "Bucket" {
+                module_paths.push(path.to_vec());
+            }
+        }
+    });
+
+    let import_path = vec!["test".into(), "ie".into(), "store".into()];
+    let export_path = vec!["exports".into(), "test".into(), "ie".into(), "store".into()];
+    assert!(
+        module_paths.contains(&import_path),
+        "expected import-side `Bucket` at {import_path:?}; got {module_paths:?}\n{src}"
+    );
+    assert!(
+        module_paths.contains(&export_path),
+        "expected export-side `Bucket` at {export_path:?}; got {module_paths:?}\n{src}"
+    );
+}
+
+#[test]
+fn export_side_resource_exposes_new_factory_for_guest_impl() {
+    // Pins the wit-bindgen factory pattern our resource-wrap emit
+    // calls into: the export-side resource type carries an inherent
+    // `pub fn new<T: Guest<R>>(val: T) -> Self` that promotes a
+    // user-supplied impl<GuestR> into a runtime resource handle.
+    // `emit_method::make_own_wrap` hardcodes `::new` to invoke this;
+    // a rename would break resource-returning interface-level fns.
+    let (_resolve, _world, src) = run_wit_bindgen_rust(RESOURCE_TRAIT_WIT, Some("rt")).unwrap();
+    let file = syn::parse_file(&src).expect("bindings parse as Rust");
+
+    // Find every inherent `impl Bucket { ... }` block under the
+    // export-side store module and scan for `pub fn new<...>`.
+    let mut found_factory = false;
+    walk_with_path(&file.items, &mut Vec::new(), &mut |path, item| {
+        if path != ["exports", "test", "rt", "store"] {
+            return;
+        }
+        let syn::Item::Impl(syn::ItemImpl {
+            self_ty,
+            items,
+            trait_,
+            ..
+        }) = item
+        else {
+            return;
+        };
+        if trait_.is_some() {
+            return; // Skip `impl Trait for Bucket`; we want the inherent impl.
+        }
+        if !matches!(&**self_ty, syn::Type::Path(p) if p.path.is_ident("Bucket")) {
+            return;
+        }
+        for ii in items {
+            if let syn::ImplItem::Fn(f) = ii {
+                if f.sig.ident == "new" && !f.sig.generics.params.is_empty() {
+                    // Confirm the bound is `T: GuestBucket` — narrows
+                    // the match so a hypothetical no-generic `::new`
+                    // doesn't satisfy the contract.
+                    let body = quote::ToTokens::to_token_stream(&f.sig).to_string();
+                    if body.contains("GuestBucket") {
+                        found_factory = true;
+                    }
+                }
+            }
+        }
+    });
+    assert!(
+        found_factory,
+        "expected `pub fn new<T: GuestBucket>(val: T) -> Self` on export-side `Bucket`; \
+         full bindings:\n{src}"
+    );
+}

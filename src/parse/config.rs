@@ -205,6 +205,12 @@ pub struct Injection {
     pub(crate) adapter_info: Option<AdapterInjectionInfo>,
     #[serde(skip)]
     pub(crate) tier: Option<builtin_protocol::Tier>,
+    /// Interfaces this injection's wrapper _exports_ that carry resource
+    /// types. Stamped during tier-3/4 materialization; chain routing wires
+    /// the consumer's imports of these siblings through the wrapper so it
+    /// sees one consistent resource identity. Empty for non-wrapping tiers.
+    #[serde(skip)]
+    pub(crate) resource_bearing_exports: Vec<String>,
 }
 
 impl PartialEq for Injection {
@@ -248,6 +254,7 @@ impl Injection {
             config_provider_path: None,
             adapter_info: None,
             tier: None,
+            resource_bearing_exports: Vec::new(),
         }
     }
 
@@ -265,6 +272,7 @@ impl Injection {
             config_provider_path: None,
             adapter_info: None,
             tier: None,
+            resource_bearing_exports: Vec::new(),
         }
     }
 }
@@ -861,6 +869,7 @@ fn into_injection(yaml: YamlInjection) -> Injection {
         config_provider_path: None,
         adapter_info: None,
         tier: None,
+        resource_bearing_exports: Vec::new(),
     }
 }
 

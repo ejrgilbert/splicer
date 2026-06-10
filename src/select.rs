@@ -410,9 +410,9 @@ fn enumerate_sites(kind: SiteKind, chain_idx: usize, n_nodes: usize) -> Vec<Spli
 pub(crate) fn suggest_interfaces<'a>(raw: &[String], available: &[&'a str]) -> Vec<&'a str> {
     let mut out: Vec<&str> = vec![];
     for pat in raw {
-        let pat_base = pat.split('@').next().unwrap_or(pat);
+        let pat_base = crate::parse::wit_name::unversioned(pat);
         for &avail in available {
-            let avail_base = avail.split('@').next().unwrap_or(avail);
+            let avail_base = crate::parse::wit_name::unversioned(avail);
             let hit =
                 avail_base == pat_base || avail.starts_with(pat.as_str()) || pat.starts_with(avail);
             if hit && !out.contains(&avail) {

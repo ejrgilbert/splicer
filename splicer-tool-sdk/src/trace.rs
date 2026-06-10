@@ -11,14 +11,12 @@
 //! in stream order with no random access or keyed lookup. It is a
 //! reader, not a correlator: events are surfaced exactly as decoded,
 //! with nothing tying one to another.
-//!
-//! Decoding is host-agnostic: callers hand in bytes and this module
-//! never touches the filesystem itself.
 
 use std::fmt;
 
 use crate::wire::decode::{DecodeError, Event, Reader};
 use crate::bridge::{args_to_typed, cells_to_typed, BridgeError, WitTyped};
+use crate::bridge_resources::{cells_to_typed_with_resources, WitTypedWithResources};
 
 /// A single decoded stream, plus a forward cursor over its call and
 /// return events.
@@ -108,6 +106,20 @@ impl TraceReader {
         };
         let tree = result.as_ref().ok_or(TraceError::VoidReturn)?;
         cells_to_typed::<R>(tree, tree.root).map_err(TraceError::Bridge)
+    }
+
+    /// Resource-aware sibling of
+    /// [`next_return_typed`](Self::next_return_typed). Decodes via
+    /// [`WitTypedWithResources`] so resource leaves in `R` materialize
+    /// as wrapper newtypes around [`MockedResource`](crate::MockedResource).
+    pub fn next_return_typed_with_resources<R: WitTypedWithResources>(
+        &mut self,
+    ) -> Result<R, TraceError> {
+        let Event::Return { result, .. } = self.next_return().ok_or(TraceError::Exhausted)? else {
+            unreachable!("next_return only yields Event::Return");
+        };
+        let tree = result.as_ref().ok_or(TraceError::VoidReturn)?;
+        cells_to_typed_with_resources::<R>(tree, tree.root).map_err(TraceError::Bridge)
     }
 
     /// Advance to the next call and decode its arguments into the tuple
@@ -316,6 +328,44 @@ mod tests {
         let mut tr = TraceReader::from_bytes(&buf).unwrap();
         assert!(tr.is_empty());
         assert!(tr.next_return().is_none());
+    }
+
+    #[test]
+    fn next_return_typed_with_resources_decodes_resource_handle() {
+        // Stand-in for a codegen-emitted WrapperBucket.
+        #[derive(Debug, PartialEq)]
+        struct StandinBucket(crate::MockedResource);
+        impl WitTypedWithResources for StandinBucket {
+            fn from_cells(tree: &FieldTree, root: u32) -> Result<Self, BridgeError> {
+                crate::MockedResource::from_handle_cell(
+                    tree,
+                    root,
+                    std::borrow::Cow::Borrowed("bucket"),
+                )
+                .map(StandinBucket)
+            }
+        }
+
+        let mut buf = Vec::new();
+        write_stream_header(&mut buf);
+        let return_tree = FieldTree {
+            cells: vec![Cell::ResourceHandle(0)],
+            record_infos: vec![],
+            flags_infos: vec![],
+            enum_infos: vec![],
+            variant_infos: vec![],
+            handle_infos: vec![crate::HandleInfo {
+                type_name: "bucket".into(),
+                id: 17,
+            }],
+            root: 0,
+        };
+        write_return_event(&mut buf, 1, &call(1), Some(&return_tree));
+
+        let mut tr = TraceReader::from_bytes(&buf).unwrap();
+        let v: StandinBucket = tr.next_return_typed_with_resources().unwrap();
+        assert_eq!(v.0.handle, 17);
+        assert_eq!(v.0.name.as_ref(), "bucket");
     }
 
     #[test]

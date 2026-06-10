@@ -3,12 +3,15 @@
 //! types. The output is a single WIT text + world name + qualified
 //! interface name, suitable for [`super::GenerateWrapperInput`].
 
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::{Output, WitPrinter};
+use wit_parser::{InterfaceId, Resolve, TypeOwner};
 
 use super::Behavior;
 use crate::adapter::async_mirror::{synthesize_async_mirror, MIRROR_NAME_MISMATCH_PREFIX};
-use crate::adapter::resolve::{decode_input_resolve, find_target_interface};
+use crate::adapter::resolve::{decode_input_resolve, find_target_interface, resolve_type_alias};
 
 #[derive(Debug, Clone)]
 pub struct TargetWit {
@@ -39,6 +42,17 @@ pub fn target_wit_for_codegen(
         .id_of(target_iface_id)
         .ok_or_else(|| anyhow!("target interface `{target_interface}` has no qualified name"))?;
 
+    // Sibling `-types` interfaces the target `use`s.
+    let sibling_ifaces = sibling_types_ifaces_of(&resolve, target_iface_id);
+    let sibling_qualified: Vec<String> = sibling_ifaces
+        .iter()
+        .map(|id| {
+            resolve.id_of(*id).ok_or_else(|| {
+                anyhow!("sibling interface used by `{target_interface}` has no qualified name")
+            })
+        })
+        .collect::<Result<_>>()?;
+
     let mirror_qname = match mirror_export_name {
         Some(expected) => {
             let (_mirror_iface_id, synthesized) =
@@ -60,11 +74,30 @@ pub fn target_wit_for_codegen(
     let mut out = String::new();
     out.push_str(&format!("package {WRAPPER_PACKAGE};\n\n"));
     out.push_str(&format!("world {WRAPPER_WORLD} {{\n"));
-    out.push_str(&format!("    export {export_iface};\n"));
-    // Tier-3 imports the real sync target even when lifting the mirror.
-    // Tier-4 has no downstream import (result synthesized in-strategy).
-    if matches!(behavior, Behavior::Transform) {
-        out.push_str(&format!("    import {qualified};\n"));
+    match behavior {
+        Behavior::Transform => {
+            // Tier-3 wraps with an inner producer; sibling types
+            // iface is pulled in transitively by the target's `use`
+            // statement. wit-component emits the right import in
+            // the encoded wrapper regardless.
+            for q in &sibling_qualified {
+                out.push_str(&format!("    import {q};\n"));
+            }
+            out.push_str(&format!("    export {export_iface};\n"));
+            // Tier-3 imports the real (sync) target even when
+            // lifting the mirror.
+            out.push_str(&format!("    import {qualified};\n"));
+        }
+        Behavior::Virtualize => {
+            // Tier-4 has no inner producer; the wrapper IS the type
+            // owner. Export the sibling types iface and synthesize
+            // resources via the strategy. No downstream import
+            // (result synthesized in-strategy).
+            for q in &sibling_qualified {
+                out.push_str(&format!("    export {q};\n"));
+            }
+            out.push_str(&format!("    export {export_iface};\n"));
+        }
     }
     out.push_str("}\n\n");
 
@@ -85,6 +118,23 @@ pub fn target_wit_for_codegen(
         world_name: WRAPPER_WORLD.to_string(),
         qualified_name: qualified,
     })
+}
+
+/// Walk `target`'s types and return every sibling interface that
+/// declares a type referenced via `use types.{R}` (or any other type
+/// whose original owner is a different interface).
+fn sibling_types_ifaces_of(resolve: &Resolve, target: InterfaceId) -> BTreeSet<InterfaceId> {
+    let mut out = BTreeSet::new();
+    let iface = &resolve.interfaces[target];
+    for (_name, type_id) in &iface.types {
+        let original_id = resolve_type_alias(resolve, *type_id);
+        if let TypeOwner::Interface(declaring) = resolve.types[original_id].owner {
+            if declaring != target {
+                out.insert(declaring);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -225,14 +275,11 @@ mod tests {
     /// `short_hash_hex` so the adapter-side cross-check passes.
     fn expected_mirror_name(target: &str) -> String {
         use crate::adapter::async_mirror::short_hash_hex;
-        // Pull the iface segment out of `ns:pkg/iface@ver` for the
-        // mirror's qualified name: `splicer:async-mirror-<hash>/<iface>@<ver>`.
-        let iface_at_ver = target
-            .rsplit_once('/')
-            .map(|(_, tail)| tail)
-            .unwrap_or(target);
+        use crate::parse::wit_name::WitName;
+        let iface = WitName::parse(target)
+            .expect("target qname must parse as ns:pkg/iface[@ver]")
+            .iface;
         // Mirror package is always `@0.0.1` regardless of the target's version.
-        let iface = iface_at_ver.split('@').next().unwrap_or(iface_at_ver);
         format!(
             "splicer:async-mirror-{}/{iface}@0.0.1",
             short_hash_hex(target)

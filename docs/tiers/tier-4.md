@@ -14,9 +14,9 @@ implementing a trait from
 codegen'd into a per-target wrapper at splice-time. See
 [tier-3.md](./tier-3.md) for the strategy-crate layout, the
 builtin / user-supplied distribution choice, codegen pipeline, and
-async-targets-only constraint — they apply identically to tier-4
-(declare `tier = 4` in the manifest, implement
-`VirtualizeStrategy` instead of `TransformStrategy`).
+sync-target bridge -- they apply identically to tier-4 (declare
+`tier = 4` in the manifest, implement `VirtualizeStrategy` instead
+of `TransformStrategy`).
 
 ## How tier-4 differs from tier-3
 
@@ -55,9 +55,6 @@ splice-time.
 | Random fuzz response         | `R: for<'a> Arbitrary<'a>` (planned)                                                                |
 | Chaos: return configured Err | `R: IntoResult, R::Err: Clone` (planned)                                                            |
 
-`hello-tier4` won't wrap an interface whose return type contains a
-resource handle (resources can't impl `Default`).
-
 `WitTyped` is impl'd for `R` automatically: the wrapper codegen emits
 it for the types wit-bindgen generates from the target WIT, and the SDK
 hand-writes it for the WIT core types. For types you define yourself, or for a
@@ -66,16 +63,22 @@ it with `#[derive(splicer_tool_sdk::WitTyped)]` (enable the SDK's
 `derive` feature; the macro's rustdoc covers both usages and the shape
 mapping).
 
-## Tier-4-specific limitation
+## Tier-4-specific limitations
 
-**Value-typed returns only.** Today, tier-4 can wrap interfaces whose
-return types are value-typed (primitives, records, variants, lists,
-options, results — anything wit-bindgen lowers without resource
-handles). Targets whose returns contain resource handles (e.g.
-`wasi:http/handler` returning `Response`) aren't supported yet —
-those need a resource walker + `MockedResource` pattern +
-types-interface composition wiring; see
-[`docs/TODO/tier3-tier4-builtins.md`](../TODO/tier3-tier4-builtins.md).
+- **Resources** work via the
+  [`MockedResource`](../../splicer-tool-sdk/src/bridge_resources.rs)
+  newtype + `WitTypedWithResources` bridge. The tier-4 wrapper owns
+  the resource type (exports the `-types` interface and synthesizes
+  via the strategy), so unlike tier-3 there's no method-dispatch
+  gap. Inline resource declarations are still rejected; static
+  methods on resources emit `core::compile_error!` (see
+  [`tier3-tier4-resource-static-methods.md`](../TODO/tier3-tier4-resource-static-methods.md)).
+  `builtin-hello-tier4.yaml` exercises this on
+  `my:service/bucket-as-arg`; [`chaos-err`](../../builtins/chaos-err/)
+  is the shipping demo strategy.
+- **`future`, `stream`, `error-context`** aren't supported.
+  Future/stream synthesis would need host primitives splicer doesn't
+  have; error-context awaits a wasmtime cross-component lift fix.
 
 ## Good for
 
