@@ -21,6 +21,7 @@ use wit_parser::{
 use super::bindings_index::{
     bindings_path_tokens, strip_exports_prefix, BindingsItem, BindingsPath, WrapperBindings,
 };
+use crate::adapter::resolve::resolve_type_alias;
 
 /// Per-interface metadata collected from the world: WIT InterfaceId,
 /// the Rust module path wit-bindgen emits the iface under, and which
@@ -81,7 +82,8 @@ pub fn build_ir(
         let iface = &resolve.interfaces[entry.id];
         for (wit_name, type_id) in &iface.types {
             // Follow `Type(_)` aliases to find the original declaration.
-            let (resolved_id, td) = resolve_through_aliases(resolve, *type_id);
+            let resolved_id = resolve_type_alias(resolve, *type_id);
+            let td = &resolve.types[resolved_id];
             if matches!(td.kind, TypeDefKind::Resource) {
                 if !seen_resource_ids.insert(resolved_id) {
                     continue;
@@ -184,21 +186,6 @@ pub fn build_ir(
         fn_sigs,
         target_import_path,
     })
-}
-
-/// Walk `Type(_)` aliases to find a type's original declaration.
-fn resolve_through_aliases(
-    resolve: &Resolve,
-    mut type_id: TypeId,
-) -> (TypeId, &wit_parser::TypeDef) {
-    loop {
-        let td = &resolve.types[type_id];
-        if let TypeDefKind::Type(wit_parser::Type::Id(next)) = td.kind {
-            type_id = next;
-            continue;
-        }
-        return (type_id, td);
-    }
 }
 
 fn resource_pascal(resolve: &Resolve, type_id: TypeId) -> Result<String> {

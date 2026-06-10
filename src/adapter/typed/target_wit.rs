@@ -11,7 +11,7 @@ use wit_parser::{InterfaceId, Resolve, TypeOwner};
 
 use super::Behavior;
 use crate::adapter::async_mirror::{synthesize_async_mirror, MIRROR_NAME_MISMATCH_PREFIX};
-use crate::adapter::resolve::{decode_input_resolve, find_target_interface};
+use crate::adapter::resolve::{decode_input_resolve, find_target_interface, resolve_type_alias};
 
 #[derive(Debug, Clone)]
 pub struct TargetWit {
@@ -42,12 +42,7 @@ pub fn target_wit_for_codegen(
         .id_of(target_iface_id)
         .ok_or_else(|| anyhow!("target interface `{target_interface}` has no qualified name"))?;
 
-    // Sibling `-types` interfaces the target `use`s. For the
-    // wasi-style factored-types pattern (resources declared in a
-    // sibling, referenced via `use types.{R}`), the wrapper world
-    // has to also claim these so wit-bindgen materializes the
-    // resource type in the wrapper crate's bindings and so wac can
-    // wire handle traffic between consumer and inner producer.
+    // Sibling `-types` interfaces the target `use`s.
     let sibling_ifaces = sibling_types_ifaces_of(&resolve, target_iface_id);
     let sibling_qualified: Vec<String> = sibling_ifaces
         .iter()
@@ -127,31 +122,16 @@ pub fn target_wit_for_codegen(
 
 /// Walk `target`'s types and return every sibling interface that
 /// declares a type referenced via `use types.{R}` (or any other type
-/// whose original owner is a different interface). The wasi-style
-/// factored-types pattern lands resources in a sibling `-types`
-/// interface; the wrapper world has to claim that interface too so
-/// the resource type identity is part of the wac composition.
+/// whose original owner is a different interface).
 fn sibling_types_ifaces_of(resolve: &Resolve, target: InterfaceId) -> BTreeSet<InterfaceId> {
     let mut out = BTreeSet::new();
     let iface = &resolve.interfaces[target];
     for (_name, type_id) in &iface.types {
-        // Follow `Type(_)` aliases (wit-parser models `use` as a
-        // local alias whose `kind = Type(original_id)`) until we
-        // reach the original declaration. The original's owner is
-        // the interface that actually declared the type.
-        let mut cur = *type_id;
-        loop {
-            let td = &resolve.types[cur];
-            if let wit_parser::TypeDefKind::Type(wit_parser::Type::Id(next)) = td.kind {
-                cur = next;
-                continue;
+        let original_id = resolve_type_alias(resolve, *type_id);
+        if let TypeOwner::Interface(declaring) = resolve.types[original_id].owner {
+            if declaring != target {
+                out.insert(declaring);
             }
-            if let TypeOwner::Interface(declaring) = td.owner {
-                if declaring != target {
-                    out.insert(declaring);
-                }
-            }
-            break;
         }
     }
     out

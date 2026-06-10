@@ -1,11 +1,8 @@
-//! WIT-resolve plumbing shared between tier-1 and tier-2 adapter
-//! generators: decoding the input split's WIT into a [`Resolve`] and
-//! locating a target interface within it. Both tiers' `build_*_adapter`
-//! entry points open with the same two calls.
+//! WIT-resolve plumbing shared across adapter generators.
 
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::{decode, DecodedWasm};
-use wit_parser::{InterfaceId, LiftLowerAbi, ManglingAndAbi, Resolve};
+use wit_parser::{InterfaceId, LiftLowerAbi, ManglingAndAbi, Resolve, Type, TypeDefKind, TypeId};
 
 // ─── Name-mangling helpers ────────────────────────────────────────
 //
@@ -36,6 +33,16 @@ pub(crate) fn hook_callback_mangling() -> ManglingAndAbi {
 /// import lookup.
 pub(crate) fn sync_mangling() -> ManglingAndAbi {
     ManglingAndAbi::Legacy(LiftLowerAbi::Sync)
+}
+
+/// Follow `TypeDefKind::Type` aliases to the underlying definition
+/// (e.g. an `api`-side `use types.{cat}` alias --> the `types`-side
+/// `resource cat` definition).
+pub(crate) fn resolve_type_alias(resolve: &Resolve, mut tid: TypeId) -> TypeId {
+    while let TypeDefKind::Type(Type::Id(next)) = &resolve.types[tid].kind {
+        tid = *next;
+    }
+    tid
 }
 
 /// Decode the input split's WIT into a [`Resolve`]; bail if the bytes
