@@ -793,6 +793,7 @@ mod tests {
                 name: "a-middleware".to_string(),
                 adapter_info: None,
                 tier: None,
+                resource_bearing_exports: Vec::new(),
                 builtin: None,
                 builtin_config: Default::default(),
                 config_as_wave: None,
@@ -896,6 +897,7 @@ mod tests {
                         ],
                     }),
                     tier: None,
+                    resource_bearing_exports: Vec::new(),
                 }],
             )
         };

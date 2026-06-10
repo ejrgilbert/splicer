@@ -370,14 +370,13 @@ impl EmitPlan {
             }
         }
 
-        // Second pass: tier-4 wraps EXPORT the sibling-types iface
-        // (the wrapper owns the resource identity). Route the
-        // consumer's import of those sibling types ifaces through
-        // the wrapper so it sees one consistent resource type.
-        // Mirror of the wrapper-side sibling-types wiring the
-        // simple-middleware branch of `add_middleware` does for
-        // tier-2/3. Done after the main pass so no-injection chains'
-        // no-op routing inserts don't clobber these overrides.
+        // Second pass: a tier-4 wrapper EXPORTS the sibling resource-bearing
+        // interfaces and owns their resource identity. Route the consumer's
+        // imports of those siblings through the wrapper so it sees one
+        // consistent resource type. Done after the main pass so the siblings'
+        // own no-injection chains don't clobber these overrides by re-routing
+        // them back to the original provider. `resource_bearing_exports` is
+        // empty for non-wrapping tiers, making this a no-op there.
         for Chain {
             interface,
             chain,
@@ -386,19 +385,13 @@ impl EmitPlan {
         } in chains
         {
             for (i, id) in chain.iter().enumerate().skip(1) {
-                let routing_id = resolve_shim_node(*id, composition, shim_comps);
                 let Some(outermost) = inject_plan.get(&i).and_then(|m| m.iter().next()) else {
                     continue;
                 };
-                if outermost.tier.is_none_or(|t| t.imports_target()) {
+                if outermost.resource_bearing_exports.is_empty() {
                     continue;
                 }
-                let Some(path) = outermost.path.as_ref() else {
-                    continue;
-                };
-                let Ok(bytes) = std::fs::read(path) else {
-                    continue;
-                };
+                let routing_id = resolve_shim_node(*id, composition, shim_comps);
                 let Some(current) = self
                     .routing
                     .get(&(routing_id, interface.name.clone()))
@@ -406,14 +399,15 @@ impl EmitPlan {
                 else {
                     continue;
                 };
-                for sib in resource_bearing_exports(&bytes) {
-                    if sib == interface.name {
-                        continue;
+                for sib in &outermost.resource_bearing_exports {
+                    if *sib != interface.name {
+                        self.routing
+                            .insert((routing_id, sib.clone()), current.clone());
                     }
-                    self.routing.insert((routing_id, sib), current.clone());
                 }
             }
         }
+
         Ok(self)
     }
 
@@ -701,10 +695,7 @@ impl EmitPlan {
             } else {
                 Vec::new()
             };
-            // Tier-2/3 wrappers also import the target's sibling
-            // types iface; without explicit wiring, wac's `...`
-            // defaults give it a contextually-distinct resource id
-            // and the wrapper's async-shim rejects the composition.
+
             if imports_target {
                 let mdl_bytes = std::fs::read(&mdl_path).map_err(|e| {
                     anyhow::anyhow!("failed to read middleware wasm at `{mdl_path}`: {e}",)
@@ -1218,8 +1209,7 @@ fn apply_site(
 
     // Prefer the consumer's split (provider_idx + 1) so the adapter
     // copies its import surface. At the outermost boundary there's no
-    // consumer, so fall back to the provider's own split — the adapter
-    // mirrors the provider's full import topology.
+    // consumer, so fall back to the provider's own split.
     let consumer_path = chain
         .consumer_split_path(
             site.provider_idx + 1,
@@ -1238,8 +1228,6 @@ fn apply_site(
 
     // Materialize tier-3/4 first so `build_per_edge_providers` sees
     // the wrapper's config import on the resulting `config_as_wave`.
-    // `accs` carries the sync-WIT detection cache and the bridge
-    // registry so a sync target only triggers mirror synth once.
     let materialized_inject = materialize_tier3_4_inline(
         interface,
         rule.inject(),
@@ -1475,9 +1463,22 @@ fn stamp_materialized(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("wrapper path is not UTF-8: {}", wrapper_path.display()))?
         .to_string();
+    // Tier-4 wrappers export the sibling resource-bearing interfaces and own
+    // the resource identity; discover those exports once here so chain routing
+    // can wire the consumer's sibling imports through the wrapper without
+    // re-reading it. Tiers that import the target don't wrap, so stay empty.
+    let sibling_exports = if tier.imports_target() {
+        Vec::new()
+    } else {
+        let bytes = std::fs::read(&wrapper_path).with_context(|| {
+            format!("read tier-4 wrapper for sibling-export discovery: {path_str}")
+        })?;
+        resource_bearing_exports(&bytes)
+    };
     let mut stamped = Injection {
         path: Some(path_str),
         tier: Some(tier),
+        resource_bearing_exports: sibling_exports,
         ..inj.clone()
     };
     crate::config_provider::validate_config_as_wave(&mut stamped)?;
@@ -1764,7 +1765,7 @@ fn resource_bearing_ifaces(bytes: &[u8], side: WorldSide) -> Vec<String> {
         WorldSide::Exports => &world.exports,
     };
     let mut result = Vec::new();
-    for (_key, item) in items {
+    for item in items.values() {
         let wit_parser::WorldItem::Interface { id, .. } = item else {
             continue;
         };
@@ -2078,6 +2079,7 @@ mod tests {
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
             tier: None,
+            resource_bearing_exports: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2148,6 +2150,7 @@ mod tests {
                 matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
             }),
             tier: None,
+            resource_bearing_exports: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2259,6 +2262,7 @@ mod tests {
                 config_provider_path: None,
                 adapter_info: None,
                 tier: None,
+                resource_bearing_exports: Vec::new(),
             }],
         )];
 
