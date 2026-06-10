@@ -27,7 +27,7 @@ use crate::bindings::wasi::filesystem::types::{
     Descriptor, DescriptorFlags, OpenFlags, PathFlags,
 };
 use crate::bindings::wasi::io::streams::OutputStream;
-use splicer_tool_sdk::{CallId, Field, FieldTree};
+use splicer_tool_sdk::{sanitize_for_filename, strip_leading_slashes, CallId, Field, FieldTree};
 
 struct State {
     buf: Vec<u8>,
@@ -126,7 +126,7 @@ fn open_file_for_edge(edge_id: &str) -> (Descriptor, OutputStream) {
         .into_iter()
         .next()
         .expect("recorder requires at least one wasi:filesystem preopen");
-    let dir = relative_dir(&config::dir());
+    let dir = strip_leading_slashes(&config::dir());
     // Lazily mkdir -p each segment so nested defaults like
     // `recordings/run-2026-05-20/` work without host pre-seeding. Each
     // create_directory_at is single-level; existing dirs error out and
@@ -156,29 +156,6 @@ fn open_file_for_edge(edge_id: &str) -> (Descriptor, OutputStream) {
         .append_via_stream()
         .expect("append-via-stream on recording file");
     (file, stream)
-}
-
-/// Strip a leading `./` (and any leading slashes) so the result is
-/// safe to feed segment-by-segment into `create_directory_at` against
-/// the preopen. wasi:filesystem rejects absolute paths and `.`/`..`
-/// components; the manifest's default `./recordings` would otherwise
-/// trip the `.` rejection.
-fn relative_dir(raw: &str) -> &str {
-    raw.trim_start_matches("./").trim_start_matches('/')
-}
-
-/// Filesystem-safe form of `edge_id`. Mirrors `splicer::edge_id::
-/// sanitize_for_filename` — kept in lockstep manually since both sides
-/// must agree (replayer reads what recorder wrote). Replace `[^A-Za-
-/// z0-9._@-]` with `_`.
-fn sanitize_for_filename(edge_id: &str) -> String {
-    edge_id
-        .chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' | '_' | '@' => c,
-            _ => '_',
-        })
-        .collect()
 }
 
 /// Splicer-injected edge identifier for this recorder instance,

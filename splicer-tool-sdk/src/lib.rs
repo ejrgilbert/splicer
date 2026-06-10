@@ -13,12 +13,14 @@
 
 pub mod bridge;
 pub mod bridge_resources;
+pub mod path;
 pub mod render;
 pub mod strategy;
 pub mod trace;
 pub mod types;
 pub mod wire;
 
+pub use path::{sanitize_for_filename, strip_leading_slashes};
 pub use wire::decode::{DecodeError, Event, Reader};
 pub use wire::encode::{write_call_event, write_field_tree, write_return_event, write_stream_header};
 pub use render::{cell_to_str, render_field_tree};

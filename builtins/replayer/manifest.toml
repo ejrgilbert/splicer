@@ -1,3 +1,9 @@
 [builtin]
-description = "Returns each wrapped call's result from a recorded trace. Requires `R: WitTypedWithResources`. Trace path: `$SPLICER_REPLAY_TRACE` (v0)."
+description = "Returns each wrapped call's result from a recorded trace. Requires `R: WitTypedWithResources`. Reads `<dir>/<sanitized-edge-id>.bin` from a wasi:filesystem preopen."
 tier = 4
+
+[[key]]
+name = "dir"
+type = "string"
+default = "./recordings"
+doc = "Directory (relative to a wasi:filesystem preopen) the replayer reads each edge's `<sanitized-edge-id>.bin` from. Mirrors recorder's `dir`."
