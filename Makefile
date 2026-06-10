@@ -8,6 +8,8 @@ BUILTIN_NAMES := $(shell for d in $(BUILTINS_DIR)/*/wit; do \
   awk '/^tier *= *[12] *$$/ {f=1} END{exit !f}' $$crate/manifest.toml 2>/dev/null \
     && basename $$crate; \
 done)
+# Internal substrate helper: no manifest.toml, but needs to be built.
+BUILTIN_NAMES += config-provider
 BUILTIN_WASMS := $(addprefix $(ASSETS_DIR)/,$(addsuffix .wasm,$(BUILTIN_NAMES)))
 
 # Every builtin with a wkg.toml needs wit/deps populated before
