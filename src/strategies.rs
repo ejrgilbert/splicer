@@ -86,21 +86,9 @@ fn lookup(name: &str) -> Result<&'static Dir<'static>> {
 /// Each variant maps to one `prepare_*` step; the rest of the
 /// pipeline is source-agnostic.
 pub enum Tier3_4Source<'a> {
-    /// Embedded builtin, referenced by name. The strategy crate's
-    /// source + the SDK are extracted from the splicer binary to a
-    /// cache dir before cargo runs. `wac_name` is the YAML
-    /// `name:`/`alias:` (= WAC variable identifier and output
-    /// filename stem) — distinct from `name` so the same builtin
-    /// can be injected on multiple targets within one splice
-    /// without the materialized wrappers colliding on a single
-    /// `builtins/<name>.wasm` path.
+    /// Embedded builtin, referenced by name.
     Builtin { name: &'a str, wac_name: &'a str },
-    /// User-supplied strategy crate on disk. `wac_name` is the YAML
-    /// `name:` field (the WAC variable identifier and the output
-    /// filename stem); `strategy_dir` is the crate root containing
-    /// `Cargo.toml` + `manifest.toml` + `src/`. The Cargo package
-    /// name and Rust struct ident are read from the on-disk
-    /// `Cargo.toml`, so YAML and crate names don't have to match.
+    /// User-supplied strategy crate on disk.
     User {
         wac_name: &'a str,
         strategy_dir: &'a Path,
@@ -174,10 +162,7 @@ struct PreparedStrategy {
 
 /// Extract the embedded builtin's source to the per-process cache and
 /// read its `splicer-tool-sdk` version, returning the inputs the
-/// shared codegen pipeline needs. The builtin name doubles as the
-/// Cargo package name; `wac_name` (the YAML alias) is the output
-/// filename stem so the same builtin used on multiple targets
-/// produces distinct artifacts under `splits_dir/builtins/`.
+/// shared codegen pipeline needs.
 fn prepare_builtin_strategy(name: &str, wac_name: &str) -> Result<PreparedStrategy> {
     let manifest = read_manifest(name)?;
     let cache_root = typed_cache_root()?;
