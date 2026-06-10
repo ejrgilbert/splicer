@@ -67,26 +67,21 @@ key + auto-injected config substrate); it never appears in user YAML.
 - [x] **User-form tier-3/4 middleware.** YAML `name:` + `path:` to a strategy
   crate directory (Cargo.toml + manifest.toml) flows through the same codegen
   pipeline as builtins. See [`docs/tiers/tier-3.md`](../tiers/tier-3.md#referencing-your-strategy-from-a-splice-config).
-- [ ] **Sync-target support in tier-3/4 codegen.** Today wit-bindgen emits sync
-  `fn` Guest methods for `func` WIT signatures but `emit_method.rs` always emits
-  `async fn` bodies (matching the async `TransformStrategy` / `VirtualizeStrategy`
-  traits), so sync targets fail the wrapper crate's compile with E0053. Options:
-  emit sync `fn` bodies that `block_on` the async strategy, or split the
-  strategy traits into sync + async variants. Currently restricts the harness
-  to `async func` targets only (see
-  `tests/component-interposition/splicer-rules/builtin-hello-tier3.yaml`).
-  When this lands, extend the matrix tests in
-  `src/adapter/typed/matrix_tests.rs` with sync `func` fixtures so both paths
-  are exercised.
+- [x] **Sync-target support in tier-3/4 codegen.** Splicer synthesizes
+  an async-WIT mirror of the sync target, the wrapper lifts the mirror,
+  and a bridge component at the chain head translates sync caller calls
+  into the wrapper's async surface (PR #100,
+  `feat/support-sync-target`). Exercised by the `my:service/adder` rule
+  in `tests/component-interposition/splicer-rules/builtin-hello-tier3.yaml`.
 
 Skipped Phase 3 — Phase 1's Stream C already covered `on_node` and
 `on_subgraph`, and Phase 2 picks up the rest.
 
 ## Phase 4: record + replay loop (2-3 weeks)
 
-- [ ] Replayer builtin (tier-4 virtualize)
-- [ ] `record` strategy (cells to sink)
-- [ ] `replay` strategy (cells → typed values, value-typed targets)
+- [x] Replayer builtin (tier-4 virtualize) — `R: WitTypedWithResources`, reads `<dir>/<sanitized-edge-id>.bin` via `splicer:builtin-config` substrate (mirrors recorder layout); demo at `--builtin-replayer`
+- [x] `record` strategy (cells to sink) — recorder builtin (Phase 1 Stream A)
+- [x] `replay` strategy (cells → typed values, value-typed targets) — replayer builtin uses `TraceReader::next_return_typed_with_resources`
 
 ## Phase 5: capstone + v1 demo (~1 week)
 
@@ -105,12 +100,12 @@ but have their own synthesis story (or lack of one).
 **Resource branch (paper demo path).** proxy-component is the
 blueprint; local PoC at `../../research/proxy-component`. Adapt with
 cells in place of WAVE:
-- [ ] WIT walker detects resources
-- [ ] `wrapped-` namespace WIT rewriting
-- [ ] `MockedResource { handle, name }` pattern + `GuestResource` impls
-- [ ] Resource correlation map in `TraceReader`
-- [ ] `WitTyped` impls for `Resource<T>`
-- [ ] wac composition wiring for types interfaces (full virt)
+- [x] WIT walker detects resources
+- [x] `wrapped-` namespace WIT rewriting
+- [x] `MockedResource { handle, name }` pattern + `GuestResource` impls
+- [x] Resource correlation map in `TraceReader` (`next_return_typed_with_resources`)
+- [x] `WitTyped` impls for `Resource<T>` (`WitTypedWithResources` trait + wrapper-newtype macro)
+- [x] wac composition wiring for types interfaces (full virt)
 - [ ] HTTP record/replay demo
 
 **Non-resource handle branches** (pass-through unblocks
