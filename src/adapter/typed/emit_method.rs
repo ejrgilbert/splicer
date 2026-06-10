@@ -3,10 +3,10 @@
 //! `WitTyped` value), and the `Guest` trait impl whose method bodies
 //! dispatch into the strategy.
 //!
-//! Args-struct field types are taken from the IR so named user types
-//! render as the absolute `bindings::<path>::<Ident>` — copying the
-//! syn type from the Guest signature would leave the ident unresolved
-//! at the top of `lib.rs`.
+//! Args-struct field types come from the IR so named user types
+//! resolve as absolute `bindings::<path>::<Ident>` paths; copying
+//! syn types from the Guest signature would leave them unresolved
+//! at the wrapper crate's top level.
 //!
 //! # What this emits
 //!
@@ -61,14 +61,12 @@ pub struct EmittedGuest {
 /// `interface_qualified_name` is the `"package:ns/iface@ver"` form
 /// of the wrapped interface; it goes into each emitted `CallId`.
 ///
-/// Interface-level (`GuestTraitKind::Interface`) emissions add a
-/// `type <Resource> = Wrapper<Resource>;` assoc-type line for every
-/// resource declared in the same interface, and rewrap
+/// Interface-level emissions add `type <Resource> = Wrapper<Resource>`
+/// assoc-types for every resource in the same interface, and rewrap
 /// resource-returning fns through the per-resource wrapper newtype.
 ///
-/// Resource-level (`GuestTraitKind::Resource`) emissions dispatch
-/// through the strategy for each method, capturing `&self` by
-/// reference in the closure so the args struct stays free of
+/// Resource-level emissions dispatch through the strategy per method,
+/// capturing `&self` in the closure so the args struct stays free of
 /// handle-typed fields.
 pub fn emit_guest(
     g: &GuestTrait,
@@ -77,18 +75,16 @@ pub fn emit_guest(
     ir: &WrapperIR,
     bridged_sync_target: bool,
 ) -> EmittedGuest {
-    // Last segment is the interface name; an empty path would silently
-    // derive the wrong args ident and miss the lookup downstream.
+    // Interface name is the deepest module-path segment.
     let interface_pascal = g
         .module_path
         .last()
         .expect("Guest trait module path is empty")
         .to_upper_camel_case();
 
-    // For interface-level Guest, the args prefix is `<IfacePascal>`
-    // (matching the per-fn `<IfacePascal><FnPascal>Args` synth). For
-    // per-resource GuestBucket, it's `<ResourcePascal>` so two
-    // resources with the same method name don't collide.
+    // Interface-level Guest uses `<IfacePascal>` (matching the
+    // `<IfacePascal><FnPascal>Args` synth); per-resource GuestBucket
+    // uses `<ResourcePascal>` so same-named methods don't collide.
     let args_prefix = match &g.kind {
         GuestTraitKind::Interface => interface_pascal.clone(),
         GuestTraitKind::Resource(ident) => ident.to_string(),
@@ -127,11 +123,9 @@ pub fn emit_guest(
         }
     };
 
-    // The interface-level Guest impl carries `type <Resource> =
-    // Wrapper<Resource>;` for every resource declared in this iface;
-    // wit-bindgen requires the associated type, and the wrapper
-    // newtype is what wires the export-side resource table to our
-    // per-method dispatch.
+    // wit-bindgen requires a `type <Resource> = Wrapper<Resource>`
+    // assoc-type per resource on the interface-level Guest impl; the
+    // wrapper newtype wires the export-side resource table to dispatch.
     let assoc_types = match &g.kind {
         GuestTraitKind::Interface => ir
             .resources
@@ -164,14 +158,12 @@ pub fn emit_guest(
 /// decodes a `Cell::ResourceHandle` into the newtype.
 ///
 /// Same struct name regardless of tier (`WrapperBucket`); the inner
-/// field shape and any companion impls differ:
+/// field shape and companion impls differ:
 ///
 /// - tier-3 (Transform): inner is the wit-bindgen-generated import-side
 ///   handle (`bindings::<import>::<R>`); method bodies forward to it.
 /// - tier-4 (Virtualize): inner is [`MockedResource`](::splicer_tool_sdk::MockedResource);
-///   method bodies dispatch to the strategy. The `WitTypedWithResources`
-///   impl is what replay-style strategies invoke internally to decode
-///   recorded tier-2 trace data.
+///   method bodies dispatch through the strategy.
 pub fn emit_resource_newtypes(ir: &WrapperIR, behavior: Behavior) -> Vec<TokenStream> {
     ir.resources
         .iter()
@@ -204,16 +196,16 @@ fn emit_one_resource_newtype(r: &ResourceInfo, behavior: Behavior) -> TokenStrea
     }
 }
 
-/// `Wrapper<Pascal>` — e.g. `WrapperBucket`. This is the wrapper-crate-local
-/// newtype that wraps the import-side resource handle.
+/// `Wrapper<Pascal>` (e.g. `WrapperBucket`): the wrapper-crate-local
+/// newtype around the import-side resource handle.
 fn wrapper_ident_for(resource_pascal: &syn::Ident) -> syn::Ident {
     syn::Ident::new(&format!("Wrapper{resource_pascal}"), Span::call_site())
 }
 
-/// Import-side Rust path for the resource: the wrapper world always
-/// imports + exports the same interface in Transform mode, so the
-/// import-side `Bucket` lives at the same module path with the
-/// leading `exports::` segment dropped.
+/// Import-side Rust path for the resource. In Transform mode the
+/// wrapper world imports and exports the same interface, so the
+/// import-side type sits at the same module path with the leading
+/// `exports::` segment dropped.
 fn import_resource_path_tokens(r: &ResourceInfo) -> TokenStream {
     let import_segs = strip_exports_prefix(&r.iface_path);
     bindings_path_tokens(&import_segs, Some(&r.rust_ident))
@@ -284,11 +276,10 @@ fn emit_method_body(
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
-    // wit-bindgen-emitted trait sigs reference iface-local idents
-    // (`Bucket`, `BucketBorrow`, …) that resolve inside the iface
-    // module but NOT at the wrapper crate's top level where our
-    // impl block lives. Rewrite bare resource idents to their
-    // absolute `bindings::<iface_path>::<R>` form first.
+    // wit-bindgen trait sigs use iface-local idents (`Bucket`,
+    // `BucketBorrow`, ...) that resolve inside the iface module but
+    // not at the wrapper crate's top level. Rewrite them to absolute
+    // `bindings::<iface_path>::<R>` paths first.
     let mut sig_inputs = method.sig.inputs.clone();
     let mut sig_output = method.sig.output.clone();
     {
@@ -336,15 +327,12 @@ fn emit_method_body(
 
     // Where the closure body's call lands: interface-level Guest fns
     // forward to the import-side iface module; per-resource methods
-    // forward via the captured `&self` (instance method) or the
-    // resource's import-side type (constructor / static).
+    // forward via `&self` (instance) or the resource's import-side
+    // type (constructor / static).
     let target_call = match (trait_kind, fn_kind) {
         (GuestTraitKind::Interface, _) => match behavior {
             Behavior::Transform => build_target_call(method_ident, fields, ir),
-            // Virtualize doesn't forward — the strategy synthesizes
-            // the result. The closure body is dropped in the
-            // Virtualize dispatch arm; only the return type derived
-            // alongside it is consumed.
+            // Virtualize doesn't forward
             Behavior::Virtualize => quote!(unreachable!()),
         },
         (GuestTraitKind::Resource(_), ExportFnKind::Method) => {
@@ -359,12 +347,6 @@ fn emit_method_body(
                     let import_resource =
                         build_import_resource_path(resource_pascal, guest_module_path);
                     let call = build_static_call(&import_resource, method_ident, fields);
-                    // Constructor is always sync per the WIT spec, but
-                    // guard the await branch defensively in case the
-                    // spec grows async constructors later. The
-                    // sync-target bridge can't carry resource-bound
-                    // fns (async-mirror synth bails), so this branch
-                    // is only reachable in pure-async setups.
                     if is_async {
                         quote!(#wrap(#call.await))
                     } else {
@@ -372,9 +354,9 @@ fn emit_method_body(
                     }
                 }
                 Behavior::Virtualize => {
-                    // tier-4 has no import side; the sync constructor
-                    // can't await an async strategy. The SDK macro
-                    // owns the monotonic-counter + Cow shape.
+                    // tier-4 has no import side; sync constructors
+                    // can't await an async strategy, so mint a fresh
+                    // mock handle via the SDK macro.
                     let resource_wit_name = ir
                         .resources
                         .iter()
@@ -400,11 +382,9 @@ fn emit_method_body(
                     build_static_call(&import_resource, method_ident, fields)
                 }
                 Behavior::Virtualize => {
-                    // tier-4 has no import side. A static method's
-                    // body would need to dispatch through the strategy
-                    // (and an async one would need the wrapper method
-                    // to be async too, which static-method async-ness
-                    // determines).
+                    // tier-4 has no import side; static methods would
+                    // need to dispatch through the strategy. Not yet
+                    // wired.
                     let msg = format!(
                         "tier-4 static methods on resources are not yet supported \
                          (encountered `{}::{}`)",
@@ -418,10 +398,10 @@ fn emit_method_body(
             unreachable!("freestanding fn appeared in a per-resource Guest trait")
         }
     };
-    // Constructor's wrap-with-await is already inlined above; other
-    // calls get the standard sync/async suffix here. `bridged_sync_target`
-    // is the sync-WIT-via-async-mirror path: the wrapper's method is
-    // async but the import side is sync, so skip `.await`.
+    // Constructor's await was inlined above. For other calls,
+    // `.await` only when the wrapper is async AND the import is
+    // async; `bridged_sync_target` flags an async wrapper over a
+    // sync import and must skip `.await` too.
     let constructor_already_handled = matches!(
         (trait_kind, fn_kind),
         (GuestTraitKind::Resource(_), ExportFnKind::Constructor)
@@ -431,14 +411,12 @@ fn emit_method_body(
     } else if is_async && !bridged_sync_target {
         quote! { #target_call.await }
     } else {
-        // Guest is async but the downstream import is sync, skip `.await`
         target_call
     };
 
-    // Resource-returning fns (interface factories, resource methods,
-    // static factories) route through `WrapperR` inside the strategy
-    // and re-wrap at the boundary. Sync paths bypass dispatch and
-    // don't use `final_wrap`.
+    // Resource-returning fns route through `WrapperR` inside the
+    // strategy and re-wrap at the boundary on return. Sync paths
+    // bypass dispatch entirely and don't use `final_wrap`.
     let resource_wrap = ir
         .fn_sigs
         .get(&args_ident.to_string())
@@ -451,9 +429,9 @@ fn emit_method_body(
         None => (nominal_return_ty.clone(), target_call.clone(), None),
     };
 
-    // Args structs with a `borrow<R>` field carry a `<'a>`
-    // parameter; instantiate at use sites with the `<'_>` placeholder
-    // so the closure / dispatch infers the live lifetime.
+    // Args structs with a `borrow<R>` field carry a `<'a>` param;
+    // instantiate at use sites with `<'_>` so the closure / dispatch
+    // infers the live lifetime.
     let args_ty: TokenStream = if has_borrow {
         quote!(#args_ident<'_>)
     } else {
@@ -462,9 +440,9 @@ fn emit_method_body(
 
     let dispatch = match behavior {
         Behavior::Transform => {
-            // Annotate the closure parameter — qualified
+            // Annotate the closure parameter; qualified
             // `<_ as Trait<…>>::handle` dispatch doesn't propagate
-            // into closure inference (E0282).
+            // through closure inference (E0282).
             quote! {
                 <_ as ::splicer_tool_sdk::TransformStrategy<#args_ty, #strategy_r_ty>>::handle(
                     s,
@@ -485,12 +463,10 @@ fn emit_method_body(
         }
     };
 
-    // Sync wrapper methods can't `.await` the async strategy. For
-    // those, skip strategy dispatch and direct-delegate the call.
-    // This is the documented L2 limitation around tier-3 + sync
-    // WIT — primarily exercised by resource constructors (always
-    // sync per the WIT spec). When end-user-visible interposition
-    // on sync methods is needed, this is the surface that grows.
+    // Strategy dispatch is async, so sync wrapper methods can't go
+    // through it; they direct-delegate to the target instead. WIT
+    // resource constructors are always sync per spec, so they hit
+    // this path.
     let body = if !is_async {
         quote! {
             let args = #args_construct;
@@ -537,16 +513,12 @@ fn emit_method_body(
     }
 }
 
-/// Rewrite bare iface-local type idents (e.g. `Bucket`, `ErrorCode`)
-/// inside a syn type into their absolute `bindings::<iface_path>::<R>`
-/// form, recursively. wit-bindgen's trait sigs use the bare form
-/// because they're emitted *inside* the iface module; our impl block
-/// lives at the wrapper crate's top level and needs the absolute path.
+/// Rewrite bare iface-local type idents inside a syn type to their
+/// absolute `bindings::<iface_path>::<R>` form, recursively.
 ///
-/// Covers both resource types (`Bucket`, `BucketBorrow<'_>`) and
+/// Covers resource types (`Bucket`, `BucketBorrow<'_>`) and
 /// non-resource named types (`ErrorCode`, user records / enums /
-/// variants / flags) that the target iface `use`s from a sibling
-/// types iface.
+/// variants / flags) reached via `use` from a sibling types iface.
 struct AbsolutizeResources<'a> {
     resources: &'a [ResourceInfo],
     types: &'a [NamedType],
@@ -555,11 +527,9 @@ struct AbsolutizeResources<'a> {
 impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
     fn visit_type_path_mut(&mut self, tp: &mut syn::TypePath) {
         if tp.qself.is_none() && tp.path.segments.len() > 1 && tp.path.segments[0].ident == "_rt" {
-            // wit-bindgen emits `_rt::X` paths (`_rt::String`, `_rt::Vec`,
-            // `_rt::Box`) that resolve inside `mod bindings` but not at
-            // the wrapper crate root where the lifted signature lands.
-            // The `_rt` module is private; strip the prefix and rely on
-            // std prelude (`String`, `Vec`, `Box` all re-export there).
+            // wit-bindgen emits `_rt::X` (`_rt::String`, `_rt::Vec`,
+            // `_rt::Box`) which only resolves inside `mod bindings`.
+            // Strip the prefix; std prelude re-exports the targets.
             let mut segs = std::mem::take(&mut tp.path.segments)
                 .into_iter()
                 .skip(1)
@@ -568,16 +538,14 @@ impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
         }
         if tp.qself.is_none() && tp.path.segments.len() == 1 {
             let seg_ident = tp.path.segments[0].ident.clone();
-            // wit-bindgen emits two distinct types for a WIT resource:
-            // the bare ident (`Bucket`) for `own<R>` positions and a
-            // `<R>Borrow` companion (`BucketBorrow<'_>`) for `borrow<R>`.
-            // Both are iface-module-local in wit-bindgen output, so the
-            // wrapper crate top-level reference needs the absolute
-            // `bindings::<iface>::…` prefix in either case.
+            // wit-bindgen emits two types per WIT resource: the bare
+            // `Bucket` for `own<R>` and `BucketBorrow<'_>` for
+            // `borrow<R>`. Both need the absolute `bindings::<iface>`
+            // prefix at the wrapper crate root.
             //
-            // Try exact match first: a resource literally named
-            // `FooBorrow` in own position must NOT be rewritten as
-            // `Foo` via the suffix-strip path.
+            // Exact match first: a resource literally named `FooBorrow`
+            // in own position must not be rewritten as `Foo` via the
+            // suffix-strip path.
             let resource_match = self
                 .resources
                 .iter()
@@ -599,12 +567,10 @@ impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
                 }
             } else if let Some(nt) = self.types.iter().find(|t| t.rust_ident == seg_ident) {
                 // Non-resource named types (records, variants, enums,
-                // flags) reached via `use types.{ErrorCode};` are
-                // emitted inside the declaring iface's module. Rewrite
-                // to the absolute path only when the type lives in a
-                // bindings module — top-level synthesized args
-                // records keep their bare ident at the wrapper crate's
-                // top level.
+                // flags) reached via `use types.{ErrorCode};` live in
+                // the declaring iface's module. Rewrite only when the
+                // type is in a bindings module; synthesized args
+                // records keep their bare ident at the wrapper root.
                 if let TypeLocation::InBindings { path } = &nt.location {
                     let abs = absolute_resource_path(path, &seg_ident);
                     let trailing_args = tp.path.segments[0].arguments.clone();
@@ -647,8 +613,8 @@ fn absolute_resource_path(iface_path: &[String], seg_ident: &syn::Ident) -> syn:
 }
 
 /// Build the closure body that forwards a per-resource method call to
-/// `self.0.<method>(args.x)` — the import-side handle held by the
-/// wrapper newtype is what the strategy ultimately reaches.
+/// `self.0.<method>(args.x)`. `self.0` is the import-side handle held
+/// by the wrapper newtype.
 fn build_self_call(method_ident: &syn::Ident, fields: &[RecordField]) -> TokenStream {
     let arg_exprs = fields.iter().map(|f| {
         let name = &f.rust_ident;
@@ -688,10 +654,10 @@ fn build_import_resource_path(
 }
 
 /// Compute the wrap transforms for a return type tree mentioning
-/// `own<R>` at any depth. `None` when there's nothing to rewrite OR
-/// when every `own<R>` in the tree is a resource the wrapper merely
-/// uses (factored types, declared in an imported types iface) — those
-/// pass through untouched via wit-bindgen's type identity flow.
+/// `own<R>` at any depth. `None` if nothing needs rewriting, or if
+/// every `own<R>` is a resource the wrapper merely uses (factored
+/// types from an imported types iface); those pass through via
+/// wit-bindgen's type identity flow.
 fn build_resource_wrap(
     ret: &WitTypeRef,
     source_for_forward: TokenStream,
@@ -735,10 +701,8 @@ fn build_wrap_at(
     }
     match ret {
         WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => {
-            // The outer `contains_owned_resource` short-circuit
-            // guarantees this leaf is owned; the type identity flow
-            // for used (non-owned) resources is handled by the
-            // pass-through arm above.
+            // Non-owned resources pass through via the arm above;
+            // reaching here means this leaf is owned.
             let wrap_ident = wrapper_ident_for(&nr.rust_ident);
             let export_path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
             CompoundWrap {
@@ -910,10 +874,8 @@ mod tests {
 
     const INTERFACE_QN: &str = "test:pkg/ops@0.1.0";
 
-    // `async func` deliberately: tier-3 strategy dispatch needs to
-    // `.await`, which sync wrapper methods can't host (the L2
-    // sync-method limitation). Tests that assert on the strategy
-    // path must therefore exercise an async surface.
+    // `async func` deliberately: strategy dispatch is async, so
+    // tests that assert on the strategy path need an async surface.
     const TINY_WIT: &str = r#"
         package test:pkg@0.1.0;
         interface ops {

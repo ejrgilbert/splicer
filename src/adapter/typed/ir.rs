@@ -74,31 +74,19 @@ pub fn build_ir(
     let mut types: Vec<NamedType> = Vec::new();
     let mut resources: Vec<ResourceInfo> = Vec::new();
     let mut seen: HashSet<(BindingsPath, String)> = HashSet::new();
-    // Resources are deduped by `TypeId`, not by `(iface_path,
-    // ident)` — a resource that gets `use`d into a second iface
-    // shares its declaring iface's `TypeId` and would otherwise
-    // emit a duplicate wrapper newtype here.
+
+    // Dedup resources by their IDs.
     let mut seen_resource_ids: HashSet<TypeId> = HashSet::new();
     for entry in &ifaces {
         let iface = &resolve.interfaces[entry.id];
         for (wit_name, type_id) in &iface.types {
-            // Follow `Type(_)` aliases to find the original
-            // declaration. WIT's `use types.{bucket}` materializes
-            // as a local alias whose `kind = Type(original_id)` and
-            // whose `owner` is the using iface; the resource itself
-            // is at the original id with `kind = Resource`.
+            // Follow `Type(_)` aliases to find the original declaration.
             let (resolved_id, td) = resolve_through_aliases(resolve, *type_id);
             if matches!(td.kind, TypeDefKind::Resource) {
                 if !seen_resource_ids.insert(resolved_id) {
                     continue;
                 }
-                // Anchor on the *declaring* iface's path (via
-                // `TypeOwner`). For wasi-style factored types the
-                // declaring iface may be on the wrapper world's
-                // import side (e.g. tier-3 wraps `async-bucket` while
-                // `bucket` lives in imported `async-bucket-types`);
-                // the import-side `IfaceEntry` provides the right
-                // module path either way.
+                // Anchor on the *declaring* iface's path (via `TypeOwner`).
                 let (declaring_path, is_owned) = match td.owner {
                     TypeOwner::Interface(declaring_id) => {
                         let declaring_entry = ifaces.iter().find(|e| e.id == declaring_id);
@@ -135,11 +123,7 @@ pub fn build_ir(
         }
     }
 
-    // Synthesize one args record per exported function. Freestanding
-    // funcs get `<IfacePascal><FnPascal>Args` (matching what the
-    // method emitter looks up); resource methods/constructors/statics
-    // get `<ResourcePascal><FnPascal>Args` so the same resource on
-    // two interfaces won't collide on a shared interface prefix.
+    // Synthesize one args record per exported function.
     let mut args_records: Vec<NamedType> = Vec::new();
     let mut fn_sigs: std::collections::HashMap<String, ExportFnSig> =
         std::collections::HashMap::new();
@@ -161,12 +145,7 @@ pub fn build_ir(
                 | FunctionKind::AsyncStatic(id)
                 | FunctionKind::Constructor(id) => resource_pascal(resolve, *id)?,
             };
-            // wit-parser names resource fns with the canonical-ABI
-            // mangling (e.g. `[method]bucket.get`,
-            // `[constructor]bucket`); wit-bindgen emits the Rust
-            // trait method without that prefix and with constructors
-            // renamed to `new`. The IR pins the wit-bindgen-emitted
-            // name as the args-ident source so the two walks line up.
+            // Pin the wit-bindgen-emitted name as the args-ident source.
             let rust_method_name = rust_method_name_for(func, fn_name);
             let args = synth_args_record(resolve, &prefix, &rust_method_name, func, &ifaces)?;
             let args_ident = args_struct_ident(&prefix, &rust_method_name);
@@ -208,9 +187,6 @@ pub fn build_ir(
 }
 
 /// Walk `Type(_)` aliases to find a type's original declaration.
-/// WIT's `use types.{R}` produces a local alias whose `kind =
-/// Type(original_id)` and whose `owner` is the using interface; the
-/// real `Resource` (or `Record`, etc.) lives at the original id.
 fn resolve_through_aliases(
     resolve: &Resolve,
     mut type_id: TypeId,
@@ -235,14 +211,7 @@ fn resource_pascal(resolve: &Resolve, type_id: TypeId) -> Result<String> {
 }
 
 /// Map a wit-parser function name to the Rust method name
-/// wit-bindgen-rust emits for it:
-///
-/// - `Freestanding` / `AsyncFreestanding`: name is already the WIT
-///   ident (e.g. `"open"`).
-/// - `Constructor`: wit-bindgen renames every constructor to `new`.
-/// - `Method` / `Static` (sync + async): the wit-parser name carries
-///   a `[method]<resource>.` or `[static]<resource>.` mangling
-///   prefix; strip it to recover the WIT method ident.
+/// wit-bindgen-rust emits for it.
 fn rust_method_name_for(func: &Function, fallback_name: &str) -> String {
     match &func.kind {
         FunctionKind::Constructor(_) => "new".to_string(),
@@ -260,21 +229,15 @@ fn rust_method_name_for(func: &Function, fallback_name: &str) -> String {
 
 /// The complete IR for one wrapper crate.
 pub struct WrapperIR {
-    /// User-declared WIT types reachable from the world. Type
-    /// aliases are transparent and not listed; resources are tracked
-    /// separately via [`Self::resources`].
+    /// User-declared WIT types reachable from the world.
     pub types: Vec<NamedType>,
-    /// WIT resources declared in exported interfaces. The codegen
-    /// emits one wrapper newtype + `GuestBucket`-style impl per
-    /// entry; resources do NOT get `WitTyped` impls.
+    /// WIT resources declared in exported interfaces.
     pub resources: Vec<ResourceInfo>,
     /// One synthesized args record per exported function (freestanding
     /// or resource method/constructor/static).
     pub args_records: Vec<NamedType>,
     /// Per-fn return type + WIT kind, keyed by the synth args struct
-    /// ident's string form. Carries enough wit-parser info downstream
-    /// so emit_method can branch on the *authoritative* kind instead
-    /// of re-deriving from Rust method names.
+    /// ident's string form.
     pub fn_sigs: std::collections::HashMap<String, ExportFnSig>,
     /// Bindings path of the wrapped target on the wrapper's *import*
     /// side. `None` in tier-4 virtualize (no downstream import).
@@ -310,15 +273,8 @@ impl From<&FunctionKind> for ExportFnKind {
 
 /// A WIT resource reachable from the wrapper world.
 pub struct ResourceInfo {
-    /// `bindings::exports::...::store` for resources the wrapper
-    /// owns (the iface that DECLARES them is on the export side);
-    /// `bindings::...::store` (no `exports::`) for resources the
-    /// wrapper merely USES (declared in an iface only on the
-    /// import side, as for tier-3 wraps over factored types where
-    /// the inner producer owns the resource).
     pub iface_path: BindingsPath,
     /// Kebab-case WIT name, e.g. `"bucket"`.
-    #[allow(dead_code)]
     pub wit_name: String,
     /// PascalCase Rust ident wit-bindgen emits for the resource type.
     pub rust_ident: syn::Ident,
@@ -684,9 +640,7 @@ fn build_named_type(
                 .collect();
             NamedKind::Flags { members }
         }
-        // Type aliases are transparent: emit no NamedType for the
-        // alias, let `<Alias as WitTyped>::…` resolve through the
-        // underlying impl.
+        // Type aliases are transparent: emit no NamedType for the alias
         TypeDefKind::Type(_) => return Ok(None),
         // Resources don't emit a `NamedType`/`WitTyped` impl — the
         // codegen tracks them via [`WrapperIR::resources`] instead.
@@ -796,11 +750,6 @@ fn type_to_ref(resolve: &Resolve, ifaces: &[IfaceEntry], ty: &Type) -> Result<Wi
                     let (path, rust_ident) = named_ref_for(resolve, ifaces, *rid)?;
                     WitTypeRef::Handle(HandleRef::ResourceBorrow(NamedRef { path, rust_ident }))
                 }
-                // A bare `Resource` TypeDefKind can appear only when
-                // a freestanding type position references the resource
-                // declaration itself — not the canonical Own/Borrow
-                // handle. WIT parsing wraps every use-site in a
-                // Handle(_), so this should be unreachable.
                 TypeDefKind::Resource => {
                     bail!("bare resource type reference outside Handle wrapper not supported")
                 }

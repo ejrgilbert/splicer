@@ -1,40 +1,33 @@
 //! Resource-aware companion to [`crate::bridge`].
 //!
-//! [`WitTyped`](crate::WitTyped) routes through `wasm-wave`, which has
-//! no representation for canonical-ABI resource handles. To decode a
-//! recorded tier-2 trace into typed Rust values that contain resource
-//! leaves (replay, mock), strategies need a parallel bridge that walks
-//! cells directly and slots a [`MockedResource`] in at each resource
-//! position.
+//! [`WitTyped`](crate::WitTyped) routes through `wasm-wave`, which
+//! has no representation for canonical-ABI resource handles.
+//! [`WitTypedWithResources`] walks cells directly so each resource
+//! leaf can be slotted in as a [`MockedResource`].
 //!
-//! [`WitTypedWithResources`] is that trait. The SDK provides impls for
-//! primitives, generic containers, and tuples. Per-WIT-resource
-//! wrapper newtypes get their impls codegen-emitted by the splicer
-//! wrapper crate. Value-typed user records / variants / enums get
-//! dual impls (both `WitTyped` and `WitTypedWithResources`) so the
-//! same Rust type works on both bridges.
+//! The SDK provides impls for primitives, generic containers, and
+//! tuples. Per-WIT-resource wrapper newtypes and value-typed user
+//! types get their impls emitted via the macros below, so the same
+//! Rust type can satisfy both bridges.
 
 use crate::bridge::{cells_to_typed, BridgeError};
 use crate::types::{Cell, FieldTree};
 
-/// Type-erased backing for a tier-4 synthesized resource handle.
+/// Type-erased backing for a synthesized resource handle.
 ///
-/// Per-WIT-resource wrapper newtypes (e.g. `WrapperBucket`) hold one
-/// of these; the codegen-emitted [`WitTypedWithResources`] impl on
-/// the wrapper reads a [`Cell::ResourceHandle`] and constructs the
-/// `MockedResource` from the corresponding `handle_infos` entry.
+/// Per-WIT-resource wrapper newtypes hold one of these; their
+/// [`WitTypedWithResources`] impl reads a [`Cell::ResourceHandle`]
+/// and pulls the matching `handle_infos` entry.
 ///
-/// `handle` is `u64` to match [`crate::HandleInfo::id`] and the wire
-/// encoder's 8-byte handle payload — narrower types alias distinct
-/// recorded handles. It is the id pulled from the recorded tier-2
-/// trace; it is **not** the runtime export-table index wit-bindgen
-/// will allocate when the wrapper hands the value back to the outer
-/// component.
+/// `handle` is `u64` to match [`crate::HandleInfo::id`] and the
+/// wire encoder's 8-byte handle payload; narrower types alias
+/// distinct stream handles. It is the id from the cell stream,
+/// **not** the runtime export-table index wit-bindgen allocates
+/// when the wrapper hands the value back downstream.
 ///
-/// `name` is `Cow<'static, str>` so codegen can pass a borrowed
-/// `&'static str` (compile-time-known WIT name) while trace-driven
-/// strategies can materialize handles from runtime-decoded
-/// `HandleInfo::type_name` without breaking the call site.
+/// `name` is `Cow<'static, str>` so callers can pass either a
+/// borrowed `&'static str` (compile-time-known) or an owned name
+/// from `HandleInfo::type_name`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MockedResource {
     pub handle: u64,
@@ -43,10 +36,8 @@ pub struct MockedResource {
 
 impl MockedResource {
     /// Decode a single `Cell::ResourceHandle` at `root` into a
-    /// `MockedResource`. Shared between the SDK's own walkers and
-    /// every codegen-emitted per-resource [`WitTypedWithResources`]
-    /// impl, so error variants stay consistent and the inlined
-    /// boilerplate per wrapper crate stays small.
+    /// `MockedResource`. Shared by SDK walkers and codegen-emitted
+    /// wrapper impls so error variants stay consistent.
     pub fn from_handle_cell(
         tree: &FieldTree,
         root: u32,
@@ -77,19 +68,14 @@ impl MockedResource {
 /// Decode a [`FieldTree`] into a typed Rust value that may contain
 /// resource leaves.
 ///
-/// Mirrors the [`WitTyped`](crate::WitTyped) shape but walks cells
-/// directly instead of routing through `wasm-wave` — `wasm-wave`'s
-/// `Value` has no resource representation, so the wave bridge stops
-/// at resource leaves. This bridge picks up exactly there.
-///
-/// Strategies that consume tier-2 trace data (replay, mock) bound
-/// their `R` on this trait.
+/// Mirrors [`WitTyped`](crate::WitTyped) but walks cells directly;
+/// `wasm-wave`'s `Value` has no resource representation, so this
+/// bridge picks up where the wave bridge stops.
 pub trait WitTypedWithResources: Sized {
     fn from_cells(tree: &FieldTree, root: u32) -> Result<Self, BridgeError>;
 }
 
-/// Convenience over `T::from_cells` — parallel name to
-/// [`cells_to_typed`](crate::cells_to_typed).
+/// Convenience over `T::from_cells`.
 pub fn cells_to_typed_with_resources<T: WitTypedWithResources>(
     tree: &FieldTree,
     root: u32,
@@ -98,9 +84,8 @@ pub fn cells_to_typed_with_resources<T: WitTypedWithResources>(
 }
 
 /// Construct a `Wrapper(MockedResource)` newtype with a fresh
-/// monotonic handle id. Tier-4 sync resource constructors invoke
-/// this; the per-invocation `AtomicU64` keeps successive calls
-/// distinguishable for record/replay.
+/// handle id. The per-call-site `AtomicU64` keeps successive
+/// constructor calls distinguishable.
 #[macro_export]
 macro_rules! mint_mock_resource {
     ($wrapper:ident, $wit_name:literal) => {{
@@ -113,13 +98,9 @@ macro_rules! mint_mock_resource {
     }};
 }
 
-/// Implement [`WitTypedWithResources`] for a value-typed user type
-/// (one that already impls [`WitTyped`](crate::WitTyped)) by routing
-/// through the wave bridge. Codegen emits one invocation per user-
-/// declared record / enum / variant / flags type so the same type
-/// satisfies both bridges; this is the macro form of the
-/// "dual impl" pattern (avoids a blanket `impl<T: WitTyped> WTWR
-/// for T` that would conflict with the explicit wrapper impl).
+/// Implement [`WitTypedWithResources`] for a value-typed type
+/// (already impls [`WitTyped`](crate::WitTyped)) by delegating to
+/// the wave bridge.
 #[macro_export]
 macro_rules! impl_wit_typed_with_resources_via_wave {
     ($ty:ty) => {
@@ -136,7 +117,6 @@ macro_rules! impl_wit_typed_with_resources_via_wave {
 
 /// Implement [`WitTypedWithResources`] for a `Wrapper(MockedResource)`
 /// newtype by delegating to [`MockedResource::from_handle_cell`].
-/// Tier-4 codegen emits one invocation per WIT resource.
 #[macro_export]
 macro_rules! impl_wit_typed_with_resources_for_wrapper {
     ($wrapper:ident, $wit_name:literal) => {
@@ -156,16 +136,9 @@ macro_rules! impl_wit_typed_with_resources_for_wrapper {
     };
 }
 
-/// Construct the `Err` arm of any `Result<T, E: Default>` via
-/// `E::default()`.
-///
-/// The Ok arm is never instantiated, so it may contain resources or
-/// anything else uninstantiable from thin air. The bound is strictly
-/// weaker than `R: Default` (no constraint on `T`) and strictly
-/// weaker than `R: Arbitrary` (no entropy source needed).
-///
-/// Not currently used by a shipping builtin; kept available for
-/// strategies that want stable / repeatable err injection.
+/// Construct the `Err` arm of `Result<T, E: Default>` via
+/// `E::default()`. The Ok arm is never instantiated, so it may
+/// hold resource-bearing or otherwise uninstantiable types.
 pub trait HasDefaultErr {
     fn default_err() -> Self;
 }
@@ -176,17 +149,10 @@ impl<T, E: Default> HasDefaultErr for Result<T, E> {
     }
 }
 
-/// Construct the `Err` arm of any `Result<T, E: Arbitrary>` from an
-/// entropy stream.
-///
-/// Sibling of [`HasDefaultErr`] for chaos / fault-injection use: each
-/// call samples a fresh err value from the supplied
-/// [`arbitrary::Unstructured`] bytes, giving real variance across
-/// invocations. Trait bound is strictly weaker than a full
-/// `R: Arbitrary` — the Ok arm's type doesn't need to impl
-/// `Arbitrary`, which is what lets chaos-err interpose on
-/// resource-bearing returns without waiting for
-/// `ArbitraryWithResources` to land.
+/// Construct the `Err` arm of `Result<T, E: Arbitrary>` by
+/// sampling from an [`arbitrary::Unstructured`] stream. The Ok
+/// arm needs no bound, so resource-bearing returns work without
+/// an `ArbitraryWithResources` trait.
 pub trait HasArbitraryErr: Sized {
     fn arbitrary_err<'a>(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self>;
 }
@@ -199,11 +165,10 @@ impl<T, E: for<'a> arbitrary::Arbitrary<'a>> HasArbitraryErr for Result<T, E> {
 
 // ---- primitive impls --------------------------------------------------
 //
-// Primitives have no resource positions, so each impl delegates to the
-// existing wave-routed `cells_to_typed`. This is the value-typed dual:
-// the same Rust type satisfies both bridges, which is what lets a
-// compound impl like `Vec<T: WitTypedWithResources>` accept `Vec<u32>`
-// as readily as `Vec<WrapperBucket>`.
+// Primitives have no resource positions, so each impl delegates to
+// `cells_to_typed`. The dual impl lets a compound like
+// `Vec<T: WitTypedWithResources>` accept value-typed and
+// resource-bearing element types alike.
 macro_rules! impl_via_wave {
     ($($T:ty),* $(,)?) => {$(
         impl WitTypedWithResources for $T {
@@ -218,11 +183,10 @@ impl_via_wave!(bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, char, Strin
 
 // ---- compound impls ---------------------------------------------------
 //
-// Compounds walk cells directly and recurse via T::from_cells, so a
-// resource leaf reaches its codegen-emitted impl without ever flowing
-// through `wasm-wave`. For value-typed element types the recursion
-// bottoms out at the wave-routed primitive impls above; the round-trip
-// result is the same as `cells_to_typed::<Self>`.
+// Compounds walk cells directly and recurse via T::from_cells, so
+// resource leaves reach their wrapper impl without flowing through
+// `wasm-wave`. Value-typed leaves bottom out at the wave-routed
+// primitive impls above.
 
 fn get_cell<'a>(tree: &'a FieldTree, idx: u32) -> Result<&'a Cell, BridgeError> {
     tree.cells
@@ -240,11 +204,9 @@ impl<T: WitTypedWithResources> WitTypedWithResources for Vec<T> {
                 .iter()
                 .map(|c| T::from_cells(tree, *c))
                 .collect(),
-            // `Cell::Bytes` is the recorder's fast path for `list<u8>`;
-            // decoding it generically here would need a u8 specialization
-            // we don't have. Resource-bearing lists never use this shape,
-            // so the limitation is benign in practice; callers with a
-            // value-typed `list<u8>` should reach for `cells_to_typed`.
+            // `Cell::Bytes` is the fast path for `list<u8>` and never
+            // carries resource handles. Callers with a value-typed
+            // `list<u8>` should use `cells_to_typed` instead.
             Cell::Bytes(_) => Err(BridgeError::Unsupported(
                 "Cell::Bytes fastpath in WitTypedWithResources",
             )),
@@ -267,10 +229,9 @@ impl<T: WitTypedWithResources> WitTypedWithResources for Option<T> {
     }
 }
 
-// Mirrors the four `Result<...>` arm shapes in [`crate::bridge`]: a
-// generic `Result<T, E>` plus three unit-arm specializations so the
-// `()` non-impl doesn't propagate. The unit arms are the shape
-// wit-bindgen emits for WIT `result<...>` arms without a payload.
+// Same four `Result<...>` arm shapes as [`crate::bridge`]: a generic
+// `Result<T, E>` plus three unit-arm specializations covering the
+// payload-less WIT `result` arms that wit-bindgen emits as `()`.
 
 impl<T: WitTypedWithResources, E: WitTypedWithResources> WitTypedWithResources for Result<T, E> {
     fn from_cells(tree: &FieldTree, root: u32) -> Result<Self, BridgeError> {
@@ -326,9 +287,8 @@ impl WitTypedWithResources for Result<(), ()> {
 // ---- tuple impls ------------------------------------------------------
 //
 // Same arity range (1..=12) as the wave-routed tuple impls in
-// [`crate::bridge`]. `()` is intentionally not impl'd (no WIT type
-// maps to it; the unit shape is encoded as a single-field sentinel
-// record at the codegen layer).
+// [`crate::bridge`]. `()` is intentionally not impl'd; no WIT type
+// maps to it (the unit shape is a sentinel record at codegen).
 
 macro_rules! impl_tuple {
     ($($T:ident => $idx:tt),+) => {
@@ -340,8 +300,6 @@ macro_rules! impl_tuple {
                         "expected Cell::TupleOf for tuple type",
                     )),
                 };
-                // Per-arity assertion: the tuple impl needs every
-                // slot, so any mismatch is a structural inconsistency.
                 let expected_arity = 0usize $(+ { let _ = $idx; 1 })+;
                 if children.len() != expected_arity {
                     return Err(BridgeError::ExpectedTypeShape(
@@ -506,10 +464,10 @@ mod tests {
 
     #[test]
     fn handle_decode_preserves_full_u64_range() {
-        // Recorded handles can exceed u32::MAX (HandleInfo::id is
-        // u64 and the wire encoder writes the full 8 bytes). Two
-        // handles that differ only above 2^32 must decode to
-        // distinct `MockedResource`s.
+        // Stream handles can exceed u32::MAX (HandleInfo::id is u64
+        // and the wire encoder writes the full 8 bytes). Two handles
+        // that differ only above 2^32 must decode to distinct
+        // `MockedResource`s.
         let big_a = (u32::MAX as u64) + 1;
         let big_b = (u32::MAX as u64) + 2;
 
@@ -534,10 +492,9 @@ mod tests {
 
     #[test]
     fn result_ok_arm_carrying_resource_decodes() {
-        // The compound shape the L3 design appendix traces end-to-end:
-        // `result<bucket, store-err>`. The Ok arm carries a resource;
-        // the Err arm is `String` (`store-err` would be a user enum in
-        // practice — using String here keeps the test SDK-only).
+        // `result<bucket, store-err>`: Ok arm carries a resource,
+        // Err arm is a value type. Using `String` for the Err keeps
+        // the test SDK-only (a user enum would work the same way).
         let mut t = empty_tree(
             vec![Cell::ResourceHandle(0), Cell::ResultOk(Some(0))],
             1,
@@ -560,7 +517,7 @@ mod tests {
     #[test]
     fn vec_of_resources_decodes() {
         // `list<bucket>`: each element decodes through the wrapper
-        // impl. Recorded handles differ per element.
+        // impl. Stream handles differ per element.
         let mut t = empty_tree(
             vec![
                 Cell::ResourceHandle(0),
@@ -632,10 +589,9 @@ mod tests {
 
     #[test]
     fn has_arbitrary_err_works_with_resource_bearing_ok_arm() {
-        // The Ok arm doesn't need to impl Arbitrary — only E does.
-        // This is the architectural win over a full `R: Arbitrary`
-        // bound: resource-bearing Ok arms compose today, before
-        // ArbitraryWithResources lands.
+        // The Ok arm doesn't need to impl Arbitrary, only E does,
+        // so resource-bearing Ok arms compose without a full
+        // `R: Arbitrary` bound.
         let bytes = [0xABu8; 64];
         let mut u = arbitrary::Unstructured::new(&bytes);
         let r: Result<StandinBucket, String> =
@@ -660,10 +616,8 @@ mod tests {
         assert_ne!(ra, rb);
     }
 
-    /// The macro emits the same impl shape the wrapper codegen
-    /// expects. Exercising it through a stand-in wrapper here is what
-    /// pins the macro's surface area, so the splice-time codegen can
-    /// keep using a one-line macro invocation.
+    /// Pins the macro's surface area through a stand-in wrapper, so
+    /// the wrapper codegen can keep using a one-line invocation.
     pub struct MacroBucket(pub MockedResource);
     crate::impl_wit_typed_with_resources_for_wrapper!(MacroBucket, "bucket");
 
@@ -679,9 +633,8 @@ mod tests {
         assert_eq!(v.0.name.as_ref(), "bucket");
     }
 
-    // Single-site macro expansion — mirrors how a tier-4 wrapper's
-    // resource-constructor body would invoke the macro from one
-    // place and have successive constructor calls share the static.
+    // Single-site macro expansion: one call site, one shared static,
+    // successive constructor calls draw fresh ids from it.
     fn mint_bucket() -> MacroBucket {
         crate::mint_mock_resource!(MacroBucket, "bucket")
     }
@@ -744,9 +697,9 @@ mod tests {
 
     #[test]
     fn impl_macro_propagates_decode_error_variants() {
-        // Out-of-bounds root index surfaces as `CellOutOfBounds` —
-        // the same variant the SDK's own walkers report — instead of
-        // an `Unsupported` catch-all the inlined codegen used.
+        // Out-of-bounds root index surfaces as `CellOutOfBounds`,
+        // matching the SDK's own walkers rather than collapsing to
+        // an `Unsupported` catch-all.
         let t = empty_tree(vec![], 0);
         let r: Result<MacroBucket, _> = WitTypedWithResources::from_cells(&t, 0);
         assert!(matches!(r, Err(BridgeError::CellOutOfBounds { .. })));
