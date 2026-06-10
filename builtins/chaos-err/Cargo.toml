@@ -10,6 +10,8 @@ publish = false
 
 [dependencies]
 splicer-tool-sdk = { version = "0.1.0", path = "../../splicer-tool-sdk" }
-# Entropy source — calls into wasi:random/random on wasi targets,
-# the OS RNG on native (used by the lib's own test build).
-getrandom = "0.2"
+getrandom = "0.4"
+wit-bindgen = { version = "0.51.0", features = ["default", "async-spawn", "inter-task-wakeup", "async"] }
+
+[build-dependencies]
+builtin-protocol = { package = "splicer-builtin-protocol", path = "../builtin-protocol", version = "0.2.0" }

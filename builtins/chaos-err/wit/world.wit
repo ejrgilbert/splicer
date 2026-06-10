@@ -1,0 +1,5 @@
+package splicer:chaos-err@0.1.0;
+
+world consumer {
+    import splicer:builtin-config/get@0.1.0;
+}

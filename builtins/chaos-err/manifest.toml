@@ -1,3 +1,9 @@
 [builtin]
 description = "Returns a freshly-sampled Err for every wrapped call. Requires `R: HasArbitraryErr` (e.g. `Result<_, E: Arbitrary>`); the Ok arm's type is unconstrained."
 tier = 4
+
+[[key]]
+name = "entropy-bytes"
+type = "u32"
+default = 256
+doc = "Per-call entropy buffer size, in bytes. Default covers typical err shapes (enums, short strings, small records); bump if a specific `Arbitrary` impl exhausts it and `handle` panics."
