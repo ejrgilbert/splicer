@@ -22,6 +22,19 @@ that unifies all four tiers across both decl styles. Verifying exactly what
 tier-4 delivers today (vs. only passing structural/matrix tests) is an explicit
 task below.
 
+**Recent progress** (commit `wire in types explicitly in generated wac`):
+tier-3 wrap of *producer-owned* resource-bearing interfaces now **composes**
+(verified via `--builtin-hello-tier3` on `my:service/async-bucket`), and
+host-provided (wasi) interfaces already worked. That is iface-level only:
+methods invoked on a returned resource still dispatch to the producer's
+`GuestBucket`, bypassing the wrapper. So *composition* is solved;
+**method-level delivery is the remaining gap**, which is exactly what the
+fresh-`T'` design below closes. (Tier-4 already owns its resource type by
+synthesizing via the strategy; the fresh-`T'` design is that same own-`GuestR`
+"proxy-component" route generalized to tiers 1-3, refined to own a *fresh* type
+and rewire cross-name so it composes, rather than re-exporting the producer's
+type identity.)
+
 ## The problem
 
 A splice wrapper can intercept interface-level functions that take or
@@ -356,6 +369,17 @@ subtyping, cross-name rewire. Remaining:
   bridge (the wrap/unwrap logic cannot be copied into the edge, since only the
   type owner can box/unbox its resource). Fusing the edge into the wrapper
   keeps it internal Rust but constrains routing.
+- `call-id` ergonomics for methods. The info a hook needs to know it's in a
+  resource method is present but *implicit*: method-kind lives in the
+  `function_name` string (`[method]bucket.get` / `[constructor]` / `[static]`,
+  the same `[` prefix `scope: resource` matches on) and the receiver is arg0 by
+  ABI convention. Lifted handle args are already tagged distinctly from plain
+  integers (`Cell::ResourceHandle` + type/correlation id), so the value side is
+  fine. The question is whether to surface method-kind and the receiver
+  *explicitly* in `call-id` (a `kind` discriminant + a marked receiver) so a
+  hook reads a field instead of substring-matching `[method]` and assuming
+  arg0-is-self. Stringly-typed convention vs. an explicit, harder-to-misuse
+  hook surface.
 
 ## References
 
