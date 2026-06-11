@@ -1,0 +1,7 @@
+package splice:edge;
+world edge {
+  import host:kv/store;
+  import splice:wrap/store;
+  import splice:wrap/bridge;
+  export run: func() -> string;
+}

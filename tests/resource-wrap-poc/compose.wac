@@ -1,0 +1,10 @@
+package test:composed;
+let prov = new host:kv { ... };
+let wrp  = new splice:wrap { "host:kv/store": prov["host:kv/store"], ... };
+let edg  = new splice:edge {
+  "host:kv/store": prov["host:kv/store"],
+  "splice:wrap/store": wrp["splice:wrap/store"],
+  "splice:wrap/bridge": wrp["splice:wrap/bridge"],
+  ...
+};
+export edg["run"];

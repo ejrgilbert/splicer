@@ -1,0 +1,14 @@
+package splice:wrap;
+interface store {
+  resource bucket {
+    constructor(name: string);
+    get: func(k: string) -> option<string>;
+    set: func(k: string, v: string);
+  }
+}
+interface bridge {
+  use host:kv/store.{bucket as raw-bucket};
+  use store.{bucket as wrapped-bucket};
+  wrap:   func(inner: raw-bucket) -> wrapped-bucket;
+  unwrap: func(w: wrapped-bucket) -> raw-bucket;
+}
