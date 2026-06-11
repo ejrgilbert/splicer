@@ -1,0 +1,23 @@
+[package]
+name = "edge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "splice:edge"
+
+[package.metadata.component.dependencies]
+
+[package.metadata.component.target]
+path = "wit"
+world = "edge"
+
+[package.metadata.component.target.dependencies]
+"host:kv" = { path = "wit/deps/host-kv" }
+"splice:wrap" = { path = "wit/deps/splice-wrap" }
