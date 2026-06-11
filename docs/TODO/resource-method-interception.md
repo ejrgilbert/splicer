@@ -311,6 +311,8 @@ subtyping, cross-name rewire. Remaining:
 - [ ] Emit bridge `wrap`/`unwrap` (or statics on `T'`).
 - [ ] Constructor (sync hook), drop (optional event), statics, `borrow<T>`
   (call-scoped wrapper).
+- [ ] Static-method codegen gaps and user-declared types holding resource
+  fields: see "Folded-in sub-problems" below.
 
 **Codegen: edge shims** (new substrate)
 - [ ] Emit boundary-edge component(s): import bridge + boundary iface,
@@ -381,13 +383,58 @@ subtyping, cross-name rewire. Remaining:
   arg0-is-self. Stringly-typed convention vs. an explicit, harder-to-misuse
   hook surface.
 
+## Folded-in sub-problems (were separate TODO docs)
+
+Sub-problems of this effort, consolidated here from their former standalone docs.
+
+### Static methods (`[static]bucket.foo`)
+
+`scope: resource` selects `[static]` surfaces too, but codegen has known gaps:
+- **Tier-3 sync static returning a resource** emits a type mismatch (trait
+  expects `Resource<WrapperBucket>`, the sync body produces import-side
+  `Bucket`). Fix: apply the `resource_wrap.forward_expr` wrap in the sync body
+  branch when present. `src/adapter/typed/emit_method.rs` (~407-420).
+- **Tier-4 statics** emit `compile_error!` (`emit_method.rs` ~486). The 2x2 to
+  fill in: async×{value,resource} via strategy dispatch, sync-resource via
+  `mint_mock_resource!`. Open question: sync tier-4 value-typed static —
+  `compile_error!` or `R::default()`?
+- Tests: `matrix_resource_static_factory_returns_resource`,
+  `matrix_tier4_static_method_fails_fast_with_compile_error`.
+
+### User-declared types containing resource fields
+
+The per-occurrence walk above assumes nested `T` (in record/variant/list/option)
+can be carried, but a user-declared record/variant that *holds* a resource field
+needs a `WitTypedWithResources` (WTWR) impl, and none is generated today (wrapper
+fails to compile). Fix: a WTWR cell walker that decodes the `WrapperBucket` cell
+but materializes the user's actual `Bucket` via `Bucket::new(...)`, with
+field-level codegen distinguishing the Rust type at the WitTypeRef (`Bucket`)
+from the WTWR-decodable type (`WrapperBucket`). Touch points:
+`src/adapter/typed/emit_wit_typed.rs`, `emit_method.rs`,
+`splicer-tool-sdk/src/bridge_resources.rs`. Non-goal: resource fields are skipped
+by redact-strings-style `TypedVisit` mutation. Verify
+`Result<HandleBearingRecord, E>` flows through `build_resource_wrap`.
+
+### Shared resource family / fan-in
+
+When a wrapped interface shares a factored `-types` interface with OTHER
+*unwrapped* consumers, handles straddle two resource identities and wac compose
+mismatches. Under fresh-`T'` this is an instance of the closure-over-T
+requirement (match step 1): only wrapped consumers are rewired to `T'`, so any
+edge where a `T'` meets a raw `T` needs wrap/unwrap or the cut isn't closed.
+Cheap near-term guard: a config-time validation that warns on the straddle.
+Current workaround: give the wrapped interface its own private `-types`
+interface so the family isn't shared. Touch points:
+`src/adapter/typed/target_wit.rs` (`Behavior::Virtualize`), the wac
+`with_chain_routing` fix.
+
 ## References
 
 - POC: `tests/resource-wrap-poc/` (`./run.sh`, README documents each check).
 - Code: `src/wac.rs`, `src/adapter/typed/target_wit.rs`,
   `src/adapter/typed/emit_method.rs`.
 - Blocker for the naive approach: wasm-tools#2506.
-- Related: `tier2-generic-resource-handles.md`,
-  `tier4-shared-resource-family.md`, `user-types-containing-resources.md`.
+- Related (distinct effort): `tier2-generic-resource-handles.md` (tier-2
+  attribute/observability extraction off resources).
 - Memory: `project_resource_record_wiring`, `project_subgraph_bounded_replay`,
   `project_tier3_producer_owned_types`.

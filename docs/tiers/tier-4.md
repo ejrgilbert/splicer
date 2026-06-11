@@ -71,8 +71,9 @@ mapping).
   the resource type (exports the `-types` interface and synthesizes
   via the strategy), so unlike tier-3 there's no method-dispatch
   gap. Inline resource declarations are still rejected; static
-  methods on resources emit `core::compile_error!` (see
-  [`tier3-tier4-resource-static-methods.md`](../TODO/tier3-tier4-resource-static-methods.md)).
+  methods on resources emit `core::compile_error!` (see the static-methods
+  section of
+  [`resource-method-interception.md`](../TODO/resource-method-interception.md)).
   `builtin-hello-tier4.yaml` exercises this on
   `my:service/bucket-as-arg`; [`chaos-err`](../../builtins/chaos-err/)
   is the shipping demo strategy.
