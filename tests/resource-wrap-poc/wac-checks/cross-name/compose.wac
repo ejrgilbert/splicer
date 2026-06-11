@@ -1,0 +1,4 @@
+package test:composed;
+let p = new test:wrapped { ... };
+let c = new test:orig { "test:orig/store": p["test:wrapped/store"], ... };
+export c["run"];

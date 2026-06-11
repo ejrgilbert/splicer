@@ -1,0 +1,16 @@
+package test:shared;
+
+interface store {
+  resource bucket {
+    constructor(name: string);
+    get: func(k: string) -> option<string>;
+    set: func(k: string, v: string);
+    // EXTRA items absent from the consumer's view of `store`:
+    wrap: static func(inner: bucket) -> bucket;
+    tag: func() -> u32;
+  }
+}
+
+world provider {
+  export store;
+}
