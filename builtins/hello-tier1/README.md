@@ -1,7 +1,7 @@
 # hello-tier1
 
 Tier-1 builtin that `println!`s a line per wrapped call. Lightweight
-smoke for splice rules and the `splicer:builtin-config` substrate.
+smoke for splice rules.
 
 Output format:
 
