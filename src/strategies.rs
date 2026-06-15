@@ -22,8 +22,21 @@ use include_dir::Dir;
 use std::path::{Path, PathBuf};
 
 use crate::adapter::typed::{
-    build_wrapper, target_wit_for_codegen, Behavior, BuildConfig, GenerateWrapperInput, TargetWit,
+    build_wrapper, smoke_check_strategy, target_wit_for_codegen, Behavior, BuildConfig,
+    BuildOutcome, GenerateWrapperInput, TargetWit,
 };
+use std::collections::HashSet;
+
+/// Outcome of materializing a tier-3/4 wrapper for one
+/// `(strategy, interface)`.
+#[derive(Debug)]
+pub enum MaterializeOutcome {
+    /// Wrapper built and installed at `path`.
+    Built { path: PathBuf, tier: Tier },
+    /// The strategy doesn't fit this interface; carries the unsatisfied
+    /// bound (parsed from rustc) for the skip warning.
+    Skipped { bound: Option<String> },
+}
 
 // Per-builtin `Dir<'_>` statics + the `EMBEDDED` slice are generated
 // by `build.rs` from `builtins/*/manifest.toml` (any builtin
@@ -117,7 +130,8 @@ pub fn materialize_tier3_4(
     split_bytes: &[u8],
     target_interface: &str,
     mirror_export_name: Option<&str>,
-) -> Result<(PathBuf, Tier)> {
+    verified: &mut HashSet<String>,
+) -> Result<MaterializeOutcome> {
     let prep = match source {
         Tier3_4Source::Builtin { name, wac_name } => prepare_builtin_strategy(name, wac_name)?,
         Tier3_4Source::User {
@@ -131,6 +145,7 @@ pub fn materialize_tier3_4(
         split_bytes,
         target_interface,
         mirror_export_name,
+        verified,
     )
 }
 
@@ -205,13 +220,24 @@ fn materialize_from_prepared(
     split_bytes: &[u8],
     target_interface: &str,
     mirror_export_name: Option<&str>,
-) -> Result<(PathBuf, Tier)> {
+    verified: &mut HashSet<String>,
+) -> Result<MaterializeOutcome> {
     let behavior = behavior_for(&prep.manifest, &prep.out_name)?;
     let target =
         target_wit_for_codegen(split_bytes, target_interface, behavior, mirror_export_name)?;
     let cache_root = typed_cache_root()?;
     let adapter_path = ensure_preview1_adapter(&cache_root)?;
     let strategy_type = prep.strategy_crate_name.to_upper_camel_case();
+
+    // Verify the strategy compiles on its own before wrapping it against
+    // any interface (once per strategy per run)
+    let strategy_key = prep.strategy_dir.to_string_lossy().into_owned();
+    if !verified.contains(&strategy_key) {
+        smoke_check_strategy(&prep.strategy_dir, &cache_root, None).with_context(|| {
+            format!("strategy '{}' does not compile on its own", prep.out_name)
+        })?;
+        verified.insert(strategy_key);
+    }
 
     // Bridged variants need a distinct on-disk wasm so two rules using the same
     // builtin on different targets don't overwrite each other's output.
@@ -236,14 +262,20 @@ fn materialize_from_prepared(
         adapter_path: &adapter_path,
         cache_root: &cache_root,
     };
-    let path = run_codegen_build(
+    let outcome = run_codegen_build(
         splits_dir,
         &plan,
         behavior,
         &target,
         mirror_export_name.is_some(),
     )?;
-    Ok((path, prep.manifest.builtin.tier))
+    Ok(match outcome {
+        BuildOutcome::Built(path) => MaterializeOutcome::Built {
+            path,
+            tier: prep.manifest.builtin.tier,
+        },
+        BuildOutcome::BoundMismatch { bound, .. } => MaterializeOutcome::Skipped { bound },
+    })
 }
 
 /// Read `manifest.toml` from the user-supplied strategy directory.
@@ -374,17 +406,16 @@ struct BuildPlan<'a> {
     cache_root: &'a Path,
 }
 
-/// Run the wrapper-crate codegen + cargo build for `plan`, then
-/// install the produced wasm at `splits_dir/builtins/<out_name>.wasm`.
-/// All the path resolution is the caller's responsibility — this
-/// function just drives the build pipeline.
+/// Run the wrapper-crate codegen + cargo build for `plan`. On success
+/// installs the wasm at `splits_dir/builtins/<out_name>.wasm` and
+/// returns `Built`; a bound mismatch passes straight through.
 fn run_codegen_build(
     splits_dir: &Path,
     plan: &BuildPlan<'_>,
     behavior: Behavior,
     target: &TargetWit,
     bridged_sync_target: bool,
-) -> Result<PathBuf> {
+) -> Result<BuildOutcome> {
     let strategy_path_str = plan.strategy_dir.to_str().with_context(|| {
         format!(
             "strategy path is not UTF-8: {}",
@@ -403,14 +434,17 @@ fn run_codegen_build(
         splicer_tool_sdk_version: plan.sdk_version,
         bridged_sync_target,
     };
-    let built = build_wrapper(
+    let built = match build_wrapper(
         &input,
         &BuildConfig {
             build_root: plan.cache_root,
             adapter_wasm: plan.adapter_path,
             target: None,
         },
-    )?;
+    )? {
+        BuildOutcome::Built(path) => path,
+        skip @ BuildOutcome::BoundMismatch { .. } => return Ok(skip),
+    };
 
     let out_dir = splits_dir.join(BUILTIN_SUBDIR);
     std::fs::create_dir_all(&out_dir)
@@ -423,7 +457,7 @@ fn run_codegen_build(
             out.display()
         )
     })?;
-    Ok(out)
+    Ok(BuildOutcome::Built(out))
 }
 
 /// Write the embedded preview1 reactor adapter under `cache_root` if
@@ -642,7 +676,7 @@ mod tests {
         "#;
         let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
         let splits = tempfile::tempdir().unwrap();
-        let (out, tier) = materialize_tier3_4(
+        let outcome = materialize_tier3_4(
             splits.path(),
             Tier3_4Source::Builtin {
                 name: "hello-tier3",
@@ -651,8 +685,12 @@ mod tests {
             &composition,
             "test:demo/ops@0.1.0",
             None,
+            &mut HashSet::new(),
         )
         .expect("materialize");
+        let MaterializeOutcome::Built { path: out, tier } = outcome else {
+            panic!("expected a built wrapper, got a skip");
+        };
         assert_eq!(tier, Tier::Tier3);
         assert!(out.ends_with("builtins/hello-tier3.wasm"));
         let bytes = std::fs::read(&out).expect("read");
@@ -693,7 +731,7 @@ mod tests {
         extract("hello-tier3", &strat).expect("extract strategy");
 
         let splits = tempfile::tempdir().unwrap();
-        let (out, tier) = materialize_tier3_4(
+        let outcome = materialize_tier3_4(
             splits.path(),
             Tier3_4Source::User {
                 wac_name: "my-greeter",
@@ -702,13 +740,104 @@ mod tests {
             &composition,
             "test:demo/ops@0.1.0",
             None,
+            &mut HashSet::new(),
         )
         .expect("materialize_tier3_4(user)");
+        let MaterializeOutcome::Built { path: out, tier } = outcome else {
+            panic!("expected a built wrapper, got a skip");
+        };
         assert_eq!(tier, Tier::Tier3);
         // Output file name is the YAML name (here `my-greeter`),
         // not the Cargo package name (`hello-tier3`).
         assert!(out.ends_with("builtins/my-greeter.wasm"));
         let bytes = std::fs::read(&out).expect("read");
         assert!(bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]), "wasm magic");
+    }
+
+    /// `chaos-err` requires `R: HasArbitraryErr`; an interface returning
+    /// a bare `u32` can't satisfy it, so the build fails on that exact
+    /// bound and materialization reports a skip instead of erroring.
+    #[test]
+    #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+    fn materialize_skips_on_bound_mismatch() {
+        use crate::adapter::typed::target_wit::test_fixture::component_from_wit;
+        const FIXTURE_WIT: &str = r#"
+            package test:demo@0.1.0;
+            interface ops {
+                add: async func(a: u32, b: u32) -> u32;
+            }
+            world demo {
+                export ops;
+            }
+        "#;
+        let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
+        let splits = tempfile::tempdir().unwrap();
+        let outcome = materialize_tier3_4(
+            splits.path(),
+            Tier3_4Source::Builtin {
+                name: "chaos-err",
+                wac_name: "chaos-err",
+            },
+            &composition,
+            "test:demo/ops@0.1.0",
+            None,
+            &mut HashSet::new(),
+        )
+        .expect("materialize returns Ok (skip, not error)");
+        match outcome {
+            MaterializeOutcome::Skipped { bound } => {
+                // The parsed bound names the concrete failing type.
+                let bound = bound.expect("bound parsed from rustc");
+                assert!(
+                    bound.contains("HasArbitraryErr"),
+                    "unexpected bound: {bound}"
+                );
+            }
+            MaterializeOutcome::Built { .. } => panic!("expected a skip, got a built wrapper"),
+        }
+    }
+
+    /// A strategy crate that doesn't compile on its own is the strategy's
+    /// fault, not a bad interface fit, so materialization hard-errors at
+    /// the standalone smoke-check rather than skipping.
+    #[test]
+    #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+    fn materialize_errors_when_strategy_is_broken() {
+        use crate::adapter::typed::target_wit::test_fixture::component_from_wit;
+        const FIXTURE_WIT: &str = r#"
+            package test:demo@0.1.0;
+            interface ops {
+                add: async func(a: u32, b: u32) -> u32;
+            }
+            world demo {
+                export ops;
+            }
+        "#;
+        let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
+
+        // Stage hello-tier3, then break its source so it can't compile.
+        let tmp = tempfile::tempdir().unwrap();
+        let strat = tmp.path().join("hello-tier3");
+        extract("hello-tier3", &strat).expect("extract strategy");
+        std::fs::write(strat.join("src/lib.rs"), "this is not valid rust;\n")
+            .expect("corrupt strategy source");
+
+        let splits = tempfile::tempdir().unwrap();
+        let err = materialize_tier3_4(
+            splits.path(),
+            Tier3_4Source::User {
+                wac_name: "broken",
+                strategy_dir: &strat,
+            },
+            &composition,
+            "test:demo/ops@0.1.0",
+            None,
+            &mut HashSet::new(),
+        )
+        .expect_err("a broken strategy must error, not skip");
+        assert!(
+            format!("{err:#}").contains("does not compile"),
+            "error should point at the standalone compile: {err:#}"
+        );
     }
 }

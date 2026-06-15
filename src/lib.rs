@@ -107,6 +107,7 @@ pub use api::{
     compose, compose_wac, format_wac_compose_cmd, splice, Bundle, ComponentInput, ComposeRequest,
     SpliceRequest,
 };
+pub use wac::{format_skip_summary, SkipRecord};
 pub use preview::{preview, preview_with_graph, PreviewOutput, PreviewRequest};
 
 /// Re-export so consumers pick up the exact cviz version splicer
@@ -138,8 +139,8 @@ pub mod types {
 /// evolves.
 pub mod lowlevel {
     pub use crate::adapter::typed::{
-        build_wrapper, generate_wrapper_crate, Behavior, BuildConfig, GenerateWrapperInput,
-        WrapperCrate,
+        build_wrapper, generate_wrapper_crate, Behavior, BuildConfig, BuildOutcome,
+        GenerateWrapperInput, WrapperCrate,
     };
     pub use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
     pub use crate::compose::build_graph_from_components;
