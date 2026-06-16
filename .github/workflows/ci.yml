@@ -105,7 +105,7 @@ jobs:
      - name: Build builtins
        run: make build-builtins
      - name: Lib-level codegen tests
-       run: cargo test --lib --locked -- --ignored --nocapture materialize_tier3_produces_a_component
+       run: cargo test --lib --locked -- --ignored --nocapture
      - name: End-to-end smoke
        run: cargo test --test tier3_4_smoke --locked -- --ignored --nocapture
 
@@ -153,7 +153,7 @@ jobs:
        with:
          tool: wac-cli@${{ env.WAC_VERSION }},wasm-tools@${{ env.WASM_TOOLS_VERSION }}
      - name: Canned shape catalog (tier-1 + tier-2)
-       run: cargo test --test fuzz_and_run -- --ignored --nocapture canned
+       run: cargo test --test fuzz_and_run -- --ignored --nocapture --skip fuzz
 
   fuzz_and_run_fuzz:
    name: Fuzz + Run (fuzz)

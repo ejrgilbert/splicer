@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use splicer::lowlevel::{build_wrapper, Behavior, BuildConfig, GenerateWrapperInput};
+use splicer::lowlevel::{build_wrapper, Behavior, BuildConfig, BuildOutcome, GenerateWrapperInput};
 
 include!(concat!(env!("OUT_DIR"), "/sdk_test_version.rs"));
 
@@ -79,7 +79,7 @@ fn build_and_validate(
         .join("wasi_snapshot_preview1.reactor.wasm");
     let build_root = tempfile::tempdir().expect("tempdir");
 
-    let wasm_path = build_wrapper(
+    let outcome = build_wrapper(
         &GenerateWrapperInput {
             target_wit,
             world_name: Some(world_name),
@@ -98,6 +98,9 @@ fn build_and_validate(
         },
     )
     .expect("build pipeline produces a wasm");
+    let BuildOutcome::Built(wasm_path) = outcome else {
+        panic!("expected a built wrapper, got a bound mismatch");
+    };
 
     let bytes = std::fs::read(&wasm_path).expect("read produced wasm");
     assert!(

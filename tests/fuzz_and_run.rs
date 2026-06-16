@@ -4570,6 +4570,7 @@ fn splice_between(root: &Path, composed_path: &Path, middleware_comp: &Path) -> 
         package_name: WAC_PACKAGE_NAME.to_string(),
         splits_dir: splits_dir.clone(),
         skip_type_check: false,
+        strict: false,
     })
     .expect("splicer::splice (between)");
     std::fs::write(&spliced_wac, &out.wac).expect("write spliced.wac");
@@ -4602,6 +4603,7 @@ fn splice_before_and_compose(
         package_name: WAC_PACKAGE_NAME.to_string(),
         splits_dir: splits_dir.clone(),
         skip_type_check: false,
+        strict: false,
     })
     .expect("splicer::splice (before)");
     std::fs::write(&before_wac, &splice_out.wac).expect("write before_splice.wac");

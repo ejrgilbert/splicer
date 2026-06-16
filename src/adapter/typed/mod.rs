@@ -16,7 +16,7 @@ pub(crate) mod target_wit;
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
 pub use bindgen::run_wit_bindgen_rust;
 pub use bindings_index::build_bindings_index;
-pub use build::{build_wrapper, BuildConfig};
+pub use build::{build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
 pub use emit_method::{emit_guest, emit_resource_newtypes, EmittedGuest};
 pub use emit_wit_typed::emit_wit_typed_impls;
 #[allow(unused_imports)]

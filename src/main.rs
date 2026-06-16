@@ -8,8 +8,8 @@ use splicer::cviz::output::graph::{generate_graph_ascii, GraphRenderOpts};
 use splicer::cviz::output::{mermaid::generate_mermaid, terminal_columns, ColorMode, Direction};
 use splicer::types::ContractResult;
 use splicer::{
-    builtin_info, compose, preview, splice, Bundle, ComponentInput, ComposeRequest, PreviewRequest,
-    SpliceRequest,
+    builtin_info, compose, format_skip_summary, preview, splice, Bundle, ComponentInput,
+    ComposeRequest, PreviewRequest, SpliceRequest,
 };
 
 const DEFAULT_PKG: &str = "example:composition";
@@ -79,6 +79,11 @@ enum Command {
         /// verified.
         #[arg(long, default_value_t = false)]
         skip_type_check: bool,
+
+        /// Fail the splice if any tier-3/4 strategy's bound doesn't fit
+        /// a matched interface. Default: skip those matches and warn.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
 
     /// Synthesize a composition from N individual Wasm components.
@@ -159,6 +164,12 @@ enum Command {
         /// Force ANSI color (auto-detected by default).
         #[arg(long, default_value = "auto")]
         color: ColorMode,
+
+        /// Compile each tier-3/4 match and show only those that fit,
+        /// pruning strategies that don't compile against the interface.
+        /// Runs cargo (slow); default preview is selection-only.
+        #[arg(long, default_value_t = false)]
+        exact: bool,
     },
 
     /// Inspect builtin middleware shipped with this splicer.
@@ -200,6 +211,7 @@ fn main() -> Result<()> {
             splits_dir,
             package,
             skip_type_check,
+            strict,
         } => run_splice(
             splice_cfg_file,
             comp_wasm,
@@ -209,6 +221,7 @@ fn main() -> Result<()> {
             splits_dir,
             package,
             skip_type_check,
+            strict,
         ),
 
         Command::Compose {
@@ -228,6 +241,7 @@ fn main() -> Result<()> {
             no_types,
             direction,
             color,
+            exact,
         } => run_preview(
             splice_cfg_file,
             comp_wasm,
@@ -237,6 +251,7 @@ fn main() -> Result<()> {
             no_types,
             direction,
             color,
+            exact,
         ),
 
         Command::Builtin { name } => run_builtin(name),
@@ -260,6 +275,7 @@ fn run_preview(
     no_types: bool,
     direction: Direction,
     color: ColorMode,
+    exact: bool,
 ) -> Result<()> {
     let rules_yaml = fs::read_to_string(&splice_cfg_file)
         .with_context(|| format!("Failed to read: {}", splice_cfg_file.display()))?;
@@ -268,6 +284,7 @@ fn run_preview(
         composition_wasm: comp_wasm,
         rules_yaml,
         only_rule: rule,
+        exact,
     })?;
 
     let opts = GraphRenderOpts::default();
@@ -316,6 +333,13 @@ fn run_preview(
     for rule_num in &result.unmatched_rules {
         eprintln!(
             "{}: rule {} matched no edges",
+            "WARN".yellow().bold(),
+            rule_num,
+        );
+    }
+    for rule_num in &result.incompatible_rules {
+        eprintln!(
+            "{}: rule {} matched edges, but its strategy compiled against none of them",
             "WARN".yellow().bold(),
             rule_num,
         );
@@ -488,6 +512,7 @@ fn run_splice(
     splits_dir: Option<PathBuf>,
     package: String,
     skip_type_check: bool,
+    strict: bool,
 ) -> Result<()> {
     let rules_yaml = fs::read_to_string(&splice_cfg_file)
         .with_context(|| format!("Failed to read: {}", splice_cfg_file.display()))?;
@@ -503,8 +528,12 @@ fn run_splice(
         package_name: package,
         splits_dir: splits.path().to_path_buf(),
         skip_type_check,
+        strict,
     })?;
     print_diagnostics(&bundle.diagnostics);
+    if let Some(summary) = format_skip_summary(&bundle.skips) {
+        eprintln!("{}: {summary}", "WARN".yellow().bold());
+    }
 
     if !plan && !bundle.any_rule_matched {
         anyhow::bail!(

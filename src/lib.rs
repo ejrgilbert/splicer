@@ -25,6 +25,7 @@
 //!     package_name: "example:composition".into(),
 //!     splits_dir: "./splits".into(),
 //!     skip_type_check: false,
+//!     strict: false,
 //! })?;
 //!
 //! // Compose to a single Wasm component, in-process — no shelling out.
@@ -108,6 +109,7 @@ pub use api::{
     SpliceRequest,
 };
 pub use preview::{preview, preview_with_graph, PreviewOutput, PreviewRequest};
+pub use wac::{format_skip_summary, SkipRecord};
 
 /// Re-export so consumers pick up the exact cviz version splicer
 /// links against, avoiding version-skew on shared types.
@@ -138,8 +140,8 @@ pub mod types {
 /// evolves.
 pub mod lowlevel {
     pub use crate::adapter::typed::{
-        build_wrapper, generate_wrapper_crate, Behavior, BuildConfig, GenerateWrapperInput,
-        WrapperCrate,
+        build_wrapper, generate_wrapper_crate, Behavior, BuildConfig, BuildOutcome,
+        GenerateWrapperInput, WrapperCrate,
     };
     pub use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
     pub use crate::compose::build_graph_from_components;

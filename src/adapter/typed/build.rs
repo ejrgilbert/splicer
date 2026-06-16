@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 use anyhow::{anyhow, bail, Context, Result};
 use wit_component::ComponentEncoder;
 
-use super::{generate_wrapper_crate, Behavior, GenerateWrapperInput, WrapperCrate};
+use super::{generate_wrapper_crate, Behavior, GenerateWrapperInput};
 
 /// Knobs that don't come from the wrapper inputs but are needed to
 /// actually drive cargo.
@@ -53,14 +53,29 @@ fn build_dir_key(input: &GenerateWrapperInput<'_>) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Result of compiling a wrapper crate.
+pub enum BuildOutcome {
+    /// Wrapper compiled to a component wasm at this path.
+    Built(PathBuf),
+    /// Cargo failed on an unsatisfied trait bound, meaning the strategy
+    /// doesn't fit this interface; callers may skip rather than fail.
+    BoundMismatch {
+        strategy: String,
+        interface: String,
+        /// Unsatisfied bound as rustc reported it, when parseable.
+        bound: Option<String>,
+        stderr: String,
+    },
+}
+
 /// Build a wrapper component for `input`. Reuses the per-key build
 /// dir across runs so cargo's incremental compile handles staleness.
-/// Returns the path to the produced wasm component, which lives
-/// inside the persistent build dir.
+/// A trait-bound failure yields [`BuildOutcome::BoundMismatch`] (the
+/// strategy doesn't fit this interface); any other failure is `Err`.
 pub fn build_wrapper(
     input: &GenerateWrapperInput<'_>,
     config: &BuildConfig<'_>,
-) -> Result<PathBuf> {
+) -> Result<BuildOutcome> {
     require_tool("cargo")?;
 
     let build_dir = config.build_root.join("builds").join(build_dir_key(input));
@@ -68,17 +83,7 @@ pub fn build_wrapper(
         .with_context(|| format!("could not create build dir {}", build_dir.display()))?;
 
     let generated = generate_wrapper_crate(input)?;
-    build_in_dir(&generated, &build_dir, config)
-}
 
-/// Write `generated` to `build_dir` and run the cargo + wit-component
-/// pipeline. Returns the path to the produced wasm component inside
-/// the build dir.
-fn build_in_dir(
-    generated: &WrapperCrate,
-    build_dir: &Path,
-    config: &BuildConfig<'_>,
-) -> Result<PathBuf> {
     let src_dir = build_dir.join("src");
     fs::create_dir_all(&src_dir)
         .with_context(|| format!("could not create {}", src_dir.display()))?;
@@ -91,14 +96,16 @@ fn build_in_dir(
     // the dep closure once instead of per-build. Concurrent splices are
     // serialized by cargo's own `target/debug/.cargo-lock`.
     let cargo_target_dir = config.build_root.join("target");
-    let out = run_cargo_build(build_dir, &cargo_target_dir, target)?;
+    let out = run_cargo_build(&build_dir, &cargo_target_dir, target)?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let hint = trait_bound_hint(&stderr);
-        bail!(
-            "cargo build failed (exit code {:?}){hint}:\n{stderr}",
-            out.status.code(),
-        );
+        // Strategy doesn't fit interface's type; skip
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        return Ok(BuildOutcome::BoundMismatch {
+            strategy: input.strategy_crate_name.to_string(),
+            interface: input.interface_qualified_name.to_string(),
+            bound: unsatisfied_bound(&stderr),
+            stderr,
+        });
     }
 
     let module_name = generated.crate_name.replace('-', "_");
@@ -115,7 +122,7 @@ fn build_in_dir(
 
     let component_wasm = build_dir.join("component.wasm");
     wrap_module_into_component(&module_wasm, config.adapter_wasm, &component_wasm)?;
-    Ok(component_wasm)
+    Ok(BuildOutcome::Built(component_wasm))
 }
 
 /// Library-side equivalent of `wasm-tools component new <module>
@@ -144,16 +151,47 @@ fn wrap_module_into_component(
     Ok(())
 }
 
-/// Spot E0277 trait-bound errors in cargo's stderr — usually means
-/// the strategy's where-clause doesn't fit the wrapped target's
-/// types (e.g. `hello-tier4` needs `R: Default`).
-fn trait_bound_hint(stderr: &str) -> &'static str {
-    if stderr.contains("E0277") || stderr.contains("trait bound") {
-        " — the strategy's trait bounds don't fit the target's types; \
-         check the builtin's manifest description for required bounds"
-    } else {
-        ""
+fn unsatisfied_bound(stderr: &str) -> Option<String> {
+    stderr.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("error[E0277]: the trait bound `")?
+            .strip_suffix("` is not satisfied")
+            .map(str::to_string)
+    })
+}
+
+/// Verify the strategy crate compiles on its own, independent of any
+/// target interface.
+pub fn smoke_check_strategy(
+    strategy_dir: &Path,
+    build_root: &Path,
+    target: Option<&str>,
+) -> Result<()> {
+    require_tool("cargo")?;
+    let target = target.unwrap_or("wasm32-wasip1");
+    let cargo_target_dir = build_root.join("target");
+    let mut cmd = Command::new("cargo");
+    cmd.args(["check", "--target", target])
+        .current_dir(strategy_dir)
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
+        // Plain stderr: this output is surfaced verbatim in error messages.
+        .env("CARGO_TERM_COLOR", "never");
+    if let Some(sdk) = super::assemble::local_sdk_path() {
+        let val = toml::Value::String(sdk);
+        cmd.arg("--config")
+            .arg(format!("patch.crates-io.splicer-tool-sdk.path={val}"));
     }
+    let out = cmd
+        .output()
+        .context("failed to invoke `cargo check` on strategy crate")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "strategy crate at {} does not compile standalone:\n{stderr}",
+            strategy_dir.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_cargo_build(build_dir: &Path, cargo_target_dir: &Path, target: &str) -> Result<Output> {
@@ -161,6 +199,8 @@ fn run_cargo_build(build_dir: &Path, cargo_target_dir: &Path, target: &str) -> R
         .args(["build", "--release", "--target", target])
         .current_dir(build_dir)
         .env("CARGO_TARGET_DIR", cargo_target_dir)
+        // force plain output
+        .env("CARGO_TERM_COLOR", "never")
         .output()
         .context("failed to invoke `cargo build`")
 }
@@ -197,15 +237,15 @@ mod tests {
     }
 
     #[test]
-    fn trait_bound_hint_fires_on_e0277() {
-        let stderr = "error[E0277]: the trait bound `Response: Default` is not satisfied";
-        assert!(!trait_bound_hint(stderr).is_empty());
-    }
-
-    #[test]
-    fn trait_bound_hint_silent_on_unrelated_failures() {
-        let stderr = "error: linking with `cc` failed: exit status: 1";
-        assert!(trait_bound_hint(stderr).is_empty());
+    fn unsatisfied_bound_extracts_when_present_else_none() {
+        let with_bound =
+            "error[E0277]: the trait bound `Response: HasArbitraryErr` is not satisfied";
+        assert_eq!(
+            unsatisfied_bound(with_bound).as_deref(),
+            Some("Response: HasArbitraryErr")
+        );
+        // No E0277 bound line: the warning just omits the bound.
+        assert!(unsatisfied_bound("error: linking with `cc` failed").is_none());
     }
 
     #[test]

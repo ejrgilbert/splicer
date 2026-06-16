@@ -211,7 +211,7 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
 /// - Unset + splicer compiled from a workspace with a sibling
 ///   `splicer-tool-sdk/` → that sibling. Otherwise (crates.io
 ///   installs) → registry.
-fn local_sdk_path() -> Option<String> {
+pub(crate) fn local_sdk_path() -> Option<String> {
     const WORKSPACE_SDK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/splicer-tool-sdk");
     match std::env::var("SPLICER_TOOL_SDK_PATH").as_deref() {
         Ok("") => None,

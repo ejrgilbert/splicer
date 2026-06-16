@@ -106,6 +106,42 @@ pub struct WacOutput {
     /// True iff at least one rule produced a full match. `false` when
     /// no rules were supplied or every rule was a no-op.
     pub any_rule_matched: bool,
+    /// Tier-3/4 matches skipped because the strategy's declared bound
+    /// did not fit the interface. Empty on a clean run.
+    pub skips: Vec<SkipRecord>,
+}
+
+/// One tier-3/4 match skipped because the strategy's bound doesn't fit
+/// the interface. Surfaced on [`WacOutput::skips`] and `Bundle::skips`
+/// so any consumer can apply its own policy; the CLI renders it via
+/// [`format_skip_summary`].
+#[derive(Debug, Clone)]
+pub struct SkipRecord {
+    /// Strategy identifier (builtin name or YAML `name:`).
+    pub strategy: String,
+    /// Interface the strategy was matched against.
+    pub interface: String,
+    /// The unsatisfied bound (parsed from rustc), when known.
+    pub bound: Option<String>,
+}
+
+/// Render a plain-text skip summary, or `None` when nothing skipped.
+pub fn format_skip_summary(skips: &[SkipRecord]) -> Option<String> {
+    if skips.is_empty() {
+        return None;
+    }
+    let mut s = format!(
+        "Skipped {} match(es) (strategy bound did not fit):",
+        skips.len()
+    );
+    for r in skips {
+        let needs = match &r.bound {
+            Some(b) => format!(": needs `{b}`"),
+            None => String::new(),
+        };
+        s.push_str(&format!("\n  {} on {}{needs}", r.strategy, r.interface));
+    }
+    Some(s)
 }
 
 /// One `let` declaration in the rendered WAC. Each entity is a node
@@ -955,6 +991,11 @@ struct SpliceAccumulators {
     /// per distinct provider+interface across the run; shared by every
     /// site that needs it.
     bridges: HashMap<(String, String), (String, String)>,
+    /// Tier-3/4 matches skipped because the strategy's bound didn't fit.
+    skips: Vec<SkipRecord>,
+    /// Strategy crate dirs already smoke-compiled this run, so the
+    /// standalone check runs once per strategy, not per interface.
+    verified_strategies: HashSet<String>,
 }
 
 /// Generate WAC from a composition graph and a set of splicing rules.
@@ -1065,6 +1106,7 @@ pub fn generate_wac(
         diagnostics,
         generated_adapters: accs.generated_adapters,
         any_rule_matched,
+        skips: accs.skips,
     })
 }
 
@@ -1399,17 +1441,32 @@ fn materialize_tier3_4_inline(
         };
         let label = source_label(&source);
         let split_bytes = read_split(label)?;
-        let (wrapper_path, tier) = crate::strategies::materialize_tier3_4(
+        let outcome = crate::strategies::materialize_tier3_4(
             std::path::Path::new(ctx.splits_path),
             source,
             &split_bytes,
             interface_name,
             mirror_for_target.as_deref(),
+            &mut accs.verified_strategies,
         )
         .with_context(|| {
             format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'")
         })?;
-        out.push(stamp_materialized(inj, wrapper_path, tier)?);
+        match outcome {
+            crate::strategies::MaterializeOutcome::Built { path, tier } => {
+                out.push(stamp_materialized(inj, path, tier)?);
+            }
+            // Bound didn't fit: record the skip and drop the injection so
+            // the chain proceeds without this wrapper. `--strict` callers
+            // promote `skips` to a hard failure downstream.
+            crate::strategies::MaterializeOutcome::Skipped { bound } => {
+                accs.skips.push(SkipRecord {
+                    strategy: label.to_string(),
+                    interface: interface_name.to_string(),
+                    bound,
+                });
+            }
+        }
     }
     Ok(out)
 }
@@ -1863,6 +1920,34 @@ fn sanitize_wac_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_skip_summary_empty_is_none() {
+        assert!(format_skip_summary(&[]).is_none());
+    }
+
+    #[test]
+    fn format_skip_summary_lists_each_skip() {
+        let skips = vec![
+            SkipRecord {
+                strategy: "chaos-err".into(),
+                interface: "wasi:http/handler@0.3.0".into(),
+                bound: Some("R: HasArbitraryErr".into()),
+            },
+            SkipRecord {
+                strategy: "replayer".into(),
+                interface: "wasi:io/streams@0.2.0".into(),
+                bound: None,
+            },
+        ];
+        let summary = format_skip_summary(&skips).expect("non-empty");
+        assert!(summary.contains("Skipped 2 match"));
+        assert!(
+            summary.contains("chaos-err on wasi:http/handler@0.3.0: needs `R: HasArbitraryErr`")
+        );
+        assert!(summary.contains("replayer on wasi:io/streams@0.2.0"));
+        assert!(!summary.contains("replayer on wasi:io/streams@0.2.0: needs"));
+    }
 
     // ── EmitPlan::add_bridge_entity ─────────────────────────────────
 

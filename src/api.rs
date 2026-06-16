@@ -17,7 +17,7 @@ use crate::contract::ContractResult;
 use crate::parse::config::{parse_yaml, SpliceRule};
 use crate::resolve::resolve_rules;
 use crate::split::split_out_composition;
-use crate::wac::{generate_wac, GeneratedAdapter};
+use crate::wac::{format_skip_summary, generate_wac, GeneratedAdapter, SkipRecord};
 
 // ── Splice request / output ────────────────────────────────────────────────
 
@@ -44,6 +44,11 @@ pub struct SpliceRequest {
     /// warnings and `splice()` succeeds. When `false`, the function
     /// returns `Err` if any contract check fails.
     pub skip_type_check: bool,
+
+    /// When `true`, a tier-3/4 match whose strategy bound doesn't fit
+    /// the interface fails the splice. When `false` (default), such
+    /// matches are skipped and reported on [`Bundle::skips`].
+    pub strict: bool,
 }
 
 // ── Compose request ────────────────────────────────────────────────────────
@@ -112,6 +117,11 @@ pub struct Bundle {
     /// True iff at least one rule produced a full match. `false` when
     /// no rules were supplied or every rule was a no-op.
     pub any_rule_matched: bool,
+
+    /// Tier-3/4 matches skipped because the strategy's declared bound
+    /// did not fit the interface. Empty under `strict` (those become an
+    /// `Err` instead) and on a clean run.
+    pub skips: Vec<SkipRecord>,
 }
 
 impl Bundle {
@@ -154,6 +164,7 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
         package_name,
         splits_dir,
         skip_type_check,
+        strict,
     } = req;
 
     let mut cfg = parse_yaml(&rules_yaml).context("Failed to parse splice rules YAML")?;
@@ -202,6 +213,13 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
         }
     }
 
+    // Strict mode promotes bound-mismatch skips to a hard failure.
+    if strict {
+        if let Some(summary) = format_skip_summary(&out.skips) {
+            anyhow::bail!("{summary}\n(strict mode: bound mismatches are fatal)");
+        }
+    }
+
     let mut wac_deps = out.wac_deps;
     canonicalize_wac_deps(&mut wac_deps)?;
 
@@ -211,6 +229,7 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
         diagnostics: out.diagnostics,
         generated_adapters: out.generated_adapters,
         any_rule_matched: out.any_rule_matched,
+        skips: out.skips,
     })
 }
 
@@ -282,6 +301,7 @@ pub fn compose(req: ComposeRequest) -> Result<Bundle> {
         diagnostics: out.diagnostics,
         generated_adapters: out.generated_adapters,
         any_rule_matched: out.any_rule_matched,
+        skips: out.skips,
     })
 }
 
