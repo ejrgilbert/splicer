@@ -785,7 +785,6 @@ mod tests {
         .expect("materialize returns Ok (skip, not error)");
         match outcome {
             MaterializeOutcome::Skipped { bound } => {
-                // The parsed bound names the concrete failing type.
                 let bound = bound.expect("bound parsed from rustc");
                 assert!(
                     bound.contains("HasArbitraryErr"),

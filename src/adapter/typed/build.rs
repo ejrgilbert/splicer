@@ -173,7 +173,9 @@ pub fn smoke_check_strategy(
     let mut cmd = Command::new("cargo");
     cmd.args(["check", "--target", target])
         .current_dir(strategy_dir)
-        .env("CARGO_TARGET_DIR", &cargo_target_dir);
+        .env("CARGO_TARGET_DIR", &cargo_target_dir)
+        // Plain stderr: this output is surfaced verbatim in error messages.
+        .env("CARGO_TERM_COLOR", "never");
     if let Some(sdk) = super::assemble::local_sdk_path() {
         let val = toml::Value::String(sdk);
         cmd.arg("--config")
@@ -197,6 +199,8 @@ fn run_cargo_build(build_dir: &Path, cargo_target_dir: &Path, target: &str) -> R
         .args(["build", "--release", "--target", target])
         .current_dir(build_dir)
         .env("CARGO_TARGET_DIR", cargo_target_dir)
+        // force plain output
+        .env("CARGO_TERM_COLOR", "never")
         .output()
         .context("failed to invoke `cargo build`")
 }
