@@ -105,11 +105,13 @@ test: test-root test-sdk test-builtins
 test-root: build-builtins
 	@echo "== test: root splicer crate =="
 	cargo test --locked --all-features --all-targets
+	cargo test --locked --all-features --doc
 
 # `--workspace` picks up the derive proc-macro member alongside the SDK.
 test-sdk:
 	@echo "== test: splicer-tool-sdk workspace =="
 	cd splicer-tool-sdk && cargo test --locked --all-features --all-targets --workspace
+	cd splicer-tool-sdk && cargo test --locked --all-features --workspace --doc
 
 # Each builtin is its own workspace. Looping (rather than naming each)
 # means a builtin that gains tests later is picked up with no edit here.

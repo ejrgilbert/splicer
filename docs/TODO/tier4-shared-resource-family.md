@@ -114,9 +114,10 @@ others too. Open questions:
 - Does the user expect to write per-iface strategies, or a single
   strategy that handles the family? The substrate doesn't have a
   vocabulary for either yet.
-- How does this compose with the existing
-  [bound-mismatch-skip-and-warn](bound-mismatch-skip-and-warn.md)
-  story? Auto-expanded ifaces might individually fail bounds.
+- How does this compose with the now-landed bound-mismatch skip-and-warn
+  behavior (strategies skip when they don't compile against an interface;
+  `src/strategies.rs` smoke-check + `src/preview.rs --exact`)?
+  Auto-expanded ifaces might individually fail bounds.
 
 Architectural cost is high. Defer until there's a real use case that
 can't be addressed by (a) + factored-types refactoring.
@@ -153,8 +154,8 @@ a use case where tier-3 semantics with tier-4 codegen pays for itself.
 - `tests/component-interposition/fan-in/shared-wit/my.service/package.wit`
   — see how `bucket-as-arg` factored its own `bucket-as-arg-types`
   to avoid the conflict.
-- [bound-mismatch-skip-and-warn.md](bound-mismatch-skip-and-warn.md)
-  — relevant for (b): per-iface bound failures during auto-expansion
-  would need graceful handling.
+- bound-mismatch skip-and-warn (landed) — relevant for (b): per-iface
+  bound failures during auto-expansion get the same graceful skip; see
+  `src/strategies.rs` (smoke-check) and `src/preview.rs` (`--exact`).
 - [resource-method-interception.md](resource-method-interception.md)
   — broader resource-method dispatch context.

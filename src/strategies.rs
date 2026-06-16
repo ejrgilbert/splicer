@@ -233,9 +233,8 @@ fn materialize_from_prepared(
     // any interface (once per strategy per run)
     let strategy_key = prep.strategy_dir.to_string_lossy().into_owned();
     if !verified.contains(&strategy_key) {
-        smoke_check_strategy(&prep.strategy_dir, &cache_root, None).with_context(|| {
-            format!("strategy '{}' does not compile on its own", prep.out_name)
-        })?;
+        smoke_check_strategy(&prep.strategy_dir, &cache_root, None)
+            .with_context(|| format!("strategy '{}' does not compile on its own", prep.out_name))?;
         verified.insert(strategy_key);
     }
 
@@ -815,10 +814,20 @@ mod tests {
         "#;
         let composition = component_from_wit(FIXTURE_WIT, "demo").expect("synthesize fixture");
 
-        // Stage hello-tier3, then break its source so it can't compile.
+        // Stage hello-tier3, rename its package, then break its source.
+        // The rename is load-bearing: tests share one CARGO_TARGET_DIR, so
+        // a crate still named `hello-tier3` v0.1.0 would let the corrupted
+        // smoke-check reuse a sibling test's valid hello-tier3 artifact and
+        // wrongly pass. A unique name forces a fresh (failing) compile.
         let tmp = tempfile::tempdir().unwrap();
-        let strat = tmp.path().join("hello-tier3");
+        let strat = tmp.path().join("broken-strategy");
         extract("hello-tier3", &strat).expect("extract strategy");
+        let cargo = std::fs::read_to_string(strat.join("Cargo.toml")).unwrap();
+        std::fs::write(
+            strat.join("Cargo.toml"),
+            cargo.replace("name = \"hello-tier3\"", "name = \"broken-strategy\""),
+        )
+        .expect("rename strategy package");
         std::fs::write(strat.join("src/lib.rs"), "this is not valid rust;\n")
             .expect("corrupt strategy source");
 

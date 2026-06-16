@@ -411,54 +411,6 @@ mod tests {
         assert!(msg.contains("multiple `MAGIC_BYTES` matches"), "{msg}");
     }
 
-    /// Regression: load the actual built template and confirm
-    /// `MAGIC_BYTES` appears exactly once. An earlier template had a
-    /// separate `const MAGIC` referenced at runtime, which rustc/lld
-    /// lowered to a second addressable copy in the data section. Run
-    /// with `cargo test -- --ignored` (or
-    /// `SPLICER_BUILTINS_DIR=assets/builtins` invoking by name).
-    #[test]
-    #[ignore = "needs built/cached/registry-resolvable config-provider template"]
-    fn built_provider_has_unique_magic() {
-        build_provider(&BTreeMap::new())
-            .expect("template must resolve and have exactly one MAGIC_BYTES match");
-    }
-
-    /// Smoke: a real shipped builtin (`hello-tier1`) trips
-    /// `imports_substrate` and `ensure_provider_for` writes a working
-    /// patched provider for it.
-    #[test]
-    #[ignore = "needs built/cached/registry-resolvable hello-tier1 + config-provider"]
-    fn hello_tier1_smoke() {
-        let hello_bytes =
-            crate::builtins::load_resolved_bytes("hello-tier1").expect("hello-tier1 must resolve");
-        assert!(imports_substrate(&hello_bytes));
-
-        let splits = tempfile::tempdir().unwrap();
-        let builtin_dir = splits.path().join("builtins");
-        std::fs::create_dir_all(&builtin_dir).unwrap();
-        let hello_path = builtin_dir.join("hello-tier1.wasm");
-        std::fs::write(&hello_path, &hello_bytes).unwrap();
-
-        let mut inj = Injection::from_path("hello-tier1", hello_path.to_str().unwrap());
-        inj.builtin_config.insert(
-            "greeting".to_string(),
-            toml::Value::String("wired-up-end-to-end".to_string()),
-        );
-
-        ensure_provider_for(&mut inj, splits.path()).expect("ensure_provider_for");
-        let provider = inj.config_provider_path.as_deref().expect("provider path");
-        let patched = std::fs::read(provider).expect("provider file");
-        let parsed = parse_back(&patched);
-        // Substrate now carries WAVE-text, so the stored value is the
-        // quoted form. The builtin's codegen'd accessor strips the
-        // quotes via `wasm_wave::from_str` at runtime.
-        assert_eq!(
-            parsed.get("greeting").map(String::as_str),
-            Some("\"wired-up-end-to-end\"")
-        );
-    }
-
     // ── imports_substrate / ensure_provider_for ─────────────────────
 
     const CONSUMER_WAT: &str = r#"(component

@@ -106,6 +106,6 @@ jobs:
           done
           echo "::error::splicer-tool-sdk $VERSION never appeared on crates.io after 60s"
           exit 1
-      # No SPLICER_TOOL_SDK_PATH: wrapper must resolve SDK from crates.io.
-      - name: Materialize a wrapper against published SDK
-        run: cargo test --lib --locked -- --ignored --nocapture materialize_tier3_produces_a_component
+      # No SPLICER_TOOL_SDK_PATH: wrappers must resolve SDK from crates.io.
+      - name: Materialize wrappers against published SDK
+        run: cargo test --lib --locked -- --ignored --nocapture

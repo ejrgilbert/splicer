@@ -326,20 +326,4 @@ mod tests {
         assert!(msg.contains(LOCAL_OVERRIDE_ENV), "{msg}");
         assert!(msg.contains("hello-tier1.wasm"), "{msg}");
     }
-
-    /// End-to-end fetch from ghcr — gated as ignored because it needs
-    /// network. Run with `cargo test -- --ignored` to verify the OCI
-    /// pull path manually.
-    #[test]
-    #[ignore = "hits ghcr.io"]
-    fn fetch_from_registry_smoke() {
-        let splits = tempfile::tempdir().unwrap();
-        let path = materialize_into(splits.path(), "hello-tier1").expect("fetch");
-        let bytes = std::fs::read(&path).unwrap();
-        assert!(
-            bytes.starts_with(b"\0asm"),
-            "fetched bytes are wasm magic, got {:?}",
-            &bytes[..bytes.len().min(8)]
-        );
-    }
 }

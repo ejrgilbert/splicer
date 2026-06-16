@@ -1942,7 +1942,9 @@ mod tests {
         ];
         let summary = format_skip_summary(&skips).expect("non-empty");
         assert!(summary.contains("Skipped 2 match"));
-        assert!(summary.contains("chaos-err on wasi:http/handler@0.3.0: needs `R: HasArbitraryErr`"));
+        assert!(
+            summary.contains("chaos-err on wasi:http/handler@0.3.0: needs `R: HasArbitraryErr`")
+        );
         assert!(summary.contains("replayer on wasi:io/streams@0.2.0"));
         assert!(!summary.contains("replayer on wasi:io/streams@0.2.0: needs"));
     }
