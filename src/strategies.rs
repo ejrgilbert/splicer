@@ -201,10 +201,18 @@ fn prepare_builtin_strategy(name: &str, wac_name: &str) -> Result<PreparedStrate
 fn prepare_user_strategy(wac_name: &str, strategy_dir: &Path) -> Result<PreparedStrategy> {
     let manifest = read_user_manifest(strategy_dir)?;
     let meta = read_user_strategy_metadata(strategy_dir)?;
+    // Canonicalize to an absolute path so the Cargo.toml path dep
+    // resolves correctly when cargo builds from the cache directory.
+    let strategy_dir = strategy_dir.canonicalize().with_context(|| {
+        format!(
+            "could not resolve strategy directory: {}",
+            strategy_dir.display()
+        )
+    })?;
     Ok(PreparedStrategy {
         manifest,
         out_name: wac_name.to_string(),
-        strategy_dir: strategy_dir.to_path_buf(),
+        strategy_dir,
         sdk_version: meta.sdk_version,
         strategy_crate_name: meta.crate_name,
     })
