@@ -444,6 +444,18 @@ impl WitTypeRef {
         }
     }
 
+    /// True when wit-bindgen lowers this type to a borrowed reference at
+    /// import-call sites: `list<T>` → `&[T]`, `string` → `&str`. The
+    /// args struct holds the owned form; callers must take a reference
+    /// when forwarding to the import-side function.
+    pub fn needs_borrow_at_import_call(&self, is_async: bool) -> bool {
+        !is_async
+            && matches!(
+                self,
+                WitTypeRef::List(_) | WitTypeRef::Primitive(Prim::String)
+            )
+    }
+
     /// True if this type tree contains a `borrow<R>` handle at any depth.
     pub fn contains_borrow(&self) -> bool {
         match self {
