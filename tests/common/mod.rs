@@ -20,8 +20,8 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-pub const SPLICER_BEFORE: &str = "splicer:tier1/before@0.4.0";
-pub const SPLICER_AFTER: &str = "splicer:tier1/after@0.4.0";
+pub const SPLICER_BEFORE: &str = "splicer:tier1/before@0.5.0";
+pub const SPLICER_AFTER: &str = "splicer:tier1/after@0.5.0";
 pub const SPLICER_BUILTIN_CONFIG_GET: &str = "splicer:builtin-config/get@0.1.0";
 
 pub const TARGET_IFACE: &str = "wasi:http/handler@0.3.0";

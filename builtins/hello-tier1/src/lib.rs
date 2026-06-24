@@ -1,10 +1,6 @@
 mod bindings {
     wit_bindgen::generate!({
         world: "hello-tier1-mdl",
-        async: [
-            "export:splicer:tier1/before@0.4.0#on-call",
-            "export:splicer:tier1/after@0.4.0#on-return",
-        ],
         generate_all
     });
 }
@@ -21,7 +17,7 @@ use crate::bindings::splicer::common::types::CallId;
 pub struct HelloTier1;
 
 impl BeforeGuest for HelloTier1 {
-    async fn on_call(call: CallId) {
+    fn on_call(call: CallId) {
         println!(
             "[{}] before {}#{}",
             config::greeting(),
@@ -32,7 +28,7 @@ impl BeforeGuest for HelloTier1 {
 }
 
 impl AfterGuest for HelloTier1 {
-    async fn on_return(call: CallId) {
+    fn on_return(call: CallId) {
         println!(
             "[{}] after  {}#{}",
             config::greeting(),

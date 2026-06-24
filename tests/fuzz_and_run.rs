@@ -3260,7 +3260,6 @@ wit-bindgen = { workspace = true }
 const MIDDLEWARE_LIB_RS: &str = r#"mod bindings {
     wit_bindgen::generate!({
         world: "mdl",
-        async: true,
         generate_all
     });
 }
@@ -3278,7 +3277,7 @@ static LAST_ID: AtomicU64 = AtomicU64::new(0);
 struct Mdl;
 
 impl BeforeGuest for Mdl {
-    async fn on_call(call: CallId) {
+    fn on_call(call: CallId) {
         let prev = LAST_ID.swap(call.id, Ordering::SeqCst);
         assert_eq!(call.id, prev + 1, "call.id should be prev + 1 (got {}, prev {prev})", call.id);
         println!("mdl: before {}#{}", call.interface_name, call.function_name);
@@ -3286,7 +3285,7 @@ impl BeforeGuest for Mdl {
 }
 
 impl AfterGuest for Mdl {
-    async fn on_return(call: CallId) {
+    fn on_return(call: CallId) {
         let last = LAST_ID.load(Ordering::SeqCst);
         assert_eq!(call.id, last, "on_return id should match the prior on_call (last={last})");
         println!("mdl: after {}#{}", call.interface_name, call.function_name);
