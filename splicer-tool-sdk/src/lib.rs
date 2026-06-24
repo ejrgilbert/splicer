@@ -63,10 +63,6 @@ pub use wasm_wave;
 /// mod bindings {
 ///     splicer_tool_sdk::wit_bindgen!({
 ///         world: "my-middleware-mdl",
-///         async: [
-///             "export:splicer:tier2/before@0.2.0#on-call",
-///             "export:splicer:tier2/after@0.2.0#on-return",
-///         ],
 ///         generate_all,
 ///     });
 /// }

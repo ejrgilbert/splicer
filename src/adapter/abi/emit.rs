@@ -875,11 +875,9 @@ impl CallIdLayout {
         self.0.offset_of(CALLID_ID)
     }
 
-    /// Build-time twin of [`emit_populate_call_id`] for the name
-    /// fields: store `iface_name` and `fn_name` into a call-id
-    /// sub-record anchored at `base` in `blob`. The id field is left
-    /// untouched — it gets written at runtime by the wasm sequence
-    /// emitted by [`emit_populate_call_id`].
+    /// Store `iface_name` and `fn_name` into a call-id sub-record
+    /// anchored at `base` in `blob`. The id field is left untouched;
+    /// it is written at runtime via `emit_store_i64_local`.
     pub(crate) fn store_names_in_blob(
         &self,
         blob: &mut [u8],
@@ -892,8 +890,7 @@ impl CallIdLayout {
     }
 }
 
-/// Build-time twin of [`emit_store_slice`]: store a `(ptr, len)`
-/// canonical-ABI slice pair into a byte buffer at `off`.
+/// Store a `(ptr, len)` canonical-ABI slice pair into a byte buffer at `off`.
 pub(crate) fn store_slice_in_blob(blob: &mut [u8], off: usize, slice: BlobSlice) {
     blob[off + SLICE_PTR_OFFSET as usize..][..4].copy_from_slice(&(slice.off as i32).to_le_bytes());
     blob[off + SLICE_LEN_OFFSET as usize..][..4].copy_from_slice(&(slice.len as i32).to_le_bytes());
@@ -1006,8 +1003,7 @@ pub(crate) fn emit_cabi_realloc_call_runtime(
 }
 
 /// Patch a slice's `ptr` field from a runtime wasm local. The slice's
-/// `len` is left untouched — caller statically wrote it (at build
-/// time, via [`emit_store_slice`] or similar) or patches it
+/// `len` is left untouched — caller statically wrote it or patches it
 /// separately when runtime-determined.
 pub(crate) fn emit_store_slice_ptr_runtime(
     f: &mut Function,
@@ -1040,22 +1036,6 @@ pub(crate) fn emit_store_slice_len_runtime(
         align: I32_STORE_LOG2_ALIGN,
         memory_index: 0,
     });
-}
-
-/// Store `slice.off` then `slice.len` as the canonical-ABI `(ptr, len)`
-/// pair at `base_ptr + field_off`.
-pub(crate) fn emit_store_slice(f: &mut Function, base_ptr: i32, field_off: u32, slice: BlobSlice) {
-    let store = |f: &mut Function, sub_off: u32, value: i32| {
-        f.instructions().i32_const(base_ptr);
-        f.instructions().i32_const(value);
-        f.instructions().i32_store(MemArg {
-            offset: (field_off + sub_off) as u64,
-            align: I32_STORE_LOG2_ALIGN,
-            memory_index: 0,
-        });
-    };
-    store(f, SLICE_PTR_OFFSET, slice.off as i32);
-    store(f, SLICE_LEN_OFFSET, slice.len as i32);
 }
 
 /// Store the i64 in `local` at `base_ptr + field_off` (8-byte align).
@@ -1250,25 +1230,6 @@ pub(crate) fn emit_borrow_drops(
         f.instructions().local_get(*flat_idx);
         f.instructions().call(drop_fn);
     }
-}
-
-/// Lower a `call-id` record into memory at `base_ptr + call_off`.
-/// Names are static blob slices; id comes from `id_local`.
-pub(crate) fn emit_populate_call_id(
-    f: &mut Function,
-    base_ptr: i32,
-    call_off: u32,
-    callid_layout: &CallIdLayout,
-    iface_name: BlobSlice,
-    fn_name: BlobSlice,
-    id_local: u32,
-) {
-    let iface_off = call_off + callid_layout.iface_off();
-    let fn_off = call_off + callid_layout.fn_off();
-    let id_off = call_off + callid_layout.id_off();
-    emit_store_slice(f, base_ptr, iface_off, iface_name);
-    emit_store_slice(f, base_ptr, fn_off, fn_name);
-    emit_store_i64_local(f, base_ptr, id_off, id_local);
 }
 
 #[cfg(test)]
