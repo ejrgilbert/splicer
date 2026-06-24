@@ -331,12 +331,12 @@ fn emit_method_body(
     // type (constructor / static).
     let target_call = match (trait_kind, fn_kind) {
         (GuestTraitKind::Interface, _) => match behavior {
-            Behavior::Transform => build_target_call(method_ident, fields, ir),
+            Behavior::Transform => build_target_call(is_async, method_ident, fields, ir),
             // Virtualize doesn't forward
             Behavior::Virtualize => quote!(unreachable!()),
         },
         (GuestTraitKind::Resource(_), ExportFnKind::Method) => {
-            build_self_call(method_ident, fields)
+            build_self_call(is_async, method_ident, fields)
         }
         (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Constructor) => {
             let wrap = wrapper_ident_for(resource_pascal);
@@ -346,7 +346,7 @@ fn emit_method_body(
                     // and wrap the resulting handle into our newtype.
                     let import_resource =
                         build_import_resource_path(resource_pascal, guest_module_path);
-                    let call = build_static_call(&import_resource, method_ident, fields);
+                    let call = build_static_call(is_async, &import_resource, method_ident, fields);
                     if is_async {
                         quote!(#wrap(#call.await))
                     } else {
@@ -379,7 +379,7 @@ fn emit_method_body(
                     // surface and return whatever the WIT declared.
                     let import_resource =
                         build_import_resource_path(resource_pascal, guest_module_path);
-                    build_static_call(&import_resource, method_ident, fields)
+                    build_static_call(is_async, &import_resource, method_ident, fields)
                 }
                 Behavior::Virtualize => {
                     // tier-4 has no import side; static methods would
@@ -612,28 +612,41 @@ fn absolute_resource_path(iface_path: &[String], seg_ident: &syn::Ident) -> syn:
     }
 }
 
+fn field_arg_exprs(fields: &[RecordField], is_async: bool) -> Vec<TokenStream> {
+    fields
+        .iter()
+        .map(|f| {
+            let name = &f.rust_ident;
+            if f.ty.needs_borrow_at_import_call(is_async) {
+                quote! { &args.#name }
+            } else {
+                quote! { args.#name }
+            }
+        })
+        .collect()
+}
+
 /// Build the closure body that forwards a per-resource method call to
 /// `self.0.<method>(args.x)`. `self.0` is the import-side handle held
 /// by the wrapper newtype.
-fn build_self_call(method_ident: &syn::Ident, fields: &[RecordField]) -> TokenStream {
-    let arg_exprs = fields.iter().map(|f| {
-        let name = &f.rust_ident;
-        quote! { args.#name }
-    });
+fn build_self_call(
+    is_async: bool,
+    method_ident: &syn::Ident,
+    fields: &[RecordField],
+) -> TokenStream {
+    let arg_exprs = field_arg_exprs(fields, is_async);
     quote! { self.0.#method_ident(#(#arg_exprs),*) }
 }
 
 /// Build the closure body for a constructor / static method:
 /// `<import>::<Resource>::<method>(args.x)`.
 fn build_static_call(
+    is_async: bool,
     import_resource: &TokenStream,
     method_ident: &syn::Ident,
     fields: &[RecordField],
 ) -> TokenStream {
-    let arg_exprs = fields.iter().map(|f| {
-        let name = &f.rust_ident;
-        quote! { args.#name }
-    });
+    let arg_exprs = field_arg_exprs(fields, is_async);
     quote! { #import_resource::#method_ident(#(#arg_exprs),*) }
 }
 
@@ -845,6 +858,7 @@ fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {
 /// Build the closure body that calls the wrapped target with args
 /// unpacked, against the import-side path pinned on the IR.
 fn build_target_call(
+    is_async: bool,
     method_ident: &syn::Ident,
     fields: &[RecordField],
     ir: &WrapperIR,
@@ -854,10 +868,7 @@ fn build_target_call(
         .as_ref()
         .expect("IR has no target_import_path; tier-3 Transform must import the wrapped target");
     let import_path = bindings_path_tokens(import_path, None);
-    let arg_exprs = fields.iter().map(|f| {
-        let name = &f.rust_ident;
-        quote! { args.#name }
-    });
+    let arg_exprs = field_arg_exprs(fields, is_async);
     quote! { #import_path::#method_ident(#(#arg_exprs),*) }
 }
 

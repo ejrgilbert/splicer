@@ -442,11 +442,10 @@ fn matrix_resource_pass_through() {
         "expected Err-arm to pass through unchanged:\n{}",
         out.lib_rs,
     );
-    // Per-resource methods use the captured `&self`, not an args
-    // field.
+    // Per-resource methods use the captured `&self`, not an args field.
     assert!(
         oneline.contains("self.0.get(args.key)"),
-        "expected GuestBucket::get closure body to call self.0.get(args.key):\n{}",
+        "expected GuestBucket::get closure body to call self.0.get(&args.key):\n{}",
         out.lib_rs,
     );
 }

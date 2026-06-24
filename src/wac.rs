@@ -251,7 +251,7 @@ struct EmitPlan {
     /// `provider_id` is shim-resolved.
     export_routing: HashMap<(u32, String), String>,
     /// Use-count per simple-middleware name. First use keeps the bare
-    /// `mdl.name`; subsequent uses suffix `-1`, `-2`, … so each
+    /// `mdl.name`; subsequent uses suffix `-i1`, `-i2`, … so each
     /// position gets its own instance (with its own state).
     simple_mdl_counts: HashMap<String, usize>,
     /// Use-count per tier-1 adapter `(mdl, iface)` pair. Same scheme as
@@ -1880,14 +1880,14 @@ fn resolve_shim_node(
 }
 
 /// First use of `pkg` returns `pkg`; subsequent uses get suffixed
-/// `pkg-1`, `pkg-2`, ... so multiple instances of the same component
-/// at different chain positions don't share a WAC var name.
+/// `pkg-i1`, `pkg-i2`, ... (i = instance) so multiple instances of the
+/// same component at different chain positions don't share a WAC var.
 fn disambiguated_var(counts: &mut HashMap<String, usize>, pkg: &str) -> String {
     let count = counts.entry(pkg.to_string()).or_insert(0);
     let var = if *count == 0 {
         pkg.to_string()
     } else {
-        format!("{pkg}-{count}")
+        format!("{pkg}-i{count}")
     };
     *count += 1;
     var

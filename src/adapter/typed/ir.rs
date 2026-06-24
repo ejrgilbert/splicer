@@ -7,12 +7,11 @@
 //! the same IR so the emitter dispatches on a single [`NamedKind`]
 //! match.
 
-use std::collections::HashSet;
-
 use anyhow::{anyhow, bail, Context, Result};
 use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use std::collections::HashSet;
 use wit_parser::{
     Function, FunctionKind, Handle, Interface, InterfaceId, Resolve, Type, TypeDefKind, TypeId,
     TypeOwner, WorldId, WorldItem,
@@ -442,6 +441,16 @@ impl WitTypeRef {
             }
             WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_handle()),
         }
+    }
+
+    /// True when wit-bindgen lowers this type to a borrowed reference at
+    /// import-call sites.
+    pub fn needs_borrow_at_import_call(&self, is_async: bool) -> bool {
+        !is_async
+            && matches!(
+                self,
+                WitTypeRef::List(_) | WitTypeRef::Primitive(Prim::String)
+            )
     }
 
     /// True if this type tree contains a `borrow<R>` handle at any depth.
