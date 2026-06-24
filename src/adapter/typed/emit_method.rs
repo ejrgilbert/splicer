@@ -612,6 +612,20 @@ fn absolute_resource_path(iface_path: &[String], seg_ident: &syn::Ident) -> syn:
     }
 }
 
+fn field_arg_exprs(fields: &[RecordField], is_async: bool) -> Vec<TokenStream> {
+    fields
+        .iter()
+        .map(|f| {
+            let name = &f.rust_ident;
+            if f.ty.needs_borrow_at_import_call(is_async) {
+                quote! { &args.#name }
+            } else {
+                quote! { args.#name }
+            }
+        })
+        .collect()
+}
+
 /// Build the closure body that forwards a per-resource method call to
 /// `self.0.<method>(args.x)`. `self.0` is the import-side handle held
 /// by the wrapper newtype.
@@ -620,14 +634,7 @@ fn build_self_call(
     method_ident: &syn::Ident,
     fields: &[RecordField],
 ) -> TokenStream {
-    let arg_exprs = fields.iter().map(|f| {
-        let name = &f.rust_ident;
-        if f.ty.needs_borrow_at_import_call(is_async) {
-            quote! { &args.#name }
-        } else {
-            quote! { args.#name }
-        }
-    });
+    let arg_exprs = field_arg_exprs(fields, is_async);
     quote! { self.0.#method_ident(#(#arg_exprs),*) }
 }
 
@@ -639,14 +646,7 @@ fn build_static_call(
     method_ident: &syn::Ident,
     fields: &[RecordField],
 ) -> TokenStream {
-    let arg_exprs = fields.iter().map(|f| {
-        let name = &f.rust_ident;
-        if f.ty.needs_borrow_at_import_call(is_async) {
-            quote! { &args.#name }
-        } else {
-            quote! { args.#name }
-        }
-    });
+    let arg_exprs = field_arg_exprs(fields, is_async);
     quote! { #import_resource::#method_ident(#(#arg_exprs),*) }
 }
 
@@ -868,16 +868,7 @@ fn build_target_call(
         .as_ref()
         .expect("IR has no target_import_path; tier-3 Transform must import the wrapped target");
     let import_path = bindings_path_tokens(import_path, None);
-    let arg_exprs = fields.iter().map(|f| {
-        let name = &f.rust_ident;
-        // list<T> → &[T] and string → &str at import call sites;
-        // borrow from the owned args-struct field.
-        if f.ty.needs_borrow_at_import_call(is_async) {
-            quote! { &args.#name }
-        } else {
-            quote! { args.#name }
-        }
-    });
+    let arg_exprs = field_arg_exprs(fields, is_async);
     quote! { #import_path::#method_ident(#(#arg_exprs),*) }
 }
 
