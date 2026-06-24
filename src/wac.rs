@@ -1882,13 +1882,6 @@ fn resolve_shim_node(
 /// First use of `pkg` returns `pkg`; subsequent uses get suffixed
 /// `pkg-i1`, `pkg-i2`, ... (i = instance) so multiple instances of the
 /// same component at different chain positions don't share a WAC var.
-///
-/// The suffix segment starts with a letter on purpose: a WAC/WIT kebab
-/// segment must begin with a letter, so a bare `pkg-1` is an invalid
-/// identifier that `wac` refuses to parse. We use `i` rather than the
-/// `v`-prefix that [`sanitize_wac_id`] gives digit-leading segments,
-/// since `v` already connotes a version number (e.g. `@0.3.0` →
-/// `v0-3-0`) and reusing it here would be ambiguous.
 fn disambiguated_var(counts: &mut HashMap<String, usize>, pkg: &str) -> String {
     let count = counts.entry(pkg.to_string()).or_insert(0);
     let var = if *count == 0 {
