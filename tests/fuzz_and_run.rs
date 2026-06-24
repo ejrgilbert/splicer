@@ -3351,7 +3351,6 @@ fn dep_dir_name(pkg: &str, version: &str) -> String {
 const MIDDLEWARE_TIER2_LIB_RS: &str = r#"mod bindings {
     wit_bindgen::generate!({
         world: "tier2-mdl",
-        async: true,
         generate_all
     });
 }
@@ -3466,7 +3465,7 @@ fn fmt_result(result: &Option<FieldTree>) -> String {
 }
 
 impl BeforeGuest for Mdl {
-    async fn on_call(call: CallId, args: Vec<Field>) {
+    fn on_call(call: CallId, args: Vec<Field>) {
         let prev = LAST_ID.swap(call.id, Ordering::SeqCst);
         assert_eq!(call.id, prev + 1, "call.id should be prev + 1 (got {}, prev {prev})", call.id);
         let rendered: Vec<String> = args.iter().map(fmt_field).collect();
@@ -3480,7 +3479,7 @@ impl BeforeGuest for Mdl {
 }
 
 impl AfterGuest for Mdl {
-    async fn on_return(call: CallId, result: Option<FieldTree>) {
+    fn on_return(call: CallId, result: Option<FieldTree>) {
         let last = LAST_ID.load(Ordering::SeqCst);
         assert_eq!(call.id, last, "on_return id should match the prior on_call (last={last})");
         println!(

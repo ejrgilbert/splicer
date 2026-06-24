@@ -11,10 +11,6 @@
 mod bindings {
     splicer_tool_sdk::wit_bindgen!({
         world: "hello-tier2-mdl",
-        async: [
-            "export:splicer:tier2/before@0.2.0#on-call",
-            "export:splicer:tier2/after@0.2.0#on-return",
-        ],
         generate_all,
     });
 }
@@ -30,7 +26,7 @@ use splicer_tool_sdk::{cell_to_str, CallId, Field, FieldTree};
 pub struct HelloTier2;
 
 impl BeforeGuest for HelloTier2 {
-    async fn on_call(call: CallId, args: Vec<Field>) {
+    fn on_call(call: CallId, args: Vec<Field>) {
         let g = config::greeting();
         let rendered: Vec<String> = args.iter().map(fmt_arg).collect();
         let payload = if rendered.is_empty() {
@@ -46,7 +42,7 @@ impl BeforeGuest for HelloTier2 {
 }
 
 impl AfterGuest for HelloTier2 {
-    async fn on_return(call: CallId, result: Option<FieldTree>) {
+    fn on_return(call: CallId, result: Option<FieldTree>) {
         let g = config::greeting();
         let payload = match &result {
             Some(tree) => fmt_res(tree),

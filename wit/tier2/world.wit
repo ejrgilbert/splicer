@@ -8,13 +8,13 @@
 ///
 /// Any non-empty subset is valid: you can export just `before`, just
 /// `after`, just `gate`, or any combination.
-package splicer:tier2@0.2.0;
+package splicer:tier2@0.3.0;
 
 interface before {
     use splicer:common/types@0.2.0.{call-id, field};
     /// Called before every invocation of a target-interface function,
     /// with the function's parameters lifted into a `list<field>`.
-    on-call: async func(call: call-id, args: list<field>);
+    on-call: func(call: call-id, args: list<field>);
 }
 
 interface after {
@@ -23,7 +23,7 @@ interface after {
     /// with the result lifted into a `field-tree`. `none` for void
     /// functions; `some(tree)` otherwise. Results are unnamed in WIT,
     /// so unlike `args` there's no `field` wrapper.
-    on-return: async func(call: call-id, %result: option<field-tree>);
+    on-return: func(call: call-id, %result: option<field-tree>);
 }
 
 interface gate {
@@ -32,7 +32,7 @@ interface gate {
     /// lifted into a `list<field>` so policy decisions can inspect them.
     /// Return `true` to invoke downstream; `false` to skip the call.
     /// Only supported for void-returning functions today.
-    should-call: async func(call: call-id, args: list<field>) -> bool;
+    should-call: func(call: call-id, args: list<field>) -> bool;
 }
 
 world tier2-middleware {

@@ -6,10 +6,6 @@
 mod bindings {
     splicer_tool_sdk::wit_bindgen!({
         world: "recorder-mdl",
-        async: [
-            "export:splicer:tier2/before@0.2.0#on-call",
-            "export:splicer:tier2/after@0.2.0#on-return",
-        ],
         generate_all,
     });
 }
@@ -52,7 +48,7 @@ fn state() -> &'static Mutex<State> {
 pub struct Recorder;
 
 impl BeforeGuest for Recorder {
-    async fn on_call(call: CallId, args: Vec<Field>) {
+    fn on_call(call: CallId, args: Vec<Field>) {
         let mut s = state().lock().unwrap();
         ensure_header(&mut s);
         splicer_tool_sdk::write_call_event(&mut s.buf, wall_now_ns(), &call, &args);
@@ -60,7 +56,7 @@ impl BeforeGuest for Recorder {
 }
 
 impl AfterGuest for Recorder {
-    async fn on_return(call: CallId, result: Option<FieldTree>) {
+    fn on_return(call: CallId, result: Option<FieldTree>) {
         let mut s = state().lock().unwrap();
         ensure_header(&mut s);
         splicer_tool_sdk::write_return_event(&mut s.buf, wall_now_ns(), &call, result.as_ref());
