@@ -1,4 +1,5 @@
 //! Sync-to-async bridge component generator.
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 
