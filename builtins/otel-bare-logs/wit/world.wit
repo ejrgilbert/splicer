@@ -14,5 +14,5 @@ world otel-bare-logs-mdl {
     import wasi:clocks/wall-clock@0.2.0;
     import splicer:builtin-config/get@0.1.0;
 
-    export splicer:tier1/after@0.4.0;
+    export splicer:tier1/after@0.5.0;
 }

@@ -18,7 +18,6 @@
 //!                                  - async results pack contiguously
 //!                                  - sync-complex results re-align to i32
 //! [… .. +sum(EVENT_RECORD_SHAPE)) event slot (if has_async_machinery)
-//! [… .. +sum(GATE_RESULT_SHAPE))  gate-result slot (if has_gate)
 //! i64-aligned upward             bump_start (consumed on finish)
 //! ```
 //!
@@ -65,13 +64,6 @@ fn align_to_val(offset: u32, align: u32) -> u32 {
 /// `event_ptr + 0` and `event_ptr + 4`.
 const EVENT_RECORD_SHAPE: &[ValType] = &[ValType::I32, ValType::I32];
 
-/// Flat shape of the bool slot `should-call` writes. The
-/// canonical ABI stores a bool as an i32; the gate phase
-/// (see `super::dispatch::emit_gate_phase`) reads it via
-/// `i32.load` at `gate_result_ptr + 0` and branches on zero /
-/// non-zero.
-const GATE_RESULT_SHAPE: &[ValType] = &[ValType::I32];
-
 /// Byte-offset bookkeeper for the dispatch module's linear memory.
 /// See the module docs for the overall layout and call-ordering rules.
 pub(crate) struct MemoryLayoutBuilder {
@@ -111,12 +103,6 @@ impl MemoryLayoutBuilder {
     /// Size and alignment fall out of [`EVENT_RECORD_SHAPE`].
     pub fn alloc_event_slot(&mut self) -> u32 {
         self.alloc_record(EVENT_RECORD_SHAPE)
-    }
-
-    /// Reserve the bool-result slot written by `should-call`.
-    /// Size and alignment fall out of [`GATE_RESULT_SHAPE`].
-    pub fn alloc_gate_result(&mut self) -> u32 {
-        self.alloc_record(GATE_RESULT_SHAPE)
     }
 
     /// Finalize the layout and return the first free byte for the

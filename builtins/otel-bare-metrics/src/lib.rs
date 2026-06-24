@@ -18,10 +18,6 @@
 mod bindings {
     wit_bindgen::generate!({
         world: "otel-bare-metrics-mdl",
-        async: [
-            "export:splicer:tier1/before@0.4.0#on-call",
-            "export:splicer:tier1/after@0.4.0#on-return",
-        ],
         generate_all,
     });
 }
@@ -239,7 +235,7 @@ fn build_resource_metrics(call: &CallId, agg: &Agg, end: Datetime) -> ResourceMe
 pub struct OtelBareMetrics;
 
 impl BeforeGuest for OtelBareMetrics {
-    async fn on_call(call: CallId) {
+    fn on_call(call: CallId) {
         let start_time = now();
         pending()
             .lock()
@@ -249,7 +245,7 @@ impl BeforeGuest for OtelBareMetrics {
 }
 
 impl AfterGuest for OtelBareMetrics {
-    async fn on_return(call: CallId) {
+    fn on_return(call: CallId) {
         let popped = pending().lock().unwrap().remove(&call.id);
         let Some(p) = popped else {
             return;
