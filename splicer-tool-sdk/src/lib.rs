@@ -24,7 +24,10 @@ pub use path::{sanitize_for_filename, strip_leading_slashes};
 pub use wire::decode::{DecodeError, Event, Reader};
 pub use wire::encode::{write_call_event, write_field_tree, write_return_event, write_stream_header};
 pub use render::{cell_to_str, render_field_tree};
-pub use strategy::{TransformStrategy, VirtualizeStrategy};
+pub use strategy::{
+    single_poll, SyncTransformStrategy, SyncVirtualizeStrategy, TransformStrategy,
+    VirtualizeStrategy,
+};
 pub use trace::{TraceError, TraceReader};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,

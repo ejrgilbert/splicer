@@ -643,14 +643,10 @@ fn matrix_borrow_args_thread_lifetime() {
 }
 
 #[test]
-fn matrix_tier4_static_method_fails_fast_with_compile_error() {
-    // tier-4 has no import side, so a static method body has nowhere
-    // to dispatch (and no fixture / design exercises strategy
-    // dispatch from a static yet). The codegen must emit a
-    // `compile_error!` into the wrapper crate so the build error
-    // points at the unsupported shape, rather than producing a call
-    // to a nonexistent import that surfaces as a misleading
-    // unresolved-name error.
+fn matrix_tier4_static_method_dispatches_sync_virtualize() {
+    // Sync static resource methods on tier-4 now route through
+    // SyncVirtualizeStrategy (same as instance methods). The strategy
+    // receives the call ID and args and synthesizes the return value.
     let out = generate_for_wit(
         r#"
             package matrix:s4@0.1.0;
@@ -671,9 +667,13 @@ fn matrix_tier4_static_method_fails_fast_with_compile_error() {
     );
     let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        oneline.contains("compile_error")
-            && oneline.contains("tier-4 static methods on resources are not yet supported"),
-        "expected a compile_error! at the tier-4 static method site:\n{}",
+        oneline.contains("SyncVirtualizeStrategy"),
+        "static method should dispatch through SyncVirtualizeStrategy:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("compile_error"),
+        "static method should NOT emit compile_error:\n{}",
         out.lib_rs,
     );
 }

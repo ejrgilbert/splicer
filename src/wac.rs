@@ -985,11 +985,13 @@ struct SpliceCtx<'a> {
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: Vec<GeneratedAdapter>,
+    #[allow(dead_code)]
     target_has_sync_cache: HashMap<(String, String), bool>,
     /// `(target_split_path, target_interface)` ->
     /// `(bridge_wasm_path, async_mirror_qualified_name)`. One bridge
     /// per distinct provider+interface across the run; shared by every
     /// site that needs it.
+    #[allow(dead_code)]
     bridges: HashMap<(String, String), (String, String)>,
     /// Tier-3/4 matches skipped because the strategy's bound didn't fit.
     skips: Vec<SkipRecord>,
@@ -1406,32 +1408,7 @@ fn materialize_tier3_4_inline(
             .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))
     };
 
-    // Tier-3/4 wrappers are async-only by construction, so any
-    // sync-WIT target forces the bridged path. Detect once + cache
-    // the bridge before each materialization so the wrapper crate
-    // gets the mirror name to lift against.
-    let mirror_for_target = if !sources.iter().any(Option::is_some) {
-        None
-    } else {
-        let consumer_split_path = consumer_split.ok_or_else(|| {
-            anyhow::anyhow!("no split for tier-3/4 sync-WIT detection on '{interface_name}'")
-        })?;
-        let target_key = (consumer_split_path.to_string(), interface_name.to_string());
-        let has_sync = *accs
-            .target_has_sync_cache
-            .entry(target_key)
-            .or_insert_with(|| target_interface_has_sync_func(interface_name, consumer_split_path));
-        if has_sync {
-            let (_path, mirror_qname) =
-                ensure_bridge(interface_name, consumer_split_path, ctx.splits_path, accs)
-                    .with_context(|| {
-                        format!("ensure bridge for tier-3/4 site on `{interface_name}`")
-                    })?;
-            Some(mirror_qname)
-        } else {
-            None
-        }
-    };
+    let mirror_for_target: Option<String> = None;
 
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
     for (inj, source) in to_inject.iter().zip(sources) {
@@ -1742,6 +1719,7 @@ fn factored_types_to_wire(
 
 /// Cached bridge generation. Returns the bridge's `.wasm` path and
 /// the async-mirror interface's fully-qualified name.
+#[allow(dead_code)]
 fn ensure_bridge(
     target_interface: &str,
     target_split_path: &str,
@@ -1760,8 +1738,9 @@ fn ensure_bridge(
 
 /// True iff `target_interface` (resolved via the component at
 /// `target_split_path`, which imports or exports it) has at least one
-/// function declared as `func` (sync) at WIT — i.e. splicer's adapter
+/// function declared as `func` (sync) at WIT -- i.e. splicer's adapter
 /// would be forced to lift that signature as sync.
+#[allow(dead_code)]
 fn target_interface_has_sync_func(target_interface: &str, target_split_path: &str) -> bool {
     let Ok(bytes) = std::fs::read(target_split_path) else {
         return false;

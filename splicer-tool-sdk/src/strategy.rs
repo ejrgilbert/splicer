@@ -140,6 +140,74 @@ pub trait VirtualizeStrategy<Args, R> {
     async fn handle(&self, call: CallId, args: Args) -> R;
 }
 
+/// Sync counterpart to [`TransformStrategy`], used when the wrapped target
+/// exports plain `func` (not `async func`). The `downstream` closure is a
+/// plain `Fn` that calls the target synchronously.
+///
+/// A blanket impl derives this for any [`TransformStrategy`] via
+/// [`single_poll`]: the async `handle` future is driven to completion in
+/// one poll. This works for strategies that complete inline; it panics if
+/// the strategy genuinely suspends (awaits something that yields), which is
+/// unsupported for sync targets.
+pub trait SyncTransformStrategy<Args, R> {
+    fn handle(&self, call: CallId, args: Args, downstream: impl Fn(Args) -> R) -> R;
+}
+
+/// Sync counterpart to [`VirtualizeStrategy`] for plain `func` targets.
+/// Same single-poll semantics as [`SyncTransformStrategy`].
+pub trait SyncVirtualizeStrategy<Args, R> {
+    fn handle(&self, call: CallId, args: Args) -> R;
+}
+
+impl<S, Args, R> SyncTransformStrategy<Args, R> for S
+where
+    S: TransformStrategy<Args, R>,
+{
+    fn handle(&self, call: CallId, args: Args, downstream: impl Fn(Args) -> R) -> R {
+        // Reborrow so the inner `async move` copies a `&F` (which is Copy)
+        // rather than moving the `F` itself. That makes the closure AsyncFn
+        // (callable more than once) rather than AsyncFnOnce.
+        let downstream = &downstream;
+        single_poll(TransformStrategy::handle(
+            self,
+            call,
+            args,
+            |a| async move { downstream(a) },
+        ))
+    }
+}
+
+impl<S, Args, R> SyncVirtualizeStrategy<Args, R> for S
+where
+    S: VirtualizeStrategy<Args, R>,
+{
+    fn handle(&self, call: CallId, args: Args) -> R {
+        single_poll(VirtualizeStrategy::handle(self, call, args))
+    }
+}
+
+/// Drive a [`Future`] to completion with a single poll using a noop waker.
+///
+/// Panics if the future returns [`Poll::Pending`] -- valid only for futures
+/// that are guaranteed to complete immediately (e.g., strategy bodies that
+/// never await anything that suspends).
+pub fn single_poll<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    unsafe fn noop_clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    unsafe fn noop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(noop_clone, noop, noop, noop);
+    // SAFETY: noop vtable functions are all no-ops; the waker is never
+    // actually used to wake anything since we only poll once.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    match std::pin::pin!(fut).poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("strategy suspended in sync context"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,9 +247,13 @@ mod tests {
     #[tokio::test]
     async fn forward_pass_through_hands_off_args() {
         let strat = PassThrough;
-        let r: u32 = strat
-            .handle(call(), (10u32, 20u32), |(a, b)| async move { a + b })
-            .await;
+        let r: u32 = TransformStrategy::<(u32, u32), u32>::handle(
+            &strat,
+            call(),
+            (10u32, 20u32),
+            |(a, b)| async move { a + b },
+        )
+        .await;
         assert_eq!(r, 30);
     }
 

@@ -100,6 +100,7 @@ pub(crate) fn import_intrinsics(
 /// local.set st; emit_wait_loop`. The shared tail every tier uses
 /// once params are pushed (whether direct flat params or a single
 /// indirect-params pointer).
+#[allow(dead_code)]
 pub(crate) fn emit_call_and_wait(
     f: &mut Function,
     hook_idx: u32,

@@ -382,9 +382,9 @@ fn emit_method_body(
                     build_static_call(is_async, &import_resource, method_ident, fields)
                 }
                 Behavior::Virtualize => {
-                    // tier-4 has no import side; static methods would
-                    // need to dispatch through the strategy. Not yet
-                    // wired.
+                    // tier-4 static: no downstream import, so target_call
+                    // is a placeholder; SyncVirtualizeStrategy dispatch
+                    // below ignores it and routes through the strategy.
                     let msg = format!(
                         "tier-4 static methods on resources are not yet supported \
                          (encountered `{}::{}`)",
@@ -414,9 +414,6 @@ fn emit_method_body(
         target_call
     };
 
-    // Resource-returning fns route through `WrapperR` inside the
-    // strategy and re-wrap at the boundary on return. Sync paths
-    // bypass dispatch entirely and don't use `final_wrap`.
     let resource_wrap = ir
         .fn_sigs
         .get(&args_ident.to_string())
@@ -463,14 +460,50 @@ fn emit_method_body(
         }
     };
 
-    // Strategy dispatch is async, so sync wrapper methods can't go
-    // through it; they direct-delegate to the target instead. WIT
-    // resource constructors are always sync per spec, so they hit
-    // this path.
     let body = if !is_async {
-        quote! {
-            let args = #args_construct;
-            #target_call
+        if matches!(fn_kind, ExportFnKind::Constructor) {
+            // Constructors return a newtype-wrapped handle; strategy dispatch
+            // can't apply the generic R return path.
+            quote! {
+                let args = #args_construct;
+                #target_call
+            }
+        } else {
+            let sync_dispatch = match behavior {
+                Behavior::Transform => quote! {
+                    <_ as ::splicer_tool_sdk::SyncTransformStrategy<#args_ty, #strategy_r_ty>>::handle(
+                        s, call, args, |args: #args_ty| { #closure_body },
+                    )
+                },
+                Behavior::Virtualize => quote! {
+                    <_ as ::splicer_tool_sdk::SyncVirtualizeStrategy<#args_ty, #strategy_r_ty>>::handle(
+                        s, call, args,
+                    )
+                },
+            };
+            match &final_wrap {
+                Some(wrap) => quote! {
+                    let call = ::splicer_tool_sdk::CallId {
+                        interface_name: #interface_qualified_name.into(),
+                        function_name: #method_name.into(),
+                        id: 0,
+                    };
+                    let args = #args_construct;
+                    let s = strategy();
+                    let intermediate = #sync_dispatch;
+                    #wrap
+                },
+                None => quote! {
+                    let call = ::splicer_tool_sdk::CallId {
+                        interface_name: #interface_qualified_name.into(),
+                        function_name: #method_name.into(),
+                        id: 0,
+                    };
+                    let args = #args_construct;
+                    let s = strategy();
+                    #sync_dispatch
+                },
+            }
         }
     } else {
         match final_wrap {
