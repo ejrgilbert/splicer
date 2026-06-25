@@ -123,6 +123,8 @@ pub struct SkipRecord {
     pub interface: String,
     /// The unsatisfied bound (parsed from rustc), when known.
     pub bound: Option<String>,
+    /// Full cargo stderr from the failed build attempt.
+    pub stderr: String,
 }
 
 /// Render a plain-text skip summary, or `None` when nothing skipped.
@@ -1436,11 +1438,12 @@ fn materialize_tier3_4_inline(
             // Bound didn't fit: record the skip and drop the injection so
             // the chain proceeds without this wrapper. `--strict` callers
             // promote `skips` to a hard failure downstream.
-            crate::strategies::MaterializeOutcome::Skipped { bound } => {
+            crate::strategies::MaterializeOutcome::Skipped { bound, stderr } => {
                 accs.skips.push(SkipRecord {
                     strategy: label.to_string(),
                     interface: interface_name.to_string(),
                     bound,
+                    stderr,
                 });
             }
         }
@@ -1912,11 +1915,13 @@ mod tests {
                 strategy: "chaos-err".into(),
                 interface: "wasi:http/handler@0.3.0".into(),
                 bound: Some("R: HasArbitraryErr".into()),
+                stderr: String::new(),
             },
             SkipRecord {
                 strategy: "replayer".into(),
                 interface: "wasi:io/streams@0.2.0".into(),
                 bound: None,
+                stderr: String::new(),
             },
         ];
         let summary = format_skip_summary(&skips).expect("non-empty");
