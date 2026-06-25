@@ -18,6 +18,10 @@ use wit_parser::{Resolve, Type};
 /// the ABI falls back to indirect-through-pointer lowering.
 pub(crate) const MAX_FLAT_PARAMS: usize = 16;
 
+/// Cap for flat-type computations in memory (retptr) context. Wasm locals
+/// have no 16-limit; this is a practical bound for realistic WIT types.
+pub(crate) const MAX_FLAT_MEMORY_TYPES: usize = 256;
+
 /// Canonical-ABI bitcast selector: the wasm conversion needed to move
 /// a value of flat type `from` into flat type `to`.
 ///

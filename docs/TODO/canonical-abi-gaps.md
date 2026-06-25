@@ -4,17 +4,17 @@
   flat representation at the function boundary — types nested in
   memory (list elements, variant/result arms, compound-result
   fields) can be lifted field-by-field via `lift_from_memory`
-  without any flat intermediate. Splicer2 currently materializes
-  per-position flat locals anyway: `push_list_of` (element
-  flat-slots staged once, written per iteration), `push_result` /
-  `push_variant` (joined arm flat-types for slot widening), and the
-  compound-result emit path (synth-locals across the whole result).
-  When a nested type's flat exceeds 16, all four bail with
-  `"flat representation exceeds MAX_FLAT_PARAMS"`. Each site needs
-  a memory-direct alternative (skip the flat-local staging, walk
-  the cell tree against the source address) that the plan-builder
-  can pick when overflow is detected. Structurally similar to
-  `build_lift_params_from_memory`, but applied per-position.
+  without any flat intermediate. Three of the four original bail
+  sites have been fixed by using `MAX_FLAT_MEMORY_TYPES` (256)
+  instead of `MAX_FLAT_PARAMS` (16) when allocating wasm locals
+  (not sig slots): `push_result` / `push_variant` (joined arm
+  flat-types for slot widening) and the compound-result emit path
+  (synth-locals across the whole result). **Remaining:** `push_list_of`
+  (element flat-slots staged once, written per iteration) still bails
+  with `"list element flat representation exceeds MAX_FLAT_PARAMS"`
+  when a list element type's flat exceeds 16. That site needs a
+  memory-direct alternative (skip the flat-local staging, walk the
+  cell tree against the element address per iteration).
 
 - **Async-asymmetric single-param flat >16.** Independent of the
   nested-overflow item above, but shares its error string. Fires in
