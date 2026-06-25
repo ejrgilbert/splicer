@@ -13,7 +13,7 @@ use wit_parser::{
 };
 
 use super::super::super::abi::emit::{wasm_type_to_val, BlobSlice};
-use super::super::super::abi::flat_types;
+use super::super::super::abi::{flat_types, MAX_FLAT_MEMORY_TYPES};
 use super::super::blob::NameInterner;
 
 const ISSUES_URL: &str = "https://github.com/ejrgilbert/splicer/issues";
@@ -819,7 +819,7 @@ impl<'a> LiftPlanBuilder<'a> {
             unreachable!("Result kind came from non-Result TypeDefKind")
         };
         let r = r.clone();
-        let Some(joined) = flat_types(resolve, ty, None) else {
+        let Some(joined) = flat_types(resolve, ty, Some(MAX_FLAT_MEMORY_TYPES)) else {
             self.record_flat_overflow("result<T, E>");
             return self.stub_disc_cell();
         };
@@ -865,7 +865,8 @@ impl<'a> LiftPlanBuilder<'a> {
     ) {
         let Some(t) = arm else { return };
         let arm_flat =
-            flat_types(resolve, t, None).expect("arm flat fits — joined fit, so arm fits");
+            flat_types(resolve, t, Some(MAX_FLAT_MEMORY_TYPES))
+                .expect("arm flat fits — joined fit, so arm fits");
         for (i, &arm_ty) in arm_flat.iter().enumerate() {
             let joined_ty = joined[1 + i];
             // Compare at wasm-level: Pointer/Length→I32, PointerOrI64→I64.
@@ -889,7 +890,7 @@ impl<'a> LiftPlanBuilder<'a> {
             .expect("Variant kind implies variant-info available");
         let type_name = names.intern(&info.type_name);
         let case_names = info.item_names.iter().map(|n| names.intern(n)).collect();
-        let Some(joined) = flat_types(resolve, ty, None) else {
+        let Some(joined) = flat_types(resolve, ty, Some(MAX_FLAT_MEMORY_TYPES)) else {
             self.record_flat_overflow("variant");
             return self.stub_disc_cell();
         };
