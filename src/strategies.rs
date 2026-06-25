@@ -34,8 +34,9 @@ pub enum MaterializeOutcome {
     /// Wrapper built and installed at `path`.
     Built { path: PathBuf, tier: Tier },
     /// The strategy doesn't fit this interface; carries the unsatisfied
-    /// bound (parsed from rustc) for the skip warning.
-    Skipped { bound: Option<String> },
+    /// bound (parsed from rustc) for the skip warning and the full
+    /// cargo stderr for diagnostics.
+    Skipped { bound: Option<String>, stderr: String },
 }
 
 // Per-builtin `Dir<'_>` statics + the `EMBEDDED` slice are generated
@@ -281,7 +282,9 @@ fn materialize_from_prepared(
             path,
             tier: prep.manifest.builtin.tier,
         },
-        BuildOutcome::BoundMismatch { bound, .. } => MaterializeOutcome::Skipped { bound },
+        BuildOutcome::BoundMismatch { bound, stderr, .. } => {
+            MaterializeOutcome::Skipped { bound, stderr }
+        }
     })
 }
 
@@ -792,7 +795,7 @@ mod tests {
         )
         .expect("materialize returns Ok (skip, not error)");
         match outcome {
-            MaterializeOutcome::Skipped { bound } => {
+            MaterializeOutcome::Skipped { bound, .. } => {
                 let bound = bound.expect("bound parsed from rustc");
                 assert!(
                     bound.contains("HasArbitraryErr"),
