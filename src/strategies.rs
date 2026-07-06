@@ -36,7 +36,10 @@ pub enum MaterializeOutcome {
     /// The strategy doesn't fit this interface; carries the unsatisfied
     /// bound (parsed from rustc) for the skip warning and the full
     /// cargo stderr for diagnostics.
-    Skipped { bound: Option<String>, stderr: String },
+    Skipped {
+        bound: Option<String>,
+        stderr: String,
+    },
 }
 
 // Per-builtin `Dir<'_>` statics + the `EMBEDDED` slice are generated

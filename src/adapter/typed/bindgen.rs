@@ -223,8 +223,7 @@ fn try_make_alias(
     import_path: &[String],
 ) -> Option<syn::Item> {
     let name = named_type_ident(item, type_names)?;
-    let path: Vec<&str> = std::iter::repeat("super")
-        .take(num_supers)
+    let path: Vec<&str> = std::iter::repeat_n("super", num_supers)
         .chain(import_path.iter().map(String::as_str))
         .collect();
     let src = format!("pub type {name} = {}::{name};", path.join("::"));
