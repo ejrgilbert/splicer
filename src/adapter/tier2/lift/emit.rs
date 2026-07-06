@@ -12,8 +12,8 @@ use super::super::super::abi::emit::{
     RecordLayout, I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, MAX_UTF8_LEN,
     OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
-use super::super::super::abi::{flat_types, MAX_FLAT_MEMORY_TYPES};
 use super::super::super::abi::WasmEncoderBindgen;
+use super::super::super::abi::{flat_types, MAX_FLAT_MEMORY_TYPES};
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
 use super::super::cells::{CellLayout, PayloadSource};
 use super::super::FuncDispatch;

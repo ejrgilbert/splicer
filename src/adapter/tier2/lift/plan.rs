@@ -864,9 +864,8 @@ impl<'a> LiftPlanBuilder<'a> {
         resolve: &Resolve,
     ) {
         let Some(t) = arm else { return };
-        let arm_flat =
-            flat_types(resolve, t, Some(MAX_FLAT_MEMORY_TYPES))
-                .expect("arm flat fits — joined fit, so arm fits");
+        let arm_flat = flat_types(resolve, t, Some(MAX_FLAT_MEMORY_TYPES))
+            .expect("arm flat fits — joined fit, so arm fits");
         for (i, &arm_ty) in arm_flat.iter().enumerate() {
             let joined_ty = joined[1 + i];
             // Compare at wasm-level: Pointer/Length→I32, PointerOrI64→I64.
