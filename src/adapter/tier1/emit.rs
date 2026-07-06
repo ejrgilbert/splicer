@@ -30,13 +30,12 @@ use wit_parser::{
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
-    build_lower_params_to_memory, call_id_layout, collect_borrow_drops, direct_return_type,
-    emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc,
-    emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
-    emit_populate_call_id, emit_resource_drop_imports, emit_wrapper_return, empty_function,
-    find_imported_hook, require_gate_compatible_func, require_indirect_params_supported_shape,
-    require_no_inline_resources, synthesize_adapter_world_wit, val_types, BlobSlice, BumpReset,
-    CallIdLayout, GlobalIndices, HookImport, WrapperExport,
+    build_lower_params_to_memory, collect_borrow_drops, direct_return_type, emit_alloc_call_id,
+    emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc, emit_data_section,
+    emit_export_section, emit_handler_call, emit_memory_and_globals, emit_resource_drop_imports,
+    emit_wrapper_return, empty_function, find_imported_hook, require_gate_compatible_func,
+    require_indirect_params_supported_shape, require_no_inline_resources,
+    synthesize_adapter_world_wit, val_types, BumpReset, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, LocalsBuilder};
@@ -234,18 +233,10 @@ struct FuncDispatch {
 const ADAPTER_WORLD_PACKAGE: &str = "splicer:adapter";
 const ADAPTER_WORLD_NAME: &str = "adapter";
 
-/// Single shared `call-id` indirect-params buffer used by every hook
-/// callsite in this dispatch module.
-struct CallIdBuf {
-    offset: i32,
-    layout: CallIdLayout,
-}
-
-/// Wrapper-body view: counter global to bump + the static buffer.
+/// Wrapper-body view: counter global to allocate per-call ids.
 #[derive(Clone, Copy)]
-struct CallIdWiring<'a> {
+struct CallIdWiring {
     counter_global: u32,
-    buf: &'a CallIdBuf,
 }
 
 /// Type-section indices. `task_return_ty[i]` is `Some` iff func `i` is async.
@@ -253,10 +244,9 @@ struct TypeIndices {
     handler_ty: Vec<u32>,
     wrapper_ty: Vec<u32>,
     task_return_ty: Vec<Option<u32>>,
-    /// Before/after hook sig: `(ptr, len) -> i32`.
+    /// Before/after hook sig: `(i32, i32, i32, i32, i64) -> ()` (5 flat call-id values).
     hook_ty: u32,
-    /// Gate hook sig: `(ptr, len, retptr) -> i32`. `Some` iff `gate`
-    /// is active.
+    /// Gate hook sig: `(i32, i32, i32, i32, i64) -> i32`. `Some` iff `gate` is active.
     gate_hook_ty: Option<u32>,
     init_ty: u32,
     cabi_post_ty: u32,
@@ -283,9 +273,6 @@ struct FuncIndices {
     cabi_post: Vec<Option<u32>>,
     /// Always `Some` — `cabi_realloc` is unconditionally exported.
     cabi_realloc: Option<u32>,
-    /// Memory offset of the bool slot `should-call` writes its retptr
-    /// into. `Some` iff `gate` is active.
-    gate_result_ptr: Option<i32>,
     async_runtime: Option<AsyncFuncs>,
     /// `[resource-drop]<R>` import per resource referenced by a borrow
     /// param across `per_func`.
@@ -308,19 +295,10 @@ fn build_dispatch_module(
         .functions
         .values()
         .collect();
-    // Any hook OR any async target needs the canon-async builtins
-    // to await its subtask handle.
     let any_async_target = funcs.iter().any(|f| f.kind.is_async());
-    let needs_async_runtime = has_before || has_after || has_gate || any_async_target;
-    let any_hook = has_before || has_after || has_gate;
+    let needs_async_runtime = any_async_target;
     let mut sizes = SizeAlign::default();
     sizes.fill(resolve);
-    // The [`CallIdLayout`] is needed iff any hook is wired (to populate
-    // the indirect-params buffer); also drives the buffer's size +
-    // alignment in [`compute_func_dispatches`].
-    let callid_layout = any_hook
-        .then(|| call_id_layout(resolve, &sizes))
-        .transpose()?;
     let plan = compute_func_dispatches(
         resolve,
         &sizes,
@@ -329,8 +307,6 @@ fn build_dispatch_module(
         &funcs,
         SlotReservations {
             needs_async_runtime,
-            has_gate,
-            callid_layout,
         },
     )?;
     let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after, has_gate);
@@ -338,6 +314,7 @@ fn build_dispatch_module(
 
     let mut module = Module::new();
     let type_idx = emit_type_section(&mut module, &mut idx, &plan.per_func, &hook_imports);
+    let any_hook = has_before || has_after || has_gate;
     let func_idx = emit_imports_section(
         &mut module,
         &mut idx,
@@ -345,7 +322,6 @@ fn build_dispatch_module(
         &type_idx,
         &hook_imports,
         plan.event_ptr,
-        plan.gate_result_ptr,
         resolve,
     );
     let func_idx =
@@ -369,9 +345,8 @@ fn build_dispatch_module(
             .cabi_realloc
             .expect("cabi_realloc is always emitted"),
     );
-    let call_id_wiring = plan.call_id_buf.as_ref().map(|buf| CallIdWiring {
+    let call_id_wiring = any_hook.then_some(CallIdWiring {
         counter_global: globals.call_id_counter,
-        buf,
     });
     emit_code_section(
         &mut module,
@@ -400,26 +375,15 @@ struct DispatchPlan {
     name_blob: Vec<u8>,
     /// `Some` iff `SlotReservations::needs_async_runtime`.
     event_ptr: Option<i32>,
-    /// `Some` iff `SlotReservations::has_gate`.
-    gate_result_ptr: Option<i32>,
-    /// `Some` iff any hook is wired (i.e. `callid_layout` is `Some`).
-    call_id_buf: Option<CallIdBuf>,
     bump_start: u32,
 }
 
 /// Gates for the fixed-slot allocations [`compute_func_dispatches`]
-/// makes after the per-func name + retptr slots. Each field controls
-/// one slot in the dispatch module's static memory.
+/// makes after the per-func name + retptr slots.
 struct SlotReservations {
-    /// Reserve the canon-async event record. Set when any hook is
-    /// wired or the target has any async function.
+    /// Reserve the canon-async event record. Set when the target has
+    /// any async function.
     needs_async_runtime: bool,
-    /// Reserve the gate-result scratch. Set when the middleware
-    /// exports the tier-1 `gate` interface.
-    has_gate: bool,
-    /// `Some` iff any hook is wired — drives the call-id buffer's
-    /// size + alignment.
-    callid_layout: Option<CallIdLayout>,
 }
 
 /// Final layout end (data + scratch + bump-allocator base) must fit
@@ -543,20 +507,9 @@ fn compute_func_dispatches(
             borrow_drops,
         });
     }
-    // [`MemoryLayoutBuilder`] is single-cursor — fixed slots land
-    // AFTER per-func name + retptr allocations, in the same order
-    // the legacy path uses.
     let event_ptr = slots
         .needs_async_runtime
         .then(|| layout.alloc_event_slot() as i32);
-    let gate_result_ptr = slots.has_gate.then(|| layout.alloc_gate_result() as i32);
-    let call_id_buf = slots.callid_layout.map(|callid_layout| {
-        let offset = layout.alloc_aligned(callid_layout.size(), callid_layout.align()) as i32;
-        CallIdBuf {
-            offset,
-            layout: callid_layout,
-        }
-    });
     let bump_start = layout.finish_as_bump_start();
     if bump_start > LAYOUT_SIZE_BUDGET {
         bail!("static-data layout end {bump_start} exceeds i32 budget {LAYOUT_SIZE_BUDGET}");
@@ -565,25 +518,16 @@ fn compute_func_dispatches(
         per_func,
         name_blob,
         event_ptr,
-        gate_result_ptr,
-        call_id_buf,
         bump_start,
     })
 }
 
-/// Active tier-1 hook imports. `before` / `after` share a common sig
-/// (`(ptr) -> i32`); `gate` has a retptr param for the bool
-/// result (`(ptr, retptr) -> i32`).
+/// Active tier-1 hook imports. `before` / `after` share a common sig;
+/// `gate` returns bool directly as `i32`.
 struct HookImports {
     before: Option<HookImport>,
     after: Option<HookImport>,
     gate: Option<HookImport>,
-}
-
-impl HookImports {
-    fn any(&self) -> bool {
-        self.before.is_some() || self.after.is_some() || self.gate.is_some()
-    }
 }
 
 /// Resolve tier-1 hook imports through wit-parser so a contract bump
@@ -650,9 +594,8 @@ fn emit_type_section(
         }
     }
 
-    // Both hooks share the same `async func(name: string)` shape; pick
-    // whichever's active. With neither active the slot is unreferenced
-    // and falls back to `() -> ()`.
+    // Both hooks share the same sig; pick whichever's active. With
+    // neither active the slot is unreferenced and falls back to `() -> ()`.
     let hook_sig = hook_imports
         .before
         .as_ref()
@@ -671,8 +614,6 @@ fn emit_type_section(
     );
     let cabi_realloc_ty = idx.alloc_ty();
 
-    // Gate hook sig — sourced from the WIT (`should-call:
-    // async func(name: string) -> bool` lowered → `(ptr, len, retptr) -> i32`).
     let gate_hook_ty = hook_imports.gate.as_ref().map(|h| {
         types
             .ty()
@@ -680,11 +621,7 @@ fn emit_type_section(
         idx.alloc_ty()
     });
 
-    // Async-runtime types are needed when a hook is active OR any
-    // target func is async — both fire the wait loop in the wrapper
-    // body. Gating only on hooks would leave a hook-less async-target
-    // module unable to await its handler subtask.
-    let needs_async_runtime = hook_imports.any() || per_func.iter().any(|f| f.is_async);
+    let needs_async_runtime = per_func.iter().any(|f| f.is_async);
     let async_runtime =
         needs_async_runtime.then(|| canon_async::emit_types(&mut types, || idx.alloc_ty()));
 
@@ -716,11 +653,7 @@ fn emit_type_section(
 }
 
 /// Phase 3 — import section: per-func handlers + hooks + async-runtime
-/// builtins + per-async-func task.return. Hook + handler names come
-/// from [`Resolve::wasm_import_name`]; the `$root/[waitable-*]` /
-/// `[subtask-drop]` builtins are wit-component intrinsics not exposed
-/// via wit-parser (mirrors `dummy_module::push_root_async_intrinsics`).
-#[allow(clippy::too_many_arguments)]
+/// builtins + per-async-func task.return.
 fn emit_imports_section(
     module: &mut Module,
     idx: &mut DispatchIndices,
@@ -728,7 +661,6 @@ fn emit_imports_section(
     type_idx: &TypeIndices,
     hook_imports: &HookImports,
     event_ptr: Option<i32>,
-    gate_result_ptr: Option<i32>,
     resolve: &Resolve,
 ) -> FuncIndices {
     let mut imports = ImportSection::new();
@@ -796,7 +728,6 @@ fn emit_imports_section(
         init: 0,
         cabi_post: vec![None; per_func.len()],
         cabi_realloc: None,
-        gate_result_ptr,
         async_runtime,
         resource_drop,
     }
@@ -850,20 +781,14 @@ fn emit_code_section(
     funcs: &[&WitFunction],
     func_idx: &FuncIndices,
     globals: &GlobalIndices,
-    call_id_wiring: Option<CallIdWiring<'_>>,
+    call_id_wiring: Option<CallIdWiring>,
 ) {
     debug_assert_eq!(
         per_func.len(),
         funcs.len(),
         "FuncDispatch list and WitFunction list must be index-aligned",
     );
-    let gate = func_idx
-        .imp_gate
-        .zip(func_idx.gate_result_ptr)
-        .map(|(import_fn, result_ptr)| GateConfig {
-            import_fn,
-            result_ptr,
-        });
+    let gate = func_idx.imp_gate.map(|import_fn| GateConfig { import_fn });
     let mut code = CodeSection::new();
     for (i, fd) in per_func.iter().enumerate() {
         if fd.is_async {
@@ -894,7 +819,6 @@ fn emit_code_section(
                 func_idx.imp_before,
                 func_idx.imp_after,
                 gate.as_ref(),
-                func_idx.async_runtime.as_ref(),
                 &func_idx.resource_drop,
                 call_id_wiring,
                 globals.bump,
@@ -911,11 +835,9 @@ fn emit_code_section(
     module.section(&code);
 }
 
-/// `should-call` runtime bundle — the import fn index plus the
-/// memory offset its retptr writes the bool result into.
+/// `should-call` runtime bundle — the import function index.
 struct GateConfig {
     import_fn: u32,
-    result_ptr: i32,
 }
 
 /// Emit one sync wrapper body. Shape is read off
@@ -929,9 +851,8 @@ fn emit_wrapper_body(
     imp_before: Option<u32>,
     imp_after: Option<u32>,
     gate: Option<&GateConfig>,
-    async_runtime: Option<&AsyncFuncs>,
     resource_drop: &HashMap<TypeId, u32>,
-    call_id_wiring: Option<CallIdWiring<'_>>,
+    call_id_wiring: Option<CallIdWiring>,
     bump_global: u32,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
@@ -941,42 +862,23 @@ fn emit_wrapper_body(
         saved_local: locals.alloc_local(ValType::I32),
     };
     let result_local = direct_return_type(&fd.export_sig).map(|t| locals.alloc_local(t));
-    // Wait-loop scratch (subtask + waitable-set handles); shared
-    // across on-call / on-return / gate awaits.
-    let wait_locals = async_runtime.map(|_| {
-        let st = locals.alloc_local(ValType::I32);
-        let ws = locals.alloc_local(ValType::I32);
-        (st, ws)
-    });
-    // i64 call-id local + per-callsite bundle; both gated on hook wired.
     let hook_site = call_id_wiring.map(|w| HookSite {
         fd,
-        buf: w.buf,
         id_local: locals.alloc_local(ValType::I64),
+        counter_global: w.counter_global,
     });
     let mut f = Function::new_with_locals_types(locals.freeze().locals);
 
     emit_bump_save(&mut f, bump_reset);
 
-    if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
-        emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
-        // Buffer contents (iface/fn name + id) are identical across
-        // before / gate / after — populate once up front.
-        populate_hook_call_id(&mut f, &site);
+    if let Some(site) = hook_site {
+        emit_alloc_call_id(&mut f, site.counter_global, site.id_local);
     }
     if let Some(idx) = imp_before {
-        emit_hook_call(&mut f, idx, async_runtime, wait_locals, hook_site.unwrap());
+        emit_hook_call(&mut f, idx, hook_site.unwrap());
     }
     if let Some(g) = gate {
-        emit_gate_phase(
-            &mut f,
-            g,
-            async_runtime,
-            wait_locals,
-            None,
-            hook_site.unwrap(),
-            bump_reset,
-        );
+        emit_gate_phase(&mut f, g, None, hook_site.unwrap(), bump_reset);
     }
     emit_handler_call(
         &mut f,
@@ -989,7 +891,7 @@ fn emit_wrapper_body(
         f.instructions().local_set(local);
     }
     if let Some(idx) = imp_after {
-        emit_hook_call(&mut f, idx, async_runtime, wait_locals, hook_site.unwrap());
+        emit_hook_call(&mut f, idx, hook_site.unwrap());
     }
     emit_borrow_drops(&mut f, &fd.borrow_drops, resource_drop);
     emit_bump_restore(&mut f, bump_reset);
@@ -1002,45 +904,25 @@ fn emit_wrapper_body(
 #[derive(Clone, Copy)]
 struct HookSite<'a> {
     fd: &'a FuncDispatch,
-    buf: &'a CallIdBuf,
     id_local: u32,
+    counter_global: u32,
 }
 
-/// Between on-call and the handler call: call
-/// `should-call(call_ptr, retptr)`, await, and `return` early if
-/// it's false (skip the downstream call). The shared call-id buffer
-/// is populated by the wrapper body once before any hook fires; this
-/// helper just pushes the args and awaits. Async wrappers call
-/// `task.return` first (`task_return_for_async`); sync void just
+/// Between on-call and the handler call: call `should-call` with the
+/// flat call-id values and return early if the result is false. Async
+/// wrappers call `task.return` first before returning; sync void just
 /// returns. Non-void targets paired with `gate` are rejected upstream.
 fn emit_gate_phase(
     f: &mut Function,
     gate: &GateConfig,
-    async_runtime: Option<&AsyncFuncs>,
-    wait_locals: Option<(u32, u32)>,
     task_return_for_async: Option<u32>,
     site: HookSite<'_>,
     bump_reset: BumpReset,
 ) {
-    f.instructions().i32_const(site.buf.offset);
-    f.instructions().i32_const(gate.result_ptr);
+    push_flat_call_id(f, site);
     f.instructions().call(gate.import_fn);
-    let art = async_runtime.expect("async_runtime active when gate is");
-    let (st, ws) = wait_locals.expect("wait_locals allocated alongside async_runtime");
-    f.instructions().local_set(st);
-    canon_async::emit_wait_loop(f, st, ws, art);
-    f.instructions().i32_const(gate.result_ptr);
-    // Canonical-ABI bool is 1 byte; the slot is i32-sized scratch but
-    // only byte 0 carries the value. Use a byte-load to keep the load
-    // width consistent with the type and the alignment honest.
-    f.instructions().i32_load8_u(wasm_encoder::MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    });
-    // `true` (nonzero) → call downstream (fall through). `false` (0)
-    // → skip and return; `i32.eqz` inverts so the `if` arm fires on
-    // the skip path.
+    // Bool is returned directly as i32. `true` → fall through; `false`
+    // → skip. `i32.eqz` inverts so the `if` arm fires on the skip path.
     f.instructions().i32_eqz();
     f.instructions().if_(BlockType::Empty);
     if let Some(tr_fn) = task_return_for_async {
@@ -1068,7 +950,7 @@ fn emit_async_wrapper_body(
     imp_task_return: u32,
     async_runtime: &AsyncFuncs,
     resource_drop: &HashMap<TypeId, u32>,
-    call_id_wiring: Option<CallIdWiring<'_>>,
+    call_id_wiring: Option<CallIdWiring>,
     bump_global: u32,
 ) {
     let nparams = fd.export_sig.params.len() as u32;
@@ -1077,10 +959,9 @@ fn emit_async_wrapper_body(
         global: bump_global,
         saved_local: locals.alloc_local(ValType::I32),
     };
-    // Wait-loop scratch, shared across hook awaits + the handler await.
+    // Wait-loop scratch for the async handler call.
     let st = locals.alloc_local(ValType::I32);
     let ws = locals.alloc_local(ValType::I32);
-    let wait_locals = Some((st, ws));
     // task.return is `wasm_signature(GuestImport, fake_func_with_result_as_param)`:
     // small results flatten into params; large results overflow into a
     // single retptr param (`indirect_params=true`). The `retptr` flag is
@@ -1115,31 +996,21 @@ fn emit_async_wrapper_body(
                 .expect("asymmetric indirect → params_record_offset reserved");
             build_lower_params_to_memory(resolve, sizes, &mut locals, func, base)
         });
-    // i64 call-id local + per-callsite bundle; both gated on hook wired.
     let hook_site = call_id_wiring.map(|w| HookSite {
         fd,
-        buf: w.buf,
         id_local: locals.alloc_local(ValType::I64),
+        counter_global: w.counter_global,
     });
 
     let mut f = Function::new_with_locals_types(locals.freeze().locals);
 
     emit_bump_save(&mut f, bump_reset);
 
-    if let (Some(w), Some(site)) = (call_id_wiring, hook_site) {
-        emit_alloc_call_id(&mut f, w.counter_global, site.id_local);
-        // Buffer contents (iface/fn name + id) are identical across
-        // before / gate / after — populate once up front.
-        populate_hook_call_id(&mut f, &site);
+    if let Some(site) = hook_site {
+        emit_alloc_call_id(&mut f, site.counter_global, site.id_local);
     }
     if let Some(idx) = imp_before {
-        emit_hook_call(
-            &mut f,
-            idx,
-            Some(async_runtime),
-            wait_locals,
-            hook_site.unwrap(),
-        );
+        emit_hook_call(&mut f, idx, hook_site.unwrap());
     }
     if let Some(g) = gate {
         // Async-with-result + gate is rejected upstream — reaching
@@ -1148,8 +1019,6 @@ fn emit_async_wrapper_body(
         emit_gate_phase(
             &mut f,
             g,
-            Some(async_runtime),
-            wait_locals,
             Some(imp_task_return),
             hook_site.unwrap(),
             bump_reset,
@@ -1186,13 +1055,7 @@ fn emit_async_wrapper_body(
     canon_async::emit_wait_loop(&mut f, st, ws, async_runtime);
 
     if let Some(idx) = imp_after {
-        emit_hook_call(
-            &mut f,
-            idx,
-            Some(async_runtime),
-            wait_locals,
-            hook_site.unwrap(),
-        );
+        emit_hook_call(&mut f, idx, hook_site.unwrap());
     }
 
     emit_borrow_drops(&mut f, &fd.borrow_drops, resource_drop);
@@ -1225,40 +1088,21 @@ fn emit_async_wrapper_body(
     code.function(&f);
 }
 
-/// Push the shared call-id buffer address, call the hook
-/// (`indirect_params = true`), and await. Caller is responsible for
-/// populating the buffer once up front — its contents are identical
-/// across before / gate / after callsites.
-fn emit_hook_call(
-    f: &mut Function,
-    hook_idx: u32,
-    async_runtime: Option<&AsyncFuncs>,
-    wait_locals: Option<(u32, u32)>,
-    site: HookSite<'_>,
-) {
-    f.instructions().i32_const(site.buf.offset);
-    let art = async_runtime.expect("async_runtime set when hook imported");
-    let (st, ws) = wait_locals.expect("wait_locals allocated with async_runtime");
-    canon_async::emit_call_and_wait(f, hook_idx, st, ws, art);
+/// Push the 5 flat call-id values then call the hook. The hook's sync
+/// canonical-ABI signature is `(i32, i32, i32, i32, i64) -> ()`.
+fn emit_hook_call(f: &mut Function, hook_idx: u32, site: HookSite<'_>) {
+    push_flat_call_id(f, site);
+    f.instructions().call(hook_idx);
 }
 
-/// Lower the call-id record into the shared buffer.
-fn populate_hook_call_id(f: &mut Function, site: &HookSite<'_>) {
-    emit_populate_call_id(
-        f,
-        site.buf.offset,
-        0,
-        &site.buf.layout,
-        BlobSlice {
-            off: site.fd.iface_name_offset as u32,
-            len: site.fd.iface_name_len as u32,
-        },
-        BlobSlice {
-            off: site.fd.fn_name_offset as u32,
-            len: site.fd.fn_name_len as u32,
-        },
-        site.id_local,
-    );
+/// Push `(iface_ptr, iface_len, fn_ptr, fn_len, id)` — the 5 flat
+/// wasm values for a `call-id` record — onto the wasm stack.
+fn push_flat_call_id(f: &mut Function, site: HookSite<'_>) {
+    f.instructions().i32_const(site.fd.iface_name_offset);
+    f.instructions().i32_const(site.fd.iface_name_len);
+    f.instructions().i32_const(site.fd.fn_name_offset);
+    f.instructions().i32_const(site.fd.fn_name_len);
+    f.instructions().local_get(site.id_local);
 }
 
 #[cfg(test)]

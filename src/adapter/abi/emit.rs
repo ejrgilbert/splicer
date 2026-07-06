@@ -744,8 +744,13 @@ pub(crate) fn find_imported_hook(
             return None;
         }
         let func = resolve.interfaces[*id].functions.values().next()?;
+        let (variant, mangling) = if func.kind.is_async() {
+            (AbiVariant::GuestImportAsync, hook_callback_mangling())
+        } else {
+            (AbiVariant::GuestImport, sync_mangling())
+        };
         let (module, name) = resolve.wasm_import_name(
-            hook_callback_mangling(),
+            mangling,
             WasmImport::Func {
                 interface: Some(key),
                 func,
@@ -754,7 +759,7 @@ pub(crate) fn find_imported_hook(
         Some(HookImport {
             module,
             name,
-            sig: resolve.wasm_signature(AbiVariant::GuestImportAsync, func),
+            sig: resolve.wasm_signature(variant, func),
             params: func.params.iter().map(|p| (p.name.clone(), p.ty)).collect(),
         })
     })
@@ -860,12 +865,6 @@ const CALLID_ID: &str = "id";
 pub(crate) struct CallIdLayout(RecordLayout);
 
 impl CallIdLayout {
-    pub(crate) fn size(&self) -> u32 {
-        self.0.size
-    }
-    pub(crate) fn align(&self) -> u32 {
-        self.0.align
-    }
     pub(crate) fn iface_off(&self) -> u32 {
         self.0.offset_of(CALLID_IFACE)
     }

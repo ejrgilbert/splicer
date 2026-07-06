@@ -133,6 +133,16 @@ jobs:
        run: make build-builtins
      - name: Install splicer from the PR-under-test tree
        run: cargo install --path . --force
+     - name: Override splicer WIT deps with local paths for middleware fixtures
+       run: |
+         for dir in tests/component-interposition/middleware/*/; do
+           cat > "$dir/wkg.toml" <<'EOF'
+         [overrides]
+         "splicer:tier1" = { path = "../../../../wit/tier1" }
+         "splicer:common" = { path = "../../../../wit/common" }
+         "splicer:tier2" = { path = "../../../../wit/tier2" }
+         EOF
+         done
      - name: Run integration tests
        env:
          SPLICER_BUILTINS_DIR: ${{ github.workspace }}/assets/builtins

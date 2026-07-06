@@ -19,9 +19,6 @@
 mod bindings {
     wit_bindgen::generate!({
         world: "otel-bare-logs-mdl",
-        async: [
-            "export:splicer:tier1/after@0.4.0#on-return",
-        ],
         generate_all,
     });
 }
@@ -107,7 +104,7 @@ fn scope() -> InstrumentationScope {
 pub struct OtelBareLogs;
 
 impl AfterGuest for OtelBareLogs {
-    async fn on_return(call: CallId) {
+    fn on_return(call: CallId) {
         let parent = outer_span_context();
         let (trace_id, span_id, trace_flags) = if empty_id(&parent.trace_id) {
             (None, None, None)

@@ -14,10 +14,6 @@
 mod bindings {
     wit_bindgen::generate!({
         world: "otel-bare-spans-mdl",
-        async: [
-            "export:splicer:tier1/before@0.4.0#on-call",
-            "export:splicer:tier1/after@0.4.0#on-return",
-        ],
         generate_all,
     });
 }
@@ -127,7 +123,7 @@ fn scope() -> InstrumentationScope {
 pub struct OtelBareSpans;
 
 impl BeforeGuest for OtelBareSpans {
-    async fn on_call(call: CallId) {
+    fn on_call(call: CallId) {
         let parent = outer_span_context();
         let trace_id = if empty_id(&parent.trace_id) {
             random_hex(TRACE_ID_BYTE_LEN)
@@ -162,7 +158,7 @@ impl BeforeGuest for OtelBareSpans {
 }
 
 impl AfterGuest for OtelBareSpans {
-    async fn on_return(call: CallId) {
+    fn on_return(call: CallId) {
         let popped = pending()
             .lock()
             .unwrap()
