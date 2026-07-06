@@ -73,7 +73,6 @@ pub fn emit_guest(
     interface_qualified_name: &str,
     behavior: Behavior,
     ir: &WrapperIR,
-    bridged_sync_target: bool,
 ) -> EmittedGuest {
     // Interface name is the deepest module-path segment.
     let interface_pascal = g
@@ -109,7 +108,6 @@ pub fn emit_guest(
             &g.module_path,
             &g.kind,
             ir,
-            bridged_sync_target,
         ));
     }
 
@@ -272,7 +270,6 @@ fn emit_method_body(
     guest_module_path: &[String],
     trait_kind: &GuestTraitKind,
     ir: &WrapperIR,
-    bridged_sync_target: bool,
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
@@ -398,17 +395,11 @@ fn emit_method_body(
             unreachable!("freestanding fn appeared in a per-resource Guest trait")
         }
     };
-    // Constructor's await was inlined above. For other calls,
-    // `.await` only when the wrapper is async AND the import is
-    // async; `bridged_sync_target` flags an async wrapper over a
-    // sync import and must skip `.await` too.
     let constructor_already_handled = matches!(
         (trait_kind, fn_kind),
         (GuestTraitKind::Resource(_), ExportFnKind::Constructor)
     );
-    let target_call = if constructor_already_handled {
-        target_call
-    } else if is_async && !bridged_sync_target {
+    let target_call = if !constructor_already_handled && is_async {
         quote! { #target_call.await }
     } else {
         target_call
@@ -937,7 +928,7 @@ mod tests {
         let bindings = build_bindings_index(&src).unwrap();
         let ir = build_ir(&resolve, world_id, &bindings, INTERFACE_QN).unwrap();
         let g = &bindings.guest_traits[0];
-        emit_guest(g, INTERFACE_QN, behavior, &ir, false)
+        emit_guest(g, INTERFACE_QN, behavior, &ir)
     }
 
     fn args_structs_str(emitted: &EmittedGuest) -> String {

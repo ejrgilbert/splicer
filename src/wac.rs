@@ -986,10 +986,8 @@ struct SpliceCtx<'a> {
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: Vec<GeneratedAdapter>,
-    /// `(target_split_path, target_interface)` ->
-    /// `(bridge_wasm_path, async_mirror_qualified_name)`. One bridge
-    /// per distinct provider+interface across the run; shared by every
-    /// site that needs it.
+    /// `(target_split_path, target_interface)` -> `(bridge_wasm_path, bridge_qualified_name)`.
+    /// One bridge per distinct provider+interface across the run; shared by every site that needs it.
     bridges: HashMap<(String, String), (String, String)>,
     /// Tier-3/4 matches skipped because the strategy's bound didn't fit.
     skips: Vec<SkipRecord>,
@@ -1406,8 +1404,6 @@ fn materialize_tier3_4_inline(
             .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))
     };
 
-    let mirror_for_target: Option<String> = None;
-
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
     for (inj, source) in to_inject.iter().zip(sources) {
         let Some(source) = source else {
@@ -1421,7 +1417,6 @@ fn materialize_tier3_4_inline(
             source,
             &split_bytes,
             interface_name,
-            mirror_for_target.as_deref(),
             &mut accs.verified_strategies,
         )
         .with_context(|| {
