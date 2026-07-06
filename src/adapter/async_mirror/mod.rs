@@ -1,7 +1,4 @@
-//! Async-WIT mirror synthesis and the sync-to-async bridge component
-//! that uses it.
-
-pub(crate) mod bridge;
+//! Async-WIT mirror synthesis.
 
 pub(crate) const MIRROR_NAME_MISMATCH_PREFIX: &str = "async mirror name mismatch";
 

@@ -357,10 +357,12 @@ pub enum WitTypeRef {
 }
 
 /// Categorizes the four canonical-ABI handle kinds.
-#[allow(dead_code)]
 pub enum HandleRef {
     ErrorContext,
+    /// Future and stream not supported yet
+    #[allow(dead_code)]
     Future(Box<WitTypeRef>),
+    #[allow(dead_code)]
     Stream(Box<WitTypeRef>),
     ResourceOwn(NamedRef),
     ResourceBorrow(NamedRef),

@@ -1,4 +1,3 @@
-use crate::adapter::async_mirror::bridge::generate_sync_async_bridge;
 use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
@@ -987,13 +986,10 @@ struct SpliceCtx<'a> {
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: Vec<GeneratedAdapter>,
-    #[allow(dead_code)]
-    target_has_sync_cache: HashMap<(String, String), bool>,
     /// `(target_split_path, target_interface)` ->
     /// `(bridge_wasm_path, async_mirror_qualified_name)`. One bridge
     /// per distinct provider+interface across the run; shared by every
     /// site that needs it.
-    #[allow(dead_code)]
     bridges: HashMap<(String, String), (String, String)>,
     /// Tier-3/4 matches skipped because the strategy's bound didn't fit.
     skips: Vec<SkipRecord>,
@@ -1718,66 +1714,6 @@ fn factored_types_to_wire(
         out.push(extra.clone());
     }
     Ok(out)
-}
-
-/// Cached bridge generation. Returns the bridge's `.wasm` path and
-/// the async-mirror interface's fully-qualified name.
-#[allow(dead_code)]
-fn ensure_bridge(
-    target_interface: &str,
-    target_split_path: &str,
-    splits_output_path: &str,
-    accs: &mut SpliceAccumulators,
-) -> anyhow::Result<(String, String)> {
-    let key = (target_split_path.to_string(), target_interface.to_string());
-    if let Some(entry) = accs.bridges.get(&key) {
-        return Ok(entry.clone());
-    }
-    let entry =
-        generate_sync_async_bridge(target_interface, splits_output_path, target_split_path)?;
-    accs.bridges.insert(key, entry.clone());
-    Ok(entry)
-}
-
-/// True iff `target_interface` (resolved via the component at
-/// `target_split_path`, which imports or exports it) has at least one
-/// function declared as `func` (sync) at WIT -- i.e. splicer's adapter
-/// would be forced to lift that signature as sync.
-#[allow(dead_code)]
-fn target_interface_has_sync_func(target_interface: &str, target_split_path: &str) -> bool {
-    let Ok(bytes) = std::fs::read(target_split_path) else {
-        return false;
-    };
-    let Ok(decoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wit_component::decode(&bytes)
-    })) else {
-        return false;
-    };
-    let Ok(wit_component::DecodedWasm::Component(resolve, world_id)) = decoded else {
-        return false;
-    };
-    let world = &resolve.worlds[world_id];
-    // Look across both imports and exports of the split — splicer
-    // calls into either side, depending on direction.
-    let surfaces = world.imports.values().chain(world.exports.values());
-    for item in surfaces {
-        let wit_parser::WorldItem::Interface { id, .. } = item else {
-            continue;
-        };
-        let Some(qname) = resolve.id_of(*id) else {
-            continue;
-        };
-        if crate::parse::wit_name::unversioned(&qname)
-            != crate::parse::wit_name::unversioned(target_interface)
-        {
-            continue;
-        }
-        let iface = &resolve.interfaces[*id];
-        if iface.functions.values().any(|f| !f.kind.is_async()) {
-            return true;
-        }
-    }
-    false
 }
 
 #[derive(Clone, Copy)]
