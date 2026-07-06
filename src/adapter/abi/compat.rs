@@ -14,10 +14,6 @@
 use wit_bindgen_core::abi::{Bitcast, FlatTypes, WasmType};
 use wit_parser::{Resolve, Type};
 
-/// Canonical-ABI parameter flat-width cap — 16 core-wasm values before
-/// the ABI falls back to indirect-through-pointer lowering.
-pub(crate) const MAX_FLAT_PARAMS: usize = 16;
-
 /// Cap for flat-type computations in memory (retptr) context. Wasm locals
 /// have no 16-limit; this is a practical bound for realistic WIT types.
 pub(crate) const MAX_FLAT_MEMORY_TYPES: usize = 256;
@@ -85,14 +81,13 @@ pub(crate) fn cast(from: WasmType, to: WasmType) -> Bitcast {
 /// Canonical-ABI flat-types computation: returns the flat wasm types
 /// for `ty`, or `None` if flattening exceeds `max_params`.
 ///
-/// Verbatim from `wit-bindgen-core/src/abi.rs:2622`, with the private
-/// `MAX_FLAT_PARAMS` constant replaced by the local copy above.
+/// Verbatim from `wit-bindgen-core/src/abi.rs:2622`.
 pub(crate) fn flat_types(
     resolve: &Resolve,
     ty: &Type,
     max_params: Option<usize>,
 ) -> Option<Vec<WasmType>> {
-    let max_params = max_params.unwrap_or(MAX_FLAT_PARAMS);
+    let max_params = max_params.unwrap_or(Resolve::MAX_FLAT_PARAMS);
     let mut storage = std::iter::repeat_n(WasmType::I32, max_params).collect::<Vec<_>>();
     let mut flat = FlatTypes::new(storage.as_mut_slice());
     resolve.push_flat(ty, &mut flat).then_some(flat.to_vec())
