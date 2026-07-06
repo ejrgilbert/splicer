@@ -28,9 +28,7 @@ use splicer_tool_sdk::{sanitize_for_filename, strip_leading_slashes, CallId, Fie
 struct State {
     buf: Vec<u8>,
     header_written: bool,
-    /// Lazily-opened append stream for the `file` sink. Held alongside
-    /// the descriptor so the file stays open across flushes — opening
-    /// per flush would re-create on every call and is expensive.
+    /// Lazily-opened append stream for the `file` sink
     file: Option<(Descriptor, OutputStream)>,
 }
 
@@ -92,9 +90,13 @@ fn drain_to_file(s: &mut State) {
     let (_desc, stream) = s
         .file
         .get_or_insert_with(|| open_file_for_edge(edge_id()));
-    // Best-effort: a stream error mid-recording isn't recoverable, but
-    // also isn't worth panicking over — match the io::Write behavior.
-    let _ = stream.blocking_write_and_flush(&s.buf);
+
+    let mut remaining = s.buf.as_slice();
+    while !remaining.is_empty() {
+        let n = remaining.len().min(WASI_BLOCKING_WRITE_MAX as usize);
+        let _ = stream.blocking_write_and_flush(&remaining[..n]);
+        remaining = &remaining[n..];
+    }
     shrink_after_flush(&mut s.buf);
 }
 
@@ -111,6 +113,9 @@ fn shrink_after_flush(buf: &mut Vec<u8>) {
 /// Capacity the recorder buffer is shrunk back to after flush, when a
 /// preceding event temporarily grew it past this.
 const BUF_FLOOR_CAPACITY: usize = 8 * 1024;
+
+/// Hard per-call size limit on `blocking-write-and-flush` enforced by wasmtime-wasi-io.
+const WASI_BLOCKING_WRITE_MAX: u64 = 4096;
 
 /// Open (or create) the recording file for this edge under
 /// `<preopen>/<config::dir()>/<sanitized_edge_id>.bin` and return an
