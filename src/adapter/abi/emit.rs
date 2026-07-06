@@ -405,7 +405,7 @@ pub(crate) fn require_indirect_params_supported_shape(
                 "{kind} function `{fn_name}` param `{}` flat representation \
                  exceeds MAX_FLAT_PARAMS ({}).",
                 param.name,
-                super::compat::MAX_FLAT_PARAMS,
+                Resolve::MAX_FLAT_PARAMS,
             );
         }
     }

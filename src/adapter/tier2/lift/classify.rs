@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
-use super::super::super::abi::flat_types;
+use super::super::super::abi::{flat_types, MAX_FLAT_MEMORY_TYPES};
 use super::super::blob::NameInterner;
 use super::plan::{Cell, LiftPlan, MapAliases};
 use super::sidetable::CellSideData;
@@ -148,12 +148,23 @@ pub(crate) fn classify_result_lift(
         if !is_supported_result(ty, resolve) {
             return Ok(None);
         }
-        // Compound emit reads the result's flat representation at
-        // emit.rs:912; bail early when it would overflow.
-        if flat_types(resolve, ty, None).is_none() {
+        // When retptr, data comes from memory and we allocate wasm locals --
+        // no signature cap. When not retptr (single-slot compound), the value
+        // lands in lcl.result and must fit in a wasm return slot.
+        let flat_cap = if result_at_retptr {
+            MAX_FLAT_MEMORY_TYPES
+        } else {
+            Resolve::MAX_FLAT_PARAMS
+        };
+        if flat_types(resolve, ty, Some(flat_cap)).is_none() {
             return Err(anyhow!(
-                "compound result flat representation exceeds MAX_FLAT_PARAMS ({})",
-                Resolve::MAX_FLAT_PARAMS,
+                "compound result flat representation exceeds {} ({})",
+                if result_at_retptr {
+                    "MAX_FLAT_MEMORY_TYPES"
+                } else {
+                    "MAX_FLAT_PARAMS"
+                },
+                flat_cap,
             ));
         }
         let plan = LiftPlan::for_type(ty, resolve, names, map_aliases)?;

@@ -12,8 +12,8 @@ use super::super::super::abi::emit::{
     RecordLayout, I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, MAX_UTF8_LEN,
     OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
-use super::super::super::abi::flat_types;
 use super::super::super::abi::WasmEncoderBindgen;
+use super::super::super::abi::{flat_types, MAX_FLAT_MEMORY_TYPES};
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
 use super::super::cells::{CellLayout, PayloadSource};
 use super::super::FuncDispatch;
@@ -919,11 +919,11 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 cell_side,
             } => {
                 let side_refs = CellSideRefs { cell_side };
-                let flat = flat_types(resolve, &compound.ty, None).unwrap_or_else(|| {
+                let flat_cap = retptr_offset.map(|_| MAX_FLAT_MEMORY_TYPES);
+                let flat = flat_types(resolve, &compound.ty, flat_cap).unwrap_or_else(|| {
                     unreachable!(
-                        "Compound result must flatten within MAX_FLAT_PARAMS ({}) — \
-                         classify_result_lift rejects upstream",
-                        Resolve::MAX_FLAT_PARAMS
+                        "Compound result must flatten within bounds — \
+                         classify_result_lift rejects upstream"
                     )
                 });
                 assert_eq!(
