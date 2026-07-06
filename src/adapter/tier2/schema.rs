@@ -46,9 +46,7 @@ pub(super) const RECORD_INFO_FIELDS: &str = "fields";
 pub(super) const RECORD_FIELD_TUPLE_NAME: &str = "name";
 pub(super) const RECORD_FIELD_TUPLE_IDX: &str = "idx";
 
-// Field names within the on-call / on-return func-params records.
-pub(super) const ON_CALL_CALL: &str = "call";
-pub(super) const ON_CALL_ARGS: &str = "args";
+// Field names within the on-return func-params record.
 pub(super) const ON_RET_CALL: &str = "call";
 pub(super) const ON_RET_RESULT: &str = "result";
 

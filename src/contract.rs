@@ -549,7 +549,7 @@ mod tests {
     #[test]
     fn match_tier_interfaces_picks_up_versioned_exports() {
         // Versioned export key + unversioned constant → semver-compatible match.
-        let exports = exports_for(&["splicer:tier2/before@0.2.0", "splicer:tier2/after@0.2.7"]);
+        let exports = exports_for(&["splicer:tier2/before@0.3.0", "splicer:tier2/after@0.3.1"]);
         let matched = match_tier_interfaces(&exports, TIER2_INTERFACES, TIER2_VERSION);
         assert_eq!(matched.len(), 2);
         assert!(matched.iter().any(|i| i == "splicer:tier2/before"));

@@ -14,8 +14,8 @@ use super::super::abi::canon_async;
 use super::super::abi::emit::{
     emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save,
     emit_cabi_realloc_call, emit_cabi_realloc_call_runtime, emit_handler_call,
-    emit_populate_call_id, emit_store_i64_local, emit_store_slice, emit_store_slice_len_runtime,
-    emit_store_slice_ptr_runtime, emit_wrapper_return, BlobSlice, BumpReset, RecordLayout,
+    emit_store_i64_local, emit_store_slice_len_runtime, emit_store_slice_ptr_runtime,
+    emit_wrapper_return, BlobSlice, BumpReset, RecordLayout,
 };
 use super::super::indices::LocalsBuilder;
 use super::lift::plan::LiftPlan;
@@ -25,8 +25,8 @@ use super::lift::{
     ListEmitLocals, RecordInfoOffsets, ResultEmitPlan, VariantInfoOffsets, WrapperLocals,
 };
 use super::schema::{
-    SchemaLayouts, FIELD_TREE, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
-    TREE_FLAGS_INFOS, TREE_HANDLE_INFOS, TREE_RECORD_INFOS, TREE_VARIANT_INFOS,
+    SchemaLayouts, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_FLAGS_INFOS,
+    TREE_HANDLE_INFOS, TREE_RECORD_INFOS, TREE_VARIANT_INFOS,
 };
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
@@ -36,21 +36,18 @@ pub(super) struct WrapperCtx<'a> {
     pub(super) schema: &'a SchemaLayouts,
     pub(super) resolve: &'a Resolve,
     pub(super) iface_name: BlobSlice,
-    pub(super) before_hook: Option<BeforeHook<'a>>,
+    pub(super) before_hook: Option<BeforeHook>,
     pub(super) after_hook: Option<AfterHook<'a>>,
-    pub(super) gate_hook: Option<GateHook<'a>>,
+    pub(super) gate_hook: Option<GateHook>,
     /// i64 counter; bumped once per call to publish `call-id.id`.
     pub(super) call_id_counter_global: u32,
     /// Bump-allocator i32 global; save/restore frees per-call `cabi_realloc`.
     pub(super) bump_global: u32,
 }
 
-/// Per-build values for the before-hook emit path. Bundled so the
-/// wrapper takes one `if let Some(...)` arm vs three correlated Options.
-pub(super) struct BeforeHook<'a> {
+/// Per-build values for the before-hook emit path.
+pub(super) struct BeforeHook {
     pub(super) idx: u32,
-    pub(super) layout: &'a RecordLayout,
-    pub(super) params_ptr: i32,
 }
 
 /// Per-build values for the after-hook emit path. Per-fn params-buffer
@@ -60,25 +57,10 @@ pub(super) struct AfterHook<'a> {
     pub(super) layout: &'a RecordLayout,
 }
 
-/// Per-build values for the gate-hook emit path. Shares the
-/// `{ call, args }` params buffer with `before` (so `params_ptr`
-/// aliases `BeforeHook::params_ptr` whenever both are wired), and
-/// adds the bool retptr slot the wrapper reads to decide whether to
-/// invoke downstream.
-pub(super) struct GateHook<'a> {
+/// Per-build values for the gate-hook emit path. Bool result returned
+/// directly as i32 (no retptr needed).
+pub(super) struct GateHook {
     pub(super) idx: u32,
-    pub(super) layout: &'a RecordLayout,
-    pub(super) params_ptr: i32,
-    pub(super) result_ptr: i32,
-}
-
-/// Per-call values written into the on-call indirect-params buffer.
-struct OnCallCallSite {
-    iface_name: BlobSlice,
-    fn_name: BlobSlice,
-    args: BlobSlice,
-    /// Local holding this invocation's id (bumped at body top).
-    id_local: u32,
 }
 
 /// Where the patched `cells: list<cell>` slice lives + per-plan
@@ -271,29 +253,25 @@ fn emit_alloc_info_buffer_for_plan(
     emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
 
-/// Write the call-id record + per-call `list<field>` args pointer/len
-/// into the indirect-params buffer at `params_ptr`. `layout` is the
-/// shared `{ call, args }` record layout used by both `before` and
-/// `gate` hooks.
-fn emit_populate_hook_params(
+/// Push the 7 flat values for a `(call: call-id, args: list<field>)`
+/// call onto the wasm stack. Used by the sync before- and gate-hook
+/// call sites; the hook's canonical-ABI sig is
+/// `(i32, i32, i32, i32, i64, i32, i32) -> ()`.
+fn emit_flat_before_params(
     f: &mut Function,
-    schema: &SchemaLayouts,
-    layout: &RecordLayout,
-    params_ptr: i32,
-    site: &OnCallCallSite,
+    ctx: &WrapperCtx<'_>,
+    fd: &FuncDispatch,
+    nargs: u32,
+    args_off: u32,
+    id_local: u32,
 ) {
-    let call_off = layout.offset_of(ON_CALL_CALL);
-    let args_off = layout.offset_of(ON_CALL_ARGS);
-    emit_populate_call_id(
-        f,
-        params_ptr,
-        call_off,
-        &schema.callid_layout,
-        site.iface_name,
-        site.fn_name,
-        site.id_local,
-    );
-    emit_store_slice(f, params_ptr, args_off, site.args);
+    f.instructions().i32_const(ctx.iface_name.off as i32);
+    f.instructions().i32_const(ctx.iface_name.len as i32);
+    f.instructions().i32_const(fd.fn_name_offset);
+    f.instructions().i32_const(fd.fn_name_len);
+    f.instructions().local_get(id_local);
+    f.instructions().i32_const(args_off as i32);
+    f.instructions().i32_const(nargs as i32);
 }
 
 pub(super) fn emit_wrapper_function(
@@ -347,16 +325,11 @@ pub(super) fn emit_wrapper_function(
 
     // ── Phase 1: on-call + gate (lift runs if either is wired) ──
     //
-    // The `before` and `gate` hooks share the `{ call, args }` params
-    // record (and, when both wired, the same buffer offset), so the
-    // lift work — cells alloc, info-buffer alloc, plan emit — runs
-    // once and is consumed by either / both hook calls below.
-    let args_buf = ctx
-        .before_hook
-        .as_ref()
-        .map(|h| (h.layout, h.params_ptr))
-        .or_else(|| ctx.gate_hook.as_ref().map(|h| (h.layout, h.params_ptr)));
-    if let Some((args_layout, args_buf_ptr)) = args_buf {
+    // Both hooks take flat params `(call-id: 5 flat, args: list 2 flat)`.
+    // The lift work — cells alloc, info-buffer alloc, plan emit — runs
+    // once; args.ptr points at the fields buffer built here.
+    let has_before_or_gate = ctx.before_hook.is_some() || ctx.gate_hook.is_some();
+    if has_before_or_gate {
         // Symmetric-indirect (sync >16 flat): wrapper has only `local
         // 0` (the host's params pointer), so we materialize each
         // param's flat representation into synth locals up front by
@@ -454,33 +427,25 @@ pub(super) fn emit_wrapper_function(
         }
         let nargs = fd.params.len() as u32;
         let args_off = if nargs == 0 { 0 } else { fd.fields_buf_offset };
-        emit_populate_hook_params(
-            &mut f,
-            schema,
-            args_layout,
-            args_buf_ptr,
-            &OnCallCallSite {
-                iface_name: ctx.iface_name,
-                fn_name: BlobSlice {
-                    off: fd.fn_name_offset as u32,
-                    len: fd.fn_name_len as u32,
-                },
-                args: BlobSlice {
-                    off: args_off,
-                    len: nargs,
-                },
-                id_local: lcl.id_local,
-            },
-        );
         if let Some(before) = ctx.before_hook.as_ref() {
-            f.instructions().i32_const(before.params_ptr);
-            canon_async::emit_call_and_wait(&mut f, before.idx, lcl.st, lcl.ws, async_funcs);
+            emit_flat_before_params(&mut f, ctx, fd, nargs, args_off, lcl.id_local);
+            f.instructions().call(before.idx);
         }
         if let Some(gate) = ctx.gate_hook.as_ref() {
-            f.instructions().i32_const(gate.params_ptr);
-            f.instructions().i32_const(gate.result_ptr);
-            canon_async::emit_call_and_wait(&mut f, gate.idx, lcl.st, lcl.ws, async_funcs);
-            emit_gate_skip_branch(&mut f, gate.result_ptr, fd, func_idx, i, bump_reset);
+            emit_flat_before_params(&mut f, ctx, fd, nargs, args_off, lcl.id_local);
+            f.instructions().call(gate.idx);
+            // Bool result on the stack directly as i32. `true` → fall
+            // through; `false` → skip. `i32.eqz` fires the if-arm on skip.
+            f.instructions().i32_eqz();
+            f.instructions().if_(wasm_encoder::BlockType::Empty);
+            if let FuncShape::Async(_) = &fd.shape {
+                let imp_task_return = func_idx.task_return_idx[i]
+                    .expect("async target with gate hook must have task.return import");
+                f.instructions().call(imp_task_return);
+            }
+            emit_bump_restore(&mut f, bump_reset);
+            f.instructions().return_();
+            f.instructions().end();
         }
     }
 
@@ -686,7 +651,7 @@ pub(super) fn emit_wrapper_function(
             after_static.layout.offset_of(ON_RET_CALL) + schema.callid_layout.id_off();
         emit_store_i64_local(&mut f, after_pf.params_offset, id_field_off, lcl.id_local);
         f.instructions().i32_const(after_pf.params_offset);
-        canon_async::emit_call_and_wait(&mut f, after_static.idx, lcl.st, lcl.ws, async_funcs);
+        f.instructions().call(after_static.idx);
     }
 
     // Drop borrow handles before tail (runtime-required).
@@ -706,43 +671,6 @@ pub(super) fn emit_wrapper_function(
     f.instructions().end();
     code.function(&f);
     Ok(())
-}
-
-/// Load the bool the gate hook wrote, invert it, and on the skip
-/// path (gate returned `false`) restore bump and return early.
-/// Async-void targets call `task.return` first so the export's
-/// canon-async caller sees a completed call. Non-void + gate is
-/// rejected upstream — see `require_supported_case`.
-fn emit_gate_skip_branch(
-    f: &mut Function,
-    gate_result_ptr: i32,
-    fd: &FuncDispatch,
-    func_idx: &FuncIndices,
-    func_i: usize,
-    bump_reset: BumpReset,
-) {
-    f.instructions().i32_const(gate_result_ptr);
-    // Canonical-ABI bool is 1 byte; the slot is i32-sized scratch but
-    // only byte 0 carries the value. Use a byte-load to keep the load
-    // width consistent with the type and the alignment honest.
-    f.instructions().i32_load8_u(wasm_encoder::MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    });
-    // `true` (nonzero) → call downstream (fall through). `false` (0)
-    // → skip and return; `i32.eqz` inverts so the `if` arm fires on
-    // the skip path.
-    f.instructions().i32_eqz();
-    f.instructions().if_(wasm_encoder::BlockType::Empty);
-    if let FuncShape::Async(_) = &fd.shape {
-        let imp_task_return = func_idx.task_return_idx[func_i]
-            .expect("async target with gate hook must have task.return import");
-        f.instructions().call(imp_task_return);
-    }
-    emit_bump_restore(f, bump_reset);
-    f.instructions().return_();
-    f.instructions().end();
 }
 
 /// Async tail. Three shapes: void (no args); indirect_params (push

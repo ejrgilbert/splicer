@@ -204,23 +204,10 @@ fn build_dispatch_module(
         func_idx.init_idx,
         func_idx.cabi_realloc_idx,
     );
-    // The args-shape buffer (`hook_params_ptr`) is shared between
-    // before + gate; either wired side latches onto it. The
-    // unreachable arms encode the "wired together or not at all"
-    // contract per hook.
-    let hook_params_ptr = plan.hook_params_ptr.map(|p| p as i32);
-    let before_hook = match (
-        schema.before_hook.as_ref(),
-        func_idx.before_hook_idx,
-        hook_params_ptr,
-    ) {
-        (Some(h), Some(idx), Some(params_ptr)) => Some(BeforeHook {
-            idx,
-            layout: &h.params_layout,
-            params_ptr,
-        }),
-        (None, None, _) => None,
-        _ => unreachable!("before-hook schema, import idx, and params-ptr wired in lockstep"),
+    let before_hook = match (schema.before_hook.as_ref(), func_idx.before_hook_idx) {
+        (Some(_), Some(idx)) => Some(BeforeHook { idx }),
+        (None, None) => None,
+        _ => unreachable!("before-hook schema and import idx wired in lockstep"),
     };
     let after_hook = match (schema.after_hook.as_ref(), func_idx.after_hook_idx) {
         (Some(h), Some(idx)) => Some(AfterHook {
@@ -230,22 +217,10 @@ fn build_dispatch_module(
         (None, None) => None,
         _ => unreachable!("after-hook schema and import idx wired in lockstep"),
     };
-    let gate_hook = match (
-        schema.gate_hook.as_ref(),
-        func_idx.gate_hook_idx,
-        hook_params_ptr,
-        plan.gate_result_ptr,
-    ) {
-        (Some(h), Some(idx), Some(params_ptr), Some(result_ptr)) => Some(GateHook {
-            idx,
-            layout: &h.params_layout,
-            params_ptr,
-            result_ptr,
-        }),
-        (None, None, _, None) => None,
-        _ => unreachable!(
-            "gate-hook schema, import idx, params-ptr, and result-ptr wired in lockstep"
-        ),
+    let gate_hook = match (schema.gate_hook.as_ref(), func_idx.gate_hook_idx) {
+        (Some(_), Some(idx)) => Some(GateHook { idx }),
+        (None, None) => None,
+        _ => unreachable!("gate-hook schema and import idx wired in lockstep"),
     };
     let wrapper_ctx = WrapperCtx {
         schema,
