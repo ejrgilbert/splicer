@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
-use super::super::super::abi::{flat_types, MAX_FLAT_MEMORY_TYPES, MAX_FLAT_PARAMS};
+use super::super::super::abi::{flat_types, MAX_FLAT_MEMORY_TYPES};
 use super::super::blob::NameInterner;
 use super::plan::{Cell, LiftPlan, MapAliases};
 use super::sidetable::CellSideData;
@@ -154,7 +154,7 @@ pub(crate) fn classify_result_lift(
         let flat_cap = if result_at_retptr {
             MAX_FLAT_MEMORY_TYPES
         } else {
-            MAX_FLAT_PARAMS
+            Resolve::MAX_FLAT_PARAMS
         };
         if flat_types(resolve, ty, Some(flat_cap)).is_none() {
             return Err(anyhow!(
