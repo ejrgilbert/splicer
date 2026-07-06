@@ -216,7 +216,16 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
     // Strict mode promotes bound-mismatch skips to a hard failure.
     if strict {
         if let Some(summary) = format_skip_summary(&out.skips) {
-            anyhow::bail!("{summary}\n(strict mode: bound mismatches are fatal)");
+            let mut msg = format!("{summary}\n(strict mode: bound mismatches are fatal)");
+            for skip in &out.skips {
+                if !skip.stderr.is_empty() {
+                    msg.push_str(&format!(
+                        "\n\n--- cargo stderr for {} on {} ---\n{}",
+                        skip.strategy, skip.interface, skip.stderr
+                    ));
+                }
+            }
+            anyhow::bail!("{msg}");
         }
     }
 

@@ -252,7 +252,7 @@ mod tests {
         let guests: Vec<EmittedGuest> = bindings
             .guest_traits
             .iter()
-            .map(|g| emit_guest(g, INTERFACE_QN, behavior, &ir, false))
+            .map(|g| emit_guest(g, INTERFACE_QN, behavior, &ir))
             .collect();
 
         let inputs = WrapperCrateInputs {

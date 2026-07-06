@@ -401,6 +401,7 @@ rules:
             strategy: "my-strat".into(),
             interface: HTTP.into(),
             bound: None,
+            stderr: String::new(),
         }];
         let out = preview_core(http_chain(), EXACT_PRUNE_YAML, None, &skips).expect("preview");
         assert_eq!(out.incompatible_rules, vec![1]);
@@ -439,6 +440,7 @@ rules:
             strategy: "bad-strat".into(),
             interface: HTTP.into(),
             bound: None,
+            stderr: String::new(),
         }];
         let out =
             preview_core(http_chain(), TWO_RULES_SAME_EDGE_YAML, None, &skips).expect("preview");
@@ -521,6 +523,7 @@ rules:
             strategy: "chaos-err".into(),
             interface: "wasi:http/handler@0.3.0".into(),
             bound: None,
+            stderr: String::new(),
         }];
         assert!(site_pruned(&rule, "wasi:http/handler@0.3.0", &skips));
         // Same strategy, different interface: not pruned.
@@ -536,6 +539,7 @@ rules:
             strategy: "my-strat".into(),
             interface: "my:svc/ops@1.0.0".into(),
             bound: None,
+            stderr: String::new(),
         }];
         assert!(site_pruned(&rule, "my:svc/ops@1.0.0", &skips));
         // A skip for a different strategy doesn't prune this rule.
@@ -543,6 +547,7 @@ rules:
             strategy: "someone-else".into(),
             interface: "my:svc/ops@1.0.0".into(),
             bound: None,
+            stderr: String::new(),
         }];
         assert!(!site_pruned(&rule, "my:svc/ops@1.0.0", &other));
     }

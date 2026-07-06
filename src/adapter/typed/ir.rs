@@ -45,17 +45,22 @@ pub fn build_ir(
     let world = &resolve.worlds[world_id];
 
     // Walk exports first, then imports — when an interface is on
-    // both sides, the export entry is canonical (wit-bindgen puts
-    // shared types under `exports::` and `pub use`s them on the
-    // import side). `seen_iface_ids.insert` both records and dedupes.
+    // both sides, the export entry is canonical. Dedup by both
+    // InterfaceId AND qualified name.
     let mut ifaces: Vec<IfaceEntry> = Vec::new();
     let mut seen_iface_ids: HashSet<InterfaceId> = HashSet::new();
+    let mut seen_iface_names: HashSet<String> = HashSet::new();
     let exports = world.exports.iter().map(|(_, item)| (item, true));
     let imports = world.imports.iter().map(|(_, item)| (item, false));
     for (item, is_export) in exports.chain(imports) {
         let id = require_iface(item)?;
         if !seen_iface_ids.insert(id) {
             continue;
+        }
+        if let Some(qname) = resolve.id_of(id) {
+            if !seen_iface_names.insert(qname) {
+                continue;
+            }
         }
         let path = module_path_for_interface(resolve, id, is_export).with_context(|| {
             let side = if is_export { "exported" } else { "imported" };
@@ -352,10 +357,12 @@ pub enum WitTypeRef {
 }
 
 /// Categorizes the four canonical-ABI handle kinds.
-#[allow(dead_code)]
 pub enum HandleRef {
     ErrorContext,
+    /// Future and stream not supported yet
+    #[allow(dead_code)]
     Future(Box<WitTypeRef>),
+    #[allow(dead_code)]
     Stream(Box<WitTypeRef>),
     ResourceOwn(NamedRef),
     ResourceBorrow(NamedRef),
@@ -806,7 +813,7 @@ fn require_iface(item: &WorldItem) -> Result<InterfaceId> {
 /// kebab-case package / namespace / iface segments lower to
 /// snake_case, exports nest under an `exports::` prefix, imports
 /// don't.
-fn module_path_for_interface(
+pub(super) fn module_path_for_interface(
     resolve: &Resolve,
     interface_id: InterfaceId,
     is_export: bool,

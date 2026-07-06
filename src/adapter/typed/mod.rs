@@ -14,7 +14,7 @@ mod ir;
 pub(crate) mod target_wit;
 
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
-pub use bindgen::run_wit_bindgen_rust;
+pub use bindgen::{alias_shared_export_types, run_wit_bindgen_rust};
 pub use bindings_index::build_bindings_index;
 pub use build::{build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
 pub use emit_method::{emit_guest, emit_resource_newtypes, EmittedGuest};
@@ -23,7 +23,7 @@ pub use emit_wit_typed::emit_wit_typed_impls;
 pub use ir::{build_ir, NamedKind, NamedType, WitTypeRef, WrapperIR};
 pub use target_wit::{target_wit_for_codegen, TargetWit};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// What the strategy does to the wrapped target — the codegen
 /// template's transform/virtualize knob.
@@ -50,6 +50,8 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     // distinct slices of the same source.
     let (resolve, world_id, bindings_src) =
         run_wit_bindgen_rust(input.target_wit, input.world_name)?;
+    // Index and IR walk the original bindings (with struct/enum definitions
+    // on both sides) so the IR can classify types correctly.
     let bindings = build_bindings_index(&bindings_src)?;
     let ir = build_ir(
         &resolve,
@@ -57,6 +59,10 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         &bindings,
         input.interface_qualified_name,
     )?;
+    // After indexing: replace export-side named-type definitions with type
+    // aliases that point to the import-side definition to fix type identity.
+    let bindings_src = alias_shared_export_types(&bindings_src, &resolve, world_id)
+        .context("post-processing wit-bindgen output for shared-interface type aliases")?;
     // User-declared types + per-method synthesized args records both
     // ride the same emitter via NamedKind dispatch.
     let user_impls = emit_wit_typed_impls(&ir.types);
@@ -65,15 +71,7 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     let guests: Vec<EmittedGuest> = bindings
         .guest_traits
         .iter()
-        .map(|g| {
-            emit_guest(
-                g,
-                input.interface_qualified_name,
-                input.behavior,
-                &ir,
-                input.bridged_sync_target,
-            )
-        })
+        .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior, &ir))
         .collect();
     let resource_newtypes = emit_resource_newtypes(&ir, input.behavior);
 
@@ -125,9 +123,6 @@ pub struct GenerateWrapperInput<'a> {
     /// match the version the strategy itself declares so cargo
     /// dedupes the two into a single source.
     pub splicer_tool_sdk_version: &'a str,
-    /// `true` when the wrapper lifts an async-WIT mirror against a
-    /// sync-WIT downstream
-    pub bridged_sync_target: bool,
 }
 
 /// Output of [`generate_wrapper_crate`]: the two source strings that

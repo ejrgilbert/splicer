@@ -73,7 +73,6 @@ pub fn emit_guest(
     interface_qualified_name: &str,
     behavior: Behavior,
     ir: &WrapperIR,
-    bridged_sync_target: bool,
 ) -> EmittedGuest {
     // Interface name is the deepest module-path segment.
     let interface_pascal = g
@@ -109,7 +108,6 @@ pub fn emit_guest(
             &g.module_path,
             &g.kind,
             ir,
-            bridged_sync_target,
         ));
     }
 
@@ -272,7 +270,6 @@ fn emit_method_body(
     guest_module_path: &[String],
     trait_kind: &GuestTraitKind,
     ir: &WrapperIR,
-    bridged_sync_target: bool,
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
@@ -382,9 +379,9 @@ fn emit_method_body(
                     build_static_call(is_async, &import_resource, method_ident, fields)
                 }
                 Behavior::Virtualize => {
-                    // tier-4 has no import side; static methods would
-                    // need to dispatch through the strategy. Not yet
-                    // wired.
+                    // tier-4 static: no downstream import, so target_call
+                    // is a placeholder; SyncVirtualizeStrategy dispatch
+                    // below ignores it and routes through the strategy.
                     let msg = format!(
                         "tier-4 static methods on resources are not yet supported \
                          (encountered `{}::{}`)",
@@ -398,25 +395,16 @@ fn emit_method_body(
             unreachable!("freestanding fn appeared in a per-resource Guest trait")
         }
     };
-    // Constructor's await was inlined above. For other calls,
-    // `.await` only when the wrapper is async AND the import is
-    // async; `bridged_sync_target` flags an async wrapper over a
-    // sync import and must skip `.await` too.
     let constructor_already_handled = matches!(
         (trait_kind, fn_kind),
         (GuestTraitKind::Resource(_), ExportFnKind::Constructor)
     );
-    let target_call = if constructor_already_handled {
-        target_call
-    } else if is_async && !bridged_sync_target {
+    let target_call = if !constructor_already_handled && is_async {
         quote! { #target_call.await }
     } else {
         target_call
     };
 
-    // Resource-returning fns route through `WrapperR` inside the
-    // strategy and re-wrap at the boundary on return. Sync paths
-    // bypass dispatch entirely and don't use `final_wrap`.
     let resource_wrap = ir
         .fn_sigs
         .get(&args_ident.to_string())
@@ -463,14 +451,50 @@ fn emit_method_body(
         }
     };
 
-    // Strategy dispatch is async, so sync wrapper methods can't go
-    // through it; they direct-delegate to the target instead. WIT
-    // resource constructors are always sync per spec, so they hit
-    // this path.
     let body = if !is_async {
-        quote! {
-            let args = #args_construct;
-            #target_call
+        if matches!(fn_kind, ExportFnKind::Constructor) {
+            // Constructors return a newtype-wrapped handle; strategy dispatch
+            // can't apply the generic R return path.
+            quote! {
+                let args = #args_construct;
+                #target_call
+            }
+        } else {
+            let sync_dispatch = match behavior {
+                Behavior::Transform => quote! {
+                    <_ as ::splicer_tool_sdk::SyncTransformStrategy<#args_ty, #strategy_r_ty>>::handle(
+                        s, call, args, |args: #args_ty| { #closure_body },
+                    )
+                },
+                Behavior::Virtualize => quote! {
+                    <_ as ::splicer_tool_sdk::SyncVirtualizeStrategy<#args_ty, #strategy_r_ty>>::handle(
+                        s, call, args,
+                    )
+                },
+            };
+            match &final_wrap {
+                Some(wrap) => quote! {
+                    let call = ::splicer_tool_sdk::CallId {
+                        interface_name: #interface_qualified_name.into(),
+                        function_name: #method_name.into(),
+                        id: 0,
+                    };
+                    let args = #args_construct;
+                    let s = strategy();
+                    let intermediate = #sync_dispatch;
+                    #wrap
+                },
+                None => quote! {
+                    let call = ::splicer_tool_sdk::CallId {
+                        interface_name: #interface_qualified_name.into(),
+                        function_name: #method_name.into(),
+                        id: 0,
+                    };
+                    let args = #args_construct;
+                    let s = strategy();
+                    #sync_dispatch
+                },
+            }
         }
     } else {
         match final_wrap {
@@ -904,7 +928,7 @@ mod tests {
         let bindings = build_bindings_index(&src).unwrap();
         let ir = build_ir(&resolve, world_id, &bindings, INTERFACE_QN).unwrap();
         let g = &bindings.guest_traits[0];
-        emit_guest(g, INTERFACE_QN, behavior, &ir, false)
+        emit_guest(g, INTERFACE_QN, behavior, &ir)
     }
 
     fn args_structs_str(emitted: &EmittedGuest) -> String {

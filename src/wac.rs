@@ -1,4 +1,3 @@
-use crate::adapter::async_mirror::bridge::generate_sync_async_bridge;
 use crate::adapter::{generate_tier1_adapter, generate_tier2_adapter};
 use crate::contract::{validate_contract, ContractResult};
 use colored::Colorize;
@@ -123,6 +122,8 @@ pub struct SkipRecord {
     pub interface: String,
     /// The unsatisfied bound (parsed from rustc), when known.
     pub bound: Option<String>,
+    /// Full cargo stderr from the failed build attempt.
+    pub stderr: String,
 }
 
 /// Render a plain-text skip summary, or `None` when nothing skipped.
@@ -985,11 +986,8 @@ struct SpliceCtx<'a> {
 struct SpliceAccumulators {
     checked_middlewares: HashMap<String, BTreeMap<String, ExportInfo>>,
     generated_adapters: Vec<GeneratedAdapter>,
-    target_has_sync_cache: HashMap<(String, String), bool>,
-    /// `(target_split_path, target_interface)` ->
-    /// `(bridge_wasm_path, async_mirror_qualified_name)`. One bridge
-    /// per distinct provider+interface across the run; shared by every
-    /// site that needs it.
+    /// `(target_split_path, target_interface)` -> `(bridge_wasm_path, bridge_qualified_name)`.
+    /// One bridge per distinct provider+interface across the run; shared by every site that needs it.
     bridges: HashMap<(String, String), (String, String)>,
     /// Tier-3/4 matches skipped because the strategy's bound didn't fit.
     skips: Vec<SkipRecord>,
@@ -1406,33 +1404,6 @@ fn materialize_tier3_4_inline(
             .with_context(|| format!("read split for tier-3/4 codegen: {split_path}"))
     };
 
-    // Tier-3/4 wrappers are async-only by construction, so any
-    // sync-WIT target forces the bridged path. Detect once + cache
-    // the bridge before each materialization so the wrapper crate
-    // gets the mirror name to lift against.
-    let mirror_for_target = if !sources.iter().any(Option::is_some) {
-        None
-    } else {
-        let consumer_split_path = consumer_split.ok_or_else(|| {
-            anyhow::anyhow!("no split for tier-3/4 sync-WIT detection on '{interface_name}'")
-        })?;
-        let target_key = (consumer_split_path.to_string(), interface_name.to_string());
-        let has_sync = *accs
-            .target_has_sync_cache
-            .entry(target_key)
-            .or_insert_with(|| target_interface_has_sync_func(interface_name, consumer_split_path));
-        if has_sync {
-            let (_path, mirror_qname) =
-                ensure_bridge(interface_name, consumer_split_path, ctx.splits_path, accs)
-                    .with_context(|| {
-                        format!("ensure bridge for tier-3/4 site on `{interface_name}`")
-                    })?;
-            Some(mirror_qname)
-        } else {
-            None
-        }
-    };
-
     let mut out: Vec<Injection> = Vec::with_capacity(to_inject.len());
     for (inj, source) in to_inject.iter().zip(sources) {
         let Some(source) = source else {
@@ -1446,7 +1417,6 @@ fn materialize_tier3_4_inline(
             source,
             &split_bytes,
             interface_name,
-            mirror_for_target.as_deref(),
             &mut accs.verified_strategies,
         )
         .with_context(|| {
@@ -1459,11 +1429,12 @@ fn materialize_tier3_4_inline(
             // Bound didn't fit: record the skip and drop the injection so
             // the chain proceeds without this wrapper. `--strict` callers
             // promote `skips` to a hard failure downstream.
-            crate::strategies::MaterializeOutcome::Skipped { bound } => {
+            crate::strategies::MaterializeOutcome::Skipped { bound, stderr } => {
                 accs.skips.push(SkipRecord {
                     strategy: label.to_string(),
                     interface: interface_name.to_string(),
                     bound,
+                    stderr,
                 });
             }
         }
@@ -1740,64 +1711,6 @@ fn factored_types_to_wire(
     Ok(out)
 }
 
-/// Cached bridge generation. Returns the bridge's `.wasm` path and
-/// the async-mirror interface's fully-qualified name.
-fn ensure_bridge(
-    target_interface: &str,
-    target_split_path: &str,
-    splits_output_path: &str,
-    accs: &mut SpliceAccumulators,
-) -> anyhow::Result<(String, String)> {
-    let key = (target_split_path.to_string(), target_interface.to_string());
-    if let Some(entry) = accs.bridges.get(&key) {
-        return Ok(entry.clone());
-    }
-    let entry =
-        generate_sync_async_bridge(target_interface, splits_output_path, target_split_path)?;
-    accs.bridges.insert(key, entry.clone());
-    Ok(entry)
-}
-
-/// True iff `target_interface` (resolved via the component at
-/// `target_split_path`, which imports or exports it) has at least one
-/// function declared as `func` (sync) at WIT — i.e. splicer's adapter
-/// would be forced to lift that signature as sync.
-fn target_interface_has_sync_func(target_interface: &str, target_split_path: &str) -> bool {
-    let Ok(bytes) = std::fs::read(target_split_path) else {
-        return false;
-    };
-    let Ok(decoded) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wit_component::decode(&bytes)
-    })) else {
-        return false;
-    };
-    let Ok(wit_component::DecodedWasm::Component(resolve, world_id)) = decoded else {
-        return false;
-    };
-    let world = &resolve.worlds[world_id];
-    // Look across both imports and exports of the split — splicer
-    // calls into either side, depending on direction.
-    let surfaces = world.imports.values().chain(world.exports.values());
-    for item in surfaces {
-        let wit_parser::WorldItem::Interface { id, .. } = item else {
-            continue;
-        };
-        let Some(qname) = resolve.id_of(*id) else {
-            continue;
-        };
-        if crate::parse::wit_name::unversioned(&qname)
-            != crate::parse::wit_name::unversioned(target_interface)
-        {
-            continue;
-        }
-        let iface = &resolve.interfaces[*id];
-        if iface.functions.values().any(|f| !f.kind.is_async()) {
-            return true;
-        }
-    }
-    false
-}
-
 #[derive(Clone, Copy)]
 enum WorldSide {
     Imports,
@@ -1933,11 +1846,13 @@ mod tests {
                 strategy: "chaos-err".into(),
                 interface: "wasi:http/handler@0.3.0".into(),
                 bound: Some("R: HasArbitraryErr".into()),
+                stderr: String::new(),
             },
             SkipRecord {
                 strategy: "replayer".into(),
                 interface: "wasi:io/streams@0.2.0".into(),
                 bound: None,
+                stderr: String::new(),
             },
         ];
         let summary = format_skip_summary(&skips).expect("non-empty");
