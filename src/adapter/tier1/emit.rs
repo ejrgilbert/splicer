@@ -30,13 +30,12 @@ use wit_parser::{
 
 use super::super::abi::canon_async::{self, AsyncFuncs, AsyncTypes};
 use super::super::abi::emit::{
-    build_lower_params_to_memory, collect_borrow_drops, direct_return_type,
-    emit_alloc_call_id, emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc,
-    emit_data_section, emit_export_section, emit_handler_call, emit_memory_and_globals,
-    emit_resource_drop_imports, emit_wrapper_return, empty_function,
-    find_imported_hook, require_gate_compatible_func, require_indirect_params_supported_shape,
-    require_no_inline_resources, synthesize_adapter_world_wit, val_types, BumpReset,
-    GlobalIndices, HookImport, WrapperExport,
+    build_lower_params_to_memory, collect_borrow_drops, direct_return_type, emit_alloc_call_id,
+    emit_borrow_drops, emit_bump_restore, emit_bump_save, emit_cabi_realloc, emit_data_section,
+    emit_export_section, emit_handler_call, emit_memory_and_globals, emit_resource_drop_imports,
+    emit_wrapper_return, empty_function, find_imported_hook, require_gate_compatible_func,
+    require_indirect_params_supported_shape, require_no_inline_resources,
+    synthesize_adapter_world_wit, val_types, BumpReset, GlobalIndices, HookImport, WrapperExport,
 };
 use super::super::abi::WasmEncoderBindgen;
 use super::super::indices::{DispatchIndices, LocalsBuilder};
@@ -306,7 +305,9 @@ fn build_dispatch_module(
         target_iface,
         target_interface_name,
         &funcs,
-        SlotReservations { needs_async_runtime },
+        SlotReservations {
+            needs_async_runtime,
+        },
     )?;
     let hook_imports = collect_hook_imports(resolve, world_id, has_before, has_after, has_gate);
     let mut idx = DispatchIndices::new();
@@ -528,7 +529,6 @@ struct HookImports {
     after: Option<HookImport>,
     gate: Option<HookImport>,
 }
-
 
 /// Resolve tier-1 hook imports through wit-parser so a contract bump
 /// (or a `wit/tier1/world.wit` signature change) can't silently
@@ -843,6 +843,7 @@ struct GateConfig {
 /// Emit one sync wrapper body. Shape is read off
 /// [`FuncDispatch::export_sig`]: `retptr` ⇒ multi-flat / compound,
 /// else `results.len() == 1` ⇒ Direct, else Void.
+#[allow(clippy::too_many_arguments)]
 fn emit_wrapper_body(
     code: &mut CodeSection,
     fd: &FuncDispatch,
@@ -1015,7 +1016,13 @@ fn emit_async_wrapper_body(
         // Async-with-result + gate is rejected upstream — reaching
         // here means async-void, so `task.return` runs before the early
         // return.
-        emit_gate_phase(&mut f, g, Some(imp_task_return), hook_site.unwrap(), bump_reset);
+        emit_gate_phase(
+            &mut f,
+            g,
+            Some(imp_task_return),
+            hook_site.unwrap(),
+            bump_reset,
+        );
     }
 
     // Handler call → packed status → wait.

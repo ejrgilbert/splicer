@@ -749,10 +749,13 @@ pub(crate) fn find_imported_hook(
         } else {
             (AbiVariant::GuestImport, sync_mangling())
         };
-        let (module, name) = resolve.wasm_import_name(mangling, WasmImport::Func {
-            interface: Some(key),
-            func,
-        });
+        let (module, name) = resolve.wasm_import_name(
+            mangling,
+            WasmImport::Func {
+                interface: Some(key),
+                func,
+            },
+        );
         Some(HookImport {
             module,
             name,
