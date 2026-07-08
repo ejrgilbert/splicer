@@ -42,8 +42,8 @@ use super::bindings_index::{
     bindings_path_tokens, strip_exports_prefix, GuestMethod, GuestTrait, GuestTraitKind,
 };
 use super::ir::{
-    args_struct_ident, ExportFnKind, HandleRef, NamedKind, NamedType, RecordField, ResourceInfo,
-    TypeLocation, WitTypeRef, WrapperIR,
+    args_struct_ident, wrapper_ident_for, BridgeResourceInfo, ExportFnKind, HandleRef, NamedKind,
+    NamedType, RecordField, ResourceInfo, TypeLocation, WitTypeRef, WrapperIR,
 };
 use super::Behavior;
 
@@ -194,19 +194,74 @@ fn emit_one_resource_newtype(r: &ResourceInfo, behavior: Behavior) -> TokenStrea
     }
 }
 
-/// `Wrapper<Pascal>` (e.g. `WrapperBucket`): the wrapper-crate-local
-/// newtype around the import-side resource handle.
-fn wrapper_ident_for(resource_pascal: &syn::Ident) -> syn::Ident {
-    syn::Ident::new(&format!("Wrapper{resource_pascal}"), Span::call_site())
-}
 
-/// Import-side Rust path for the resource. In Transform mode the
+/// Import-side Rust path for the resource. In normal Transform mode the
 /// wrapper world imports and exports the same interface, so the
 /// import-side type sits at the same module path with the leading
-/// `exports::` segment dropped.
+/// `exports::` segment dropped. In T' mode the owned resource's
+/// `inner_type_path` points directly at the raw (import-side) type.
 fn import_resource_path_tokens(r: &ResourceInfo) -> TokenStream {
-    let import_segs = strip_exports_prefix(&r.iface_path);
+    let import_segs = r
+        .inner_type_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| strip_exports_prefix(&r.iface_path));
     bindings_path_tokens(&import_segs, Some(&r.rust_ident))
+}
+
+/// Import-side path for constructors and statics. In T' mode the GuestBucket
+/// trait's module path points to the T' interface (splicer:wrapper), not the
+/// raw resource; use the IR's `inner_type_path` override when present.
+fn import_resource_path_for_ctor(
+    resource_pascal: &syn::Ident,
+    guest_module_path: &[String],
+    ir: &WrapperIR,
+) -> TokenStream {
+    if let Some(raw_path) = ir
+        .resources
+        .iter()
+        .find(|r| r.is_owned && &r.rust_ident == resource_pascal)
+        .and_then(|r| r.inner_type_path.as_ref())
+    {
+        bindings_path_tokens(raw_path, Some(resource_pascal))
+    } else {
+        build_import_resource_path(resource_pascal, guest_module_path)
+    }
+}
+
+/// Emit the fixed `impl <bridge>::Guest for Wrapper` block for T' mode.
+/// Uses hard-wired `wrap`/`unwrap` bodies (not strategy dispatch).
+pub fn emit_bridge_guest_impl(bridge_resources: &[BridgeResourceInfo]) -> Option<TokenStream> {
+    if bridge_resources.is_empty() {
+        return None;
+    }
+    let bridge_path =
+        bindings_path_tokens(&bridge_resources[0].bridge_module_path, None);
+    let methods: Vec<TokenStream> = bridge_resources
+        .iter()
+        .map(|br| {
+            let raw =
+                bindings_path_tokens(&br.raw_resource_path, Some(&br.raw_resource_ident));
+            let exp = bindings_path_tokens(
+                &br.export_resource_path,
+                Some(&br.export_resource_ident),
+            );
+            let wrap = &br.wrapper_ident;
+            quote! {
+                fn wrap(inner: #raw) -> #exp {
+                    #exp::new(#wrap(inner))
+                }
+                fn unwrap(w: #exp) -> #raw {
+                    w.into_inner::<#wrap>().0
+                }
+            }
+        })
+        .collect();
+    Some(quote! {
+        impl #bridge_path::Guest for Wrapper {
+            #(#methods)*
+        }
+    })
 }
 
 fn find_args_record<'a>(ir: &'a WrapperIR, args_ident: &syn::Ident) -> &'a NamedType {
@@ -342,7 +397,7 @@ fn emit_method_body(
                     // tier-3: forward to the import-side constructor
                     // and wrap the resulting handle into our newtype.
                     let import_resource =
-                        build_import_resource_path(resource_pascal, guest_module_path);
+                        import_resource_path_for_ctor(resource_pascal, guest_module_path, ir);
                     let call = build_static_call(is_async, &import_resource, method_ident, fields);
                     if is_async {
                         quote!(#wrap(#call.await))
@@ -375,7 +430,7 @@ fn emit_method_body(
                     // tier-3: dispatch through the import-side type
                     // surface and return whatever the WIT declared.
                     let import_resource =
-                        build_import_resource_path(resource_pascal, guest_module_path);
+                        import_resource_path_for_ctor(resource_pascal, guest_module_path, ir);
                     build_static_call(is_async, &import_resource, method_ident, fields)
                 }
                 Behavior::Virtualize => {
