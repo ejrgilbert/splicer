@@ -211,6 +211,11 @@ pub struct Injection {
     /// sees one consistent resource identity. Empty for non-wrapping tiers.
     #[serde(skip)]
     pub(crate) resource_bearing_exports: Vec<String>,
+    /// T' mode: (consumer_import_key, t_prime_export_key) cross-name wires
+    /// for WAC routing. Stamped from TargetWit during materialization.
+    /// Empty for non-T' wrappers.
+    #[serde(skip)]
+    pub(crate) t_prime_redirects: Vec<(String, String)>,
 }
 
 impl PartialEq for Injection {
@@ -255,6 +260,7 @@ impl Injection {
             adapter_info: None,
             tier: None,
             resource_bearing_exports: Vec::new(),
+            t_prime_redirects: Vec::new(),
         }
     }
 
@@ -273,6 +279,7 @@ impl Injection {
             adapter_info: None,
             tier: None,
             resource_bearing_exports: Vec::new(),
+            t_prime_redirects: Vec::new(),
         }
     }
 }
@@ -870,6 +877,7 @@ fn into_injection(yaml: YamlInjection) -> Injection {
         adapter_info: None,
         tier: None,
         resource_bearing_exports: Vec::new(),
+        t_prime_redirects: Vec::new(),
     }
 }
 

@@ -32,7 +32,13 @@ use std::collections::HashSet;
 #[derive(Debug)]
 pub enum MaterializeOutcome {
     /// Wrapper built and installed at `path`.
-    Built { path: PathBuf, tier: Tier },
+    Built {
+        path: PathBuf,
+        tier: Tier,
+        /// T' mode: (consumer_import_key, t_prime_export_key) cross-name wires.
+        /// Empty for non-T' wrappers.
+        t_prime_redirects: Vec<(String, String)>,
+    },
     /// The strategy doesn't fit this interface; carries the unsatisfied
     /// bound (parsed from rustc) for the skip warning and the full
     /// cargo stderr for diagnostics.
@@ -254,6 +260,7 @@ fn materialize_from_prepared(
         BuildOutcome::Built(path) => MaterializeOutcome::Built {
             path,
             tier: prep.manifest.builtin.tier,
+            t_prime_redirects: target.t_prime_redirects,
         },
         BuildOutcome::BoundMismatch { bound, stderr, .. } => {
             MaterializeOutcome::Skipped { bound, stderr }
@@ -668,7 +675,10 @@ mod tests {
             &mut HashSet::new(),
         )
         .expect("materialize");
-        let MaterializeOutcome::Built { path: out, tier } = outcome else {
+        let MaterializeOutcome::Built {
+            path: out, tier, ..
+        } = outcome
+        else {
             panic!("expected a built wrapper, got a skip");
         };
         assert_eq!(tier, Tier::Tier3);
@@ -722,7 +732,10 @@ mod tests {
             &mut HashSet::new(),
         )
         .expect("materialize_tier3_4(user)");
-        let MaterializeOutcome::Built { path: out, tier } = outcome else {
+        let MaterializeOutcome::Built {
+            path: out, tier, ..
+        } = outcome
+        else {
             panic!("expected a built wrapper, got a skip");
         };
         assert_eq!(tier, Tier::Tier3);

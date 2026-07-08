@@ -1266,7 +1266,10 @@ fn matrix_resource_t_prime_factored_transform() {
         .expect("synthesize T' producer component");
     let target_wit = target_wit_for_codegen(&component, "test:kv/store@0.1.0", Behavior::Transform)
         .expect("extract T' WIT");
-    assert!(target_wit.is_t_prime, "expected T' mode for factored resource");
+    assert!(
+        !target_wit.t_prime_redirects.is_empty(),
+        "expected T' mode for factored resource"
+    );
 
     let out = generate_wrapper_crate(&GenerateWrapperInput {
         target_wit: &target_wit.wit_text,
@@ -1283,7 +1286,9 @@ fn matrix_resource_t_prime_factored_transform() {
     // WrapperBucket holds the import-side raw resource from store-types.
     assert!(
         out.lib_rs.contains("WrapperBucket")
-            && out.lib_rs.contains("bindings::test::kv::store_types::Bucket"),
+            && out
+                .lib_rs
+                .contains("bindings::test::kv::store_types::Bucket"),
         "WrapperBucket must hold raw store-types::Bucket in T' mode:\n{}",
         out.lib_rs
     );
