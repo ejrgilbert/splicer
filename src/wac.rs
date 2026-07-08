@@ -154,9 +154,13 @@ struct Entity {
     var: String,
     /// The package name in `new my:pkg`.
     pkg: String,
-    /// Explicit imports to wire as `"iface": src["iface"],`. Order is
-    /// preserved for deterministic rendering.
-    imports: Vec<(String, String)>,
+    /// Explicit import wirings. Each entry is
+    /// `(consumer_key, source_var, source_export_key)` where
+    /// `source_export_key` is `None` for same-name wires (the common case)
+    /// and `Some(key)` for cross-name wires (T' redirect: consumer imports
+    /// `test:kv/store@0.1.0` from `wrapper["splicer:wrapper/store@0.0.0"]`).
+    /// Order is preserved for deterministic rendering.
+    imports: Vec<(String, String, Option<String>)>,
     /// Whether to append `...` so wac compose pulls remaining imports
     /// from the host or matching peers.
     catchall: bool,
@@ -179,7 +183,7 @@ impl Entity {
     fn wired(
         var: impl Into<String>,
         pkg: impl Into<String>,
-        imports: Vec<(String, String)>,
+        imports: Vec<(String, String, Option<String>)>,
     ) -> Self {
         Self {
             var: var.into(),
@@ -192,7 +196,7 @@ impl Entity {
     /// Vars this entity references on its right-hand side. Used by the
     /// renderer's topological sort.
     fn deps(&self) -> impl Iterator<Item = &str> {
-        self.imports.iter().map(|(_, v)| v.as_str())
+        self.imports.iter().map(|(_, v, _)| v.as_str())
     }
 
     /// Render this entity as a single `let var = new my:pkg { ... };`
@@ -202,8 +206,9 @@ impl Entity {
             return format!("let {} = new {INST_PREFIX}:{} {{}};", self.var, self.pkg);
         }
         let mut s = format!("let {} = new {INST_PREFIX}:{} {{", self.var, self.pkg);
-        for (iface, src) in &self.imports {
-            s.push_str(&format!("\n    \"{iface}\": {src}[\"{iface}\"],"));
+        for (consumer_key, src, src_key_override) in &self.imports {
+            let src_key = src_key_override.as_deref().unwrap_or(consumer_key.as_str());
+            s.push_str(&format!("\n    \"{consumer_key}\": {src}[\"{src_key}\"],"));
         }
         if self.catchall {
             s.push_str("\n    ...");
@@ -243,10 +248,11 @@ struct EmitPlan {
     /// Composition node id → wac var. Multiple ids may share a var when
     /// they resolve to the same split.
     node_vars: HashMap<u32, String>,
-    /// `(consumer_id, iface)` → source var that should provide that
-    /// import after middleware routing. `consumer_id` is shim-resolved
-    /// so it matches the `with_exports` lookup convention.
-    routing: HashMap<(u32, String), String>,
+    /// `(consumer_id, iface)` → `(source_var, source_export_key_override)`.
+    /// `source_export_key_override` is `None` for same-name wires and
+    /// `Some(key)` for cross-name wires (T' redirects). `consumer_id` is
+    /// shim-resolved so it matches the `with_exports` lookup convention.
+    routing: HashMap<(u32, String), (String, Option<String>)>,
     /// `(provider_id, export_iface)` → wrapped var, populated when a
     /// top-level wrap fronts the provider's export of that iface.
     /// `provider_id` is shim-resolved.
@@ -375,8 +381,21 @@ impl EmitPlan {
                         }
                         None => middleware_var,
                     };
-                    self.routing
-                        .insert((routing_id, interface.name.clone()), current.clone());
+                    self.routing.insert(
+                        (routing_id, interface.name.clone()),
+                        (current.clone(), None),
+                    );
+                    // T' mode: override routing entries with cross-name wires for each redirect.
+                    if let Some(mdls) = inject_plan.get(&i) {
+                        if let Some(outermost) = mdls.iter().next() {
+                            for (original_iface, t_prime_export) in &outermost.t_prime_redirects {
+                                self.routing.insert(
+                                    (routing_id, original_iface.clone()),
+                                    (current.clone(), Some(t_prime_export.clone())),
+                                );
+                            }
+                        }
+                    }
                 }
                 prev_var = Some(node_var.clone());
 
@@ -429,7 +448,7 @@ impl EmitPlan {
                     continue;
                 }
                 let routing_id = resolve_shim_node(*id, composition, shim_comps);
-                let Some(current) = self
+                let Some((current_var, _)) = self
                     .routing
                     .get(&(routing_id, interface.name.clone()))
                     .cloned()
@@ -439,7 +458,7 @@ impl EmitPlan {
                 for sib in &outermost.resource_bearing_exports {
                     if *sib != interface.name {
                         self.routing
-                            .insert((routing_id, sib.clone()), current.clone());
+                            .insert((routing_id, sib.clone()), (current_var.clone(), None));
                     }
                 }
             }
@@ -485,23 +504,24 @@ impl EmitPlan {
             }
             let node = &composition.nodes[&id];
             let routing_id = resolve_shim_node(id, composition, shim_comps);
-            let mut imports: Vec<(String, String)> = Vec::new();
+            let mut imports: Vec<(String, String, Option<String>)> = Vec::new();
             for conn in &node.imports {
                 if conn.is_host_import {
                     continue;
                 }
                 let iface = &conn.interface_name;
-                let src_var = if let Some(routed) = self.routing.get(&(routing_id, iface.clone())) {
-                    routed.clone()
-                } else if let Some(src_id) = conn.source_instance {
-                    match self.node_vars.get(&src_id) {
-                        Some(v) => v.clone(),
-                        None => continue,
-                    }
-                } else {
-                    continue;
-                };
-                imports.push((iface.clone(), src_var));
+                let (src_var, src_key) =
+                    if let Some((var, key)) = self.routing.get(&(routing_id, iface.clone())) {
+                        (var.clone(), key.clone())
+                    } else if let Some(src_id) = conn.source_instance {
+                        match self.node_vars.get(&src_id) {
+                            Some(v) => (v.clone(), None),
+                            None => continue,
+                        }
+                    } else {
+                        continue;
+                    };
+                imports.push((iface.clone(), src_var, src_key));
             }
             self.entities.insert(
                 var.clone(),
@@ -663,6 +683,7 @@ impl EmitPlan {
                                     crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED
                                         .to_string(),
                                     cfg_pkg.clone(),
+                                    None,
                                 )],
                             ),
                         );
@@ -678,8 +699,8 @@ impl EmitPlan {
             // chain position gets its own var.
             let adapter_var = disambiguated_var(&mut self.adapter_counts, &adapter_pkg);
 
-            let mut imports: Vec<(String, String)> =
-                vec![(interface.name.clone(), downstream_var.to_string())];
+            let mut imports: Vec<(String, String, Option<String>)> =
+                vec![(interface.name.clone(), downstream_var.to_string(), None)];
             for hook_iface in &adapter_info.matched_hook_interfaces {
                 let version = if hook_iface.starts_with(&format!("{TIER1_PACKAGE}/")) {
                     TIER1_VERSION
@@ -690,7 +711,11 @@ impl EmitPlan {
                         "matched hook interface '{hook_iface}' is not part of any known tier package",
                     );
                 };
-                imports.push((versioned_interface(hook_iface, version), real_pkg.clone()));
+                imports.push((
+                    versioned_interface(hook_iface, version),
+                    real_pkg.clone(),
+                    None,
+                ));
             }
             // Resource-bearing factored-types imports — `...` doesn't
             // unify resource type identity across separately-imported
@@ -709,7 +734,7 @@ impl EmitPlan {
                 composition,
                 shim_comps,
             )? {
-                imports.push((extra, sibling_types_source.to_string()));
+                imports.push((extra, sibling_types_source.to_string(), None));
             }
             self.entities.insert(
                 adapter_var.clone(),
@@ -727,8 +752,8 @@ impl EmitPlan {
             // (they replace the downstream instead of forwarding); the
             // wac wire must be skipped for those.
             let imports_target = mdl.tier.is_none_or(|t| t.imports_target());
-            let mut imports = if imports_target {
-                vec![(interface.name.clone(), downstream_var.to_string())]
+            let mut imports: Vec<(String, String, Option<String>)> = if imports_target {
+                vec![(interface.name.clone(), downstream_var.to_string(), None)]
             } else {
                 Vec::new()
             };
@@ -743,7 +768,7 @@ impl EmitPlan {
                     composition,
                     shim_comps,
                 )? {
-                    imports.push((extra, sibling_types_source.to_string()));
+                    imports.push((extra, sibling_types_source.to_string(), None));
                 }
             }
             // Wire the config provider on the wrapper.
@@ -756,6 +781,7 @@ impl EmitPlan {
                 imports.push((
                     crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED.to_string(),
                     cfg_pkg,
+                    None,
                 ));
             }
             self.entities
@@ -782,6 +808,7 @@ impl EmitPlan {
         let imports = vec![(
             mirror_iface_qualified.to_string(),
             downstream_var.to_string(),
+            None,
         )];
         // The bridge has exactly one declared import (the mirror) and
         // one export (the target)
@@ -1423,8 +1450,12 @@ fn materialize_tier3_4_inline(
             format!("materialize tier-3/4 strategy '{label}' on '{interface_name}'")
         })?;
         match outcome {
-            crate::strategies::MaterializeOutcome::Built { path, tier } => {
-                out.push(stamp_materialized(inj, path, tier)?);
+            crate::strategies::MaterializeOutcome::Built {
+                path,
+                tier,
+                t_prime_redirects,
+            } => {
+                out.push(stamp_materialized(inj, path, tier, t_prime_redirects)?);
             }
             // Bound didn't fit: record the skip and drop the injection so
             // the chain proceeds without this wrapper. `--strict` callers
@@ -1486,6 +1517,7 @@ fn stamp_materialized(
     inj: &Injection,
     wrapper_path: std::path::PathBuf,
     tier: builtin_protocol::Tier,
+    t_prime_redirects: Vec<(String, String)>,
 ) -> anyhow::Result<Injection> {
     let path_str = wrapper_path
         .to_str()
@@ -1507,6 +1539,7 @@ fn stamp_materialized(
         path: Some(path_str),
         tier: Some(tier),
         resource_bearing_exports: sibling_exports,
+        t_prime_redirects,
         ..inj.clone()
     };
     crate::config_provider::validate_config_as_wave(&mut stamped)?;
@@ -1886,7 +1919,8 @@ mod tests {
             entity.imports,
             vec![(
                 "splicer:async-mirror-abc/adder@0.0.1".to_string(),
-                "mw_a".to_string()
+                "mw_a".to_string(),
+                None,
             )]
         );
         assert_eq!(
@@ -2080,6 +2114,7 @@ mod tests {
             }),
             tier: None,
             resource_bearing_exports: Vec::new(),
+            t_prime_redirects: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2113,10 +2148,10 @@ mod tests {
             .get("metrics")
             .expect("real middleware entity must be added");
         assert!(
-            real.imports
-                .iter()
-                .any(|(iface, src)| iface == "splicer:builtin-config/get@0.1.0"
-                    && src == "metrics-config"),
+            real.imports.iter().any(
+                |(iface, src, _)| iface == "splicer:builtin-config/get@0.1.0"
+                    && src == "metrics-config"
+            ),
             "real middleware must wire the provider's `get` export; got: {real:?}"
         );
 
@@ -2151,6 +2186,7 @@ mod tests {
             }),
             tier: None,
             resource_bearing_exports: Vec::new(),
+            t_prime_redirects: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2263,6 +2299,7 @@ mod tests {
                 adapter_info: None,
                 tier: None,
                 resource_bearing_exports: Vec::new(),
+                t_prime_redirects: Vec::new(),
             }],
         )];
 

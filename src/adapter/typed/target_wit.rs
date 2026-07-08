@@ -7,10 +7,13 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, Context, Result};
 use wit_component::{Output, WitPrinter};
-use wit_parser::{FunctionKind, Handle, InterfaceId, Resolve, Type, TypeDefKind, TypeId, TypeOwner};
+use wit_parser::{
+    FunctionKind, Handle, InterfaceId, Resolve, Type, TypeDefKind, TypeId, TypeOwner,
+};
 
 use super::Behavior;
 use crate::adapter::resolve::{decode_input_resolve, find_target_interface, resolve_type_alias};
+use crate::parse::wit_name::iface_of;
 
 #[derive(Debug, Clone)]
 pub struct TargetWit {
@@ -18,8 +21,9 @@ pub struct TargetWit {
     pub world_name: String,
     /// User-facing target name.
     pub qualified_name: String,
-    /// True when emitted in T'-forwarding mode (bridge interface present).
-    pub is_t_prime: bool,
+    /// T' mode: (consumer_import_key, t_prime_export_key) cross-name wires for WAC routing.
+    /// Covers the main interface and all sibling types interfaces. Empty otherwise.
+    pub t_prime_redirects: Vec<(String, String)>,
 }
 
 /// Package identifier for the splicer-emitted T' wrapper package.
@@ -103,7 +107,7 @@ pub fn target_wit_for_codegen(
         wit_text: out,
         world_name: WRAPPER_WORLD.to_string(),
         qualified_name: qualified,
-        is_t_prime: false,
+        t_prime_redirects: vec![],
     })
 }
 
@@ -138,11 +142,49 @@ fn emit_t_prime_world(
         .ok_or_else(|| anyhow!("target interface `{target_interface}` has no local name"))?;
     let t_prime_iface = emit_t_prime_interface_wit(resolve, target_iface_id, local_name, factored)?;
     let bridge_iface = emit_bridge_interface_wit(factored, local_name);
+
+    // For each sibling types interface, emit a re-export interface that re-exports
+    // the T' resource type. This makes the consumer's sibling import consistent
+    // with the T' type it gets from the main interface (both sourced from same wrapper instance).
+    let sibling_local_names: Vec<&str> = sibling_qualified.iter().map(|q| iface_of(q)).collect();
+    let mut sibling_reexport_blocks = String::new();
+    for (sibling_q, &sibling_local) in sibling_qualified.iter().zip(&sibling_local_names) {
+        let res_names: Vec<&str> = factored
+            .iter()
+            .filter(|r| r.declaring_qualified == *sibling_q)
+            .map(|r| r.wit_name.as_str())
+            .collect();
+        if res_names.is_empty() {
+            continue;
+        }
+        sibling_reexport_blocks.push_str(&format!("interface {sibling_local} {{\n"));
+        for res in &res_names {
+            sibling_reexport_blocks.push_str(&format!("  use {local_name}.{{{res}}};\n"));
+        }
+        sibling_reexport_blocks.push_str("}\n");
+    }
+
+    // Collect WAC cross-name redirect pairs: (consumer_import_key → t_prime_export_key).
+    let mut t_prime_redirects = vec![(
+        qualified.clone(),
+        format!("splicer:wrapper/{local_name}@0.0.0"),
+    )];
+    for (sibling_q, &sibling_local) in sibling_qualified.iter().zip(&sibling_local_names) {
+        t_prime_redirects.push((
+            sibling_q.clone(),
+            format!("splicer:wrapper/{sibling_local}@0.0.0"),
+        ));
+    }
+
     let mut out = String::new();
     out.push_str(&format!("package {WRAPPER_PACKAGE};\n\n"));
     out.push_str(&t_prime_iface);
     out.push('\n');
     out.push_str(&bridge_iface);
+    if !sibling_reexport_blocks.is_empty() {
+        out.push('\n');
+        out.push_str(&sibling_reexport_blocks);
+    }
     out.push_str(&format!("\nworld {WRAPPER_WORLD} {{\n"));
     out.push_str(&format!("    import {qualified};\n"));
     for q in sibling_qualified {
@@ -150,13 +192,16 @@ fn emit_t_prime_world(
     }
     out.push_str(&format!("    export {local_name};\n"));
     out.push_str(&format!("    export {BRIDGE_IFACE};\n"));
+    for sibling_local in &sibling_local_names {
+        out.push_str(&format!("    export {sibling_local};\n"));
+    }
     out.push_str("}\n\n");
     out.push_str(&print_all_packages(resolve, target_interface)?);
     Ok(TargetWit {
         wit_text: out,
         world_name: WRAPPER_WORLD.to_string(),
         qualified_name: qualified,
-        is_t_prime: true,
+        t_prime_redirects,
     })
 }
 
@@ -186,7 +231,9 @@ fn factored_resources_of(resolve: &Resolve, target: InterfaceId) -> Vec<Factored
         if !matches!(td.kind, TypeDefKind::Resource) {
             continue;
         }
-        let TypeOwner::Interface(declaring) = td.owner else { continue };
+        let TypeOwner::Interface(declaring) = td.owner else {
+            continue;
+        };
         if declaring == target {
             continue; // inline, not factored
         }
@@ -251,9 +298,11 @@ fn emit_type_id_text(resolve: &Resolve, id: TypeId) -> String {
             format!("tuple<{}>", elems.join(", "))
         }
         // own<R> in WIT is written as just the resource name.
-        TypeDefKind::Handle(Handle::Own(rid)) => {
-            resolve.types[*rid].name.as_deref().unwrap_or("?").to_string()
-        }
+        TypeDefKind::Handle(Handle::Own(rid)) => resolve.types[*rid]
+            .name
+            .as_deref()
+            .unwrap_or("?")
+            .to_string(),
         TypeDefKind::Handle(Handle::Borrow(rid)) => {
             let name = resolve.types[*rid].name.as_deref().unwrap_or("?");
             format!("borrow<{name}>")
@@ -284,9 +333,7 @@ fn emit_resource_methods_wit(
                 let params = emit_params(resolve, &func.params, false);
                 out.push_str(&format!("    constructor({params});\n"));
             }
-            FunctionKind::Method(rid) | FunctionKind::AsyncMethod(rid)
-                if *rid == original =>
-            {
+            FunctionKind::Method(rid) | FunctionKind::AsyncMethod(rid) if *rid == original => {
                 let async_kw = if matches!(func.kind, FunctionKind::AsyncMethod(_)) {
                     "async "
                 } else {
@@ -299,9 +346,7 @@ fn emit_resource_methods_wit(
                     "    {method_name}: {async_kw}func({params}){ret};\n"
                 ));
             }
-            FunctionKind::Static(rid) | FunctionKind::AsyncStatic(rid)
-                if *rid == original =>
-            {
+            FunctionKind::Static(rid) | FunctionKind::AsyncStatic(rid) if *rid == original => {
                 let async_kw = if matches!(func.kind, FunctionKind::AsyncStatic(_)) {
                     "async "
                 } else {
@@ -331,8 +376,7 @@ fn emit_t_prime_interface_wit(
 ) -> Result<String> {
     let mut out = format!("interface {local_name} {{\n");
     for res in resources {
-        let methods =
-            emit_resource_methods_wit(resolve, res.type_id, res.declaring_iface_id);
+        let methods = emit_resource_methods_wit(resolve, res.type_id, res.declaring_iface_id);
         out.push_str(&format!("  resource {} {{\n", res.wit_name));
         out.push_str(&methods);
         out.push_str("  }\n");
@@ -346,9 +390,14 @@ fn emit_t_prime_interface_wit(
             FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {
                 let async_kw = if matches!(
                     func.kind,
-                    FunctionKind::AsyncFreestanding | FunctionKind::AsyncMethod(_)
+                    FunctionKind::AsyncFreestanding
+                        | FunctionKind::AsyncMethod(_)
                         | FunctionKind::AsyncStatic(_)
-                ) { "async " } else { "" };
+                ) {
+                    "async "
+                } else {
+                    ""
+                };
                 let params = emit_params(resolve, &func.params, false);
                 let ret = emit_result(resolve, func.result.as_ref());
                 out.push_str(&format!("  {fn_name}: {async_kw}func({params}){ret};\n"));
@@ -372,9 +421,7 @@ fn emit_bridge_interface_wit(resources: &[FactoredResource], t_prime_local_name:
         out.push_str(&format!(
             "  use {t_prime_local_name}.{{{wn} as wrapped-{wn}}};\n"
         ));
-        out.push_str(&format!(
-            "  wrap: func(inner: raw-{wn}) -> wrapped-{wn};\n"
-        ));
+        out.push_str(&format!("  wrap: func(inner: raw-{wn}) -> wrapped-{wn};\n"));
         out.push_str(&format!("  unwrap: func(w: wrapped-{wn}) -> raw-{wn};\n"));
     }
     out.push_str("}\n");
@@ -384,11 +431,7 @@ fn emit_bridge_interface_wit(resources: &[FactoredResource], t_prime_local_name:
 // ── emit_params / emit_result helpers ───────────────────────────────
 
 fn emit_params(resolve: &Resolve, params: &[wit_parser::Param], skip_first: bool) -> String {
-    let iter = if skip_first {
-        params.iter().skip(1)
-    } else {
-        params.iter().skip(0)
-    };
+    let iter = params.iter().skip(usize::from(skip_first));
     iter.map(|p| format!("{}: {}", p.name, emit_wit_type_text(resolve, &p.ty)))
         .collect::<Vec<_>>()
         .join(", ")
@@ -405,7 +448,11 @@ fn emit_result(resolve: &Resolve, result: Option<&Type>) -> String {
 fn method_short_name(fn_name: &str) -> &str {
     fn_name
         .find(']')
-        .and_then(|i| fn_name[i + 1..].find('.').map(|j| &fn_name[i + 1 + j + 1..]))
+        .and_then(|i| {
+            fn_name[i + 1..]
+                .find('.')
+                .map(|j| &fn_name[i + 1 + j + 1..])
+        })
         .unwrap_or(fn_name)
 }
 
@@ -556,14 +603,26 @@ mod tests {
             component_from_wit(FACTORED_RESOURCE_WIT, "provider").expect("synthesize fixture");
         let target = target_wit_for_codegen(&component, "test:kv/store@0.1.0", Behavior::Transform)
             .expect("extract");
-        assert!(target.is_t_prime, "should have emitted T' world");
+        assert!(
+            !target.t_prime_redirects.is_empty(),
+            "should have emitted T' world"
+        );
         let wit = &target.wit_text;
         assert!(wit.contains("interface bridge"), "missing bridge:\n{wit}");
         assert!(wit.contains("wrap:"), "missing wrap:\n{wit}");
         assert!(wit.contains("unwrap:"), "missing unwrap:\n{wit}");
-        assert!(wit.contains("export store;"), "missing export store:\n{wit}");
-        assert!(wit.contains("export bridge;"), "missing export bridge:\n{wit}");
-        assert!(wit.contains("import test:kv/store@0.1.0;"), "missing import:\n{wit}");
+        assert!(
+            wit.contains("export store;"),
+            "missing export store:\n{wit}"
+        );
+        assert!(
+            wit.contains("export bridge;"),
+            "missing export bridge:\n{wit}"
+        );
+        assert!(
+            wit.contains("import test:kv/store@0.1.0;"),
+            "missing import:\n{wit}"
+        );
         assert!(
             wit.contains("resource bucket"),
             "T' interface must declare fresh bucket resource:\n{wit}"
@@ -581,8 +640,62 @@ mod tests {
             component_from_wit(FACTORED_RESOURCE_WIT, "provider").expect("synthesize fixture");
         let target = target_wit_for_codegen(&component, "test:kv/store@0.1.0", Behavior::Transform)
             .expect("extract");
-        assert!(target.is_t_prime);
+        assert!(!target.t_prime_redirects.is_empty());
         run_wit_bindgen_rust(&target.wit_text, Some(&target.world_name))
             .expect("wit-bindgen accepts T' WIT");
+    }
+
+    #[test]
+    fn t_prime_world_emits_sibling_reexport_and_redirects() {
+        let component =
+            component_from_wit(FACTORED_RESOURCE_WIT, "provider").expect("synthesize fixture");
+        let target = target_wit_for_codegen(&component, "test:kv/store@0.1.0", Behavior::Transform)
+            .expect("extract");
+        assert!(!target.t_prime_redirects.is_empty());
+        let wit = &target.wit_text;
+        // Sibling types re-export: wrapper exports a store-types interface that
+        // re-exports the T' bucket so consumer's sibling import is consistent.
+        assert!(
+            wit.contains("interface store-types"),
+            "missing sibling re-export interface:\n{wit}"
+        );
+        assert!(
+            wit.contains("use store.{bucket}"),
+            "sibling re-export must use T' bucket:\n{wit}"
+        );
+        assert!(
+            wit.contains("export store-types;"),
+            "world must export store-types:\n{wit}"
+        );
+        // Redirects: one for the main interface, one for the sibling.
+        assert_eq!(target.t_prime_redirects.len(), 2, "expected 2 redirects");
+        assert!(
+            target.t_prime_redirects.contains(&(
+                "test:kv/store@0.1.0".to_string(),
+                "splicer:wrapper/store@0.0.0".to_string()
+            )),
+            "missing main redirect: {:?}",
+            target.t_prime_redirects
+        );
+        assert!(
+            target.t_prime_redirects.contains(&(
+                "test:kv/store-types@0.1.0".to_string(),
+                "splicer:wrapper/store-types@0.0.0".to_string()
+            )),
+            "missing sibling redirect: {:?}",
+            target.t_prime_redirects
+        );
+    }
+
+    #[test]
+    fn non_t_prime_target_has_empty_redirects() {
+        let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
+        let target = target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform)
+            .expect("extract");
+        assert!(target.t_prime_redirects.is_empty());
+        assert!(
+            target.t_prime_redirects.is_empty(),
+            "non-T' should have no redirects"
+        );
     }
 }

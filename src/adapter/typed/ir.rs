@@ -107,8 +107,7 @@ pub fn build_ir(
                 };
 
                 // Keep T' matching stable by using canonical typedef name.
-                let canonical_name =
-                    td.name.as_deref().unwrap_or(wit_name.as_str());
+                let canonical_name = td.name.as_deref().unwrap_or(wit_name.as_str());
                 let rust_ident_str = canonical_name.to_upper_camel_case();
                 resources.push(ResourceInfo {
                     iface_path: declaring_path,
@@ -142,11 +141,18 @@ pub fn build_ir(
         let import_side: Vec<_> = resources
             .iter()
             .filter(|r| !r.is_owned)
-            .map(|r| (r.wit_name.clone(), r.iface_path.clone(), r.rust_ident.clone()))
+            .map(|r| {
+                (
+                    r.wit_name.clone(),
+                    r.iface_path.clone(),
+                    r.rust_ident.clone(),
+                )
+            })
             .collect();
         for owned in resources.iter_mut().filter(|r| r.is_owned) {
-            if let Some((_, raw_path, _)) =
-                import_side.iter().find(|(name, _, _)| name == &owned.wit_name)
+            if let Some((_, raw_path, _)) = import_side
+                .iter()
+                .find(|(name, _, _)| name == &owned.wit_name)
             {
                 owned.inner_type_path = Some(raw_path.clone());
             }
@@ -270,7 +276,11 @@ fn build_bridge_resources(
             let raw = resources
                 .iter()
                 .find(|r| !r.is_owned && r.wit_name == owned.wit_name)?;
-            Some(BridgeResourceInfo::new(owned, raw, bridge_module_path.clone()))
+            Some(BridgeResourceInfo::new(
+                owned,
+                raw,
+                bridge_module_path.clone(),
+            ))
         })
         .collect()
 }

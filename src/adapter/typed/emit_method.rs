@@ -194,7 +194,6 @@ fn emit_one_resource_newtype(r: &ResourceInfo, behavior: Behavior) -> TokenStrea
     }
 }
 
-
 /// Import-side Rust path for the resource. In normal Transform mode the
 /// wrapper world imports and exports the same interface, so the
 /// import-side type sits at the same module path with the leading
@@ -235,17 +234,13 @@ pub fn emit_bridge_guest_impl(bridge_resources: &[BridgeResourceInfo]) -> Option
     if bridge_resources.is_empty() {
         return None;
     }
-    let bridge_path =
-        bindings_path_tokens(&bridge_resources[0].bridge_module_path, None);
+    let bridge_path = bindings_path_tokens(&bridge_resources[0].bridge_module_path, None);
     let methods: Vec<TokenStream> = bridge_resources
         .iter()
         .map(|br| {
-            let raw =
-                bindings_path_tokens(&br.raw_resource_path, Some(&br.raw_resource_ident));
-            let exp = bindings_path_tokens(
-                &br.export_resource_path,
-                Some(&br.export_resource_ident),
-            );
+            let raw = bindings_path_tokens(&br.raw_resource_path, Some(&br.raw_resource_ident));
+            let exp =
+                bindings_path_tokens(&br.export_resource_path, Some(&br.export_resource_ident));
             let wrap = &br.wrapper_ident;
             quote! {
                 fn wrap(inner: #raw) -> #exp {
