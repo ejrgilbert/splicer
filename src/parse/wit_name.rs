@@ -8,8 +8,15 @@ pub(crate) fn unversioned(qname: &str) -> &str {
     qname.split_once('@').map(|(base, _)| base).unwrap_or(qname)
 }
 
+/// Extract just the interface name from a qualified WIT name.
+///
+/// `"test:kv/store-types@0.1.0"` → `"store-types"`.
+/// Falls back to returning the full input if the input isn't in `ns:pkg/iface` form.
+pub(crate) fn iface_of(qname: &str) -> &str {
+    WitName::parse(qname).map_or(qname, |n| n.iface)
+}
+
 /// Structured view of `ns:pkg/iface[@ver]`.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WitName<'a> {
     pub(crate) ns: &'a str,
@@ -18,7 +25,6 @@ pub(crate) struct WitName<'a> {
     pub(crate) version: Option<&'a str>,
 }
 
-#[cfg(test)]
 impl<'a> WitName<'a> {
     /// Parse `ns:pkg/iface[@ver]`. Returns `None` if the input lacks
     /// either the `ns:pkg` colon or the `/iface` slash.
