@@ -57,6 +57,9 @@ pub struct WrapperCrateInputs<'a> {
     pub strategy_crate_name: &'a str,
     /// The PascalCase Rust ident of the strategy type to instantiate.
     pub strategy_type: &'a str,
+    /// T' mode only: fixed `impl bridge::Guest for Wrapper` block with
+    /// hard-wired `wrap`/`unwrap` bodies (no strategy dispatch).
+    pub bridge_impl: Option<&'a TokenStream>,
 }
 
 /// Assemble a complete `lib.rs` source string for the wrapper crate.
@@ -90,6 +93,7 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         .flat_map(|g| g.args_structs.iter())
         .collect();
     let guest_impls: Vec<&TokenStream> = inputs.guests.iter().map(|g| &g.guest_impl).collect();
+    let bridge_impl = inputs.bridge_impl;
 
     let assembled = quote! {
         // wit-bindgen output, inlined verbatim under `mod bindings`.
@@ -126,6 +130,7 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         struct Wrapper;
 
         #(#guest_impls)*
+        #bridge_impl
 
         bindings::export!(Wrapper with_types_in bindings);
     };
@@ -263,6 +268,7 @@ mod tests {
             behavior,
             strategy_crate_name: "my-strategy",
             strategy_type: "MyStrategy",
+            bridge_impl: None,
         };
         assemble_lib_rs(&inputs).expect("assembly succeeds")
     }

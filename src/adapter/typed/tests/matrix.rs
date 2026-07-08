@@ -1235,3 +1235,108 @@ fn matrix_multiple_exported_interfaces() {
     assert!(out.lib_rs.contains("OpsAPingArgs"));
     assert!(out.lib_rs.contains("OpsBPongArgs"));
 }
+
+// ── T' forwarding wrapper ────────────────────────────────────────────
+
+/// Producer WIT for the T' matrix test. Passed to `target_wit_for_codegen`
+/// to produce the T' WIT, which is then fed to `generate_wrapper_crate`.
+const T_PRIME_PRODUCER_WIT: &str = r#"
+    package test:kv@0.1.0;
+    interface store-types {
+      resource bucket {
+        constructor(name: string);
+        get: async func(k: string) -> option<string>;
+        set: async func(k: string, v: string);
+      }
+    }
+    interface store {
+      use store-types.{bucket};
+      open: async func(name: string) -> bucket;
+    }
+    world provider {
+      export store;
+      export store-types;
+    }
+"#;
+
+#[test]
+fn matrix_resource_t_prime_factored_transform() {
+    use super::super::target_wit::{target_wit_for_codegen, test_fixture::component_from_wit};
+    let component = component_from_wit(T_PRIME_PRODUCER_WIT, "provider")
+        .expect("synthesize T' producer component");
+    let target_wit = target_wit_for_codegen(&component, "test:kv/store@0.1.0", Behavior::Transform)
+        .expect("extract T' WIT");
+    assert!(target_wit.is_t_prime, "expected T' mode for factored resource");
+
+    let out = generate_wrapper_crate(&GenerateWrapperInput {
+        target_wit: &target_wit.wit_text,
+        world_name: Some(&target_wit.world_name),
+        interface_qualified_name: "test:kv/store@0.1.0",
+        behavior: Behavior::Transform,
+        strategy_crate_name: "matrix-strategy",
+        strategy_crate_path: "/abs/path/to/matrix-strategy",
+        strategy_type: "MatrixStrategy",
+        splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
+    })
+    .expect("T' wrapper generation succeeds");
+
+    // WrapperBucket holds the import-side raw resource from store-types.
+    assert!(
+        out.lib_rs.contains("WrapperBucket")
+            && out.lib_rs.contains("bindings::test::kv::store_types::Bucket"),
+        "WrapperBucket must hold raw store-types::Bucket in T' mode:\n{}",
+        out.lib_rs
+    );
+
+    // Bridge Guest impl emitted with fixed wrap/unwrap bodies.
+    assert!(
+        out.lib_rs.contains("bridge::Guest for Wrapper"),
+        "bridge Guest impl must be emitted:\n{}",
+        out.lib_rs
+    );
+    assert!(
+        out.lib_rs.contains("fn wrap") && out.lib_rs.contains("fn unwrap"),
+        "bridge impl must contain wrap and unwrap:\n{}",
+        out.lib_rs
+    );
+    assert!(
+        out.lib_rs.contains("WrapperBucket(inner)"),
+        "wrap body must construct WrapperBucket(inner):\n{}",
+        out.lib_rs
+    );
+    assert!(
+        out.lib_rs.contains("into_inner::<WrapperBucket>()"),
+        "unwrap body must call into_inner::<WrapperBucket>():\n{}",
+        out.lib_rs
+    );
+
+    // Bridge Guest trait must NOT go through strategy dispatch.
+    // The bridge impl uses fixed bodies; only the freestanding `open` fn
+    // goes through the strategy. No args struct is synthesized for bridge.
+    assert!(
+        !out.lib_rs.contains("BridgeWrapArgs") && !out.lib_rs.contains("BridgeUnwrapArgs"),
+        "bridge Guest impl must use fixed bodies, not strategy dispatch:\n{}",
+        out.lib_rs
+    );
+
+    // Per-resource GuestBucket impl on WrapperBucket with forwarding methods.
+    assert!(
+        out.lib_rs.contains("GuestBucket for WrapperBucket"),
+        "per-resource GuestBucket forwarding impl on WrapperBucket must be emitted:\n{}",
+        out.lib_rs
+    );
+
+    // Freestanding function (open) uses TransformStrategy dispatch.
+    assert!(
+        out.lib_rs.contains("TransformStrategy"),
+        "T' wrapper must still use TransformStrategy for freestanding functions:\n{}",
+        out.lib_rs
+    );
+
+    // Constructor forwards to the raw bucket's new(), not T''s own new().
+    assert!(
+        out.lib_rs.contains("test::kv::store_types::Bucket::new"),
+        "constructor must call RawBucket::new, not T' store::Bucket::new:\n{}",
+        out.lib_rs
+    );
+}
