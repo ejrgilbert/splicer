@@ -20,6 +20,7 @@ use wit_parser::{
 use super::bindings_index::{
     bindings_path_tokens, strip_exports_prefix, BindingsItem, BindingsPath, WrapperBindings,
 };
+use super::target_wit::{BRIDGE_IFACE, WRAPPER_PKG_NAME, WRAPPER_PKG_NS};
 use crate::adapter::resolve::resolve_type_alias;
 
 /// Per-interface metadata collected from the world: WIT InterfaceId,
@@ -104,12 +105,17 @@ pub fn build_ir(
                     }
                     _ => (entry.path.clone(), entry.is_export),
                 };
-                let rust_ident_str = wit_name.to_upper_camel_case();
+
+                // Keep T' matching stable by using canonical typedef name.
+                let canonical_name =
+                    td.name.as_deref().unwrap_or(wit_name.as_str());
+                let rust_ident_str = canonical_name.to_upper_camel_case();
                 resources.push(ResourceInfo {
                     iface_path: declaring_path,
-                    wit_name: wit_name.clone(),
+                    wit_name: canonical_name.to_string(),
                     rust_ident: syn::Ident::new(&rust_ident_str, Span::call_site()),
                     is_owned,
+                    inner_type_path: None,
                 });
                 continue;
             }
@@ -129,11 +135,34 @@ pub fn build_ir(
         }
     }
 
+    // T' mode: patch owned resources with their import-side path so the
+    // WrapperR newtype holds the correct raw type.
+    let t_prime = is_t_prime_world(resolve, world_id);
+    if t_prime {
+        let import_side: Vec<_> = resources
+            .iter()
+            .filter(|r| !r.is_owned)
+            .map(|r| (r.wit_name.clone(), r.iface_path.clone(), r.rust_ident.clone()))
+            .collect();
+        for owned in resources.iter_mut().filter(|r| r.is_owned) {
+            if let Some((_, raw_path, _)) =
+                import_side.iter().find(|(name, _, _)| name == &owned.wit_name)
+            {
+                owned.inner_type_path = Some(raw_path.clone());
+            }
+        }
+    }
+
     // Synthesize one args record per exported function.
     let mut args_records: Vec<NamedType> = Vec::new();
     let mut fn_sigs: std::collections::HashMap<String, ExportFnSig> =
         std::collections::HashMap::new();
     for entry in ifaces.iter().filter(|e| e.is_export) {
+        // Bridge interface uses fixed wrap/unwrap bodies, not strategy
+        // dispatch. Skip args-record synthesis for it.
+        if t_prime && is_bridge_iface(resolve, entry.id) {
+            continue;
+        }
         let iface = &resolve.interfaces[entry.id];
         let iface_pascal = iface
             .name
@@ -183,13 +212,67 @@ pub fn build_ir(
             }
         });
 
+    let bridge_resources = if t_prime {
+        build_bridge_resources(&resources, bindings)
+    } else {
+        Vec::new()
+    };
+
     Ok(WrapperIR {
         types,
         resources,
         args_records,
         fn_sigs,
         target_import_path,
+        bridge_resources,
     })
+}
+
+// ── T' helpers ──────────────────────────────────────────────────────────
+
+fn is_bridge_iface(resolve: &Resolve, id: InterfaceId) -> bool {
+    let iface = &resolve.interfaces[id];
+    if iface.name.as_deref() != Some(BRIDGE_IFACE) {
+        return false;
+    }
+    let Some(pkg_id) = iface.package else {
+        return false;
+    };
+    let pkg = &resolve.packages[pkg_id];
+    pkg.name.namespace == WRAPPER_PKG_NS && pkg.name.name == WRAPPER_PKG_NAME
+}
+
+fn is_t_prime_world(resolve: &Resolve, world_id: WorldId) -> bool {
+    resolve.worlds[world_id].exports.values().any(|item| {
+        let WorldItem::Interface { id, .. } = item else {
+            return false;
+        };
+        is_bridge_iface(resolve, *id)
+    })
+}
+
+fn build_bridge_resources(
+    resources: &[ResourceInfo],
+    bindings: &WrapperBindings,
+) -> Vec<BridgeResourceInfo> {
+    // Locate the bridge module path from the generated bindings.
+    let bridge_module_path = bindings
+        .guest_traits
+        .iter()
+        .find(|g| g.module_path.last().map(String::as_str) == Some(BRIDGE_IFACE))
+        .map(|g| g.module_path.clone())
+        .unwrap_or_default();
+
+    resources
+        .iter()
+        .filter(|r| r.is_owned)
+        .filter_map(|owned| {
+            let raw = resources
+                .iter()
+                .find(|r| !r.is_owned && r.wit_name == owned.wit_name)?;
+            Some(BridgeResourceInfo::new(owned, raw, bridge_module_path.clone()))
+        })
+        .collect()
 }
 
 fn resource_pascal(resolve: &Resolve, type_id: TypeId) -> Result<String> {
@@ -233,6 +316,8 @@ pub struct WrapperIR {
     /// Bindings path of the wrapped target on the wrapper's *import*
     /// side. `None` in tier-4 virtualize (no downstream import).
     pub target_import_path: Option<BindingsPath>,
+    /// One entry per resource covered by the bridge interface.
+    pub bridge_resources: Vec<BridgeResourceInfo>,
 }
 
 pub struct ExportFnSig {
@@ -274,6 +359,39 @@ pub struct ResourceInfo {
     /// a `WrapperR` newtype + `GuestR` impl). False for resources
     /// the wrapper only consumes from an imported iface.
     pub is_owned: bool,
+    /// T' mode only: bindings path of the raw (import-side) resource
+    /// held inside `WrapperR`
+    pub inner_type_path: Option<BindingsPath>,
+}
+
+/// Describes one resource pair covered by the T' bridge interface.
+pub struct BridgeResourceInfo {
+    pub raw_resource_path: BindingsPath,
+    pub raw_resource_ident: syn::Ident,
+    pub export_resource_path: BindingsPath,
+    pub export_resource_ident: syn::Ident,
+    /// `Wrapper<Pascal>` newtype ident, e.g. `WrapperBucket`.
+    pub wrapper_ident: syn::Ident,
+    /// Module path of the bridge Guest trait in the generated bindings.
+    pub bridge_module_path: BindingsPath,
+}
+
+impl BridgeResourceInfo {
+    fn new(owned: &ResourceInfo, raw: &ResourceInfo, bridge_module_path: BindingsPath) -> Self {
+        BridgeResourceInfo {
+            raw_resource_path: raw.iface_path.clone(),
+            raw_resource_ident: raw.rust_ident.clone(),
+            export_resource_path: owned.iface_path.clone(),
+            export_resource_ident: owned.rust_ident.clone(),
+            wrapper_ident: wrapper_ident_for(&owned.rust_ident),
+            bridge_module_path,
+        }
+    }
+}
+
+/// Derive resource's wrapper name.
+pub(crate) fn wrapper_ident_for(resource_pascal: &syn::Ident) -> syn::Ident {
+    syn::Ident::new(&format!("Wrapper{resource_pascal}"), Span::call_site())
 }
 
 /// A named entity that gets a `WitTyped` impl: either a WIT-declared
