@@ -17,7 +17,7 @@ pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, Wrappe
 pub use bindgen::{alias_shared_export_types, run_wit_bindgen_rust};
 pub use bindings_index::build_bindings_index;
 pub use build::{build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
-pub use emit_method::{emit_guest, emit_resource_newtypes, EmittedGuest};
+pub use emit_method::{emit_bridge_guest_impl, emit_guest, emit_resource_newtypes, EmittedGuest};
 pub use emit_wit_typed::emit_wit_typed_impls;
 #[allow(unused_imports)]
 pub use ir::{build_ir, NamedKind, NamedType, WitTypeRef, WrapperIR};
@@ -68,12 +68,16 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     let user_impls = emit_wit_typed_impls(&ir.types);
     let args_impls = emit_wit_typed_impls(&ir.args_records);
     let witty_impls: Vec<_> = user_impls.into_iter().chain(args_impls).collect();
+    // T' mode: the bridge Guest trait uses fixed wrap/unwrap bodies;
+    // exclude it from strategy-dispatch codegen.
     let guests: Vec<EmittedGuest> = bindings
         .guest_traits
         .iter()
+        .filter(|g| g.module_path.last().map(String::as_str) != Some(target_wit::BRIDGE_IFACE))
         .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior, &ir))
         .collect();
     let resource_newtypes = emit_resource_newtypes(&ir, input.behavior);
+    let bridge_impl = emit_bridge_guest_impl(&ir.bridge_resources);
 
     let lib_rs = assemble_lib_rs(&WrapperCrateInputs {
         bindings_src: &bindings_src,
@@ -83,6 +87,7 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         behavior: input.behavior,
         strategy_crate_name: input.strategy_crate_name,
         strategy_type: input.strategy_type,
+        bridge_impl: bridge_impl.as_ref(),
     })?;
 
     let crate_name =
