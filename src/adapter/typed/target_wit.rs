@@ -3,12 +3,14 @@
 //! types. The output is a single WIT text + world name + qualified
 //! interface name, suitable for [`super::GenerateWrapperInput`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{anyhow, Context, Result};
 use wit_component::{Output, WitPrinter};
 use wit_parser::{
-    FunctionKind, Handle, InterfaceId, Resolve, Type, TypeDefKind, TypeId, TypeOwner,
+    Docs, Function, FunctionKind, Handle, IndexMap, Interface, InterfaceId, Package, PackageId,
+    PackageName, Param, Resolve, Result_, Span, Stability, Tuple, Type, TypeDef, TypeDefKind,
+    TypeId, TypeOwner, World, WorldId, WorldItem, WorldKey,
 };
 
 use super::Behavior;
@@ -43,14 +45,16 @@ pub fn target_wit_for_codegen(
     target_interface: &str,
     behavior: Behavior,
 ) -> Result<TargetWit> {
-    let resolve = decode_input_resolve(component_bytes)?;
+    let mut resolve = decode_input_resolve(component_bytes)?;
     let target_iface_id = find_target_interface(&resolve, target_interface)?;
     let qualified = resolve
         .id_of(target_iface_id)
         .ok_or_else(|| anyhow!("target interface `{target_interface}` has no qualified name"))?;
 
     // Sibling `-types` interfaces the target `use`s.
-    let sibling_ifaces = sibling_types_ifaces_of(&resolve, target_iface_id);
+    let sibling_ifaces: Vec<InterfaceId> = sibling_types_ifaces_of(&resolve, target_iface_id)
+        .into_iter()
+        .collect();
     let sibling_qualified: Vec<String> = sibling_ifaces
         .iter()
         .map(|id| {
@@ -65,10 +69,11 @@ pub fn target_wit_for_codegen(
     let factored = factored_resources_of(&resolve, target_iface_id);
     if !factored.is_empty() && matches!(behavior, Behavior::Transform) {
         return emit_t_prime_world(
-            &resolve,
+            &mut resolve,
             target_iface_id,
             target_interface,
             qualified,
+            &sibling_ifaces,
             &sibling_qualified,
             &factored,
         );
@@ -126,79 +131,59 @@ fn print_all_packages(resolve: &Resolve, target_interface: &str) -> Result<Strin
     Ok(printer.output.to_string())
 }
 
-/// Assemble the T'-forwarding WIT package (bridge interface + fresh
-/// resource declarations) for a factored-resource Transform target.
+/// Build the T' WIT package in the resolve programmatically, render it with
+/// WitPrinter (which auto-generates `use` statements), and assemble the final
+/// TargetWit for factored-resource Transform targets.
 fn emit_t_prime_world(
-    resolve: &Resolve,
+    resolve: &mut Resolve,
     target_iface_id: InterfaceId,
     target_interface: &str,
     qualified: String,
+    sibling_ifaces: &[InterfaceId],
     sibling_qualified: &[String],
     factored: &[FactoredResource],
 ) -> Result<TargetWit> {
     let local_name = resolve.interfaces[target_iface_id]
         .name
         .as_deref()
-        .ok_or_else(|| anyhow!("target interface `{target_interface}` has no local name"))?;
-    let t_prime_iface = emit_t_prime_interface_wit(resolve, target_iface_id, local_name, factored)?;
-    let bridge_iface = emit_bridge_interface_wit(factored, local_name);
+        .ok_or_else(|| anyhow!("target interface `{target_interface}` has no local name"))?
+        .to_string();
 
-    // For each sibling types interface, emit a re-export interface that re-exports
-    // the T' resource type. This makes the consumer's sibling import consistent
-    // with the T' type it gets from the main interface (both sourced from same wrapper instance).
+    // Capture original packages BEFORE mutating resolve with T' nodes.
+    let original_pkg_text = print_all_packages(resolve, target_interface)?;
+
+    let t_prime_pkg_id = build_t_prime_package(
+        resolve,
+        target_iface_id,
+        &local_name,
+        sibling_ifaces,
+        sibling_qualified,
+        factored,
+    )?;
+
+    let mut printer = WitPrinter::default();
+    printer
+        .print_package(resolve, t_prime_pkg_id, true)
+        .context("printing T' wrapper package")?;
+    let t_prime_text = printer.output.to_string();
+
+    // WAC cross-name redirect pairs: main interface + siblings that have factored resources.
     let sibling_local_names: Vec<&str> = sibling_qualified.iter().map(|q| iface_of(q)).collect();
-    let mut sibling_reexport_blocks = String::new();
-    for (sibling_q, &sibling_local) in sibling_qualified.iter().zip(&sibling_local_names) {
-        let res_names: Vec<&str> = factored
-            .iter()
-            .filter(|r| r.declaring_qualified == *sibling_q)
-            .map(|r| r.wit_name.as_str())
-            .collect();
-        if res_names.is_empty() {
-            continue;
-        }
-        sibling_reexport_blocks.push_str(&format!("interface {sibling_local} {{\n"));
-        for res in &res_names {
-            sibling_reexport_blocks.push_str(&format!("  use {local_name}.{{{res}}};\n"));
-        }
-        sibling_reexport_blocks.push_str("}\n");
-    }
-
-    // Collect WAC cross-name redirect pairs: (consumer_import_key → t_prime_export_key).
     let mut t_prime_redirects = vec![(
         qualified.clone(),
         format!("splicer:wrapper/{local_name}@0.0.0"),
     )];
     for (sibling_q, &sibling_local) in sibling_qualified.iter().zip(&sibling_local_names) {
-        t_prime_redirects.push((
-            sibling_q.clone(),
-            format!("splicer:wrapper/{sibling_local}@0.0.0"),
-        ));
+        if factored.iter().any(|r| r.declaring_qualified == *sibling_q) {
+            t_prime_redirects.push((
+                sibling_q.clone(),
+                format!("splicer:wrapper/{sibling_local}@0.0.0"),
+            ));
+        }
     }
 
-    let mut out = String::new();
-    out.push_str(&format!("package {WRAPPER_PACKAGE};\n\n"));
-    out.push_str(&t_prime_iface);
-    out.push('\n');
-    out.push_str(&bridge_iface);
-    if !sibling_reexport_blocks.is_empty() {
-        out.push('\n');
-        out.push_str(&sibling_reexport_blocks);
-    }
-    out.push_str(&format!("\nworld {WRAPPER_WORLD} {{\n"));
-    out.push_str(&format!("    import {qualified};\n"));
-    for q in sibling_qualified {
-        out.push_str(&format!("    import {q};\n"));
-    }
-    out.push_str(&format!("    export {local_name};\n"));
-    out.push_str(&format!("    export {BRIDGE_IFACE};\n"));
-    for sibling_local in &sibling_local_names {
-        out.push_str(&format!("    export {sibling_local};\n"));
-    }
-    out.push_str("}\n\n");
-    out.push_str(&print_all_packages(resolve, target_interface)?);
     Ok(TargetWit {
-        wit_text: out,
+        wit_text: format!("{t_prime_text}\n\n{original_pkg_text}"),
         world_name: WRAPPER_WORLD.to_string(),
         qualified_name: qualified,
         t_prime_redirects,
@@ -251,216 +236,6 @@ fn factored_resources_of(resolve: &Resolve, target: InterfaceId) -> Vec<Factored
     out
 }
 
-/// Render a WIT type as its source-level text (e.g. `option<string>`,
-/// `borrow<bucket>`). Resource own-handles are emitted as bare names
-/// (WIT shorthand for `own<R>`).
-fn emit_wit_type_text(resolve: &Resolve, ty: &Type) -> String {
-    match ty {
-        Type::Bool => "bool".to_string(),
-        Type::U8 => "u8".to_string(),
-        Type::U16 => "u16".to_string(),
-        Type::U32 => "u32".to_string(),
-        Type::U64 => "u64".to_string(),
-        Type::S8 => "s8".to_string(),
-        Type::S16 => "s16".to_string(),
-        Type::S32 => "s32".to_string(),
-        Type::S64 => "s64".to_string(),
-        Type::F32 => "f32".to_string(),
-        Type::F64 => "f64".to_string(),
-        Type::Char => "char".to_string(),
-        Type::String => "string".to_string(),
-        Type::ErrorContext => "error-context".to_string(),
-        Type::Id(id) => emit_type_id_text(resolve, *id),
-    }
-}
-
-fn emit_type_id_text(resolve: &Resolve, id: TypeId) -> String {
-    let td = &resolve.types[id];
-    match &td.kind {
-        TypeDefKind::List(ty) => format!("list<{}>", emit_wit_type_text(resolve, ty)),
-        TypeDefKind::Option(ty) => format!("option<{}>", emit_wit_type_text(resolve, ty)),
-        TypeDefKind::Result(r) => match (&r.ok, &r.err) {
-            (None, None) => "result".to_string(),
-            (Some(ok), None) => format!("result<{}>", emit_wit_type_text(resolve, ok)),
-            (None, Some(err)) => format!("result<_, {}>", emit_wit_type_text(resolve, err)),
-            (Some(ok), Some(err)) => format!(
-                "result<{}, {}>",
-                emit_wit_type_text(resolve, ok),
-                emit_wit_type_text(resolve, err)
-            ),
-        },
-        TypeDefKind::Tuple(t) => {
-            let elems: Vec<_> = t
-                .types
-                .iter()
-                .map(|ty| emit_wit_type_text(resolve, ty))
-                .collect();
-            format!("tuple<{}>", elems.join(", "))
-        }
-        // own<R> in WIT is written as just the resource name.
-        TypeDefKind::Handle(Handle::Own(rid)) => resolve.types[*rid]
-            .name
-            .as_deref()
-            .unwrap_or("?")
-            .to_string(),
-        TypeDefKind::Handle(Handle::Borrow(rid)) => {
-            let name = resolve.types[*rid].name.as_deref().unwrap_or("?");
-            format!("borrow<{name}>")
-        }
-        // Follow aliases.
-        TypeDefKind::Type(inner) => emit_wit_type_text(resolve, inner),
-        // Named types: record, variant, enum, flags, resource — bare name.
-        _ => td.name.as_deref().unwrap_or("?").to_string(),
-    }
-}
-
-/// Emit the WIT method/constructor/static declarations for one resource
-/// by walking the functions stored in its declaring interface.
-fn emit_resource_methods_wit(
-    resolve: &Resolve,
-    resource_type_id: TypeId,
-    declaring_iface_id: InterfaceId,
-) -> String {
-    let original = resolve_type_alias(resolve, resource_type_id);
-    let iface = &resolve.interfaces[declaring_iface_id];
-    let mut out = String::new();
-    // Functions are sorted by key for determinism.
-    let mut fns: Vec<_> = iface.functions.iter().collect();
-    fns.sort_by_key(|(name, _)| *name);
-    for (_, func) in fns {
-        match &func.kind {
-            FunctionKind::Constructor(rid) if *rid == original => {
-                let params = emit_params(resolve, &func.params, false);
-                out.push_str(&format!("    constructor({params});\n"));
-            }
-            FunctionKind::Method(rid) | FunctionKind::AsyncMethod(rid) if *rid == original => {
-                let async_kw = if matches!(func.kind, FunctionKind::AsyncMethod(_)) {
-                    "async "
-                } else {
-                    ""
-                };
-                let method_name = method_short_name(&func.name);
-                let params = emit_params(resolve, &func.params, true); // skip self
-                let ret = emit_result(resolve, func.result.as_ref());
-                out.push_str(&format!(
-                    "    {method_name}: {async_kw}func({params}){ret};\n"
-                ));
-            }
-            FunctionKind::Static(rid) | FunctionKind::AsyncStatic(rid) if *rid == original => {
-                let async_kw = if matches!(func.kind, FunctionKind::AsyncStatic(_)) {
-                    "async "
-                } else {
-                    ""
-                };
-                let static_name = static_short_name(&func.name);
-                let params = emit_params(resolve, &func.params, false);
-                let ret = emit_result(resolve, func.result.as_ref());
-                out.push_str(&format!(
-                    "    {static_name}: static {async_kw}func({params}){ret};\n"
-                ));
-            }
-            // function isn't tied to the resource we're targeting
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Emit the T' interface block: fresh resource declarations + forwarded
-/// freestanding functions from the target interface.
-fn emit_t_prime_interface_wit(
-    resolve: &Resolve,
-    target_iface_id: InterfaceId,
-    local_name: &str,
-    resources: &[FactoredResource],
-) -> Result<String> {
-    let mut out = format!("interface {local_name} {{\n");
-    for res in resources {
-        let methods = emit_resource_methods_wit(resolve, res.type_id, res.declaring_iface_id);
-        out.push_str(&format!("  resource {} {{\n", res.wit_name));
-        out.push_str(&methods);
-        out.push_str("  }\n");
-    }
-    // Freestanding functions from the target interface (factories, etc.).
-    let iface = &resolve.interfaces[target_iface_id];
-    let mut fns: Vec<_> = iface.functions.iter().collect();
-    fns.sort_by_key(|(name, _)| *name);
-    for (fn_name, func) in fns {
-        match func.kind {
-            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {
-                let async_kw = if matches!(
-                    func.kind,
-                    FunctionKind::AsyncFreestanding
-                        | FunctionKind::AsyncMethod(_)
-                        | FunctionKind::AsyncStatic(_)
-                ) {
-                    "async "
-                } else {
-                    ""
-                };
-                let params = emit_params(resolve, &func.params, false);
-                let ret = emit_result(resolve, func.result.as_ref());
-                out.push_str(&format!("  {fn_name}: {async_kw}func({params}){ret};\n"));
-            }
-            _ => {} // resource surfaces are emitted above, not here
-        }
-    }
-    out.push_str("}\n");
-    Ok(out)
-}
-
-/// Emit the bridge interface that exposes wrap/unwrap for T'.
-fn emit_bridge_interface_wit(resources: &[FactoredResource], t_prime_local_name: &str) -> String {
-    let mut out = format!("interface {BRIDGE_IFACE} {{\n");
-    for res in resources {
-        let wn = &res.wit_name;
-        out.push_str(&format!(
-            "  use {}.{{{} as raw-{}}};\n",
-            res.declaring_qualified, wn, wn
-        ));
-        out.push_str(&format!(
-            "  use {t_prime_local_name}.{{{wn} as wrapped-{wn}}};\n"
-        ));
-        out.push_str(&format!("  wrap: func(inner: raw-{wn}) -> wrapped-{wn};\n"));
-        out.push_str(&format!("  unwrap: func(w: wrapped-{wn}) -> raw-{wn};\n"));
-    }
-    out.push_str("}\n");
-    out
-}
-
-// ── emit_params / emit_result helpers ───────────────────────────────
-
-fn emit_params(resolve: &Resolve, params: &[wit_parser::Param], skip_first: bool) -> String {
-    let iter = params.iter().skip(usize::from(skip_first));
-    iter.map(|p| format!("{}: {}", p.name, emit_wit_type_text(resolve, &p.ty)))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn emit_result(resolve: &Resolve, result: Option<&Type>) -> String {
-    match result {
-        Some(ty) => format!(" -> {}", emit_wit_type_text(resolve, ty)),
-        None => String::new(),
-    }
-}
-
-/// Strip `[method]resource.` or `[async-method]resource.` prefix.
-fn method_short_name(fn_name: &str) -> &str {
-    fn_name
-        .find(']')
-        .and_then(|i| {
-            fn_name[i + 1..]
-                .find('.')
-                .map(|j| &fn_name[i + 1 + j + 1..])
-        })
-        .unwrap_or(fn_name)
-}
-
-/// Strip `[static]resource.` prefix.
-fn static_short_name(fn_name: &str) -> &str {
-    method_short_name(fn_name) // same pattern
-}
-
 /// Walk `target`'s types and return every sibling interface that
 /// declares a type referenced via `use types.{R}` (or any other type
 /// whose original owner is a different interface).
@@ -476,6 +251,617 @@ fn sibling_types_ifaces_of(resolve: &Resolve, target: InterfaceId) -> BTreeSet<I
         }
     }
     out
+}
+
+// ==================
+// ==== builders ====
+// ==================
+
+/// Allocate all T' package nodes in the resolve and return the PackageId.
+fn build_t_prime_package(
+    resolve: &mut Resolve,
+    target_iface_id: InterfaceId,
+    local_name: &str,
+    sibling_ifaces: &[InterfaceId],
+    sibling_qualified: &[String],
+    factored: &[FactoredResource],
+) -> Result<PackageId> {
+    let pkg_name = PackageName {
+        namespace: WRAPPER_PKG_NS.to_string(),
+        name: WRAPPER_PKG_NAME.to_string(),
+        version: Some(semver::Version::new(0, 0, 0)),
+    };
+    let pkg_id = resolve.packages.alloc(Package {
+        name: pkg_name.clone(),
+        docs: Docs::default(),
+        interfaces: IndexMap::default(),
+        worlds: IndexMap::default(),
+    });
+    resolve.package_names.insert(pkg_name, pkg_id);
+
+    // Sibling T' interfaces FIRST: each sibling that has factored resources gets its own
+    // T' interface that DECLARES the fresh resource (with its methods). The main T' interface
+    // then uses those types via USE aliases, mirroring the original WIT structure.
+    let mut subst: HashMap<TypeId, TypeId> = HashMap::new();
+    let mut sibling_t_prime_iface_ids: Vec<InterfaceId> = Vec::new();
+    for (_sibling_iface_id, sibling_q) in sibling_ifaces.iter().zip(sibling_qualified.iter()) {
+        let sibling_local = iface_of(sibling_q);
+        let res_for_sibling: Vec<&FactoredResource> = factored
+            .iter()
+            .filter(|r| r.declaring_qualified == *sibling_q)
+            .collect();
+        if res_for_sibling.is_empty() {
+            continue;
+        }
+        let sibling_t_prime_id = build_sibling_t_prime_iface(
+            resolve,
+            pkg_id,
+            sibling_local,
+            &res_for_sibling,
+            &mut subst,
+        )?;
+        resolve.packages[pkg_id]
+            .interfaces
+            .insert(sibling_local.to_string(), sibling_t_prime_id);
+        sibling_t_prime_iface_ids.push(sibling_t_prime_id);
+    }
+
+    // T' main interface: freestanding functions only; resources come via USE aliases from
+    // the sibling T' interfaces whose fresh types are now in `subst`.
+    let t_prime_iface_id =
+        build_t_prime_iface(resolve, pkg_id, target_iface_id, local_name, factored, &subst)?;
+    resolve.packages[pkg_id]
+        .interfaces
+        .insert(local_name.to_string(), t_prime_iface_id);
+
+    // Bridge interface: wrap/unwrap helpers.
+    let bridge_iface_id = build_bridge_iface(resolve, pkg_id, factored, &subst)?;
+    resolve.packages[pkg_id]
+        .interfaces
+        .insert(BRIDGE_IFACE.to_string(), bridge_iface_id);
+
+    // World: imports target + siblings, exports T' iface + bridge + sibling reexports.
+    let world_id = build_wrapper_world(
+        resolve,
+        pkg_id,
+        target_iface_id,
+        sibling_ifaces,
+        t_prime_iface_id,
+        bridge_iface_id,
+        &sibling_t_prime_iface_ids,
+    );
+    resolve.packages[pkg_id]
+        .worlds
+        .insert(WRAPPER_WORLD.to_string(), world_id);
+
+    Ok(pkg_id)
+}
+
+/// Build the T' main interface: freestanding functions only, with USE aliases for any
+/// factored resource types that appear in parameters or results. Fresh resource TypeDefs
+/// are owned by the sibling T' interfaces (built before this call) and already recorded
+/// in `subst`.
+fn build_t_prime_iface(
+    resolve: &mut Resolve,
+    pkg_id: PackageId,
+    target_iface_id: InterfaceId,
+    local_name: &str,
+    factored: &[FactoredResource],
+    subst: &HashMap<TypeId, TypeId>,
+) -> Result<InterfaceId> {
+    let t_prime_iface_id = resolve.interfaces.alloc(Interface {
+        name: Some(local_name.to_string()),
+        types: IndexMap::default(),
+        functions: IndexMap::default(),
+        docs: Docs::default(),
+        stability: Stability::default(),
+        package: Some(pkg_id),
+        span: Span::default(),
+        clone_of: None,
+    });
+
+    let mut use_cache: HashMap<TypeId, TypeId> = HashMap::new();
+
+    // Copy freestanding functions from the target interface. Substitution adds USE aliases
+    // in this interface for any factored resource types encountered in params/results.
+    let freestanding: Vec<(String, Function)> = resolve.interfaces[target_iface_id]
+        .functions
+        .iter()
+        .filter(|(_, func)| {
+            matches!(
+                func.kind,
+                FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
+            )
+        })
+        .map(|(name, func)| (name.clone(), func.clone()))
+        .collect();
+
+    for (fn_name, func) in freestanding {
+        let new_params = substitute_params(
+            resolve,
+            &func.params,
+            subst,
+            t_prime_iface_id,
+            &mut use_cache,
+        );
+        let new_result = func.result.map(|ty| {
+            substitute_ty(resolve, ty, subst, t_prime_iface_id, &mut use_cache)
+        });
+        resolve.interfaces[t_prime_iface_id].functions.insert(
+            fn_name,
+            Function {
+                name: func.name,
+                kind: func.kind,
+                params: new_params,
+                result: new_result,
+                docs: Docs::default(),
+                stability: Stability::default(),
+                span: Span::default(),
+            },
+        );
+    }
+
+    // Also add USE aliases for factored resources that don't appear in any freestanding
+    // function (e.g. resources exported purely so callers can construct them), so the
+    // T' world export is still type-consistent even when freestanding functions happen
+    // not to reference the resource type directly.
+    for res in factored {
+        let original = resolve_type_alias(resolve, res.type_id);
+        if let Some(&fresh_id) = subst.get(&original) {
+            // Only add a USE alias if the fresh resource lives in a different interface.
+            if resolve.types[fresh_id].owner != TypeOwner::Interface(t_prime_iface_id) {
+                ensure_use_alias(resolve, fresh_id, t_prime_iface_id, &mut use_cache);
+            }
+        }
+    }
+
+    Ok(t_prime_iface_id)
+}
+
+/// Build the bridge interface: wrap/unwrap functions for each factored resource.
+fn build_bridge_iface(
+    resolve: &mut Resolve,
+    pkg_id: PackageId,
+    factored: &[FactoredResource],
+    subst: &HashMap<TypeId, TypeId>,
+) -> Result<InterfaceId> {
+    let bridge_iface_id = resolve.interfaces.alloc(Interface {
+        name: Some(BRIDGE_IFACE.to_string()),
+        types: IndexMap::default(),
+        functions: IndexMap::default(),
+        docs: Docs::default(),
+        stability: Stability::default(),
+        package: Some(pkg_id),
+        span: Span::default(),
+        clone_of: None,
+    });
+
+    for res in factored {
+        let original = resolve_type_alias(resolve, res.type_id);
+        let fresh_id = subst[&original];
+        let wn = &res.wit_name;
+
+        // `raw-{name}`: USE alias pointing to original resource in its declaring interface.
+        // WitPrinter emits `use <declaring_qualified>.{name as raw-name}`.
+        let raw_id = resolve.types.alloc(TypeDef {
+            name: Some(format!("raw-{wn}")),
+            kind: TypeDefKind::Type(Type::Id(original)),
+            owner: TypeOwner::Interface(bridge_iface_id),
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        resolve.interfaces[bridge_iface_id]
+            .types
+            .insert(format!("raw-{wn}"), raw_id);
+
+        // `wrapped-{name}`: USE alias pointing to T' resource (same package).
+        // WitPrinter emits `use {local_name}.{name as wrapped-name}`.
+        let wrapped_id = resolve.types.alloc(TypeDef {
+            name: Some(format!("wrapped-{wn}")),
+            kind: TypeDefKind::Type(Type::Id(fresh_id)),
+            owner: TypeOwner::Interface(bridge_iface_id),
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        resolve.interfaces[bridge_iface_id]
+            .types
+            .insert(format!("wrapped-{wn}"), wrapped_id);
+
+        // `wrap-{name}: func(inner: raw-{name}) -> wrapped-{name}`
+        let wrap_fn = format!("wrap-{wn}");
+        resolve.interfaces[bridge_iface_id].functions.insert(
+            wrap_fn.clone(),
+            Function {
+                name: wrap_fn,
+                kind: FunctionKind::Freestanding,
+                params: vec![Param {
+                    name: "inner".to_string(),
+                    ty: Type::Id(raw_id),
+                    span: Span::default(),
+                }],
+                result: Some(Type::Id(wrapped_id)),
+                docs: Docs::default(),
+                stability: Stability::default(),
+                span: Span::default(),
+            },
+        );
+
+        // `unwrap-{name}: func(w: wrapped-{name}) -> raw-{name}`
+        let unwrap_fn = format!("unwrap-{wn}");
+        resolve.interfaces[bridge_iface_id].functions.insert(
+            unwrap_fn.clone(),
+            Function {
+                name: unwrap_fn,
+                kind: FunctionKind::Freestanding,
+                params: vec![Param {
+                    name: "w".to_string(),
+                    ty: Type::Id(wrapped_id),
+                    span: Span::default(),
+                }],
+                result: Some(Type::Id(raw_id)),
+                docs: Docs::default(),
+                stability: Stability::default(),
+                span: Span::default(),
+            },
+        );
+    }
+
+    Ok(bridge_iface_id)
+}
+
+/// Build a sibling T' interface that DECLARES the fresh resource (mirroring the original
+/// sibling's structure) with all of its methods. This ensures the T' sibling exports the
+/// constructor and methods that the consumer expects to call on the import side, and
+/// populates `subst` with the (original → fresh) mapping for subsequent builders.
+fn build_sibling_t_prime_iface(
+    resolve: &mut Resolve,
+    pkg_id: PackageId,
+    sibling_local: &str,
+    res_for_sibling: &[&FactoredResource],
+    subst: &mut HashMap<TypeId, TypeId>,
+) -> Result<InterfaceId> {
+    let iface_id = resolve.interfaces.alloc(Interface {
+        name: Some(sibling_local.to_string()),
+        types: IndexMap::default(),
+        functions: IndexMap::default(),
+        docs: Docs::default(),
+        stability: Stability::default(),
+        package: Some(pkg_id),
+        span: Span::default(),
+        clone_of: None,
+    });
+
+    // Declare fresh resource TypeDefs owned by this sibling interface.
+    for res in res_for_sibling {
+        let original = resolve_type_alias(resolve, res.type_id);
+        let fresh_id = resolve.types.alloc(TypeDef {
+            name: Some(res.wit_name.clone()),
+            kind: TypeDefKind::Resource,
+            owner: TypeOwner::Interface(iface_id),
+            docs: Docs::default(),
+            stability: Stability::default(),
+            span: Span::default(),
+        });
+        resolve.interfaces[iface_id]
+            .types
+            .insert(res.wit_name.clone(), fresh_id);
+        subst.insert(original, fresh_id);
+    }
+
+    let mut use_cache: HashMap<TypeId, TypeId> = HashMap::new();
+
+    // Copy resource methods (constructor + instance methods) from the original declaring interface.
+    for res in res_for_sibling {
+        let original = resolve_type_alias(resolve, res.type_id);
+        let fresh_id = subst[&original];
+        let res_fns: Vec<(String, Function)> = resolve.interfaces[res.declaring_iface_id]
+            .functions
+            .iter()
+            .filter(|(_, func)| matches_resource(&func.kind, original))
+            .map(|(name, func)| (name.clone(), func.clone()))
+            .collect();
+        for (fn_name, func) in res_fns {
+            let new_kind = remap_func_kind(&func.kind, original, fresh_id);
+            let new_params =
+                substitute_params(resolve, &func.params, subst, iface_id, &mut use_cache);
+            let new_result = func
+                .result
+                .map(|ty| substitute_ty(resolve, ty, subst, iface_id, &mut use_cache));
+            resolve.interfaces[iface_id].functions.insert(
+                fn_name,
+                Function {
+                    name: func.name,
+                    kind: new_kind,
+                    params: new_params,
+                    result: new_result,
+                    docs: Docs::default(),
+                    stability: Stability::default(),
+                    span: Span::default(),
+                },
+            );
+        }
+    }
+
+    Ok(iface_id)
+}
+
+/// Build the wrapper world that imports the target + siblings and exports
+/// the T' interface, bridge, and sibling reexport interfaces.
+fn build_wrapper_world(
+    resolve: &mut Resolve,
+    pkg_id: PackageId,
+    target_iface_id: InterfaceId,
+    sibling_ifaces: &[InterfaceId],
+    t_prime_iface_id: InterfaceId,
+    bridge_iface_id: InterfaceId,
+    sibling_reexport_iface_ids: &[InterfaceId],
+) -> WorldId {
+    let mut imports: IndexMap<WorldKey, WorldItem> = IndexMap::default();
+    let mut exports: IndexMap<WorldKey, WorldItem> = IndexMap::default();
+
+    let wi = |id: InterfaceId| WorldItem::Interface {
+        id,
+        stability: Stability::default(),
+        span: Span::default(),
+    };
+
+    // Imports: external target + sibling interfaces.
+    // WitPrinter emits their qualified names (different package).
+    imports.insert(WorldKey::Interface(target_iface_id), wi(target_iface_id));
+    for &sibling_id in sibling_ifaces {
+        imports.insert(WorldKey::Interface(sibling_id), wi(sibling_id));
+    }
+
+    // Exports: T' iface + bridge + sibling reexports.
+    // WitPrinter emits their local names (same package).
+    exports.insert(WorldKey::Interface(t_prime_iface_id), wi(t_prime_iface_id));
+    exports.insert(WorldKey::Interface(bridge_iface_id), wi(bridge_iface_id));
+    for &reexport_id in sibling_reexport_iface_ids {
+        exports.insert(WorldKey::Interface(reexport_id), wi(reexport_id));
+    }
+    // Also export the original target interface so the WAC export line
+    // `export t_prime_var["original_iface_name"]` resolves correctly.
+    // The generated delegation impl delegates to the T' handler impl
+    // (wrapping/unwrapping resources via the bridge).
+    exports.insert(WorldKey::Interface(target_iface_id), wi(target_iface_id));
+
+    resolve.worlds.alloc(World {
+        name: WRAPPER_WORLD.to_string(),
+        imports,
+        exports,
+        package: Some(pkg_id),
+        docs: Docs::default(),
+        stability: Stability::default(),
+        includes: vec![],
+        span: Span::default(),
+    })
+}
+
+// ========================
+// ==== type substitution ====
+// ========================
+
+fn matches_resource(kind: &FunctionKind, resource_id: TypeId) -> bool {
+    match kind {
+        FunctionKind::Constructor(rid)
+        | FunctionKind::Method(rid)
+        | FunctionKind::AsyncMethod(rid)
+        | FunctionKind::Static(rid)
+        | FunctionKind::AsyncStatic(rid) => *rid == resource_id,
+        _ => false,
+    }
+}
+
+fn remap_func_kind(kind: &FunctionKind, old_id: TypeId, new_id: TypeId) -> FunctionKind {
+    match kind {
+        FunctionKind::Constructor(rid) if *rid == old_id => FunctionKind::Constructor(new_id),
+        FunctionKind::Method(rid) if *rid == old_id => FunctionKind::Method(new_id),
+        FunctionKind::AsyncMethod(rid) if *rid == old_id => FunctionKind::AsyncMethod(new_id),
+        FunctionKind::Static(rid) if *rid == old_id => FunctionKind::Static(new_id),
+        FunctionKind::AsyncStatic(rid) if *rid == old_id => FunctionKind::AsyncStatic(new_id),
+        other => other.clone(),
+    }
+}
+
+fn substitute_params(
+    resolve: &mut Resolve,
+    params: &[Param],
+    subst: &HashMap<TypeId, TypeId>,
+    t_prime_iface_id: InterfaceId,
+    use_cache: &mut HashMap<TypeId, TypeId>,
+) -> Vec<Param> {
+    params
+        .iter()
+        .map(|p| {
+            let new_ty = substitute_ty(resolve, p.ty, subst, t_prime_iface_id, use_cache);
+            Param {
+                name: p.name.clone(),
+                ty: new_ty,
+                span: p.span,
+            }
+        })
+        .collect()
+}
+
+fn substitute_ty(
+    resolve: &mut Resolve,
+    ty: Type,
+    subst: &HashMap<TypeId, TypeId>,
+    t_prime_iface_id: InterfaceId,
+    use_cache: &mut HashMap<TypeId, TypeId>,
+) -> Type {
+    match ty {
+        Type::Id(id) => Type::Id(substitute_id(resolve, id, subst, t_prime_iface_id, use_cache)),
+        other => other,
+    }
+}
+
+fn substitute_id(
+    resolve: &mut Resolve,
+    id: TypeId,
+    subst: &HashMap<TypeId, TypeId>,
+    t_prime_iface_id: InterfaceId,
+    use_cache: &mut HashMap<TypeId, TypeId>,
+) -> TypeId {
+    let original = resolve_type_alias(resolve, id);
+
+    // Factored resource → substitute with fresh T' resource.
+    // When the fresh resource lives in a sibling T' interface (different from the current
+    // interface being built), add a USE alias so WitPrinter emits the correct `use` line.
+    if let Some(&fresh_id) = subst.get(&original) {
+        if resolve.types[fresh_id].owner != TypeOwner::Interface(t_prime_iface_id) {
+            return ensure_use_alias(resolve, fresh_id, t_prime_iface_id, use_cache);
+        }
+        return fresh_id;
+    }
+
+    // Named type from another interface → add USE alias so WitPrinter emits `use`.
+    // find_named_external follows cross-interface USE aliases to the declaring
+    // interface, but preserves intra-interface aliases (e.g. `type headers = fields`).
+    if let Some(ext_id) = find_named_external(resolve, id, t_prime_iface_id) {
+        return ensure_use_alias(resolve, ext_id, t_prime_iface_id, use_cache);
+    }
+
+    // Anonymous structural type → clone kind, substitute inner types, alloc new TypeDef.
+    let kind = resolve.types[original].kind.clone();
+    let new_kind = substitute_kind(resolve, kind, subst, t_prime_iface_id, use_cache);
+    resolve.types.alloc(TypeDef {
+        name: None,
+        kind: new_kind,
+        owner: TypeOwner::None,
+        docs: Docs::default(),
+        stability: Stability::default(),
+        span: Span::default(),
+    })
+}
+
+/// Walk the alias chain of `id` to find the first named type whose declaring interface
+/// is not `exclude_iface`. Follows cross-interface USE aliases but stops at
+/// intra-interface aliases (e.g., `type headers = fields` stays as `headers`).
+fn find_named_external(
+    resolve: &Resolve,
+    id: TypeId,
+    exclude_iface: InterfaceId,
+) -> Option<TypeId> {
+    let td = &resolve.types[id];
+    if let (Some(_name), TypeOwner::Interface(owner)) = (&td.name, td.owner) {
+        if owner != exclude_iface {
+            // If this named type is itself a cross-interface USE alias, follow to the
+            // declaring interface so WitPrinter emits the right `use` path.
+            if let TypeDefKind::Type(Type::Id(inner)) = td.kind {
+                let inner_owner = resolve.types[inner].owner;
+                if inner_owner != TypeOwner::Interface(owner) {
+                    return find_named_external(resolve, inner, exclude_iface);
+                }
+            }
+            return Some(id);
+        }
+    }
+    // Anonymous or owned by exclude_iface: follow Type aliases only.
+    if let TypeDefKind::Type(Type::Id(inner)) = td.kind {
+        return find_named_external(resolve, inner, exclude_iface);
+    }
+    None
+}
+
+fn substitute_kind(
+    resolve: &mut Resolve,
+    kind: TypeDefKind,
+    subst: &HashMap<TypeId, TypeId>,
+    t_prime_iface_id: InterfaceId,
+    use_cache: &mut HashMap<TypeId, TypeId>,
+) -> TypeDefKind {
+    match kind {
+        TypeDefKind::List(ty) => {
+            TypeDefKind::List(substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache))
+        }
+        TypeDefKind::Option(ty) => {
+            TypeDefKind::Option(substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache))
+        }
+        TypeDefKind::Future(Some(ty)) => TypeDefKind::Future(Some(substitute_ty(
+            resolve,
+            ty,
+            subst,
+            t_prime_iface_id,
+            use_cache,
+        ))),
+        TypeDefKind::Stream(Some(ty)) => TypeDefKind::Stream(Some(substitute_ty(
+            resolve,
+            ty,
+            subst,
+            t_prime_iface_id,
+            use_cache,
+        ))),
+        TypeDefKind::Result(r) => {
+            let ok =
+                r.ok.map(|ty| substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache));
+            let err =
+                r.err
+                    .map(|ty| substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache));
+            TypeDefKind::Result(Result_ { ok, err })
+        }
+        TypeDefKind::Tuple(t) => {
+            let types = t
+                .types
+                .into_iter()
+                .map(|ty| substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache))
+                .collect();
+            TypeDefKind::Tuple(Tuple { types })
+        }
+        TypeDefKind::Handle(Handle::Own(rid)) => TypeDefKind::Handle(Handle::Own(substitute_id(
+            resolve,
+            rid,
+            subst,
+            t_prime_iface_id,
+            use_cache,
+        ))),
+        TypeDefKind::Handle(Handle::Borrow(rid)) => {
+            TypeDefKind::Handle(Handle::Borrow(substitute_id(
+                resolve,
+                rid,
+                subst,
+                t_prime_iface_id,
+                use_cache,
+            )))
+        }
+        TypeDefKind::Type(inner) => {
+            TypeDefKind::Type(substitute_ty(resolve, inner, subst, t_prime_iface_id, use_cache))
+        }
+        // Pass through: Resource, Record, Flags, Variant, Enum, Future(None), Stream(None), Unknown
+        other => other,
+    }
+}
+
+/// Ensure a USE alias TypeDef for `external_id` exists in the T' interface.
+/// WitPrinter detects the cross-interface alias and emits `use <iface>.{name}` automatically.
+fn ensure_use_alias(
+    resolve: &mut Resolve,
+    external_id: TypeId,
+    t_prime_iface_id: InterfaceId,
+    use_cache: &mut HashMap<TypeId, TypeId>,
+) -> TypeId {
+    if let Some(&cached) = use_cache.get(&external_id) {
+        return cached;
+    }
+    let name = resolve.types[external_id]
+        .name
+        .clone()
+        .expect("named type has no name");
+    let alias_id = resolve.types.alloc(TypeDef {
+        name: Some(name.clone()),
+        kind: TypeDefKind::Type(Type::Id(external_id)),
+        owner: TypeOwner::Interface(t_prime_iface_id),
+        docs: Docs::default(),
+        stability: Stability::default(),
+        span: Span::default(),
+    });
+    resolve.interfaces[t_prime_iface_id]
+        .types
+        .insert(name, alias_id);
+    use_cache.insert(external_id, alias_id);
+    alias_id
 }
 
 #[cfg(test)]
@@ -609,8 +995,8 @@ mod tests {
         );
         let wit = &target.wit_text;
         assert!(wit.contains("interface bridge"), "missing bridge:\n{wit}");
-        assert!(wit.contains("wrap:"), "missing wrap:\n{wit}");
-        assert!(wit.contains("unwrap:"), "missing unwrap:\n{wit}");
+        assert!(wit.contains("wrap-bucket:"), "missing wrap-bucket:\n{wit}");
+        assert!(wit.contains("unwrap-bucket:"), "missing unwrap-bucket:\n{wit}");
         assert!(
             wit.contains("export store;"),
             "missing export store:\n{wit}"
@@ -653,15 +1039,21 @@ mod tests {
             .expect("extract");
         assert!(!target.t_prime_redirects.is_empty());
         let wit = &target.wit_text;
-        // Sibling types re-export: wrapper exports a store-types interface that
-        // re-exports the T' bucket so consumer's sibling import is consistent.
+        // Sibling types interface: wrapper exports a store-types interface that
+        // DECLARES the fresh T' bucket (with methods) so the consumer's sibling import
+        // is type-consistent and includes [constructor]bucket.
         assert!(
             wit.contains("interface store-types"),
-            "missing sibling re-export interface:\n{wit}"
+            "missing sibling T' interface:\n{wit}"
         );
         assert!(
-            wit.contains("use store.{bucket}"),
-            "sibling re-export must use T' bucket:\n{wit}"
+            wit.contains("resource bucket"),
+            "sibling T' interface must declare fresh bucket resource:\n{wit}"
+        );
+        // Main T' interface must USE the bucket from the sibling T' interface.
+        assert!(
+            wit.contains("use store-types.{bucket}"),
+            "main T' interface must use bucket from sibling:\n{wit}"
         );
         assert!(
             wit.contains("export store-types;"),

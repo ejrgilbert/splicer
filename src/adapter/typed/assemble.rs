@@ -60,6 +60,10 @@ pub struct WrapperCrateInputs<'a> {
     /// T' mode only: fixed `impl bridge::Guest for Wrapper` block with
     /// hard-wired `wrap`/`unwrap` bodies (no strategy dispatch).
     pub bridge_impl: Option<&'a TokenStream>,
+    /// T' mode only: delegation `impl original_iface::Guest for Wrapper` that
+    /// wraps incoming raw resource handles into T' types via the bridge,
+    /// calls the T' Guest impl, and unwraps results back to raw types.
+    pub delegation_impl: Option<&'a TokenStream>,
 }
 
 /// Assemble a complete `lib.rs` source string for the wrapper crate.
@@ -94,6 +98,7 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         .collect();
     let guest_impls: Vec<&TokenStream> = inputs.guests.iter().map(|g| &g.guest_impl).collect();
     let bridge_impl = inputs.bridge_impl;
+    let delegation_impl = inputs.delegation_impl;
 
     let assembled = quote! {
         // wit-bindgen output, inlined verbatim under `mod bindings`.
@@ -131,6 +136,7 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
 
         #(#guest_impls)*
         #bridge_impl
+        #delegation_impl
 
         bindings::export!(Wrapper with_types_in bindings);
     };
@@ -269,6 +275,7 @@ mod tests {
             strategy_crate_name: "my-strategy",
             strategy_type: "MyStrategy",
             bridge_impl: None,
+            delegation_impl: None,
         };
         assemble_lib_rs(&inputs).expect("assembly succeeds")
     }
