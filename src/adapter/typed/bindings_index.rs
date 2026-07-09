@@ -75,7 +75,6 @@ pub enum GuestTraitKind {
 
 pub struct GuestMethod {
     pub ident: syn::Ident,
-    pub sig: syn::Signature,
 }
 
 /// What Rust shape wit-bindgen emitted for a given WIT type.
@@ -203,7 +202,6 @@ fn trait_methods(t: &ItemTrait) -> Vec<GuestMethod> {
                 sig, default: None, ..
             }) => Some(GuestMethod {
                 ident: sig.ident.clone(),
-                sig: sig.clone(),
             }),
             _ => None,
         })
