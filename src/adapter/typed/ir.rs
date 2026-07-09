@@ -83,6 +83,10 @@ pub fn build_ir(
 
     // Dedup resources by their IDs.
     let mut seen_resource_ids: HashSet<TypeId> = HashSet::new();
+    // Track alias entries separately to avoid duplicating them across
+    // multiple interface iterations (e.g. wasi:http/types.{headers} appears
+    // in both the T' export interface and the import-side interface).
+    let mut seen_alias_keys: HashSet<(Vec<String>, String)> = HashSet::new();
     for entry in &ifaces {
         let iface = &resolve.interfaces[entry.id];
         for (wit_name, type_id) in &iface.types {
@@ -90,9 +94,6 @@ pub fn build_ir(
             let resolved_id = resolve_type_alias(resolve, *type_id);
             let td = &resolve.types[resolved_id];
             if matches!(td.kind, TypeDefKind::Resource) {
-                if !seen_resource_ids.insert(resolved_id) {
-                    continue;
-                }
                 // Anchor on the *declaring* iface's path (via `TypeOwner`).
                 let (declaring_path, is_owned) = match td.owner {
                     TypeOwner::Interface(declaring_id) => {
@@ -105,9 +106,34 @@ pub fn build_ir(
                     }
                     _ => (entry.path.clone(), entry.is_export),
                 };
+                let canonical_name = td.name.as_deref().unwrap_or(wit_name.as_str());
+
+                // When a resource is accessed through a USE alias with a
+                // different local name (e.g. `headers` aliasing `fields`),
+                // wit-bindgen uses the alias name PascalCase in generated Rust.
+                // Add an extra entry so AbsolutizeResources can resolve it.
+                // Bridge interface aliases (raw-bucket, wrapped-bucket, etc.) are
+                // synthetic re-exports handled by fixed wrap/unwrap bodies, not
+                // by strategy dispatch, so skip them here.
+                if wit_name.as_str() != canonical_name && !is_bridge_iface(resolve, entry.id) {
+                    let alias_key = (declaring_path.clone(), wit_name.to_string());
+                    if seen_alias_keys.insert(alias_key) {
+                        let alias_rust = wit_name.to_upper_camel_case();
+                        resources.push(ResourceInfo {
+                            iface_path: declaring_path.clone(),
+                            wit_name: wit_name.to_string(),
+                            rust_ident: syn::Ident::new(&alias_rust, Span::call_site()),
+                            is_owned,
+                            inner_type_path: None,
+                        });
+                    }
+                }
+
+                if !seen_resource_ids.insert(resolved_id) {
+                    continue;
+                }
 
                 // Keep T' matching stable by using canonical typedef name.
-                let canonical_name = td.name.as_deref().unwrap_or(wit_name.as_str());
                 let rust_ident_str = canonical_name.to_upper_camel_case();
                 resources.push(ResourceInfo {
                     iface_path: declaring_path,
@@ -167,6 +193,12 @@ pub fn build_ir(
         // Bridge interface uses fixed wrap/unwrap bodies, not strategy
         // dispatch. Skip args-record synthesis for it.
         if t_prime && is_bridge_iface(resolve, entry.id) {
+            continue;
+        }
+        // Original-target interface (added as an extra export for WAC routing)
+        // gets a delegation impl, not strategy dispatch. Skipping here prevents
+        // args-struct name collisions with the T' interface's records.
+        if t_prime && !is_t_prime_iface(resolve, entry.id) {
             continue;
         }
         let iface = &resolve.interfaces[entry.id];
@@ -235,6 +267,14 @@ pub fn build_ir(
 }
 
 // ── T' helpers ──────────────────────────────────────────────────────────
+
+fn is_t_prime_iface(resolve: &Resolve, id: InterfaceId) -> bool {
+    let Some(pkg_id) = resolve.interfaces[id].package else {
+        return false;
+    };
+    let pkg = &resolve.packages[pkg_id];
+    pkg.name.namespace == WRAPPER_PKG_NS && pkg.name.name == WRAPPER_PKG_NAME
+}
 
 fn is_bridge_iface(resolve: &Resolve, id: InterfaceId) -> bool {
     let iface = &resolve.interfaces[id];
@@ -384,6 +424,9 @@ pub struct BridgeResourceInfo {
     pub wrapper_ident: syn::Ident,
     /// Module path of the bridge Guest trait in the generated bindings.
     pub bridge_module_path: BindingsPath,
+    /// Kebab-case WIT resource name (e.g. `"bucket"`), used to
+    /// derive per-resource bridge function names.
+    pub wit_name: String,
 }
 
 impl BridgeResourceInfo {
@@ -395,6 +438,7 @@ impl BridgeResourceInfo {
             export_resource_ident: owned.rust_ident.clone(),
             wrapper_ident: wrapper_ident_for(&owned.rust_ident),
             bridge_module_path,
+            wit_name: owned.wit_name.clone(),
         }
     }
 }
@@ -487,11 +531,10 @@ pub enum WitTypeRef {
 /// Categorizes the four canonical-ABI handle kinds.
 pub enum HandleRef {
     ErrorContext,
-    /// Future and stream not supported yet
-    #[allow(dead_code)]
-    Future(Box<WitTypeRef>),
-    #[allow(dead_code)]
-    Stream(Box<WitTypeRef>),
+    /// `future<T>` (None inner = unit payload `future<_>`).
+    Future(Option<Box<WitTypeRef>>),
+    /// `stream<T>` (None inner = unit element `stream<_>`).
+    Stream(Option<Box<WitTypeRef>>),
     ResourceOwn(NamedRef),
     ResourceBorrow(NamedRef),
 }
@@ -500,6 +543,14 @@ impl HandleRef {
     fn to_tokens(&self) -> TokenStream {
         match self {
             HandleRef::ErrorContext => quote!(::wit_bindgen::rt::async_support::ErrorContext),
+            HandleRef::Future(inner) => {
+                let t = inner.as_deref().map(WitTypeRef::to_tokens).unwrap_or_else(|| quote!(()));
+                quote!(::wit_bindgen::rt::async_support::FutureReader<#t>)
+            }
+            HandleRef::Stream(inner) => {
+                let t = inner.as_deref().map(WitTypeRef::to_tokens).unwrap_or_else(|| quote!(()));
+                quote!(::wit_bindgen::rt::async_support::StreamReader<#t>)
+            }
             // `own<R>` lowers to the bare resource type
             // (`bindings::iface::Bucket`).
             HandleRef::ResourceOwn(nr) => bindings_path_tokens(&nr.path, Some(&nr.rust_ident)),
@@ -511,9 +562,6 @@ impl HandleRef {
                 let path = bindings_path_tokens(&nr.path, Some(&borrow_ident));
                 let lt = syn::Lifetime::new("'a", Span::call_site());
                 quote!(#path<#lt>)
-            }
-            HandleRef::Future(_) | HandleRef::Stream(_) => {
-                unreachable!("future/stream handle kind not yet supported")
             }
         }
     }
@@ -874,18 +922,34 @@ fn type_to_ref(resolve: &Resolve, ifaces: &[IfaceEntry], ty: &Type) -> Result<Wi
                     WitTypeRef::Named(NamedRef { path, rust_ident })
                 }
                 TypeDefKind::Handle(Handle::Own(rid)) => {
-                    let (path, rust_ident) = named_ref_for(resolve, ifaces, *rid)?;
+                    // Follow USE aliases to the canonical declaring interface; the alias's
+                    // owner is the importer, not the declarer, which would break iface_path
+                    // matching in contains_owned_resource / AbsolutizeResources.
+                    let canonical = resolve_type_alias(resolve, *rid);
+                    let (path, rust_ident) = named_ref_for(resolve, ifaces, canonical)?;
                     WitTypeRef::Handle(HandleRef::ResourceOwn(NamedRef { path, rust_ident }))
                 }
                 TypeDefKind::Handle(Handle::Borrow(rid)) => {
-                    let (path, rust_ident) = named_ref_for(resolve, ifaces, *rid)?;
+                    let canonical = resolve_type_alias(resolve, *rid);
+                    let (path, rust_ident) = named_ref_for(resolve, ifaces, canonical)?;
                     WitTypeRef::Handle(HandleRef::ResourceBorrow(NamedRef { path, rust_ident }))
                 }
                 TypeDefKind::Resource => {
                     bail!("bare resource type reference outside Handle wrapper not supported")
                 }
-                TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
-                    bail!("future/stream in field position not supported")
+                TypeDefKind::Future(inner) => {
+                    let inner_ref = inner
+                        .as_ref()
+                        .map(|t| type_to_ref(resolve, ifaces, t).map(Box::new))
+                        .transpose()?;
+                    WitTypeRef::Handle(HandleRef::Future(inner_ref))
+                }
+                TypeDefKind::Stream(inner) => {
+                    let inner_ref = inner
+                        .as_ref()
+                        .map(|t| type_to_ref(resolve, ifaces, t).map(Box::new))
+                        .transpose()?;
+                    WitTypeRef::Handle(HandleRef::Stream(inner_ref))
                 }
                 TypeDefKind::Map(..) | TypeDefKind::FixedLengthList(..) => {
                     bail!("{} in field position not supported", td.kind.as_str())
