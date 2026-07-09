@@ -43,7 +43,7 @@ use super::bindings_index::{
 };
 use super::ir::{
     args_struct_ident, wrapper_ident_for, BridgeResourceInfo, ExportFnKind, HandleRef, NamedKind,
-    NamedType, RecordField, ResourceInfo, TypeLocation, WitTypeRef, WrapperIR,
+    NamedRef, NamedType, RecordField, ResourceInfo, TypeLocation, WitTypeRef, WrapperIR,
 };
 use super::Behavior;
 
@@ -241,13 +241,19 @@ pub fn emit_bridge_guest_impl(bridge_resources: &[BridgeResourceInfo]) -> Option
             let raw = bindings_path_tokens(&br.raw_resource_path, Some(&br.raw_resource_ident));
             let exp =
                 bindings_path_tokens(&br.export_resource_path, Some(&br.export_resource_ident));
-            let wrap = &br.wrapper_ident;
+            let wrap_wrapper = &br.wrapper_ident;
+            // WIT names are `wrap-{name}` / `unwrap-{name}` (kebab); Rust uses underscores.
+            let snake = br.wit_name.replace('-', "_");
+            let wrap_fn =
+                syn::Ident::new(&format!("wrap_{snake}"), proc_macro2::Span::call_site());
+            let unwrap_fn =
+                syn::Ident::new(&format!("unwrap_{snake}"), proc_macro2::Span::call_site());
             quote! {
-                fn wrap(inner: #raw) -> #exp {
-                    #exp::new(#wrap(inner))
+                fn #wrap_fn(inner: #raw) -> #exp {
+                    #exp::new(#wrap_wrapper(inner))
                 }
-                fn unwrap(w: #exp) -> #raw {
-                    w.into_inner::<#wrap>().0
+                fn #unwrap_fn(w: #exp) -> #raw {
+                    w.into_inner::<#wrap_wrapper>().0
                 }
             }
         })
@@ -257,6 +263,198 @@ pub fn emit_bridge_guest_impl(bridge_resources: &[BridgeResourceInfo]) -> Option
             #(#methods)*
         }
     })
+}
+
+/// Emit a delegation `impl original_iface::Guest for Wrapper` for T' mode.
+///
+/// When the T' wrapper also exports the original target interface (for WAC
+/// routing), the generated impl receives raw resource handles from the host,
+/// wraps them into T' types via the bridge, calls the T' Guest impl, and
+/// unwraps the T' result back to raw types. There is no strategy dispatch;
+/// the strategy runs inside the T' Guest impl that this delegates to.
+pub fn emit_delegation_guest_impl(
+    original_g: &GuestTrait,
+    t_prime_g: &GuestTrait,
+    bridge_resources: &[BridgeResourceInfo],
+    ir: &WrapperIR,
+) -> Option<TokenStream> {
+    if bridge_resources.is_empty() || !matches!(original_g.kind, GuestTraitKind::Interface) {
+        return None;
+    }
+    let bridge_path = bindings_path_tokens(&bridge_resources[0].bridge_module_path, None);
+    let t_prime_path = build_module_path(&t_prime_g.module_path);
+    let t_prime_trait_ident = &t_prime_g.trait_ident;
+    let original_path = build_module_path(&original_g.module_path);
+    let original_trait_ident = &original_g.trait_ident;
+
+    let t_prime_iface_pascal = t_prime_g
+        .module_path
+        .last()
+        .expect("T' Guest trait module path is empty")
+        .to_upper_camel_case();
+
+    let method_impls: Vec<TokenStream> = original_g
+        .methods
+        .iter()
+        .zip(t_prime_g.methods.iter())
+        .map(|(orig_method, t_prime_method)| {
+            let method_ident = &orig_method.ident;
+            let is_async = orig_method.sig.asyncness.is_some();
+
+            let mut sig_inputs = orig_method.sig.inputs.clone();
+            let mut sig_output = orig_method.sig.output.clone();
+            {
+                // Use import-side (non-owned) resources: the original-interface
+                // delegation signature uses raw types, not T' types.
+                let mut visitor = AbsolutizeResources {
+                    resources: &ir.resources,
+                    types: &ir.types,
+                    prefer_import_side: true,
+                };
+                for arg in sig_inputs.iter_mut() {
+                    syn::visit_mut::VisitMut::visit_fn_arg_mut(&mut visitor, arg);
+                }
+                syn::visit_mut::VisitMut::visit_return_type_mut(&mut visitor, &mut sig_output);
+            }
+
+            let params = extract_named_params(&orig_method.sig);
+
+            // Get the T' args record to learn which params are resource handles.
+            let args_ident =
+                args_struct_ident(&t_prime_iface_pascal, &t_prime_method.ident.to_string());
+            let t_prime_fields: &[RecordField] = ir
+                .args_records
+                .iter()
+                .find(|t| t.rust_ident == args_ident)
+                .map(|t| match &t.kind {
+                    NamedKind::Record { fields } => fields.as_slice(),
+                    _ => &[],
+                })
+                .unwrap_or(&[]);
+
+            // Build wrapped call args: resource params go through bridge wrap.
+            let call_args: Vec<TokenStream> = params
+                .iter()
+                .enumerate()
+                .map(|(i, (param_ident, _param_ty))| {
+                    if let Some(field) = t_prime_fields.get(i) {
+                        if let Some(wrap_expr) =
+                            bridge_wrap_expr(field, bridge_resources, &bridge_path)
+                        {
+                            return quote!(#wrap_expr(#param_ident));
+                        }
+                    }
+                    quote!(#param_ident)
+                })
+                .collect();
+
+            let t_prime_call = if is_async {
+                quote!(
+                    <Wrapper as #t_prime_path::#t_prime_trait_ident>::#method_ident(
+                        #(#call_args),*
+                    ).await
+                )
+            } else {
+                quote!(
+                    <Wrapper as #t_prime_path::#t_prime_trait_ident>::#method_ident(
+                        #(#call_args),*
+                    )
+                )
+            };
+
+            // Unwrap any resource handles in the return type.
+            let fn_sig_key = args_ident.to_string();
+            let return_ty = ir.fn_sigs.get(&fn_sig_key).and_then(|s| s.return_ty.as_ref());
+            let body = delegation_return_expr(t_prime_call, return_ty, bridge_resources, &bridge_path);
+
+            if is_async {
+                quote! { async fn #method_ident(#sig_inputs) #sig_output { #body } }
+            } else {
+                quote! { fn #method_ident(#sig_inputs) #sig_output { #body } }
+            }
+        })
+        .collect();
+
+    Some(quote! {
+        impl #original_path::#original_trait_ident for Wrapper {
+            #(#method_impls)*
+        }
+    })
+}
+
+/// If `field` holds a T' resource own-handle that has a bridge wrap function,
+/// return a turbofish call expression fragment `<Wrapper as bridge::Guest>::wrap_xxx`.
+/// The caller appends the raw param: `bridge_wrap_expr(field, ...)(raw_param)`.
+fn bridge_wrap_expr(
+    field: &RecordField,
+    bridge_resources: &[BridgeResourceInfo],
+    bridge_path: &TokenStream,
+) -> Option<TokenStream> {
+    let (path, ident) = match &field.ty {
+        WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => (&nr.path, &nr.rust_ident),
+        _ => return None,
+    };
+    let br = bridge_resources
+        .iter()
+        .find(|br| br.export_resource_path == *path && br.export_resource_ident == *ident)?;
+    let snake = br.wit_name.replace('-', "_");
+    let wrap_fn = syn::Ident::new(&format!("wrap_{snake}"), Span::call_site());
+    Some(quote!(<Wrapper as #bridge_path::Guest>::#wrap_fn))
+}
+
+/// Build the return expression for a delegation method, unwrapping any T'
+/// resource handles in the result back to raw types via the bridge.
+fn delegation_return_expr(
+    t_prime_call: TokenStream,
+    return_ty: Option<&WitTypeRef>,
+    bridge_resources: &[BridgeResourceInfo],
+    bridge_path: &TokenStream,
+) -> TokenStream {
+    match return_ty {
+        None => t_prime_call,
+        Some(WitTypeRef::Handle(HandleRef::ResourceOwn(nr))) => {
+            if let Some(br) = find_bridge_for_export_resource(nr, bridge_resources) {
+                let snake = br.wit_name.replace('-', "_");
+                let unwrap_fn = syn::Ident::new(&format!("unwrap_{snake}"), Span::call_site());
+                let r = syn::Ident::new("_r", Span::call_site());
+                quote! {
+                    let #r = #t_prime_call;
+                    <Wrapper as #bridge_path::Guest>::#unwrap_fn(#r)
+                }
+            } else {
+                t_prime_call
+            }
+        }
+        Some(WitTypeRef::Result { ok, .. }) => {
+            if let Some(inner) = ok {
+                if let WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) = inner.as_ref() {
+                    if let Some(br) = find_bridge_for_export_resource(nr, bridge_resources) {
+                        let snake = br.wit_name.replace('-', "_");
+                        let unwrap_fn =
+                            syn::Ident::new(&format!("unwrap_{snake}"), Span::call_site());
+                        let r = syn::Ident::new("_r", Span::call_site());
+                        return quote! {
+                            match #t_prime_call {
+                                Ok(#r) => Ok(<Wrapper as #bridge_path::Guest>::#unwrap_fn(#r)),
+                                Err(e) => Err(e),
+                            }
+                        };
+                    }
+                }
+            }
+            t_prime_call
+        }
+        _ => t_prime_call,
+    }
+}
+
+fn find_bridge_for_export_resource<'a>(
+    nr: &NamedRef,
+    bridge_resources: &'a [BridgeResourceInfo],
+) -> Option<&'a BridgeResourceInfo> {
+    bridge_resources
+        .iter()
+        .find(|br| br.export_resource_path == nr.path && br.export_resource_ident == nr.rust_ident)
 }
 
 fn find_args_record<'a>(ir: &'a WrapperIR, args_ident: &syn::Ident) -> &'a NamedType {
@@ -333,6 +531,7 @@ fn emit_method_body(
         let mut visitor = AbsolutizeResources {
             resources: &ir.resources,
             types: &ir.types,
+            prefer_import_side: false,
         };
         for arg in sig_inputs.iter_mut() {
             syn::visit_mut::VisitMut::visit_fn_arg_mut(&mut visitor, arg);
@@ -393,7 +592,8 @@ fn emit_method_body(
                     // and wrap the resulting handle into our newtype.
                     let import_resource =
                         import_resource_path_for_ctor(resource_pascal, guest_module_path, ir);
-                    let call = build_static_call(is_async, &import_resource, method_ident, fields);
+                    let call =
+                        build_static_call(is_async, &import_resource, method_ident, fields, &ir.resources);
                     if is_async {
                         quote!(#wrap(#call.await))
                     } else {
@@ -426,7 +626,7 @@ fn emit_method_body(
                     // surface and return whatever the WIT declared.
                     let import_resource =
                         import_resource_path_for_ctor(resource_pascal, guest_module_path, ir);
-                    build_static_call(is_async, &import_resource, method_ident, fields)
+                    build_static_call(is_async, &import_resource, method_ident, fields, &ir.resources)
                 }
                 Behavior::Virtualize => {
                     // tier-4 static: no downstream import, so target_call
@@ -596,6 +796,10 @@ fn emit_method_body(
 struct AbsolutizeResources<'a> {
     resources: &'a [ResourceInfo],
     types: &'a [NamedType],
+    /// When true, prefer import-side (non-owned) resources over
+    /// export-side (owned) ones for name resolution. Used by the
+    /// delegation impl where the signature uses raw (original) types.
+    prefer_import_side: bool,
 }
 
 impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
@@ -620,18 +824,28 @@ impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
             // Exact match first: a resource literally named `FooBorrow`
             // in own position must not be rewritten as `Foo` via the
             // suffix-strip path.
-            let resource_match = self
-                .resources
-                .iter()
-                .find(|r| r.rust_ident == seg_ident)
-                .or_else(|| {
-                    seg_ident
-                        .to_string()
-                        .strip_suffix("Borrow")
-                        .and_then(|stripped| {
-                            self.resources.iter().find(|r| r.rust_ident == stripped)
-                        })
-                });
+            let find_resource = |ident: &syn::Ident| -> Option<&ResourceInfo> {
+                if self.prefer_import_side {
+                    // Prefer non-owned (import-side) resources so the
+                    // delegation impl signature uses raw types, not T' types.
+                    self.resources
+                        .iter()
+                        .find(|r| r.rust_ident == *ident && !r.is_owned)
+                        .or_else(|| self.resources.iter().find(|r| r.rust_ident == *ident))
+                } else {
+                    self.resources.iter().find(|r| r.rust_ident == *ident)
+                }
+            };
+            let resource_match = find_resource(&seg_ident).or_else(|| {
+                seg_ident
+                    .to_string()
+                    .strip_suffix("Borrow")
+                    .and_then(|stripped| {
+                        let stripped_ident =
+                            syn::Ident::new(stripped, proc_macro2::Span::call_site());
+                        find_resource(&stripped_ident)
+                    })
+            });
             if let Some(r) = resource_match {
                 let abs = absolute_resource_path(&r.iface_path, &seg_ident);
                 let trailing_args = tp.path.segments[0].arguments.clone();
@@ -700,6 +914,40 @@ fn field_arg_exprs(fields: &[RecordField], is_async: bool) -> Vec<TokenStream> {
         .collect()
 }
 
+/// Like `field_arg_exprs` but also unwraps T' export resources to their original
+/// import-side handles for the downstream call. For any arg field whose type is
+/// `own<R>` where R is a locally-owned (T') resource, emits
+/// `args.field.into_inner::<WrapperR>().0` instead of `args.field`.
+fn field_arg_exprs_for_transform(
+    fields: &[RecordField],
+    is_async: bool,
+    resources: &[ResourceInfo],
+) -> Vec<TokenStream> {
+    fields
+        .iter()
+        .map(|f| {
+            let name = &f.rust_ident;
+            if f.ty.needs_borrow_at_import_call(is_async) {
+                return quote! { &args.#name };
+            }
+            if let WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) = &f.ty {
+                let owned = resources.iter().find(|r| {
+                    r.is_owned && r.rust_ident == nr.rust_ident && r.iface_path == nr.path
+                });
+                // Only unwrap in T' mode (inner_type_path set): the WrapperR
+                // newtype holds the raw handle and must be unwrapped before
+                // forwarding. In normal tier-3, the export-side resource IS the
+                // handle — no unwrapping needed.
+                if let Some(r) = owned.filter(|r| r.inner_type_path.is_some()) {
+                    let wrap_ident = wrapper_ident_for(&r.rust_ident);
+                    return quote! { args.#name.into_inner::<#wrap_ident>().0 };
+                }
+            }
+            quote! { args.#name }
+        })
+        .collect()
+}
+
 /// Build the closure body that forwards a per-resource method call to
 /// `self.0.<method>(args.x)`. `self.0` is the import-side handle held
 /// by the wrapper newtype.
@@ -719,8 +967,9 @@ fn build_static_call(
     import_resource: &TokenStream,
     method_ident: &syn::Ident,
     fields: &[RecordField],
+    resources: &[ResourceInfo],
 ) -> TokenStream {
-    let arg_exprs = field_arg_exprs(fields, is_async);
+    let arg_exprs = field_arg_exprs_for_transform(fields, is_async, resources);
     quote! { #import_resource::#method_ident(#(#arg_exprs),*) }
 }
 
@@ -942,7 +1191,7 @@ fn build_target_call(
         .as_ref()
         .expect("IR has no target_import_path; tier-3 Transform must import the wrapped target");
     let import_path = bindings_path_tokens(import_path, None);
-    let arg_exprs = field_arg_exprs(fields, is_async);
+    let arg_exprs = field_arg_exprs_for_transform(fields, is_async, &ir.resources);
     quote! { #import_path::#method_ident(#(#arg_exprs),*) }
 }
 

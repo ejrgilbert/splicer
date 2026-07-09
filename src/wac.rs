@@ -444,7 +444,9 @@ impl EmitPlan {
                 let Some(outermost) = inject_plan.get(&i).and_then(|m| m.iter().next()) else {
                     continue;
                 };
-                if outermost.resource_bearing_exports.is_empty() {
+                if outermost.resource_bearing_exports.is_empty()
+                    && outermost.t_prime_redirects.is_empty()
+                {
                     continue;
                 }
                 let routing_id = resolve_shim_node(*id, composition, shim_comps);
@@ -459,6 +461,17 @@ impl EmitPlan {
                     if *sib != interface.name {
                         self.routing
                             .insert((routing_id, sib.clone()), (current_var.clone(), None));
+                    }
+                }
+                // T' redirects for sibling interfaces may have been overwritten by the
+                // sibling's own no-inject chain processing in the first pass above.
+                // Re-apply them here so the consumer sees consistent resource types.
+                for (original_iface, t_prime_export) in &outermost.t_prime_redirects {
+                    if original_iface != &interface.name {
+                        self.routing.insert(
+                            (routing_id, original_iface.clone()),
+                            (current_var.clone(), Some(t_prime_export.clone())),
+                        );
                     }
                 }
             }
