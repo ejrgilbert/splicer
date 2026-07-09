@@ -208,15 +208,9 @@ pub fn build_ir(
             .ok_or_else(|| anyhow!("exported interface has no name"))?
             .to_upper_camel_case();
         for (fn_name, func) in &iface.functions {
-            let prefix = match &func.kind {
-                FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {
-                    iface_pascal.clone()
-                }
-                FunctionKind::Method(id)
-                | FunctionKind::AsyncMethod(id)
-                | FunctionKind::Static(id)
-                | FunctionKind::AsyncStatic(id)
-                | FunctionKind::Constructor(id) => resource_pascal(resolve, *id)?,
+            let prefix = match func.kind.resource() {
+                Some(id) => resource_pascal(resolve, id)?,
+                None => iface_pascal.clone(),
             };
             // Pin the wit-bindgen-emitted name as the args-ident source.
             let rust_method_name = rust_method_name_for(func, fn_name);
@@ -228,8 +222,56 @@ pub fn build_ir(
                 .map(|t| type_to_ref(resolve, &ifaces, t))
                 .transpose()?;
             let kind = ExportFnKind::from(&func.kind);
-            fn_sigs.insert(args_ident.to_string(), ExportFnSig { return_ty, kind });
+            let is_async = func.kind.is_async();
+            fn_sigs.insert(args_ident.to_string(), ExportFnSig { return_ty, kind, is_async });
             args_records.push(args);
+        }
+    }
+
+    // T' mode: build delegation sigs from original (non-T') exported interfaces.
+    // These give emit_delegation_guest_impl the param/return types it needs without
+    // parsing the generated Rust bindings.
+    let mut delegation_sigs: std::collections::HashMap<String, DelegationSig> =
+        std::collections::HashMap::new();
+    if t_prime {
+        for entry in ifaces.iter().filter(|e| e.is_export) {
+            if is_t_prime_iface(resolve, entry.id) || is_bridge_iface(resolve, entry.id) {
+                continue;
+            }
+            let iface = &resolve.interfaces[entry.id];
+            let iface_pascal = iface
+                .name
+                .as_ref()
+                .ok_or_else(|| anyhow!("exported interface has no name"))?
+                .to_upper_camel_case();
+            for (fn_name, func) in &iface.functions {
+                // emit_delegation_guest_impl only handles interface-level (freestanding) fns.
+                if !matches!(
+                    func.kind,
+                    FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
+                ) {
+                    continue;
+                }
+                let rust_method_name = rust_method_name_for(func, fn_name);
+                let args_ident_str =
+                    args_struct_ident(&iface_pascal, &rust_method_name).to_string();
+                let params = func
+                    .params
+                    .iter()
+                    .map(|param| {
+                        let ident = mirror_field_ident(&param.name);
+                        let ty = type_to_ref(resolve, &ifaces, &param.ty)?;
+                        Ok((ident, ty))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let return_ty = func
+                    .result
+                    .as_ref()
+                    .map(|t| type_to_ref(resolve, &ifaces, t))
+                    .transpose()?;
+                let is_async = func.kind.is_async();
+                delegation_sigs.insert(args_ident_str, DelegationSig { params, return_ty, is_async });
+            }
         }
     }
 
@@ -251,7 +293,7 @@ pub fn build_ir(
         });
 
     let bridge_resources = if t_prime {
-        build_bridge_resources(&resources, bindings)
+        build_bridge_resources(&resources)
     } else {
         Vec::new()
     };
@@ -261,6 +303,7 @@ pub fn build_ir(
         resources,
         args_records,
         fn_sigs,
+        delegation_sigs,
         target_import_path,
         bridge_resources,
     })
@@ -297,18 +340,15 @@ fn is_t_prime_world(resolve: &Resolve, world_id: WorldId) -> bool {
     })
 }
 
-fn build_bridge_resources(
-    resources: &[ResourceInfo],
-    bindings: &WrapperBindings,
-) -> Vec<BridgeResourceInfo> {
-    // Locate the bridge module path from the generated bindings.
-    let bridge_module_path = bindings
-        .guest_traits
-        .iter()
-        .find(|g| g.module_path.last().map(String::as_str) == Some(BRIDGE_IFACE))
-        .map(|g| g.module_path.clone())
-        .unwrap_or_default();
-
+fn build_bridge_resources(resources: &[ResourceInfo]) -> Vec<BridgeResourceInfo> {
+    // WitPrinter always emits the bridge interface under exports::splicer::wrapper::bridge
+    // (module_path_for_interface with is_export=true for splicer:wrapper/bridge@0.0.0).
+    let bridge_module_path = vec![
+        "exports".to_string(),
+        "splicer".to_string(),
+        "wrapper".to_string(),
+        "bridge".to_string(),
+    ];
     resources
         .iter()
         .filter(|r| r.is_owned)
@@ -363,6 +403,10 @@ pub struct WrapperIR {
     /// Per-fn return type + WIT kind, keyed by the synth args struct
     /// ident's string form.
     pub fn_sigs: std::collections::HashMap<String, ExportFnSig>,
+    /// T' mode only: delegation method signatures derived from WIT for the
+    /// original (non-T') exported interface's freestanding functions.
+    /// Keyed by args_struct_ident string (same key space as fn_sigs).
+    pub delegation_sigs: std::collections::HashMap<String, DelegationSig>,
     /// Bindings path of the wrapped target on the wrapper's *import*
     /// side. `None` in tier-4 virtualize (no downstream import).
     pub target_import_path: Option<BindingsPath>,
@@ -373,6 +417,17 @@ pub struct WrapperIR {
 pub struct ExportFnSig {
     pub return_ty: Option<WitTypeRef>,
     pub kind: ExportFnKind,
+    pub is_async: bool,
+}
+
+/// Delegation method signature derived from WIT for one freestanding function
+/// in the original (non-T') exported interface. Used by emit_delegation_guest_impl
+/// to build method bodies without parsing the generated Rust bindings.
+pub struct DelegationSig {
+    /// (snake_case ident, WIT type) for each explicit param (self excluded).
+    pub params: Vec<(syn::Ident, WitTypeRef)>,
+    pub return_ty: Option<WitTypeRef>,
+    pub is_async: bool,
 }
 
 /// wit-parser's `FunctionKind` collapsed to what the emitter actually

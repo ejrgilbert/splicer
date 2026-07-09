@@ -42,8 +42,9 @@ use super::bindings_index::{
     bindings_path_tokens, strip_exports_prefix, GuestMethod, GuestTrait, GuestTraitKind,
 };
 use super::ir::{
-    args_struct_ident, wrapper_ident_for, BridgeResourceInfo, ExportFnKind, HandleRef, NamedKind,
-    NamedRef, NamedType, RecordField, ResourceInfo, TypeLocation, WitTypeRef, WrapperIR,
+    args_struct_ident, wrapper_ident_for, BridgeResourceInfo, DelegationSig, ExportFnKind,
+    HandleRef, NamedKind, NamedRef, NamedType, RecordField, ResourceInfo, TypeLocation, WitTypeRef,
+    WrapperIR,
 };
 use super::Behavior;
 
@@ -299,29 +300,24 @@ pub fn emit_delegation_guest_impl(
         .zip(t_prime_g.methods.iter())
         .map(|(orig_method, t_prime_method)| {
             let method_ident = &orig_method.ident;
-            let is_async = orig_method.sig.asyncness.is_some();
 
-            let mut sig_inputs = orig_method.sig.inputs.clone();
-            let mut sig_output = orig_method.sig.output.clone();
-            {
-                // Use import-side (non-owned) resources: the original-interface
-                // delegation signature uses raw types, not T' types.
-                let mut visitor = AbsolutizeResources {
-                    resources: &ir.resources,
-                    types: &ir.types,
-                    prefer_import_side: true,
-                };
-                for arg in sig_inputs.iter_mut() {
-                    syn::visit_mut::VisitMut::visit_fn_arg_mut(&mut visitor, arg);
-                }
-                syn::visit_mut::VisitMut::visit_return_type_mut(&mut visitor, &mut sig_output);
-            }
-
-            let params = extract_named_params(&orig_method.sig);
-
-            // Get the T' args record to learn which params are resource handles.
+            // Derive signature from WIT data (delegation_sigs), not from
+            // parsing and absolutizing the generated Rust bindings.
             let args_ident =
                 args_struct_ident(&t_prime_iface_pascal, &t_prime_method.ident.to_string());
+            let del_sig: &DelegationSig = ir
+                .delegation_sigs
+                .get(&args_ident.to_string())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "IR has no delegation sig for `{args_ident}`; \
+                         the delegation interface walk and Guest-trait extraction disagree"
+                    )
+                });
+            let is_async = del_sig.is_async;
+            let (generics, sig_inputs, sig_output) = delegation_method_sig(del_sig);
+
+            // Get the T' args record to learn which params are resource handles.
             let t_prime_fields: &[RecordField] = ir
                 .args_records
                 .iter()
@@ -332,17 +328,17 @@ pub fn emit_delegation_guest_impl(
                 })
                 .unwrap_or(&[]);
 
-            // Build wrapped call args: resource params go through bridge wrap.
-            let call_args: Vec<TokenStream> = params
+            // Build wrapped call args. Resource params go through bridge wrap.
+            // Param idents match t_prime_fields idents (both derived from the
+            // same WIT param names via mirror_field_ident).
+            let call_args: Vec<TokenStream> = t_prime_fields
                 .iter()
-                .enumerate()
-                .map(|(i, (param_ident, _param_ty))| {
-                    if let Some(field) = t_prime_fields.get(i) {
-                        if let Some(wrap_expr) =
-                            bridge_wrap_expr(field, bridge_resources, &bridge_path)
-                        {
-                            return quote!(#wrap_expr(#param_ident));
-                        }
+                .map(|field| {
+                    let param_ident = &field.rust_ident;
+                    if let Some(wrap_expr) =
+                        bridge_wrap_expr(field, bridge_resources, &bridge_path)
+                    {
+                        return quote!(#wrap_expr(#param_ident));
                     }
                     quote!(#param_ident)
                 })
@@ -367,11 +363,7 @@ pub fn emit_delegation_guest_impl(
             let return_ty = ir.fn_sigs.get(&fn_sig_key).and_then(|s| s.return_ty.as_ref());
             let body = delegation_return_expr(t_prime_call, return_ty, bridge_resources, &bridge_path);
 
-            if is_async {
-                quote! { async fn #method_ident(#sig_inputs) #sig_output { #body } }
-            } else {
-                quote! { fn #method_ident(#sig_inputs) #sig_output { #body } }
-            }
+            emit_fn(is_async, method_ident, &generics, &sig_inputs, &sig_output, &body)
         })
         .collect();
 
@@ -521,55 +513,48 @@ fn emit_method_body(
 ) -> TokenStream {
     let method_ident = &method.ident;
     let method_name = method_ident.to_string();
-    // wit-bindgen trait sigs use iface-local idents (`Bucket`,
-    // `BucketBorrow`, ...) that resolve inside the iface module but
-    // not at the wrapper crate's top level. Rewrite them to absolute
-    // `bindings::<iface_path>::<R>` paths first.
-    let mut sig_inputs = method.sig.inputs.clone();
-    let mut sig_output = method.sig.output.clone();
-    {
-        let mut visitor = AbsolutizeResources {
-            resources: &ir.resources,
-            types: &ir.types,
-            prefer_import_side: false,
-        };
-        for arg in sig_inputs.iter_mut() {
-            syn::visit_mut::VisitMut::visit_fn_arg_mut(&mut visitor, arg);
-        }
-        syn::visit_mut::VisitMut::visit_return_type_mut(&mut visitor, &mut sig_output);
-    }
-    let nominal_return_ty = match &sig_output {
-        syn::ReturnType::Default => quote!(()),
-        syn::ReturnType::Type(_, ty) => quote!(#ty),
-    };
     let fields = args_fields(args_record);
-    let is_async = method.sig.asyncness.is_some();
 
-    // Both sides of the pairing come from the same kebab→snake mirror,
-    // so positional indexing is sound by construction.
-    let positional_params = extract_named_params(&method.sig);
-    assert_eq!(
-        positional_params.len(),
-        fields.len(),
-        "Guest method `{}`: syn signature has {} params but IR args record has {} fields",
-        method_ident,
-        positional_params.len(),
-        fields.len()
-    );
-    let inits = fields.iter().enumerate().map(|(i, f)| {
+    let fn_sig_entry = ir.fn_sigs.get(&args_ident.to_string());
+    let is_async = fn_sig_entry.map(|s| s.is_async).unwrap_or(false);
+    let fn_kind = fn_sig_entry.map(|s| s.kind).unwrap_or(ExportFnKind::Freestanding);
+    let return_ty_ref = fn_sig_entry.and_then(|s| s.return_ty.as_ref());
+
+    let generics = if has_borrow { quote!(<'a>) } else { quote!() };
+    let param_tokens: Vec<TokenStream> = fields
+        .iter()
+        .map(|f| {
+            let ident = &f.rust_ident;
+            let ty = f.ty.to_tokens();
+            quote!(#ident: #ty)
+        })
+        .collect();
+    // WIT resource methods lower to borrow<R> — shared receiver in Rust.
+    let sig_inputs = match fn_kind {
+        ExportFnKind::Method => quote!(&self, #(#param_tokens),*),
+        _ => quote!(#(#param_tokens),*),
+    };
+    let nominal_return_ty = return_ty_ref
+        .map(|t| t.to_tokens())
+        .unwrap_or_else(|| quote!(()));
+    let sig_output = match fn_kind {
+        ExportFnKind::Constructor => quote!(-> Self),
+        _ => return_ty_ref
+            .map(|t| {
+                let ty = t.to_tokens();
+                quote!(-> #ty)
+            })
+            .unwrap_or_else(|| quote!()),
+    };
+
+    // Field idents and the method's parameter idents are both derived from
+    // the same WIT param names (via mirror_field_ident), so we initialise
+    // each args-struct field by binding it to the same-named local.
+    let inits = fields.iter().map(|f| {
         let field = &f.rust_ident;
-        let value = &positional_params[i].0;
-        quote! { #field: #value }
+        quote! { #field: #field }
     });
     let args_construct = quote! { #args_ident { #(#inits),* } };
-
-    // Authoritative WIT-side kind for this fn (the IR pinned it from
-    // wit-parser's FunctionKind).
-    let fn_kind = ir
-        .fn_sigs
-        .get(&args_ident.to_string())
-        .map(|s| s.kind)
-        .unwrap_or(ExportFnKind::Freestanding);
 
     // Where the closure body's call lands: interface-level Guest fns
     // forward to the import-side iface module; per-resource methods
@@ -772,132 +757,50 @@ fn emit_method_body(
         }
     };
 
+    emit_fn(is_async, method_ident, &generics, &sig_inputs, &sig_output, &body)
+}
+
+fn emit_fn(
+    is_async: bool,
+    ident: &syn::Ident,
+    generics: &TokenStream,
+    inputs: &TokenStream,
+    output: &TokenStream,
+    body: &TokenStream,
+) -> TokenStream {
     if is_async {
-        quote! {
-            async fn #method_ident(#sig_inputs) #sig_output {
-                #body
-            }
-        }
+        quote! { async fn #ident #generics(#inputs) #output { #body } }
     } else {
-        quote! {
-            fn #method_ident(#sig_inputs) #sig_output {
-                #body
-            }
-        }
+        quote! { fn #ident #generics(#inputs) #output { #body } }
     }
 }
 
-/// Rewrite bare iface-local type idents inside a syn type to their
-/// absolute `bindings::<iface_path>::<R>` form, recursively.
+/// Build `(generics, inputs, output)` token fragments for a delegation
+/// method signature derived from a `DelegationSig`.
 ///
-/// Covers resource types (`Bucket`, `BucketBorrow<'_>`) and
-/// non-resource named types (`ErrorCode`, user records / enums /
-/// variants / flags) reached via `use` from a sibling types iface.
-struct AbsolutizeResources<'a> {
-    resources: &'a [ResourceInfo],
-    types: &'a [NamedType],
-    /// When true, prefer import-side (non-owned) resources over
-    /// export-side (owned) ones for name resolution. Used by the
-    /// delegation impl where the signature uses raw (original) types.
-    prefer_import_side: bool,
-}
-
-impl syn::visit_mut::VisitMut for AbsolutizeResources<'_> {
-    fn visit_type_path_mut(&mut self, tp: &mut syn::TypePath) {
-        if tp.qself.is_none() && tp.path.segments.len() > 1 && tp.path.segments[0].ident == "_rt" {
-            // wit-bindgen emits `_rt::X` (`_rt::String`, `_rt::Vec`,
-            // `_rt::Box`) which only resolves inside `mod bindings`.
-            // Strip the prefix; std prelude re-exports the targets.
-            let mut segs = std::mem::take(&mut tp.path.segments)
-                .into_iter()
-                .skip(1)
-                .collect::<syn::punctuated::Punctuated<_, _>>();
-            std::mem::swap(&mut tp.path.segments, &mut segs);
+/// - `generics`: `<'a>` if any param contains a resource borrow, else empty
+/// - `inputs`: comma-separated `ident: Type` list for inside `(`…`)`
+/// - `output`: `-> Type` or empty if unit return
+fn delegation_method_sig(sig: &DelegationSig) -> (TokenStream, TokenStream, TokenStream) {
+    let has_borrow = sig.params.iter().any(|(_, ty)| ty.contains_borrow());
+    let generics = if has_borrow { quote!(<'a>) } else { quote!() };
+    let inputs: Vec<TokenStream> = sig
+        .params
+        .iter()
+        .map(|(ident, ty)| {
+            let ty_tokens = ty.to_tokens();
+            quote!(#ident: #ty_tokens)
+        })
+        .collect();
+    let inputs = quote!(#(#inputs),*);
+    let output = match &sig.return_ty {
+        Some(ty) => {
+            let ty_tokens = ty.to_tokens();
+            quote!(-> #ty_tokens)
         }
-        if tp.qself.is_none() && tp.path.segments.len() == 1 {
-            let seg_ident = tp.path.segments[0].ident.clone();
-            // wit-bindgen emits two types per WIT resource: the bare
-            // `Bucket` for `own<R>` and `BucketBorrow<'_>` for
-            // `borrow<R>`. Both need the absolute `bindings::<iface>`
-            // prefix at the wrapper crate root.
-            //
-            // Exact match first: a resource literally named `FooBorrow`
-            // in own position must not be rewritten as `Foo` via the
-            // suffix-strip path.
-            let find_resource = |ident: &syn::Ident| -> Option<&ResourceInfo> {
-                if self.prefer_import_side {
-                    // Prefer non-owned (import-side) resources so the
-                    // delegation impl signature uses raw types, not T' types.
-                    self.resources
-                        .iter()
-                        .find(|r| r.rust_ident == *ident && !r.is_owned)
-                        .or_else(|| self.resources.iter().find(|r| r.rust_ident == *ident))
-                } else {
-                    self.resources.iter().find(|r| r.rust_ident == *ident)
-                }
-            };
-            let resource_match = find_resource(&seg_ident).or_else(|| {
-                seg_ident
-                    .to_string()
-                    .strip_suffix("Borrow")
-                    .and_then(|stripped| {
-                        let stripped_ident =
-                            syn::Ident::new(stripped, proc_macro2::Span::call_site());
-                        find_resource(&stripped_ident)
-                    })
-            });
-            if let Some(r) = resource_match {
-                let abs = absolute_resource_path(&r.iface_path, &seg_ident);
-                let trailing_args = tp.path.segments[0].arguments.clone();
-                tp.path = abs;
-                if let Some(last) = tp.path.segments.last_mut() {
-                    last.arguments = trailing_args;
-                }
-            } else if let Some(nt) = self.types.iter().find(|t| t.rust_ident == seg_ident) {
-                // Non-resource named types (records, variants, enums,
-                // flags) reached via `use types.{ErrorCode};` live in
-                // the declaring iface's module. Rewrite only when the
-                // type is in a bindings module; synthesized args
-                // records keep their bare ident at the wrapper root.
-                if let TypeLocation::InBindings { path } = &nt.location {
-                    let abs = absolute_resource_path(path, &seg_ident);
-                    let trailing_args = tp.path.segments[0].arguments.clone();
-                    tp.path = abs;
-                    if let Some(last) = tp.path.segments.last_mut() {
-                        last.arguments = trailing_args;
-                    }
-                }
-            }
-        }
-        syn::visit_mut::visit_type_path_mut(self, tp);
-    }
-}
-
-/// Build an absolute `bindings::<iface>::<seg_ident>` path. `seg_ident`
-/// is what wit-bindgen used for the terminal segment (`Bucket` for
-/// own, `BucketBorrow` for borrow, `ErrorCode` for a used variant);
-/// `iface_path` comes from the declaring interface's IR entry.
-fn absolute_resource_path(iface_path: &[String], seg_ident: &syn::Ident) -> syn::Path {
-    use syn::punctuated::Punctuated;
-    let mut segments: Punctuated<syn::PathSegment, syn::Token![::]> = Punctuated::new();
-    segments.push(syn::PathSegment {
-        ident: syn::Ident::new("bindings", Span::call_site()),
-        arguments: syn::PathArguments::None,
-    });
-    for s in iface_path {
-        segments.push(syn::PathSegment {
-            ident: syn::Ident::new(s, Span::call_site()),
-            arguments: syn::PathArguments::None,
-        });
-    }
-    segments.push(syn::PathSegment {
-        ident: seg_ident.clone(),
-        arguments: syn::PathArguments::None,
-    });
-    syn::Path {
-        leading_colon: None,
-        segments,
-    }
+        None => quote!(),
+    };
+    (generics, inputs, output)
 }
 
 fn field_arg_exprs(fields: &[RecordField], is_async: bool) -> Vec<TokenStream> {
@@ -1156,26 +1059,6 @@ fn build_wrap_at(
         }
         _ => unreachable!("build_wrap_at: unsupported resource-bearing shape"),
     }
-}
-
-fn extract_named_params(sig: &syn::Signature) -> Vec<(syn::Ident, syn::Type)> {
-    sig.inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            syn::FnArg::Typed(pat_typed) => match &*pat_typed.pat {
-                syn::Pat::Ident(pat_ident) => {
-                    Some((pat_ident.ident.clone(), (*pat_typed.ty).clone()))
-                }
-                other => panic!(
-                    "Guest method `{}` has a non-Ident parameter pattern `{}`; \
-                     the wrapper codegen expects `Ident: Type`",
-                    sig.ident,
-                    quote!(#other),
-                ),
-            },
-            syn::FnArg::Receiver(_) => None,
-        })
-        .collect()
 }
 
 /// Build the closure body that calls the wrapped target with args
