@@ -20,8 +20,11 @@ use syn::{Item, ItemMacro, ItemMod, ItemTrait, TraitItem, TraitItemFn};
 /// `Color`, etc.
 pub type BindingsPath = Vec<String>;
 
+/// wit-bindgen-rust nests export-side bindings under this module prefix.
+pub(super) const EXPORTS_PREFIX: &str = "exports";
+
 pub fn strip_exports_prefix(segs: &[String]) -> Vec<String> {
-    if segs.first().map(String::as_str) == Some("exports") {
+    if segs.first().map(String::as_str) == Some(EXPORTS_PREFIX) {
         segs[1..].to_vec()
     } else {
         segs.to_vec()

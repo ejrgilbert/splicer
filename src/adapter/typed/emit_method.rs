@@ -34,7 +34,7 @@
 //! Virtualize emission drops the closure and dispatches through
 //! `VirtualizeStrategy::handle` instead.
 
-use heck::ToUpperCamelCase;
+use heck::{ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 
@@ -243,8 +243,8 @@ pub fn emit_bridge_guest_impl(bridge_resources: &[BridgeResourceInfo]) -> Option
             let exp =
                 bindings_path_tokens(&br.export_resource_path, Some(&br.export_resource_ident));
             let wrap_wrapper = &br.wrapper_ident;
-            // WIT names are `wrap-{name}` / `unwrap-{name}` (kebab); Rust uses underscores.
-            let snake = br.wit_name.replace('-', "_");
+
+            let snake = br.wit_name.to_snake_case();
             let wrap_fn =
                 syn::Ident::new(&format!("wrap_{snake}"), proc_macro2::Span::call_site());
             let unwrap_fn =
@@ -382,16 +382,11 @@ fn bridge_wrap_expr(
     bridge_resources: &[BridgeResourceInfo],
     bridge_path: &TokenStream,
 ) -> Option<TokenStream> {
-    let (path, ident) = match &field.ty {
-        WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => (&nr.path, &nr.rust_ident),
-        _ => return None,
+    let WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) = &field.ty else {
+        return None;
     };
-    let br = bridge_resources
-        .iter()
-        .find(|br| br.export_resource_path == *path && br.export_resource_ident == *ident)?;
-    let snake = br.wit_name.replace('-', "_");
-    let wrap_fn = syn::Ident::new(&format!("wrap_{snake}"), Span::call_site());
-    Some(quote!(<Wrapper as #bridge_path::Guest>::#wrap_fn))
+    let br = find_bridge_for_export_resource(nr, bridge_resources)?;
+    Some(bridge_wrap_call(br, bridge_path))
 }
 
 /// Build the return expression for a delegation method, unwrapping any T'
@@ -402,39 +397,71 @@ fn delegation_return_expr(
     bridge_resources: &[BridgeResourceInfo],
     bridge_path: &TokenStream,
 ) -> TokenStream {
-    match return_ty {
-        None => t_prime_call,
-        Some(WitTypeRef::Handle(HandleRef::ResourceOwn(nr))) => {
-            if let Some(br) = find_bridge_for_export_resource(nr, bridge_resources) {
-                let snake = br.wit_name.replace('-', "_");
-                let unwrap_fn = syn::Ident::new(&format!("unwrap_{snake}"), Span::call_site());
-                let r = syn::Ident::new("_r", Span::call_site());
-                quote! {
-                    let #r = #t_prime_call;
-                    <Wrapper as #bridge_path::Guest>::#unwrap_fn(#r)
+    let Some(ty) = return_ty else {
+        return t_prime_call;
+    };
+    let r = syn::Ident::new("_r", Span::call_site());
+    match ty {
+        WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) => {
+            match find_bridge_for_export_resource(nr, bridge_resources) {
+                Some(br) => {
+                    let unwrap = bridge_unwrap_call(br, bridge_path);
+                    quote! { let #r = #t_prime_call; #unwrap(#r) }
                 }
-            } else {
-                t_prime_call
+                None => t_prime_call,
             }
         }
-        Some(WitTypeRef::Result { ok, .. }) => {
-            if let Some(inner) = ok {
-                if let WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) = inner.as_ref() {
-                    if let Some(br) = find_bridge_for_export_resource(nr, bridge_resources) {
-                        let snake = br.wit_name.replace('-', "_");
-                        let unwrap_fn =
-                            syn::Ident::new(&format!("unwrap_{snake}"), Span::call_site());
-                        let r = syn::Ident::new("_r", Span::call_site());
-                        return quote! {
-                            match #t_prime_call {
-                                Ok(#r) => Ok(<Wrapper as #bridge_path::Guest>::#unwrap_fn(#r)),
-                                Err(e) => Err(e),
-                            }
-                        };
-                    }
-                }
+        WitTypeRef::Option(inner) => {
+            match try_own_unwrap_ty(inner, bridge_resources, bridge_path) {
+                Some(unwrap) => quote! {
+                    match #t_prime_call { Some(#r) => Some(#unwrap(#r)), None => None }
+                },
+                None => t_prime_call,
             }
-            t_prime_call
+        }
+        WitTypeRef::Result { ok, .. } => {
+            let unwrap = ok
+                .as_deref()
+                .and_then(|inner| try_own_unwrap_ty(inner, bridge_resources, bridge_path));
+            match unwrap {
+                Some(unwrap) => quote! {
+                    match #t_prime_call { Ok(#r) => Ok(#unwrap(#r)), Err(e) => Err(e) }
+                },
+                None => t_prime_call,
+            }
+        }
+        WitTypeRef::List(inner) => {
+            match try_own_unwrap_ty(inner, bridge_resources, bridge_path) {
+                Some(unwrap) => quote! {
+                    #t_prime_call.into_iter().map(|#r| #unwrap(#r)).collect()
+                },
+                None => t_prime_call,
+            }
+        }
+        WitTypeRef::Tuple(elems) => {
+            let vars: Vec<syn::Ident> = (0..elems.len())
+                .map(|i| syn::Ident::new(&format!("_r{i}"), Span::call_site()))
+                .collect();
+            let unwraps: Vec<Option<TokenStream>> = elems
+                .iter()
+                .map(|elem| try_own_unwrap_ty(elem, bridge_resources, bridge_path))
+                .collect();
+            if unwraps.iter().all(|u| u.is_none()) {
+                return t_prime_call;
+            }
+            let destructure = quote!((#(#vars,)*));
+            let reassemble: Vec<TokenStream> = unwraps
+                .into_iter()
+                .zip(&vars)
+                .map(|(unwrap, var)| match unwrap {
+                    Some(call) => quote!(#call(#var)),
+                    None => quote!(#var),
+                })
+                .collect();
+            quote! {
+                let #destructure = #t_prime_call;
+                (#(#reassemble,)*)
+            }
         }
         _ => t_prime_call,
     }
@@ -447,6 +474,35 @@ fn find_bridge_for_export_resource<'a>(
     bridge_resources
         .iter()
         .find(|br| br.export_resource_path == nr.path && br.export_resource_ident == nr.rust_ident)
+}
+
+/// Build the `<Wrapper as bridge_path::Guest>::unwrap_xxx` call expression
+/// for a bridge resource's unwrap function.
+fn bridge_unwrap_call(br: &BridgeResourceInfo, bridge_path: &TokenStream) -> TokenStream {
+    let snake = br.wit_name.to_snake_case();
+    let unwrap_fn = syn::Ident::new(&format!("unwrap_{snake}"), Span::call_site());
+    quote!(<Wrapper as #bridge_path::Guest>::#unwrap_fn)
+}
+
+/// Build the `<Wrapper as bridge_path::Guest>::wrap_xxx` call expression
+/// for a bridge resource's wrap function.
+fn bridge_wrap_call(br: &BridgeResourceInfo, bridge_path: &TokenStream) -> TokenStream {
+    let snake = br.wit_name.to_snake_case();
+    let wrap_fn = syn::Ident::new(&format!("wrap_{snake}"), Span::call_site());
+    quote!(<Wrapper as #bridge_path::Guest>::#wrap_fn)
+}
+
+/// If `ty` is `own<R>` for a bridged resource, return the unwrap call expression.
+fn try_own_unwrap_ty(
+    ty: &WitTypeRef,
+    bridge_resources: &[BridgeResourceInfo],
+    bridge_path: &TokenStream,
+) -> Option<TokenStream> {
+    let WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) = ty else {
+        return None;
+    };
+    let br = find_bridge_for_export_resource(nr, bridge_resources)?;
+    Some(bridge_unwrap_call(br, bridge_path))
 }
 
 fn find_args_record<'a>(ir: &'a WrapperIR, args_ident: &syn::Ident) -> &'a NamedType {

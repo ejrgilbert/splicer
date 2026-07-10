@@ -849,6 +849,12 @@ fn ensure_use_alias(
         .name
         .clone()
         .expect("named type has no name");
+
+    // Reuse existing aliases if already produced.
+    if let Some(&existing) = resolve.interfaces[t_prime_iface_id].types.get(&name) {
+        use_cache.insert(external_id, existing);
+        return existing;
+    }
     let alias_id = resolve.types.alloc(TypeDef {
         name: Some(name.clone()),
         kind: TypeDefKind::Type(Type::Id(external_id)),
@@ -1084,10 +1090,6 @@ mod tests {
         let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
         let target = target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform)
             .expect("extract");
-        assert!(target.t_prime_redirects.is_empty());
-        assert!(
-            target.t_prime_redirects.is_empty(),
-            "non-T' should have no redirects"
-        );
+        assert!(target.t_prime_redirects.is_empty(), "non-T' should have no redirects");
     }
 }
