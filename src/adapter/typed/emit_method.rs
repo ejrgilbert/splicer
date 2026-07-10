@@ -617,9 +617,6 @@ fn emit_method_body(
         ExportFnKind::Method => quote!(&self, #(#param_tokens),*),
         _ => quote!(#(#param_tokens),*),
     };
-    let nominal_return_ty = return_ty_ref
-        .map(|t| t.to_tokens())
-        .unwrap_or_else(|| quote!(()));
     let sig_output = match fn_kind {
         ExportFnKind::Constructor => quote!(-> Self),
         _ => return_ty_ref
@@ -643,29 +640,32 @@ fn emit_method_body(
     // forward to the import-side iface module; per-resource methods
     // forward via `&self` (instance) or the resource's import-side
     // type (constructor / static).
-    let target_call = match (trait_kind, fn_kind) {
-        (GuestTraitKind::Interface, _) => match behavior {
-            Behavior::Transform => build_target_call(is_async, method_ident, fields, ir),
-            // Virtualize doesn't forward
-            Behavior::Virtualize => quote!(unreachable!()),
-        },
+    let (target_call, constructor_wrap_ident) = match (trait_kind, fn_kind) {
+        (GuestTraitKind::Interface, _) => {
+            let call = match behavior {
+                Behavior::Transform => build_target_call(is_async, method_ident, fields, ir),
+                // Virtualize doesn't forward
+                Behavior::Virtualize => quote!(unreachable!()),
+            };
+            (call, None)
+        }
         (GuestTraitKind::Resource(_), ExportFnKind::Method) => {
-            build_self_call(is_async, method_ident, fields)
+            (build_self_call(is_async, method_ident, fields), None)
         }
         (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Constructor) => {
             let wrap = wrapper_ident_for(resource_pascal);
-            match behavior {
+            let call = match behavior {
                 Behavior::Transform => {
                     // tier-3: forward to the import-side constructor
                     // and wrap the resulting handle into our newtype.
                     let import_resource =
                         import_resource_path_for_ctor(resource_pascal, guest_module_path, ir);
-                    let call =
+                    let ctor =
                         build_static_call(is_async, &import_resource, method_ident, fields, &ir.resources);
                     if is_async {
-                        quote!(#wrap(#call.await))
+                        quote!(#wrap(#ctor.await))
                     } else {
-                        quote!(#wrap(#call))
+                        quote!(#wrap(#ctor))
                     }
                 }
                 Behavior::Virtualize => {
@@ -685,10 +685,11 @@ fn emit_method_body(
                         });
                     quote!(::splicer_tool_sdk::mint_mock_resource!(#wrap, #resource_wit_name))
                 }
-            }
+            };
+            (call, Some(wrap))
         }
         (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Static) => {
-            match behavior {
+            let call = match behavior {
                 Behavior::Transform => {
                     // tier-3: dispatch through the import-side type
                     // surface and return whatever the WIT declared.
@@ -707,32 +708,38 @@ fn emit_method_body(
                     );
                     quote!(::core::compile_error!(#msg))
                 }
-            }
+            };
+            (call, None)
         }
         (GuestTraitKind::Resource(_), ExportFnKind::Freestanding) => {
             unreachable!("freestanding fn appeared in a per-resource Guest trait")
         }
     };
-    let constructor_already_handled = matches!(
-        (trait_kind, fn_kind),
-        (GuestTraitKind::Resource(_), ExportFnKind::Constructor)
-    );
-    let target_call = if !constructor_already_handled && is_async {
+    // Constructors manage their own await (inside the target_call expression);
+    // all other async calls get .await appended here.
+    let is_constructor = constructor_wrap_ident.is_some();
+    let target_call = if !is_constructor && is_async {
         quote! { #target_call.await }
     } else {
         target_call
     };
 
-    let resource_wrap = ir
-        .fn_sigs
-        .get(&args_ident.to_string())
-        .and_then(|s| s.return_ty.as_ref())
-        .and_then(|r| {
+    // Constructors: strategy R is the wrapper newtype; WIT constructor return types
+    // are implicit and absent from fn_sigs, so derive directly.
+    // Everything else: compute from the declared return type via resource_wrap.
+    let (strategy_r_ty, closure_body, final_wrap) = if let Some(w) = constructor_wrap_ident.as_ref() {
+        (quote!(#w), target_call.clone(), None)
+    } else {
+        let nominal_return_ty = return_ty_ref
+            .map(|t| t.to_tokens())
+            .unwrap_or_else(|| quote!(()));
+        let resource_wrap = return_ty_ref.and_then(|r| {
             build_resource_wrap(r, target_call.clone(), quote!(intermediate), &ir.resources)
         });
-    let (strategy_r_ty, closure_body, final_wrap) = match resource_wrap {
-        Some(rw) => (rw.intermediate_ty, rw.forward_expr, Some(rw.reverse_expr)),
-        None => (nominal_return_ty.clone(), target_call.clone(), None),
+        match resource_wrap {
+            Some(rw) => (rw.intermediate_ty, rw.forward_expr, Some(rw.reverse_expr)),
+            None => (nominal_return_ty, target_call.clone(), None),
+        }
     };
 
     // Args structs with a `borrow<R>` field carry a `<'a>` param;
@@ -769,74 +776,48 @@ fn emit_method_body(
         }
     };
 
-    let body = if !is_async {
-        if matches!(fn_kind, ExportFnKind::Constructor) {
-            // Constructors return a newtype-wrapped handle; strategy dispatch
-            // can't apply the generic R return path.
-            quote! {
-                let args = #args_construct;
-                #target_call
-            }
-        } else {
-            let sync_dispatch = match behavior {
-                Behavior::Transform => quote! {
-                    <_ as ::splicer_tool_sdk::SyncTransformStrategy<#args_ty, #strategy_r_ty>>::handle(
-                        s, call, args, |args: #args_ty| { #closure_body },
-                    )
-                },
-                Behavior::Virtualize => quote! {
-                    <_ as ::splicer_tool_sdk::SyncVirtualizeStrategy<#args_ty, #strategy_r_ty>>::handle(
-                        s, call, args,
-                    )
-                },
-            };
-            match &final_wrap {
-                Some(wrap) => quote! {
-                    let call = ::splicer_tool_sdk::CallId {
-                        interface_name: #interface_qualified_name.into(),
-                        function_name: #method_name.into(),
-                        id: 0,
-                    };
-                    let args = #args_construct;
-                    let s = strategy();
-                    let intermediate = #sync_dispatch;
-                    #wrap
-                },
-                None => quote! {
-                    let call = ::splicer_tool_sdk::CallId {
-                        interface_name: #interface_qualified_name.into(),
-                        function_name: #method_name.into(),
-                        id: 0,
-                    };
-                    let args = #args_construct;
-                    let s = strategy();
-                    #sync_dispatch
-                },
-            }
+    let sync_dispatch = match behavior {
+        Behavior::Transform => quote! {
+            <_ as ::splicer_tool_sdk::SyncTransformStrategy<#args_ty, #strategy_r_ty>>::handle(
+                s, call, args, |args: #args_ty| { #closure_body },
+            )
+        },
+        Behavior::Virtualize => quote! {
+            <_ as ::splicer_tool_sdk::SyncVirtualizeStrategy<#args_ty, #strategy_r_ty>>::handle(
+                s, call, args,
+            )
+        },
+    };
+
+    // Virtualize constructors mint a fresh mock handle directly; all other
+    // cases (sync and async, including Transform constructors) share the
+    // standard call/args/strategy preamble with a tail that varies by async-ness.
+    let body = if is_constructor && matches!(behavior, Behavior::Virtualize) {
+        quote! {
+            let args = #args_construct;
+            #target_call
         }
     } else {
-        match final_wrap {
-            Some(wrap) => quote! {
-                let call = ::splicer_tool_sdk::CallId {
-                    interface_name: #interface_qualified_name.into(),
-                    function_name: #method_name.into(),
-                    id: 0,
-                };
-                let args = #args_construct;
-                let s = strategy();
-                let intermediate = #dispatch.await;
-                #wrap
-            },
-            None => quote! {
-                let call = ::splicer_tool_sdk::CallId {
-                    interface_name: #interface_qualified_name.into(),
-                    function_name: #method_name.into(),
-                    id: 0,
-                };
-                let args = #args_construct;
-                let s = strategy();
-                #dispatch.await
-            },
+        let tail = if is_async {
+            match final_wrap {
+                Some(wrap) => quote! { let intermediate = #dispatch.await; #wrap },
+                None => quote! { #dispatch.await },
+            }
+        } else {
+            match &final_wrap {
+                Some(wrap) => quote! { let intermediate = #sync_dispatch; #wrap },
+                None => quote! { #sync_dispatch },
+            }
+        };
+        quote! {
+            let call = ::splicer_tool_sdk::CallId {
+                interface_name: #interface_qualified_name.into(),
+                function_name: #method_name.into(),
+                id: 0,
+            };
+            let args = #args_construct;
+            let s = strategy();
+            #tail
         }
     };
 
