@@ -19,6 +19,7 @@ use wit_parser::{
 
 use super::bindings_index::{
     bindings_path_tokens, strip_exports_prefix, BindingsItem, BindingsPath, WrapperBindings,
+    EXPORTS_PREFIX,
 };
 use super::target_wit::{BRIDGE_IFACE, WRAPPER_PKG_NAME, WRAPPER_PKG_NS};
 use crate::adapter::resolve::resolve_type_alias;
@@ -293,7 +294,13 @@ pub fn build_ir(
         });
 
     let bridge_resources = if t_prime {
-        build_bridge_resources(&resources)
+        let bridge_path = ifaces
+            .iter()
+            .find(|e| e.is_export && is_bridge_iface(resolve, e.id))
+            .map(|e| module_path_for_interface(resolve, e.id, true))
+            .transpose()?
+            .ok_or_else(|| anyhow!("T' world exports no bridge interface"))?;
+        build_bridge_resources(&resources, bridge_path)
     } else {
         Vec::new()
     };
@@ -340,15 +347,10 @@ fn is_t_prime_world(resolve: &Resolve, world_id: WorldId) -> bool {
     })
 }
 
-fn build_bridge_resources(resources: &[ResourceInfo]) -> Vec<BridgeResourceInfo> {
-    // WitPrinter always emits the bridge interface under exports::splicer::wrapper::bridge
-    // (module_path_for_interface with is_export=true for splicer:wrapper/bridge@0.0.0).
-    let bridge_module_path = vec![
-        "exports".to_string(),
-        "splicer".to_string(),
-        "wrapper".to_string(),
-        "bridge".to_string(),
-    ];
+fn build_bridge_resources(
+    resources: &[ResourceInfo],
+    bridge_module_path: Vec<String>,
+) -> Vec<BridgeResourceInfo> {
     resources
         .iter()
         .filter(|r| r.is_owned)
@@ -1076,7 +1078,7 @@ pub(super) fn module_path_for_interface(
     let pkg = &resolve.packages[pkg_id];
     let mut path = Vec::new();
     if is_export {
-        path.push("exports".to_string());
+        path.push(EXPORTS_PREFIX.to_string());
     }
     path.push(pkg.name.namespace.to_snake_case());
     path.push(pkg.name.name.to_snake_case());

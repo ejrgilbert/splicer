@@ -179,12 +179,17 @@ fn replace_types_in_module(
     import_path: &[String],
 ) {
     if remaining_path.is_empty() {
+        // Track which type names were actually aliased to remove Debug impls
+        let mut aliased: HashSet<String> = HashSet::new();
         let mut i = 0;
         while i < items.len() {
             if let Some(alias) = try_make_alias(&items[i], type_names, num_supers, import_path) {
+                if let Some(name) = named_type_ident(&items[i], type_names) {
+                    aliased.insert(name.to_string());
+                }
                 items[i] = alias;
                 i += 1;
-            } else if is_debug_impl_for_named_type(&items[i], type_names) {
+            } else if is_debug_impl_for_named_type(&items[i], &aliased) {
                 // Remove the hand-rolled Debug impl; type aliases inherit
                 // Debug from the import-side definition automatically.
                 items.remove(i);
@@ -227,7 +232,7 @@ fn try_make_alias(
         .chain(import_path.iter().map(String::as_str))
         .collect();
     let src = format!("pub type {name} = {}::{name};", path.join("::"));
-    Some(syn::parse_str::<syn::Item>(&src).expect("generated type alias must parse"))
+    syn::parse_str::<syn::Item>(&src).ok()
 }
 
 /// Return the Rust ident of `item` if it is a named-type definition (struct,
