@@ -328,40 +328,67 @@ pub fn emit_delegation_guest_impl(
                 })
                 .unwrap_or(&[]);
 
-            // Build wrapped call args. Resource params go through bridge wrap.
-            // Param idents match t_prime_fields idents (both derived from the
-            // same WIT param names via mirror_field_ident).
-            let call_args: Vec<TokenStream> = t_prime_fields
-                .iter()
-                .map(|field| {
-                    let param_ident = &field.rust_ident;
-                    if let Some(wrap_expr) =
-                        bridge_wrap_expr(field, bridge_resources, &bridge_path)
-                    {
-                        return quote!(#wrap_expr(#param_ident));
-                    }
-                    quote!(#param_ident)
-                })
-                .collect();
 
-            let t_prime_call = if is_async {
-                quote!(
-                    <Wrapper as #t_prime_path::#t_prime_trait_ident>::#method_ident(
-                        #(#call_args),*
-                    ).await
-                )
+            let has_t_prime_resource_borrow = del_sig.params.iter().any(|(_, ty)| {
+                // Borrows can't be wrapped, fall back to calling the import side directly (bypass strategy dispatch)
+                // TODO: can we fix this to where we don't bypass interposition logic
+                if let WitTypeRef::Handle(HandleRef::ResourceBorrow(nr)) = ty {
+                    ir.resources.iter().any(|r| r.is_owned && r.rust_ident == nr.rust_ident)
+                } else {
+                    false
+                }
+            });
+
+            let body = if has_t_prime_resource_borrow {
+                let import_path = bindings_path_tokens(
+                    ir.target_import_path
+                        .as_ref()
+                        .expect("T' delegation requires a target import path"),
+                    None,
+                );
+                let direct_args: Vec<TokenStream> =
+                    del_sig.params.iter().map(|(ident, _)| quote!(#ident)).collect();
+                if is_async {
+                    quote!(#import_path::#method_ident(#(#direct_args),*).await)
+                } else {
+                    quote!(#import_path::#method_ident(#(#direct_args),*))
+                }
             } else {
-                quote!(
-                    <Wrapper as #t_prime_path::#t_prime_trait_ident>::#method_ident(
-                        #(#call_args),*
-                    )
-                )
-            };
+                // Build wrapped call args. Resource params go through bridge wrap.
+                // Param idents match t_prime_fields idents (both derived from the
+                // same WIT param names via mirror_field_ident).
+                let call_args: Vec<TokenStream> = t_prime_fields
+                    .iter()
+                    .map(|field| {
+                        let param_ident = &field.rust_ident;
+                        if let Some(wrap_expr) =
+                            bridge_wrap_expr(field, bridge_resources, &bridge_path)
+                        {
+                            return quote!(#wrap_expr(#param_ident));
+                        }
+                        quote!(#param_ident)
+                    })
+                    .collect();
 
-            // Unwrap any resource handles in the return type.
-            let fn_sig_key = args_ident.to_string();
-            let return_ty = ir.fn_sigs.get(&fn_sig_key).and_then(|s| s.return_ty.as_ref());
-            let body = delegation_return_expr(t_prime_call, return_ty, bridge_resources, &bridge_path);
+                let t_prime_call = if is_async {
+                    quote!(
+                        <Wrapper as #t_prime_path::#t_prime_trait_ident>::#method_ident(
+                            #(#call_args),*
+                        ).await
+                    )
+                } else {
+                    quote!(
+                        <Wrapper as #t_prime_path::#t_prime_trait_ident>::#method_ident(
+                            #(#call_args),*
+                        )
+                    )
+                };
+
+                // Unwrap any resource handles in the return type.
+                let fn_sig_key = args_ident.to_string();
+                let return_ty = ir.fn_sigs.get(&fn_sig_key).and_then(|s| s.return_ty.as_ref());
+                delegation_return_expr(t_prime_call, return_ty, bridge_resources, &bridge_path)
+            };
 
             emit_fn(is_async, method_ident, &generics, &sig_inputs, &sig_output, &body)
         })
@@ -838,13 +865,27 @@ fn emit_fn(
 /// - `inputs`: comma-separated `ident: Type` list for inside `(`…`)`
 /// - `output`: `-> Type` or empty if unit return
 fn delegation_method_sig(sig: &DelegationSig) -> (TokenStream, TokenStream, TokenStream) {
-    let has_borrow = sig.params.iter().any(|(_, ty)| ty.contains_borrow());
+    // ResourceBorrow params render as `&Type` (not `TypeBorrow<'a>`), so they don't
+    // introduce the `'a` lifetime — the reference lifetime is inferred at call sites.
+    let has_borrow = sig.params.iter().any(|(_, ty)| match ty {
+        WitTypeRef::Handle(HandleRef::ResourceBorrow(_)) => false,
+        _ => ty.contains_borrow(),
+    });
     let generics = if has_borrow { quote!(<'a>) } else { quote!() };
     let inputs: Vec<TokenStream> = sig
         .params
         .iter()
         .map(|(ident, ty)| {
-            let ty_tokens = ty.to_tokens();
+            // The delegation impl targets the original (non-T') exported interface.
+            // That interface aliases its resource types to the import-side handle type,
+            // so wit-bindgen emits borrow<R> params as `&R` (not `RBorrow<'a>`).
+            let ty_tokens = match ty {
+                WitTypeRef::Handle(HandleRef::ResourceBorrow(nr)) => {
+                    let path = bindings_path_tokens(&nr.path, Some(&nr.rust_ident));
+                    quote!(&#path)
+                }
+                _ => ty.to_tokens(),
+            };
             quote!(#ident: #ty_tokens)
         })
         .collect();
@@ -900,6 +941,17 @@ fn field_arg_exprs_for_transform(
                 if let Some(r) = owned.filter(|r| r.inner_type_path.is_some()) {
                     let wrap_ident = wrapper_ident_for(&r.rust_ident);
                     return quote! { args.#name.into_inner::<#wrap_ident>().0 };
+                }
+            }
+            // borrow<R> in T' mode: args.c is T'-RBorrow<'a> wrapping WrapperR(raw_R).
+            // Extract &raw_R via get::<WrapperR>().0 for the import-side call.
+            if let WitTypeRef::Handle(HandleRef::ResourceBorrow(nr)) = &f.ty {
+                let owned = resources.iter().find(|r| {
+                    r.is_owned && r.rust_ident == nr.rust_ident && r.iface_path == nr.path
+                });
+                if let Some(r) = owned.filter(|r| r.inner_type_path.is_some()) {
+                    let wrap_ident = wrapper_ident_for(&r.rust_ident);
+                    return quote! { &args.#name.get::<#wrap_ident>().0 };
                 }
             }
             quote! { args.#name }
