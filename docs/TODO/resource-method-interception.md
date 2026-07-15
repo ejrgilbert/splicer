@@ -1,39 +1,35 @@
 # Resource-method interception via forwarding wrappers
 
-**Status: design verified end-to-end (June 2026), implementation pending.**
+**Status: factored resource method interception done at tier-3/4 (July 2026);
+inline resource T' codegen done; subgraph edge shims and recorder/fuzz remain.**
 POC at `tests/resource-wrap-poc/` (`./run.sh`).
 
 ## Goal (done criteria)
 
 Resource interception working across **all tiers (1-4)** for **both inline and
 standalone (factored) resource declarations**. Current state, verified against
-code:
+code and integration tests:
 
-| tier | inline decl | standalone decl |
-| ---- | ----------- | --------------- |
-| 1-2  | hard-bail at codegen (`require_no_inline_resources`, `abi/emit.rs:1090`) | passes the inline check; method `[method]` dispatch + delivery still unbuilt |
-| 3-4  | no codegen bail; per-method codegen runs | no codegen bail; per-method codegen runs |
+| tier | inline decl | standalone (factored) decl |
+| ---- | ----------- | -------------------------- |
+| 1-2  | hard-bail at codegen (`require_no_inline_resources`, `abi/emit.rs:1090`) | works (no method interception needed for value-typed interfaces) |
+| 3-4  | T' codegen done (inline resources trigger T' path in `target_wit.rs`) | **done** -- method calls reach the wrapper at runtime (confirmed by `builtin-hello-tier3/4` integration tests) |
 
-The tier-3/4 cells are not "done": the gap was always **runtime delivery** of
-method calls to the wrapper (the old wac "resource types are not the same"
-mismatch), which hit inline *and* standalone alike. So the real axis is
-delivery, not declaration style. The fresh-`T'` mechanism is the single fix
-that unifies all four tiers across both decl styles. Verifying exactly what
-tier-4 delivers today (vs. only passing structural/matrix tests) is an explicit
-task below.
+**What is done:**
+- T' codegen for factored resources at tier-3/4: sibling T' interfaces, bridge,
+  wrapper world, `t_prime_redirects` consumer rewire -- all complete.
+- T' codegen for inline resources at tier-3/4: `inline_resources_of` + `InlineResource`
+  added; main T' interface owns fresh resource + methods; bridge emits `wrap-R`/`unwrap-R`.
+- `FuncScope::Resource` predicate in `select.rs`.
+- Integration tests: `builtin-hello-tier3/4` confirm constructor + method calls reach
+  the wrapper (`[constructor]`, `[method]`, `[static]` surfaces all fire).
 
-**Recent progress** (commit `wire in types explicitly in generated wac`):
-tier-3 wrap of *producer-owned* resource-bearing interfaces now **composes**
-(verified via `--builtin-hello-tier3` on `my:service/async-bucket`), and
-host-provided (wasi) interfaces already worked. That is iface-level only:
-methods invoked on a returned resource still dispatch to the producer's
-`GuestBucket`, bypassing the wrapper. So *composition* is solved;
-**method-level delivery is the remaining gap**, which is exactly what the
-fresh-`T'` design below closes. (Tier-4 already owns its resource type by
-synthesizing via the strategy; the fresh-`T'` design is that same own-`GuestR`
-"proxy-component" route generalized to tiers 1-3, refined to own a *fresh* type
-and rewire cross-name so it composes, rather than re-exporting the producer's
-type identity.)
+**Remaining:**
+1. Subgraph edge shims (see below).
+2. Recorder/replayer + resources: tier-2 recorder and tier-4 replayer not yet
+   exercised with resource methods.
+3. Fuzz coverage: resource types excluded from tier-1/2/3/4 generators.
+4. Tier-1/2 inline resource bail removal (deferred; no T' path there yet).
 
 ## The problem
 
@@ -279,70 +275,49 @@ Verified primitives (POC): forwarding `T'` + round-trip identity, width
 subtyping, cross-name rewire. Remaining:
 
 **Match / analysis**
-- [ ] Implement the `scope: resource` match predicate. `FuncScope::Resource`
-  is a `todo!()` at `src/select.rs:308` (config parses fine via
-  `src/parse/config.rs:165` / `compile_scopes`; `scope: interface` already
-  works as `!name.starts_with('[')`). Resource scope = `name.starts_with('[')`
-  i.e. `[method]` / `[constructor]` / `[static]` surfaces. This is how a rule
-  opts into method interception (the "+ methods" column) vs interface-level,
-  and it's what constrains matching for inline resources. The `todo!`'s own
-  note points at `src/adapter/abi/emit.rs` to carry resource handles across the
-  wrap, i.e. the wrapper/edge codegen below.
-- [ ] Enumerate resource types in the target subgraph; mark each
-  instrument-methods vs functions-only (the `scope` predicate selects this;
-  see the matrix above).
-- [ ] Determine owner side / first-crossing direction per resource type.
+- [x] Implement the `scope: resource` match predicate (`src/select.rs`: `name.starts_with('[')`).
+- [x] Enumerate resource types in the target subgraph (`factored_resources_of` + `inline_resources_of`
+  in `target_wit.rs`).
+- [~] Determine owner side / first-crossing direction per resource type (done for the
+  factored pattern; edge shim direction logic pending).
 - [ ] Classify every edge: internal / incoming / outgoing x carries-T
-  (incl. nested in record/list/option).
+  (incl. nested in record/list/option) -- needed for edge shims.
 - [ ] Decide closure strategy: global redirect vs bounded cut (prove closed).
 
 **Codegen: wrapper** (`target_wit.rs`, `emit_method.rs`)
 - [ ] Replace the inline-resource bail `require_no_inline_resources`
-  (`src/adapter/abi/emit.rs:1090`, tier-1/2 only) with fresh-`T'` type emission.
-  The #2506 wall in code; our approach removes the need for it.
-- [ ] Emit fresh-named `T'` interface (mirror original methods) + world
-  (import real / export `T'` / export bridge).  [`target_wit.rs`]
-- [ ] Reuse `emit_method.rs`'s existing per-method dispatch over the
-  `[method]`/`[constructor]`/`[static]` surfaces. Already emitted for tier-3/4
-  and strategy-parameterized, so it generalizes to tier-1/2/3. NOT new body
-  codegen; the `GuestT'` forwarding impl comes from this path. Value-returning
-  replay routes through tier-4 result synthesis (the gate can't synthesize
-  results, pre-existing general limit).
-- [ ] Emit bridge `wrap`/`unwrap` (or statics on `T'`).
-- [ ] Constructor (sync hook), drop (optional event), statics, `borrow<T>`
-  (call-scoped wrapper).
-- [ ] Static-method codegen gaps and user-declared types holding resource
-  fields: see "Folded-in sub-problems" below.
+  (`src/adapter/abi/emit.rs:1090`, tier-1/2 only) -- deferred, no T' path at tier-1/2 yet.
+- [x] Emit fresh-named `T'` interface (mirror original methods) + world for factored
+  and inline resources. [`target_wit.rs`]
+- [x] Reuse `emit_method.rs`'s existing per-method dispatch over `[method]`/`[constructor]`/`[static]`
+  surfaces (already strategy-parameterized; no new body codegen needed).
+- [x] Emit bridge `wrap`/`unwrap`.
+- [~] Constructor (sync hook), drop, statics, `borrow<T>`: constructor + most statics done;
+  known codegen gaps remain (see "Folded-in sub-problems" below).
 
 **Codegen: edge shims** (new substrate)
-- [ ] Emit boundary-edge component(s): import bridge + boundary iface,
-  re-export boundary iface.
-- [ ] Weave per-occurrence wrap/unwrap into the lift/lower walk (params,
-  returns, receiver, nested); direction = match the landing side.
+- [ ] Emit boundary-edge component(s): import bridge + boundary iface, re-export boundary iface.
+- [ ] Weave per-occurrence wrap/unwrap into the lift/lower walk (params, returns, receiver,
+  nested); direction = match the landing side.
 - [ ] One shared wrapper component per resource type across all boundary edges.
 
 **wac wiring** (`wac.rs`)
-- [ ] Redirect consumer imports of the producer interface to `T'` (cross-name).
-- [ ] Wire edge bridge imports to the wrapper's bridge export.
-- [ ] Wire wrapper import to the real producer.
+- [x] Redirect consumer imports of the producer interface to `T'` (cross-name, via `t_prime_redirects`).
+- [ ] Wire edge bridge imports to the wrapper's bridge export (pending edge shims).
+- [x] Wire wrapper import to the real producer.
 
-**Validation** (done criteria: tiers 1-4 x {inline, standalone})
-- [ ] Verify what tier-4 actually delivers today: it has no inline codegen bail
-  (that's tier-1/2 only), but confirm whether resource-method calls reach the
-  wrapper at runtime for inline and standalone, vs. only passing structural /
-  matrix tests. Adopt fresh-`T'` delivery wherever they don't.
-- [ ] e2e: interposed factory returns a resource, outgoing-edge shim boxes it
-  (the unrun step-4 flow).
-- [ ] e2e: record then replay a resource-method trace through recorder/replayer
-  (tier-2 + tier-4).
-- [ ] Runtime smoke test in the suite (`GuestT'::method` fires on consumer call).
-- [ ] Cover the full matrix: tier-1/2/3/4 x {inline, standalone}.
+**Validation**
+- [x] Verify tier-3/4 runtime delivery: method calls reach the wrapper at runtime for factored
+  resources (confirmed by `builtin-hello-tier3/4` expected outputs).
+- [x] Runtime smoke test: `[constructor]`, `[method]`, `[static]` surfaces all fire in
+  integration tests.
+- [ ] e2e: interposed factory returns a resource, outgoing-edge shim boxes it (step-4 flow).
+- [ ] e2e: record then replay a resource-method trace (tier-2 recorder + tier-4 replayer).
+- [ ] Cover the full matrix: tier-1/2 resource interception still pending.
 
 **Integration tests** (`tests/component-interposition/`)
-- [ ] Add e2e interposition fixtures that exercise resource *methods* across
-  tier-1/2/3/4 x {inline, standalone}, with `expected-output/` baselines. The
-  harness already runs `builtin-{tier1..4}` + `recorder` cases; add
-  resource-bearing targets alongside them.
+- [ ] Add e2e interposition fixtures that exercise resource *methods* at tier-1/2 and across
+  inline declarations, with `expected-output/` baselines (tier-3/4 factored already covered).
 
 **Fuzz coverage** (resources are barely covered today; this work unblocks it)
 - [ ] `tests/fuzz_and_run.rs`: today only `own<T>`/`borrow<T>` as
