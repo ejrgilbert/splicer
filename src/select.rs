@@ -940,9 +940,24 @@ mod tests {
         assert!(!matches_scope("close", FuncScope::Resource));
         // `scope: resource` selects resource surfaces end-to-end.
         let pred = FuncPred::new(None, vec![FuncScope::Resource], vec![], vec![]);
-        let _ = select_with_pred(pred, |a| {
+        let sites = select_with_pred(pred, |a| {
             instance(vec![(RES_CTOR, func(a, false, vec![], vec![]))])
-        });
+        })
+        .expect("decidable");
+        assert_eq!(sites.len(), 1, "resource-only interface must match scope: resource");
+    }
+
+    #[test]
+    fn scope_resource_rejects_free_function_interface() {
+        let pred = FuncPred::new(None, vec![FuncScope::Resource], vec![], vec![]);
+        let sites = select_with_pred(pred, |a| {
+            instance(vec![("open", func(a, false, vec![], vec![]))])
+        })
+        .expect("decidable");
+        assert!(
+            sites.is_empty(),
+            "free-function interface must be rejected by scope: resource"
+        );
     }
 
     // ── suggest_interfaces ───────────────────────────────────────────

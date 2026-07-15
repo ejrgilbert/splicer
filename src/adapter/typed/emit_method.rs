@@ -34,9 +34,13 @@
 //! Virtualize emission drops the closure and dispatches through
 //! `VirtualizeStrategy::handle` instead.
 
+use core::unreachable;
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use wit_parser::{Handle, Type, TypeDefKind, TypeId};
+
+use crate::adapter::resolve::resolve_type_alias;
 
 use super::bindings_index::{
     bindings_path_tokens, strip_exports_prefix, GuestMethod, GuestTrait, GuestTraitKind,
@@ -187,6 +191,11 @@ fn emit_one_resource_newtype(r: &ResourceInfo, behavior: Behavior) -> TokenStrea
             let wit_name = &r.wit_name;
             quote! {
                 pub struct #wrap(pub ::splicer_tool_sdk::MockedResource);
+                impl ::core::default::Default for #wrap {
+                    fn default() -> Self {
+                        ::splicer_tool_sdk::mint_mock_resource!(#wrap, #wit_name)
+                    }
+                }
                 ::splicer_tool_sdk::impl_wit_typed_with_resources_for_wrapper!(
                     #wrap, #wit_name
                 );
@@ -603,6 +612,25 @@ fn emit_method_body(
     let fn_kind = fn_sig_entry.map(|s| s.kind).unwrap_or(ExportFnKind::Freestanding);
     let return_ty_ref = fn_sig_entry.and_then(|s| s.return_ty.as_ref());
 
+    // Compute call-site expressions for each param from the canonical WIT types.
+    let param_exprs: Vec<TokenStream> = ir
+        .fn_funcs
+        .get(&args_ident.to_string())
+        .map(|func| {
+            let skip_self = matches!(fn_kind, ExportFnKind::Method);
+            func.params
+                .iter()
+                .skip(if skip_self { 1 } else { 0 })
+                .zip(fields.iter())
+                .map(|(param, f)| {
+                    param_call_expr(&param.ty, &f.rust_ident, is_async, &ir.resolve, &ir.resources)
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            fields.iter().map(|f| { let n = &f.rust_ident; quote!(args.#n) }).collect()
+        });
+
     let generics = if has_borrow { quote!(<'a>) } else { quote!() };
     let param_tokens: Vec<TokenStream> = fields
         .iter()
@@ -643,14 +671,14 @@ fn emit_method_body(
     let (target_call, constructor_wrap_ident) = match (trait_kind, fn_kind) {
         (GuestTraitKind::Interface, _) => {
             let call = match behavior {
-                Behavior::Transform => build_target_call(is_async, method_ident, fields, ir),
+                Behavior::Transform => build_target_call(method_ident, &param_exprs, ir),
                 // Virtualize doesn't forward
                 Behavior::Virtualize => quote!(unreachable!()),
             };
             (call, None)
         }
         (GuestTraitKind::Resource(_), ExportFnKind::Method) => {
-            (build_self_call(is_async, method_ident, fields), None)
+            (build_self_call(method_ident, &param_exprs), None)
         }
         (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Constructor) => {
             let wrap = wrapper_ident_for(resource_pascal);
@@ -660,8 +688,7 @@ fn emit_method_body(
                     // and wrap the resulting handle into our newtype.
                     let import_resource =
                         import_resource_path_for_ctor(resource_pascal, guest_module_path, ir);
-                    let ctor =
-                        build_static_call(is_async, &import_resource, method_ident, fields, &ir.resources);
+                    let ctor = build_static_call(&import_resource, method_ident, &param_exprs);
                     if is_async {
                         quote!(#wrap(#ctor.await))
                     } else {
@@ -691,23 +718,12 @@ fn emit_method_body(
         (GuestTraitKind::Resource(resource_pascal), ExportFnKind::Static) => {
             let call = match behavior {
                 Behavior::Transform => {
-                    // tier-3: dispatch through the import-side type
-                    // surface and return whatever the WIT declared.
                     let import_resource =
                         import_resource_path_for_ctor(resource_pascal, guest_module_path, ir);
-                    build_static_call(is_async, &import_resource, method_ident, fields, &ir.resources)
+                    build_static_call(&import_resource, method_ident, &param_exprs)
                 }
-                Behavior::Virtualize => {
-                    // tier-4 static: no downstream import, so target_call
-                    // is a placeholder; SyncVirtualizeStrategy dispatch
-                    // below ignores it and routes through the strategy.
-                    let msg = format!(
-                        "tier-4 static methods on resources are not yet supported \
-                         (encountered `{}::{}`)",
-                        resource_pascal, method_ident,
-                    );
-                    quote!(::core::compile_error!(#msg))
-                }
+                // target_call is dead code in the Virtualize dispatch path.
+                Behavior::Virtualize => quote!(::core::unreachable!()),
             };
             (call, None)
         }
@@ -789,15 +805,7 @@ fn emit_method_body(
         },
     };
 
-    // Virtualize constructors mint a fresh mock handle directly; all other
-    // cases (sync and async, including Transform constructors) share the
-    // standard call/args/strategy preamble with a tail that varies by async-ness.
-    let body = if is_constructor && matches!(behavior, Behavior::Virtualize) {
-        quote! {
-            let args = #args_construct;
-            #target_call
-        }
-    } else {
+    let body = {
         let tail = if is_async {
             match final_wrap {
                 Some(wrap) => quote! { let intermediate = #dispatch.await; #wrap },
@@ -881,88 +889,74 @@ fn delegation_method_sig(sig: &DelegationSig) -> (TokenStream, TokenStream, Toke
     (generics, inputs, output)
 }
 
-fn field_arg_exprs(fields: &[RecordField], is_async: bool) -> Vec<TokenStream> {
-    fields
-        .iter()
-        .map(|f| {
-            let name = &f.rust_ident;
-            if f.ty.needs_borrow_at_import_call(is_async) {
-                quote! { &args.#name }
-            } else {
-                quote! { args.#name }
+/// Produce the expression to pass a single param at an import-side call site.
+/// Rules are driven entirely by the canonical WIT type:
+/// - `string` or `list<_>` in a sync context: `&args.name` (borrowed)
+/// - `own<R>` where R is a T' resource: `args.name.into_inner::<WrapperR>().0`
+/// - `borrow<R>` where R is a T' resource: `&args.name.get::<WrapperR>().0`
+/// - everything else: `args.name` (move)
+///
+/// Both the typedef-level and resource-level TypeIds are resolved through
+/// `resolve_type_alias` so USE-aliases in the WIT match the canonical ids
+/// stored in `ResourceInfo.type_id`.
+fn param_call_expr(
+    ty: &Type,
+    name: &syn::Ident,
+    is_async: bool,
+    resolve: &wit_parser::Resolve,
+    resources: &[ResourceInfo],
+) -> TokenStream {
+    if let Type::Id(raw_id) = ty {
+        // Follow USE-aliases to the canonical typedef so Handle patterns match.
+        let canonical_typedef_id = resolve_type_alias(resolve, *raw_id);
+        let kind = &resolve.types[canonical_typedef_id].kind;
+        if !is_async && matches!(kind, TypeDefKind::List(_)) {
+            return quote!(&args.#name);
+        }
+        if let TypeDefKind::Handle(h) = kind {
+            let (resource_id, is_borrow) = match h {
+                Handle::Own(id) => (id, false),
+                Handle::Borrow(id) => (id, true),
+            };
+            let canonical_resource = resolve_type_alias(resolve, *resource_id);
+            if let Some(r) = t_prime_resource_by_type_id(canonical_resource, resources) {
+                let wrap_ident = wrapper_ident_for(&r.rust_ident);
+                return if is_borrow {
+                    quote!(&args.#name.get::<#wrap_ident>().0)
+                } else {
+                    quote!(args.#name.into_inner::<#wrap_ident>().0)
+                };
             }
-        })
-        .collect()
+        }
+    }
+    if !is_async && matches!(ty, Type::String) {
+        return quote!(&args.#name);
+    }
+    quote!(args.#name)
 }
 
-/// Like `field_arg_exprs` but also unwraps T' export resources to their original
-/// import-side handles for the downstream call. For any arg field whose type is
-/// `own<R>` where R is a locally-owned (T') resource, emits
-/// `args.field.into_inner::<WrapperR>().0` instead of `args.field`.
-fn field_arg_exprs_for_transform(
-    fields: &[RecordField],
-    is_async: bool,
-    resources: &[ResourceInfo],
-) -> Vec<TokenStream> {
-    fields
+/// Find a T' resource (is_owned + inner_type_path set) by its canonical TypeId.
+fn t_prime_resource_by_type_id(resource_id: TypeId, resources: &[ResourceInfo]) -> Option<&ResourceInfo> {
+    resources
         .iter()
-        .map(|f| {
-            let name = &f.rust_ident;
-            if f.ty.needs_borrow_at_import_call(is_async) {
-                return quote! { &args.#name };
-            }
-            if let WitTypeRef::Handle(HandleRef::ResourceOwn(nr)) = &f.ty {
-                let owned = resources.iter().find(|r| {
-                    r.is_owned && r.rust_ident == nr.rust_ident && r.iface_path == nr.path
-                });
-                // Only unwrap in T' mode (inner_type_path set): the WrapperR
-                // newtype holds the raw handle and must be unwrapped before
-                // forwarding. In normal tier-3, the export-side resource IS the
-                // handle — no unwrapping needed.
-                if let Some(r) = owned.filter(|r| r.inner_type_path.is_some()) {
-                    let wrap_ident = wrapper_ident_for(&r.rust_ident);
-                    return quote! { args.#name.into_inner::<#wrap_ident>().0 };
-                }
-            }
-            // borrow<R> in T' mode: args.c is T'-RBorrow<'a> wrapping WrapperR(raw_R).
-            // Extract &raw_R via get::<WrapperR>().0 for the import-side call.
-            if let WitTypeRef::Handle(HandleRef::ResourceBorrow(nr)) = &f.ty {
-                let owned = resources.iter().find(|r| {
-                    r.is_owned && r.rust_ident == nr.rust_ident && r.iface_path == nr.path
-                });
-                if let Some(r) = owned.filter(|r| r.inner_type_path.is_some()) {
-                    let wrap_ident = wrapper_ident_for(&r.rust_ident);
-                    return quote! { &args.#name.get::<#wrap_ident>().0 };
-                }
-            }
-            quote! { args.#name }
-        })
-        .collect()
+        .find(|r| r.is_owned && r.type_id == resource_id && r.inner_type_path.is_some())
 }
 
 /// Build the closure body that forwards a per-resource method call to
 /// `self.0.<method>(args.x)`. `self.0` is the import-side handle held
 /// by the wrapper newtype.
-fn build_self_call(
-    is_async: bool,
-    method_ident: &syn::Ident,
-    fields: &[RecordField],
-) -> TokenStream {
-    let arg_exprs = field_arg_exprs(fields, is_async);
-    quote! { self.0.#method_ident(#(#arg_exprs),*) }
+fn build_self_call(method_ident: &syn::Ident, param_exprs: &[TokenStream]) -> TokenStream {
+    quote! { self.0.#method_ident(#(#param_exprs),*) }
 }
 
 /// Build the closure body for a constructor / static method:
 /// `<import>::<Resource>::<method>(args.x)`.
 fn build_static_call(
-    is_async: bool,
     import_resource: &TokenStream,
     method_ident: &syn::Ident,
-    fields: &[RecordField],
-    resources: &[ResourceInfo],
+    param_exprs: &[TokenStream],
 ) -> TokenStream {
-    let arg_exprs = field_arg_exprs_for_transform(fields, is_async, resources);
-    quote! { #import_resource::#method_ident(#(#arg_exprs),*) }
+    quote! { #import_resource::#method_ident(#(#param_exprs),*) }
 }
 
 /// Resolve the import-side resource type path from the GuestBucket
@@ -1153,9 +1147,8 @@ fn build_wrap_at(
 /// Build the closure body that calls the wrapped target with args
 /// unpacked, against the import-side path pinned on the IR.
 fn build_target_call(
-    is_async: bool,
     method_ident: &syn::Ident,
-    fields: &[RecordField],
+    param_exprs: &[TokenStream],
     ir: &WrapperIR,
 ) -> TokenStream {
     let import_path = ir
@@ -1163,8 +1156,7 @@ fn build_target_call(
         .as_ref()
         .expect("IR has no target_import_path; tier-3 Transform must import the wrapped target");
     let import_path = bindings_path_tokens(import_path, None);
-    let arg_exprs = field_arg_exprs_for_transform(fields, is_async, &ir.resources);
-    quote! { #import_path::#method_ident(#(#arg_exprs),*) }
+    quote! { #import_path::#method_ident(#(#param_exprs),*) }
 }
 
 fn build_module_path(segments: &[String]) -> TokenStream {
@@ -1197,7 +1189,7 @@ mod tests {
     fn emit_for_wit(wit: &str, behavior: Behavior) -> EmittedGuest {
         let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = build_bindings_index(&src).unwrap();
-        let ir = build_ir(&resolve, world_id, &bindings, INTERFACE_QN).unwrap();
+        let ir = build_ir(resolve, world_id, &bindings, INTERFACE_QN).unwrap();
         let g = &bindings.guest_traits[0];
         emit_guest(g, INTERFACE_QN, behavior, &ir)
     }
