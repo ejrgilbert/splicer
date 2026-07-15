@@ -57,14 +57,14 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     // on both sides) so the IR can classify types correctly.
     let bindings = build_bindings_index(&bindings_src)?;
     let ir = build_ir(
-        &resolve,
+        resolve,
         world_id,
         &bindings,
         input.interface_qualified_name,
     )?;
     // After indexing: replace export-side named-type definitions with type
     // aliases that point to the import-side definition to fix type identity.
-    let bindings_src = alias_shared_export_types(&bindings_src, &resolve, world_id)
+    let bindings_src = alias_shared_export_types(&bindings_src, &ir.resolve, ir.world_id)
         .context("post-processing wit-bindgen output for shared-interface type aliases")?;
     // User-declared types + per-method synthesized args records both
     // ride the same emitter via NamedKind dispatch.
