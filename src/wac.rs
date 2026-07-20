@@ -906,26 +906,22 @@ impl EmitPlan {
         let shim_pkg = format!("splicer-edge-shim-{}", sanitize_wac_id(collateral_local));
         let shim_var = disambiguated_var(&mut self.edge_shim_counts, &shim_pkg);
 
-        // Derive the T' sibling types import key (what the shim uses in its WIT world).
-        // e.g. "splicer:wrapper/shapes-handles-types@0.0.0"
+        // The T' package has version @0.0.0, so the compiled edge shim binary imports
+        // the sibling types and bridge interfaces with @0.0.0 -- even though the WIT
+        // text uses unversioned syntax. Use the versioned keys for both consumer and src.
         let t_prime_sibling_key = spec.t_prime_types_export.clone();
-        // Strip version to get the non-versioned import identifier used in the shim's WIT world.
-        // The shim world imports e.g. `splicer:wrapper/shapes-handles-types` (without @ver).
-        let t_prime_sibling_unversioned =
-            t_prime_sibling_key.split_once('@').map(|(b, _)| b).unwrap_or(&t_prime_sibling_key);
-        let bridge_unversioned = "splicer:wrapper/bridge";
         let bridge_key = "splicer:wrapper/bridge@0.0.0";
 
         let imports = vec![
-            // T' sibling types: wire from T' wrapper with cross-name override.
+            // T' sibling types: wire from T' wrapper.
             (
-                t_prime_sibling_unversioned.to_string(),
+                t_prime_sibling_key.clone(),
                 t_prime_var.to_string(),
                 Some(t_prime_sibling_key),
             ),
-            // Bridge: wire from T' wrapper with cross-name override.
+            // Bridge: wire from T' wrapper.
             (
-                bridge_unversioned.to_string(),
+                bridge_key.to_string(),
                 t_prime_var.to_string(),
                 Some(bridge_key.to_string()),
             ),
