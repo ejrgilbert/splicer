@@ -77,38 +77,75 @@ pub fn build_wrapper(
     config: &BuildConfig<'_>,
 ) -> Result<BuildOutcome> {
     require_tool("cargo")?;
-
-    let build_dir = config.build_root.join("builds").join(build_dir_key(input));
-    fs::create_dir_all(&build_dir)
-        .with_context(|| format!("could not create build dir {}", build_dir.display()))?;
-
-    let generated = generate_wrapper_crate(input)?;
-
-    let src_dir = build_dir.join("src");
-    fs::create_dir_all(&src_dir)
-        .with_context(|| format!("could not create {}", src_dir.display()))?;
-    fs::write(build_dir.join("Cargo.toml"), &generated.cargo_toml)
-        .context("could not write Cargo.toml")?;
-    fs::write(src_dir.join("lib.rs"), &generated.lib_rs).context("could not write src/lib.rs")?;
-
     let target = config.target.unwrap_or("wasm32-wasip1");
-    // Shared target dir across every wrapper build so cargo amortizes
-    // the dep closure once instead of per-build. Concurrent splices are
-    // serialized by cargo's own `target/debug/.cargo-lock`.
-    let cargo_target_dir = config.build_root.join("target");
-    let out = run_cargo_build(&build_dir, &cargo_target_dir, target)?;
-    if !out.status.success() {
-        // Strategy doesn't fit interface's type; skip
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        return Ok(BuildOutcome::BoundMismatch {
+    let generated = generate_wrapper_crate(input)?;
+    match compile_sources(
+        &build_dir_key(input),
+        &generated.crate_name,
+        &generated.lib_rs,
+        &generated.cargo_toml,
+        config.build_root,
+        config.adapter_wasm,
+        target,
+    )? {
+        Ok(path) => Ok(BuildOutcome::Built(path)),
+        Err(stderr) => Ok(BuildOutcome::BoundMismatch {
             strategy: input.strategy_crate_name.to_string(),
             interface: input.interface_qualified_name.to_string(),
             bound: unsatisfied_bound(&stderr),
             stderr,
-        });
+        }),
+    }
+}
+
+/// Build a pre-written crate (lib.rs + Cargo.toml) to a component wasm.
+/// Any compile error is a hard failure (no skip path).
+pub fn build_crate_source(
+    crate_name: &str,
+    lib_rs: &str,
+    cargo_toml: &str,
+    build_root: &Path,
+    adapter_wasm: &Path,
+    target: Option<&str>,
+) -> Result<PathBuf> {
+    require_tool("cargo")?;
+    let mut h = DefaultHasher::new();
+    crate_name.hash(&mut h);
+    lib_rs.hash(&mut h);
+    let key = format!("{:016x}", h.finish());
+    let target = target.unwrap_or("wasm32-wasip1");
+    compile_sources(&key, crate_name, lib_rs, cargo_toml, build_root, adapter_wasm, target)?
+        .map_err(|stderr| anyhow::anyhow!("crate `{crate_name}` failed to compile:\n{stderr}"))
+}
+
+fn compile_sources(
+    key: &str,
+    crate_name: &str,
+    lib_rs: &str,
+    cargo_toml: &str,
+    build_root: &Path,
+    adapter_wasm: &Path,
+    target: &str,
+) -> Result<Result<PathBuf, String>> {
+    let build_dir = build_root.join("builds").join(key);
+    fs::create_dir_all(&build_dir)
+        .with_context(|| format!("could not create build dir {}", build_dir.display()))?;
+    let src_dir = build_dir.join("src");
+    fs::create_dir_all(&src_dir)
+        .with_context(|| format!("could not create {}", src_dir.display()))?;
+    fs::write(build_dir.join("Cargo.toml"), cargo_toml).context("could not write Cargo.toml")?;
+    fs::write(src_dir.join("lib.rs"), lib_rs).context("could not write src/lib.rs")?;
+
+    // Shared target dir so cargo amortizes the dep closure once across
+    // every wrapper build. Concurrent splices are serialized by cargo's
+    // own `target/debug/.cargo-lock`.
+    let cargo_target_dir = build_root.join("target");
+    let out = run_cargo_build(&build_dir, &cargo_target_dir, target)?;
+    if !out.status.success() {
+        return Ok(Err(String::from_utf8_lossy(&out.stderr).into_owned()));
     }
 
-    let module_name = generated.crate_name.replace('-', "_");
+    let module_name = crate_name.replace('-', "_");
     let module_wasm = cargo_target_dir
         .join(target)
         .join("release")
@@ -121,8 +158,8 @@ pub fn build_wrapper(
     }
 
     let component_wasm = build_dir.join("component.wasm");
-    wrap_module_into_component(&module_wasm, config.adapter_wasm, &component_wasm)?;
-    Ok(BuildOutcome::Built(component_wasm))
+    wrap_module_into_component(&module_wasm, adapter_wasm, &component_wasm)?;
+    Ok(Ok(component_wasm))
 }
 
 /// Library-side equivalent of `wasm-tools component new <module>

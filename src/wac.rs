@@ -267,6 +267,8 @@ struct EmitPlan {
     adapter_counts: HashMap<String, usize>,
     /// Use-count per bridge pkg.
     bridge_counts: HashMap<String, usize>,
+    /// Use-count per edge shim pkg.
+    edge_shim_counts: HashMap<String, usize>,
     /// Real-middleware vars already added (dedup tier-1 across rules).
     emitted_real_vars: HashSet<String>,
 }
@@ -473,6 +475,58 @@ impl EmitPlan {
                             (current_var.clone(), Some(t_prime_export.clone())),
                         );
                     }
+                }
+            }
+        }
+
+        // Third pass: insert edge shim components for T'-wrapped collateral interfaces.
+        // For each injection that has edge_shim_specs, instantiate a shim that sits between
+        // the consumer (T' handles) and the raw collateral, unwrapping T' → raw.
+        for Chain {
+            interface,
+            chain,
+            inject_plan,
+            ..
+        } in chains
+        {
+            for (i, id) in chain.iter().enumerate().skip(1) {
+                let Some(outermost) = inject_plan.get(&i).and_then(|m| m.iter().next()) else {
+                    continue;
+                };
+                if outermost.edge_shim_specs.is_empty() {
+                    continue;
+                }
+                let routing_id = resolve_shim_node(*id, composition, shim_comps);
+                // t_prime_var: the T' wrapper's var (already set by the first pass).
+                let Some((t_prime_var, _)) =
+                    self.routing.get(&(routing_id, interface.name.clone())).cloned()
+                else {
+                    continue;
+                };
+                // raw_provider_var: the chain node just before position i (the raw provider).
+                let raw_provider_id = chain[i - 1];
+                let Some(raw_provider_var) = self.node_vars.get(&raw_provider_id).cloned() else {
+                    continue;
+                };
+                for spec in &outermost.edge_shim_specs {
+                    // raw_collateral_var: still points to the raw collateral component.
+                    let Some((raw_collateral_var, _)) = self
+                        .routing
+                        .get(&(routing_id, spec.collateral_iface.clone()))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let shim_var = self.add_edge_shim_entity(
+                        spec,
+                        &t_prime_var,
+                        &raw_collateral_var,
+                        &raw_provider_var,
+                    );
+                    self.routing.insert(
+                        (routing_id, spec.collateral_iface.clone()),
+                        (shim_var, Some(spec.shim_export_key.clone())),
+                    );
                 }
             }
         }
@@ -837,6 +891,61 @@ impl EmitPlan {
         self.used_middlewares
             .insert(bridge_pkg, bridge_wasm_path.to_string());
         bridge_var
+    }
+
+    /// Instantiate an edge shim component that unwraps T' handles before forwarding to the
+    /// raw collateral. Returns the edge shim's WAC var.
+    fn add_edge_shim_entity(
+        &mut self,
+        spec: &crate::parse::config::EdgeShimSpec,
+        t_prime_var: &str,
+        raw_collateral_var: &str,
+        raw_provider_var: &str,
+    ) -> String {
+        let collateral_local = crate::parse::wit_name::iface_of(&spec.collateral_iface);
+        let shim_pkg = format!("splicer-edge-shim-{}", sanitize_wac_id(collateral_local));
+        let shim_var = disambiguated_var(&mut self.edge_shim_counts, &shim_pkg);
+
+        // Derive the T' sibling types import key (what the shim uses in its WIT world).
+        // e.g. "splicer:wrapper/shapes-handles-types@0.0.0"
+        let t_prime_sibling_key = spec.t_prime_types_export.clone();
+        // Strip version to get the non-versioned import identifier used in the shim's WIT world.
+        // The shim world imports e.g. `splicer:wrapper/shapes-handles-types` (without @ver).
+        let t_prime_sibling_unversioned =
+            t_prime_sibling_key.split_once('@').map(|(b, _)| b).unwrap_or(&t_prime_sibling_key);
+        let bridge_unversioned = "splicer:wrapper/bridge";
+        let bridge_key = "splicer:wrapper/bridge@0.0.0";
+
+        let imports = vec![
+            // T' sibling types: wire from T' wrapper with cross-name override.
+            (
+                t_prime_sibling_unversioned.to_string(),
+                t_prime_var.to_string(),
+                Some(t_prime_sibling_key),
+            ),
+            // Bridge: wire from T' wrapper with cross-name override.
+            (
+                bridge_unversioned.to_string(),
+                t_prime_var.to_string(),
+                Some(bridge_key.to_string()),
+            ),
+            // Raw sibling types: wire from raw provider (no override).
+            (spec.raw_types_iface.clone(), raw_provider_var.to_string(), None),
+            // Raw collateral: wire from raw collateral component (no override).
+            (spec.collateral_iface.clone(), raw_collateral_var.to_string(), None),
+        ];
+
+        self.entities.insert(
+            shim_var.clone(),
+            Entity {
+                var: shim_var.clone(),
+                pkg: shim_pkg.clone(),
+                imports,
+                catchall: false,
+            },
+        );
+        self.used_middlewares.insert(shim_pkg, spec.shim_path.clone());
+        shim_var
     }
 
     /// Render the plan to WAC text. Entities are emitted in topological
@@ -1467,8 +1576,9 @@ fn materialize_tier3_4_inline(
                 path,
                 tier,
                 t_prime_redirects,
+                edge_shim_specs,
             } => {
-                out.push(stamp_materialized(inj, path, tier, t_prime_redirects)?);
+                out.push(stamp_materialized(inj, path, tier, t_prime_redirects, edge_shim_specs)?);
             }
             // Bound didn't fit: record the skip and drop the injection so
             // the chain proceeds without this wrapper. `--strict` callers
@@ -1531,6 +1641,7 @@ fn stamp_materialized(
     wrapper_path: std::path::PathBuf,
     tier: builtin_protocol::Tier,
     t_prime_redirects: Vec<(String, String)>,
+    edge_shim_specs: Vec<crate::parse::config::EdgeShimSpec>,
 ) -> anyhow::Result<Injection> {
     let path_str = wrapper_path
         .to_str()
@@ -1553,6 +1664,7 @@ fn stamp_materialized(
         tier: Some(tier),
         resource_bearing_exports: sibling_exports,
         t_prime_redirects,
+        edge_shim_specs,
         ..inj.clone()
     };
     crate::config_provider::validate_config_as_wave(&mut stamped)?;
@@ -2128,6 +2240,7 @@ mod tests {
             tier: None,
             resource_bearing_exports: Vec::new(),
             t_prime_redirects: Vec::new(),
+                edge_shim_specs: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2200,6 +2313,7 @@ mod tests {
             tier: None,
             resource_bearing_exports: Vec::new(),
             t_prime_redirects: Vec::new(),
+                edge_shim_specs: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2313,6 +2427,7 @@ mod tests {
                 tier: None,
                 resource_bearing_exports: Vec::new(),
                 t_prime_redirects: Vec::new(),
+                edge_shim_specs: Vec::new(),
             }],
         )];
 

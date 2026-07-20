@@ -3,7 +3,7 @@
 //! types. The output is a single WIT text + world name + qualified
 //! interface name, suitable for [`super::GenerateWrapperInput`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{anyhow, Context, Result};
 use wit_component::{Output, WitPrinter};
@@ -13,9 +13,11 @@ use wit_parser::{
     TypeId, TypeOwner, World, WorldId, WorldItem, WorldKey,
 };
 
+use heck::ToUpperCamelCase;
+
 use super::Behavior;
 use crate::adapter::resolve::{decode_input_resolve, find_target_interface, resolve_type_alias};
-use crate::parse::wit_name::iface_of;
+use crate::parse::wit_name::{iface_of, WitName};
 
 #[derive(Debug, Clone)]
 pub struct TargetWit {
@@ -26,6 +28,49 @@ pub struct TargetWit {
     /// T' mode: (consumer_import_key, t_prime_export_key) cross-name wires for WAC routing.
     /// Covers the main interface and all sibling types interfaces. Empty otherwise.
     pub t_prime_redirects: Vec<(String, String)>,
+    /// One entry per collateral interface that carries the wrapped resource type as a param.
+    pub edge_shim_wits: Vec<EdgeShimWit>,
+}
+
+/// Info about a function in a collateral interface that carries resource-typed params or return.
+#[derive(Debug, Clone)]
+pub struct EdgeShimFunctionSpec {
+    /// WIT kebab-case function name.
+    pub fn_name: String,
+    pub is_async: bool,
+    /// Per-param info (name, Rust type string, whether it's an owned resource handle).
+    pub params: Vec<EdgeShimParamSpec>,
+    /// Rust return type string ("()" if no return).
+    pub return_rust_ty: String,
+}
+
+/// Per-parameter info for edge shim codegen.
+#[derive(Debug, Clone)]
+pub struct EdgeShimParamSpec {
+    pub name: String,
+    /// Fully-qualified Rust type path (e.g. `bindings::exports::splicer::edge_shim::shapes_viewer::Counter`).
+    pub rust_ty: String,
+    pub is_resource_own: bool,
+}
+
+/// Everything needed to build one edge shim component.
+#[derive(Debug, Clone)]
+pub struct EdgeShimWit {
+    pub wit_text: String,
+    /// World name inside the edge shim package.
+    pub world_name: String,
+    /// Export key to use in WAC: `"splicer:edge-shim/{collateral_local}@0.0.0"`.
+    pub shim_export_key: String,
+    /// Qualified collateral interface (e.g. `"my:service/shapes-viewer"`).
+    pub collateral_iface: String,
+    /// Qualified raw types interface (e.g. `"my:service/shapes-handles-types"`).
+    pub raw_types_iface: String,
+    /// T' sibling types export key (e.g. `"splicer:wrapper/shapes-handles-types@0.0.0"`).
+    pub t_prime_types_export: String,
+    /// WIT name of the resource (e.g. `"counter"`).
+    pub resource_wit_name: String,
+    /// Functions that carry the resource as an owned param.
+    pub functions: Vec<EdgeShimFunctionSpec>,
 }
 
 /// Package identifier for the splicer-emitted T' wrapper package.
@@ -112,6 +157,7 @@ pub fn target_wit_for_codegen(
         world_name: WRAPPER_WORLD.to_string(),
         qualified_name: qualified,
         t_prime_redirects: vec![],
+        edge_shim_wits: vec![],
     })
 }
 
@@ -181,12 +227,385 @@ fn emit_t_prime_world(
         }
     }
 
+    let collaterals = detect_collateral_interfaces(
+        resolve,
+        resources,
+        target_iface_id,
+        sibling_ifaces,
+    );
+    let edge_shim_wits = emit_edge_shim_worlds(
+        &collaterals,
+        resources,
+        sibling_qualified,
+        &t_prime_text,
+        &original_pkg_text,
+        resolve,
+    );
+
     Ok(TargetWit {
         wit_text: format!("{t_prime_text}\n\n{original_pkg_text}"),
         world_name: WRAPPER_WORLD.to_string(),
         qualified_name: qualified,
         t_prime_redirects,
+        edge_shim_wits,
     })
+}
+
+// ============================
+// ==== Collateral detection ==
+// ============================
+
+/// A collateral interface: one that imports the same resource types as the target but
+/// is not the target or a sibling types interface.
+struct CollateralIface {
+    iface_id: InterfaceId,
+    /// Qualified name (e.g. `"my:service/shapes-viewer"`).
+    qualified_name: String,
+    /// Functions that carry the wrapped resource as an owned parameter.
+    resource_functions: Vec<ResourceFunctionInfo>,
+}
+
+struct ResourceFunctionInfo {
+    fn_name: String,
+    is_async: bool,
+    param_resource_positions: Vec<usize>,
+}
+
+/// Walk the consumer world's imports to find interfaces (not the target, not siblings) that
+/// accept any of the wrapped resource TypeIds as owned params.
+fn detect_collateral_interfaces(
+    resolve: &Resolve,
+    resources: &[ResourceToWrap],
+    target_iface_id: InterfaceId,
+    sibling_iface_ids: &[InterfaceId],
+) -> Vec<CollateralIface> {
+    let resource_type_ids: HashSet<TypeId> =
+        resources.iter().map(|r| resolve_type_alias(resolve, r.type_id)).collect();
+
+    // Find the world that imports the target interface (the consumer world).
+    let consumer_world = resolve.worlds.iter().find_map(|(_id, w)| {
+        w.imports.values().any(|item| match item {
+            WorldItem::Interface { id, .. } => *id == target_iface_id,
+            _ => false,
+        })
+        .then_some(w)
+    });
+    let Some(world) = consumer_world else {
+        return vec![];
+    };
+
+    let excluded: HashSet<InterfaceId> =
+        std::iter::once(target_iface_id).chain(sibling_iface_ids.iter().copied()).collect();
+
+    let mut out = Vec::new();
+    for item in world.imports.values() {
+        let WorldItem::Interface { id: iface_id, .. } = item else { continue };
+        if excluded.contains(iface_id) {
+            continue;
+        }
+        let Some(q) = resolve.id_of(*iface_id) else { continue };
+        let iface = &resolve.interfaces[*iface_id];
+
+        let mut res_fns = Vec::new();
+        for (fn_name, func) in &iface.functions {
+            if !matches!(func.kind, FunctionKind::Freestanding | FunctionKind::AsyncFreestanding) {
+                continue;
+            }
+            let is_async = matches!(func.kind, FunctionKind::AsyncFreestanding);
+            let resource_positions: Vec<usize> = func
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| type_has_own_resource(resolve, p.ty, &resource_type_ids))
+                .map(|(i, _)| i)
+                .collect();
+            if !resource_positions.is_empty() {
+                res_fns.push(ResourceFunctionInfo {
+                    fn_name: fn_name.clone(),
+                    is_async,
+                    param_resource_positions: resource_positions,
+                });
+            }
+        }
+        if !res_fns.is_empty() {
+            out.push(CollateralIface {
+                iface_id: *iface_id,
+                qualified_name: q,
+                resource_functions: res_fns,
+            });
+        }
+    }
+    out
+}
+
+/// Returns true if `ty` is (or contains) `own<R>` where R resolves to one of `resource_ids`.
+fn type_has_own_resource(
+    resolve: &Resolve,
+    ty: Type,
+    resource_ids: &HashSet<TypeId>,
+) -> bool {
+    let Type::Id(id) = ty else { return false };
+    let orig = resolve_type_alias(resolve, id);
+    match &resolve.types[orig].kind {
+        TypeDefKind::Handle(Handle::Own(rid)) => {
+            resource_ids.contains(&resolve_type_alias(resolve, *rid))
+        }
+        _ => false,
+    }
+}
+
+// ==============================
+// ==== Edge shim WIT builder ===
+// ==============================
+
+/// Build one `EdgeShimWit` per collateral interface.
+fn emit_edge_shim_worlds(
+    collaterals: &[CollateralIface],
+    resources: &[ResourceToWrap],
+    sibling_qualified: &[String],
+    t_prime_text: &str,
+    original_pkg_text: &str,
+    resolve: &Resolve,
+) -> Vec<EdgeShimWit> {
+    collaterals
+        .iter()
+        .filter_map(|c| {
+            emit_edge_shim_world(c, resources, sibling_qualified, t_prime_text, original_pkg_text, resolve)
+        })
+        .collect()
+}
+
+fn emit_edge_shim_world(
+    collateral: &CollateralIface,
+    resources: &[ResourceToWrap],
+    sibling_qualified: &[String],
+    t_prime_text: &str,
+    original_pkg_text: &str,
+    resolve: &Resolve,
+) -> Option<EdgeShimWit> {
+    // Only handle factored-types resources (with a sibling) for now.
+    let resource = resources.iter().find(|r| r.sibling_qualified.is_some())?;
+    let sibling_q = resource.sibling_qualified.as_deref()?;
+    // Verify the sibling is actually in the sibling list.
+    if !sibling_qualified.contains(&sibling_q.to_string()) {
+        return None;
+    }
+    let sibling_local = iface_of(sibling_q);
+    let collateral_local = iface_of(&collateral.qualified_name);
+
+    let resource_wit_name = &resource.wit_name;
+    let world_name = format!("{collateral_local}-edge-shim");
+
+    // Collect the names of all resources used by the collateral interface that are in our set.
+    let resource_ids: HashSet<TypeId> =
+        resources.iter().map(|r| resolve_type_alias(resolve, r.type_id)).collect();
+    let collateral_iface = &resolve.interfaces[collateral.iface_id];
+    let used_resource_names: Vec<&str> = collateral_iface
+        .types
+        .iter()
+        .filter_map(|(name, &tid)| {
+            let orig = resolve_type_alias(resolve, tid);
+            resource_ids.contains(&orig).then_some(name.as_str())
+        })
+        .collect();
+    if used_resource_names.is_empty() {
+        return None;
+    }
+
+    // Rust paths used later by codegen.
+    let collateral_snake = collateral_local.replace('-', "_");
+    let export_rust_prefix =
+        format!("bindings::exports::splicer::edge_shim::{collateral_snake}");
+
+    // Verify we can derive the raw import Rust path (needed by emit_edge_shim codegen).
+    wit_name_to_rust_path(&collateral.qualified_name)?;
+
+    let mut functions = Vec::new();
+    for (fn_name, func) in &collateral_iface.functions {
+        if !matches!(func.kind, FunctionKind::Freestanding | FunctionKind::AsyncFreestanding) {
+            continue;
+        }
+        let is_async = matches!(func.kind, FunctionKind::AsyncFreestanding);
+        let params = func
+            .params
+            .iter()
+            .map(|p| {
+                let is_own = type_has_own_resource(resolve, p.ty, &resource_ids);
+                let rust_ty = if is_own {
+                    let pascal = resource_wit_name.to_upper_camel_case();
+                    format!("{export_rust_prefix}::{pascal}")
+                } else {
+                    wit_prim_to_rust(resolve, p.ty)
+                        .unwrap_or_else(|| "/* unsupported */".to_string())
+                };
+                EdgeShimParamSpec {
+                    name: p.name.replace('-', "_"),
+                    rust_ty,
+                    is_resource_own: is_own,
+                }
+            })
+            .collect();
+        let return_rust_ty = match func.result {
+            None => "()".to_string(),
+            Some(ty) => wit_prim_to_rust(resolve, ty).unwrap_or_else(|| "/* unsupported */".to_string()),
+        };
+        functions.push(EdgeShimFunctionSpec {
+            fn_name: fn_name.clone(),
+            is_async,
+            params,
+            return_rust_ty,
+        });
+    }
+
+    // Build the edge shim WIT text.
+    let names_list = used_resource_names.join(", ");
+    let mut wit = format!("package splicer:edge-shim@0.0.0;\n\n");
+    wit.push_str(&format!("interface {collateral_local} {{\n"));
+    wit.push_str(&format!("    use splicer:wrapper/{sibling_local}.{{{names_list}}};\n"));
+    for (fn_name, func) in &collateral_iface.functions {
+        if !matches!(func.kind, FunctionKind::Freestanding | FunctionKind::AsyncFreestanding) {
+            continue;
+        }
+        let async_kw = if matches!(func.kind, FunctionKind::AsyncFreestanding) { "async " } else { "" };
+        let params_str = func
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", p.name, render_wit_type(resolve, p.ty, &resource_ids, resource_wit_name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ret_str = match func.result {
+            None => String::new(),
+            Some(ty) => format!(" -> {}", render_wit_type(resolve, ty, &resource_ids, resource_wit_name)),
+        };
+        wit.push_str(&format!("    {fn_name}: {async_kw}func({params_str}){ret_str};\n"));
+    }
+    wit.push_str("}\n\n");
+
+    wit.push_str(&format!("world {world_name} {{\n"));
+    wit.push_str(&format!("    import splicer:wrapper/{sibling_local};\n"));
+    wit.push_str(&format!("    import splicer:wrapper/{BRIDGE_IFACE};\n"));
+    wit.push_str(&format!("    import {sibling_q};\n"));
+    wit.push_str(&format!("    import {};\n", collateral.qualified_name));
+    wit.push_str(&format!("    export {collateral_local};\n"));
+    wit.push_str("}\n");
+
+    let wit_text = format!("{wit}\n\n{t_prime_text}\n\n{original_pkg_text}");
+
+    Some(EdgeShimWit {
+        wit_text,
+        world_name,
+        shim_export_key: format!("splicer:edge-shim/{collateral_local}@0.0.0"),
+        collateral_iface: collateral.qualified_name.clone(),
+        raw_types_iface: sibling_q.to_string(),
+        t_prime_types_export: format!("splicer:wrapper/{sibling_local}@0.0.0"),
+        resource_wit_name: resource_wit_name.clone(),
+        functions,
+    })
+}
+
+/// Render a WIT type to its WIT text form, using the resource's local name for own handles.
+fn render_wit_type(
+    resolve: &Resolve,
+    ty: Type,
+    resource_ids: &HashSet<TypeId>,
+    resource_local_name: &str,
+) -> String {
+    match ty {
+        Type::Bool => "bool".to_string(),
+        Type::U8 => "u8".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
+        Type::S8 => "s8".to_string(),
+        Type::S16 => "s16".to_string(),
+        Type::S32 => "s32".to_string(),
+        Type::S64 => "s64".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::Char => "char".to_string(),
+        Type::String => "string".to_string(),
+        Type::ErrorContext => "error-context".to_string(),
+        Type::Id(id) => {
+            let orig = resolve_type_alias(resolve, id);
+            match &resolve.types[orig].kind {
+                TypeDefKind::Handle(Handle::Own(rid)) => {
+                    let orig_rid = resolve_type_alias(resolve, *rid);
+                    if resource_ids.contains(&orig_rid) {
+                        resource_local_name.to_string()
+                    } else {
+                        resolve.types[orig_rid]
+                            .name
+                            .as_deref()
+                            .unwrap_or("unknown")
+                            .to_string()
+                    }
+                }
+                TypeDefKind::Handle(Handle::Borrow(rid)) => {
+                    let orig_rid = resolve_type_alias(resolve, *rid);
+                    let name = if resource_ids.contains(&orig_rid) {
+                        resource_local_name.to_string()
+                    } else {
+                        resolve.types[orig_rid]
+                            .name
+                            .as_deref()
+                            .unwrap_or("unknown")
+                            .to_string()
+                    };
+                    format!("borrow<{name}>")
+                }
+                TypeDefKind::Option(inner) => {
+                    format!("option<{}>", render_wit_type(resolve, *inner, resource_ids, resource_local_name))
+                }
+                TypeDefKind::List(inner) => {
+                    format!("list<{}>", render_wit_type(resolve, *inner, resource_ids, resource_local_name))
+                }
+                _ => resolve.types[orig]
+                    .name
+                    .as_deref()
+                    .unwrap_or("unknown")
+                    .to_string(),
+            }
+        }
+    }
+}
+
+/// Convert a WIT primitive to its Rust type string. Returns None for compound/named types.
+fn wit_prim_to_rust(resolve: &Resolve, ty: Type) -> Option<String> {
+    Some(match ty {
+        Type::Bool => "bool".to_string(),
+        Type::U8 => "u8".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
+        Type::S8 => "i8".to_string(),
+        Type::S16 => "i16".to_string(),
+        Type::S32 => "i32".to_string(),
+        Type::S64 => "i64".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::Char => "char".to_string(),
+        Type::String => "String".to_string(),
+        Type::ErrorContext => "wit_bindgen::rt::async_support::ErrorContext".to_string(),
+        Type::Id(id) => {
+            let orig = resolve_type_alias(resolve, id);
+            match &resolve.types[orig].kind {
+                TypeDefKind::Handle(Handle::Own(_)) | TypeDefKind::Handle(Handle::Borrow(_)) => {
+                    return None; // handled by caller
+                }
+                _ => return None,
+            }
+        }
+    })
+}
+
+/// Convert a qualified WIT interface name (e.g. `"my:service/shapes-viewer"`) to a
+/// `bindings::{ns}::{pkg}::{iface}` Rust module path prefix.
+fn wit_name_to_rust_path(qualified: &str) -> Option<String> {
+    let n = WitName::parse(qualified)?;
+    let ns = n.ns.replace('-', "_");
+    let pkg = n.pkg.replace('-', "_");
+    let iface = n.iface.replace('-', "_");
+    Some(format!("bindings::{ns}::{pkg}::{iface}"))
 }
 
 // ==================
