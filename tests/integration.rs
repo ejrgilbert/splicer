@@ -296,3 +296,21 @@ fn integration_builtin_hello_tier4() {
 fn integration_builtin_otel() {
     run_config("builtin-otel");
 }
+
+#[test]
+#[ignore]
+fn integration_builtin_recorder() {
+    run_config("builtin-recorder");
+}
+
+#[test]
+#[ignore]
+fn integration_builtin_replayer() {
+    run_config("builtin-replayer");
+}
+
+// #[test]
+// #[ignore]
+// fn integration_on_subgraph_resource() {
+//     run_config("on-subgraph-resource");
+// }

@@ -7,16 +7,22 @@ use heck::{ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::quote;
 use toml::{map::Map, Value};
-
 use super::target_wit::{EdgeShimWit, BRIDGE_IFACE};
 use super::WrapperCrate;
 use crate::parse::wit_name::WitName;
 
 /// Generate the complete source of an edge shim crate for `shim_wit`.
 pub fn generate_edge_shim_crate(shim_wit: &EdgeShimWit) -> Result<WrapperCrate> {
-    let (_, _, bindings_src) = super::run_wit_bindgen_rust(
+    // The edge-shim WIT only contains the edge-shim package itself. T' and
+    // the original component packages are already in `base_resolve`, so we
+    // push the edge-shim text on top of that pre-populated resolve. This
+    // avoids the multi-package inline WIT format, which breaks when nested
+    // packages have cross-package USE statements (they are resolved
+    // independently and fail if their own deps aren't in the same group).
+    let bindings_src = run_bindgen_on_base_resolve(
+        shim_wit.base_resolve.clone(),
         &shim_wit.wit_text,
-        Some(&shim_wit.world_name),
+        &shim_wit.world_name,
     )
     .with_context(|| {
         format!(
@@ -159,10 +165,50 @@ pub fn emit_edge_shim_guest_impl(shim_wit: &EdgeShimWit) -> TokenStream {
 
     quote! {
         impl bindings::#(#export_mod_segs)::*::Guest for EdgeShim {
-            type #resource_pascal = bindings::#(#bridge_segs)::*::#resource_pascal;
             #(#methods)*
         }
     }
+}
+
+fn run_bindgen_on_base_resolve(
+    mut resolve: wit_parser::Resolve,
+    wit_text: &str,
+    world_name: &str,
+) -> Result<String> {
+    use wit_bindgen_core::{Files, WorldGenerator};
+    let pkg_id = resolve
+        .push_str("<in-memory>", wit_text)
+        .context("failed to parse edge-shim WIT")?;
+    let world_id = resolve
+        .select_world(&[pkg_id], Some(world_name))
+        .with_context(|| format!("could not select world '{world_name}'"))?;
+    let mut generator = wit_bindgen_rust::Opts {
+        generate_all: true,
+        ..Default::default()
+    }
+    .build();
+    let mut files = Files::default();
+    generator
+        .generate(&mut resolve, world_id, &mut files)
+        .context("wit-bindgen-rust generation failed")?;
+    let rs_files: Vec<_> = files
+        .iter()
+        .filter(|(name, _)| name.ends_with(".rs"))
+        .collect();
+    let bytes = match rs_files.as_slice() {
+        [(_, bytes)] => *bytes,
+        [] => anyhow::bail!("wit-bindgen-rust produced no .rs output"),
+        many => {
+            let names: Vec<&str> = many.iter().map(|(name, _)| *name).collect();
+            anyhow::bail!(
+                "wit-bindgen-rust produced {} .rs files; expected exactly one: {names:?}",
+                many.len()
+            );
+        }
+    };
+    std::str::from_utf8(bytes)
+        .map(String::from)
+        .context("wit-bindgen-rust output is not UTF-8")
 }
 
 fn assemble_edge_shim_lib_rs(bindings_src: &str, guest_impl: &TokenStream) -> Result<String> {
