@@ -54,9 +54,14 @@ pub struct EdgeShimParamSpec {
 }
 
 /// Everything needed to build one edge shim component.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct EdgeShimWit {
+    /// Edge-shim-only WIT text (`package splicer:edge-shim@0.0.0; interface ...; world ...`).
+    /// Does NOT include the T' or original packages -- those are already in `base_resolve`.
     pub wit_text: String,
+    /// Resolve pre-populated with T' (splicer:wrapper) + all original component packages.
+    /// `generate_edge_shim_crate` pushes `wit_text` on top of this resolve.
+    pub base_resolve: Resolve,
     /// World name inside the edge shim package.
     pub world_name: String,
     /// Export key to use in WAC: `"splicer:edge-shim/{collateral_local}@0.0.0"`.
@@ -237,8 +242,6 @@ fn emit_t_prime_world(
         &collaterals,
         resources,
         sibling_qualified,
-        &t_prime_text,
-        &original_pkg_text,
         resolve,
     );
 
@@ -363,15 +366,11 @@ fn emit_edge_shim_worlds(
     collaterals: &[CollateralIface],
     resources: &[ResourceToWrap],
     sibling_qualified: &[String],
-    t_prime_text: &str,
-    original_pkg_text: &str,
     resolve: &Resolve,
 ) -> Vec<EdgeShimWit> {
     collaterals
         .iter()
-        .filter_map(|c| {
-            emit_edge_shim_world(c, resources, sibling_qualified, t_prime_text, original_pkg_text, resolve)
-        })
+        .filter_map(|c| emit_edge_shim_world(c, resources, sibling_qualified, resolve))
         .collect()
 }
 
@@ -379,8 +378,6 @@ fn emit_edge_shim_world(
     collateral: &CollateralIface,
     resources: &[ResourceToWrap],
     sibling_qualified: &[String],
-    t_prime_text: &str,
-    original_pkg_text: &str,
     resolve: &Resolve,
 ) -> Option<EdgeShimWit> {
     // Only handle factored-types resources (with a sibling) for now.
@@ -457,11 +454,13 @@ fn emit_edge_shim_world(
         });
     }
 
-    // Build the edge shim WIT text.
+    // Build the edge-shim WIT text -- edge-shim package ONLY. The T' and original
+    // packages are already in `base_resolve`; `generate_edge_shim_crate` pushes this
+    // text on top of that pre-populated resolve instead of re-parsing the dependencies.
     let names_list = used_resource_names.join(", ");
-    let mut wit = format!("package splicer:edge-shim@0.0.0;\n\n");
-    wit.push_str(&format!("interface {collateral_local} {{\n"));
-    wit.push_str(&format!("    use splicer:wrapper/{sibling_local}.{{{names_list}}};\n"));
+    let mut wit_text = format!("package splicer:edge-shim@0.0.0;\n\n");
+    wit_text.push_str(&format!("interface {collateral_local} {{\n"));
+    wit_text.push_str(&format!("    use splicer:wrapper/{sibling_local}.{{{names_list}}};\n"));
     for (fn_name, func) in &collateral_iface.functions {
         if !matches!(func.kind, FunctionKind::Freestanding | FunctionKind::AsyncFreestanding) {
             continue;
@@ -477,22 +476,41 @@ fn emit_edge_shim_world(
             None => String::new(),
             Some(ty) => format!(" -> {}", render_wit_type(resolve, ty, &resource_ids, resource_wit_name)),
         };
-        wit.push_str(&format!("    {fn_name}: {async_kw}func({params_str}){ret_str};\n"));
+        wit_text.push_str(&format!("    {fn_name}: {async_kw}func({params_str}){ret_str};\n"));
     }
-    wit.push_str("}\n\n");
+    wit_text.push_str("}\n\n");
 
-    wit.push_str(&format!("world {world_name} {{\n"));
-    wit.push_str(&format!("    import splicer:wrapper/{sibling_local};\n"));
-    wit.push_str(&format!("    import splicer:wrapper/{BRIDGE_IFACE};\n"));
-    wit.push_str(&format!("    import {sibling_q};\n"));
-    wit.push_str(&format!("    import {};\n", collateral.qualified_name));
-    wit.push_str(&format!("    export {collateral_local};\n"));
-    wit.push_str("}\n");
+    wit_text.push_str(&format!("world {world_name} {{\n"));
+    wit_text.push_str(&format!("    import splicer:wrapper/{sibling_local};\n"));
+    wit_text.push_str(&format!("    import splicer:wrapper/{BRIDGE_IFACE};\n"));
+    wit_text.push_str(&format!("    import {sibling_q};\n"));
+    wit_text.push_str(&format!("    import {};\n", collateral.qualified_name));
+    wit_text.push_str(&format!("    export {collateral_local};\n"));
+    wit_text.push_str("}\n");
 
-    let wit_text = format!("{wit}\n\n{t_prime_text}\n\n{original_pkg_text}");
+    // WIT USE/import syntax can't express @version; register the T' package under
+    // its unversioned name as well so `use splicer:wrapper/...` resolves when
+    // push_str appends this edge-shim text to the pre-populated base_resolve.
+    let mut base_resolve = resolve.clone();
+    let unversioned = PackageName {
+        namespace: WRAPPER_PKG_NS.to_string(),
+        name: WRAPPER_PKG_NAME.to_string(),
+        version: None,
+    };
+    if !base_resolve.package_names.contains_key(&unversioned) {
+        let versioned = PackageName {
+            namespace: WRAPPER_PKG_NS.to_string(),
+            name: WRAPPER_PKG_NAME.to_string(),
+            version: Some(semver::Version::new(0, 0, 0)),
+        };
+        if let Some(&pkg_id) = base_resolve.package_names.get(&versioned) {
+            base_resolve.package_names.insert(unversioned, pkg_id);
+        }
+    }
 
     Some(EdgeShimWit {
         wit_text,
+        base_resolve,
         world_name,
         shim_export_key: format!("splicer:edge-shim/{collateral_local}@0.0.0"),
         collateral_iface: collateral.qualified_name.clone(),
@@ -868,6 +886,28 @@ fn emit_bridge_pair(
         .types
         .insert(format!("wrapped-{wit_name}"), wrapped_id);
 
+    // Bare TypeId references to resource aliases hit `push_flat → Resource => todo!()` in
+    // wit-parser's ABI. `Remap::append` (called during `push_str`) converts them to
+    // `own<T>` handles; programmatic resolves bypass that. Use anonymous Own handles
+    // explicitly so ABI works on both the text-round-trip (T' wrapper) and direct-resolve
+    // (edge shim) paths.
+    let own_raw = resolve.types.alloc(TypeDef {
+        name: None,
+        kind: TypeDefKind::Handle(Handle::Own(raw_id)),
+        owner: TypeOwner::None,
+        docs: Docs::default(),
+        stability: Stability::default(),
+        span: Span::default(),
+    });
+    let own_wrapped = resolve.types.alloc(TypeDef {
+        name: None,
+        kind: TypeDefKind::Handle(Handle::Own(wrapped_id)),
+        owner: TypeOwner::None,
+        docs: Docs::default(),
+        stability: Stability::default(),
+        span: Span::default(),
+    });
+
     let wrap_fn = format!("wrap-{wit_name}");
     resolve.interfaces[bridge_iface_id].functions.insert(
         wrap_fn.clone(),
@@ -876,10 +916,10 @@ fn emit_bridge_pair(
             kind: FunctionKind::Freestanding,
             params: vec![Param {
                 name: "inner".to_string(),
-                ty: Type::Id(raw_id),
+                ty: Type::Id(own_raw),
                 span: Span::default(),
             }],
-            result: Some(Type::Id(wrapped_id)),
+            result: Some(Type::Id(own_wrapped)),
             docs: Docs::default(),
             stability: Stability::default(),
             span: Span::default(),
@@ -894,10 +934,10 @@ fn emit_bridge_pair(
             kind: FunctionKind::Freestanding,
             params: vec![Param {
                 name: "w".to_string(),
-                ty: Type::Id(wrapped_id),
+                ty: Type::Id(own_wrapped),
                 span: Span::default(),
             }],
-            result: Some(Type::Id(raw_id)),
+            result: Some(Type::Id(own_raw)),
             docs: Docs::default(),
             stability: Stability::default(),
             span: Span::default(),
