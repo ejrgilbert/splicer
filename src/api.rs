@@ -612,6 +612,7 @@ rules:
                 tier: None,
                 resource_bearing_exports: Vec::new(),
                 t_prime_redirects: Vec::new(),
+                edge_shim_specs: Vec::new(),
             }],
         )];
         let tmp = tempfile::tempdir().unwrap();

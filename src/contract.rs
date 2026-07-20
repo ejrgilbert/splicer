@@ -339,6 +339,7 @@ mod tests {
             tier: None,
             resource_bearing_exports: Vec::new(),
             t_prime_redirects: Vec::new(),
+                edge_shim_specs: Vec::new(),
             builtin: None,
             builtin_config: Default::default(),
             config_as_wave: None,
