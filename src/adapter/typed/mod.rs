@@ -8,6 +8,7 @@ mod assemble;
 mod bindgen;
 mod bindings_index;
 mod build;
+mod emit_edge_shim;
 mod emit_method;
 mod emit_wit_typed;
 mod ir;
@@ -16,7 +17,8 @@ pub(crate) mod target_wit;
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
 pub use bindgen::{alias_shared_export_types, run_wit_bindgen_rust};
 pub use bindings_index::build_bindings_index;
-pub use build::{build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
+pub use build::{build_crate_source, build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
+pub use emit_edge_shim::generate_edge_shim_crate;
 pub use emit_method::{
     emit_bridge_guest_impl, emit_delegation_guest_impl, emit_guest, emit_resource_newtypes,
     EmittedGuest,
