@@ -26,7 +26,7 @@ pub fn split_out_composition(
         .with_context(|| format!("Failed to create splits directory: {output}"))?;
     let buff = fs::read(wasm_path)
         .with_context(|| format!("Failed to read composition wasm: {}", wasm_path.display()))?;
-    let component = Component::parse(&buff, false, false, false).with_context(|| {
+    let component = Component::parse(&buff, false, false).with_context(|| {
         format!(
             "Failed to parse composition wasm as a component: {}",
             wasm_path.display()
