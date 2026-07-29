@@ -6331,7 +6331,6 @@ dependencies = [
 name = "wirm"
 version = "5.0.1"
 dependencies = [
- "gimli",
  "log",
  "paste",
  "wasm-encoder 0.247.0",
