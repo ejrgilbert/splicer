@@ -88,7 +88,10 @@ pub struct SizeReport {
     pub composed: Option<Composed>,
 }
 impl SizeReport {
-    pub fn build(wac_deps: &BTreeMap<String, PathBuf>, kinds: &BTreeMap<String, DepKind>) -> Self {
+    pub(crate) fn build(
+        wac_deps: &BTreeMap<String, PathBuf>,
+        kinds: &BTreeMap<String, DepKind>,
+    ) -> Self {
         let mut report = SizeReport::default();
         let prefix = format!("{INST_PREFIX}:");
         for (pkg, path) in wac_deps {
@@ -131,7 +134,7 @@ impl SizeReport {
     }
 
     /// Record the composed total and derive the glue residual.
-    pub fn set_composed(&mut self, total_bytes: u64) {
+    pub(crate) fn set_composed(&mut self, total_bytes: u64) {
         let glue_bytes = total_bytes as i64 - self.leaves_bytes() as i64;
         self.composed = Some(Composed {
             total_bytes,

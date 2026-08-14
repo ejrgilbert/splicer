@@ -124,8 +124,8 @@ pub struct Bundle {
     /// `Err` instead) and on a clean run.
     pub skips: Vec<SkipRecord>,
 
-    /// Breakdown of code-size
-    pub size_report: SizeReport,
+    /// Leaf-level code-size classification cached from the WAC plan.
+    leaf_report: SizeReport,
 }
 
 impl Bundle {
@@ -141,6 +141,22 @@ impl Bundle {
     /// before return.
     pub fn to_wasm(&self) -> Result<Vec<u8>> {
         compose_wac(&self.wac, &self.wac_deps)
+    }
+
+    /// Code-size breakdown (app / shims / tools / wrappers / support)
+    /// completed with the composed total and glue residual.
+    /// `composed_bytes` is the length of [`Bundle::to_wasm`]'s output.
+    pub fn size_report(&self, composed_bytes: u64) -> SizeReport {
+        let mut report = self.leaf_report.clone();
+        report.set_composed(composed_bytes);
+        report
+    }
+
+    /// Leaf-level code-size breakdown without the composed total, for
+    /// callers that skip composition (e.g. `--plan`), where the glue
+    /// residual is undefined.
+    pub fn leaf_size_report(&self) -> SizeReport {
+        self.leaf_report.clone()
     }
 }
 
@@ -236,7 +252,7 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
     let mut wac_deps = out.wac_deps;
     canonicalize_wac_deps(&mut wac_deps)?;
 
-    let size_report = SizeReport::build(&wac_deps, &out.middleware_kinds);
+    let leaf_report = SizeReport::build(&wac_deps, &out.middleware_kinds);
 
     Ok(Bundle {
         wac: out.wac,
@@ -245,7 +261,7 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
         generated_adapters: out.generated_adapters,
         any_rule_matched: out.any_rule_matched,
         skips: out.skips,
-        size_report,
+        leaf_report,
     })
 }
 
@@ -311,7 +327,8 @@ pub fn compose(req: ComposeRequest) -> Result<Bundle> {
     let mut wac_deps = out.wac_deps;
     canonicalize_wac_deps(&mut wac_deps)?;
 
-    let size_report = SizeReport::build(&wac_deps, &out.middleware_kinds);
+    // Compose injects nothing, so every leaf is an app component.
+    let leaf_report = SizeReport::build(&wac_deps, &out.middleware_kinds);
 
     Ok(Bundle {
         wac: out.wac,
@@ -320,7 +337,7 @@ pub fn compose(req: ComposeRequest) -> Result<Bundle> {
         generated_adapters: out.generated_adapters,
         any_rule_matched: out.any_rule_matched,
         skips: out.skips,
-        size_report,
+        leaf_report,
     })
 }
 

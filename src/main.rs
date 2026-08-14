@@ -661,7 +661,7 @@ fn finish(
         );
         if let Some(fmt) = metrics {
             // No compose ran, so glue/total are undefined
-            emit_metrics(&bundle.size_report, fmt, metrics_out.as_deref())?;
+            emit_metrics(&bundle.leaf_size_report(), fmt, metrics_out.as_deref())?;
         }
         return Ok(());
     }
@@ -677,9 +677,7 @@ fn finish(
     };
 
     if let Some(fmt) = metrics {
-        let mut report = bundle.size_report.clone();
-        report.set_composed(composed.len() as u64);
-        emit_metrics(&report, fmt, metrics_out.as_deref())?;
+        emit_metrics(&bundle.size_report(composed.len() as u64), fmt, metrics_out.as_deref())?;
     }
 
     let output_path = output.unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_WASM));
