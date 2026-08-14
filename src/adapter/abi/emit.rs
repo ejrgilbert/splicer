@@ -1495,13 +1495,13 @@ mod tests {
             assert!(
                 matches!(&block[1], Instruction::LocalSet(idx) if *idx == ADDR_LOCAL),
                 "param {param_i}: block[1] expected LocalSet({ADDR_LOCAL}), got {:?}",
-                &block[1],
+                block[1],
             );
             // [2] local.get $param_flat (cursor advances 1 per primitive)
             assert!(
                 matches!(&block[2], Instruction::LocalGet(idx) if *idx == param_i as u32),
                 "param {param_i}: block[2] expected LocalGet({param_i}), got {:?}",
-                &block[2],
+                block[2],
             );
             // [3] local.set $tmp — captured for [5]'s reload check
             let tmp = match &block[3] {
@@ -1512,13 +1512,13 @@ mod tests {
             assert!(
                 matches!(&block[4], Instruction::LocalGet(idx) if *idx == ADDR_LOCAL),
                 "param {param_i}: block[4] expected LocalGet({ADDR_LOCAL}), got {:?}",
-                &block[4],
+                block[4],
             );
             // [5] local.get $tmp — must be the same local stored at [3]
             assert!(
                 matches!(&block[5], Instruction::LocalGet(idx) if *idx == tmp),
                 "param {param_i}: block[5] should reload the same tmp ({tmp}) stored at [3], got {:?}",
-                &block[5],
+                block[5],
             );
             // [6] <store> offset=0 — the field offset is in addr_local,
             // not in MemArg.offset. A non-zero offset would mean the
@@ -1526,7 +1526,7 @@ mod tests {
             let actual_offset = sig.match_offset(&block[6]).unwrap_or_else(|| {
                 panic!(
                     "param {param_i}: block[6] expected {sig:?} store, got {:?}",
-                    &block[6],
+                    block[6],
                 )
             });
             assert_eq!(
@@ -1611,7 +1611,7 @@ mod tests {
         assert!(
             matches!(&insts[1], Instruction::LocalSet(idx) if *idx == ADDR_LOCAL),
             "head[1] expected LocalSet({ADDR_LOCAL}), got {:?}",
-            &insts[1],
+            insts[1],
         );
 
         // Per-field block at indices [HEAD_LEN + i*FIELD_LEN ..]:
@@ -1621,7 +1621,7 @@ mod tests {
             assert!(
                 matches!(&block[0], Instruction::LocalGet(idx) if *idx == field_i as u32),
                 "field {field_i}: block[0] expected LocalGet({field_i}), got {:?}",
-                &block[0],
+                block[0],
             );
             // [1] local.set $tmp
             let tmp = match &block[1] {
@@ -1632,19 +1632,19 @@ mod tests {
             assert!(
                 matches!(&block[2], Instruction::LocalGet(idx) if *idx == ADDR_LOCAL),
                 "field {field_i}: block[2] expected LocalGet({ADDR_LOCAL}), got {:?}",
-                &block[2],
+                block[2],
             );
             // [3] local.get $tmp (same as [1])
             assert!(
                 matches!(&block[3], Instruction::LocalGet(idx) if *idx == tmp),
                 "field {field_i}: block[3] should reload tmp ({tmp}), got {:?}",
-                &block[3],
+                block[3],
             );
             // [4] <store> with the field's in-record offset baked into MemArg.
             let actual_offset = sig.match_offset(&block[4]).unwrap_or_else(|| {
                 panic!(
                     "field {field_i}: block[4] expected {sig:?} store, got {:?}",
-                    &block[4],
+                    block[4],
                 )
             });
             assert_eq!(

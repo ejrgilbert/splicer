@@ -84,6 +84,7 @@ pub mod builtin_info {
 mod compose;
 mod config_provider;
 mod contract;
+mod metrics;
 mod parse;
 mod preview;
 mod resolve;
@@ -125,6 +126,7 @@ pub mod types {
         TIER1_INTERFACES, TIER1_PACKAGE, TIER1_VERSION, TIER2_AFTER, TIER2_BEFORE, TIER2_GATE,
         TIER2_INTERFACES, TIER2_PACKAGE, TIER2_VERSION,
     };
+    pub use crate::metrics::{Bucket, Composed, DepItem, DepKind, SizeReport};
     pub use crate::parse::config::{Injection, SpliceRule};
     pub use crate::wac::GeneratedAdapter;
 }

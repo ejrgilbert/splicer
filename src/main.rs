@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use splicer::cviz::output::graph::{generate_graph_ascii, GraphRenderOpts};
 use splicer::cviz::output::{mermaid::generate_mermaid, terminal_columns, ColorMode, Direction};
-use splicer::types::ContractResult;
+use splicer::types::{ContractResult, SizeReport};
 use splicer::{
     builtin_info, compose, format_skip_summary, preview, splice, Bundle, ComponentInput,
     ComposeRequest, PreviewRequest, SpliceRequest,
@@ -84,6 +84,21 @@ enum Command {
         /// a matched interface. Default: skip those matches and warn.
         #[arg(long, default_value_t = false)]
         strict: bool,
+
+        /// Emit a code-size breakdown. Pass `json` for a machine-readable report.
+        /// Under `--plan`, glue/total are omitted.
+        #[arg(
+            long = "metrics",
+            value_name = "FORMAT",
+            num_args = 0..=1,
+            default_missing_value = "table",
+            value_enum,
+        )]
+        metrics: Option<MetricsFormat>,
+
+        /// Write the `--metrics` report to this file instead of stderr.
+        #[arg(long = "metrics-out", value_name = "PATH")]
+        metrics_out: Option<PathBuf>,
     },
 
     /// Synthesize a composition from N individual Wasm components.
@@ -125,6 +140,21 @@ enum Command {
         /// Package name written at the top of the generated WAC.
         #[arg(long, default_value = DEFAULT_PKG)]
         package: String,
+
+        /// Emit a code-size breakdown. Pass `json` for a machine-readable report.
+        /// Under `--plan`, glue/total are omitted.
+        #[arg(
+            long = "metrics",
+            value_name = "FORMAT",
+            num_args = 0..=1,
+            default_missing_value = "table",
+            value_enum,
+        )]
+        metrics: Option<MetricsFormat>,
+
+        /// Write the `--metrics` report to this file instead of stderr.
+        #[arg(long = "metrics-out", value_name = "PATH")]
+        metrics_out: Option<PathBuf>,
     },
 
     /// Render the composition with each rule's matched edges highlighted.
@@ -212,6 +242,8 @@ fn main() -> Result<()> {
             package,
             skip_type_check,
             strict,
+            metrics,
+            metrics_out,
         } => run_splice(
             splice_cfg_file,
             comp_wasm,
@@ -222,6 +254,8 @@ fn main() -> Result<()> {
             package,
             skip_type_check,
             strict,
+            metrics,
+            metrics_out,
         ),
 
         Command::Compose {
@@ -230,7 +264,9 @@ fn main() -> Result<()> {
             emit_wac,
             plan,
             package,
-        } => run_compose(wasms, output, emit_wac, plan, package),
+            metrics,
+            metrics_out,
+        } => run_compose(wasms, output, emit_wac, plan, package, metrics, metrics_out),
 
         Command::Preview {
             splice_cfg_file,
@@ -263,6 +299,12 @@ enum PreviewFormat {
     #[default]
     Ascii,
     Mermaid,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum MetricsFormat {
+    Table,
+    Json,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,6 +555,8 @@ fn run_splice(
     package: String,
     skip_type_check: bool,
     strict: bool,
+    metrics: Option<MetricsFormat>,
+    metrics_out: Option<PathBuf>,
 ) -> Result<()> {
     let rules_yaml = fs::read_to_string(&splice_cfg_file)
         .with_context(|| format!("Failed to read: {}", splice_cfg_file.display()))?;
@@ -541,15 +585,18 @@ fn run_splice(
         );
     }
 
-    finish(bundle, output, emit_wac, plan, splits)
+    finish(bundle, output, emit_wac, plan, splits, metrics, metrics_out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_compose(
     wasms: Vec<String>,
     output: Option<PathBuf>,
     emit_wac: Option<PathBuf>,
     plan: bool,
     package: String,
+    metrics: Option<MetricsFormat>,
+    metrics_out: Option<PathBuf>,
 ) -> Result<()> {
     let components: Vec<ComponentInput> = wasms
         .iter()
@@ -575,18 +622,29 @@ fn run_compose(
     print_diagnostics(&bundle.diagnostics);
 
     // Compose has no splits dir to manage.
-    finish(bundle, output, emit_wac, plan, SplitsLocation::None)
+    finish(
+        bundle,
+        output,
+        emit_wac,
+        plan,
+        SplitsLocation::None,
+        metrics,
+        metrics_out,
+    )
 }
 
 /// Tail-end of both subcommands: write the WAC if requested, then
 /// either print the `--plan` shell command or run in-process compose
 /// and write the composed `.wasm`.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     bundle: Bundle,
     output: Option<PathBuf>,
     emit_wac: Option<PathBuf>,
     plan: bool,
     splits: SplitsLocation,
+    metrics: Option<MetricsFormat>,
+    metrics_out: Option<PathBuf>,
 ) -> Result<()> {
     if plan {
         // --plan implies --emit-wac if the user didn't pass one.
@@ -601,6 +659,10 @@ fn finish(
             "{}",
             format!("WAC saved to: {}", wac_path.display()).dimmed()
         );
+        if let Some(fmt) = metrics {
+            // No compose ran, so glue/total are undefined
+            emit_metrics(&bundle.size_report, fmt, metrics_out.as_deref())?;
+        }
         return Ok(());
     }
 
@@ -614,9 +676,35 @@ fn finish(
         Err(e) => return Err(handle_compose_failure(e, &bundle, emit_wac, splits)),
     };
 
+    if let Some(fmt) = metrics {
+        let mut report = bundle.size_report.clone();
+        report.set_composed(composed.len() as u64);
+        emit_metrics(&report, fmt, metrics_out.as_deref())?;
+    }
+
     let output_path = output.unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_WASM));
     fs::write(&output_path, &composed)
         .with_context(|| format!("Failed to write composed wasm: {}", output_path.display()))?;
+    Ok(())
+}
+
+/// Render the size report and write it to `out` (or stderr when `None`).
+fn emit_metrics(report: &SizeReport, format: MetricsFormat, out: Option<&Path>) -> Result<()> {
+    let rendered = match format {
+        MetricsFormat::Table => report.to_table(),
+        MetricsFormat::Json => report.to_json(),
+    };
+    match out {
+        Some(path) => {
+            fs::write(path, &rendered)
+                .with_context(|| format!("Failed to write metrics: {}", path.display()))?;
+            eprintln!(
+                "{}",
+                format!("metrics written to: {}", path.display()).dimmed()
+            );
+        }
+        None => eprintln!("{rendered}"),
+    }
     Ok(())
 }
 

@@ -2,14 +2,14 @@
 //! (holding T' handles) and a raw collateral interface, unwrapping T' → raw before
 //! forwarding the call.
 
+use super::target_wit::{EdgeShimWit, BRIDGE_IFACE};
+use super::WrapperCrate;
+use crate::parse::wit_name::WitName;
 use anyhow::{Context, Result};
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::TokenStream;
 use quote::quote;
 use toml::{map::Map, Value};
-use super::target_wit::{EdgeShimWit, BRIDGE_IFACE};
-use super::WrapperCrate;
-use crate::parse::wit_name::WitName;
 
 /// Generate the complete source of an edge shim crate for `shim_wit`.
 pub fn generate_edge_shim_crate(shim_wit: &EdgeShimWit) -> Result<WrapperCrate> {
@@ -37,7 +37,11 @@ pub fn generate_edge_shim_crate(shim_wit: &EdgeShimWit) -> Result<WrapperCrate> 
     let crate_name = edge_shim_crate_name(shim_wit);
     let cargo_toml = edge_shim_cargo_toml(&crate_name);
 
-    Ok(WrapperCrate { crate_name, lib_rs, cargo_toml })
+    Ok(WrapperCrate {
+        crate_name,
+        lib_rs,
+        cargo_toml,
+    })
 }
 
 /// Build a stable crate name for the edge shim (kebab-case, no special chars).
@@ -52,10 +56,20 @@ pub fn edge_shim_crate_name(shim_wit: &EdgeShimWit) -> String {
 
     let sanitize = |s: &str| -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
             .collect()
     };
-    format!("splicer_edge_shim_{}_{}", sanitize(&shim_wit.collateral_iface), suffix)
+    format!(
+        "splicer_edge_shim_{}_{}",
+        sanitize(&shim_wit.collateral_iface),
+        suffix
+    )
 }
 
 /// Emit the `impl Guest for EdgeShim` block for the edge shim crate.
@@ -70,8 +84,7 @@ pub fn emit_edge_shim_guest_impl(shim_wit: &EdgeShimWit) -> TokenStream {
         .collect();
 
     // Raw collateral import path: e.g. bindings::my::service::shapes_viewer
-    let raw_path = wit_name_to_rust_idents(&shim_wit.collateral_iface)
-        .unwrap_or_default();
+    let raw_path = wit_name_to_rust_idents(&shim_wit.collateral_iface).unwrap_or_default();
 
     // Bridge path: bindings::splicer::wrapper::bridge
     let bridge_segs: Vec<syn::Ident> = ["splicer", "wrapper", BRIDGE_IFACE]
@@ -93,10 +106,8 @@ pub fn emit_edge_shim_guest_impl(shim_wit: &EdgeShimWit) -> TokenStream {
         .functions
         .iter()
         .map(|f| {
-            let fn_ident: syn::Ident = syn::Ident::new(
-                &f.fn_name.replace('-', "_"),
-                proc_macro2::Span::call_site(),
-            );
+            let fn_ident: syn::Ident =
+                syn::Ident::new(&f.fn_name.replace('-', "_"), proc_macro2::Span::call_site());
             let maybe_async = if f.is_async { quote!(async) } else { quote!() };
             let maybe_await = if f.is_async { quote!(.await) } else { quote!() };
 
@@ -104,25 +115,25 @@ pub fn emit_edge_shim_guest_impl(shim_wit: &EdgeShimWit) -> TokenStream {
                 .params
                 .iter()
                 .map(|p| {
-                    let pname: syn::Ident = syn::Ident::new(&p.name, proc_macro2::Span::call_site());
+                    let pname: syn::Ident =
+                        syn::Ident::new(&p.name, proc_macro2::Span::call_site());
                     // Parse the Rust type string. Fall back to a placeholder on parse failure.
-                    let ty: syn::Type = syn::parse_str(&p.rust_ty).unwrap_or_else(|_| {
-                        syn::parse_str("()").unwrap()
-                    });
+                    let ty: syn::Type = syn::parse_str(&p.rust_ty)
+                        .unwrap_or_else(|_| syn::parse_str("()").unwrap());
                     quote!(#pname: #ty)
                 })
                 .collect();
 
-            let return_ty: syn::Type = syn::parse_str(&f.return_rust_ty).unwrap_or_else(|_| {
-                syn::parse_str("()").unwrap()
-            });
+            let return_ty: syn::Type =
+                syn::parse_str(&f.return_rust_ty).unwrap_or_else(|_| syn::parse_str("()").unwrap());
             let has_explicit_return = f.return_rust_ty != "()";
 
             let (let_bindings, call_args): (Vec<TokenStream>, Vec<TokenStream>) = f
                 .params
                 .iter()
                 .map(|p| {
-                    let pname: syn::Ident = syn::Ident::new(&p.name, proc_macro2::Span::call_site());
+                    let pname: syn::Ident =
+                        syn::Ident::new(&p.name, proc_macro2::Span::call_site());
                     if p.is_resource_own {
                         let raw_pname: syn::Ident = syn::Ident::new(
                             &format!("raw_{}", p.name),
@@ -225,8 +236,8 @@ fn assemble_edge_shim_lib_rs(bindings_src: &str, guest_impl: &TokenStream) -> Re
         bindings::export!(EdgeShim with_types_in bindings);
     };
 
-    let parsed =
-        syn::parse2::<syn::File>(assembled).context("assembled edge shim lib.rs is not valid Rust")?;
+    let parsed = syn::parse2::<syn::File>(assembled)
+        .context("assembled edge shim lib.rs is not valid Rust")?;
     Ok(prettyplease::unparse(&parsed))
 }
 
@@ -251,8 +262,7 @@ fn edge_shim_cargo_toml(crate_name: &str) -> String {
     root.insert("lib".into(), Value::Table(lib));
     root.insert("dependencies".into(), Value::Table(dependencies));
 
-    toml::to_string(&Value::Table(root))
-        .expect("toml serialization is infallible")
+    toml::to_string(&Value::Table(root)).expect("toml serialization is infallible")
 }
 
 /// Convert a qualified WIT interface name to module ident segments for Rust.
@@ -262,12 +272,7 @@ fn wit_name_to_rust_idents(qualified: &str) -> Option<Vec<syn::Ident>> {
     let segs = [n.ns, n.pkg, n.iface];
     Some(
         segs.iter()
-            .map(|s| {
-                syn::Ident::new(
-                    &s.replace('-', "_"),
-                    proc_macro2::Span::call_site(),
-                )
-            })
+            .map(|s| syn::Ident::new(&s.replace('-', "_"), proc_macro2::Span::call_site()))
             .collect(),
     )
 }

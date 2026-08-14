@@ -147,7 +147,8 @@ pub fn build_ir(
                 });
                 continue;
             }
-            let nt = build_named_type(&resolve, &ifaces, *type_id, wit_name, &entry.path, bindings)?;
+            let nt =
+                build_named_type(&resolve, &ifaces, *type_id, wit_name, &entry.path, bindings)?;
             if let Some(nt) = nt {
                 let key = (
                     match &nt.location {
@@ -226,7 +227,14 @@ pub fn build_ir(
                 .transpose()?;
             let kind = ExportFnKind::from(&func.kind);
             let is_async = func.kind.is_async();
-            fn_sigs.insert(args_ident.to_string(), ExportFnSig { return_ty, kind, is_async });
+            fn_sigs.insert(
+                args_ident.to_string(),
+                ExportFnSig {
+                    return_ty,
+                    kind,
+                    is_async,
+                },
+            );
             fn_funcs.insert(args_ident.to_string(), func.clone());
             args_records.push(args);
         }
@@ -273,7 +281,14 @@ pub fn build_ir(
                     .map(|t| type_to_ref(&resolve, &ifaces, t))
                     .transpose()?;
                 let is_async = func.kind.is_async();
-                delegation_sigs.insert(args_ident_str, DelegationSig { params, return_ty, is_async });
+                delegation_sigs.insert(
+                    args_ident_str,
+                    DelegationSig {
+                        params,
+                        return_ty,
+                        is_async,
+                    },
+                );
             }
         }
     }
@@ -612,11 +627,17 @@ impl HandleRef {
         match self {
             HandleRef::ErrorContext => quote!(::wit_bindgen::rt::async_support::ErrorContext),
             HandleRef::Future(inner) => {
-                let t = inner.as_deref().map(WitTypeRef::to_tokens).unwrap_or_else(|| quote!(()));
+                let t = inner
+                    .as_deref()
+                    .map(WitTypeRef::to_tokens)
+                    .unwrap_or_else(|| quote!(()));
                 quote!(::wit_bindgen::rt::async_support::FutureReader<#t>)
             }
             HandleRef::Stream(inner) => {
-                let t = inner.as_deref().map(WitTypeRef::to_tokens).unwrap_or_else(|| quote!(()));
+                let t = inner
+                    .as_deref()
+                    .map(WitTypeRef::to_tokens)
+                    .unwrap_or_else(|| quote!(()));
                 quote!(::wit_bindgen::rt::async_support::StreamReader<#t>)
             }
             // `own<R>` lowers to the bare resource type

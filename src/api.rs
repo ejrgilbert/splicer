@@ -14,6 +14,7 @@ use wac_resolver::{packages, FileSystemPackageResolver};
 use crate::builtins;
 use crate::compose::{build_graph_from_components, filename_from_path};
 use crate::contract::ContractResult;
+use crate::metrics::SizeReport;
 use crate::parse::config::{parse_yaml, SpliceRule};
 use crate::resolve::resolve_rules;
 use crate::split::split_out_composition;
@@ -122,6 +123,9 @@ pub struct Bundle {
     /// did not fit the interface. Empty under `strict` (those become an
     /// `Err` instead) and on a clean run.
     pub skips: Vec<SkipRecord>,
+
+    /// Breakdown of code-size
+    pub size_report: SizeReport,
 }
 
 impl Bundle {
@@ -232,6 +236,8 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
     let mut wac_deps = out.wac_deps;
     canonicalize_wac_deps(&mut wac_deps)?;
 
+    let size_report = SizeReport::build(&wac_deps, &out.middleware_kinds);
+
     Ok(Bundle {
         wac: out.wac,
         wac_deps,
@@ -239,6 +245,7 @@ pub fn splice(req: SpliceRequest) -> Result<Bundle> {
         generated_adapters: out.generated_adapters,
         any_rule_matched: out.any_rule_matched,
         skips: out.skips,
+        size_report,
     })
 }
 
@@ -304,6 +311,8 @@ pub fn compose(req: ComposeRequest) -> Result<Bundle> {
     let mut wac_deps = out.wac_deps;
     canonicalize_wac_deps(&mut wac_deps)?;
 
+    let size_report = SizeReport::build(&wac_deps, &out.middleware_kinds);
+
     Ok(Bundle {
         wac: out.wac,
         wac_deps,
@@ -311,6 +320,7 @@ pub fn compose(req: ComposeRequest) -> Result<Bundle> {
         generated_adapters: out.generated_adapters,
         any_rule_matched: out.any_rule_matched,
         skips: out.skips,
+        size_report,
     })
 }
 

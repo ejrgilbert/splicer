@@ -224,7 +224,10 @@ fn emit_t_prime_world(
         format!("splicer:wrapper/{local_name}@0.0.0"),
     )];
     for (sibling_q, &sibling_local) in sibling_qualified.iter().zip(&sibling_local_names) {
-        if resources.iter().any(|r| r.sibling_qualified.as_deref() == Some(sibling_q.as_str())) {
+        if resources
+            .iter()
+            .any(|r| r.sibling_qualified.as_deref() == Some(sibling_q.as_str()))
+        {
             t_prime_redirects.push((
                 sibling_q.clone(),
                 format!("splicer:wrapper/{sibling_local}@0.0.0"),
@@ -232,18 +235,9 @@ fn emit_t_prime_world(
         }
     }
 
-    let collaterals = detect_collateral_interfaces(
-        resolve,
-        resources,
-        target_iface_id,
-        sibling_ifaces,
-    );
-    let edge_shim_wits = emit_edge_shim_worlds(
-        &collaterals,
-        resources,
-        sibling_qualified,
-        resolve,
-    );
+    let collaterals =
+        detect_collateral_interfaces(resolve, resources, target_iface_id, sibling_ifaces);
+    let edge_shim_wits = emit_edge_shim_worlds(&collaterals, resources, sibling_qualified, resolve);
 
     Ok(TargetWit {
         wit_text: format!("{t_prime_text}\n\n{original_pkg_text}"),
@@ -282,36 +276,48 @@ fn detect_collateral_interfaces(
     target_iface_id: InterfaceId,
     sibling_iface_ids: &[InterfaceId],
 ) -> Vec<CollateralIface> {
-    let resource_type_ids: HashSet<TypeId> =
-        resources.iter().map(|r| resolve_type_alias(resolve, r.type_id)).collect();
+    let resource_type_ids: HashSet<TypeId> = resources
+        .iter()
+        .map(|r| resolve_type_alias(resolve, r.type_id))
+        .collect();
 
     // Find the world that imports the target interface (the consumer world).
     let consumer_world = resolve.worlds.iter().find_map(|(_id, w)| {
-        w.imports.values().any(|item| match item {
-            WorldItem::Interface { id, .. } => *id == target_iface_id,
-            _ => false,
-        })
-        .then_some(w)
+        w.imports
+            .values()
+            .any(|item| match item {
+                WorldItem::Interface { id, .. } => *id == target_iface_id,
+                _ => false,
+            })
+            .then_some(w)
     });
     let Some(world) = consumer_world else {
         return vec![];
     };
 
-    let excluded: HashSet<InterfaceId> =
-        std::iter::once(target_iface_id).chain(sibling_iface_ids.iter().copied()).collect();
+    let excluded: HashSet<InterfaceId> = std::iter::once(target_iface_id)
+        .chain(sibling_iface_ids.iter().copied())
+        .collect();
 
     let mut out = Vec::new();
     for item in world.imports.values() {
-        let WorldItem::Interface { id: iface_id, .. } = item else { continue };
+        let WorldItem::Interface { id: iface_id, .. } = item else {
+            continue;
+        };
         if excluded.contains(iface_id) {
             continue;
         }
-        let Some(q) = resolve.id_of(*iface_id) else { continue };
+        let Some(q) = resolve.id_of(*iface_id) else {
+            continue;
+        };
         let iface = &resolve.interfaces[*iface_id];
 
         let mut res_fns = Vec::new();
         for (fn_name, func) in &iface.functions {
-            if !matches!(func.kind, FunctionKind::Freestanding | FunctionKind::AsyncFreestanding) {
+            if !matches!(
+                func.kind,
+                FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
+            ) {
                 continue;
             }
             let is_async = matches!(func.kind, FunctionKind::AsyncFreestanding);
@@ -342,11 +348,7 @@ fn detect_collateral_interfaces(
 }
 
 /// Returns true if `ty` is (or contains) `own<R>` where R resolves to one of `resource_ids`.
-fn type_has_own_resource(
-    resolve: &Resolve,
-    ty: Type,
-    resource_ids: &HashSet<TypeId>,
-) -> bool {
+fn type_has_own_resource(resolve: &Resolve, ty: Type, resource_ids: &HashSet<TypeId>) -> bool {
     let Type::Id(id) = ty else { return false };
     let orig = resolve_type_alias(resolve, id);
     match &resolve.types[orig].kind {
@@ -394,8 +396,10 @@ fn emit_edge_shim_world(
     let world_name = format!("{collateral_local}-edge-shim");
 
     // Collect the names of all resources used by the collateral interface that are in our set.
-    let resource_ids: HashSet<TypeId> =
-        resources.iter().map(|r| resolve_type_alias(resolve, r.type_id)).collect();
+    let resource_ids: HashSet<TypeId> = resources
+        .iter()
+        .map(|r| resolve_type_alias(resolve, r.type_id))
+        .collect();
     let collateral_iface = &resolve.interfaces[collateral.iface_id];
     let used_resource_names: Vec<&str> = collateral_iface
         .types
@@ -411,15 +415,17 @@ fn emit_edge_shim_world(
 
     // Rust paths used later by codegen.
     let collateral_snake = collateral_local.replace('-', "_");
-    let export_rust_prefix =
-        format!("bindings::exports::splicer::edge_shim::{collateral_snake}");
+    let export_rust_prefix = format!("bindings::exports::splicer::edge_shim::{collateral_snake}");
 
     // Verify we can derive the raw import Rust path (needed by emit_edge_shim codegen).
     wit_name_to_rust_path(&collateral.qualified_name)?;
 
     let mut functions = Vec::new();
     for (fn_name, func) in &collateral_iface.functions {
-        if !matches!(func.kind, FunctionKind::Freestanding | FunctionKind::AsyncFreestanding) {
+        if !matches!(
+            func.kind,
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
+        ) {
             continue;
         }
         let is_async = matches!(func.kind, FunctionKind::AsyncFreestanding);
@@ -444,7 +450,9 @@ fn emit_edge_shim_world(
             .collect();
         let return_rust_ty = match func.result {
             None => "()".to_string(),
-            Some(ty) => wit_prim_to_rust(resolve, ty).unwrap_or_else(|| "/* unsupported */".to_string()),
+            Some(ty) => {
+                wit_prim_to_rust(resolve, ty).unwrap_or_else(|| "/* unsupported */".to_string())
+            }
         };
         functions.push(EdgeShimFunctionSpec {
             fn_name: fn_name.clone(),
@@ -458,25 +466,45 @@ fn emit_edge_shim_world(
     // packages are already in `base_resolve`; `generate_edge_shim_crate` pushes this
     // text on top of that pre-populated resolve instead of re-parsing the dependencies.
     let names_list = used_resource_names.join(", ");
-    let mut wit_text = format!("package splicer:edge-shim@0.0.0;\n\n");
+    let mut wit_text = "package splicer:edge-shim@0.0.0;\n\n".to_string();
     wit_text.push_str(&format!("interface {collateral_local} {{\n"));
-    wit_text.push_str(&format!("    use splicer:wrapper/{sibling_local}.{{{names_list}}};\n"));
+    wit_text.push_str(&format!(
+        "    use splicer:wrapper/{sibling_local}.{{{names_list}}};\n"
+    ));
     for (fn_name, func) in &collateral_iface.functions {
-        if !matches!(func.kind, FunctionKind::Freestanding | FunctionKind::AsyncFreestanding) {
+        if !matches!(
+            func.kind,
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
+        ) {
             continue;
         }
-        let async_kw = if matches!(func.kind, FunctionKind::AsyncFreestanding) { "async " } else { "" };
+        let async_kw = if matches!(func.kind, FunctionKind::AsyncFreestanding) {
+            "async "
+        } else {
+            ""
+        };
         let params_str = func
             .params
             .iter()
-            .map(|p| format!("{}: {}", p.name, render_wit_type(resolve, p.ty, &resource_ids, resource_wit_name)))
+            .map(|p| {
+                format!(
+                    "{}: {}",
+                    p.name,
+                    render_wit_type(resolve, p.ty, &resource_ids, resource_wit_name)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let ret_str = match func.result {
             None => String::new(),
-            Some(ty) => format!(" -> {}", render_wit_type(resolve, ty, &resource_ids, resource_wit_name)),
+            Some(ty) => format!(
+                " -> {}",
+                render_wit_type(resolve, ty, &resource_ids, resource_wit_name)
+            ),
         };
-        wit_text.push_str(&format!("    {fn_name}: {async_kw}func({params_str}){ret_str};\n"));
+        wit_text.push_str(&format!(
+            "    {fn_name}: {async_kw}func({params_str}){ret_str};\n"
+        ));
     }
     wit_text.push_str("}\n\n");
 
@@ -572,10 +600,16 @@ fn render_wit_type(
                     format!("borrow<{name}>")
                 }
                 TypeDefKind::Option(inner) => {
-                    format!("option<{}>", render_wit_type(resolve, *inner, resource_ids, resource_local_name))
+                    format!(
+                        "option<{}>",
+                        render_wit_type(resolve, *inner, resource_ids, resource_local_name)
+                    )
                 }
                 TypeDefKind::List(inner) => {
-                    format!("list<{}>", render_wit_type(resolve, *inner, resource_ids, resource_local_name))
+                    format!(
+                        "list<{}>",
+                        render_wit_type(resolve, *inner, resource_ids, resource_local_name)
+                    )
                 }
                 _ => resolve.types[orig]
                     .name
@@ -833,8 +867,7 @@ fn copy_resource_methods(
         .collect();
     for (fn_name, func) in res_fns {
         let new_kind = remap_func_kind(&func.kind, original_id, fresh_id);
-        let new_params =
-            substitute_params(resolve, &func.params, subst, dest_iface_id, use_cache);
+        let new_params = substitute_params(resolve, &func.params, subst, dest_iface_id, use_cache);
         let new_result = func
             .result
             .map(|ty| substitute_ty(resolve, ty, subst, dest_iface_id, use_cache));
@@ -1001,9 +1034,9 @@ fn build_t_prime_iface(
             t_prime_iface_id,
             &mut use_cache,
         );
-        let new_result = func.result.map(|ty| {
-            substitute_ty(resolve, ty, subst, t_prime_iface_id, &mut use_cache)
-        });
+        let new_result = func
+            .result
+            .map(|ty| substitute_ty(resolve, ty, subst, t_prime_iface_id, &mut use_cache));
         resolve.interfaces[t_prime_iface_id].functions.insert(
             fn_name,
             Function {
@@ -1195,7 +1228,13 @@ fn substitute_ty(
     use_cache: &mut HashMap<TypeId, TypeId>,
 ) -> Type {
     match ty {
-        Type::Id(id) => Type::Id(substitute_id(resolve, id, subst, t_prime_iface_id, use_cache)),
+        Type::Id(id) => Type::Id(substitute_id(
+            resolve,
+            id,
+            subst,
+            t_prime_iface_id,
+            use_cache,
+        )),
         other => other,
     }
 }
@@ -1276,12 +1315,20 @@ fn substitute_kind(
     use_cache: &mut HashMap<TypeId, TypeId>,
 ) -> TypeDefKind {
     match kind {
-        TypeDefKind::List(ty) => {
-            TypeDefKind::List(substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache))
-        }
-        TypeDefKind::Option(ty) => {
-            TypeDefKind::Option(substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache))
-        }
+        TypeDefKind::List(ty) => TypeDefKind::List(substitute_ty(
+            resolve,
+            ty,
+            subst,
+            t_prime_iface_id,
+            use_cache,
+        )),
+        TypeDefKind::Option(ty) => TypeDefKind::Option(substitute_ty(
+            resolve,
+            ty,
+            subst,
+            t_prime_iface_id,
+            use_cache,
+        )),
         TypeDefKind::Future(Some(ty)) => TypeDefKind::Future(Some(substitute_ty(
             resolve,
             ty,
@@ -1299,9 +1346,9 @@ fn substitute_kind(
         TypeDefKind::Result(r) => {
             let ok =
                 r.ok.map(|ty| substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache));
-            let err =
-                r.err
-                    .map(|ty| substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache));
+            let err = r
+                .err
+                .map(|ty| substitute_ty(resolve, ty, subst, t_prime_iface_id, use_cache));
             TypeDefKind::Result(Result_ { ok, err })
         }
         TypeDefKind::Tuple(t) => {
@@ -1319,18 +1366,16 @@ fn substitute_kind(
             t_prime_iface_id,
             use_cache,
         ))),
-        TypeDefKind::Handle(Handle::Borrow(rid)) => {
-            TypeDefKind::Handle(Handle::Borrow(substitute_id(
-                resolve,
-                rid,
-                subst,
-                t_prime_iface_id,
-                use_cache,
-            )))
-        }
-        TypeDefKind::Type(inner) => {
-            TypeDefKind::Type(substitute_ty(resolve, inner, subst, t_prime_iface_id, use_cache))
-        }
+        TypeDefKind::Handle(Handle::Borrow(rid)) => TypeDefKind::Handle(Handle::Borrow(
+            substitute_id(resolve, rid, subst, t_prime_iface_id, use_cache),
+        )),
+        TypeDefKind::Type(inner) => TypeDefKind::Type(substitute_ty(
+            resolve,
+            inner,
+            subst,
+            t_prime_iface_id,
+            use_cache,
+        )),
         // Pass through: Resource, Record, Flags, Variant, Enum, Future(None), Stream(None), Unknown
         other => other,
     }
@@ -1504,7 +1549,10 @@ mod tests {
         let wit = &target.wit_text;
         assert!(wit.contains("interface bridge"), "missing bridge:\n{wit}");
         assert!(wit.contains("wrap-bucket:"), "missing wrap-bucket:\n{wit}");
-        assert!(wit.contains("unwrap-bucket:"), "missing unwrap-bucket:\n{wit}");
+        assert!(
+            wit.contains("unwrap-bucket:"),
+            "missing unwrap-bucket:\n{wit}"
+        );
         assert!(
             wit.contains("export store;"),
             "missing export store:\n{wit}"
@@ -1592,7 +1640,10 @@ mod tests {
         let component = component_from_wit(TINY_WIT, "demo").expect("synthesize fixture");
         let target = target_wit_for_codegen(&component, "test:demo/ops@0.1.0", Behavior::Transform)
             .expect("extract");
-        assert!(target.t_prime_redirects.is_empty(), "non-T' should have no redirects");
+        assert!(
+            target.t_prime_redirects.is_empty(),
+            "non-T' should have no redirects"
+        );
     }
 
     // Inline resource: resource declared directly inside the target interface (no sibling
@@ -1626,10 +1677,22 @@ mod tests {
         let wit = &target.wit_text;
         assert!(wit.contains("interface bridge"), "missing bridge:\n{wit}");
         assert!(wit.contains("wrap-bucket:"), "missing wrap-bucket:\n{wit}");
-        assert!(wit.contains("unwrap-bucket:"), "missing unwrap-bucket:\n{wit}");
-        assert!(wit.contains("resource bucket"), "T' must declare fresh bucket:\n{wit}");
-        assert!(wit.contains("export store;"), "missing export store:\n{wit}");
-        assert!(wit.contains("export bridge;"), "missing export bridge:\n{wit}");
+        assert!(
+            wit.contains("unwrap-bucket:"),
+            "missing unwrap-bucket:\n{wit}"
+        );
+        assert!(
+            wit.contains("resource bucket"),
+            "T' must declare fresh bucket:\n{wit}"
+        );
+        assert!(
+            wit.contains("export store;"),
+            "missing export store:\n{wit}"
+        );
+        assert!(
+            wit.contains("export bridge;"),
+            "missing export bridge:\n{wit}"
+        );
         // Inline resource: no sibling types interface, so only one redirect.
         assert_eq!(
             target.t_prime_redirects.len(),
@@ -1655,7 +1718,10 @@ mod tests {
             .expect("extract");
         let wit = &target.wit_text;
         // Constructor and methods must appear in the T' main interface.
-        assert!(wit.contains("constructor(name: string)"), "missing constructor:\n{wit}");
+        assert!(
+            wit.contains("constructor(name: string)"),
+            "missing constructor:\n{wit}"
+        );
         assert!(wit.contains("get:"), "missing get method:\n{wit}");
         assert!(wit.contains("set:"), "missing set method:\n{wit}");
         // No sibling types interface should appear.

@@ -20,6 +20,7 @@ pub const EDGE_ID_CONFIG_KEY: &str = "_splicer_edge_id";
 
 use cviz::canonical_edge_id;
 
+use crate::metrics::DepKind;
 use crate::parse::config::{AdapterInjectionInfo, Injection, SpliceRule};
 use crate::select::{RuleMatcher, SpliceSite};
 use crate::split::gen_split_path;
@@ -108,6 +109,9 @@ pub struct WacOutput {
     /// Tier-3/4 matches skipped because the strategy's declared bound
     /// did not fit the interface. Empty on a clean run.
     pub skips: Vec<SkipRecord>,
+    /// Kind of every injected/generated leaf in [`Self::wac_deps`].
+    /// Entries absent from this are original-app splits.
+    pub middleware_kinds: BTreeMap<String, DepKind>,
 }
 
 /// One tier-3/4 match skipped because the strategy's bound doesn't fit
@@ -237,6 +241,8 @@ struct EmitPlan {
     /// `middleware-a-1`) share one dep entry; `BTreeMap` keeps the
     /// emitted command line deterministic.
     used_middlewares: BTreeMap<String, String>,
+    /// Records what each item in [`Self::used_middlewares`] is.
+    middleware_kinds: BTreeMap<String, DepKind>,
 
     // Planning state
     /// First non-`None` alias seen per node id. Drives the var assigned
@@ -498,8 +504,10 @@ impl EmitPlan {
                 }
                 let routing_id = resolve_shim_node(*id, composition, shim_comps);
                 // t_prime_var: the T' wrapper's var (already set by the first pass).
-                let Some((t_prime_var, _)) =
-                    self.routing.get(&(routing_id, interface.name.clone())).cloned()
+                let Some((t_prime_var, _)) = self
+                    .routing
+                    .get(&(routing_id, interface.name.clone()))
+                    .cloned()
                 else {
                     continue;
                 };
@@ -733,6 +741,8 @@ impl EmitPlan {
             // subsequent calls.
             if self.emitted_real_vars.insert(real_pkg.clone()) {
                 self.used_middlewares.insert(real_pkg.clone(), mdl_path);
+                self.middleware_kinds
+                    .insert(real_pkg.clone(), DepKind::Tool);
                 match cfg_pkg.as_ref() {
                     Some(cfg_pkg) => {
                         self.entities
@@ -741,6 +751,8 @@ impl EmitPlan {
                             cfg_pkg.clone(),
                             mdl.config_provider_path.as_ref().unwrap().clone(),
                         );
+                        self.middleware_kinds
+                            .insert(cfg_pkg.clone(), DepKind::Support);
                         self.entities.insert(
                             real_pkg.clone(),
                             Entity::wired(
@@ -807,6 +819,8 @@ impl EmitPlan {
                 adapter_var.clone(),
                 Entity::wired(&adapter_var, &adapter_pkg, imports),
             );
+            self.middleware_kinds
+                .insert(adapter_pkg.clone(), DepKind::Shim);
             self.used_middlewares
                 .insert(adapter_pkg, adapter_info.adapter_path.clone());
 
@@ -845,6 +859,8 @@ impl EmitPlan {
                     .insert(cfg_pkg.clone(), Entity::leaf(&cfg_pkg, &cfg_pkg));
                 self.used_middlewares
                     .insert(cfg_pkg.clone(), cfg_path.clone());
+                self.middleware_kinds
+                    .insert(cfg_pkg.clone(), DepKind::Support);
                 imports.push((
                     crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED.to_string(),
                     cfg_pkg,
@@ -853,6 +869,14 @@ impl EmitPlan {
             }
             self.entities
                 .insert(mw_var.clone(), Entity::wired(&mw_var, &real_pkg, imports));
+            // Simple branch = no generated adapter: tier-3/4 fuse the
+            // transform strategy into the middleware itself (a wrapper);
+            // anything else is a plain injected tool.
+            let kind = match mdl.tier {
+                Some(t) if u8::from(t) >= 3 => DepKind::Wrapper,
+                _ => DepKind::Tool,
+            };
+            self.middleware_kinds.insert(real_pkg.clone(), kind);
             self.used_middlewares.insert(real_pkg, mdl_path);
             Ok(mw_var)
         }
@@ -888,6 +912,8 @@ impl EmitPlan {
                 catchall: false,
             },
         );
+        self.middleware_kinds
+            .insert(bridge_pkg.clone(), DepKind::Support);
         self.used_middlewares
             .insert(bridge_pkg, bridge_wasm_path.to_string());
         bridge_var
@@ -926,9 +952,17 @@ impl EmitPlan {
                 Some(bridge_key.to_string()),
             ),
             // Raw sibling types: wire from raw provider (no override).
-            (spec.raw_types_iface.clone(), raw_provider_var.to_string(), None),
+            (
+                spec.raw_types_iface.clone(),
+                raw_provider_var.to_string(),
+                None,
+            ),
             // Raw collateral: wire from raw collateral component (no override).
-            (spec.collateral_iface.clone(), raw_collateral_var.to_string(), None),
+            (
+                spec.collateral_iface.clone(),
+                raw_collateral_var.to_string(),
+                None,
+            ),
         ];
 
         self.entities.insert(
@@ -940,7 +974,10 @@ impl EmitPlan {
                 catchall: false,
             },
         );
-        self.used_middlewares.insert(shim_pkg, spec.shim_path.clone());
+        self.middleware_kinds
+            .insert(shim_pkg.clone(), DepKind::Support);
+        self.used_middlewares
+            .insert(shim_pkg, spec.shim_path.clone());
         shim_var
     }
 
@@ -1250,6 +1287,7 @@ pub fn generate_wac(
         generated_adapters: accs.generated_adapters,
         any_rule_matched,
         skips: accs.skips,
+        middleware_kinds: plan.middleware_kinds,
     })
 }
 
@@ -1574,7 +1612,13 @@ fn materialize_tier3_4_inline(
                 t_prime_redirects,
                 edge_shim_specs,
             } => {
-                out.push(stamp_materialized(inj, path, tier, t_prime_redirects, edge_shim_specs)?);
+                out.push(stamp_materialized(
+                    inj,
+                    path,
+                    tier,
+                    t_prime_redirects,
+                    edge_shim_specs,
+                )?);
             }
             // Bound didn't fit: record the skip and drop the injection so
             // the chain proceeds without this wrapper. `--strict` callers
@@ -2236,7 +2280,7 @@ mod tests {
             tier: None,
             resource_bearing_exports: Vec::new(),
             t_prime_redirects: Vec::new(),
-                edge_shim_specs: Vec::new(),
+            edge_shim_specs: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2309,7 +2353,7 @@ mod tests {
             tier: None,
             resource_bearing_exports: Vec::new(),
             t_prime_redirects: Vec::new(),
-                edge_shim_specs: Vec::new(),
+            edge_shim_specs: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
