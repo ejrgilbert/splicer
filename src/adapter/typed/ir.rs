@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use heck::{ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use wit_parser::{
     Function, FunctionKind, Handle, Interface, InterfaceId, Resolve, Type, TypeDefKind, TypeId,
     TypeOwner, WorldId, WorldItem,
@@ -19,7 +19,9 @@ use wit_parser::{
 
 use super::bindings_index::{
     bindings_path_tokens, strip_exports_prefix, BindingsItem, BindingsPath, WrapperBindings,
+    EXPORTS_PREFIX,
 };
+use super::target_wit::{BRIDGE_IFACE, WRAPPER_PKG_NAME, WRAPPER_PKG_NS};
 use crate::adapter::resolve::resolve_type_alias;
 
 /// Per-interface metadata collected from the world: WIT InterfaceId,
@@ -37,7 +39,7 @@ struct IfaceEntry {
 
 /// Walk the world and build the IR.
 pub fn build_ir(
-    resolve: &Resolve,
+    resolve: Resolve,
     world_id: WorldId,
     bindings: &WrapperBindings,
     interface_qualified_name: &str,
@@ -62,7 +64,7 @@ pub fn build_ir(
                 continue;
             }
         }
-        let path = module_path_for_interface(resolve, id, is_export).with_context(|| {
+        let path = module_path_for_interface(&resolve, id, is_export).with_context(|| {
             let side = if is_export { "exported" } else { "imported" };
             format!("could not derive module path for {side} interface")
         })?;
@@ -82,16 +84,17 @@ pub fn build_ir(
 
     // Dedup resources by their IDs.
     let mut seen_resource_ids: HashSet<TypeId> = HashSet::new();
+    // Track alias entries separately to avoid duplicating them across
+    // multiple interface iterations (e.g. wasi:http/types.{headers} appears
+    // in both the T' export interface and the import-side interface).
+    let mut seen_alias_keys: HashSet<(Vec<String>, String)> = HashSet::new();
     for entry in &ifaces {
         let iface = &resolve.interfaces[entry.id];
         for (wit_name, type_id) in &iface.types {
             // Follow `Type(_)` aliases to find the original declaration.
-            let resolved_id = resolve_type_alias(resolve, *type_id);
+            let resolved_id = resolve_type_alias(&resolve, *type_id);
             let td = &resolve.types[resolved_id];
             if matches!(td.kind, TypeDefKind::Resource) {
-                if !seen_resource_ids.insert(resolved_id) {
-                    continue;
-                }
                 // Anchor on the *declaring* iface's path (via `TypeOwner`).
                 let (declaring_path, is_owned) = match td.owner {
                     TypeOwner::Interface(declaring_id) => {
@@ -104,16 +107,47 @@ pub fn build_ir(
                     }
                     _ => (entry.path.clone(), entry.is_export),
                 };
-                let rust_ident_str = wit_name.to_upper_camel_case();
+                let canonical_name = td.name.as_deref().unwrap_or(wit_name.as_str());
+
+                // When a resource is accessed through a USE alias with a
+                // different local name (e.g. `headers` aliasing `fields`),
+                // wit-bindgen uses the alias name PascalCase in generated Rust.
+                // Add an extra entry so AbsolutizeResources can resolve it.
+                // Bridge interface aliases (raw-bucket, wrapped-bucket, etc.) are
+                // synthetic re-exports handled by fixed wrap/unwrap bodies, not
+                // by strategy dispatch, so skip them here.
+                if wit_name.as_str() != canonical_name && !is_bridge_iface(&resolve, entry.id) {
+                    let alias_key = (declaring_path.clone(), wit_name.to_string());
+                    if seen_alias_keys.insert(alias_key) {
+                        let alias_rust = wit_name.to_upper_camel_case();
+                        resources.push(ResourceInfo {
+                            iface_path: declaring_path.clone(),
+                            wit_name: wit_name.to_string(),
+                            rust_ident: syn::Ident::new(&alias_rust, Span::call_site()),
+                            type_id: resolved_id,
+                            is_owned,
+                            inner_type_path: None,
+                        });
+                    }
+                }
+
+                if !seen_resource_ids.insert(resolved_id) {
+                    continue;
+                }
+
+                // Keep T' matching stable by using canonical typedef name.
+                let rust_ident_str = canonical_name.to_upper_camel_case();
                 resources.push(ResourceInfo {
                     iface_path: declaring_path,
-                    wit_name: wit_name.clone(),
+                    wit_name: canonical_name.to_string(),
                     rust_ident: syn::Ident::new(&rust_ident_str, Span::call_site()),
+                    type_id: resolved_id,
                     is_owned,
+                    inner_type_path: None,
                 });
                 continue;
             }
-            let nt = build_named_type(resolve, &ifaces, *type_id, wit_name, &entry.path, bindings)?;
+            let nt = build_named_type(&resolve, &ifaces, *type_id, wit_name, &entry.path, bindings)?;
             if let Some(nt) = nt {
                 let key = (
                     match &nt.location {
@@ -129,11 +163,47 @@ pub fn build_ir(
         }
     }
 
+    // T' mode: patch owned resources with their import-side path so the
+    // WrapperR newtype holds the correct raw type.
+    let t_prime = is_t_prime_world(&resolve, world_id);
+    if t_prime {
+        let import_side: Vec<_> = resources
+            .iter()
+            .filter(|r| !r.is_owned)
+            .map(|r| {
+                (
+                    r.wit_name.clone(),
+                    r.iface_path.clone(),
+                    r.rust_ident.clone(),
+                )
+            })
+            .collect();
+        for owned in resources.iter_mut().filter(|r| r.is_owned) {
+            if let Some((_, raw_path, _)) = import_side
+                .iter()
+                .find(|(name, _, _)| name == &owned.wit_name)
+            {
+                owned.inner_type_path = Some(raw_path.clone());
+            }
+        }
+    }
+
     // Synthesize one args record per exported function.
     let mut args_records: Vec<NamedType> = Vec::new();
-    let mut fn_sigs: std::collections::HashMap<String, ExportFnSig> =
-        std::collections::HashMap::new();
+    let mut fn_sigs: HashMap<String, ExportFnSig> = HashMap::new();
+    let mut fn_funcs: HashMap<String, Function> = HashMap::new();
     for entry in ifaces.iter().filter(|e| e.is_export) {
+        // Bridge interface uses fixed wrap/unwrap bodies, not strategy
+        // dispatch. Skip args-record synthesis for it.
+        if t_prime && is_bridge_iface(&resolve, entry.id) {
+            continue;
+        }
+        // Original-target interface (added as an extra export for WAC routing)
+        // gets a delegation impl, not strategy dispatch. Skipping here prevents
+        // args-struct name collisions with the T' interface's records.
+        if t_prime && !is_t_prime_iface(&resolve, entry.id) {
+            continue;
+        }
         let iface = &resolve.interfaces[entry.id];
         let iface_pascal = iface
             .name
@@ -141,28 +211,70 @@ pub fn build_ir(
             .ok_or_else(|| anyhow!("exported interface has no name"))?
             .to_upper_camel_case();
         for (fn_name, func) in &iface.functions {
-            let prefix = match &func.kind {
-                FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {
-                    iface_pascal.clone()
-                }
-                FunctionKind::Method(id)
-                | FunctionKind::AsyncMethod(id)
-                | FunctionKind::Static(id)
-                | FunctionKind::AsyncStatic(id)
-                | FunctionKind::Constructor(id) => resource_pascal(resolve, *id)?,
+            let prefix = match func.kind.resource() {
+                Some(id) => resource_pascal(&resolve, id)?,
+                None => iface_pascal.clone(),
             };
             // Pin the wit-bindgen-emitted name as the args-ident source.
             let rust_method_name = rust_method_name_for(func, fn_name);
-            let args = synth_args_record(resolve, &prefix, &rust_method_name, func, &ifaces)?;
+            let args = synth_args_record(&resolve, &prefix, &rust_method_name, func, &ifaces)?;
             let args_ident = args_struct_ident(&prefix, &rust_method_name);
             let return_ty = func
                 .result
                 .as_ref()
-                .map(|t| type_to_ref(resolve, &ifaces, t))
+                .map(|t| type_to_ref(&resolve, &ifaces, t))
                 .transpose()?;
             let kind = ExportFnKind::from(&func.kind);
-            fn_sigs.insert(args_ident.to_string(), ExportFnSig { return_ty, kind });
+            let is_async = func.kind.is_async();
+            fn_sigs.insert(args_ident.to_string(), ExportFnSig { return_ty, kind, is_async });
+            fn_funcs.insert(args_ident.to_string(), func.clone());
             args_records.push(args);
+        }
+    }
+
+    // T' mode: build delegation sigs from original (non-T') exported interfaces.
+    // These give emit_delegation_guest_impl the param/return types it needs without
+    // parsing the generated Rust bindings.
+    let mut delegation_sigs: HashMap<String, DelegationSig> = HashMap::new();
+    if t_prime {
+        for entry in ifaces.iter().filter(|e| e.is_export) {
+            if is_t_prime_iface(&resolve, entry.id) || is_bridge_iface(&resolve, entry.id) {
+                continue;
+            }
+            let iface = &resolve.interfaces[entry.id];
+            let iface_pascal = iface
+                .name
+                .as_ref()
+                .ok_or_else(|| anyhow!("exported interface has no name"))?
+                .to_upper_camel_case();
+            for (fn_name, func) in &iface.functions {
+                // emit_delegation_guest_impl only handles interface-level (freestanding) fns.
+                if !matches!(
+                    func.kind,
+                    FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
+                ) {
+                    continue;
+                }
+                let rust_method_name = rust_method_name_for(func, fn_name);
+                let args_ident_str =
+                    args_struct_ident(&iface_pascal, &rust_method_name).to_string();
+                let params = func
+                    .params
+                    .iter()
+                    .map(|param| {
+                        let ident = mirror_field_ident(&param.name);
+                        let ty = type_to_ref(&resolve, &ifaces, &param.ty)?;
+                        Ok((ident, ty))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let return_ty = func
+                    .result
+                    .as_ref()
+                    .map(|t| type_to_ref(&resolve, &ifaces, t))
+                    .transpose()?;
+                let is_async = func.kind.is_async();
+                delegation_sigs.insert(args_ident_str, DelegationSig { params, return_ty, is_async });
+            }
         }
     }
 
@@ -183,13 +295,81 @@ pub fn build_ir(
             }
         });
 
+    let bridge_resources = if t_prime {
+        let bridge_path = ifaces
+            .iter()
+            .find(|e| e.is_export && is_bridge_iface(&resolve, e.id))
+            .map(|e| module_path_for_interface(&resolve, e.id, true))
+            .transpose()?
+            .ok_or_else(|| anyhow!("T' world exports no bridge interface"))?;
+        build_bridge_resources(&resources, bridge_path)
+    } else {
+        Vec::new()
+    };
+
     Ok(WrapperIR {
+        resolve,
+        world_id,
         types,
         resources,
         args_records,
         fn_sigs,
+        fn_funcs,
+        delegation_sigs,
         target_import_path,
+        bridge_resources,
     })
+}
+
+// ── T' helpers ──────────────────────────────────────────────────────────
+
+fn is_t_prime_iface(resolve: &Resolve, id: InterfaceId) -> bool {
+    let Some(pkg_id) = resolve.interfaces[id].package else {
+        return false;
+    };
+    let pkg = &resolve.packages[pkg_id];
+    pkg.name.namespace == WRAPPER_PKG_NS && pkg.name.name == WRAPPER_PKG_NAME
+}
+
+fn is_bridge_iface(resolve: &Resolve, id: InterfaceId) -> bool {
+    let iface = &resolve.interfaces[id];
+    if iface.name.as_deref() != Some(BRIDGE_IFACE) {
+        return false;
+    }
+    let Some(pkg_id) = iface.package else {
+        return false;
+    };
+    let pkg = &resolve.packages[pkg_id];
+    pkg.name.namespace == WRAPPER_PKG_NS && pkg.name.name == WRAPPER_PKG_NAME
+}
+
+fn is_t_prime_world(resolve: &Resolve, world_id: WorldId) -> bool {
+    resolve.worlds[world_id].exports.values().any(|item| {
+        let WorldItem::Interface { id, .. } = item else {
+            return false;
+        };
+        is_bridge_iface(resolve, *id)
+    })
+}
+
+fn build_bridge_resources(
+    resources: &[ResourceInfo],
+    bridge_module_path: Vec<String>,
+) -> Vec<BridgeResourceInfo> {
+    resources
+        .iter()
+        .filter(|r| r.is_owned)
+        .filter_map(|owned| {
+            let raw = resources
+                .iter()
+                .find(|r| !r.is_owned && r.wit_name == owned.wit_name)?;
+            Some(BridgeResourceInfo::new(
+                owned,
+                raw,
+                bridge_module_path.clone(),
+            ))
+        })
+        .collect()
 }
 
 fn resource_pascal(resolve: &Resolve, type_id: TypeId) -> Result<String> {
@@ -220,6 +400,10 @@ fn rust_method_name_for(func: &Function, fallback_name: &str) -> String {
 
 /// The complete IR for one wrapper crate.
 pub struct WrapperIR {
+    /// The wit-parser resolution for the wrapper world.
+    pub resolve: Resolve,
+    /// World that was resolved.
+    pub world_id: WorldId,
     /// User-declared WIT types reachable from the world.
     pub types: Vec<NamedType>,
     /// WIT resources declared in exported interfaces.
@@ -229,15 +413,32 @@ pub struct WrapperIR {
     pub args_records: Vec<NamedType>,
     /// Per-fn return type + WIT kind, keyed by the synth args struct
     /// ident's string form.
-    pub fn_sigs: std::collections::HashMap<String, ExportFnSig>,
+    pub fn_sigs: HashMap<String, ExportFnSig>,
+    /// synth args ident -> original wit-parser func
+    pub fn_funcs: HashMap<String, Function>,
+    /// (T' mode only) synth args ident -> delegation method signatures
+    pub delegation_sigs: HashMap<String, DelegationSig>,
     /// Bindings path of the wrapped target on the wrapper's *import*
     /// side. `None` in tier-4 virtualize (no downstream import).
     pub target_import_path: Option<BindingsPath>,
+    /// One entry per resource covered by the bridge interface.
+    pub bridge_resources: Vec<BridgeResourceInfo>,
 }
 
 pub struct ExportFnSig {
     pub return_ty: Option<WitTypeRef>,
     pub kind: ExportFnKind,
+    pub is_async: bool,
+}
+
+/// Delegation method signature derived from WIT for one freestanding function
+/// in the original (non-T') exported interface. Used by emit_delegation_guest_impl
+/// to build method bodies without parsing the generated Rust bindings.
+pub struct DelegationSig {
+    /// (snake_case ident, WIT type) for each explicit param (self excluded).
+    pub params: Vec<(syn::Ident, WitTypeRef)>,
+    pub return_ty: Option<WitTypeRef>,
+    pub is_async: bool,
 }
 
 /// wit-parser's `FunctionKind` collapsed to what the emitter actually
@@ -269,11 +470,50 @@ pub struct ResourceInfo {
     pub wit_name: String,
     /// PascalCase Rust ident wit-bindgen emits for the resource type.
     pub rust_ident: syn::Ident,
+    /// canonical wit-parser id
+    pub type_id: TypeId,
     /// True iff the wrapper EXPORTS the iface that declares this
     /// resource (the wrapper is the canonical type owner and emits
     /// a `WrapperR` newtype + `GuestR` impl). False for resources
     /// the wrapper only consumes from an imported iface.
     pub is_owned: bool,
+    /// T' mode only: bindings path of the raw (import-side) resource
+    /// held inside `WrapperR`
+    pub inner_type_path: Option<BindingsPath>,
+}
+
+/// Describes one resource pair covered by the T' bridge interface.
+pub struct BridgeResourceInfo {
+    pub raw_resource_path: BindingsPath,
+    pub raw_resource_ident: syn::Ident,
+    pub export_resource_path: BindingsPath,
+    pub export_resource_ident: syn::Ident,
+    /// `Wrapper<Pascal>` newtype ident, e.g. `WrapperBucket`.
+    pub wrapper_ident: syn::Ident,
+    /// Module path of the bridge Guest trait in the generated bindings.
+    pub bridge_module_path: BindingsPath,
+    /// Kebab-case WIT resource name (e.g. `"bucket"`), used to
+    /// derive per-resource bridge function names.
+    pub wit_name: String,
+}
+
+impl BridgeResourceInfo {
+    fn new(owned: &ResourceInfo, raw: &ResourceInfo, bridge_module_path: BindingsPath) -> Self {
+        BridgeResourceInfo {
+            raw_resource_path: raw.iface_path.clone(),
+            raw_resource_ident: raw.rust_ident.clone(),
+            export_resource_path: owned.iface_path.clone(),
+            export_resource_ident: owned.rust_ident.clone(),
+            wrapper_ident: wrapper_ident_for(&owned.rust_ident),
+            bridge_module_path,
+            wit_name: owned.wit_name.clone(),
+        }
+    }
+}
+
+/// Derive resource's wrapper name.
+pub(crate) fn wrapper_ident_for(resource_pascal: &syn::Ident) -> syn::Ident {
+    syn::Ident::new(&format!("Wrapper{resource_pascal}"), Span::call_site())
 }
 
 /// A named entity that gets a `WitTyped` impl: either a WIT-declared
@@ -359,11 +599,10 @@ pub enum WitTypeRef {
 /// Categorizes the four canonical-ABI handle kinds.
 pub enum HandleRef {
     ErrorContext,
-    /// Future and stream not supported yet
-    #[allow(dead_code)]
-    Future(Box<WitTypeRef>),
-    #[allow(dead_code)]
-    Stream(Box<WitTypeRef>),
+    /// `future<T>` (None inner = unit payload `future<_>`).
+    Future(Option<Box<WitTypeRef>>),
+    /// `stream<T>` (None inner = unit element `stream<_>`).
+    Stream(Option<Box<WitTypeRef>>),
     ResourceOwn(NamedRef),
     ResourceBorrow(NamedRef),
 }
@@ -372,6 +611,14 @@ impl HandleRef {
     fn to_tokens(&self) -> TokenStream {
         match self {
             HandleRef::ErrorContext => quote!(::wit_bindgen::rt::async_support::ErrorContext),
+            HandleRef::Future(inner) => {
+                let t = inner.as_deref().map(WitTypeRef::to_tokens).unwrap_or_else(|| quote!(()));
+                quote!(::wit_bindgen::rt::async_support::FutureReader<#t>)
+            }
+            HandleRef::Stream(inner) => {
+                let t = inner.as_deref().map(WitTypeRef::to_tokens).unwrap_or_else(|| quote!(()));
+                quote!(::wit_bindgen::rt::async_support::StreamReader<#t>)
+            }
             // `own<R>` lowers to the bare resource type
             // (`bindings::iface::Bucket`).
             HandleRef::ResourceOwn(nr) => bindings_path_tokens(&nr.path, Some(&nr.rust_ident)),
@@ -383,9 +630,6 @@ impl HandleRef {
                 let path = bindings_path_tokens(&nr.path, Some(&borrow_ident));
                 let lt = syn::Lifetime::new("'a", Span::call_site());
                 quote!(#path<#lt>)
-            }
-            HandleRef::Future(_) | HandleRef::Stream(_) => {
-                unreachable!("future/stream handle kind not yet supported")
             }
         }
     }
@@ -448,16 +692,6 @@ impl WitTypeRef {
             }
             WitTypeRef::Tuple(elems) => elems.iter().any(|t| t.contains_handle()),
         }
-    }
-
-    /// True when wit-bindgen lowers this type to a borrowed reference at
-    /// import-call sites.
-    pub fn needs_borrow_at_import_call(&self, is_async: bool) -> bool {
-        !is_async
-            && matches!(
-                self,
-                WitTypeRef::List(_) | WitTypeRef::Primitive(Prim::String)
-            )
     }
 
     /// True if this type tree contains a `borrow<R>` handle at any depth.
@@ -746,18 +980,34 @@ fn type_to_ref(resolve: &Resolve, ifaces: &[IfaceEntry], ty: &Type) -> Result<Wi
                     WitTypeRef::Named(NamedRef { path, rust_ident })
                 }
                 TypeDefKind::Handle(Handle::Own(rid)) => {
-                    let (path, rust_ident) = named_ref_for(resolve, ifaces, *rid)?;
+                    // Follow USE aliases to the canonical declaring interface; the alias's
+                    // owner is the importer, not the declarer, which would break iface_path
+                    // matching in contains_owned_resource / AbsolutizeResources.
+                    let canonical = resolve_type_alias(resolve, *rid);
+                    let (path, rust_ident) = named_ref_for(resolve, ifaces, canonical)?;
                     WitTypeRef::Handle(HandleRef::ResourceOwn(NamedRef { path, rust_ident }))
                 }
                 TypeDefKind::Handle(Handle::Borrow(rid)) => {
-                    let (path, rust_ident) = named_ref_for(resolve, ifaces, *rid)?;
+                    let canonical = resolve_type_alias(resolve, *rid);
+                    let (path, rust_ident) = named_ref_for(resolve, ifaces, canonical)?;
                     WitTypeRef::Handle(HandleRef::ResourceBorrow(NamedRef { path, rust_ident }))
                 }
                 TypeDefKind::Resource => {
                     bail!("bare resource type reference outside Handle wrapper not supported")
                 }
-                TypeDefKind::Future(_) | TypeDefKind::Stream(_) => {
-                    bail!("future/stream in field position not supported")
+                TypeDefKind::Future(inner) => {
+                    let inner_ref = inner
+                        .as_ref()
+                        .map(|t| type_to_ref(resolve, ifaces, t).map(Box::new))
+                        .transpose()?;
+                    WitTypeRef::Handle(HandleRef::Future(inner_ref))
+                }
+                TypeDefKind::Stream(inner) => {
+                    let inner_ref = inner
+                        .as_ref()
+                        .map(|t| type_to_ref(resolve, ifaces, t).map(Box::new))
+                        .transpose()?;
+                    WitTypeRef::Handle(HandleRef::Stream(inner_ref))
                 }
                 TypeDefKind::Map(..) | TypeDefKind::FixedLengthList(..) => {
                     bail!("{} in field position not supported", td.kind.as_str())
@@ -829,7 +1079,7 @@ pub(super) fn module_path_for_interface(
     let pkg = &resolve.packages[pkg_id];
     let mut path = Vec::new();
     if is_export {
-        path.push("exports".to_string());
+        path.push(EXPORTS_PREFIX.to_string());
     }
     path.push(pkg.name.namespace.to_snake_case());
     path.push(pkg.name.name.to_snake_case());
@@ -942,7 +1192,7 @@ mod tests {
     fn build(wit: &str, world: &str) -> WrapperIR {
         let (resolve, world_id, src) = run_wit_bindgen_rust(wit, Some(world)).unwrap();
         let bindings = build_bindings_index(&src).unwrap();
-        build_ir(&resolve, world_id, &bindings, "").unwrap()
+        build_ir(resolve, world_id, &bindings, "").unwrap()
     }
 
     #[test]

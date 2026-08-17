@@ -57,6 +57,13 @@ pub struct WrapperCrateInputs<'a> {
     pub strategy_crate_name: &'a str,
     /// The PascalCase Rust ident of the strategy type to instantiate.
     pub strategy_type: &'a str,
+    /// T' mode only: fixed `impl bridge::Guest for Wrapper` block with
+    /// hard-wired `wrap`/`unwrap` bodies (no strategy dispatch).
+    pub bridge_impl: Option<&'a TokenStream>,
+    /// T' mode only: delegation `impl original_iface::Guest for Wrapper` that
+    /// wraps incoming raw resource handles into T' types via the bridge,
+    /// calls the T' Guest impl, and unwraps results back to raw types.
+    pub delegation_impl: Option<&'a TokenStream>,
 }
 
 /// Assemble a complete `lib.rs` source string for the wrapper crate.
@@ -90,6 +97,8 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         .flat_map(|g| g.args_structs.iter())
         .collect();
     let guest_impls: Vec<&TokenStream> = inputs.guests.iter().map(|g| &g.guest_impl).collect();
+    let bridge_impl = inputs.bridge_impl;
+    let delegation_impl = inputs.delegation_impl;
 
     let assembled = quote! {
         // wit-bindgen output, inlined verbatim under `mod bindings`.
@@ -126,6 +135,8 @@ pub fn assemble_lib_rs(inputs: &WrapperCrateInputs<'_>) -> Result<String> {
         struct Wrapper;
 
         #(#guest_impls)*
+        #bridge_impl
+        #delegation_impl
 
         bindings::export!(Wrapper with_types_in bindings);
     };
@@ -245,7 +256,7 @@ mod tests {
     fn assemble_for_wit(wit: &str, behavior: Behavior) -> String {
         let (resolve, world_id, bindings_src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
         let bindings = build_bindings_index(&bindings_src).unwrap();
-        let ir = build_ir(&resolve, world_id, &bindings, INTERFACE_QN).unwrap();
+        let ir = build_ir(resolve, world_id, &bindings, INTERFACE_QN).unwrap();
         let user_impls = emit_wit_typed_impls(&ir.types);
         let args_impls = emit_wit_typed_impls(&ir.args_records);
         let witty_impls: Vec<_> = user_impls.into_iter().chain(args_impls).collect();
@@ -263,6 +274,8 @@ mod tests {
             behavior,
             strategy_crate_name: "my-strategy",
             strategy_type: "MyStrategy",
+            bridge_impl: None,
+            delegation_impl: None,
         };
         assemble_lib_rs(&inputs).expect("assembly succeeds")
     }

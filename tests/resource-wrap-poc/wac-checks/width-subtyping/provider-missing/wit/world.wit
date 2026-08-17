@@ -1,0 +1,14 @@
+package test:shared;
+
+interface store {
+  resource bucket {
+    constructor(name: string);
+    get: func(k: string) -> option<string>;
+    // NOTE: `set` removed -- consumer needs it
+    tag: func() -> u32;
+  }
+}
+
+world provider {
+  export store;
+}

@@ -73,6 +73,13 @@ impl MockedResource {
 /// bridge picks up where the wave bridge stops.
 pub trait WitTypedWithResources: Sized {
     fn from_cells(tree: &FieldTree, root: u32) -> Result<Self, BridgeError>;
+
+    /// Rebuild `Vec<Self>` from a [`Cell::Bytes`] (the `list<u8>` fast path).
+    /// `None` for every type but `u8`, so `Cell::Bytes` under any other
+    /// `Vec<T>` stays rejected.
+    fn vec_from_bytes(_bytes: &[u8]) -> Option<Vec<Self>> {
+        None
+    }
 }
 
 /// Convenience over `T::from_cells`.
@@ -179,7 +186,18 @@ macro_rules! impl_via_wave {
     )*};
 }
 
-impl_via_wave!(bool, u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, char, String);
+impl_via_wave!(bool, u16, u32, u64, i8, i16, i32, i64, f32, f64, char, String);
+
+// `u8` also overrides `vec_from_bytes` so `Vec<u8>` decodes the `Cell::Bytes`
+// fast path; otherwise identical to the `impl_via_wave!` shape.
+impl WitTypedWithResources for u8 {
+    fn from_cells(tree: &FieldTree, root: u32) -> Result<Self, BridgeError> {
+        cells_to_typed::<u8>(tree, root)
+    }
+    fn vec_from_bytes(bytes: &[u8]) -> Option<Vec<Self>> {
+        Some(bytes.to_vec())
+    }
+}
 
 // ---- compound impls ---------------------------------------------------
 //
@@ -204,11 +222,10 @@ impl<T: WitTypedWithResources> WitTypedWithResources for Vec<T> {
                 .iter()
                 .map(|c| T::from_cells(tree, *c))
                 .collect(),
-            // `Cell::Bytes` is the fast path for `list<u8>` and never
-            // carries resource handles. Callers with a value-typed
-            // `list<u8>` should use `cells_to_typed` instead.
-            Cell::Bytes(_) => Err(BridgeError::Unsupported(
-                "Cell::Bytes fastpath in WitTypedWithResources",
+            // `list<u8>` records as a single `Cell::Bytes`; only `Vec<u8>`
+            // can rebuild from it (every other element type returns `None`).
+            Cell::Bytes(b) => T::vec_from_bytes(b).ok_or(BridgeError::Unsupported(
+                "Cell::Bytes fastpath is only valid for Vec<u8>",
             )),
             _ => Err(BridgeError::Unsupported(
                 "expected Cell::ListOf for Vec<T>",
@@ -712,13 +729,19 @@ mod tests {
     }
 
     #[test]
-    fn bytes_cell_in_vec_is_explicitly_unsupported() {
-        // Documenting the intentional limitation: Cell::Bytes shows
-        // up only for value-typed `list<u8>`; callers should reach
-        // for `cells_to_typed::<Vec<u8>>` instead, which DOES handle
-        // the fastpath.
+    fn bytes_cell_decodes_into_vec_u8() {
+        // `list<u8>` records as a single `Cell::Bytes`; `Vec<u8>` rebuilds
+        // from it via the `vec_from_bytes` fast path.
         let t = empty_tree(vec![Cell::Bytes(vec![1, 2, 3])], 0);
-        let r: Result<Vec<u8>, _> = WitTypedWithResources::from_cells(&t, 0);
+        let v: Vec<u8> = WitTypedWithResources::from_cells(&t, 0).unwrap();
+        assert_eq!(v, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn bytes_cell_rejected_for_non_u8_vec() {
+        // The fast path is `u8`-only; any other element type still rejects it.
+        let t = empty_tree(vec![Cell::Bytes(vec![1, 2, 3])], 0);
+        let r: Result<Vec<u32>, _> = WitTypedWithResources::from_cells(&t, 0);
         assert!(matches!(r, Err(BridgeError::Unsupported(_))));
     }
 }

@@ -305,13 +305,7 @@ fn funcs(ty: &InterfaceType) -> impl Iterator<Item = (&str, &FuncSignature)> {
 fn matches_scope(name: &str, scope: FuncScope) -> bool {
     match scope {
         FuncScope::Interface => !name.starts_with('['),
-        FuncScope::Resource => todo!(
-            "scope: resource — splicer's adapter codegen doesn't yet \
-             handle resource constructor/method/static surfaces. \
-             Implement here (`name.starts_with('[')`) and extend the \
-             wrapper-component logic in `src/adapter/abi/emit.rs` to \
-             carry resource handles across the wrap."
-        ),
+        FuncScope::Resource => name.starts_with('['),
     }
 }
 
@@ -938,17 +932,32 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "scope: resource")]
-    fn scope_resource_is_a_todo_for_now() {
-        // `scope: resource` is the forward-compat seam: splicer's
-        // adapter codegen can't yet wrap resource surfaces, so
-        // `matches_scope` for `FuncScope::Resource` panics with a
-        // pointer to the implementation site. Replace this test (and
-        // lift the `todo!()`) when resource-surface codegen lands.
+    fn scope_resource_matches_bracket_prefixed_names() {
+        assert!(matches_scope("[method]bucket.get", FuncScope::Resource));
+        assert!(matches_scope("[constructor]bucket", FuncScope::Resource));
+        assert!(matches_scope("[static]bucket.info", FuncScope::Resource));
+        assert!(!matches_scope("open", FuncScope::Resource));
+        assert!(!matches_scope("close", FuncScope::Resource));
+        // `scope: resource` selects resource surfaces end-to-end.
         let pred = FuncPred::new(None, vec![FuncScope::Resource], vec![], vec![]);
-        let _ = select_with_pred(pred, |a| {
+        let sites = select_with_pred(pred, |a| {
             instance(vec![(RES_CTOR, func(a, false, vec![], vec![]))])
-        });
+        })
+        .expect("decidable");
+        assert_eq!(sites.len(), 1, "resource-only interface must match scope: resource");
+    }
+
+    #[test]
+    fn scope_resource_rejects_free_function_interface() {
+        let pred = FuncPred::new(None, vec![FuncScope::Resource], vec![], vec![]);
+        let sites = select_with_pred(pred, |a| {
+            instance(vec![("open", func(a, false, vec![], vec![]))])
+        })
+        .expect("decidable");
+        assert!(
+            sites.is_empty(),
+            "free-function interface must be rejected by scope: resource"
+        );
     }
 
     // ── suggest_interfaces ───────────────────────────────────────────

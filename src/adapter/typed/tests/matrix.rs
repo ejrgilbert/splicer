@@ -453,12 +453,10 @@ fn matrix_resource_pass_through() {
 fn matrix_resource_virtualize() {
     // Tier-4 (Virtualize) over a resource-bearing interface: the
     // wrapper newtype's inner field is `MockedResource` (no import
-    // side exists), per-resource async methods dispatch via
-    // `VirtualizeStrategy`, the sync constructor synthesizes a
-    // stand-in `MockedResource` (no strategy dispatch, since
-    // constructors are sync per the WIT spec), and the codegen emits
-    // a `WitTypedWithResources` impl that decodes a recorded
-    // `Cell::ResourceHandle` into the wrapper newtype.
+    // side exists), all methods (including sync constructors) dispatch
+    // via `SyncVirtualizeStrategy` or `VirtualizeStrategy`, and the
+    // codegen emits a `WitTypedWithResources` impl that decodes a
+    // recorded `Cell::ResourceHandle` into the wrapper newtype.
     //
     // Exercises the four return shapes a tier-4 strategy may
     // synthesize: bare `bucket`, `option<bucket>`, `result<bucket, _>`,
@@ -523,11 +521,14 @@ fn matrix_resource_virtualize() {
         out.lib_rs,
     );
 
-    // The sync constructor goes through the SDK macro that owns the
-    // counter + Cow shape. Codegen just emits the invocation.
+    assert!(
+        oneline.contains("SyncVirtualizeStrategy"),
+        "expected sync constructor to dispatch via SyncVirtualizeStrategy:\n{}",
+        out.lib_rs,
+    );
     assert!(
         oneline.contains("mint_mock_resource!(WrapperBucket, \"bucket\")"),
-        "expected sync constructor to delegate to mint_mock_resource! macro:\n{}",
+        "expected mint_mock_resource! in WrapperBucket Default impl:\n{}",
         out.lib_rs,
     );
 
@@ -765,8 +766,13 @@ fn matrix_zero_arg_constructor_tier4() {
         out.lib_rs,
     );
     assert!(
+        oneline.contains("SyncVirtualizeStrategy"),
+        "expected tier-4 constructor to dispatch via SyncVirtualizeStrategy:\n{}",
+        out.lib_rs,
+    );
+    assert!(
         oneline.contains("mint_mock_resource!(WrapperBucket, \"bucket\")"),
-        "expected tier-4 mint_mock_resource invocation in constructor:\n{}",
+        "expected mint_mock_resource! in WrapperBucket Default impl:\n{}",
         out.lib_rs,
     );
 }
@@ -983,8 +989,9 @@ fn matrix_resource_method_returns_resource() {
 
 #[test]
 fn matrix_resource_static_factory_returns_resource() {
-    // `[static] bucket.anonymous -> bucket`: wrap fires from the
-    // static-method body too, not just methods.
+    // `[static] bucket.anonymous -> bucket`: wit-bindgen generates `-> Bucket` (not `-> Self`)
+    // for statics, so the wrap path emits WrapperBucket(import_call) as the closure forward
+    // and Bucket::new(intermediate) as the reverse.
     let out = generate_for_wit(
         r#"
             package matrix:res-stat@0.1.0;
@@ -1017,9 +1024,154 @@ fn matrix_resource_static_factory_returns_resource() {
         "expected static closure body to wrap import-side factory call:\n{}",
         out.lib_rs,
     );
+    // wit-bindgen generates `-> Bucket` (not `-> Self`) for statics, so the reverse_expr
+    // Bucket::new(intermediate) IS required to convert WrapperBucket -> Bucket.
     assert!(
-        oneline.contains("bindings::exports::matrix::res_stat::store::Bucket::new(intermediate)"),
-        "expected final wrap to call Bucket::new(intermediate):\n{}",
+        oneline.contains("Bucket::new(intermediate)"),
+        "static factory returning own<R> must emit reverse_expr Bucket::new wrap:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_resource_sync_static_factory_returns_resource() {
+    // `[static] bucket.create -> bucket` (sync): wit-bindgen generates `-> Bucket` (not `-> Self`)
+    // for statics; closure wraps import result into WrapperBucket, reverse emits Bucket::new.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-sync-stat@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    create: static func() -> bucket;
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-sync-stat/store@0.1.0",
+        "bindings::matrix::res_sync_stat::store::Bucket::create",
+        Behavior::Transform,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("SyncTransformStrategy< BucketCreateArgs, WrapperBucket")
+            || oneline.contains("SyncTransformStrategy<BucketCreateArgs, WrapperBucket"),
+        "expected sync static to use SyncTransformStrategy<_, WrapperBucket>:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        oneline.contains("WrapperBucket(")
+            && oneline.contains("bindings::matrix::res_sync_stat::store::Bucket::create()"),
+        "expected sync static closure to wrap import-side call into WrapperBucket:\n{}",
+        out.lib_rs,
+    );
+    // wit-bindgen generates `-> Bucket` for statics, so reverse_expr Bucket::new(intermediate)
+    // IS required to convert WrapperBucket -> Bucket.
+    assert!(
+        oneline.contains("Bucket::new(intermediate)"),
+        "sync static factory returning own<R> must emit reverse_expr Bucket::new wrap:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_tier4_static_async_factory_returns_resource() {
+    // Async tier-4 static returning own<R>: VirtualizeStrategy dispatch, works because
+    // WrapperBucket implements Default (via mint_mock_resource! in its Default impl).
+    // wit-bindgen generates `-> Bucket` for statics, so Bucket::new(intermediate) wraps
+    // the strategy's WrapperBucket result.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-virt-async-stat@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    anonymous: static async func() -> bucket;
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-virt-async-stat/store@0.1.0",
+        "bindings::matrix::res_virt_async_stat::store::Bucket::anonymous",
+        Behavior::Virtualize,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("VirtualizeStrategy< BucketAnonymousArgs, WrapperBucket")
+            || oneline.contains("VirtualizeStrategy<BucketAnonymousArgs, WrapperBucket"),
+        "expected async tier-4 static to use VirtualizeStrategy<_, WrapperBucket>:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("compile_error"),
+        "async tier-4 static must not emit compile_error:\n{}",
+        out.lib_rs,
+    );
+    // wit-bindgen generates `-> Bucket` for statics; reverse_expr IS required.
+    assert!(
+        oneline.contains("Bucket::new(intermediate)"),
+        "async tier-4 static returning own<R> must emit reverse_expr Bucket::new wrap:\n{}",
+        out.lib_rs,
+    );
+    // WrapperBucket has a Default impl backed by mint_mock_resource! so strategies
+    // that require R: Default compile without error.
+    assert!(
+        oneline.contains("impl ::core::default::Default for WrapperBucket")
+            || oneline.contains("impl :: core :: default :: Default for WrapperBucket"),
+        "WrapperBucket must have a Default impl in Virtualize mode:\n{}",
+        out.lib_rs,
+    );
+}
+
+#[test]
+fn matrix_tier4_static_sync_factory_returns_resource() {
+    // Sync tier-4 static returning own<R>: SyncVirtualizeStrategy dispatch, works because
+    // WrapperBucket implements Default (via mint_mock_resource! in its Default impl).
+    // wit-bindgen generates `-> Bucket` for statics, so Bucket::new(intermediate) wraps it.
+    let out = generate_for_wit(
+        r#"
+            package matrix:res-virt-sync-stat@0.1.0;
+            interface store {
+                resource bucket {
+                    constructor(name: string);
+                    create: static func() -> bucket;
+                }
+            }
+            world w { export store; }
+        "#,
+        "w",
+        "matrix:res-virt-sync-stat/store@0.1.0",
+        "bindings::matrix::res_virt_sync_stat::store::Bucket::create",
+        Behavior::Virtualize,
+    );
+    let oneline: String = out.lib_rs.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        oneline.contains("SyncVirtualizeStrategy< BucketCreateArgs, WrapperBucket")
+            || oneline.contains("SyncVirtualizeStrategy<BucketCreateArgs, WrapperBucket"),
+        "sync tier-4 static must dispatch through SyncVirtualizeStrategy<_, WrapperBucket>:\n{}",
+        out.lib_rs,
+    );
+    assert!(
+        !oneline.contains("compile_error"),
+        "sync tier-4 static must not emit compile_error:\n{}",
+        out.lib_rs,
+    );
+    // Reverse-expr wraps the strategy-returned WrapperBucket into the export Bucket handle.
+    assert!(
+        oneline.contains("Bucket::new(intermediate)"),
+        "sync tier-4 static must emit reverse_expr Bucket::new wrap:\n{}",
+        out.lib_rs,
+    );
+    // WrapperBucket has a Default impl so SyncVirtualizeStrategy<_, WrapperBucket> compiles.
+    assert!(
+        oneline.contains("impl ::core::default::Default for WrapperBucket")
+            || oneline.contains("impl :: core :: default :: Default for WrapperBucket"),
+        "WrapperBucket must have a Default impl in Virtualize mode:\n{}",
         out.lib_rs,
     );
 }
@@ -1234,4 +1386,114 @@ fn matrix_multiple_exported_interfaces() {
     // Per-method args structs should be namespaced by interface.
     assert!(out.lib_rs.contains("OpsAPingArgs"));
     assert!(out.lib_rs.contains("OpsBPongArgs"));
+}
+
+// ── T' forwarding wrapper ────────────────────────────────────────────
+
+/// Producer WIT for the T' matrix test. Passed to `target_wit_for_codegen`
+/// to produce the T' WIT, which is then fed to `generate_wrapper_crate`.
+const T_PRIME_PRODUCER_WIT: &str = r#"
+    package test:kv@0.1.0;
+    interface store-types {
+      resource bucket {
+        constructor(name: string);
+        get: async func(k: string) -> option<string>;
+        set: async func(k: string, v: string);
+      }
+    }
+    interface store {
+      use store-types.{bucket};
+      open: async func(name: string) -> bucket;
+    }
+    world provider {
+      export store;
+      export store-types;
+    }
+"#;
+
+#[test]
+fn matrix_resource_t_prime_factored_transform() {
+    use super::super::target_wit::{target_wit_for_codegen, test_fixture::component_from_wit};
+    let component = component_from_wit(T_PRIME_PRODUCER_WIT, "provider")
+        .expect("synthesize T' producer component");
+    let target_wit = target_wit_for_codegen(&component, "test:kv/store@0.1.0", Behavior::Transform)
+        .expect("extract T' WIT");
+    assert!(
+        !target_wit.t_prime_redirects.is_empty(),
+        "expected T' mode for factored resource"
+    );
+
+    let out = generate_wrapper_crate(&GenerateWrapperInput {
+        target_wit: &target_wit.wit_text,
+        world_name: Some(&target_wit.world_name),
+        interface_qualified_name: "test:kv/store@0.1.0",
+        behavior: Behavior::Transform,
+        strategy_crate_name: "matrix-strategy",
+        strategy_crate_path: "/abs/path/to/matrix-strategy",
+        strategy_type: "MatrixStrategy",
+        splicer_tool_sdk_version: crate::test_consts::SDK_TEST_VERSION,
+    })
+    .expect("T' wrapper generation succeeds");
+
+    // WrapperBucket holds the import-side raw resource from store-types.
+    assert!(
+        out.lib_rs.contains("WrapperBucket")
+            && out
+                .lib_rs
+                .contains("bindings::test::kv::store_types::Bucket"),
+        "WrapperBucket must hold raw store-types::Bucket in T' mode:\n{}",
+        out.lib_rs
+    );
+
+    // Bridge Guest impl emitted with fixed wrap/unwrap bodies.
+    assert!(
+        out.lib_rs.contains("bridge::Guest for Wrapper"),
+        "bridge Guest impl must be emitted:\n{}",
+        out.lib_rs
+    );
+    assert!(
+        out.lib_rs.contains("fn wrap") && out.lib_rs.contains("fn unwrap"),
+        "bridge impl must contain wrap and unwrap:\n{}",
+        out.lib_rs
+    );
+    assert!(
+        out.lib_rs.contains("WrapperBucket(inner)"),
+        "wrap body must construct WrapperBucket(inner):\n{}",
+        out.lib_rs
+    );
+    assert!(
+        out.lib_rs.contains("into_inner::<WrapperBucket>()"),
+        "unwrap body must call into_inner::<WrapperBucket>():\n{}",
+        out.lib_rs
+    );
+
+    // Bridge Guest trait must NOT go through strategy dispatch.
+    // The bridge impl uses fixed bodies; only the freestanding `open` fn
+    // goes through the strategy. No args struct is synthesized for bridge.
+    assert!(
+        !out.lib_rs.contains("BridgeWrapArgs") && !out.lib_rs.contains("BridgeUnwrapArgs"),
+        "bridge Guest impl must use fixed bodies, not strategy dispatch:\n{}",
+        out.lib_rs
+    );
+
+    // Per-resource GuestBucket impl on WrapperBucket with forwarding methods.
+    assert!(
+        out.lib_rs.contains("GuestBucket for WrapperBucket"),
+        "per-resource GuestBucket forwarding impl on WrapperBucket must be emitted:\n{}",
+        out.lib_rs
+    );
+
+    // Freestanding function (open) uses TransformStrategy dispatch.
+    assert!(
+        out.lib_rs.contains("TransformStrategy"),
+        "T' wrapper must still use TransformStrategy for freestanding functions:\n{}",
+        out.lib_rs
+    );
+
+    // Constructor forwards to the raw bucket's new(), not T''s own new().
+    assert!(
+        out.lib_rs.contains("test::kv::store_types::Bucket::new"),
+        "constructor must call RawBucket::new, not T' store::Bucket::new:\n{}",
+        out.lib_rs
+    );
 }

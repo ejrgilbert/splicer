@@ -8,6 +8,7 @@ mod assemble;
 mod bindgen;
 mod bindings_index;
 mod build;
+mod emit_edge_shim;
 mod emit_method;
 mod emit_wit_typed;
 mod ir;
@@ -16,8 +17,12 @@ pub(crate) mod target_wit;
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
 pub use bindgen::{alias_shared_export_types, run_wit_bindgen_rust};
 pub use bindings_index::build_bindings_index;
-pub use build::{build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
-pub use emit_method::{emit_guest, emit_resource_newtypes, EmittedGuest};
+pub use build::{build_crate_source, build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
+pub use emit_edge_shim::generate_edge_shim_crate;
+pub use emit_method::{
+    emit_bridge_guest_impl, emit_delegation_guest_impl, emit_guest, emit_resource_newtypes,
+    EmittedGuest,
+};
 pub use emit_wit_typed::emit_wit_typed_impls;
 #[allow(unused_imports)]
 pub use ir::{build_ir, NamedKind, NamedType, WitTypeRef, WrapperIR};
@@ -54,26 +59,72 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     // on both sides) so the IR can classify types correctly.
     let bindings = build_bindings_index(&bindings_src)?;
     let ir = build_ir(
-        &resolve,
+        resolve,
         world_id,
         &bindings,
         input.interface_qualified_name,
     )?;
     // After indexing: replace export-side named-type definitions with type
     // aliases that point to the import-side definition to fix type identity.
-    let bindings_src = alias_shared_export_types(&bindings_src, &resolve, world_id)
+    let bindings_src = alias_shared_export_types(&bindings_src, &ir.resolve, ir.world_id)
         .context("post-processing wit-bindgen output for shared-interface type aliases")?;
     // User-declared types + per-method synthesized args records both
     // ride the same emitter via NamedKind dispatch.
     let user_impls = emit_wit_typed_impls(&ir.types);
     let args_impls = emit_wit_typed_impls(&ir.args_records);
     let witty_impls: Vec<_> = user_impls.into_iter().chain(args_impls).collect();
+    // T' mode detection: bridge resources are non-empty iff in T' mode.
+    let in_t_prime = !ir.bridge_resources.is_empty();
+    // T' package check: traits from splicer:wrapper are T' traits (strategy dispatch);
+    // others in T' mode are delegation exports (original target iface added for WAC routing).
+    let is_t_prime_trait = |g: &bindings_index::GuestTrait| {
+        g.module_path.get(1).map(String::as_str) == Some(target_wit::WRAPPER_PKG_NS)
+            && g.module_path.get(2).map(String::as_str) == Some(target_wit::WRAPPER_PKG_NAME)
+    };
+    let is_bridge = |g: &bindings_index::GuestTrait| {
+        g.module_path.last().map(String::as_str) == Some(target_wit::BRIDGE_IFACE)
+    };
+    // Strategy dispatch: T' traits (or all traits in non-T' mode), excluding bridge.
     let guests: Vec<EmittedGuest> = bindings
         .guest_traits
         .iter()
+        .filter(|g| !is_bridge(g))
+        .filter(|g| !in_t_prime || is_t_prime_trait(g))
         .map(|g| emit_guest(g, input.interface_qualified_name, input.behavior, &ir))
         .collect();
     let resource_newtypes = emit_resource_newtypes(&ir, input.behavior);
+    let bridge_impl = emit_bridge_guest_impl(&ir.bridge_resources);
+    // Delegation impl: for each original-target-interface Guest trait in T' mode,
+    // pair it with the corresponding T' interface Guest trait and generate a
+    // delegation body that wraps/unwraps resources via the bridge.
+    let delegation_impl = if in_t_prime {
+        let delegation_traits: Vec<_> = bindings
+            .guest_traits
+            .iter()
+            .filter(|g| !is_bridge(g) && !is_t_prime_trait(g))
+            .collect();
+        let t_prime_iface_traits: Vec<_> = bindings
+            .guest_traits
+            .iter()
+            .filter(|g| is_t_prime_trait(g) && matches!(g.kind, bindings_index::GuestTraitKind::Interface))
+            .collect();
+        delegation_traits
+            .iter()
+            .filter_map(|orig_g| {
+                // Pair with the T' interface Guest that has the same local name (last segment).
+                let orig_last = orig_g.module_path.last()?;
+                let t_prime_g = t_prime_iface_traits
+                    .iter()
+                    .find(|tg| tg.module_path.last() == Some(orig_last))?;
+                emit_delegation_guest_impl(orig_g, t_prime_g, &ir.bridge_resources, &ir)
+            })
+            .reduce(|mut acc, ts| {
+                acc.extend(ts);
+                acc
+            })
+    } else {
+        None
+    };
 
     let lib_rs = assemble_lib_rs(&WrapperCrateInputs {
         bindings_src: &bindings_src,
@@ -83,6 +134,8 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         behavior: input.behavior,
         strategy_crate_name: input.strategy_crate_name,
         strategy_type: input.strategy_type,
+        bridge_impl: bridge_impl.as_ref(),
+        delegation_impl: delegation_impl.as_ref(),
     })?;
 
     let crate_name =

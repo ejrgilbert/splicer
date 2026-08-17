@@ -1,0 +1,9 @@
+package test:orig;
+interface store {
+  resource bucket {
+    constructor(name: string);
+    get: func(k: string) -> option<string>;
+    set: func(k: string, v: string);
+  }
+}
+world consumer { import store; export run: func() -> string; }

@@ -30,8 +30,8 @@ path = "examples/wac_compose.rs"
 
 [dependencies]
 colored = "3.1.1"
-cviz = "3.0.0"
-#cviz = { path = "../cviz" }
+#cviz = "3.0.0"
+cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 globset = "0.4.18"
@@ -45,8 +45,8 @@ wit-bindgen-core = "0.57.1"
 wit-bindgen-rust = "0.57.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-wirm = "5.0.0"
-#wirm = { path = "../../research/compilers/wirm" }
+#wirm = "5.0.0"
+wirm = { path = "../../research/compilers/wirm" }
 wit-component = "0.247"
 oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["rt", "macros"] }
@@ -74,3 +74,4 @@ wit-component = { version = "0.247", features = ["dummy-module"] }
 wasmtime = { version = "44", features = ["component-model", "component-model-async", "async"] }
 wasmtime-wasi = "44"
 tokio = { version = "1", features = ["rt", "macros"] }
+

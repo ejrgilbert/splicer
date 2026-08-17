@@ -182,6 +182,22 @@ pub struct AdapterInjectionInfo {
     pub matched_hook_interfaces: Vec<String>,
 }
 
+/// Describes a built edge shim component that sits between the consumer (holding T' handles)
+/// and a raw collateral interface.
+#[derive(Clone, Debug)]
+pub struct EdgeShimSpec {
+    /// Qualified collateral interface (e.g. `"my:service/shapes-viewer"`).
+    pub collateral_iface: String,
+    /// Qualified raw sibling types interface (e.g. `"my:service/shapes-handles-types"`).
+    pub raw_types_iface: String,
+    /// T' sibling types export key (e.g. `"splicer:wrapper/shapes-handles-types@0.0.0"`).
+    pub t_prime_types_export: String,
+    /// WAC export key for the edge shim (e.g. `"splicer:edge-shim/shapes-viewer@0.0.0"`).
+    pub shim_export_key: String,
+    /// Path to the built edge shim component wasm.
+    pub shim_path: String,
+}
+
 /// A middleware to inject at a splice point. From the YAML `inject`
 /// list, or programmatically via [`Injection::from_path`].
 #[derive(Clone, Debug, Deserialize)]
@@ -211,6 +227,15 @@ pub struct Injection {
     /// sees one consistent resource identity. Empty for non-wrapping tiers.
     #[serde(skip)]
     pub(crate) resource_bearing_exports: Vec<String>,
+    /// T' mode: (consumer_import_key, t_prime_export_key) cross-name wires
+    /// for WAC routing. Stamped from TargetWit during materialization.
+    /// Empty for non-T' wrappers.
+    #[serde(skip)]
+    pub(crate) t_prime_redirects: Vec<(String, String)>,
+    /// One entry per collateral interface that needs a T' handle unwrap edge shim.
+    /// Stamped during materialization; empty until then.
+    #[serde(skip)]
+    pub(crate) edge_shim_specs: Vec<EdgeShimSpec>,
 }
 
 impl PartialEq for Injection {
@@ -255,6 +280,8 @@ impl Injection {
             adapter_info: None,
             tier: None,
             resource_bearing_exports: Vec::new(),
+            t_prime_redirects: Vec::new(),
+            edge_shim_specs: Vec::new(),
         }
     }
 
@@ -273,6 +300,8 @@ impl Injection {
             adapter_info: None,
             tier: None,
             resource_bearing_exports: Vec::new(),
+            t_prime_redirects: Vec::new(),
+            edge_shim_specs: Vec::new(),
         }
     }
 }
@@ -870,6 +899,8 @@ fn into_injection(yaml: YamlInjection) -> Injection {
         adapter_info: None,
         tier: None,
         resource_bearing_exports: Vec::new(),
+        t_prime_redirects: Vec::new(),
+                edge_shim_specs: Vec::new(),
     }
 }
 
