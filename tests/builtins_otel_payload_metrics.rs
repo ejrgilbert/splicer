@@ -117,7 +117,8 @@ fn payload_metrics_exports_size_shape_and_error_rate() -> Result<()> {
     // ── arg direction: size + structure of "hello" ──
     let arg = metrics_for(exports, "arg");
     assert_eq!(arg.len(), 7, "6 registry metrics + the type histogram");
-    assert_eq!(hist_sum(&arg, "payload.size"), 5.0, "\"hello\" = 5 bytes");
+    // canonical-ABI estimate: 8-byte string descriptor + 5 content bytes.
+    assert_eq!(hist_sum(&arg, "payload.size"), 13.0, "\"hello\" = 8 + 5 bytes");
     assert_eq!(hist_sum(&arg, "payload.node.count"), 1.0, "one node");
     assert_eq!(hist_sum(&arg, "payload.depth"), 1.0, "depth 1");
     assert_base_attrs(

@@ -19,4 +19,4 @@ name = "payloads"
 type = "enum { args, result, both }"
 case_insensitive = true
 default = "both"
-doc = "Which payloads to measure."
+doc = "Which payloads to measure. Narrowing to args/result only partly cuts overhead, the unmeasured direction is still lifted."

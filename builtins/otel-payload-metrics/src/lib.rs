@@ -16,8 +16,6 @@
 //! (`payload.cell.count`) is the one non-scalar metric and is built by a
 //! dedicated branch beside the registry loop.
 
-// TODO: There are lots of hardcoded values in this file.
-
 mod bindings {
     splicer_tool_sdk::wit_bindgen!({
         world: "otel-payload-metrics-mdl",
@@ -45,59 +43,11 @@ use splicer_tool_sdk::{CallId, Cell, Field, FieldTree};
 
 // ── Payload statistics ────────────────────────────────────────────────
 
-/// Estimated serialized byte size of a single cell. The tree is already
-/// lifted, so this is an *estimate* of wire size — payload-content bytes
-/// for primitives, a small fixed overhead for structural/nominal/handle
-/// cells — not the exact canonical-ABI byte count.
-/// TODO: Can we use Rust's size_of for this instead?
-fn cell_size(cell: &Cell) -> u64 {
-    match cell {
-        Cell::Bool(_) => 1,
-        Cell::Integer(_) => 8,
-        Cell::Floating(_) => 8,
-        Cell::Text(s) => s.len() as u64,
-        Cell::Bytes(b) => b.len() as u64,
-        Cell::OptionSome(_) | Cell::OptionNone | Cell::ResultOk(_) | Cell::ResultErr(_) => 1,
-        Cell::ListOf(_)
-        | Cell::TupleOf(_)
-        | Cell::RecordOf(_)
-        | Cell::FlagsSet(_)
-        | Cell::EnumCase(_)
-        | Cell::VariantCase(_)
-        | Cell::ResourceHandle(_)
-        | Cell::StreamHandle(_)
-        | Cell::FutureHandle(_)
-        | Cell::ErrorContextHandle(_) => 4,
-    }
-}
-
-/// Child cell indices referenced by a compound/nominal cell (structural
-/// recursion). Primitives, flags, enums and handles have no children.
-fn children(tree: &FieldTree, cell: &Cell) -> Vec<u32> {
-    match cell {
-        Cell::ListOf(ix) | Cell::TupleOf(ix) => ix.clone(),
-        Cell::OptionSome(i) => vec![*i],
-        Cell::ResultOk(o) | Cell::ResultErr(o) => o.iter().copied().collect(),
-        Cell::RecordOf(i) => tree
-            .record_infos
-            .get(*i as usize)
-            .map(|r| r.fields.iter().map(|(_, c)| *c).collect())
-            .unwrap_or_default(),
-        Cell::VariantCase(i) => tree
-            .variant_infos
-            .get(*i as usize)
-            .and_then(|v| v.payload)
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 /// Per-payload statistics. One field per derived quantity; extend both
 /// this struct and [`METRICS`] to add a metric.
 #[derive(Default)]
 struct PayloadStats {
-    /// Estimated serialized byte size (see [`cell_size`]).
+    /// Estimated canonical-ABI byte size (see `FieldTree::size_est`).
     size_bytes: u64,
     /// Number of value nodes reachable from the root.
     node_count: u64,
@@ -117,7 +67,10 @@ struct PayloadStats {
 /// [`PayloadStats`] quantity. Iterative with a visited guard so shared or
 /// malformed indices can't loop or double-count.
 fn walk(tree: &FieldTree) -> PayloadStats {
-    let mut s = PayloadStats::default();
+    let mut s = PayloadStats {
+        size_bytes: tree.size_est(),
+        ..PayloadStats::default()
+    };
     if tree.cells.is_empty() {
         return s;
     }
@@ -135,7 +88,6 @@ fn walk(tree: &FieldTree) -> PayloadStats {
         if depth > s.depth {
             s.depth = depth;
         }
-        s.size_bytes += cell_size(cell);
         *s.kind_counts.entry(cell.kind_name()).or_default() += 1;
 
         match cell {
@@ -150,7 +102,7 @@ fn walk(tree: &FieldTree) -> PayloadStats {
             _ => {}
         }
 
-        for child in children(tree, cell) {
+        for child in tree.child_indices(cell) {
             stack.push((child, depth + 1));
         }
     }
@@ -161,16 +113,13 @@ fn walk(tree: &FieldTree) -> PayloadStats {
 
 /// OTel instrument shape for a registry entry.
 enum Instrument {
-    /// Base-2 exponential histogram over the per-payload sample. No
-    /// explicit bounds — buckets are derived from [`SCALE`].
+    /// Base-2 exponential histogram over the per-payload sample
     Histogram,
     /// Monotonic delta sum of the per-payload sample.
     Sum,
 }
 
-/// A scalar metric derived from a payload. `sample` pulls one number per
-/// payload out of [`PayloadStats`]; the aggregator folds it per the
-/// instrument shape.
+/// A scalar metric derived from a payload
 struct MetricDesc {
     name: &'static str,
     description: &'static str,
@@ -518,14 +467,11 @@ fn build_resource_metrics(
 }
 
 // ── Tier-2 hooks ──────────────────────────────────────────────────────
-// TODO: Is there a way to ONLY instrument what's configured to be done? Like -- if
-//       the user configures `arg` or `result`, it doesn't need to invoke BOTH on_call and on_return
 
 pub struct OtelPayloadMetrics;
 
 impl BeforeGuest for OtelPayloadMetrics {
     fn on_call(call: CallId, args: Vec<Field>) {
-        // TODO: Can this decision be cached somehow? I don't know if constantly polling config::payloads is paying a cross-component call every time
         if matches!(
             config::payloads(),
             config::Payloads::Args | config::Payloads::Both
@@ -539,7 +485,6 @@ impl BeforeGuest for OtelPayloadMetrics {
 
 impl AfterGuest for OtelPayloadMetrics {
     fn on_return(call: CallId, result: Option<FieldTree>) {
-        // TODO: Can this decision be cached somehow? I don't know if constantly polling config::payloads is paying a cross-component call every time
         if matches!(
             config::payloads(),
             config::Payloads::Result | config::Payloads::Both
@@ -615,9 +560,9 @@ mod tests {
         assert_eq!(stats.result_ok, 0);
         assert_eq!(stats.kind_counts.get("text").copied(), Some(3));
         assert_eq!(stats.kind_counts.get("list").copied(), Some(1));
-        // "abc" + "x" + "y" = 5 text bytes, + record(4) + list(4)
-        // + result-err(1) = 14.
-        assert_eq!(stats.size_bytes, 14);
+        // Canonical-ABI estimate (see FieldTree::size_est): record 0
+        // + text(8+3) + list header 8 + text(8+1) + text(8+1) + err disc 1.
+        assert_eq!(stats.size_bytes, 38);
     }
 
     #[test]
