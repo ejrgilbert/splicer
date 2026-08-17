@@ -94,6 +94,37 @@ pub enum Cell {
     ErrorContextHandle(u32),
 }
 
+impl Cell {
+    /// Short, stable label for this cell's kind (e.g. `"text"`, `"list"`,
+    /// `"resource"`). One exhaustive match beside the type: adding a
+    /// `Cell` variant stops this compiling until a label is supplied, so
+    /// there is no parallel table to drift. Useful for diagnostics and
+    /// for tagging metrics/traces by value kind.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Cell::Bool(_) => "bool",
+            Cell::Integer(_) => "integer",
+            Cell::Floating(_) => "floating",
+            Cell::Text(_) => "text",
+            Cell::Bytes(_) => "bytes",
+            Cell::ListOf(_) => "list",
+            Cell::TupleOf(_) => "tuple",
+            Cell::OptionSome(_) => "option-some",
+            Cell::OptionNone => "option-none",
+            Cell::ResultOk(_) => "result-ok",
+            Cell::ResultErr(_) => "result-err",
+            Cell::RecordOf(_) => "record",
+            Cell::FlagsSet(_) => "flags",
+            Cell::EnumCase(_) => "enum",
+            Cell::VariantCase(_) => "variant",
+            Cell::ResourceHandle(_) => "resource",
+            Cell::StreamHandle(_) => "stream",
+            Cell::FutureHandle(_) => "future",
+            Cell::ErrorContextHandle(_) => "error-context",
+        }
+    }
+}
+
 /// A lifted value tree: a flat array of cells, side tables for
 /// nominal-typed information, plus the root cell index. Walk by
 /// reading `cells[root]` and following child indices.

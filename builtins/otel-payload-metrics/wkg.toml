@@ -1,0 +1,4 @@
+[overrides]
+"splicer:tier2" = { path = "../../wit/tier2" }
+"splicer:common" = { path = "../../wit/common" }
+"splicer:builtin-config" = { path = "../../wit/builtin-config" }

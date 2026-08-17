@@ -1,0 +1,10 @@
+package splicer:otel-payload-metrics@0.1.0;
+
+world otel-payload-metrics-mdl {
+    import wasi:otel/metrics@0.2.0-rc.2;
+    import wasi:clocks/wall-clock@0.2.0;
+    import splicer:builtin-config/get@0.1.0;
+
+    export splicer:tier2/before@0.3.0;
+    export splicer:tier2/after@0.3.0;
+}

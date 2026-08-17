@@ -1,0 +1,22 @@
+[builtin]
+description = "Derive metrics (size, shape, type mix, error rate) about payloads crossing the boundary and emit via wasi:otel/metrics. Never persists payload content."
+tier = 2
+
+[[key]]
+name = "buffer"
+type = "u32"
+default = 1
+doc = "Number of observations to fold into a window before flushing. 1 means flush every sample (no aggregation)."
+
+[[key]]
+name = "flush_after_seconds"
+type = "f64"
+default = 10.0
+doc = "Wall-clock seconds before an open delta window is force-flushed, regardless of sample count."
+
+[[key]]
+name = "payloads"
+type = "enum { args, result, both }"
+case_insensitive = true
+default = "both"
+doc = "Which payloads to measure."

@@ -12,69 +12,38 @@
 //! pointing at a directory containing it.
 
 use anyhow::Result;
-use wasmtime::component::Val;
+use wasmtime::component::Linker;
 
 mod common;
 use common::{
-    add_builtin_config_stub, assert_call_attrs, drive_call_cycle, empty_span_context, expect_list,
-    expect_record, expect_string, expect_u32, expect_u64, field, Host,
+    add_builtin_config_stub, assert_call_attrs, capture_call, captured, drive_call_cycle,
+    empty_span_context, expect_list, expect_record, expect_string, expect_u32, expect_u64, field,
+    stub_returning, Captures, Host,
 };
 
 const OTEL_TRACING: &str = "wasi:otel/tracing@0.2.0-rc.2";
 
-#[derive(Default)]
-struct Capture {
-    starts: Vec<Val>,
-    ends: Vec<Val>,
-}
-
-fn add_otel_tracing_to_linker(
-    linker: &mut wasmtime::component::Linker<Host<Capture>>,
-) -> Result<()> {
+fn setup(linker: &mut Linker<Host<Captures>>) -> Result<()> {
     add_builtin_config_stub(linker)?;
     let mut otel = linker.instance(OTEL_TRACING)?;
-
-    otel.func_new("on-start", |store, _ty, params, _results| {
-        store
-            .data()
-            .capture
-            .lock()
-            .unwrap()
-            .starts
-            .push(params[0].clone());
-        Ok(())
-    })?;
-
-    otel.func_new("on-end", |store, _ty, params, _results| {
-        store
-            .data()
-            .capture
-            .lock()
-            .unwrap()
-            .ends
-            .push(params[0].clone());
-        Ok(())
-    })?;
-
-    otel.func_new("outer-span-context", |_store, _ty, _params, results| {
-        results[0] = empty_span_context();
-        Ok(())
-    })?;
-
-    Ok(())
+    capture_call(&mut otel, "on-start")?;
+    capture_call(&mut otel, "on-end")?;
+    stub_returning(&mut otel, "outer-span-context", empty_span_context())
 }
 
 #[test]
 fn otel_bare_spans_emits_consistent_start_and_end() -> Result<()> {
     let bytes = common::read_builtin("otel-bare-spans");
-    let capture = drive_call_cycle::<Capture, _>(&bytes, add_otel_tracing_to_linker)?;
+    let capture = drive_call_cycle::<Captures, _>(&bytes, setup)?;
     let cap = capture.lock().unwrap();
+    let starts = captured(&cap, "on-start");
+    let ends = captured(&cap, "on-end");
 
-    assert_eq!(cap.starts.len(), 1, "exactly one on-start call expected");
-    assert_eq!(cap.ends.len(), 1, "exactly one on-end call expected");
+    assert_eq!(starts.len(), 1, "exactly one on-start call expected");
+    assert_eq!(ends.len(), 1, "exactly one on-end call expected");
 
-    let start_ctx = expect_record(&cap.starts[0]);
-    let end_span = expect_record(&cap.ends[0]);
+    let start_ctx = expect_record(&starts[0]);
+    let end_span = expect_record(&ends[0]);
 
     let started_trace = expect_string(field(start_ctx, "trace-id"));
     let started_span_id = expect_string(field(start_ctx, "span-id"));

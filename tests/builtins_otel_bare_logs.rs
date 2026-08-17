@@ -13,60 +13,42 @@
 //! pointing at a directory containing it.
 
 use anyhow::Result;
-use wasmtime::component::Val;
+use wasmtime::component::Linker;
 
 mod common;
 use common::{
-    add_builtin_config_stub, assert_call_attrs, drive_call_cycle, empty_span_context, expect_list,
-    expect_record, expect_string, field, Host,
+    add_builtin_config_stub, assert_call_attrs, capture_call, captured, drive_call_cycle,
+    empty_span_context, expect_list, expect_option, expect_optional_string, expect_optional_u8,
+    expect_record, expect_string, field, stub_returning, stub_void, Captures, Host,
 };
 
 const OTEL_LOGS: &str = "wasi:otel/logs@0.2.0-rc.2";
 const OTEL_TRACING: &str = "wasi:otel/tracing@0.2.0-rc.2";
 
-#[derive(Default)]
-struct Capture {
-    logs: Vec<Val>,
-}
-
-fn add_otel_logs_to_linker(linker: &mut wasmtime::component::Linker<Host<Capture>>) -> Result<()> {
+fn setup(linker: &mut Linker<Host<Captures>>) -> Result<()> {
     add_builtin_config_stub(linker)?;
     let mut logs = linker.instance(OTEL_LOGS)?;
-    logs.func_new("on-emit", |store, _ty, params, _results| {
-        store
-            .data()
-            .capture
-            .lock()
-            .unwrap()
-            .logs
-            .push(params[0].clone());
-        Ok(())
-    })?;
+    capture_call(&mut logs, "on-emit")?;
 
+    // The builtin's WIT only calls `outer-span-context`, but the tracing
+    // instance has other functions on it; provide trivial stubs so
+    // instantiation doesn't fail on missing imports it never calls.
     let mut tracing = linker.instance(OTEL_TRACING)?;
-    tracing.func_new("outer-span-context", |_store, _ty, _params, results| {
-        results[0] = empty_span_context();
-        Ok(())
-    })?;
-    // The builtin's WIT only calls `outer-span-context`, but the
-    // tracing instance has other functions on it; provide trivial
-    // stubs so instantiation doesn't fail on missing imports the
-    // builtin never calls.
-    tracing.func_new("on-start", |_store, _ty, _params, _results| Ok(()))?;
-    tracing.func_new("on-end", |_store, _ty, _params, _results| Ok(()))?;
-
-    Ok(())
+    stub_returning(&mut tracing, "outer-span-context", empty_span_context())?;
+    stub_void(&mut tracing, "on-start")?;
+    stub_void(&mut tracing, "on-end")
 }
 
 #[test]
 fn otel_bare_logs_emits_structured_record() -> Result<()> {
     let bytes = common::read_builtin("otel-bare-logs");
-    let capture = drive_call_cycle::<Capture, _>(&bytes, add_otel_logs_to_linker)?;
+    let capture = drive_call_cycle::<Captures, _>(&bytes, setup)?;
     let cap = capture.lock().unwrap();
+    let logs = captured(&cap, "on-emit");
 
-    assert_eq!(cap.logs.len(), 1, "exactly one on-emit call expected");
+    assert_eq!(logs.len(), 1, "exactly one on-emit call expected");
 
-    let record = expect_record(&cap.logs[0]);
+    let record = expect_record(&logs[0]);
 
     // Severity: INFO / 9.
     assert_eq!(
@@ -94,33 +76,31 @@ fn otel_bare_logs_emits_structured_record() -> Result<()> {
     );
 
     // Attributes: code.namespace / code.function, JSON-encoded.
-    let attrs_opt = expect_option_field(field(record, "attributes"));
-    let attrs = expect_list(attrs_opt.expect("attributes present"));
-    assert_call_attrs(attrs);
+    let attrs = expect_option(field(record, "attributes")).expect("attributes present");
+    assert_call_attrs(expect_list(attrs));
 
     // Observed-timestamp present (we don't pin a value — clock state).
     assert!(
-        expect_option_field(field(record, "observed-timestamp")).is_some(),
+        expect_option(field(record, "observed-timestamp")).is_some(),
         "observed-timestamp is set"
     );
 
     // No host parent ⇒ trace-correlation fields unset.
     assert!(
-        expect_option_field(field(record, "trace-id")).is_none(),
+        expect_option(field(record, "trace-id")).is_none(),
         "trace-id is none when no parent span"
     );
     assert!(
-        expect_option_field(field(record, "span-id")).is_none(),
+        expect_option(field(record, "span-id")).is_none(),
         "span-id is none when no parent span"
     );
     assert!(
-        expect_option_field(field(record, "trace-flags")).is_none(),
+        expect_option(field(record, "trace-flags")).is_none(),
         "trace-flags is none when no parent span"
     );
 
     // Instrumentation scope identifies the source builtin.
-    let scope_opt = expect_option_field(field(record, "instrumentation-scope"));
-    let scope = expect_record(scope_opt.expect("instrumentation-scope present"));
+    let scope = expect_record(expect_option(field(record, "instrumentation-scope")).expect("scope"));
     assert_eq!(
         expect_string(field(scope, "name")),
         "splicer:otel-bare-logs",
@@ -128,26 +108,4 @@ fn otel_bare_logs_emits_structured_record() -> Result<()> {
     );
 
     Ok(())
-}
-
-fn expect_option_field(v: &Val) -> Option<&Val> {
-    if let Val::Option(inner) = v {
-        inner.as_deref()
-    } else {
-        panic!("expected option, got {v:?}")
-    }
-}
-
-fn expect_optional_string(v: &Val) -> Option<&str> {
-    expect_option_field(v).map(expect_string)
-}
-
-fn expect_optional_u8(v: &Val) -> Option<u8> {
-    expect_option_field(v).map(|inner| {
-        if let Val::U8(n) = inner {
-            *n
-        } else {
-            panic!("expected u8, got {inner:?}")
-        }
-    })
 }
