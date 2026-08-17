@@ -1,0 +1,22 @@
+[builtin]
+description = "Rewrite string content in payloads crossing the boundary by user-configured regexes."
+tier = 3
+
+[[key]]
+name = "patterns"
+type = "list<string>"
+default = []
+doc = "Regexes to redact via substring replacement (anchor with `^...$` to match whole strings). Empty list disables the builtin."
+
+[[key]]
+name = "direction"
+type = "enum { args, result, both }"
+case_insensitive = true
+default = "both"
+doc = "Which payloads to rewrite. Narrowing to args/result only partly cuts overhead, the unredacted direction is still lifted."
+
+[[key]]
+name = "replacement"
+type = "string"
+default = "***"
+doc = "Literal token each match is replaced with."

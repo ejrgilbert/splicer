@@ -58,6 +58,17 @@ const TIER3_EC_TARGET_WIT: &str = r#"
     }
 "#;
 
+const TIER3_REDACT_TARGET_WIT: &str = r#"
+    package smoke:redact@0.1.0;
+    interface ops {
+        greet: async func(name: string) -> string;
+    }
+    world redact-smoke {
+        export ops;
+        import ops;
+    }
+"#;
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -140,6 +151,19 @@ fn hello_tier3_builds_to_a_valid_component() {
         Behavior::Transform,
         "hello-tier3",
         "HelloTier3",
+    );
+}
+
+#[test]
+#[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+fn redact_strings_builds_to_a_valid_component() {
+    build_and_validate(
+        TIER3_REDACT_TARGET_WIT,
+        "redact-smoke",
+        "smoke:redact/ops@0.1.0",
+        Behavior::Transform,
+        "redact-strings",
+        "RedactStrings",
     );
 }
 

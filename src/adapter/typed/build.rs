@@ -226,6 +226,11 @@ pub fn smoke_check_strategy(
         cmd.arg("--config")
             .arg(format!("patch.crates-io.splicer-tool-sdk.path={val}"));
     }
+    if let Some(bp) = super::assemble::local_builtin_protocol_path() {
+        let val = toml::Value::String(bp);
+        cmd.arg("--config")
+            .arg(format!("patch.crates-io.splicer-builtin-protocol.path={val}"));
+    }
     let out = cmd
         .output()
         .context("failed to invoke `cargo check` on strategy crate")?;

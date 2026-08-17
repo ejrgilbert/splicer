@@ -62,6 +62,26 @@ fn record_round_trips_through_wave() {
     assert_eq!(back, pet);
 }
 
+// Regression: `from_value` codegen must not let a field named after one
+// of its own internal bindings (`value`, `name`, `v`) collide with them.
+#[derive(Debug, PartialEq, DeriveWitTyped)]
+struct Collide {
+    name: String,
+    value: u32,
+    v: bool,
+}
+
+#[test]
+fn record_with_reserved_field_names_round_trips() {
+    let c = Collide {
+        name: "n".to_string(),
+        value: 9,
+        v: true,
+    };
+    let back = Collide::from_value(&c.to_value()).unwrap();
+    assert_eq!(back, c);
+}
+
 #[test]
 fn unit_enum_round_trips_through_wave() {
     for s in [Status::Healthy, Status::UnderObservation] {

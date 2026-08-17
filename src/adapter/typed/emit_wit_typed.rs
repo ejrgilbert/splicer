@@ -97,7 +97,7 @@ fn emit_record(t: &NamedType, fields: &[RecordField]) -> TokenStream {
         let ty = f.ty.to_tokens();
         quote! {
             #wit => #ident = ::core::option::Option::Some(
-                <#ty as ::splicer_tool_sdk::WitTyped>::from_value(&v)?
+                <#ty as ::splicer_tool_sdk::WitTyped>::from_value(&__wave_val)?
             ),
         }
     });
@@ -127,16 +127,16 @@ fn emit_record(t: &NamedType, fields: &[RecordField]) -> TokenStream {
             }
 
             fn from_value(
-                value: &::splicer_tool_sdk::wasm_wave::value::Value,
+                __wave_value: &::splicer_tool_sdk::wasm_wave::value::Value,
             ) -> ::core::result::Result<Self, ::splicer_tool_sdk::BridgeError> {
                 #(#from_value_inits)*
-                for (name, v) in value.unwrap_record() {
-                    match &*name {
+                for (__wave_name, __wave_val) in __wave_value.unwrap_record() {
+                    match &*__wave_name {
                         #(#from_value_arms)*
-                        other => return ::core::result::Result::Err(
+                        __wave_other => return ::core::result::Result::Err(
                             ::splicer_tool_sdk::BridgeError::UnknownCase {
                                 type_kind: ::splicer_tool_sdk::wasm_wave::wasm::WasmTypeKind::Record,
-                                case: other.to_string(),
+                                case: __wave_other.to_string(),
                             }
                         ),
                     }

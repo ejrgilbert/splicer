@@ -18,6 +18,7 @@ pub mod render;
 pub mod strategy;
 pub mod trace;
 pub mod types;
+pub mod visit;
 pub mod wire;
 
 pub use path::{sanitize_for_filename, strip_leading_slashes};
@@ -29,6 +30,7 @@ pub use strategy::{
     VirtualizeStrategy,
 };
 pub use trace::{TraceError, TraceReader};
+pub use visit::map_strings;
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };

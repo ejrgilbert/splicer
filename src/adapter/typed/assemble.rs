@@ -200,11 +200,23 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
     root.insert("lib".into(), Value::Table(lib));
     root.insert("dependencies".into(), Value::Table(dependencies));
 
+    // Patch source-only crates to their in-tree paths when splicer runs
+    // from a workspace. Covers both `splicer-tool-sdk` (linked by the
+    // wrapper + strategy) and `splicer-builtin-protocol` (the strategy's
+    // build-dependency that codegens its config accessors); a patch in
+    // the wrapper's root Cargo.toml reaches the strategy's deps too.
+    let mut crates_io = Map::new();
     if let Some(local_sdk) = local_sdk_path() {
-        let mut sdk_patch = Map::new();
-        sdk_patch.insert("path".into(), Value::String(local_sdk));
-        let mut crates_io = Map::new();
-        crates_io.insert("splicer-tool-sdk".into(), Value::Table(sdk_patch));
+        let mut p = Map::new();
+        p.insert("path".into(), Value::String(local_sdk));
+        crates_io.insert("splicer-tool-sdk".into(), Value::Table(p));
+    }
+    if let Some(local_bp) = local_builtin_protocol_path() {
+        let mut p = Map::new();
+        p.insert("path".into(), Value::String(local_bp));
+        crates_io.insert("splicer-builtin-protocol".into(), Value::Table(p));
+    }
+    if !crates_io.is_empty() {
         let mut patch = Map::new();
         patch.insert("crates-io".into(), Value::Table(crates_io));
         root.insert("patch".into(), Value::Table(patch));
@@ -231,6 +243,22 @@ pub(crate) fn local_sdk_path() -> Option<String> {
             .join("Cargo.toml")
             .exists()
             .then(|| WORKSPACE_SDK.to_string()),
+    }
+}
+
+/// Path the wrapper should patch `splicer-builtin-protocol` to, or
+/// `None` for crates.io resolution. Same three-state precedence as
+/// [`local_sdk_path`], keyed on `SPLICER_BUILTIN_PROTOCOL_PATH`.
+pub(crate) fn local_builtin_protocol_path() -> Option<String> {
+    const WORKSPACE_BP: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/builtins/builtin-protocol");
+    match std::env::var("SPLICER_BUILTIN_PROTOCOL_PATH").as_deref() {
+        Ok("") => None,
+        Ok(path) => Some(path.to_string()),
+        Err(_) => std::path::Path::new(WORKSPACE_BP)
+            .join("Cargo.toml")
+            .exists()
+            .then(|| WORKSPACE_BP.to_string()),
     }
 }
 

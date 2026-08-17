@@ -115,17 +115,23 @@ fn build_section_static(payload_len: usize, builtin_name: &str) -> TokenStream {
 }
 
 fn build_config_module(manifest: &Manifest) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    let needs_string_decoder = manifest.keys.iter().any(|k| {
-        matches!(
-            k.parsed_type().expect("manifest already validated"),
-            TypeAst::String
-        )
-    });
-    let decoder = if needs_string_decoder {
-        build_wave_string_decoder()
-    } else {
-        TokenStream::new()
-    };
+    let has_string_key = manifest
+        .keys
+        .iter()
+        .any(|k| matches!(k.parsed_type().expect("manifest already validated"), TypeAst::String));
+    let has_string_list_key = manifest
+        .keys
+        .iter()
+        .any(|k| is_string_list(&k.parsed_type().expect("manifest already validated")));
+    // The list decoder decodes each element via `decode_wave_string`, so
+    // emit the scalar decoder whenever either kind of string key exists.
+    let mut decoder = TokenStream::new();
+    if has_string_key || has_string_list_key {
+        decoder.extend(build_wave_string_decoder());
+    }
+    if has_string_list_key {
+        decoder.extend(build_wave_string_list_decoder());
+    }
     let mut type_decls = Vec::new();
     let mut accessors = Vec::new();
     for key in &manifest.keys {
@@ -311,6 +317,12 @@ fn build_accessor(key: &ConfigKey) -> Result<TokenStream, Box<dyn std::error::Er
                 doc_attr,
             ))
         }
+        _ if is_string_list(&ty) => Ok(build_string_list_accessor(
+            &fn_name,
+            key_lit,
+            default_lit,
+            doc_attr,
+        )),
         TypeAst::List(_) | TypeAst::Option(_) | TypeAst::Tuple(_) => Err(format!(
             "key '{}': compound-type codegen not yet implemented \
              (see the wasm-wave fallback note in splicer-builtin-protocol)",
@@ -318,6 +330,10 @@ fn build_accessor(key: &ConfigKey) -> Result<TokenStream, Box<dyn std::error::Er
         )
         .into()),
     }
+}
+
+fn is_string_list(ty: &TypeAst) -> bool {
+    matches!(ty, TypeAst::List(elem) if matches!(**elem, TypeAst::String))
 }
 
 fn build_numeric_accessor(
@@ -361,6 +377,68 @@ fn build_string_accessor(
             // `String::as_str` qualified to dodge the recent stdlib
             // name clash with `str::as_str`.
             String::as_str(v)
+        }
+    }
+}
+
+fn build_string_list_accessor(
+    fn_name: &proc_macro2::Ident,
+    key_lit: &str,
+    default_lit: &str,
+    doc_attr: TokenStream,
+) -> TokenStream {
+    quote! {
+        #doc_attr
+        pub fn #fn_name() -> &'static [String] {
+            static V: OnceLock<Vec<String>> = OnceLock::new();
+            V.get_or_init(|| {
+                let raw = lookup(#key_lit)
+                    .unwrap_or_else(|| #default_lit.to_string());
+                decode_wave_string_list(&raw)
+            })
+            .as_slice()
+        }
+    }
+}
+
+fn build_wave_string_list_decoder() -> TokenStream {
+    quote! {
+        fn decode_wave_string_list(raw: &str) -> Vec<String> {
+            let inner = raw
+                .trim()
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .expect("manifest-validated list literal");
+            let mut out = Vec::new();
+            let mut chars = inner.chars().peekable();
+            while let Some(&c) = chars.peek() {
+                if c != '"' {
+                    chars.next(); // skip separators / whitespace
+                    continue;
+                }
+                // Copy one full quoted token, escapes included, then hand
+                // it to the scalar decoder.
+                let mut token = String::from('"');
+                chars.next(); // opening quote
+                loop {
+                    match chars.next() {
+                        Some('\\') => {
+                            token.push('\\');
+                            if let Some(escaped) = chars.next() {
+                                token.push(escaped);
+                            }
+                        }
+                        Some('"') => {
+                            token.push('"');
+                            break;
+                        }
+                        Some(other) => token.push(other),
+                        None => break, // validated upstream; tolerate truncation
+                    }
+                }
+                out.push(decode_wave_string(&token));
+            }
+            out
         }
     }
 }
@@ -413,4 +491,38 @@ fn rust_primitive(ty: &TypeAst) -> &'static str {
 
 fn sanitize_ident(name: &str) -> String {
     name.replace('-', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_wit_type;
+
+    #[test]
+    fn is_string_list_matches_only_list_of_string() {
+        assert!(is_string_list(&parse_wit_type("list<string>").unwrap()));
+        assert!(!is_string_list(&parse_wit_type("list<u32>").unwrap()));
+        assert!(!is_string_list(&parse_wit_type("string").unwrap()));
+        assert!(!is_string_list(
+            &parse_wit_type("option<list<string>>").unwrap()
+        ));
+    }
+
+    /// A generated `list<string>` key emits its accessor plus both the
+    /// scalar and list WAVE decoders (the list decoder reuses the scalar
+    /// one per element).
+    #[test]
+    fn string_list_key_emits_accessor_and_decoders() {
+        let manifest = Manifest::from_toml(
+            "[builtin]\ndescription = \"x\"\ntier = 3\n\
+             [[key]]\nname = \"patterns\"\ntype = \"list<string>\"\n\
+             default = []\ndoc = \"d\"\n",
+        )
+        .unwrap();
+        let module = build_config_module(&manifest).unwrap().to_string();
+        assert!(module.contains("fn patterns"), "{module}");
+        assert!(module.contains("& 'static [String]"), "{module}");
+        assert!(module.contains("fn decode_wave_string_list"), "{module}");
+        assert!(module.contains("fn decode_wave_string "), "{module}");
+    }
 }
