@@ -13,6 +13,7 @@
 
 pub mod bridge;
 pub mod bridge_resources;
+pub mod gen;
 pub mod path;
 pub mod render;
 pub mod strategy;
@@ -31,6 +32,7 @@ pub use strategy::{
 };
 pub use trace::{TraceError, TraceReader};
 pub use visit::map_strings;
+pub use gen::{build_typed, build_value, GenError, MinimalBuilder, ValueBuilder};
 pub use types::{
     CallId, Cell, EnumInfo, Field, FieldTree, FlagsInfo, HandleInfo, RecordInfo, VariantInfo,
 };

@@ -1,0 +1,53 @@
+[builtin]
+description = "Virtualizes a dependency, returning a random value for every call. Requires `R: WitTyped` (value-typed returns)."
+tier = 4
+
+[[key]]
+name = "seed"
+type = "u64"
+default = 0
+doc = "Fixed seed for a repeatable run; leave at 0 to get fresh values each run. Each call's seed is logged so you can reproduce a specific one."
+
+[[key]]
+name = "max-depth"
+type = "u32"
+default = 5
+doc = "How many levels deep to nest generated values (e.g. a record inside a list inside an option) before stopping."
+
+[[key]]
+name = "max-list-len"
+type = "u32"
+default = 8
+doc = "Longest list to generate."
+
+[[key]]
+name = "max-string-len"
+type = "u32"
+default = 32
+doc = "Longest string to generate, in characters."
+
+[[key]]
+name = "boundary-bias"
+type = "f32"
+default = 0.3
+doc = "How often to pick a tricky edge-case value (0, the max, an empty string, NaN) instead of a plain random one. 0 = never, 1 = always."
+
+[[key]]
+name = "log"
+type = "enum { none, summary, value }"
+case_insensitive = true
+default = "summary"
+doc = "How much to log per call: none, a summary (the call and its seed), or the full generated value."
+
+[[key]]
+name = "sink"
+type = "enum { stdout, stderr, file }"
+case_insensitive = true
+default = "stdout"
+doc = "Where the log goes. `file` writes a separate log per spliced instance (under `dir`); stdout/stderr just print."
+
+[[key]]
+name = "dir"
+type = "string"
+default = "./fuzz-logs"
+doc = "Folder for the `file` sink; each instance gets its own `<edge>.log` here. Ignored for stdout/stderr."

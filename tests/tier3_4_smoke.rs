@@ -69,6 +69,21 @@ const TIER3_REDACT_TARGET_WIT: &str = r#"
     }
 "#;
 
+const TIER4_FUZZ_TARGET_WIT: &str = r#"
+    package smoke:fuzz@0.1.0;
+    interface ops {
+        record report {
+            id: u32,
+            tags: list<string>,
+            ratio: f64,
+        }
+        run: async func(seed: u64) -> result<report, string>;
+    }
+    world fuzz-smoke {
+        export ops;
+    }
+"#;
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -138,6 +153,36 @@ fn hello_tier4_builds_to_a_valid_component() {
         Behavior::Virtualize,
         "hello-tier4",
         "HelloTier4",
+    );
+}
+
+#[test]
+#[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+fn fuzz_results_builds_to_a_valid_component() {
+    // Value-typed scalar return (u32): the fuzz-results generator must
+    // satisfy the wrapper's `R: WitTyped` bound and produce a component.
+    build_and_validate(
+        TIER4_TARGET_WIT,
+        "tier4-smoke",
+        "smoke:tier4/ops@0.1.0",
+        Behavior::Virtualize,
+        "fuzz-results",
+        "FuzzResults",
+    );
+}
+
+#[test]
+#[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+fn fuzz_results_over_result_of_record_builds_to_a_valid_component() {
+    // `result<record{...}, string>` return: exercises the generator's
+    // result / record / list arms through the codegen'd WitTyped impls.
+    build_and_validate(
+        TIER4_FUZZ_TARGET_WIT,
+        "fuzz-smoke",
+        "smoke:fuzz/ops@0.1.0",
+        Behavior::Virtualize,
+        "fuzz-results",
+        "FuzzResults",
     );
 }
 

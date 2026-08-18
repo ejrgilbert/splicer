@@ -1,0 +1,5 @@
+package splicer:fuzz-results@0.1.0;
+
+world consumer {
+    import splicer:builtin-config/get@0.1.0;
+}
