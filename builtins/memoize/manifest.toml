@@ -1,0 +1,28 @@
+[builtin]
+description = "Cache pure-function results keyed by arguments; return the cached result on repeat calls instead of invoking downstream."
+tier = 3
+
+[[key]]
+name = "max_entries"
+type = "u32"
+default = 1024
+doc = "Maximum cached entries before eviction. 0 = unbounded."
+
+[[key]]
+name = "ttl_seconds"
+type = "f64"
+default = 0.0
+doc = "Entries expire this many wall-clock seconds after insertion. 0 = never expire."
+
+[[key]]
+name = "eviction"
+type = "enum { lru, fifo, reject }"
+case_insensitive = true
+default = "lru"
+doc = "At capacity: `lru` evicts least-recently-used, `fifo` evicts oldest-inserted, `reject` stops admitting new entries."
+
+[[key]]
+name = "cache_errors"
+type = "bool"
+default = false
+doc = "Whether to cache `result::err` returns. Off = errors always re-invoke downstream."

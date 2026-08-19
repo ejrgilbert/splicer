@@ -214,6 +214,19 @@ fn redact_strings_builds_to_a_valid_component() {
 
 #[test]
 #[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
+fn memoize_builds_to_a_valid_component() {
+    build_and_validate(
+        TIER3_REDACT_TARGET_WIT,
+        "redact-smoke",
+        "smoke:redact/ops@0.1.0",
+        Behavior::Transform,
+        "memoize",
+        "Memoize",
+    );
+}
+
+#[test]
+#[ignore = "shells out to cargo + wasm32-wasip1; run with --ignored"]
 fn hello_tier3_with_error_context_arg_builds_to_a_valid_component() {
     // Compile-only bar: cross-component `error-context` lift is
     // broken in wasmtime <=44, so a fully-spliced runtime run isn't
