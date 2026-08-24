@@ -50,6 +50,7 @@ struct EmitVisitor {
 
     // Used to find shims
     has_core_module: Vec<bool>,
+    has_child_component: Vec<bool>,
     shim_comps: HashMap<usize, usize>, // shim_comp_num -> outer_comp_num
 
     err: Option<wirm::error::Error>,
@@ -61,11 +62,16 @@ impl EmitVisitor {
             curr_comp_num: 0,
             comp_num_stack: vec![],
             has_core_module: vec![],
+            has_child_component: vec![],
             shim_comps: HashMap::new(),
             err: None,
         }
     }
     fn handle_enter_component(&mut self, comp: &Component) {
+        // Record that our parent (if any) nests at least one child.
+        if let Some(parent_has_child) = self.has_child_component.last_mut() {
+            *parent_has_child = true;
+        }
         // we reserve 0 for the outermost component!
         // (if it's the outermost, the id is None)
         self.comp_num_stack.push(self.curr_comp_num);
@@ -75,6 +81,7 @@ impl EmitVisitor {
         }
         self.curr_comp_num += 1;
         self.has_core_module.push(false);
+        self.has_child_component.push(false);
     }
     fn handle_exit_component(&mut self, _: &Component) {
         self.apply_shim_identification_heuristic();
@@ -82,15 +89,21 @@ impl EmitVisitor {
 
     fn apply_shim_identification_heuristic(&mut self) {
         let has_core_module = self.has_core_module.pop().unwrap();
+        let has_child_component = self.has_child_component.pop().unwrap();
         if let Some(my_comp_num) = self.comp_num_stack.pop() {
-            if !has_core_module {
+            // A genuine shim is a *leaf* component with no inner core module:
+            // a thin adapter the outer wraps with non-WAC stitching, so we
+            // instantiate the OUTER rather than the inner shim.
+            //
+            // A module-less component that itself nests child components is
+            // NOT a shim -- it's a real subcomposition that re-exports its
+            // children's interfaces (common in deeply-nested pre-composed
+            // inputs). Collapsing it to its parent would merge distinct
+            // providers onto one instance (and onto a split that doesn't
+            // export the interface), so leave it standalone.
+            if !has_core_module && !has_child_component {
                 // protect against doing this for the outermost component
                 if let Some(outer_comp_num) = self.comp_num_stack.last() {
-                    // I'm making an assumption here, if the component I'm exiting does
-                    // not have an inner core module, it's likely a shim!
-                    // The outer component likely contains this inner shim with some necessary non-wac
-                    // stitching around it! So, I would need to make sure I instantiate the OUTER component
-                    // rather than the inner shim.
                     self.shim_comps.insert(my_comp_num, *outer_comp_num);
                 }
             }
@@ -118,4 +131,63 @@ impl ComponentVisitor<'_> for EmitVisitor {
 /// Build the filesystem path for a split sub-component by index.
 pub fn gen_split_path(splits_path: &str, comp_id: usize) -> String {
     format!("{splits_path}/split{comp_id}.wasm")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Split a WAT component from a temp file and return its shim map.
+    fn shim_map_of(wat: &str) -> HashMap<usize, usize> {
+        let bytes = wat::parse_str(wat).expect("valid component wat");
+        let dir = std::env::temp_dir().join(format!(
+            "splicer-split-test-{}-{}",
+            std::process::id(),
+            // cheap unique-ish suffix so parallel tests don't collide
+            wat.len()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir splits");
+        let wasm_path = dir.join("input.wasm");
+        std::fs::write(&wasm_path, &bytes).expect("write input wasm");
+        let (_out, shim_comps) =
+            split_out_composition(&wasm_path, &Some(dir.to_string_lossy().into_owned()))
+                .expect("split succeeds");
+        shim_comps
+    }
+
+    /// The shim heuristic must collapse a module-less *leaf* component (a
+    /// thin adapter) to its parent, but leave a module-less *non-leaf*
+    /// subcomposition standalone — collapsing the latter merged distinct
+    /// providers onto the root in deeply-nested pre-composed inputs.
+    #[test]
+    fn module_less_subcomposition_is_not_a_shim_but_leaf_shim_is() {
+        // comp 0 = root
+        //   comp 1 = wrapper: module-less, but nests comp 2 -> NOT a shim
+        //     comp 2 = inner: has a core module               -> NOT a shim
+        //   comp 3 = leaf: module-less, no children           -> shim -> 0
+        let wat = r#"
+            (component
+              (component
+                (component
+                  (core module)
+                )
+              )
+              (component)
+            )
+        "#;
+        let shim = shim_map_of(wat);
+        assert!(
+            !shim.contains_key(&1),
+            "module-less subcomposition (comp 1) must NOT be a shim; got {shim:?}"
+        );
+        assert!(
+            !shim.contains_key(&2),
+            "module-bearing inner (comp 2) must NOT be a shim; got {shim:?}"
+        );
+        assert_eq!(
+            shim.get(&3),
+            Some(&0),
+            "module-less leaf (comp 3) must collapse to its parent; got {shim:?}"
+        );
+    }
 }

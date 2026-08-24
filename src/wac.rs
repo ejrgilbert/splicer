@@ -315,16 +315,25 @@ impl EmitPlan {
             }
         }
         let mut split_to_var: HashMap<usize, String> = HashMap::new();
+        let mut used_vars: HashSet<String> = HashSet::new();
         for id in &chain_nodes {
             let resolved_split = resolved_split_num(*id, composition, shim_comps);
             if let Some(existing) = split_to_var.get(&resolved_split) {
                 self.node_vars.insert(*id, existing.clone());
                 continue;
             }
-            let pkg = match self.aliases.get(id) {
+            let base = match self.aliases.get(id) {
                 Some(Some(a)) => a.clone(),
                 _ => sanitize_wac_id(get_name(&composition.nodes[id])),
             };
+            // A nested composition can reuse the same leaf instance index in
+            // different subtrees, so distinct components share a display name.
+            let pkg = if used_vars.contains(&base) {
+                format!("{base}-s{resolved_split}")
+            } else {
+                base
+            };
+            used_vars.insert(pkg.clone());
             self.node_vars.insert(*id, pkg.clone());
             split_to_var.insert(resolved_split, pkg);
         }
@@ -407,7 +416,23 @@ impl EmitPlan {
                 }
                 prev_var = Some(node_var.clone());
 
-                if i == chain.len() - 1 {
+                // A top-level (boundary) wrap fronts the outermost node's
+                // EXPORT of the interface. It's only meaningful when that
+                // node actually exports the interface externally (a
+                // composition-level export). A chain that terminates at an
+                // internal consumer -- one that imports the interface but
+                // never re-exports it (e.g. a service that calls geo but
+                // exports only search) -- has no boundary edge to wrap;
+                // emitting one would reference a non-existent export and
+                // fail to compose.
+                let exports_at_boundary = composition
+                    .component_exports
+                    .get(&interface.name)
+                    .is_some_and(|info| {
+                        resolve_shim_node(info.source_instance, composition, shim_comps)
+                            == routing_id
+                    });
+                if i == chain.len() - 1 && exports_at_boundary {
                     if let Some(top) = inject_plan.get(&(i + 1)) {
                         if !top.is_empty() {
                             let middleware_var = self.fold_inject_middlewares(
@@ -2502,6 +2527,216 @@ mod tests {
              `mw` middleware (the inner `before` rule), but it doesn't. \
              middle block:\n{middle_block}\n\nFull WAC:\n{}",
             out.wac
+        );
+    }
+
+    /// A single `mw` injection for the `before` boundary-gating tests.
+    fn boundary_test_injection() -> crate::parse::config::Injection {
+        crate::parse::config::Injection {
+            name: "mw".to_string(),
+            path: Some(crate::tests::test_mw_path().to_string()),
+            builtin: None,
+            builtin_config: Default::default(),
+            config_as_wave: None,
+            config_provider_path: None,
+            adapter_info: None,
+            tier: None,
+            resource_bearing_exports: Vec::new(),
+            t_prime_redirects: Vec::new(),
+            edge_shim_specs: Vec::new(),
+        }
+    }
+
+    /// A `before` rule enumerates every chain position, including the
+    /// outermost boundary. That boundary wrap fronts the node's EXPORT of
+    /// the interface — but a chain that terminates at an internal consumer
+    /// (a node that imports the interface but never re-exports it) has no
+    /// boundary edge to wrap. Emitting one references a non-existent export
+    /// and fails to compose, so it must be skipped. (This is the
+    /// DeathStarBench `hotel:api/geo` case in miniature: `search` consumes
+    /// `geo` but exports only `search`.)
+    #[test]
+    fn before_boundary_wrap_skipped_when_interface_not_exported() {
+        use crate::parse::config::SpliceRule;
+        use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
+
+        let mut graph = CompositionGraph::new();
+        // node 0 = geo provider (leaf).
+        graph.add_node(0, ComponentNode::new("$geo-prov".to_string(), 0, 0));
+        // node 1 = search svc: imports geo, exports search (NOT geo).
+        let mut search = ComponentNode::new("$search".to_string(), 1, 1);
+        search.add_import(InterfaceConnection {
+            interface_name: "test:svc/geo".to_string(),
+            source_instance: Some(0),
+            is_host_import: false,
+            fingerprint: None,
+            interface_type: None,
+        });
+        graph.add_node(1, search);
+        // The composition exports search, not geo.
+        graph.add_export("test:svc/search".to_string(), 1, None);
+
+        let rules = vec![SpliceRule::before(
+            "test:svc/geo",
+            None,
+            None,
+            vec![boundary_test_injection()],
+        )];
+        let out = generate_wac(
+            HashMap::new(),
+            "/tmp/splicer-boundary-neg",
+            &graph,
+            &rules,
+            None,
+            "test:boundary",
+        )
+        .expect("generate_wac");
+
+        // The real geo edge (geo-prov -> search) is still wrapped: `search`
+        // imports geo through the middleware.
+        assert!(
+            out.wac.contains("\"test:svc/geo\": mw[\"test:svc/geo\"]"),
+            "interior geo edge must route through `mw`; got:\n{}",
+            out.wac
+        );
+        // But there must be NO boundary adapter sourcing geo FROM the
+        // internal consumer (`search` doesn't export geo).
+        assert!(
+            !out.wac.contains("search[\"test:svc/geo\"]"),
+            "no boundary wrap may source `test:svc/geo` from the consumer \
+             that only imports it; got:\n{}",
+            out.wac
+        );
+        // The composition's real export is untouched.
+        assert!(
+            out.wac.contains("export search[\"test:svc/search\"];"),
+            "top-level export must survive; got:\n{}",
+            out.wac
+        );
+    }
+
+    /// The complement: when the boundary node genuinely EXPORTS the
+    /// interface (a top-level composition export), the `before` boundary
+    /// wrap must still be emitted and the export routed through it — so the
+    /// gating doesn't over-suppress legitimate boundary interposition.
+    #[test]
+    fn before_boundary_wrap_emitted_when_interface_is_exported() {
+        use crate::parse::config::SpliceRule;
+        use cviz::model::{ComponentNode, CompositionGraph};
+
+        let mut graph = CompositionGraph::new();
+        // node 0 = provider that exports the target interface (leaf).
+        graph.add_node(0, ComponentNode::new("$api-prov".to_string(), 0, 0));
+        graph.add_export("test:svc/api".to_string(), 0, None);
+
+        let rules = vec![SpliceRule::before(
+            "test:svc/api",
+            None,
+            None,
+            vec![boundary_test_injection()],
+        )];
+        let out = generate_wac(
+            HashMap::new(),
+            "/tmp/splicer-boundary-pos",
+            &graph,
+            &rules,
+            None,
+            "test:boundary",
+        )
+        .expect("generate_wac");
+
+        // The middleware fronts the provider's export...
+        assert!(
+            out.wac
+                .contains("\"test:svc/api\": api-prov[\"test:svc/api\"]"),
+            "mw must wrap the provider's export; got:\n{}",
+            out.wac
+        );
+        // ...and the composition exports the interface THROUGH the mw.
+        assert!(
+            out.wac.contains("export mw[\"test:svc/api\"];"),
+            "top-level export must route through the boundary wrap; got:\n{}",
+            out.wac
+        );
+    }
+
+    /// A nested composition can reuse the same leaf instance index in two
+    /// different subtrees, so two physically-distinct components carry the
+    /// same display name (`instance-v15`). Their WAC vars must stay
+    /// distinct — otherwise both providers collapse to one `let`, the
+    /// consumer wires both interfaces from it, and `wac_deps` loses one of
+    /// the two wasm paths (compose then fails to resolve).
+    #[test]
+    fn recurring_leaf_index_gets_distinct_provider_vars() {
+        use cviz::model::{ComponentNode, CompositionGraph, InterfaceConnection};
+
+        let mut graph = CompositionGraph::new();
+
+        // Two distinct provider components (different `component_num` →
+        // different splits) that happen to share the display name
+        // `instance-v15`.
+        graph.add_node(0, ComponentNode::new("$instance-v15".to_string(), 15, 15));
+        graph.add_node(1, ComponentNode::new("$instance-v15".to_string(), 30, 30));
+
+        // Consumer imports a different interface from each provider.
+        let mut frontend = ComponentNode::new("$frontend".to_string(), 1, 1);
+        frontend.add_import(InterfaceConnection {
+            interface_name: "hotel:api/attractions".to_string(),
+            source_instance: Some(0),
+            is_host_import: false,
+            fingerprint: None,
+            interface_type: None,
+        });
+        frontend.add_import(InterfaceConnection {
+            interface_name: "hotel:api/geo".to_string(),
+            source_instance: Some(1),
+            is_host_import: false,
+            fingerprint: None,
+            interface_type: None,
+        });
+        graph.add_node(2, frontend);
+
+        graph.add_export("hotel:api/frontend".to_string(), 2, None);
+
+        // No rules: the collision is rule-independent.
+        let out = generate_wac(
+            HashMap::new(),
+            "/tmp/splicer-recurring-leaf-splits",
+            &graph,
+            &[],
+            None,
+            "test:nested",
+        )
+        .expect("generate_wac");
+
+        // Pull the two source vars the frontend wires each interface from.
+        let src_of = |iface: &str| -> String {
+            let needle = format!("\"{iface}\": ");
+            let start = out
+                .wac
+                .find(&needle)
+                .unwrap_or_else(|| panic!("frontend must wire `{iface}`; got:\n{}", out.wac))
+                + needle.len();
+            let rest = &out.wac[start..];
+            let end = rest.find('[').expect("wired import has `src[\"..\"]` form");
+            rest[..end].trim().to_string()
+        };
+        let attractions_src = src_of("hotel:api/attractions");
+        let geo_src = src_of("hotel:api/geo");
+        assert_ne!(
+            attractions_src, geo_src,
+            "the two recurring-index providers must get distinct WAC vars, \
+             but both interfaces are wired from `{attractions_src}`; full WAC:\n{}",
+            out.wac
+        );
+
+        // Two distinct providers + the frontend = 3 distinct deps.
+        assert_eq!(
+            out.wac_deps.len(),
+            3,
+            "expected 3 distinct wac_deps (frontend + two providers), got {}: {:?}",
+            out.wac_deps.len(),
+            out.wac_deps.keys().collect::<Vec<_>>(),
         );
     }
 
