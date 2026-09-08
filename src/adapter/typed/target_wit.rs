@@ -42,6 +42,8 @@ pub struct EdgeShimFunctionSpec {
     pub params: Vec<EdgeShimParamSpec>,
     /// Rust return type string ("()" if no return).
     pub return_rust_ty: String,
+    /// True when the return is an owned resource handle that must be wrapped (raw -> T').
+    pub return_is_resource_own: bool,
 }
 
 /// Per-parameter info for edge shim codegen.
@@ -253,19 +255,13 @@ fn emit_t_prime_world(
 // ============================
 
 /// A collateral interface: one that imports the same resource types as the target but
-/// is not the target or a sibling types interface.
+/// is not the target or a sibling types interface. Only interfaces with at least one
+/// function carrying the wrapped resource (as an owned param or return) are collateral;
+/// the per-function detail is re-derived in `emit_edge_shim_world`.
 struct CollateralIface {
     iface_id: InterfaceId,
     /// Qualified name (e.g. `"my:service/shapes-viewer"`).
     qualified_name: String,
-    /// Functions that carry the wrapped resource as an owned parameter.
-    resource_functions: Vec<ResourceFunctionInfo>,
-}
-
-struct ResourceFunctionInfo {
-    fn_name: String,
-    is_async: bool,
-    param_resource_positions: Vec<usize>,
 }
 
 /// Walk the consumer world's imports to find interfaces (not the target, not siblings) that
@@ -312,35 +308,20 @@ fn detect_collateral_interfaces(
         };
         let iface = &resolve.interfaces[*iface_id];
 
-        let mut res_fns = Vec::new();
-        for (fn_name, func) in &iface.functions {
-            if !matches!(
+        let carries_resource = iface.functions.values().any(|func| {
+            matches!(
                 func.kind,
                 FunctionKind::Freestanding | FunctionKind::AsyncFreestanding
-            ) {
-                continue;
-            }
-            let is_async = matches!(func.kind, FunctionKind::AsyncFreestanding);
-            let resource_positions: Vec<usize> = func
+            ) && (func
                 .params
                 .iter()
-                .enumerate()
-                .filter(|(_, p)| type_has_own_resource(resolve, p.ty, &resource_type_ids))
-                .map(|(i, _)| i)
-                .collect();
-            if !resource_positions.is_empty() {
-                res_fns.push(ResourceFunctionInfo {
-                    fn_name: fn_name.clone(),
-                    is_async,
-                    param_resource_positions: resource_positions,
-                });
-            }
-        }
-        if !res_fns.is_empty() {
+                .any(|p| type_has_own_resource(resolve, p.ty, &resource_type_ids))
+                || return_has_own_resource(resolve, func, &resource_type_ids))
+        });
+        if carries_resource {
             out.push(CollateralIface {
                 iface_id: *iface_id,
                 qualified_name: q,
-                resource_functions: res_fns,
             });
         }
     }
@@ -357,6 +338,16 @@ fn type_has_own_resource(resolve: &Resolve, ty: Type, resource_ids: &HashSet<Typ
         }
         _ => false,
     }
+}
+
+/// True when `func`'s return is an owned resource handle in `resource_ids`.
+fn return_has_own_resource(
+    resolve: &Resolve,
+    func: &Function,
+    resource_ids: &HashSet<TypeId>,
+) -> bool {
+    func.result
+        .is_some_and(|ty| type_has_own_resource(resolve, ty, resource_ids))
 }
 
 // ==============================
@@ -448,8 +439,13 @@ fn emit_edge_shim_world(
                 }
             })
             .collect();
+        let return_is_resource_own = return_has_own_resource(resolve, func, &resource_ids);
         let return_rust_ty = match func.result {
             None => "()".to_string(),
+            Some(_) if return_is_resource_own => {
+                let pascal = resource_wit_name.to_upper_camel_case();
+                format!("{export_rust_prefix}::{pascal}")
+            }
             Some(ty) => {
                 wit_prim_to_rust(resolve, ty).unwrap_or_else(|| "/* unsupported */".to_string())
             }
@@ -459,6 +455,7 @@ fn emit_edge_shim_world(
             is_async,
             params,
             return_rust_ty,
+            return_is_resource_own,
         });
     }
 
@@ -1741,5 +1738,69 @@ mod tests {
         assert!(!target.t_prime_redirects.is_empty());
         run_wit_bindgen_rust(&target.wit_text, Some(&target.world_name))
             .expect("wit-bindgen accepts inline-resource T' WIT");
+    }
+
+    // Consumer world that imports the wrapped target (`store`) plus a collateral
+    // interface (`registry`) whose `lookup` RETURNS the wrapped resource. The
+    // resource enters the subgraph via that return, so the edge shim must wrap it.
+    const COLLATERAL_RETURN_WIT: &str = r#"
+        package test:kv@0.1.0;
+        interface store-types {
+            resource bucket {
+                constructor(name: string);
+                get: async func(k: string) -> option<string>;
+            }
+        }
+        interface store {
+            use store-types.{bucket};
+            open: async func(name: string) -> bucket;
+        }
+        interface registry {
+            use store-types.{bucket};
+            lookup: async func(name: string) -> bucket;
+        }
+        world consumer {
+            import store;
+            import store-types;
+            import registry;
+        }
+    "#;
+
+    #[test]
+    fn collateral_returning_resource_emits_wrapping_edge_shim() {
+        let component =
+            component_from_wit(COLLATERAL_RETURN_WIT, "consumer").expect("synthesize fixture");
+        let target = target_wit_for_codegen(&component, "test:kv/store@0.1.0", Behavior::Transform)
+            .expect("extract");
+
+        let shim = target
+            .edge_shim_wits
+            .iter()
+            .find(|s| s.collateral_iface == "test:kv/registry@0.1.0")
+            .expect("registry must be detected as a collateral interface");
+
+        let lookup = shim
+            .functions
+            .iter()
+            .find(|f| f.fn_name == "lookup")
+            .expect("lookup must be in the shim's function list");
+        assert!(
+            lookup.return_is_resource_own,
+            "a resource-returning collateral fn must be flagged for wrapping"
+        );
+        assert!(
+            lookup.return_rust_ty.ends_with("::Bucket"),
+            "return type must be the T' resource, got {:?}",
+            lookup.return_rust_ty
+        );
+
+        // The generated Rust body must wrap the raw handle before returning it.
+        let krate = crate::adapter::typed::generate_edge_shim_crate(shim)
+            .expect("edge shim crate generates");
+        assert!(
+            krate.lib_rs.contains("wrap_bucket"),
+            "shim body must call wrap_bucket on the return:\n{}",
+            krate.lib_rs
+        );
     }
 }

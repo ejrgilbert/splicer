@@ -6,7 +6,7 @@ use super::target_wit::{EdgeShimWit, BRIDGE_IFACE};
 use super::WrapperCrate;
 use crate::parse::wit_name::WitName;
 use anyhow::{Context, Result};
-use heck::{ToSnakeCase, ToUpperCamelCase};
+use heck::ToSnakeCase;
 use proc_macro2::TokenStream;
 use quote::quote;
 use toml::{map::Map, Value};
@@ -93,12 +93,12 @@ pub fn emit_edge_shim_guest_impl(shim_wit: &EdgeShimWit) -> TokenStream {
         .collect();
 
     let resource_snake = shim_wit.resource_wit_name.to_snake_case();
-    let resource_pascal: syn::Ident = syn::Ident::new(
-        &shim_wit.resource_wit_name.to_upper_camel_case(),
-        proc_macro2::Span::call_site(),
-    );
     let unwrap_fn: syn::Ident = syn::Ident::new(
         &format!("unwrap_{resource_snake}"),
+        proc_macro2::Span::call_site(),
+    );
+    let wrap_fn: syn::Ident = syn::Ident::new(
+        &format!("wrap_{resource_snake}"),
         proc_macro2::Span::call_site(),
     );
 
@@ -153,9 +153,19 @@ pub fn emit_edge_shim_guest_impl(shim_wit: &EdgeShimWit) -> TokenStream {
                 bindings::#(#raw_path)::*::#fn_ident(#(#call_args),*)#maybe_await
             };
 
-            let body = quote! {
-                #(#let_bindings)*
-                #call_expr
+            // A resource-typed return crosses back into the subgraph: wrap the
+            // raw handle into T' before handing it to the consumer.
+            let body = if f.return_is_resource_own {
+                quote! {
+                    #(#let_bindings)*
+                    let raw_ret = #call_expr;
+                    bindings::#(#bridge_segs)::*::#wrap_fn(raw_ret)
+                }
+            } else {
+                quote! {
+                    #(#let_bindings)*
+                    #call_expr
+                }
             };
 
             if has_explicit_return {

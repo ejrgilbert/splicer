@@ -1,7 +1,9 @@
 # Resource-method interception via forwarding wrappers
 
 **Status: factored resource method interception done at tier-3/4 (July 2026);
-inline resource T' codegen done; subgraph edge shims and recorder/fuzz remain.**
+inline resource T' codegen done; subgraph edge shims done for top-level `own<R>`
+in both directions (param-unwrap and return-wrap); `borrow<R>`/nested `own<R>`
+and recorder/fuzz remain.**
 POC at `tests/resource-wrap-poc/` (`./run.sh`).
 
 ## Goal (done criteria)
@@ -23,9 +25,17 @@ code and integration tests:
 - `FuncScope::Resource` predicate in `select.rs`.
 - Integration tests: `builtin-hello-tier3/4` confirm constructor + method calls reach
   the wrapper (`[constructor]`, `[method]`, `[static]` surfaces all fire).
+- Subgraph edge shims for top-level `own<R>`: `detect_collateral_interfaces` +
+  `emit_edge_shim_world` (`target_wit.rs`) + `emit_edge_shim.rs` emit a per-collateral
+  shim that unwraps `own<R>` params (handle leaving the subgraph) and wraps `own<R>`
+  returns (handle entering the subgraph); `wac.rs` third pass instantiates + routes them
+  and reuses the wrapper's existing `bridge` import. Integration: `on-subgraph-resource`
+  (param-unwrap exercised); return-wrap covered by a unit test (see Validation).
 
 **Remaining:**
-1. Subgraph edge shims (see below).
+1. Subgraph edge shims: top-level `own<R>` done in both directions (param-unwrap and
+   return-wrap); `borrow<R>`, receiver position, and nested `own<R>` (record/list/option)
+   remain. See below.
 2. Recorder/replayer + resources: tier-2 recorder and tier-4 replayer not yet
    exercised with resource methods.
 3. Fuzz coverage: resource types excluded from tier-1/2/3/4 generators.
@@ -129,7 +139,14 @@ The wrapper's `GuestBucket` impl: `struct WrappedBucket { inner: RawBucket }`,
 methods forward to `inner` (hooks here), `wrap = WrappedHandle::new(...)`,
 `unwrap = w.into_inner().inner`. See `tests/resource-wrap-poc/wrapper/src/lib.rs`.
 
-### Boundary-edge shim (step 4, not yet built)
+### Boundary-edge shim (step 4, built for top-level `own<R>`)
+
+Implemented for top-level `own<R>` in both directions: `emit_edge_shim.rs` emits a
+per-collateral shim that unwraps `own<R>` params and wraps `own<R>` returns, and
+`wac.rs` (third pass, `add_edge_shim_entity`) instantiates and routes it. What
+remains is `borrow<R>`, receiver position, and `own<R>` nested inside
+record/list/option. The design below still describes the target shape; the
+per-occurrence walk is the unfinished part.
 
 The POC's `edge` is a mint-then-wrap driver, not a real interposer. The real
 shim sits on a boundary edge that carries `T` as a function param/return and
@@ -262,7 +279,10 @@ Full rationale in memory note `project_resource_record_wiring`.
    the existing lift/lower walk. Direction rule: make the representation match
    the side it lands on (raw on the owner side, T' on the other). One shared
    wrapper component per resource type across all of S's boundary edges, so a
-   handle wrapped at one edge can be unwrapped at another.
+   handle wrapped at one edge can be unwrapped at another. **Done for top-level
+   `own<R>`** (`emit_edge_shim.rs`: unwrap params, wrap returns; one shim per
+   collateral interface). Remaining: `borrow<R>`, receiver, and nested
+   `own<R>` occurrences, plus consolidating to one shim per resource type.
 
 5. **wac: redirect.** Rewire consumer imports of the producer interface to the
    wrapper's fresh `store` export (cross-name, verified); wire edge shims'
@@ -279,9 +299,10 @@ subtyping, cross-name rewire. Remaining:
 - [x] Enumerate resource types in the target subgraph (`factored_resources_of` + `inline_resources_of`
   in `target_wit.rs`).
 - [~] Determine owner side / first-crossing direction per resource type (done for the
-  factored pattern; edge shim direction logic pending).
-- [ ] Classify every edge: internal / incoming / outgoing x carries-T
-  (incl. nested in record/list/option) -- needed for edge shims.
+  factored pattern and top-level `own<R>` edge-shim direction; nested/borrow pending).
+- [~] Classify every edge: internal / incoming / outgoing x carries-T. Done for top-level
+  `own<R>` params/returns on imported collateral interfaces (`detect_collateral_interfaces`);
+  nested (record/list/option) and `borrow<R>` remain.
 - [ ] Decide closure strategy: global redirect vs bounded cut (prove closed).
 
 **Codegen: wrapper** (`target_wit.rs`, `emit_method.rs`)
@@ -295,15 +316,17 @@ subtyping, cross-name rewire. Remaining:
 - [~] Constructor (sync hook), drop, statics, `borrow<T>`: constructor + most statics done;
   known codegen gaps remain (see "Folded-in sub-problems" below).
 
-**Codegen: edge shims** (new substrate)
-- [ ] Emit boundary-edge component(s): import bridge + boundary iface, re-export boundary iface.
-- [ ] Weave per-occurrence wrap/unwrap into the lift/lower walk (params, returns, receiver,
-  nested); direction = match the landing side.
-- [ ] One shared wrapper component per resource type across all boundary edges.
+**Codegen: edge shims** (`target_wit.rs`, `emit_edge_shim.rs`, `wac.rs`)
+- [x] Emit boundary-edge component(s): import bridge + boundary iface, re-export boundary iface.
+- [~] Weave per-occurrence wrap/unwrap: top-level `own<R>` params (unwrap, leaving the
+  subgraph) and returns (wrap, entering the subgraph) done; receiver, `borrow<R>`, and
+  nested (record/list/option) remain. Direction = match the landing side.
+- [ ] One shared wrapper component per resource type across all boundary edges (currently
+  one shim per collateral interface).
 
 **wac wiring** (`wac.rs`)
 - [x] Redirect consumer imports of the producer interface to `T'` (cross-name, via `t_prime_redirects`).
-- [ ] Wire edge bridge imports to the wrapper's bridge export (pending edge shims).
+- [x] Wire edge bridge imports to the wrapper's bridge export (`add_edge_shim_entity`, third pass).
 - [x] Wire wrapper import to the real producer.
 
 **Validation**
@@ -311,7 +334,12 @@ subtyping, cross-name rewire. Remaining:
   resources (confirmed by `builtin-hello-tier3/4` expected outputs).
 - [x] Runtime smoke test: `[constructor]`, `[method]`, `[static]` surfaces all fire in
   integration tests.
-- [ ] e2e: interposed factory returns a resource, outgoing-edge shim boxes it (step-4 flow).
+- [x] Edge shim param-unwrap exercised e2e (`on-subgraph-resource`: consumer passes a `T'`
+  handle to a collateral interface; shim unwraps to raw).
+- [x] Unit: return-position wrap (`collateral_returning_resource_emits_wrapping_edge_shim`,
+  `target_wit.rs`) -- a collateral fn returning `own<R>` gets `wrap-R` in the shim body.
+- [ ] e2e: interposed collateral *returns* a resource, edge shim wraps it into `T'`
+  (return-wrap; codegen + unit done, no integration fixture yet).
 - [ ] e2e: record then replay a resource-method trace (tier-2 recorder + tier-4 replayer).
 - [ ] Cover the full matrix: tier-1/2 resource interception still pending.
 
@@ -407,7 +435,8 @@ interface so the family isn't shared. Touch points:
 
 - POC: `tests/resource-wrap-poc/` (`./run.sh`, README documents each check).
 - Code: `src/wac.rs`, `src/adapter/typed/target_wit.rs`,
-  `src/adapter/typed/emit_method.rs`.
+  `src/adapter/typed/emit_method.rs`, `src/adapter/typed/emit_edge_shim.rs`
+  (edge shim codegen).
 - Blocker for the naive approach: wasm-tools#2506.
 - Related (distinct effort): `tier2-generic-resource-handles.md` (tier-2
   attribute/observability extraction off resources).
