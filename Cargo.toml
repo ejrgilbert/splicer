@@ -30,8 +30,8 @@ path = "examples/wac_compose.rs"
 
 [dependencies]
 colored = "3.1.1"
-#cviz = "3.0.0"
-cviz = { path = "../cviz" }
+cviz = "3.0.1"
+#cviz = { path = "../cviz" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
@@ -39,21 +39,21 @@ globset = "0.4.18"
 anyhow = "1.0.86"
 semver = "1"
 clap = { version = "4.5.58", features = ["derive"] }
-wasmparser = "0.247.0"
-wasm-encoder = { version = "0.247.0", features = ["wasmparser"] }
-wit-parser = "0.247"
-wit-bindgen-core = "0.57.1"
-wit-bindgen-rust = "0.57.1"
+wasmparser = "0.263.0"
+wasm-encoder = { version = "0.263.0", features = ["wasmparser"] }
+wit-parser = "0.262.0"
+wit-bindgen-core = "0.63.0"
+wit-bindgen-rust = "0.63.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-#wirm = "5.0.0"
-wirm = { path = "../../research/compilers/wirm" }
-wit-component = "0.247"
+wirm = "5.2.0"
+#wirm = { path = "../../research/compilers/wirm" }
+wit-component = "0.262.0"
 oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
 tokio = { version = "1", features = ["rt", "macros"] }
-wac-parser = "0.10"
-wac-resolver = "0.10"
-wac-graph = "0.10"
+wac-parser = "0.12.0"
+wac-resolver = "0.12.0"
+wac-graph = "0.12.0"
 tempfile = "3"
 builtin-protocol = { package = "splicer-builtin-protocol", path = "builtins/builtin-protocol", version = "0.2.0" }
 toml = "0.8"
@@ -71,8 +71,8 @@ toml = "0.8"
 [dev-dependencies]
 wat = "1"
 arbitrary = "1"
-wit-component = { version = "0.247", features = ["dummy-module"] }
-wasmtime = { version = "44", features = ["component-model", "component-model-async", "async"] }
-wasmtime-wasi = "44"
+wit-component = { version = "0.262.0", features = ["dummy-module"] }
+wasmtime = { version = "50.0.3", features = ["component-model", "component-model-async", "async"] }
+wasmtime-wasi = "50.0.3"
 tokio = { version = "1", features = ["rt", "macros"] }
 

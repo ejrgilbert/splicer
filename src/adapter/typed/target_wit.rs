@@ -837,6 +837,7 @@ fn declare_fresh_resource(
         docs: Docs::default(),
         stability: Stability::default(),
         span: Span::default(),
+        external_id: None,
     });
     resolve.interfaces[dest_iface_id]
         .types
@@ -878,6 +879,7 @@ fn copy_resource_methods(
                 docs: Docs::default(),
                 stability: Stability::default(),
                 span: Span::default(),
+                external_id: None,
             },
         );
     }
@@ -899,6 +901,7 @@ fn emit_bridge_pair(
         docs: Docs::default(),
         stability: Stability::default(),
         span: Span::default(),
+        external_id: None,
     });
     resolve.interfaces[bridge_iface_id]
         .types
@@ -911,6 +914,7 @@ fn emit_bridge_pair(
         docs: Docs::default(),
         stability: Stability::default(),
         span: Span::default(),
+        external_id: None,
     });
     resolve.interfaces[bridge_iface_id]
         .types
@@ -928,6 +932,7 @@ fn emit_bridge_pair(
         docs: Docs::default(),
         stability: Stability::default(),
         span: Span::default(),
+        external_id: None,
     });
     let own_wrapped = resolve.types.alloc(TypeDef {
         name: None,
@@ -936,6 +941,7 @@ fn emit_bridge_pair(
         docs: Docs::default(),
         stability: Stability::default(),
         span: Span::default(),
+        external_id: None,
     });
 
     let wrap_fn = format!("wrap-{wit_name}");
@@ -953,6 +959,7 @@ fn emit_bridge_pair(
             docs: Docs::default(),
             stability: Stability::default(),
             span: Span::default(),
+            external_id: None,
         },
     );
 
@@ -971,6 +978,7 @@ fn emit_bridge_pair(
             docs: Docs::default(),
             stability: Stability::default(),
             span: Span::default(),
+            external_id: None,
         },
     );
 }
@@ -1044,6 +1052,7 @@ fn build_t_prime_iface(
                 docs: Docs::default(),
                 stability: Stability::default(),
                 span: Span::default(),
+                external_id: None,
             },
         );
     }
@@ -1137,6 +1146,8 @@ fn build_wrapper_world(
         id,
         stability: Stability::default(),
         span: Span::default(),
+        docs: Docs::default(),
+        external_id: None,
     };
 
     // Imports: external target + sibling interfaces.
@@ -1272,6 +1283,7 @@ fn substitute_id(
         docs: Docs::default(),
         stability: Stability::default(),
         span: Span::default(),
+        external_id: None,
     })
 }
 
@@ -1406,6 +1418,7 @@ fn ensure_use_alias(
         docs: Docs::default(),
         stability: Stability::default(),
         span: Span::default(),
+        external_id: None,
     });
     resolve.interfaces[t_prime_iface_id]
         .types
@@ -1437,7 +1450,7 @@ pub(crate) mod test_fixture {
             world_id,
             ManglingAndAbi::Legacy(LiftLowerAbi::AsyncStackful),
         );
-        embed_component_metadata(&mut core, &resolve, world_id, StringEncoding::UTF8)
+        embed_component_metadata(&mut core, &resolve, world_id, StringEncoding::UTF8, false)
             .context("embed_component_metadata")?;
         ComponentEncoder::default()
             .validate(false)

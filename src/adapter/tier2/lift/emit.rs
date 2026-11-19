@@ -2144,7 +2144,7 @@ fn emit_list_of_arm(
     f.instructions().i32_store(MemArg {
         offset: 0,
         align: I32_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     });
 
     f.instructions().local_get(ll.j);
@@ -2276,7 +2276,7 @@ fn emit_stage_tuple_slot(
         f.instructions().i32_store(MemArg {
             offset: ((i as u32) * 4) as u64,
             align: I32_STORE_LOG2_ALIGN,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
         });
     }
 }
@@ -2367,7 +2367,7 @@ fn emit_handle_runtime_fill(
         f.instructions().i32_store(MemArg {
             offset: off as u64,
             align: I32_STORE_LOG2_ALIGN,
-            memory_index: 0,
+            target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
         });
     };
     store_i32(
@@ -2387,7 +2387,7 @@ fn emit_handle_runtime_fill(
     f.instructions().i64_store(MemArg {
         offset: id_off as u64,
         align: I64_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     });
 }
 
@@ -2415,7 +2415,7 @@ fn emit_record_runtime_fill(
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     };
 
     match fill.slot_source {
@@ -2652,7 +2652,7 @@ fn emit_flags_runtime_fill(
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     };
 
     let base_local = lcl
@@ -2790,12 +2790,12 @@ fn emit_variant_runtime_fill(
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     };
     let store_i8 = |off: u32| MemArg {
         offset: off as u64,
         align: I8_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     };
 
     // Static folds offsets into memargs; PerIteration stages slot_addr.

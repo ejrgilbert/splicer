@@ -466,6 +466,7 @@ pub(crate) fn desugar_map_aliases(resolve: &mut Resolve) -> MapAliases {
             docs: Docs::default(),
             stability: Stability::default(),
             span: Span::default(),
+            external_id: None,
         });
         aliases.map_to_tuple.insert(map_id, tuple_id);
     }
