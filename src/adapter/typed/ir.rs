@@ -386,15 +386,24 @@ fn resource_pascal(resolve: &Resolve, type_id: TypeId) -> Result<String> {
 fn rust_method_name_for(func: &Function, fallback_name: &str) -> String {
     match &func.kind {
         FunctionKind::Constructor(_) => "new".to_string(),
-        FunctionKind::Method(_) | FunctionKind::AsyncMethod(_) => fallback_name
+        FunctionKind::Method(_)
+        | FunctionKind::AsyncMethod(_)
+        | FunctionKind::MethodGetter(_)
+        | FunctionKind::MethodSetter(_) => fallback_name
             .rsplit_once('.')
             .map(|(_, m)| m.to_string())
             .unwrap_or_else(|| fallback_name.to_string()),
-        FunctionKind::Static(_) | FunctionKind::AsyncStatic(_) => fallback_name
+        FunctionKind::Static(_)
+        | FunctionKind::AsyncStatic(_)
+        | FunctionKind::StaticGetter(_)
+        | FunctionKind::StaticSetter(_) => fallback_name
             .rsplit_once('.')
             .map(|(_, m)| m.to_string())
             .unwrap_or_else(|| fallback_name.to_string()),
-        FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => fallback_name.to_string(),
+        FunctionKind::Freestanding
+        | FunctionKind::AsyncFreestanding
+        | FunctionKind::Getter
+        | FunctionKind::Setter => fallback_name.to_string(),
     }
 }
 
@@ -455,9 +464,18 @@ pub enum ExportFnKind {
 impl From<&FunctionKind> for ExportFnKind {
     fn from(k: &FunctionKind) -> Self {
         match k {
-            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => Self::Freestanding,
-            FunctionKind::Method(_) | FunctionKind::AsyncMethod(_) => Self::Method,
-            FunctionKind::Static(_) | FunctionKind::AsyncStatic(_) => Self::Static,
+            FunctionKind::Freestanding
+            | FunctionKind::AsyncFreestanding
+            | FunctionKind::Getter
+            | FunctionKind::Setter => Self::Freestanding,
+            FunctionKind::Method(_)
+            | FunctionKind::AsyncMethod(_)
+            | FunctionKind::MethodGetter(_)
+            | FunctionKind::MethodSetter(_) => Self::Method,
+            FunctionKind::Static(_)
+            | FunctionKind::AsyncStatic(_)
+            | FunctionKind::StaticGetter(_)
+            | FunctionKind::StaticSetter(_) => Self::Static,
             FunctionKind::Constructor(_) => Self::Constructor,
         }
     }

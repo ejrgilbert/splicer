@@ -92,7 +92,7 @@ pub(crate) fn build_adapter(
         has_after,
         has_gate,
     )?;
-    embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
+    embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8, false)
         .context("embed_component_metadata")?;
 
     ComponentEncoder::default()

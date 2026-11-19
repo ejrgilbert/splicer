@@ -1016,7 +1016,7 @@ pub(crate) fn emit_store_slice_ptr_runtime(
     f.instructions().i32_store(MemArg {
         offset: (field_off + SLICE_PTR_OFFSET) as u64,
         align: I32_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     });
 }
 
@@ -1034,7 +1034,7 @@ pub(crate) fn emit_store_slice_len_runtime(
     f.instructions().i32_store(MemArg {
         offset: (field_off + SLICE_LEN_OFFSET) as u64,
         align: I32_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     });
 }
 
@@ -1045,7 +1045,7 @@ pub(crate) fn emit_store_i64_local(f: &mut Function, base_ptr: i32, field_off: u
     f.instructions().i64_store(MemArg {
         offset: field_off as u64,
         align: I64_STORE_LOG2_ALIGN,
-        memory_index: 0,
+        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
     });
 }
 
