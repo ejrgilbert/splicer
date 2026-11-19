@@ -111,14 +111,13 @@ pub(crate) fn build_adapter(
 /// each param/result to live in the interface being encoded. Re-point them back
 /// at B's alias.
 ///
-///     (type (instance                     ;; interface B
-///       (alias outer 1 1 (type (;0;)))    ;; B's type 0 = alias of A's `order`
-///       (export "order" (type (eq 0)))
-///       (type (func (param "o" 0)))))     ;; source:  param -> B's type 0 (-> A's `order`)
-///                                         ;; decoded: param -> A's `order`, hop dropped
-///
-/// Top-level refs only; a nested type (e.g. a `list` of it) still points at A —
-/// see `test_adapter_cross_interface_nested_value_types`.
+/// ```text
+/// (type (instance                     ;; interface B
+///   (alias outer 1 1 (type (;0;)))    ;; B's type 0 = alias of A's `order`
+///   (export "order" (type (eq 0)))
+///   (type (func (param "o" 0)))))     ;; source:  param -> B's type 0 (-> A's `order`)
+///                                     ;; decoded: param -> A's `order`, hop dropped
+/// ```
 fn repoint_fns_to_local_aliases(resolve: &mut Resolve, iface_id: InterfaceId) {
     use std::collections::HashMap;
     use wit_parser::{Type, TypeDefKind, TypeId, TypeOwner};
@@ -145,23 +144,85 @@ fn repoint_fns_to_local_aliases(resolve: &mut Resolve, iface_id: InterfaceId) {
         .cloned()
         .collect();
     for fname in fn_names {
-        let func = resolve.interfaces[iface_id]
+        // Copy the signature types out so `repoint_ty` can borrow `resolve` mutably.
+        let (params, result): (Vec<Type>, Option<Type>) = {
+            let f = &resolve.interfaces[iface_id].functions[&fname];
+            (f.params.iter().map(|p| p.ty).collect(), f.result)
+        };
+        let params: Vec<Type> = params
+            .into_iter()
+            .map(|t| repoint_ty(resolve, t, &alias_of))
+            .collect();
+        let result = result.map(|t| repoint_ty(resolve, t, &alias_of));
+
+        let f = resolve.interfaces[iface_id]
             .functions
             .get_mut(&fname)
             .unwrap();
-        for p in func.params.iter_mut() {
-            if let Type::Id(id) = &mut p.ty {
-                if let Some(&a) = alias_of.get(id) {
-                    *id = a;
-                }
-            }
+        for (p, new_ty) in f.params.iter_mut().zip(params) {
+            p.ty = new_ty;
         }
-        if let Some(Type::Id(id)) = &mut func.result {
-            if let Some(&a) = alias_of.get(id) {
-                *id = a;
-            }
+        f.result = result;
+    }
+}
+
+/// Rewrite `ty` so any reference to a type with a local alias in `alias_of`
+/// becomes that alias. A direct reference is swapped outright; a reference
+/// reached through an anonymous wrapper (`list`, `record`, …) is rewritten by
+/// cloning the wrapper, so shared types aren't mutated in place.
+fn repoint_ty(
+    resolve: &mut Resolve,
+    ty: Type,
+    alias_of: &std::collections::HashMap<TypeId, TypeId>,
+) -> Type {
+    use wit_parser::TypeOwner;
+
+    let Type::Id(id) = ty else {
+        return ty;
+    };
+    if let Some(&alias) = alias_of.get(&id) {
+        return Type::Id(alias);
+    }
+    // Only descend into anonymous structural types (the wrappers decode makes);
+    // named types are their own references and must not be mutated.
+    if resolve.types[id].owner != TypeOwner::None {
+        return ty;
+    }
+    let mut kind = resolve.types[id].kind.clone();
+    let mut changed = false;
+    for slot in type_slots(&mut kind) {
+        let new = repoint_ty(resolve, *slot, alias_of);
+        if new != *slot {
+            *slot = new;
+            changed = true;
         }
     }
+    if !changed {
+        return ty;
+    }
+    let mut td = resolve.types[id].clone();
+    td.kind = kind;
+    Type::Id(resolve.types.alloc(td))
+}
+
+/// Mutable references to every `Type` embedded directly in a `TypeDefKind`.
+fn type_slots(kind: &mut wit_parser::TypeDefKind) -> Vec<&mut Type> {
+    use wit_parser::TypeDefKind::*;
+    let mut slots = Vec::new();
+    match kind {
+        Record(r) => slots.extend(r.fields.iter_mut().map(|f| &mut f.ty)),
+        Variant(v) => slots.extend(v.cases.iter_mut().filter_map(|c| c.ty.as_mut())),
+        Tuple(t) => slots.extend(t.types.iter_mut()),
+        List(t) | FixedLengthList(t, _) | Option(t) => slots.push(t),
+        Result(r) => {
+            slots.extend(r.ok.as_mut());
+            slots.extend(r.err.as_mut());
+        }
+        Future(t) | Stream(t) => slots.extend(t.as_mut()),
+        Type(t) => slots.push(t),
+        _ => {}
+    }
+    slots
 }
 
 /// Bail on cases the new path doesn't yet handle. Resource-bound
