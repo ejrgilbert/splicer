@@ -55,6 +55,8 @@ pub(in crate::adapter) enum SplitKind {
     /// Value-type only — mirrors the nebula `orders` composition
     /// shape that surfaced the cross-interface aliasing bug.
     ConsumerSiblingTypes,
+    /// Recursive sibling types with ref chains
+    ConsumerSiblingTypesNested,
 }
 
 /// Build a minimal split component for the given `kind`. Written as
@@ -87,6 +89,9 @@ pub(in crate::adapter) fn synth_split(
         (SplitKind::Provider, false) => wat_provider_primitive_only(target, iface_inst, arena),
         (SplitKind::Provider, true) => wat_provider_http_handler_shape(target),
         (SplitKind::ConsumerSiblingTypes, _) => wat_consumer_cross_interface_value_types(target),
+        (SplitKind::ConsumerSiblingTypesNested, _) => {
+            wat_consumer_cross_interface_nested_value_types(target)
+        }
     };
 
     let bytes = wat::parse_str(&wat).unwrap_or_else(|e| {
@@ -453,6 +458,41 @@ fn wat_consumer_cross_interface_value_types(target: &str) -> String {
     (export "quote" (type (eq 2)))
     (type (;4;) (func (param "order" 0) (result 2)))
     (export "create-order" (func (type 4)))
+  ))
+  (import "{target}" (instance (;1;) (type 3)))
+)
+"#
+    )
+}
+
+/// Recursive chain of type refs
+fn wat_consumer_cross_interface_nested_value_types(target: &str) -> String {
+    format!(
+        r#"(component
+  (type (;0;) (instance
+    (type (record (field "sku" string) (field "quantity" u32) (field "unit-price" f64)))
+    (export "item" (type (eq 0)))
+    (type (list 1))
+    (type (enum "BE" "US" "UK" "JP" "CA" "AU"))
+    (export "country" (type (eq 3)))
+    (type (record (field "order-id" string) (field "items" 2) (field "destination" 4)))
+    (export "order" (type (eq 5)))
+    (type (enum "EUR" "USD" "GBP" "JPY" "CAD" "AUD"))
+    (export "currency" (type (eq 7)))
+    (type (record (field "order-id" string) (field "subtotal" f64) (field "tax" f64) (field "total" f64) (field "currency" 8)))
+    (export "quote" (type (eq 9)))
+  ))
+  (import "synth:test/types" (instance (;0;) (type 0)))
+  (alias export 0 "order" (type (;1;)))
+  (alias export 0 "quote" (type (;2;)))
+  (type (;3;) (instance
+    (alias outer 1 1 (type (;0;)))
+    (export "order" (type (eq 0)))
+    (alias outer 1 2 (type (;2;)))
+    (export "quote" (type (eq 2)))
+    (type (;4;) (list 0))
+    (type (;5;) (func (param "orders" 4) (result 2)))
+    (export "create-order" (func (type 5)))
   ))
   (import "{target}" (instance (;1;) (type 3)))
 )
@@ -1284,6 +1324,18 @@ fn test_adapter_cross_interface_value_types() {
         &iface,
         &graph.arena,
         SplitKind::ConsumerSiblingTypes,
+    );
+}
+
+#[test]
+fn test_adapter_cross_interface_nested_value_types() {
+    let arena = TypeArena::default();
+    let iface = make_iface(vec![]);
+    gen_and_validate(
+        "nebula:service/orders",
+        &iface,
+        &arena,
+        SplitKind::ConsumerSiblingTypesNested,
     );
 }
 

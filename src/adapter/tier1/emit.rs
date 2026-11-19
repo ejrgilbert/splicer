@@ -83,6 +83,8 @@ pub(crate) fn build_adapter(
         .select_world(&[world_pkg], Some(ADAPTER_WORLD_NAME))
         .context("select adapter world")?;
 
+    repoint_fns_to_local_aliases(&mut resolve, target_iface);
+
     let mut core_module = build_dispatch_module(
         &resolve,
         world_id,
@@ -101,6 +103,65 @@ pub(crate) fn build_adapter(
         .context("ComponentEncoder::module")?
         .encode()
         .context("ComponentEncoder::encode")
+}
+
+/// `wit_component::decode` flattens alias chains: in the source component B's
+/// func references B's local alias of a type that lives in A, but decode points
+/// the func straight at A's type. The re-encoder then rejects it — it requires
+/// each param/result to live in the interface being encoded. Re-point them back
+/// at B's alias.
+///
+///     (type (instance                     ;; interface B
+///       (alias outer 1 1 (type (;0;)))    ;; B's type 0 = alias of A's `order`
+///       (export "order" (type (eq 0)))
+///       (type (func (param "o" 0)))))     ;; source:  param -> B's type 0 (-> A's `order`)
+///                                         ;; decoded: param -> A's `order`, hop dropped
+///
+/// Top-level refs only; a nested type (e.g. a `list` of it) still points at A —
+/// see `test_adapter_cross_interface_nested_value_types`.
+fn repoint_fns_to_local_aliases(resolve: &mut Resolve, iface_id: InterfaceId) {
+    use std::collections::HashMap;
+    use wit_parser::{Type, TypeDefKind, TypeId, TypeOwner};
+
+    // A's type id -> B's own alias of it
+    let mut alias_of: HashMap<TypeId, TypeId> = HashMap::new();
+    for (_name, &alias_tid) in resolve.interfaces[iface_id].types.iter() {
+        if resolve.types[alias_tid].owner != TypeOwner::Interface(iface_id) {
+            continue;
+        }
+        if let TypeDefKind::Type(Type::Id(inner)) = resolve.types[alias_tid].kind {
+            if resolve.types[inner].owner != TypeOwner::Interface(iface_id) {
+                alias_of.insert(inner, alias_tid);
+            }
+        }
+    }
+    if alias_of.is_empty() {
+        return;
+    }
+
+    let fn_names: Vec<String> = resolve.interfaces[iface_id]
+        .functions
+        .keys()
+        .cloned()
+        .collect();
+    for fname in fn_names {
+        let func = resolve.interfaces[iface_id]
+            .functions
+            .get_mut(&fname)
+            .unwrap();
+        for p in func.params.iter_mut() {
+            if let Type::Id(id) = &mut p.ty {
+                if let Some(&a) = alias_of.get(id) {
+                    *id = a;
+                }
+            }
+        }
+        if let Some(Type::Id(id)) = &mut func.result {
+            if let Some(&a) = alias_of.get(id) {
+                *id = a;
+            }
+        }
+    }
 }
 
 /// Bail on cases the new path doesn't yet handle. Resource-bound
