@@ -251,7 +251,10 @@ fn edge_shim_cargo_toml(crate_name: &str) -> String {
     );
 
     let mut dependencies = Map::new();
-    dependencies.insert("wit-bindgen".into(), Value::String("0.57".into()));
+    dependencies.insert(
+        "wit-bindgen".into(),
+        Value::String(super::WRAPPER_WIT_BINDGEN_VERSION.into()),
+    );
 
     let mut root = Map::new();
     root.insert("package".into(), Value::Table(package));

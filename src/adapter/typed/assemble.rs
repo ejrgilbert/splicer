@@ -193,7 +193,10 @@ pub fn assemble_cargo_toml(inputs: &CargoTomlInputs<'_>) -> String {
         inputs.strategy_crate_name.into(),
         Value::Table(strategy_dep),
     );
-    dependencies.insert("wit-bindgen".into(), Value::String("0.57".into()));
+    dependencies.insert(
+        "wit-bindgen".into(),
+        Value::String(super::WRAPPER_WIT_BINDGEN_VERSION.into()),
+    );
 
     let mut root = Map::new();
     root.insert("package".into(), Value::Table(package));

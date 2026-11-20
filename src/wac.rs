@@ -947,7 +947,7 @@ impl EmitPlan {
                 var: shim_var.clone(),
                 pkg: shim_pkg.clone(),
                 imports,
-                catchall: false,
+                catchall: true,
             },
         );
         self.used_middlewares

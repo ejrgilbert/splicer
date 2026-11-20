@@ -309,8 +309,8 @@ fn integration_builtin_replayer() {
     run_config("builtin-replayer");
 }
 
-// #[test]
-// #[ignore]
-// fn integration_on_subgraph_resource() {
-//     run_config("on-subgraph-resource");
-// }
+#[test]
+#[ignore]
+fn integration_on_subgraph_resource() {
+    run_config("on-subgraph-resource");
+}

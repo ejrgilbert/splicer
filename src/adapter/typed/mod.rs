@@ -14,6 +14,11 @@ mod emit_wit_typed;
 mod ir;
 pub(crate) mod target_wit;
 
+mod wit_bindgen_version {
+    include!(concat!(env!("OUT_DIR"), "/wrapper_wit_bindgen_version.rs"));
+}
+pub(crate) use wit_bindgen_version::WRAPPER_WIT_BINDGEN_VERSION;
+
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
 pub use bindgen::{alias_shared_export_types, run_wit_bindgen_rust};
 pub use bindings_index::build_bindings_index;

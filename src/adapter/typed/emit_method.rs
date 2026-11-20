@@ -626,6 +626,9 @@ fn emit_method_body(
     let return_ty_ref = fn_sig_entry.and_then(|s| s.return_ty.as_ref());
 
     // Compute call-site expressions for each param from the canonical WIT types.
+    // `borrow<R>` params also yield a pre-binding (see `param_call_expr`) that
+    // must be evaluated before `args` is built and captured by the closure.
+    let mut borrow_prebindings: Vec<(syn::Ident, TokenStream)> = Vec::new();
     let param_exprs: Vec<TokenStream> = ir
         .fn_funcs
         .get(&args_ident.to_string())
@@ -636,13 +639,17 @@ fn emit_method_body(
                 .skip(if skip_self { 1 } else { 0 })
                 .zip(fields.iter())
                 .map(|(param, f)| {
-                    param_call_expr(
+                    let p = param_call_expr(
                         &param.ty,
                         &f.rust_ident,
                         is_async,
                         &ir.resolve,
                         &ir.resources,
-                    )
+                    );
+                    if let Some(pb) = p.prebinding {
+                        borrow_prebindings.push(pb);
+                    }
+                    p.expr
                 })
                 .collect()
         })
@@ -793,6 +800,14 @@ fn emit_method_body(
         quote!(#args_ident)
     };
 
+    // When a `borrow<R>` pre-binding is captured, the forwarding closure must
+    // `move` so it owns the captured import-side reference.
+    let closure_move = if borrow_prebindings.is_empty() {
+        quote!()
+    } else {
+        quote!(move)
+    };
+
     let dispatch = match behavior {
         Behavior::Transform => {
             // Annotate the closure parameter; qualified
@@ -803,7 +818,7 @@ fn emit_method_body(
                     s,
                     call,
                     args,
-                    |args: #args_ty| async move { #closure_body },
+                    #closure_move |args: #args_ty| async move { #closure_body },
                 )
             }
         }
@@ -821,7 +836,7 @@ fn emit_method_body(
     let sync_dispatch = match behavior {
         Behavior::Transform => quote! {
             <_ as ::splicer_tool_sdk::SyncTransformStrategy<#args_ty, #strategy_r_ty>>::handle(
-                s, call, args, |args: #args_ty| { #closure_body },
+                s, call, args, #closure_move |args: #args_ty| { #closure_body },
             )
         },
         Behavior::Virtualize => quote! {
@@ -843,12 +858,18 @@ fn emit_method_body(
                 None => quote! { #sync_dispatch },
             }
         };
+        // Resolve `borrow<R>` import-side references before `args` moves the
+        // borrow handles in; the closure captures these bindings.
+        let prebindings = borrow_prebindings.iter().map(|(ident, rhs)| {
+            quote! { let #ident = #rhs; }
+        });
         quote! {
             let call = ::splicer_tool_sdk::CallId {
                 interface_name: #interface_qualified_name.into(),
                 function_name: #method_name.into(),
                 id: 0,
             };
+            #(#prebindings)*
             let args = #args_construct;
             let s = strategy();
             #tail
@@ -922,12 +943,34 @@ fn delegation_method_sig(sig: &DelegationSig) -> (TokenStream, TokenStream, Toke
     (generics, inputs, output)
 }
 
+/// The call-site expression for one param, plus an optional pre-binding
+/// that must be emitted (and evaluated) before the `args` struct is built.
+struct ParamCallExpr {
+    /// Expression placed at the import-side call site inside the closure.
+    expr: TokenStream,
+    /// `Some((ident, rhs))` for `borrow<R>` params: the closure captures
+    /// `let ident = rhs;` from the enclosing fn rather than dereferencing
+    /// the borrow through `args` — see [`param_call_expr`] for why.
+    prebinding: Option<(syn::Ident, TokenStream)>,
+}
+
 /// Produce the expression to pass a single param at an import-side call site.
 /// Rules are driven entirely by the canonical WIT type:
 /// - `string` or `list<_>` in a sync context: `&args.name` (borrowed)
 /// - `own<R>` where R is a T' resource: `args.name.into_inner::<WrapperR>().0`
-/// - `borrow<R>` where R is a T' resource: `&args.name.get::<WrapperR>().0`
+/// - `borrow<R>` where R is a T' resource: pre-bind `let __borrow_name =
+///   &name.get::<WrapperR>().0;` from the raw method param and pass that ident
 /// - everything else: `args.name` (move)
+///
+/// The `borrow<R>` case cannot dereference through the moved `args` inside the
+/// forwarding closure: wit-bindgen's `RBorrow<'a>::get()` returns `&'a T` tied
+/// to the `args` struct's fixed lifetime param, and a future that borrows at
+/// that fixed `'a` can't satisfy the higher-ranked `CallRefFuture<'_>` of the
+/// SDK's `downstream: impl AsyncFn(Args) -> R` bound. Resolving the import-side
+/// reference once up front and capturing it in the closure environment ties the
+/// borrow to the closure (`CallRefFuture`), which is well-formed. The resolved
+/// `&'a` reference is independent of the local `name` storage, so `name` can
+/// still be moved into `args` afterward.
 ///
 /// Both the typedef-level and resource-level TypeIds are resolved through
 /// `resolve_type_alias` so USE-aliases in the WIT match the canonical ids
@@ -938,13 +981,17 @@ fn param_call_expr(
     is_async: bool,
     resolve: &wit_parser::Resolve,
     resources: &[ResourceInfo],
-) -> TokenStream {
+) -> ParamCallExpr {
+    let plain = |expr| ParamCallExpr {
+        expr,
+        prebinding: None,
+    };
     if let Type::Id(raw_id) = ty {
         // Follow USE-aliases to the canonical typedef so Handle patterns match.
         let canonical_typedef_id = resolve_type_alias(resolve, *raw_id);
         let kind = &resolve.types[canonical_typedef_id].kind;
         if !is_async && matches!(kind, TypeDefKind::List(_)) {
-            return quote!(&args.#name);
+            return plain(quote!(&args.#name));
         }
         if let TypeDefKind::Handle(h) = kind {
             let (resource_id, is_borrow) = match h {
@@ -955,17 +1002,21 @@ fn param_call_expr(
             if let Some(r) = t_prime_resource_by_type_id(canonical_resource, resources) {
                 let wrap_ident = wrapper_ident_for(&r.rust_ident);
                 return if is_borrow {
-                    quote!(&args.#name.get::<#wrap_ident>().0)
+                    let binding = quote::format_ident!("__borrow_{}", name);
+                    ParamCallExpr {
+                        expr: quote!(#binding),
+                        prebinding: Some((binding, quote!(&#name.get::<#wrap_ident>().0))),
+                    }
                 } else {
-                    quote!(args.#name.into_inner::<#wrap_ident>().0)
+                    plain(quote!(args.#name.into_inner::<#wrap_ident>().0))
                 };
             }
         }
     }
     if !is_async && matches!(ty, Type::String) {
-        return quote!(&args.#name);
+        return plain(quote!(&args.#name));
     }
-    quote!(args.#name)
+    plain(quote!(args.#name))
 }
 
 /// Find a T' resource (is_owned + inner_type_path set) by its canonical TypeId.
@@ -1351,6 +1402,86 @@ mod tests {
             decls.contains("bindings :: exports :: test :: pkg :: ops :: Point")
                 || decls.contains("bindings::exports::test::pkg::ops::Point"),
             "args struct field should use absolute bindings:: path: {decls}"
+        );
+    }
+
+    /// Build a `Resolve` from `wit` and return the handle typedef id for the
+    /// first `own`/`borrow` handle plus the resource id it refers to, along
+    /// with a T' `ResourceInfo` describing that resource. Lets the
+    /// `param_call_expr` tests drive the borrow/own branches without the full
+    /// T' redirect IR machinery.
+    fn handle_fixture(wit: &str) -> (wit_parser::Resolve, TypeId, Vec<ResourceInfo>) {
+        let (resolve, _world_id, _src) = run_wit_bindgen_rust(wit, Some("w")).unwrap();
+        let (handle_id, resource_id) = resolve
+            .types
+            .iter()
+            .find_map(|(id, ty)| match &ty.kind {
+                TypeDefKind::Handle(Handle::Own(r) | Handle::Borrow(r)) => Some((id, *r)),
+                _ => None,
+            })
+            .expect("fixture WIT must contain a handle type");
+        let resources = vec![ResourceInfo {
+            iface_path: vec!["bindings".into()],
+            wit_name: "r".into(),
+            rust_ident: syn::Ident::new("R", Span::call_site()),
+            type_id: resolve_type_alias(&resolve, resource_id),
+            is_owned: true,
+            // `Some(..)` is what marks this as a T' (producer-owned) resource,
+            // which is the only case `param_call_expr` rewrites.
+            inner_type_path: Some(vec!["bindings".into(), "R".into()]),
+        }];
+        (resolve, handle_id, resources)
+    }
+
+    #[test]
+    fn param_call_expr_borrow_prebinds_import_ref_out_of_closure() {
+        // `borrow<r>` must resolve the import-side `&R` before the args move,
+        // and the closure call site refers to that pre-binding — not
+        // `args.c.get()`, whose `&'a` ties to the args lifetime and breaks the
+        // `AsyncFn(Args) -> R` bound.
+        let wit = r#"
+            package test:pkg@0.1.0;
+            interface ops {
+                resource r;
+                use-it: async func(c: borrow<r>) -> u32;
+            }
+            world w { export ops; }
+        "#;
+        let (resolve, handle_id, resources) = handle_fixture(wit);
+        let name = syn::Ident::new("c", Span::call_site());
+        let p = param_call_expr(&Type::Id(handle_id), &name, true, &resolve, &resources);
+
+        assert_eq!(p.expr.to_string(), "__borrow_c", "call site is the binding");
+        let (bind_ident, rhs) = p.prebinding.expect("borrow<R> yields a pre-binding");
+        assert_eq!(bind_ident.to_string(), "__borrow_c");
+        let rhs = normalize(&rhs.to_string());
+        assert!(
+            rhs.contains("& c . get ::") && rhs.contains("WrapperR"),
+            "pre-binding derefs the raw param via get::<WrapperR>: {rhs}"
+        );
+    }
+
+    #[test]
+    fn param_call_expr_own_moves_through_args_without_prebinding() {
+        // `own<r>` is moved out of `args` inside the closure; no borrow
+        // lifetime leaks, so there is no pre-binding.
+        let wit = r#"
+            package test:pkg@0.1.0;
+            interface ops {
+                resource r;
+                take-it: async func(c: r) -> u32;
+            }
+            world w { export ops; }
+        "#;
+        let (resolve, handle_id, resources) = handle_fixture(wit);
+        let name = syn::Ident::new("c", Span::call_site());
+        let p = param_call_expr(&Type::Id(handle_id), &name, true, &resolve, &resources);
+
+        assert!(p.prebinding.is_none(), "own<R> needs no pre-binding");
+        let expr = normalize(&p.expr.to_string());
+        assert!(
+            expr.contains("args . c . into_inner ::") && expr.contains("WrapperR"),
+            "own<R> moves through args via into_inner::<WrapperR>: {expr}"
         );
     }
 }
