@@ -25,4 +25,4 @@ arbitrary = "1"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
 splicer-tool-sdk-derive = { version = "0.1.0", path = "derive" }
-wit-bindgen = "0.51.0"
+wit-bindgen = "0.63.0"
