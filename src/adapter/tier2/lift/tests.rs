@@ -443,7 +443,7 @@ fn func_with_params(
 /// `fields` slot.
 fn synth_record_info_layouts(resolve: &Resolve) -> (RecordLayout, RecordLayout) {
     let mut sizes = SizeAlign::default();
-    sizes.fill(resolve);
+    sizes.fill(resolve).expect("failed to fill");
     let entry = RecordLayout::for_named_fields(
         &sizes,
         &[
@@ -480,7 +480,7 @@ fn synth_cell_layout() -> CellLayout {
         .copied()
         .expect("splicer:common/types must export `cell`");
     let mut sizes = SizeAlign::default();
-    sizes.fill(&resolve);
+    sizes.fill(&resolve).expect("failed to fill");
     CellLayout::from_resolve(&sizes, &resolve, cell_id)
 }
 
@@ -502,7 +502,7 @@ fn synth_info_layout(record_name: &str) -> RecordLayout {
         .copied()
         .unwrap_or_else(|| panic!("splicer:common/types must export `{record_name}`"));
     let mut sizes = SizeAlign::default();
-    sizes.fill(&resolve);
+    sizes.fill(&resolve).expect("failed to fill");
     RecordLayout::for_record_typedef(&sizes, &resolve, record_id)
 }
 
@@ -660,7 +660,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     use crate::adapter::indices::FrozenLocals;
 
     let mut sizes = SizeAlign::default();
-    sizes.fill(resolve);
+    sizes.fill(resolve).expect("failed to fill");
     let cell_layout = synth_cell_layout();
     let handle_info_layout = synth_info_layout("handle-info");
     let flags_info_layout = synth_info_layout("flags-info");

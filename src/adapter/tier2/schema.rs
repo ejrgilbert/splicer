@@ -94,7 +94,7 @@ pub(super) fn compute_schema(
     has_gate: bool,
 ) -> Result<SchemaLayouts> {
     let mut size_align = SizeAlign::default();
-    size_align.fill(resolve);
+    size_align.fill(resolve)?;
 
     let field_ty_id = find_common_typeid(resolve, TYPEDEF_FIELD)?;
     let field_tree_ty_id = find_common_typeid(resolve, TYPEDEF_FIELD_TREE)?;

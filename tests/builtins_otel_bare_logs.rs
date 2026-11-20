@@ -100,7 +100,8 @@ fn otel_bare_logs_emits_structured_record() -> Result<()> {
     );
 
     // Instrumentation scope identifies the source builtin.
-    let scope = expect_record(expect_option(field(record, "instrumentation-scope")).expect("scope"));
+    let scope =
+        expect_record(expect_option(field(record, "instrumentation-scope")).expect("scope"));
     assert_eq!(
         expect_string(field(scope, "name")),
         "splicer:otel-bare-logs",

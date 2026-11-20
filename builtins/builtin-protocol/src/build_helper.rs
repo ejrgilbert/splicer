@@ -115,10 +115,12 @@ fn build_section_static(payload_len: usize, builtin_name: &str) -> TokenStream {
 }
 
 fn build_config_module(manifest: &Manifest) -> Result<TokenStream, Box<dyn std::error::Error>> {
-    let has_string_key = manifest
-        .keys
-        .iter()
-        .any(|k| matches!(k.parsed_type().expect("manifest already validated"), TypeAst::String));
+    let has_string_key = manifest.keys.iter().any(|k| {
+        matches!(
+            k.parsed_type().expect("manifest already validated"),
+            TypeAst::String
+        )
+    });
     let has_string_list_key = manifest
         .keys
         .iter()

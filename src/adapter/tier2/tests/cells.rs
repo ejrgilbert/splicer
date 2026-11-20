@@ -404,7 +404,7 @@ fn cell_discriminants_match_wit_declaration_order() {
         .copied()
         .expect("splicer:common/types must export `cell` typedef");
     let mut sizes = SizeAlign::default();
-    sizes.fill(&resolve);
+    sizes.fill(&resolve).expect("failed to fill");
     let layout = CellLayout::from_resolve(&sizes, &resolve, cell_id);
 
     for (expected_disc, name) in EXPECTED_CELL_CASES.iter().enumerate() {

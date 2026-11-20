@@ -21,7 +21,7 @@ use wasmtime::component::{Linker, Val};
 mod common;
 use common::{
     add_builtin_config_stub, assert_json_attr, capture_export, captured, drive_tier2_cycle,
-    expect_list, expect_record, f64_metric_number, field, first_data_point, exp_histogram_record,
+    exp_histogram_record, expect_list, expect_record, f64_metric_number, field, first_data_point,
     kv_map, metric, otel_metrics_by_name, sum_record, u64_metric_number, Captures, Host, TARGET_FN,
     TARGET_IFACE,
 };
@@ -118,7 +118,11 @@ fn payload_metrics_exports_size_shape_and_error_rate() -> Result<()> {
     let arg = metrics_for(exports, "arg");
     assert_eq!(arg.len(), 7, "6 registry metrics + the type histogram");
     // canonical-ABI estimate: 8-byte string descriptor + 5 content bytes.
-    assert_eq!(hist_sum(&arg, "payload.size"), 13.0, "\"hello\" = 8 + 5 bytes");
+    assert_eq!(
+        hist_sum(&arg, "payload.size"),
+        13.0,
+        "\"hello\" = 8 + 5 bytes"
+    );
     assert_eq!(hist_sum(&arg, "payload.node.count"), 1.0, "one node");
     assert_eq!(hist_sum(&arg, "payload.depth"), 1.0, "depth 1");
     assert_base_attrs(

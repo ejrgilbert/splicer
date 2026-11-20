@@ -250,8 +250,7 @@ pub(crate) fn local_sdk_path() -> Option<String> {
 /// `None` for crates.io resolution. Same three-state precedence as
 /// [`local_sdk_path`], keyed on `SPLICER_BUILTIN_PROTOCOL_PATH`.
 pub(crate) fn local_builtin_protocol_path() -> Option<String> {
-    const WORKSPACE_BP: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/builtins/builtin-protocol");
+    const WORKSPACE_BP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/builtins/builtin-protocol");
     match std::env::var("SPLICER_BUILTIN_PROTOCOL_PATH").as_deref() {
         Ok("") => None,
         Ok(path) => Some(path.to_string()),

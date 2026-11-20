@@ -677,7 +677,11 @@ fn finish(
     };
 
     if let Some(fmt) = metrics {
-        emit_metrics(&bundle.size_report(composed.len() as u64), fmt, metrics_out.as_deref())?;
+        emit_metrics(
+            &bundle.size_report(composed.len() as u64),
+            fmt,
+            metrics_out.as_deref(),
+        )?;
     }
 
     let output_path = output.unwrap_or_else(|| PathBuf::from(DEFAULT_OUTPUT_WASM));

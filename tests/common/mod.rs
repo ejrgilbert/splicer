@@ -78,6 +78,7 @@ pub fn empty_span_context() -> Val {
 /// `setup`-installed fake host imports, and return the runtime plus the
 /// store, instance, and capture handle. Both `drive_*` helpers share
 /// this; they differ only in which exports they invoke.
+#[allow(clippy::type_complexity)]
 fn setup_instance<C, F>(
     bytes: &[u8],
     setup: F,
@@ -176,7 +177,11 @@ where
             .call_async(&mut store, &[cid.clone(), Val::List(args)], &mut [])
             .await?;
         on_return
-            .call_async(&mut store, &[cid, Val::Option(result.map(Box::new))], &mut [])
+            .call_async(
+                &mut store,
+                &[cid, Val::Option(result.map(Box::new))],
+                &mut [],
+            )
             .await?;
         Ok::<_, anyhow::Error>(())
     })?;
@@ -393,7 +398,12 @@ pub fn otel_metrics_by_name(resource_metrics: &Val, scope_name: &str) -> HashMap
     );
     expect_list(field(sm, "metrics"))
         .iter()
-        .map(|m| (expect_string(field(expect_record(m), "name")).to_string(), m.clone()))
+        .map(|m| {
+            (
+                expect_string(field(expect_record(m), "name")).to_string(),
+                m.clone(),
+            )
+        })
         .collect()
 }
 
@@ -414,7 +424,10 @@ pub fn sum_record(metric: &Val) -> &[(String, Val)] {
 /// The `f64-histogram` aggregation record of a metric.
 pub fn histogram_record(metric: &Val) -> &[(String, Val)] {
     let (case, payload) = expect_variant(field(expect_record(metric), "data"));
-    assert_eq!(case, "f64-histogram", "expected f64-histogram data, got {case}");
+    assert_eq!(
+        case, "f64-histogram",
+        "expected f64-histogram data, got {case}"
+    );
     expect_record(payload.expect("f64-histogram payload"))
 }
 

@@ -71,7 +71,11 @@ fn otel_bare_metrics_exports_count_and_duration() -> Result<()> {
         "duration uses delta temporality"
     );
     let hist_dp = first_data_point(hist);
-    assert_eq!(expect_u64(field(hist_dp, "count")), 1, "histogram count is 1");
+    assert_eq!(
+        expect_u64(field(hist_dp, "count")),
+        1,
+        "histogram count is 1"
+    );
 
     let bounds = expect_list(field(hist_dp, "bounds"));
     assert_eq!(
