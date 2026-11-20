@@ -164,6 +164,34 @@ fn main() {
     generate_builtin_config_constants(&out_dir);
     stage_embedded_strategies(&out_dir);
     emit_sdk_test_version(&out_dir);
+    emit_wrapper_wit_bindgen_version(&out_dir);
+}
+
+fn emit_wrapper_wit_bindgen_version(out_dir: &str) {
+    let cargo_toml = Path::new("Cargo.toml");
+    println!("cargo::rerun-if-changed=Cargo.toml");
+    let src = fs::read_to_string(cargo_toml)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", cargo_toml.display()));
+    let parsed: toml::Value = toml::from_str(&src)
+        .unwrap_or_else(|e| panic!("Failed to parse {} as TOML: {e}", cargo_toml.display()));
+    let dep = parsed
+        .get("dependencies")
+        .and_then(|d| d.get("wit-bindgen-rust"))
+        .unwrap_or_else(|| panic!("[dependencies].wit-bindgen-rust missing from Cargo.toml"));
+    // Accept both `wit-bindgen-rust = "0.63.0"` and the table form
+    // `wit-bindgen-rust = { version = "0.63.0", ... }`.
+    let version = dep
+        .as_str()
+        .or_else(|| dep.get("version").and_then(|v| v.as_str()))
+        .unwrap_or_else(|| {
+            panic!("[dependencies].wit-bindgen-rust has no version string in Cargo.toml")
+        });
+    let dest = Path::new(out_dir).join("wrapper_wit_bindgen_version.rs");
+    fs::write(
+        &dest,
+        format!("pub(crate) const WRAPPER_WIT_BINDGEN_VERSION: &str = \"{version}\";\n"),
+    )
+    .unwrap_or_else(|e| panic!("Failed to write {}: {e}", dest.display()));
 }
 
 /// Read `splicer-tool-sdk/Cargo.toml` and emit its `[package].version`

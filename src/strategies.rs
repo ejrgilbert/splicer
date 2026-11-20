@@ -22,9 +22,10 @@ use include_dir::Dir;
 use std::path::{Path, PathBuf};
 
 use crate::adapter::typed::{
-    build_wrapper, smoke_check_strategy, target_wit_for_codegen, Behavior, BuildConfig,
-    BuildOutcome, GenerateWrapperInput, TargetWit,
+    build_crate_source, build_wrapper, generate_edge_shim_crate, smoke_check_strategy,
+    target_wit_for_codegen, Behavior, BuildConfig, BuildOutcome, GenerateWrapperInput, TargetWit,
 };
+use crate::parse::config::EdgeShimSpec;
 use std::collections::HashSet;
 
 /// Outcome of materializing a tier-3/4 wrapper for one
@@ -32,7 +33,15 @@ use std::collections::HashSet;
 #[derive(Debug)]
 pub enum MaterializeOutcome {
     /// Wrapper built and installed at `path`.
-    Built { path: PathBuf, tier: Tier },
+    Built {
+        path: PathBuf,
+        tier: Tier,
+        /// T' mode: (consumer_import_key, t_prime_export_key) cross-name wires.
+        /// Empty for non-T' wrappers.
+        t_prime_redirects: Vec<(String, String)>,
+        /// One entry per collateral interface that needs a T' handle unwrap edge shim.
+        edge_shim_specs: Vec<EdgeShimSpec>,
+    },
     /// The strategy doesn't fit this interface; carries the unsatisfied
     /// bound (parsed from rustc) for the skip warning and the full
     /// cargo stderr for diagnostics.
@@ -251,10 +260,38 @@ fn materialize_from_prepared(
     };
     let outcome = run_codegen_build(splits_dir, &plan, behavior, &target)?;
     Ok(match outcome {
-        BuildOutcome::Built(path) => MaterializeOutcome::Built {
-            path,
-            tier: prep.manifest.builtin.tier,
-        },
+        BuildOutcome::Built(path) => {
+            let mut edge_shim_specs = Vec::new();
+            for shim_wit in &target.edge_shim_wits {
+                let shim_crate = generate_edge_shim_crate(shim_wit).with_context(|| {
+                    format!("generating edge shim for `{}`", shim_wit.collateral_iface)
+                })?;
+                let shim_path = build_crate_source(
+                    &shim_crate.crate_name,
+                    &shim_crate.lib_rs,
+                    &shim_crate.cargo_toml,
+                    &cache_root,
+                    &adapter_path,
+                    None,
+                )
+                .with_context(|| {
+                    format!("building edge shim for `{}`", shim_wit.collateral_iface)
+                })?;
+                edge_shim_specs.push(EdgeShimSpec {
+                    collateral_iface: shim_wit.collateral_iface.clone(),
+                    raw_types_iface: shim_wit.raw_types_iface.clone(),
+                    t_prime_types_export: shim_wit.t_prime_types_export.clone(),
+                    shim_export_key: shim_wit.shim_export_key.clone(),
+                    shim_path: shim_path.to_string_lossy().into_owned(),
+                });
+            }
+            MaterializeOutcome::Built {
+                path,
+                tier: prep.manifest.builtin.tier,
+                t_prime_redirects: target.t_prime_redirects,
+                edge_shim_specs,
+            }
+        }
         BuildOutcome::BoundMismatch { bound, stderr, .. } => {
             MaterializeOutcome::Skipped { bound, stderr }
         }
@@ -668,7 +705,10 @@ mod tests {
             &mut HashSet::new(),
         )
         .expect("materialize");
-        let MaterializeOutcome::Built { path: out, tier } = outcome else {
+        let MaterializeOutcome::Built {
+            path: out, tier, ..
+        } = outcome
+        else {
             panic!("expected a built wrapper, got a skip");
         };
         assert_eq!(tier, Tier::Tier3);
@@ -722,7 +762,10 @@ mod tests {
             &mut HashSet::new(),
         )
         .expect("materialize_tier3_4(user)");
-        let MaterializeOutcome::Built { path: out, tier } = outcome else {
+        let MaterializeOutcome::Built {
+            path: out, tier, ..
+        } = outcome
+        else {
             panic!("expected a built wrapper, got a skip");
         };
         assert_eq!(tier, Tier::Tier3);

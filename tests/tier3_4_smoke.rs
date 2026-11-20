@@ -105,7 +105,7 @@ fn build_and_validate(
     assert!(
         bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]),
         "produced file is not wasm: {:?}",
-        &bytes.get(..8)
+        bytes.get(..8)
     );
 
     // Walk the binary with wasmparser to confirm it's a parseable

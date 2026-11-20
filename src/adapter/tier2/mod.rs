@@ -109,8 +109,14 @@ pub(super) fn build_tier2_adapter(
 
     let mut core_module =
         build_dispatch_module(&resolve, &schema, &per_func, &funcs, plan, iface_name)?;
-    embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8)
-        .context("embed_component_metadata")?;
+    embed_component_metadata(
+        &mut core_module,
+        &resolve,
+        world_id,
+        StringEncoding::UTF8,
+        false,
+    )
+    .context("embed_component_metadata")?;
 
     ComponentEncoder::default()
         .validate(true)
