@@ -267,7 +267,8 @@ impl<'a> WasmEncoderBindgen<'a> {
         let mem_arg = MemArg {
             offset: off,
             align: load.natural_align_log2(),
-            target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let addr_local = self.current_addr_local();
         self.emit_one(Instruction::LocalGet(addr_local));
@@ -287,7 +288,8 @@ impl<'a> WasmEncoderBindgen<'a> {
         let mem_arg = MemArg {
             offset: off,
             align: store.natural_align_log2(),
-            target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         };
         let value_vt = store.value_valtype();
         let tmp = self.alloc_store_tmp(value_vt);
@@ -1310,7 +1312,7 @@ mod tests {
 
     fn new_sizes(resolve: &Resolve) -> SizeAlign {
         let mut s = SizeAlign::default();
-        s.fill(resolve);
+        s.fill(resolve).expect("splicer:common/types must fill");
         s
     }
 

@@ -17,7 +17,9 @@ pub(crate) mod target_wit;
 pub use assemble::{assemble_cargo_toml, assemble_lib_rs, CargoTomlInputs, WrapperCrateInputs};
 pub use bindgen::{alias_shared_export_types, run_wit_bindgen_rust};
 pub use bindings_index::build_bindings_index;
-pub use build::{build_crate_source, build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome};
+pub use build::{
+    build_crate_source, build_wrapper, smoke_check_strategy, BuildConfig, BuildOutcome,
+};
 pub use emit_edge_shim::generate_edge_shim_crate;
 pub use emit_method::{
     emit_bridge_guest_impl, emit_delegation_guest_impl, emit_guest, emit_resource_newtypes,
@@ -58,12 +60,7 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
     // Index and IR walk the original bindings (with struct/enum definitions
     // on both sides) so the IR can classify types correctly.
     let bindings = build_bindings_index(&bindings_src)?;
-    let ir = build_ir(
-        resolve,
-        world_id,
-        &bindings,
-        input.interface_qualified_name,
-    )?;
+    let ir = build_ir(resolve, world_id, &bindings, input.interface_qualified_name)?;
     // After indexing: replace export-side named-type definitions with type
     // aliases that point to the import-side definition to fix type identity.
     let bindings_src = alias_shared_export_types(&bindings_src, &ir.resolve, ir.world_id)
@@ -106,7 +103,9 @@ pub fn generate_wrapper_crate(input: &GenerateWrapperInput<'_>) -> Result<Wrappe
         let t_prime_iface_traits: Vec<_> = bindings
             .guest_traits
             .iter()
-            .filter(|g| is_t_prime_trait(g) && matches!(g.kind, bindings_index::GuestTraitKind::Interface))
+            .filter(|g| {
+                is_t_prime_trait(g) && matches!(g.kind, bindings_index::GuestTraitKind::Interface)
+            })
             .collect();
         delegation_traits
             .iter()

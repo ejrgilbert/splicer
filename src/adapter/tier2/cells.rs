@@ -166,7 +166,8 @@ impl CellLayout {
         f.instructions().i32_store8(MemArg {
             offset: 0,
             align: 0,
-            target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
+            target: wasm_encoder::MemArgTarget::Memory(0),
+            ordering: None,
         });
         for part in parts {
             f.instructions().local_get(addr_local);
@@ -188,7 +189,8 @@ impl CellLayout {
             let mem = MemArg {
                 offset: self.payload_offset + part.offset as u64,
                 align: part.kind.natural_align(),
-                target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
+                target: wasm_encoder::MemArgTarget::Memory(0),
+                ordering: None,
             };
             match part.kind {
                 StoreKind::I8 => f.instructions().i32_store8(mem),
@@ -542,7 +544,8 @@ fn emit_utf8_encode(
     let store_i8 = |off: u32| MemArg {
         offset: off as u64,
         align: I8_STORE_LOG2_ALIGN,
-        target: wasm_encoder::MemArgTarget::Memory(0), ordering: None,
+        target: wasm_encoder::MemArgTarget::Memory(0),
+        ordering: None,
     };
 
     // 1B branch: cp < 0x80 → buf[0] = cp; len = 1.

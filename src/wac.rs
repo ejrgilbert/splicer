@@ -498,8 +498,10 @@ impl EmitPlan {
                 }
                 let routing_id = resolve_shim_node(*id, composition, shim_comps);
                 // t_prime_var: the T' wrapper's var (already set by the first pass).
-                let Some((t_prime_var, _)) =
-                    self.routing.get(&(routing_id, interface.name.clone())).cloned()
+                let Some((t_prime_var, _)) = self
+                    .routing
+                    .get(&(routing_id, interface.name.clone()))
+                    .cloned()
                 else {
                     continue;
                 };
@@ -926,9 +928,17 @@ impl EmitPlan {
                 Some(bridge_key.to_string()),
             ),
             // Raw sibling types: wire from raw provider (no override).
-            (spec.raw_types_iface.clone(), raw_provider_var.to_string(), None),
+            (
+                spec.raw_types_iface.clone(),
+                raw_provider_var.to_string(),
+                None,
+            ),
             // Raw collateral: wire from raw collateral component (no override).
-            (spec.collateral_iface.clone(), raw_collateral_var.to_string(), None),
+            (
+                spec.collateral_iface.clone(),
+                raw_collateral_var.to_string(),
+                None,
+            ),
         ];
 
         self.entities.insert(
@@ -940,7 +950,8 @@ impl EmitPlan {
                 catchall: false,
             },
         );
-        self.used_middlewares.insert(shim_pkg, spec.shim_path.clone());
+        self.used_middlewares
+            .insert(shim_pkg, spec.shim_path.clone());
         shim_var
     }
 
@@ -1574,7 +1585,13 @@ fn materialize_tier3_4_inline(
                 t_prime_redirects,
                 edge_shim_specs,
             } => {
-                out.push(stamp_materialized(inj, path, tier, t_prime_redirects, edge_shim_specs)?);
+                out.push(stamp_materialized(
+                    inj,
+                    path,
+                    tier,
+                    t_prime_redirects,
+                    edge_shim_specs,
+                )?);
             }
             // Bound didn't fit: record the skip and drop the injection so
             // the chain proceeds without this wrapper. `--strict` callers
@@ -2236,7 +2253,7 @@ mod tests {
             tier: None,
             resource_bearing_exports: Vec::new(),
             t_prime_redirects: Vec::new(),
-                edge_shim_specs: Vec::new(),
+            edge_shim_specs: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),
@@ -2309,7 +2326,7 @@ mod tests {
             tier: None,
             resource_bearing_exports: Vec::new(),
             t_prime_redirects: Vec::new(),
-                edge_shim_specs: Vec::new(),
+            edge_shim_specs: Vec::new(),
         };
         let contract = Contract {
             name: "wasi:http/handler@0.3.0".to_string(),

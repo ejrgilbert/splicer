@@ -254,8 +254,7 @@ pub fn emit_bridge_guest_impl(bridge_resources: &[BridgeResourceInfo]) -> Option
             let wrap_wrapper = &br.wrapper_ident;
 
             let snake = br.wit_name.to_snake_case();
-            let wrap_fn =
-                syn::Ident::new(&format!("wrap_{snake}"), proc_macro2::Span::call_site());
+            let wrap_fn = syn::Ident::new(&format!("wrap_{snake}"), proc_macro2::Span::call_site());
             let unwrap_fn =
                 syn::Ident::new(&format!("unwrap_{snake}"), proc_macro2::Span::call_site());
             quote! {
@@ -337,12 +336,13 @@ pub fn emit_delegation_guest_impl(
                 })
                 .unwrap_or(&[]);
 
-
             let has_t_prime_resource_borrow = del_sig.params.iter().any(|(_, ty)| {
                 // Borrows can't be wrapped, fall back to calling the import side directly (bypass strategy dispatch)
                 // TODO: can we fix this to where we don't bypass interposition logic
                 if let WitTypeRef::Handle(HandleRef::ResourceBorrow(nr)) = ty {
-                    ir.resources.iter().any(|r| r.is_owned && r.rust_ident == nr.rust_ident)
+                    ir.resources
+                        .iter()
+                        .any(|r| r.is_owned && r.rust_ident == nr.rust_ident)
                 } else {
                     false
                 }
@@ -355,8 +355,11 @@ pub fn emit_delegation_guest_impl(
                         .expect("T' delegation requires a target import path"),
                     None,
                 );
-                let direct_args: Vec<TokenStream> =
-                    del_sig.params.iter().map(|(ident, _)| quote!(#ident)).collect();
+                let direct_args: Vec<TokenStream> = del_sig
+                    .params
+                    .iter()
+                    .map(|(ident, _)| quote!(#ident))
+                    .collect();
                 if is_async {
                     quote!(#import_path::#method_ident(#(#direct_args),*).await)
                 } else {
@@ -395,11 +398,21 @@ pub fn emit_delegation_guest_impl(
 
                 // Unwrap any resource handles in the return type.
                 let fn_sig_key = args_ident.to_string();
-                let return_ty = ir.fn_sigs.get(&fn_sig_key).and_then(|s| s.return_ty.as_ref());
+                let return_ty = ir
+                    .fn_sigs
+                    .get(&fn_sig_key)
+                    .and_then(|s| s.return_ty.as_ref());
                 delegation_return_expr(t_prime_call, return_ty, bridge_resources, &bridge_path)
             };
 
-            emit_fn(is_async, method_ident, &generics, &sig_inputs, &sig_output, &body)
+            emit_fn(
+                is_async,
+                method_ident,
+                &generics,
+                &sig_inputs,
+                &sig_output,
+                &body,
+            )
         })
         .collect();
 
@@ -466,14 +479,12 @@ fn delegation_return_expr(
                 None => t_prime_call,
             }
         }
-        WitTypeRef::List(inner) => {
-            match try_own_unwrap_ty(inner, bridge_resources, bridge_path) {
-                Some(unwrap) => quote! {
-                    #t_prime_call.into_iter().map(|#r| #unwrap(#r)).collect()
-                },
-                None => t_prime_call,
-            }
-        }
+        WitTypeRef::List(inner) => match try_own_unwrap_ty(inner, bridge_resources, bridge_path) {
+            Some(unwrap) => quote! {
+                #t_prime_call.into_iter().map(|#r| #unwrap(#r)).collect()
+            },
+            None => t_prime_call,
+        },
         WitTypeRef::Tuple(elems) => {
             let vars: Vec<syn::Ident> = (0..elems.len())
                 .map(|i| syn::Ident::new(&format!("_r{i}"), Span::call_site()))
@@ -609,7 +620,9 @@ fn emit_method_body(
 
     let fn_sig_entry = ir.fn_sigs.get(&args_ident.to_string());
     let is_async = fn_sig_entry.map(|s| s.is_async).unwrap_or(false);
-    let fn_kind = fn_sig_entry.map(|s| s.kind).unwrap_or(ExportFnKind::Freestanding);
+    let fn_kind = fn_sig_entry
+        .map(|s| s.kind)
+        .unwrap_or(ExportFnKind::Freestanding);
     let return_ty_ref = fn_sig_entry.and_then(|s| s.return_ty.as_ref());
 
     // Compute call-site expressions for each param from the canonical WIT types.
@@ -623,12 +636,24 @@ fn emit_method_body(
                 .skip(if skip_self { 1 } else { 0 })
                 .zip(fields.iter())
                 .map(|(param, f)| {
-                    param_call_expr(&param.ty, &f.rust_ident, is_async, &ir.resolve, &ir.resources)
+                    param_call_expr(
+                        &param.ty,
+                        &f.rust_ident,
+                        is_async,
+                        &ir.resolve,
+                        &ir.resources,
+                    )
                 })
                 .collect()
         })
         .unwrap_or_else(|| {
-            fields.iter().map(|f| { let n = &f.rust_ident; quote!(args.#n) }).collect()
+            fields
+                .iter()
+                .map(|f| {
+                    let n = &f.rust_ident;
+                    quote!(args.#n)
+                })
+                .collect()
         });
 
     let generics = if has_borrow { quote!(<'a>) } else { quote!() };
@@ -743,7 +768,8 @@ fn emit_method_body(
     // Constructors: strategy R is the wrapper newtype; WIT constructor return types
     // are implicit and absent from fn_sigs, so derive directly.
     // Everything else: compute from the declared return type via resource_wrap.
-    let (strategy_r_ty, closure_body, final_wrap) = if let Some(w) = constructor_wrap_ident.as_ref() {
+    let (strategy_r_ty, closure_body, final_wrap) = if let Some(w) = constructor_wrap_ident.as_ref()
+    {
         (quote!(#w), target_call.clone(), None)
     } else {
         let nominal_return_ty = return_ty_ref
@@ -829,7 +855,14 @@ fn emit_method_body(
         }
     };
 
-    emit_fn(is_async, method_ident, &generics, &sig_inputs, &sig_output, &body)
+    emit_fn(
+        is_async,
+        method_ident,
+        &generics,
+        &sig_inputs,
+        &sig_output,
+        &body,
+    )
 }
 
 fn emit_fn(
@@ -936,7 +969,10 @@ fn param_call_expr(
 }
 
 /// Find a T' resource (is_owned + inner_type_path set) by its canonical TypeId.
-fn t_prime_resource_by_type_id(resource_id: TypeId, resources: &[ResourceInfo]) -> Option<&ResourceInfo> {
+fn t_prime_resource_by_type_id(
+    resource_id: TypeId,
+    resources: &[ResourceInfo],
+) -> Option<&ResourceInfo> {
     resources
         .iter()
         .find(|r| r.is_owned && r.type_id == resource_id && r.inner_type_path.is_some())

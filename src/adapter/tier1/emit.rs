@@ -94,8 +94,14 @@ pub(crate) fn build_adapter(
         has_after,
         has_gate,
     )?;
-    embed_component_metadata(&mut core_module, &resolve, world_id, StringEncoding::UTF8, false)
-        .context("embed_component_metadata")?;
+    embed_component_metadata(
+        &mut core_module,
+        &resolve,
+        world_id,
+        StringEncoding::UTF8,
+        false,
+    )
+    .context("embed_component_metadata")?;
 
     ComponentEncoder::default()
         .validate(true)
@@ -420,7 +426,7 @@ fn build_dispatch_module(
     let any_async_target = funcs.iter().any(|f| f.kind.is_async());
     let needs_async_runtime = any_async_target;
     let mut sizes = SizeAlign::default();
-    sizes.fill(resolve);
+    sizes.fill(resolve)?;
     let plan = compute_func_dispatches(
         resolve,
         &sizes,

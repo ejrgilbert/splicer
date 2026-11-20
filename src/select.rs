@@ -944,7 +944,11 @@ mod tests {
             instance(vec![(RES_CTOR, func(a, false, vec![], vec![]))])
         })
         .expect("decidable");
-        assert_eq!(sites.len(), 1, "resource-only interface must match scope: resource");
+        assert_eq!(
+            sites.len(),
+            1,
+            "resource-only interface must match scope: resource"
+        );
     }
 
     #[test]

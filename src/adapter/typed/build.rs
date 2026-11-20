@@ -114,8 +114,16 @@ pub fn build_crate_source(
     lib_rs.hash(&mut h);
     let key = format!("{:016x}", h.finish());
     let target = target.unwrap_or("wasm32-wasip1");
-    compile_sources(&key, crate_name, lib_rs, cargo_toml, build_root, adapter_wasm, target)?
-        .map_err(|stderr| anyhow::anyhow!("crate `{crate_name}` failed to compile:\n{stderr}"))
+    compile_sources(
+        &key,
+        crate_name,
+        lib_rs,
+        cargo_toml,
+        build_root,
+        adapter_wasm,
+        target,
+    )?
+    .map_err(|stderr| anyhow::anyhow!("crate `{crate_name}` failed to compile:\n{stderr}"))
 }
 
 fn compile_sources(
